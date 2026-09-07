@@ -387,7 +387,7 @@ async fn start_cgi(key: &str, app: &AppRouteConfig, state_dir: &Path) -> Result<
     {
         use std::sync::atomic::Ordering;
         let port = TCP_PORT_SEQ.fetch_add(1, Ordering::Relaxed);
-        let bind = format!("127.0.0.1:{port}");
+        let bind = format!("0.0.0.0:{port}");
         let mut cmd = Command::new(&cgi_bin);
         cmd.arg("-b")
             .arg(&bind)

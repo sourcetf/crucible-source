@@ -386,7 +386,7 @@ mod script_rel_tests {
 
     fn listener_with_rust_app() -> ListenerConfig {
         ListenerConfig {
-            address: "127.0.0.1".into(),
+            address: "0.0.0.0".into(),
             address_v6: None,
             port: 19095,
             root: PathBuf::from("www-apps"),
