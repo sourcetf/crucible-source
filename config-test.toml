@@ -73,6 +73,7 @@ deny = []
 [[listeners]]
 address = "0.0.0.0"
 address_v6 = "::"
+port_reuse = true
 autoindex = true
 file_open = [
     "/php/demo.php=preview",
@@ -276,6 +277,7 @@ paths = ["/aspnet"]
 [[listeners]]
 address = "0.0.0.0"
 address_v6 = "::"
+port_reuse = true
 autoindex = true
 http_versions = [
     "h1",
@@ -289,6 +291,7 @@ status_path = "/__status"
 [[listeners]]
 address = "0.0.0.0"
 address_v6 = "::"
+port_reuse = true
 autoindex = true
 http_versions = [
     "h1",
@@ -309,6 +312,7 @@ versions = ["TLSv1.2"]
 [[listeners]]
 address = "0.0.0.0"
 address_v6 = "::"
+port_reuse = true
 autoindex = true
 http_versions = [
     "h1",
@@ -330,6 +334,7 @@ versions = [
 [[listeners]]
 address = "0.0.0.0"
 address_v6 = "::"
+port_reuse = true
 http_versions = [
     "h1",
     "h2",
@@ -358,6 +363,7 @@ prefer_tls13 = true
 [[listeners]]
 address = "0.0.0.0"
 address_v6 = "::"
+port_reuse = true
 http_versions = [
     "h1",
     "h2",
@@ -384,6 +390,7 @@ prefer_tls13 = true
 [[listeners]]
 address = "0.0.0.0"
 address_v6 = "::"
+port_reuse = true
 l4_forward = "127.0.0.1:55556"
 port = 55555
 root = "www-static-fair"
@@ -391,6 +398,7 @@ root = "www-static-fair"
 [[listeners]]
 address = "0.0.0.0"
 address_v6 = "::"
+port_reuse = true
 http_versions = ["h1"]
 port = 55556
 root = "state/l4auto"

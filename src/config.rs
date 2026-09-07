@@ -502,6 +502,7 @@ pub struct ListenerConfig {
     pub status_path: Option<String>,
     #[serde(default)]
     pub address_v6: Option<String>,
+    #[serde(default)]
     pub port_reuse: bool,
     #[serde(default)]
     pub rate_limit: Option<RateLimitConfig>,

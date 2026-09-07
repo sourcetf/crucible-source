@@ -265,14 +265,72 @@ async fn handle_inner(
                 let fwd = super::resolve_fwd_dest(&dc, Some(addr));
                 let mut hit = "default".to_string();
                 if dc.geo.enabled {
-                    for l in &dc.geo.lines {
-                        if l.cidrs.iter().any(|c| super::cidr_contains(c, addr)) {
-                            hit = l.name.clone();
-                            break;
-                        }
-                    }
+                    hit = super::geoip::line_for(&dc.geo.mmdb, addr)
+                        .unwrap_or_else(|| {
+                            dc.geo.lines.iter()
+                                .find(|l| l.cidrs.iter().any(|c| super::cidr_contains(c, addr)))
+                                .map(|l| l.name.clone())
+                                .unwrap_or_else(|| "default".into())
+                        });
                 }
                 Ok(json!({"ip": ip, "line": hit, "fwd_dest": fwd.to_string()}))
+            }
+            // GeoIP 管理（需求 9）：手动 sync / status / 查表
+            p if p.ends_with("/api/dns/geoip/sync") => {
+                if !v["force"].as_bool().unwrap_or(false) && !v["domain"].is_null() {
+                    // no-op guard
+                }
+                let force = v["force"].as_bool().unwrap_or(false);
+                let mmdb = dc.geo.mmdb.clone();
+                let mut run_sync = true;
+                if !force {
+                    let stamp = super::state_root().join("geo").join("last_sync.txt");
+                    let age_days = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_secs() / 86_400)
+                        .unwrap_or(0)
+                        .saturating_sub(
+                            std::fs::read_to_string(&stamp).ok()
+                                .and_then(|s| s.trim().parse::<u64>().ok())
+                                .unwrap_or(0),
+                        );
+                    if age_days < mmdb.sync_days { run_sync = false; }
+                }
+                let r = if mmdb.is_active() && !mmdb.license_key.is_empty() && run_sync {
+                    tokio::task::spawn_blocking(move || super::geoip::ensure_synced(&mmdb))
+                        .await
+                        .map_err(|e| e.to_string())?
+                } else {
+                    Ok(())
+                };
+                match r {
+                    Ok(_) => {
+                        // 清缓存 reader 让下次 lookup 读新 db
+                        super::geoip::reset_cache();
+                        Ok(json!({"ok": true, "synced": run_sync}))
+                    }
+                    Err(e) => Ok(json!({"ok": false, "error": e.to_string()})),
+                }
+            }
+            p if p.ends_with("/api/dns/geoip/status") => {
+                Ok(super::geoip::status())
+            }
+            p if p.ends_with("/api/dns/geoip/lines") => {
+                let lines: Vec<serde_json::Value> = dc.geo.lines.iter().map(|l| json!({
+                    "name": l.name, "cidrs": l.cidrs, "rule_count": l.cidrs.len()
+                })).collect();
+                let mmdb_info = json!({
+                    "enabled": dc.geo.mmdb.is_active(),
+                    "city_db": dc.geo.mmdb.city_db(),
+                    "asn_db": dc.geo.mmdb.asn_db(),
+                    "sync_days": dc.geo.mmdb.sync_days,
+                    "has_license": !dc.geo.mmdb.license_key.is_empty(),
+                    "country_map": dc.geo.mmdb.country_to_line.len(),
+                    "asn_map": dc.geo.mmdb.asn_to_line.len(),
+                    "isp_map": dc.geo.mmdb.isp_contains.len(),
+                    "reader": super::geoip::status(),
+                });
+                Ok(json!({ "lines": lines, "mmdb": mmdb_info }))
             }
             p if p.ends_with("/api/dns/reload") => {
                 reconcile_current(&live).await?;

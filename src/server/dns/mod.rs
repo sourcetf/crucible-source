@@ -20,6 +20,7 @@ pub mod acme;
 pub mod admin_api;
 pub mod dot_doh;
 pub mod ecs;
+pub mod geoip;
 
 /// DNS 总配置（config.toml `[dns]` / 面板 panel.toml）。serde 全默认：缺省即关闭、零行为变化。
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -130,9 +131,64 @@ pub struct RpzRule {
 pub struct GeoCfg {
     #[serde(default)]
     pub enabled: bool,
-    /// 线路组：name + 该线路的客户端 CIDR 列表（由 geoip SQLite 预计算填充）
+    /// 线路组：name + 该线路的客户端 CIDR 列表（由 geoip SQLite 预计算填充或面板手填）
     #[serde(default)]
     pub lines: Vec<GeoLine>,
+    /// MaxMind GeoLite2 自动同步 + ASN/ISP/geo 线路匹配 (需求 9 扩展)
+    #[serde(default)]
+    pub mmdb: GeoMmdbCfg,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct GeoMmdbCfg {
+    /// libmaxminddb 解析 MMDB；空 path 且 license_key 非空 → 自动下载 GeoLite2-City + GeoLite2-ASN
+    #[serde(default)]
+    pub db_path_city: String,
+    #[serde(default)]
+    pub db_path_asn: String,
+    /// MaxMind License Key —— 为空跳过自动同步
+    #[serde(default)]
+    pub license_key: String,
+    /// 同步间隔（天）；0 = 不自动同步
+    #[serde(default = "default_geo_sync_days")]
+    pub sync_days: u64,
+    /// ASN 字符串 (e.g. "AS13335" 或 "13335") → 线路名
+    #[serde(default)]
+    pub asn_to_line: Vec<(String, String)>,
+    /// ISO 国家码 → 线路名
+    #[serde(default)]
+    pub country_to_line: Vec<(String, String)>,
+    /// ISP/组织名子串 → 线路名 (大小写不敏感包含匹配)
+    #[serde(default)]
+    pub isp_contains: Vec<(String, String)>,
+}
+
+pub fn default_geo_sync_days() -> u64 {
+    7
+}
+
+impl GeoMmdbCfg {
+    /// 数据库就绪 (db_path 存在或 license_key 非空可 auto-fetch)
+    pub fn is_active(&self) -> bool {
+        !self.db_path_city.is_empty()
+            || !self.db_path_asn.is_empty()
+            || (!self.license_key.is_empty() && self.sync_days > 0)
+    }
+    /// 本地 db_path 或 license_key 推算的默认 city db 路径
+    pub fn city_db(&self) -> String {
+        if !self.db_path_city.is_empty() {
+            self.db_path_city.clone()
+        } else {
+            format!("{}/GeoLite2-City.mmdb", state_root().join("geo").display())
+        }
+    }
+    pub fn asn_db(&self) -> String {
+        if !self.db_path_asn.is_empty() {
+            self.db_path_asn.clone()
+        } else {
+            format!("{}/GeoLite2-ASN.mmdb", state_root().join("geo").display())
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -660,7 +716,8 @@ pub fn gen_named_conf(cfg: &DnsConfig, zones: &[ZoneRow]) -> String {
     let port = cfg.port_or_default();
     let rndc_port = cfg.rndc_port_or_default();
     let secret = load_or_make_secret();
-    let geo_on = cfg.geo.enabled && !cfg.geo.lines.is_empty();
+    let geo_on = cfg.geo.enabled
+        && (!cfg.geo.lines.is_empty() || cfg.geo.mmdb.is_active());
     let mut s = String::new();
 
     // listen-on：基础地址 + 分线路转发 loopback（127.0.0.2..N+1）
@@ -812,12 +869,24 @@ pub fn gen_named_conf(cfg: &DnsConfig, zones: &[ZoneRow]) -> String {
 
 /// DoT/DoH 分线路转发目标：客户端 IP 命中 geo.lines[i].cidrs → 127.0.0.(2+i)
 /// （named 侧 fwd-<line> view match-destinations 同一地址）；未启用/未命中 → 127.0.0.1。
+/// mmdb 启用时按 line_for() 匹配 (asn/country/isp → 线路名 → 索引)
 pub fn resolve_fwd_dest(cfg: &DnsConfig, client: Option<std::net::IpAddr>) -> std::net::IpAddr {
     use std::net::IpAddr;
     let Some(ip) = client else {
         return IpAddr::from([127u8, 0, 0, 1]);
     };
-    if !(cfg.geo.enabled && !cfg.geo.lines.is_empty()) {
+    if !cfg.geo.enabled {
+        return IpAddr::from([127u8, 0, 0, 1]);
+    }
+    // mmdb 优先 (需求 9: 模块化, ASN/ISP/国家线路)
+    if cfg.geo.mmdb.is_active() {
+        if let Some(line) = crate::server::dns::geoip::line_for(&cfg.geo.mmdb, ip) {
+            if let Some(i) = cfg.geo.lines.iter().position(|l| l.name == line) {
+                return IpAddr::from([127u8, 0, 0, (2 + i.min(250)) as u8]);
+            }
+        }
+    }
+    if cfg.geo.lines.is_empty() {
         return IpAddr::from([127u8, 0, 0, 1]);
     }
     for (i, l) in cfg.geo.lines.iter().enumerate() {
@@ -996,7 +1065,8 @@ pub fn write_all(cfg: &DnsConfig) -> Result<Vec<(String, PathBuf)>> {
 
     // per-view 变体落盘——必须与 gen_named_conf 的 view 列表一致（view_tag, line_tag）；
     // 同一 zone 文件不得跨 view 复用（named 'writeable file already in use' 拒载）
-    let geo_on = cfg.geo.enabled && !cfg.geo.lines.is_empty();
+    let geo_on = cfg.geo.enabled
+        && (!cfg.geo.lines.is_empty() || cfg.geo.mmdb.is_active());
     let mut views: Vec<(String, String)> = vec![(String::new(), String::new())];
     if geo_on {
         for l in &cfg.geo.lines {
@@ -1138,6 +1208,12 @@ pub fn reconcile(cfg: &DnsConfig) -> Result<()> {
         return Ok(());
     }
     write_all(cfg)?;
+    // 需求 9：MaxMind GeoLite2 数据库自同步 (cron 每日 + 启动时增量检查)
+    if cfg.geo.enabled && cfg.geo.mmdb.is_active() && !cfg.geo.mmdb.license_key.is_empty() {
+        if let Err(e) = crate::server::dns::geoip::ensure_synced(&cfg.geo.mmdb) {
+            log::warn!("dns: geoip auto-sync failed: {e:#}");
+        }
+    }
     let alive = named_alive(cfg);
     if !alive {
         // 探活校验只在 named 未运行时做（避免探针端口冲突假阴性）；
