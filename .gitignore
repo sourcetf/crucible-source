@@ -72,3 +72,9 @@ __pycache__/
 *.pyc
 *.core
 webserver.core
+
+# Compiled helpers / dev clutter
+www-apps/go/deps/bin/
+scripts/*/mmdb2jsonl
+*.bak
+*.bak-*
