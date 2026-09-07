@@ -1,0 +1,14 @@
+{
+  "status": "stopped",
+  "note": "overnight_loop concluded; retain final H2 knobs (BATCH_CAP=16, busy_poll=100us, workers=2)",
+  "best_dual": {
+    "iter": 28,
+    "ours_rps": 713000,
+    "ours_lat_us": 1635,
+    "h2o_rps": 796000,
+    "h2o_lat_us": 1412,
+    "rps_gap": 1.116,
+    "lat_gap": 1.158
+  },
+  "updated": "2026-09-04"
+}

@@ -1,0 +1,85 @@
+//! Optional Prometheus-style metrics endpoint.
+
+use crate::config::TelemetryConfig;
+use crate::server::h1::{full, BoxBody};
+use bytes::Bytes;
+use http::{Request, Response, StatusCode};
+use hyper::body::Incoming;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+static REQUESTS_TOTAL: AtomicU64 = AtomicU64::new(0);
+static H3_STREAMS_ACTIVE: AtomicU64 = AtomicU64::new(0);
+
+pub fn record_request() {
+    REQUESTS_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+pub fn set_h3_streams(n: u64) {
+    H3_STREAMS_ACTIVE.store(n, Ordering::Relaxed);
+}
+
+pub fn metrics_body() -> String {
+    format!(
+        "# HELP crucible_requests_total Total HTTP requests served\n\
+         # TYPE crucible_requests_total counter\n\
+         crucible_requests_total {}\n\
+         # HELP crucible_h3_streams_active Active HTTP/3 streams\n\
+         # TYPE crucible_h3_streams_active gauge\n\
+         crucible_h3_streams_active {}\n",
+        REQUESTS_TOTAL.load(Ordering::Relaxed),
+        H3_STREAMS_ACTIVE.load(Ordering::Relaxed),
+    )
+}
+
+pub fn maybe_handle(
+    req: &Request<Incoming>,
+    cfg: &TelemetryConfig,
+) -> Option<Response<BoxBody>> {
+    if !cfg.enabled {
+        return None;
+    }
+    if req.method() != http::Method::GET {
+        return Some(
+            Response::builder()
+                .status(StatusCode::METHOD_NOT_ALLOWED)
+                .body(full("method not allowed"))
+                .unwrap(),
+        );
+    }
+    if req.uri().path() != cfg.path {
+        return None;
+    }
+    Some(metrics_response())
+}
+
+/// H2/H3 path uses bodyless requests.
+pub fn maybe_handle_simple(
+    req: &Request<()>,
+    cfg: &TelemetryConfig,
+) -> Option<Response<Bytes>> {
+    if !cfg.enabled || req.method() != http::Method::GET || req.uri().path() != cfg.path {
+        return None;
+    }
+    let body = metrics_body();
+    Some(
+        Response::builder()
+            .status(StatusCode::OK)
+            .header(
+                http::header::CONTENT_TYPE,
+                "text/plain; version=0.0.4; charset=utf-8",
+            )
+            .body(Bytes::from(body))
+            .unwrap(),
+    )
+}
+
+fn metrics_response() -> Response<BoxBody> {
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(
+            http::header::CONTENT_TYPE,
+            "text/plain; version=0.0.4; charset=utf-8",
+        )
+        .body(full(metrics_body()))
+        .unwrap()
+}

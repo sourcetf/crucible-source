@@ -1,0 +1,74 @@
+# Build artifacts
+target/
+**/target/
+*.pdb
+*.rlib
+*.o
+*.so
+*.dylib
+*.dll
+*.exe
+*.bin
+
+# Lock files (rebuild fresh)
+# Keep Cargo.lock actually — it's needed for reproducible builds
+# Cargo.lock
+
+# OS / editor junk
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*~
+.vscode/
+.idea/
+
+# Runtime state (zones, keys, log)
+state/
+*.journal
+*.signed
+*.jbk
+*.jnl
+
+# Secrets
+*.key
+*.pem
+*.crt
+config/secrets.*
+.env
+.env.*
+
+# Local notes
+*.local
+*.log
+*.tmp
+*.bak
+
+# Agent/IDE scratch
+.cursor/
+.agents/
+.codegraph/
+
+# Test debris
+*.b64
+*.pkt
+*.wire
+pg.*
+nul
+out/
+scratch/
+tmp_*/
+.cache/
+
+# Scripts that were one-off deployment helpers
+_remote*.txt
+_sync*.txt
+_probe*.py
+_build_errors*
+_remote.py
+_remote_*.py
+data/
+__pycache__/
+*.pyc
+*.core
+webserver.core

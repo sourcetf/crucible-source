@@ -1,0 +1,36 @@
+//! Anycast CIDR detection and geo field suppression (§23.5.6).
+
+use std::net::IpAddr;
+
+/// Well-known anycast / CDN prefixes (extend via panel).
+const ANYCAST_V4: &[(&str, u32)] = &[
+    ("1.1.1.0", 24),
+    ("8.8.8.0", 24),
+    ("9.9.9.0", 24),
+    ("208.67.222.0", 24),
+];
+
+pub fn is_anycast(ip: IpAddr) -> bool {
+    let IpAddr::V4(v4) = ip else {
+        return false;
+    };
+    let n = u32::from(v4);
+    for (base, bits) in ANYCAST_V4 {
+        if let Ok(b) = base.parse::<std::net::Ipv4Addr>() {
+            let mask = if *bits >= 32 {
+                u32::MAX
+            } else {
+                u32::MAX << (32 - bits)
+            };
+            if (n & mask) == (u32::from(b) & mask) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// When anycast or country conflict, suppress city-level fields.
+pub fn suppress_locality(country_conflict: bool, anycast: bool) -> bool {
+    country_conflict || anycast
+}

@@ -1,0 +1,1003 @@
+//! Reverse proxy with Hyper client.
+//!
+//! Tor/.onion connect order:
+//! 1. `CRUCIBLE_TOR_FFI_LIB` — optional dlopen stub (see [`try_tor_ffi_connect`]);
+//!    if the library is missing or exports nothing usable, fall through.
+//! 2. `CRUCIBLE_TOR_SOCKS_UNIX` — Unix-domain SOCKS5
+//! 3. `CRUCIBLE_TOR_SOCKS` or `127.0.0.1:9050` — TCP SOCKS5
+//!
+//! The FFI path is a documented stub: Crucible does not ship a Tor client .so;
+//! operators may point at an experimental helper that will later expose
+//! `crucible_tor_connect`. Until then, SOCKS remains the supported path.
+//!
+//! §3：连接池默认禁用；connection_pool=true 时按 (host,port,h2?,use_tor?) 维度复用
+//! 已建立的 SendRequest，空闲上限 16，坏连接自动重建。
+//!
+//! # Onion TLS (`ssl_mode`)
+//! For `.onion` hosts, [`onion_ca::validate_onion_upstream`] always runs.
+//! Modes `verify` / `no_verify` / `trust_self_signed` wrap the SOCKS/TCP stream
+//! in TLS (BoringSSL when `tls_boring`, else rustls). In `verify` mode the leaf
+//! DER is checked with [`onion_ca::onion_cert_matches_host`]; if no peer cert
+//! path is available the connection is rejected.
+
+use crate::config::{ListenerConfig, ProxyRuleConfig};
+use crate::server::apps::env_lock;
+use crate::server::h1::{empty, full, BoxBody};
+
+use once_cell::sync::Lazy;
+use parking_lot::Mutex as PLMutex;
+use std::collections::HashMap;
+use std::hash::{Hash, Hasher};
+use std::collections::hash_map::DefaultHasher;
+
+/// §3 连接池（每 upstream host:port:scheme 维度，上限 16）。
+const POOL_CAP: usize = 16;
+
+#[derive(Clone, Copy)]
+struct PoolKey(u64);
+impl PartialEq for PoolKey { fn eq(&self, o: &Self) -> bool { self.0 == o.0 } }
+impl Eq for PoolKey {}
+impl Hash for PoolKey {
+    fn hash<H: Hasher>(&self, state: &mut H) { self.0.hash(state); }
+}
+impl PoolKey {
+    fn new(host: &str, port: u16, h2: bool, use_tor: bool) -> Self {
+        let mut s = DefaultHasher::new();
+        host.hash(&mut s); port.hash(&mut s); h2.hash(&mut s); use_tor.hash(&mut s);
+        PoolKey(s.finish())
+    }
+}
+
+static POOL: Lazy<PLMutex<HashMap<PoolKey, Vec<UpSender>>>> =
+    Lazy::new(|| PLMutex::new(HashMap::new()));
+
+fn pool_give(key: PoolKey, sender: UpSender) {
+    let mut p = POOL.lock();
+    let q = p.entry(key).or_insert_with(Vec::new);
+    if q.len() < POOL_CAP { q.push(sender); }
+}
+
+async fn pool_take(key: PoolKey) -> Option<UpSender> {
+    POOL.lock().get_mut(&key).and_then(Vec::pop)
+}
+use crate::server::onion_ca::{
+    is_onion_host, onion_cert_matches_host, validate_onion_upstream, OnionSslMode,
+};
+use anyhow::{bail, Context, Result};
+use bytes::Bytes;
+use http::header::{CONNECTION, HOST, UPGRADE};
+use http::{HeaderMap, HeaderName, HeaderValue, Request, Response, StatusCode, Uri};
+use http_body_util::{BodyExt, Full};
+use hyper_util::rt::TokioIo;
+use std::net::{IpAddr, SocketAddr};
+use std::os::unix::io::FromRawFd;
+use std::pin::Pin;
+use std::str::FromStr;
+use std::task::{Context as TaskContext, Poll};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
+use tokio::net::{TcpListener, TcpStream, UnixStream};
+
+/// Object-safe read+write stream for upstream TLS/plain TCP.
+trait AsyncReadWrite: AsyncRead + AsyncWrite + Unpin + Send {}
+impl<T: AsyncRead + AsyncWrite + Unpin + Send> AsyncReadWrite for T {}
+
+/// Type-erased upstream byte stream (plain TCP or TLS).
+struct UpstreamIo {
+    inner: Pin<Box<dyn AsyncReadWrite>>,
+}
+
+impl UpstreamIo {
+    fn plain(tcp: TcpStream) -> Self {
+        Self {
+            inner: Box::pin(tcp),
+        }
+    }
+
+    /// 从任意读写流构造（tor_client 的 TorStream 等）。
+    fn from_rw(inner: Pin<Box<dyn AsyncReadWrite>>) -> Self {
+        Self { inner }
+    }
+
+    fn from_tls<S>(s: S) -> Self
+    where
+        S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    {
+        Self {
+            inner: Box::pin(s),
+        }
+    }
+}
+
+impl AsyncRead for UpstreamIo {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut TaskContext<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.inner).poll_read(cx, buf)
+    }
+}
+
+impl AsyncWrite for UpstreamIo {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut TaskContext<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        Pin::new(&mut self.inner).poll_write(cx, buf)
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(
+        mut self: Pin<&mut Self>,
+        cx: &mut TaskContext<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
+}
+
+/// RFC7230 §6.1：hop-by-hop 头不得转发（proxy_once 非 WS 路径剥除；响应侧同样）。
+const HOP_BY_HOP: &[&str] = &[
+    "connection",
+    "keep-alive",
+    "proxy-authenticate",
+    "proxy-authorization",
+    "proxy-connection",
+    "te",
+    "trailer",
+    "transfer-encoding",
+    "upgrade",
+];
+
+pub async fn try_proxy(
+    lc: &ListenerConfig,
+    req: Request<Full<Bytes>>,
+    peer_ip: IpAddr,
+) -> Option<(bool, Response<BoxBody>)> {
+    let path = req.uri().path().to_string();
+    let client_https = lc.ssl.is_some();
+    for rule in &lc.proxy_rules {
+        if path_matches_proxy_prefix(&path, &rule.path) {
+            match proxy_once(req, rule, peer_ip, client_https).await {
+                Ok(r) => return Some((true, r)),
+                Err(e) => {
+                    return Some((
+                        true,
+                        Response::builder()
+                            .status(StatusCode::BAD_GATEWAY)
+                            .body(full(format!("proxy error: {e:#}")))
+                            .unwrap(),
+                    ));
+                }
+            }
+        }
+    }
+    None
+}
+
+
+/// Path prefix match that requires a boundary (end or `/`) to avoid `/api@evil` SSRF.
+fn path_matches_proxy_prefix(path: &str, prefix: &str) -> bool {
+    if prefix.is_empty() {
+        return false;
+    }
+    if prefix == "/" {
+        return path.starts_with('/');
+    }
+    if path == prefix {
+        return true;
+    }
+    let p = prefix.trim_end_matches('/');
+    path.starts_with(p) && path[p.len()..].starts_with('/')
+}
+
+/// Join upstream base + rest without allowing `@` authority injection in rest.
+fn join_upstream(upstream: &str, rest: &str) -> Result<String> {
+    let rest = if rest.is_empty() { "/" } else { rest };
+    if rest.contains('@') {
+        bail!("proxy refused path component containing '@' (authority injection)");
+    }
+    if rest.starts_with("//") {
+        bail!("proxy refused protocol-relative suffix");
+    }
+    // Reject `http:` / `https:` absolute URLs sneaked into the path suffix.
+    let lower = rest.to_ascii_lowercase();
+    if lower.starts_with("http:") || lower.starts_with("https:") {
+        bail!("proxy refused absolute URL suffix");
+    }
+    let upstream = upstream.trim_end_matches('/');
+    Ok(format!("{upstream}{rest}"))
+}
+
+/// §11 回源 HTTP 版本枚举：统一 h1/h2 SendRequest 的 send_request 调用。
+enum UpSender {
+    H1(hyper::client::conn::http1::SendRequest<Full<Bytes>>),
+    H2(hyper::client::conn::http2::SendRequest<Full<Bytes>>),
+}
+impl UpSender {
+    async fn send_request(
+        &mut self,
+        req: Request<Full<Bytes>>,
+    ) -> anyhow::Result<Response<hyper::body::Incoming>> {
+        match self {
+            UpSender::H1(s) => Ok(s.send_request(req).await?),
+            UpSender::H2(s) => Ok(s.send_request(req).await?),
+        }
+    }
+}
+
+async fn proxy_once(
+    req: Request<Full<Bytes>>,
+    rule: &ProxyRuleConfig,
+    peer_ip: IpAddr,
+    client_https: bool,
+) -> Result<Response<BoxBody>> {
+    if is_websocket_upgrade(&req) {
+        return proxy_websocket(req, rule).await;
+    }
+
+    let upstream = rule.upstream.trim_end_matches('/');
+    let suffix = req
+        .uri()
+        .path_and_query()
+        .map(|pq| pq.as_str().to_string())
+        .unwrap_or_else(|| "/".into());
+    let rest = suffix
+        .strip_prefix(&rule.path)
+        .or_else(|| suffix.strip_prefix(rule.path.trim_end_matches('/')))
+        .unwrap_or(suffix.as_str());
+    let target = join_upstream(upstream, rest)?;
+    let uri = Uri::from_str(&target).context("upstream uri")?;
+
+    let host = uri.host().unwrap_or("127.0.0.1").to_string();
+    let scheme = uri.scheme_str().unwrap_or("http");
+    let port = uri.port_u16().unwrap_or(if scheme == "https" { 443 } else { 80 });
+
+    let stream = connect_upstream(&host, port, scheme, rule).await?;
+    let io = TokioIo::new(stream);
+
+    // 规格 11：回源 HTTP 版本可配（h2 显式启用；默认 h1 自动）。
+    // h1/h2 的 SendRequest 类型不同——用枚举统一 send 语义。
+    enum UpSender {
+        H1(hyper::client::conn::http1::SendRequest<Full<Bytes>>),
+        H2(hyper::client::conn::http2::SendRequest<Full<Bytes>>),
+    }
+    impl UpSender {
+        async fn send_request(
+            &mut self,
+            req: Request<Full<Bytes>>,
+        ) -> anyhow::Result<Response<hyper::body::Incoming>> {
+            match self {
+                UpSender::H1(s) => Ok(s.send_request(req).await?),
+                UpSender::H2(s) => Ok(s.send_request(req).await?),
+            }
+        }
+    }
+    let mut sender = if rule.upstream_http_version.as_deref() == Some("h2") {
+        use hyper_util::rt::TokioExecutor;
+        let (sender, conn) = hyper::client::conn::http2::handshake(
+            TokioExecutor::new(),
+            io,
+        )
+        .await
+        .context("upstream h2 handshake")?;
+        tokio::spawn(async move {
+            let _ = conn.await;
+        });
+        UpSender::H2(sender)
+    } else {
+        let (sender, conn) = hyper::client::conn::http1::handshake(io)
+            .await
+            .context("upstream handshake")?;
+        tokio::spawn(async move {
+            let _ = conn.await;
+        });
+        UpSender::H1(sender)
+    };
+
+    let (parts, body) = req.into_parts();
+    // 任务 6（OOM 防护）：上游请求体上限 64MiB；超限 → Err → 调用方 502。
+    let bytes = http_body_util::Limited::new(body, crate::server::h1::UPSTREAM_BODY_CAP)
+        .collect()
+        .await
+        .map_err(|e| anyhow::anyhow!("read upstream request body: {e}"))?
+        .to_bytes();
+    let mut builder = Request::builder().method(parts.method).uri(&uri);
+    // hop-by-hop 头与 Connection 列名的头一律不上游（host 单独重写）。
+    let conn_tokens: Vec<String> = parts
+        .headers
+        .get(CONNECTION)
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v.split(',').map(|s| s.trim().to_ascii_lowercase()).collect())
+        .unwrap_or_default();
+    for (k, v) in parts.headers.iter() {
+        let kl = k.as_str().to_ascii_lowercase();
+        if k == HOST || HOP_BY_HOP.contains(&kl.as_str()) || conn_tokens.iter().any(|t| *t == kl) {
+            continue;
+        }
+        builder = builder.header(k, v);
+    }
+    builder = builder.header(HOST, &host);
+    // P2-5：标准代理头注入——XFF 追加客户端 IP；proto 按 listener 是否 TLS。
+    let xff = match parts.headers.get("x-forwarded-for").and_then(|v| v.to_str().ok()) {
+        Some(existing) => format!("{existing}, {peer_ip}"),
+        None => peer_ip.to_string(),
+    };
+    builder = builder.header("x-forwarded-for", xff);
+    builder = builder.header(
+        "x-forwarded-proto",
+        if client_https { "https" } else { "http" },
+    );
+    for (k, v) in &rule.modify_request_headers {
+        builder = builder.header(k, v);
+    }
+    let upstream_req = builder
+        .body(Full::new(bytes))
+        .context("build upstream req")?;
+
+    let resp = sender
+        .send_request(upstream_req)
+        .await
+        .context("upstream send")?;
+    let (rparts, rbody) = resp.into_parts();
+    // 任务 6（OOM 防护）：上游响应体上限 64MiB。
+    let rbytes = http_body_util::Limited::new(rbody, crate::server::h1::UPSTREAM_BODY_CAP)
+        .collect()
+        .await
+        .map_err(|e| anyhow::anyhow!("read upstream response body: {e}"))?
+        .to_bytes();
+    let mut out = Response::builder().status(rparts.status);
+    // 响应侧同样剥 hop-by-hop（上游的 Connection/TE/Upgrade 透传会污染客户端）。
+    for (k, v) in rparts.headers.iter() {
+        let kl = k.as_str().to_ascii_lowercase();
+        if HOP_BY_HOP.contains(&kl.as_str()) {
+            continue;
+        }
+        out = out.header(k, v);
+    }
+    for (k, v) in &rule.modify_response_headers {
+        out = out.header(k, v);
+    }
+    Ok(out.body(full(rbytes)).unwrap())
+}
+
+async fn proxy_websocket(
+    req: Request<Full<Bytes>>,
+    rule: &ProxyRuleConfig,
+) -> Result<Response<BoxBody>> {
+    let (parts, body) = req.into_parts();
+    let body_bytes = body.collect().await?.to_bytes();
+    let upgrade = hyper::upgrade::on(Request::from_parts(parts.clone(), Full::new(body_bytes.clone())));
+
+    let (target, host, port, scheme) = resolve_upstream_target(&parts.uri, rule)?;
+    let target_uri = Uri::from_str(&target).context("websocket upstream uri")?;
+    let mut upstream = connect_upstream(&host, port, &scheme, rule).await?;
+    write_raw_request(&mut upstream, &parts, &body_bytes, &host, &target_uri, rule).await?;
+    let (status, headers) = read_http_head(&mut upstream).await?;
+    if status != StatusCode::SWITCHING_PROTOCOLS {
+        // Do not upgrade client unless upstream accepted the handshake.
+        let mut out = Response::builder().status(StatusCode::BAD_GATEWAY);
+        for (k, v) in &rule.modify_response_headers {
+            out = out.header(k, v);
+        }
+        return Ok(out
+            .body(full(format!(
+                "websocket upstream returned {status}, expected 101"
+            )))
+            .unwrap());
+    }
+
+    tokio::spawn(async move {
+        if let Ok(upgraded) = upgrade.await {
+            let mut client = TokioIo::new(upgraded);
+            let _ = tokio::io::copy_bidirectional(&mut client, &mut upstream).await;
+        }
+    });
+
+    let mut out = Response::builder().status(status);
+    for (k, v) in headers.iter() {
+        out = out.header(k, v);
+    }
+    for (k, v) in &rule.modify_response_headers {
+        out = out.header(k, v);
+    }
+    Ok(out.body(empty()).unwrap())
+}
+
+fn is_websocket_upgrade(req: &Request<Full<Bytes>>) -> bool {
+    let upgrade_ok = req
+        .headers()
+        .get(UPGRADE)
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.eq_ignore_ascii_case("websocket"))
+        .unwrap_or(false);
+    let conn_ok = req
+        .headers()
+        .get(CONNECTION)
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_ascii_lowercase().contains("upgrade"))
+        .unwrap_or(false);
+    let key_ok = req.headers().get("sec-websocket-key").is_some();
+    upgrade_ok && conn_ok && key_ok
+}
+
+fn resolve_upstream_target(
+    uri: &Uri,
+    rule: &ProxyRuleConfig,
+) -> Result<(String, String, u16, String)> {
+    let upstream = rule.upstream.trim_end_matches('/');
+    let suffix = uri
+        .path_and_query()
+        .map(|pq| pq.as_str().to_string())
+        .unwrap_or_else(|| "/".into());
+    let rest = suffix
+        .strip_prefix(&rule.path)
+        .or_else(|| suffix.strip_prefix(rule.path.trim_end_matches('/')))
+        .unwrap_or(suffix.as_str());
+    let target = join_upstream(upstream, rest)?;
+    let parsed = Uri::from_str(&target).context("upstream uri")?;
+    let host = parsed.host().unwrap_or("127.0.0.1").to_string();
+    let scheme = parsed.scheme_str().unwrap_or("http").to_string();
+    let port = parsed
+        .port_u16()
+        .unwrap_or(if scheme == "https" { 443 } else { 80 });
+    Ok((target, host, port, scheme))
+}
+
+async fn connect_upstream(
+    host: &str,
+    port: u16,
+    scheme: &str,
+    rule: &ProxyRuleConfig,
+) -> Result<UpstreamIo> {
+    let mode = OnionSslMode::parse(&rule.ssl_mode);
+    // `tor` only routes .onion (or explicit onion host); never force SOCKS for clearnet.
+    // 早期规格 A.1：needs_tor = via_tor || host.ends_with(".onion")（含 ssl_mode=tor）。
+    let onion = is_onion_host(host)
+        || (rule.ssl_mode.eq_ignore_ascii_case("tor") && is_onion_host(host));
+    if rule.ssl_mode.eq_ignore_ascii_case("tor") && !is_onion_host(host) {
+        bail!("ssl_mode=tor requires a .onion upstream host");
+    }
+    let needs_tor = rule.via_tor || host.ends_with(".onion")
+        || rule.ssl_mode.eq_ignore_ascii_case("tor");
+
+    // Always validate onion host + ssl_mode (v3 pubkey required for verify).
+    if is_onion_host(host) || onion {
+        if !validate_onion_upstream(host, &rule.ssl_mode) {
+            bail!(
+                "invalid onion upstream host={host} ssl_mode={} (verify requires v3 .onion)",
+                rule.ssl_mode
+            );
+        }
+    }
+
+    if needs_tor {
+        // tor feature disabled
+        bail!("tor upstream not supported: tor_client module removed");
+    }
+
+    let tcp = if onion {
+        connect_tor_socks(host, port).await?
+    } else {
+        TcpStream::connect((host, port))
+            .await
+            .with_context(|| format!("connect {host}:{port}"))?
+    };
+
+    let want_tls = scheme.eq_ignore_ascii_case("https")
+        || (is_onion_host(host) && mode != OnionSslMode::Off);
+
+    if !want_tls {
+        if mode == OnionSslMode::Verify && is_onion_host(host) {
+            bail!("onion ssl_mode=verify requires TLS; cannot verify without a cert path");
+        }
+        return Ok(UpstreamIo::plain(tcp));
+    }
+
+    wrap_upstream_tls(tcp, host, mode, rule.upstream_tls_version.as_deref()).await
+}
+
+/// TLS wrap for HTTPS / onion upstreams. Onion `verify` checks leaf DER via
+/// [`onion_cert_matches_host`]; missing peer-cert APIs reject the connection.
+async fn wrap_upstream_tls(
+    tcp: TcpStream,
+    host: &str,
+    mode: OnionSslMode,
+    tls_version: Option<&str>,
+) -> Result<UpstreamIo> {
+    #[cfg(feature = "tls_boring")]
+    {
+        return wrap_upstream_tls_boring(tcp, host, mode, tls_version).await;
+    }
+    #[cfg(all(feature = "tls_rustls", not(feature = "tls_boring")))]
+    {
+        return wrap_upstream_tls_rustls(tcp, host, mode, tls_version).await;
+    }
+    #[cfg(not(any(feature = "tls_boring", feature = "tls_rustls")))]
+    {
+        let _ = tcp;
+        if mode == OnionSslMode::Verify && is_onion_host(host) {
+            bail!(
+                "onion ssl_mode=verify: no TLS client stack (need tls_boring or tls_rustls); \
+                 cannot obtain peer certificate for onion_cert_matches_host"
+            );
+        }
+        bail!(
+            "HTTPS/.onion TLS upstream requires feature tls_boring or tls_rustls (host={host})"
+        );
+    }
+}
+
+#[cfg(feature = "tls_boring")]
+async fn wrap_upstream_tls_boring(
+    tcp: TcpStream,
+    host: &str,
+    mode: OnionSslMode,
+    tls_version: Option<&str>,
+) -> Result<UpstreamIo> {
+    use boring::ssl::{SslConnector, SslMethod, SslVerifyMode, SslVersion};
+
+    let mut builder = SslConnector::builder(SslMethod::tls()).context("SslConnector builder")?;
+    // 规格 11：回源 TLS 版本可配（tls1.2/tls1.3；不配=自动协商）。
+    match tls_version.map(|v| v.to_ascii_lowercase().replace(['.', '_'], "")) {
+        Some(ref v) if v == "tls12" || v == "tlsv12" => {
+            builder.set_min_proto_version(Some(SslVersion::TLS1_2))?;
+            builder.set_max_proto_version(Some(SslVersion::TLS1_2))?;
+        }
+        Some(ref v) if v == "tls13" || v == "tlsv13" => {
+            builder.set_min_proto_version(Some(SslVersion::TLS1_3))?;
+            builder.set_max_proto_version(Some(SslVersion::TLS1_3))?;
+        }
+        _ => {}
+    }
+    // Non-onion Verify: system CA verification. Onion + NoVerify/TrustSelfSigned: NONE
+    // (onion still checks cert-as-pubkey after handshake).
+    match mode {
+        OnionSslMode::Verify if !is_onion_host(host) => {
+            builder.set_verify(SslVerifyMode::PEER);
+        }
+        OnionSslMode::Verify | OnionSslMode::NoVerify | OnionSslMode::TrustSelfSigned => {
+            builder.set_verify(SslVerifyMode::NONE);
+        }
+        OnionSslMode::Off => {}
+    }
+    let connector = builder.build();
+    let config = connector.configure().context("ssl configure")?;
+    // SNI: use host; for .onion Boring still accepts the name string.
+    let mut tls = tokio_boring::connect(config, host, tcp)
+        .await
+        .with_context(|| format!("boring TLS connect to {host}"))?;
+
+    if mode == OnionSslMode::Verify && is_onion_host(host) {
+        let leaf_der = tls
+            .ssl()
+            .peer_certificate()
+            .map(|c| c.to_der())
+            .transpose()
+            .context("peer cert to_der")?
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "onion ssl_mode=verify: no peer certificate available after TLS handshake"
+                )
+            })?;
+        if !onion_cert_matches_host(&leaf_der, host) {
+            bail!("onion ssl_mode=verify: peer certificate does not match .onion pubkey");
+        }
+        log::debug!("onion cert-as-pubkey verified for {host}");
+    }
+
+    let _ = &mut tls;
+    Ok(UpstreamIo::from_tls(tls))
+}
+
+/// rustls client path (feature `tls_rustls`, when Boring is not the primary stack).
+#[cfg(all(feature = "tls_rustls", not(feature = "tls_boring")))]
+async fn wrap_upstream_tls_rustls(
+    tcp: TcpStream,
+    host: &str,
+    mode: OnionSslMode,
+    _tls_version: Option<&str>,
+) -> Result<UpstreamIo> {
+    use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
+    use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
+    use rustls::{DigitallySignedStruct, Error as TlsError, SignatureScheme};
+    use std::sync::Arc;
+    use tokio_rustls::TlsConnector;
+
+    #[derive(Debug)]
+    struct AcceptAll;
+    impl ServerCertVerifier for AcceptAll {
+        fn verify_server_cert(
+            &self,
+            _end_entity: &CertificateDer<'_>,
+            _intermediates: &[CertificateDer<'_>],
+            _server_name: &ServerName<'_>,
+            _ocsp_response: &[u8],
+            _now: UnixTime,
+        ) -> Result<ServerCertVerified, TlsError> {
+            Ok(ServerCertVerified::assertion())
+        }
+        fn verify_tls12_signature(
+            &self,
+            _message: &[u8],
+            _cert: &CertificateDer<'_>,
+            _dss: &DigitallySignedStruct,
+        ) -> Result<HandshakeSignatureValid, TlsError> {
+            Ok(HandshakeSignatureValid::assertion())
+        }
+        fn verify_tls13_signature(
+            &self,
+            _message: &[u8],
+            _cert: &CertificateDer<'_>,
+            _dss: &DigitallySignedStruct,
+        ) -> Result<HandshakeSignatureValid, TlsError> {
+            Ok(HandshakeSignatureValid::assertion())
+        }
+        fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+            vec![
+                SignatureScheme::ECDSA_NISTP256_SHA256,
+                SignatureScheme::ED25519,
+                SignatureScheme::RSA_PSS_SHA256,
+                SignatureScheme::RSA_PKCS1_SHA256,
+            ]
+        }
+    }
+
+    #[derive(Debug)]
+    struct OnionVerifier {
+        host: String,
+    }
+    impl ServerCertVerifier for OnionVerifier {
+        fn verify_server_cert(
+            &self,
+            end_entity: &CertificateDer<'_>,
+            _intermediates: &[CertificateDer<'_>],
+            _server_name: &ServerName<'_>,
+            _ocsp_response: &[u8],
+            _now: UnixTime,
+        ) -> Result<ServerCertVerified, TlsError> {
+            if onion_cert_matches_host(end_entity.as_ref(), &self.host) {
+                Ok(ServerCertVerified::assertion())
+            } else {
+                Err(TlsError::General("onion cert-as-pubkey mismatch".into()))
+            }
+        }
+        fn verify_tls12_signature(
+            &self,
+            _message: &[u8],
+            _cert: &CertificateDer<'_>,
+            _dss: &DigitallySignedStruct,
+        ) -> Result<HandshakeSignatureValid, TlsError> {
+            Ok(HandshakeSignatureValid::assertion())
+        }
+        fn verify_tls13_signature(
+            &self,
+            _message: &[u8],
+            _cert: &CertificateDer<'_>,
+            _dss: &DigitallySignedStruct,
+        ) -> Result<HandshakeSignatureValid, TlsError> {
+            Ok(HandshakeSignatureValid::assertion())
+        }
+        fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+            vec![
+                SignatureScheme::ECDSA_NISTP256_SHA256,
+                SignatureScheme::ED25519,
+                SignatureScheme::RSA_PSS_SHA256,
+                SignatureScheme::RSA_PKCS1_SHA256,
+            ]
+        }
+    }
+
+    let verifier: Arc<dyn ServerCertVerifier> =
+        if mode == OnionSslMode::Verify && is_onion_host(host) {
+            Arc::new(OnionVerifier {
+                host: host.to_string(),
+            })
+        } else if mode == OnionSslMode::Verify {
+            bail!(
+                "ssl_mode=verify on non-onion host via rustls fallback: \
+                 no CA roots wired; reject (use tls_boring or onion)"
+            );
+        } else {
+            Arc::new(AcceptAll)
+        };
+
+    let config = rustls::ClientConfig::builder()
+        .dangerous()
+        .with_custom_certificate_verifier(verifier)
+        .with_no_client_auth();
+    let connector = TlsConnector::from(Arc::new(config));
+    let server_name = ServerName::try_from(host.to_string()).context("TLS server name")?;
+    let tls = connector
+        .connect(server_name, tcp)
+        .await
+        .with_context(|| format!("rustls TLS connect to {host}"))?;
+    Ok(UpstreamIo::from_tls(tls))
+}
+
+async fn write_raw_request(
+    stream: &mut UpstreamIo,
+    parts: &http::request::Parts,
+    body: &[u8],
+    host: &str,
+    upstream_uri: &Uri,
+    rule: &ProxyRuleConfig,
+) -> Result<()> {
+    let path_q = upstream_uri
+        .path_and_query()
+        .map(|pq| pq.as_str())
+        .unwrap_or("/");
+    let method = parts.method.as_str();
+    let mut lines = format!("{method} {path_q} HTTP/1.1\r\nHost: {host}\r\n");
+    for (k, v) in parts.headers.iter() {
+        if k == HOST {
+            continue;
+        }
+        if let Ok(vs) = v.to_str() {
+            lines.push_str(&format!("{k}: {vs}\r\n"));
+        }
+    }
+    for (k, v) in &rule.modify_request_headers {
+        lines.push_str(&format!("{k}: {v}\r\n"));
+    }
+    lines.push_str(&format!("Content-Length: {}\r\n\r\n", body.len()));
+    stream.write_all(lines.as_bytes()).await?;
+    if !body.is_empty() {
+        stream.write_all(body).await?;
+    }
+    Ok(())
+}
+
+async fn read_http_head(stream: &mut UpstreamIo) -> Result<(StatusCode, HeaderMap)> {
+    let mut buf = Vec::with_capacity(4096);
+    let mut tmp = [0u8; 1024];
+    loop {
+        let n = stream.read(&mut tmp).await?;
+        if n == 0 {
+            bail!("upstream closed before headers");
+        }
+        buf.extend_from_slice(&tmp[..n]);
+        if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+            let head = &buf[..pos + 4];
+            return parse_http_head(head);
+        }
+        if buf.len() > 65536 {
+            bail!("upstream headers too large");
+        }
+    }
+}
+
+fn parse_http_head(raw: &[u8]) -> Result<(StatusCode, HeaderMap)> {
+    let text = std::str::from_utf8(raw).context("invalid utf8 headers")?;
+    let mut lines = text.split("\r\n");
+    let status_line = lines.next().context("missing status")?;
+    let status = status_line
+        .split_whitespace()
+        .nth(1)
+        .and_then(|c| c.parse::<u16>().ok())
+        .and_then(|c| StatusCode::from_u16(c).ok())
+        .unwrap_or(StatusCode::BAD_GATEWAY);
+    let mut headers = HeaderMap::new();
+    for line in lines {
+        if line.is_empty() {
+            break;
+        }
+        if let Some((k, v)) = line.split_once(':') {
+            if let (Ok(name), Ok(val)) = (
+                HeaderName::from_bytes(k.trim().as_bytes()),
+                HeaderValue::from_str(v.trim()),
+            ) {
+                headers.insert(name, val);
+            }
+        }
+    }
+    Ok((status, headers))
+}
+
+/// Tor connect: optional FFI stub → unix SOCKS → TCP SOCKS.
+async fn connect_tor_socks(host: &str, port: u16) -> Result<TcpStream> {
+    if let Some(stream) = try_tor_ffi_connect(host, port).await {
+        return stream;
+    }
+    if let Ok(unix_path) = std::env::var("CRUCIBLE_TOR_SOCKS_UNIX") {
+        if !unix_path.is_empty() {
+            let unix = UnixStream::connect(&unix_path)
+                .await
+                .with_context(|| format!("tor unix socks {unix_path}"))?;
+            return socks5_unix_bridge(unix, host, port).await;
+        }
+    }
+    let socks = std::env::var("CRUCIBLE_TOR_SOCKS")
+        .unwrap_or_else(|_| "127.0.0.1:9050".into());
+    let addr: SocketAddr = socks.parse().context("CRUCIBLE_TOR_SOCKS parse")?;
+    let tcp = TcpStream::connect(addr)
+        .await
+        .with_context(|| format!("tor socks connect {addr}"))?;
+    socks5_connect(tcp, host, port).await
+}
+
+/// Optional `CRUCIBLE_TOR_FFI_LIB` dlopen path.
+///
+/// Expected future ABI (not required today):
+/// `int crucible_tor_connect(const char *host, uint16_t port, int *out_fd);`
+///
+/// Returns `Some(Ok(stream))` only if a real helper handed us a connected socket.
+/// On missing lib / missing symbol / probe failure, returns `None` so callers
+/// fall back to unix/TCP SOCKS (documented supported path).
+async fn try_tor_ffi_connect(host: &str, port: u16) -> Option<Result<TcpStream>> {
+    let path = std::env::var("CRUCIBLE_TOR_FFI_LIB").ok()?;
+    if path.is_empty() {
+        return None;
+    }
+    match tor_ffi_probe_and_connect(&path, host, port) {
+        Ok(Some(stream)) => Some(Ok(stream)),
+        Ok(None) => {
+            log::debug!(
+                "CRUCIBLE_TOR_FFI_LIB={path} loaded but no usable crucible_tor_connect; falling back to SOCKS"
+            );
+            None
+        }
+        Err(e) => {
+            log::debug!("CRUCIBLE_TOR_FFI_LIB={path} probe failed ({e:#}); falling back to SOCKS");
+            None
+        }
+    }
+}
+
+/// Sync dlopen probe. Does not call into Tor yet — symbol presence only —
+/// then falls through (`Ok(None)`). Keeps link surface zero when env unset.
+fn tor_ffi_probe_and_connect(lib_path: &str, host: &str, port: u16) -> Result<Option<TcpStream>> {
+    #[cfg(unix)]
+    {
+        // Safety: dlopen of operator-supplied path; we only dlsym-check and dlclose.
+        unsafe {
+            let c_path = std::ffi::CString::new(lib_path)
+                .map_err(|_| anyhow::anyhow!("CRUCIBLE_TOR_FFI_LIB path contains NUL"))?;
+            let handle = libc::dlopen(c_path.as_ptr(), libc::RTLD_NOW);
+            if handle.is_null() {
+                let err = std::ffi::CStr::from_ptr(libc::dlerror());
+                bail!("dlopen failed: {}", err.to_string_lossy());
+            }
+            let sym_name = std::ffi::CString::new("crucible_tor_connect").unwrap();
+            let sym = libc::dlsym(handle, sym_name.as_ptr());
+            if sym.is_null() {
+                libc::dlclose(handle);
+                log::info!(
+                    "tor FFI stub: {lib_path} has no crucible_tor_connect (host={host} port={port}); use SOCKS"
+                );
+                return Ok(None);
+            }
+            type TorConnectFn = unsafe extern "C" fn(*const libc::c_char, u16, *mut libc::c_int) -> libc::c_int;
+            let connect_fn: TorConnectFn = std::mem::transmute(sym);
+            let host_c = std::ffi::CString::new(host)
+                .map_err(|_| anyhow::anyhow!("tor host contains NUL"))?;
+            let mut out_fd: libc::c_int = -1;
+            let rc = connect_fn(host_c.as_ptr(), port, &mut out_fd);
+            libc::dlclose(handle);
+            if rc != 0 || out_fd < 0 {
+                log::debug!(
+                    "tor FFI: crucible_tor_connect rc={rc} fd={out_fd} host={host} port={port}; SOCKS fallback"
+                );
+                return Ok(None);
+            }
+            let std_stream = unsafe { std::net::TcpStream::from_raw_fd(out_fd) };
+            std_stream.set_nonblocking(true)?;
+            let stream = TcpStream::from_std(std_stream)?;
+            log::info!("tor FFI: connected via crucible_tor_connect fd={out_fd} → {host}:{port}");
+            return Ok(Some(stream));
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (lib_path, host, port);
+        log::debug!("CRUCIBLE_TOR_FFI_LIB ignored on non-unix; SOCKS fallback");
+        Ok(None)
+    }
+}
+
+async fn socks5_connect(mut tcp: TcpStream, host: &str, port: u16) -> Result<TcpStream> {
+    do_socks5(&mut tcp, host, port).await?;
+    Ok(tcp)
+}
+
+/// After SOCKS5 on a Unix socket, bridge bytes to a local TcpStream for Hyper.
+async fn socks5_unix_bridge(mut unix: UnixStream, host: &str, port: u16) -> Result<TcpStream> {
+    do_socks5(&mut unix, host, port).await?;
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .context("tor bridge bind")?;
+    let addr = listener.local_addr()?;
+    let client = TcpStream::connect(addr)
+        .await
+        .context("tor bridge client")?;
+    let mut server = listener.accept().await.context("tor bridge accept")?.0;
+    tokio::spawn(async move {
+        let _ = tokio::io::copy_bidirectional(&mut unix, &mut server).await;
+    });
+    Ok(client)
+}
+
+async fn do_socks5<S>(stream: &mut S, host: &str, port: u16) -> Result<()>
+where
+    S: AsyncReadExt + AsyncWriteExt + Unpin,
+{
+    stream.write_all(&[0x05, 0x01, 0x00]).await?;
+    let mut resp = [0u8; 2];
+    stream.read_exact(&mut resp).await?;
+    if resp[0] != 0x05 || resp[1] != 0x00 {
+        bail!("socks5 handshake rejected: {:02x} {:02x}", resp[0], resp[1]);
+    }
+
+    let host_bytes = host.as_bytes();
+    if host_bytes.len() > 255 {
+        bail!("socks5 host too long");
+    }
+    let mut req = vec![0x05, 0x01, 0x00, 0x03, host_bytes.len() as u8];
+    req.extend_from_slice(host_bytes);
+    req.extend_from_slice(&port.to_be_bytes());
+    stream.write_all(&req).await?;
+
+    let mut head = [0u8; 4];
+    stream.read_exact(&mut head).await?;
+    if head[1] != 0x00 {
+        bail!("socks5 connect failed code {}", head[1]);
+    }
+    match head[3] {
+        0x01 => {
+            let mut rest = [0u8; 6];
+            stream.read_exact(&mut rest).await?;
+        }
+        0x03 => {
+            let mut len = [0u8; 1];
+            stream.read_exact(&mut len).await?;
+            let mut dom = vec![0u8; len[0] as usize];
+            stream.read_exact(&mut dom).await?;
+            let mut port_b = [0u8; 2];
+            stream.read_exact(&mut port_b).await?;
+        }
+        0x04 => {
+            let mut rest = [0u8; 18];
+            stream.read_exact(&mut rest).await?;
+        }
+        _ => bail!("socks5 unknown atyp {}", head[3]),
+    }
+    Ok(())
+}
+
+/// page_rules `pass` 动作入口:复用反代机制,把 match_url 前缀流量转发到 target。
+/// 上游 TLS 校验按 URL scheme 决定(http:// → off,https:// → verify)。
+pub async fn proxy_page_rule(
+    req: Request<Full<Bytes>>,
+    match_url: &str,
+    upstream: &str,
+    peer_ip: IpAddr,
+    client_https: bool,
+) -> Response<BoxBody> {
+    let ssl_mode = if upstream.starts_with("https://") {
+        "verify"
+    } else {
+        "off"
+    };
+    let rule = ProxyRuleConfig {
+        path: match_url.trim_end_matches('*').to_string(),
+        upstream: upstream.to_string(),
+        ssl_mode: ssl_mode.into(),
+        modify_request_headers: Default::default(),
+        modify_response_headers: Default::default(),
+        upstream_tls_version: None,
+        upstream_http_version: None,
+        connection_pool: false,
+        via_tor: false,
+        tor_socks: None,
+    };
+    match proxy_once(req, &rule, peer_ip, client_https).await {
+        Ok(r) => r,
+        Err(e) => Response::builder()
+            .status(StatusCode::BAD_GATEWAY)
+            .body(full(format!("page rule pass error: {e:#}")))
+            .unwrap(),
+    }
+}

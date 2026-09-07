@@ -1,0 +1,99 @@
+//! IP allow/deny access control.
+
+use crate::config::IpAccessConfig;
+use std::net::{IpAddr, SocketAddr};
+
+/// Returns true if the peer is allowed.
+/// 规则：若 allow 非空则必须命中 allow；deny 命中则拒绝（deny 优先于 allow 之外的默认放行）。
+pub fn is_allowed(cfg: &IpAccessConfig, peer: SocketAddr) -> bool {
+    let ip = peer.ip();
+    if cfg.deny.iter().any(|p| cidr_or_exact(p, ip)) {
+        return false;
+    }
+    if cfg.allow.is_empty() {
+        return true;
+    }
+    cfg.allow.iter().any(|p| cidr_or_exact(p, ip))
+}
+
+pub fn deny_response() -> (http::StatusCode, &'static str) {
+    (http::StatusCode::FORBIDDEN, "forbidden by ip_access")
+}
+
+fn cidr_or_exact(pattern: &str, ip: IpAddr) -> bool {
+    let pattern = pattern.trim();
+    if pattern.is_empty() || pattern == "*" {
+        return true;
+    }
+    if let Some((net, bits)) = pattern.split_once('/') {
+        let Ok(base) = net.parse::<IpAddr>() else {
+            return false;
+        };
+        let Ok(prefix) = bits.parse::<u8>() else {
+            return false;
+        };
+        return ip_in_cidr(ip, base, prefix);
+    }
+    match pattern.parse::<IpAddr>() {
+        Ok(p) => p == ip,
+        Err(_) => false,
+    }
+}
+
+fn ip_in_cidr(ip: IpAddr, base: IpAddr, prefix: u8) -> bool {
+    match (ip, base) {
+        (IpAddr::V4(a), IpAddr::V4(b)) => {
+            if prefix > 32 {
+                return false;
+            }
+            let mask = if prefix == 0 {
+                0u32
+            } else {
+                u32::MAX << (32 - prefix)
+            };
+            (u32::from(a) & mask) == (u32::from(b) & mask)
+        }
+        (IpAddr::V6(a), IpAddr::V6(b)) => {
+            if prefix > 128 {
+                return false;
+            }
+            let a = u128::from(a);
+            let b = u128::from(b);
+            let mask = if prefix == 0 {
+                0u128
+            } else {
+                u128::MAX << (128 - prefix)
+            };
+            (a & mask) == (b & mask)
+        }
+        _ => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::SocketAddr;
+
+    #[test]
+    fn allow_exact() {
+        let cfg = IpAccessConfig {
+            allow: vec!["127.0.0.1".into()],
+            deny: vec![],
+        };
+        let peer: SocketAddr = "127.0.0.1:1".parse().unwrap();
+        assert!(is_allowed(&cfg, peer));
+        let peer2: SocketAddr = "10.0.0.1:1".parse().unwrap();
+        assert!(!is_allowed(&cfg, peer2));
+    }
+
+    #[test]
+    fn deny_cidr() {
+        let cfg = IpAccessConfig {
+            allow: vec![],
+            deny: vec!["10.0.0.0/8".into()],
+        };
+        assert!(!is_allowed(&cfg, "10.1.2.3:9".parse().unwrap()));
+        assert!(is_allowed(&cfg, "192.168.0.1:9".parse().unwrap()));
+    }
+}

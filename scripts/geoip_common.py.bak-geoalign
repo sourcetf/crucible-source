@@ -1,0 +1,532 @@
+#!/usr/bin/env python3
+"""Shared GeoIP offline helpers (schema, covering merge, layer import)."""
+from __future__ import annotations
+
+import ipaddress
+import json
+import sqlite3
+import time
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any
+
+DEFAULT_DB = "data/geoip/current/geoip.sqlite"
+SOURCES_JSON = "data/geoip/current/SOURCES.json"
+PANEL_DB = "data/geoip/panel.sqlite"
+
+EPOCH_FIELDS = (
+    "country",
+    "province",
+    "region",
+    "city",
+    "district",
+    "isp",
+    "asn",
+    "as_org",
+    "net_org",
+    "cloud_provider",
+    "cloud_region",
+    "cloud_service",
+    "hosting",
+    "dc",
+    "division_code",
+)
+
+SEED_RANGES: list[tuple[str, str, dict[str, str]]] = [
+    ("1.2.4.8", "1.2.4.8", {"country": "CN", "province": "北京", "region": "BJ", "city": "Beijing", "isp": "DemoISP", "asn": "4134", "as_org": "CHINANET-BACKBONE", "dc": ""}),
+    ("192.0.2.0", "192.0.2.255", {"country": "US", "region": "CA", "city": "Los Angeles", "isp": "ExampleNet", "dc": "LAX1"}),
+    ("198.51.100.0", "198.51.100.255", {"country": "DE", "region": "BE", "city": "Berlin", "isp": "SampleCo", "dc": "FRA2"}),
+    ("203.0.113.0", "203.0.113.255", {"country": "JP", "region": "13", "city": "Tokyo", "isp": "TestASN", "dc": "NRT1"}),
+]
+
+
+@dataclass
+class MergedFields:
+    country: str = ""
+    province: str = ""
+    region: str = ""
+    city: str = ""
+    district: str = ""
+    isp: str = ""
+    dc: str = ""
+    asn: str = ""
+    as_org: str = ""
+    # §2.5：net_org = 网段注册公司（inetnum 持有者），≠ as_org（AS 持有者）。
+    net_org: str = ""
+    cloud_provider: str = ""
+    cloud_region: str = ""
+    cloud_service: str = ""
+    hosting: str = ""
+    division_code: str = ""
+    prefix: str = ""
+    bits: int = 0
+    weight: int = 0
+    commit_unix: int = 0
+    prefixes_merged: int = 0
+    extra: dict[str, str] = field(default_factory=dict)
+
+
+def _create_range_table(conn: sqlite3.Connection, name: str) -> None:
+    conn.execute(
+        f"""CREATE TABLE IF NOT EXISTS {name} (
+            start TEXT NOT NULL,
+            end TEXT NOT NULL,
+            bits INTEGER DEFAULT 0,
+            weight INTEGER DEFAULT 0,
+            country TEXT,
+            province TEXT,
+            region TEXT,
+            city TEXT,
+            district TEXT,
+            isp TEXT,
+            asn TEXT,
+            as_org TEXT,
+            net_org TEXT,
+            cloud_provider TEXT,
+            cloud_region TEXT,
+            cloud_service TEXT,
+            hosting TEXT,
+            division_code TEXT,
+            prefix TEXT,
+            source TEXT,
+            e_country INTEGER DEFAULT 0,
+            e_province INTEGER DEFAULT 0,
+            e_region INTEGER DEFAULT 0,
+            e_city INTEGER DEFAULT 0,
+            e_district INTEGER DEFAULT 0,
+            e_isp INTEGER DEFAULT 0,
+            e_asn INTEGER DEFAULT 0,
+            e_as_org INTEGER DEFAULT 0,
+            e_net_org INTEGER DEFAULT 0,
+            e_cloud_provider INTEGER DEFAULT 0,
+            e_cloud_region INTEGER DEFAULT 0,
+            e_cloud_service INTEGER DEFAULT 0,
+            e_hosting INTEGER DEFAULT 0,
+            e_dc INTEGER DEFAULT 0,
+            e_division_code INTEGER DEFAULT 0,
+            commit_unix INTEGER DEFAULT 0
+        )"""
+    )
+    conn.execute(f"CREATE INDEX IF NOT EXISTS idx_{name}_start ON {name}(start)")
+    conn.execute(f"CREATE INDEX IF NOT EXISTS idx_{name}_range ON {name}(start, end)")
+
+
+def init_schema(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        """CREATE TABLE IF NOT EXISTS geoip (
+            ip_start TEXT NOT NULL,
+            ip_end TEXT NOT NULL,
+            bits INTEGER DEFAULT 0,
+            weight INTEGER DEFAULT 0,
+            prefix TEXT,
+            country TEXT, region TEXT, city TEXT, isp TEXT, dc TEXT,
+            province TEXT, district TEXT,
+            asn TEXT, as_org TEXT,
+            cloud_provider TEXT, cloud_region TEXT, cloud_service TEXT,
+            hosting TEXT, division_code TEXT, source TEXT,
+            e_country INTEGER DEFAULT 0,
+            e_province INTEGER DEFAULT 0,
+            e_city INTEGER DEFAULT 0,
+            e_district INTEGER DEFAULT 0,
+            e_isp INTEGER DEFAULT 0,
+            e_asn INTEGER DEFAULT 0,
+            e_as_org INTEGER DEFAULT 0,
+            e_cloud_provider INTEGER DEFAULT 0,
+            e_cloud_region INTEGER DEFAULT 0,
+            e_cloud_service INTEGER DEFAULT 0,
+            e_hosting INTEGER DEFAULT 0,
+            commit_unix INTEGER DEFAULT 0
+        )"""
+    )
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_geoip_start ON geoip(ip_start)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_geoip_range ON geoip(ip_start, ip_end)")
+    for col, typ in (
+        ("province", "TEXT"),
+        ("district", "TEXT"),
+        ("asn", "TEXT"),
+        ("as_org", "TEXT"),
+        ("net_org", "TEXT"),
+        ("cloud_provider", "TEXT"),
+        ("cloud_region", "TEXT"),
+        ("cloud_service", "TEXT"),
+        ("hosting", "TEXT"),
+        ("division_code", "TEXT"),
+        ("source", "TEXT"),
+        ("e_country", "INTEGER DEFAULT 0"),
+        ("e_province", "INTEGER DEFAULT 0"),
+        ("e_region", "INTEGER DEFAULT 0"),
+        ("e_city", "INTEGER DEFAULT 0"),
+        ("e_district", "INTEGER DEFAULT 0"),
+        ("e_isp", "INTEGER DEFAULT 0"),
+        ("e_asn", "INTEGER DEFAULT 0"),
+        ("e_as_org", "INTEGER DEFAULT 0"),
+        ("e_net_org", "INTEGER DEFAULT 0"),
+        ("e_cloud_provider", "INTEGER DEFAULT 0"),
+        ("e_cloud_region", "INTEGER DEFAULT 0"),
+        ("e_cloud_service", "INTEGER DEFAULT 0"),
+        ("e_hosting", "INTEGER DEFAULT 0"),
+        ("e_dc", "INTEGER DEFAULT 0"),
+        ("e_division_code", "INTEGER DEFAULT 0"),
+        ("commit_unix", "INTEGER DEFAULT 0"),
+        ("bits", "INTEGER DEFAULT 0"),
+        ("weight", "INTEGER DEFAULT 0"),
+        ("prefix", "TEXT"),
+    ):
+        try:
+            conn.execute(f"ALTER TABLE geoip ADD COLUMN {col} {typ}")
+        except sqlite3.OperationalError:
+            pass
+    _create_range_table(conn, "ipv4")
+    _create_range_table(conn, "ipv6")
+    # §2.6：anycast 表——bgptools/anycast-prefixes 与 RIPE anycast 提取写入这里，
+    # 查询侧（Rust anycast.rs）读表判定 + 国家票 30% 共识抑制。
+    conn.execute(
+        """CREATE TABLE IF NOT EXISTS anycast (
+            start TEXT NOT NULL,
+            end TEXT NOT NULL,
+            bits INTEGER DEFAULT 0,
+            prefix TEXT,
+            source TEXT,
+            commit_unix INTEGER DEFAULT 0
+        )"""
+    )
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_anycast_range ON anycast(start, end)")
+
+
+def upsert_anycast(
+    conn: sqlite3.Connection,
+    start: str,
+    end: str,
+    *,
+    source: str = "anycast",
+    commit_unix: int | None = None,
+) -> None:
+    """§2.6：写入 anycast 表（幂等：同段重复写以最后一条为准）。"""
+    bits = 0
+    prefix = f"{start}-{end}"
+    try:
+        nets = list(
+            ipaddress.summarize_address_range(
+                ipaddress.ip_address(start), ipaddress.ip_address(end)
+            )
+        )
+        if len(nets) == 1:
+            prefix = str(nets[0])
+            bits = int(prefix.split("/")[1])
+    except ValueError:
+        pass
+    cu = int(commit_unix if commit_unix is not None else time.time())
+    conn.execute(
+        """INSERT INTO anycast(start, end, bits, prefix, source, commit_unix)
+           VALUES(?,?,?,?,?,?)
+           ON CONFLICT(start, end) DO UPDATE SET
+             bits=excluded.bits, prefix=excluded.prefix,
+             source=excluded.source, commit_unix=excluded.commit_unix""",
+        (start, end, bits, prefix, source, cu),
+    )
+
+
+def set_meta_flag(name: str, value: Any = 1) -> None:
+    """§3.2：黑名单元标记（ip2region_blacklisted=1 等）落 SOURCES.json 顶层。"""
+    path = Path(SOURCES_JSON)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    meta: dict[str, Any] = {}
+    if path.is_file():
+        try:
+            meta = json.loads(path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            meta = {}
+    meta[name] = value
+    path.write_text(json.dumps(meta, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+
+def init_panel_schema(conn: sqlite3.Connection) -> None:
+    """Panel metadata DB — mirrors Rust `geoip_panel::db::open_panel`.
+
+    Tables: panel_edits, panel_conflicts, panel_sources, panel_cron, panel_audit.
+    """
+    conn.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS panel_edits (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            prefix TEXT NOT NULL,
+            field TEXT NOT NULL,
+            value TEXT NOT NULL,
+            weight INTEGER DEFAULT 200,
+            created_at TEXT DEFAULT (datetime('now'))
+        );
+        CREATE TABLE IF NOT EXISTS panel_conflicts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            prefix TEXT NOT NULL,
+            field TEXT NOT NULL,
+            sources TEXT NOT NULL,
+            resolved INTEGER DEFAULT 0,
+            created_at TEXT DEFAULT (datetime('now'))
+        );
+        CREATE TABLE IF NOT EXISTS panel_sources (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL UNIQUE,
+            weight INTEGER DEFAULT 50,
+            enabled INTEGER DEFAULT 1,
+            url TEXT,
+            last_commit TEXT,
+            last_unix INTEGER DEFAULT 0
+        );
+        CREATE TABLE IF NOT EXISTS panel_cron (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL UNIQUE,
+            schedule TEXT NOT NULL,
+            enabled INTEGER DEFAULT 1,
+            last_run INTEGER DEFAULT 0,
+            last_status TEXT
+        );
+        CREATE TABLE IF NOT EXISTS panel_audit (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            action TEXT NOT NULL,
+            detail TEXT,
+            ts INTEGER DEFAULT (strftime('%s','now')),
+            created_at TEXT DEFAULT (datetime('now'))
+        );
+        """
+    )
+    try:
+        conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_panel_cron_name ON panel_cron(name)"
+        )
+    except sqlite3.OperationalError:
+        pass
+    try:
+        conn.execute("ALTER TABLE panel_audit ADD COLUMN ts INTEGER DEFAULT 0")
+    except sqlite3.OperationalError:
+        pass
+
+
+def seed_panel_demo(conn: sqlite3.Connection, *, commit_unix: int | None = None) -> None:
+    """Insert demo sources / conflict / cron / audit rows when empty."""
+    cu = int(commit_unix if commit_unix is not None else time.time())
+    n = conn.execute("SELECT COUNT(*) FROM panel_sources").fetchone()[0]
+    if n == 0:
+        for name, weight in (
+            ("demo-seed", 80),
+            ("rir-geofeed", 60),
+            ("qqwry", 40),
+        ):
+            conn.execute(
+                """INSERT OR IGNORE INTO panel_sources(name, weight, enabled, url, last_commit, last_unix)
+                   VALUES(?,?,1,?,?,?)""",
+                (name, weight, "", "demo", cu),
+            )
+    n = conn.execute("SELECT COUNT(*) FROM panel_conflicts").fetchone()[0]
+    if n == 0:
+        conn.execute(
+            """INSERT INTO panel_conflicts(prefix, field, sources, resolved)
+               VALUES(?,?,?,0)""",
+            ("8.8.8.0/24", "isp", "demo-seed|rir-geofeed"),
+        )
+    n = conn.execute("SELECT COUNT(*) FROM panel_cron").fetchone()[0]
+    if n == 0:
+        conn.execute(
+            """INSERT OR IGNORE INTO panel_cron(name, schedule, enabled, last_run, last_status)
+               VALUES(?,?,1,0,?)""",
+            ("geoip_update", "0 3 * * *", "never"),
+        )
+    conn.execute(
+        "INSERT INTO panel_audit(action, detail, ts) VALUES(?,?,?)",
+        ("seed", "geoip_seed_demo panel bootstrap", cu),
+    )
+
+
+def ip_to_int(ip: str) -> int:
+    return int(ipaddress.ip_address(ip))
+
+
+def load_covering(conn: sqlite3.Connection, ip: str) -> list[sqlite3.Row]:
+    conn.row_factory = sqlite3.Row
+    cur = conn.execute(
+        """SELECT * FROM geoip
+           WHERE ip_start <= ? AND ip_end >= ?
+           ORDER BY COALESCE(commit_unix, 0) ASC, COALESCE(weight, 0) ASC, COALESCE(bits, 0) ASC""",
+        (ip, ip),
+    )
+    return list(cur.fetchall())
+
+
+def merge_covering(rows: list[sqlite3.Row]) -> MergedFields:
+    out = MergedFields()
+    if not rows:
+        return out
+    out.prefixes_merged = len(rows)
+
+    def pick(field: str) -> str:
+        best = ""
+        best_score = (-1, -1)
+        e_col = f"e_{field}"
+        for r in rows:
+            keys = r.keys()
+            val = (r[field] or "").strip() if field in keys else ""
+            if not val:
+                continue
+            epoch = 0
+            if e_col in keys:
+                epoch = int(r[e_col] or 0)
+            cu = int(r["commit_unix"] or 0) if "commit_unix" in keys else 0
+            if epoch <= 0:
+                epoch = cu
+            w = int(r["weight"] or 0) if "weight" in keys else 0
+            # 标准合并语义：信任权重优先，其次才是上游 commit_unix（score =
+            # weight * 10^10 + commit_unix 的元组等价形式）；空值不覆盖非空
+            # 由上方 val 判空保证。
+            score = (w, epoch)
+            if score >= best_score:
+                best = val
+                best_score = score
+        return best
+
+    out.country = pick("country")
+    out.province = pick("province")
+    out.region = pick("region")
+    out.city = pick("city")
+    out.district = pick("district")
+    out.isp = pick("isp")
+    out.dc = pick("dc")
+    out.asn = pick("asn")
+    out.as_org = pick("as_org")
+    out.net_org = pick("net_org")
+    out.cloud_provider = pick("cloud_provider")
+    out.cloud_region = pick("cloud_region")
+    out.cloud_service = pick("cloud_service")
+    out.hosting = pick("hosting")
+    out.division_code = pick("division_code")
+    last = rows[-1]
+    keys = last.keys()
+    out.prefix = (last["prefix"] or f"{last['ip_start']}-{last['ip_end']}") if "prefix" in keys else ""
+    out.bits = int(last["bits"] or 0) if "bits" in keys else 0
+    out.weight = int(last["weight"] or 0) if "weight" in keys else 0
+    out.commit_unix = int(last["commit_unix"] or 0) if "commit_unix" in keys else 0
+    return out
+
+
+def format_label(m: MergedFields) -> str:
+    if m.cloud_provider:
+        head = m.cloud_provider
+        region_or_city = m.cloud_region or m.city
+        if region_or_city:
+            head = f"{head} {region_or_city}"
+        parts = [head]
+        if m.isp:
+            parts.append(m.isp)
+        if m.asn:
+            parts.append(f"AS{m.asn} {m.as_org}".strip())
+        return " / ".join(p for p in parts if p)
+    geo = [p for p in (m.province, m.city, m.district, m.isp) if p]
+    parts: list[str] = []
+    if geo:
+        parts.append(" ".join(geo))
+    if m.hosting:
+        parts.append(m.hosting)
+    if m.asn:
+        parts.append(f"AS{m.asn} {m.as_org}".strip())
+    elif m.net_org:
+        parts.append(m.net_org)
+    if m.net_org and m.net_org != m.as_org and m.asn:
+        parts.append(f"reg={m.net_org}")
+    return " / ".join(p for p in parts if p)
+
+
+def lookup_merged(conn: sqlite3.Connection, ip: str) -> MergedFields | None:
+    try:
+        ipaddress.ip_address(ip)
+    except ValueError:
+        return None
+    rows = load_covering(conn, ip)
+    if not rows:
+        return None
+    return merge_covering(rows)
+
+
+def upsert_range(
+    conn: sqlite3.Connection,
+    start: str,
+    end: str,
+    fields: dict[str, Any],
+    *,
+    weight: int = 50,
+    source: str = "",
+    commit_unix: int | None = None,
+) -> None:
+    bits = 32
+    prefix = f"{start}/32"
+    try:
+        nets = list(
+            ipaddress.summarize_address_range(
+                ipaddress.ip_address(start), ipaddress.ip_address(end)
+            )
+        )
+        if len(nets) == 1:
+            prefix = str(nets[0])
+            bits = int(prefix.split("/")[1])
+    except ValueError:
+        pass
+    cu = int(commit_unix if commit_unix is not None else fields.get("commit_unix") or time.time())
+    epochs = {}
+    for f in EPOCH_FIELDS:
+        val = fields.get(f, "")
+        epochs[f"e_{f}"] = cu if val else int(fields.get(f"e_{f}") or 0)
+
+    conn.execute(
+        """INSERT INTO geoip (
+            ip_start, ip_end, bits, weight, prefix,
+            country, province, region, city, district, isp, dc,
+            asn, as_org, net_org, cloud_provider, cloud_region, cloud_service,
+            hosting, division_code, source,
+            e_country, e_province, e_city, e_district, e_isp,
+            e_asn, e_as_org, e_net_org, e_cloud_provider, e_cloud_region,
+            e_cloud_service, e_hosting, commit_unix
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                  ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (
+            start,
+            end,
+            bits,
+            weight,
+            prefix,
+            fields.get("country", ""),
+            fields.get("province", fields.get("region", "")),
+            fields.get("region", ""),
+            fields.get("city", ""),
+            fields.get("district", ""),
+            fields.get("isp", ""),
+            fields.get("dc", ""),
+            fields.get("asn", ""),
+            fields.get("as_org", ""),
+            fields.get("net_org", ""),
+            fields.get("cloud_provider", ""),
+            fields.get("cloud_region", ""),
+            fields.get("cloud_service", ""),
+            fields.get("hosting", ""),
+            fields.get("division_code", ""),
+            source or fields.get("source", ""),
+            epochs["e_country"],
+            epochs["e_province"],
+            epochs["e_city"],
+            epochs["e_district"],
+            epochs["e_isp"],
+            epochs["e_asn"],
+            epochs["e_as_org"],
+            epochs["e_net_org"],
+            epochs["e_cloud_provider"],
+            epochs["e_cloud_region"],
+            epochs["e_cloud_service"],
+            epochs["e_hosting"],
+            cu,
+        ),
+    )
+
+
+def write_sources_meta(path: Path, meta: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    existing: dict[str, Any] = {}
+    if path.is_file():
+        existing = json.loads(path.read_text(encoding="utf-8"))
+    existing.update(meta)
+    path.write_text(json.dumps(existing, indent=2, sort_keys=True) + "\n", encoding="utf-8")

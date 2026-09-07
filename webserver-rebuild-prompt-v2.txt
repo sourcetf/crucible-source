@@ -1,0 +1,1368 @@
+# 任务：从零重建高性能 Rust Web 服务器项目「webserver」
+
+你是资深系统工程师。请根据下文**完整规格**从零实现一个可编译、可运行、可对标 h2o 的 Rust 项目。目标不是抄片段，而是还原架构、模块边界、配置模型、应用引擎 ABI、Admin UI 能力、TLS 分流、性能门禁与已知最终状态。源码已随云厂商跑路丢失；本提示词是唯一规格书。实现时优先正确性与性能，生产代码禁止 Python（bench/geoip 脚本除外）。
+
+---
+
+## 0. 项目身份与目标
+
+- **名称**：Crucible（crate/binary 同名）
+- **语言**：Rust（edition 2021），Cargo workspace 风格 monorepo；`src/` 为主二进制，`libs/` 为 vendored/本地库
+- **定位**：单机超高性能 HTTP/1.1 + HTTP/2 + HTTP/3(QUIC) 服务器，多站点多监听，内嵌管理面板，路径级应用引擎，细粒度 GeoIP，反向代理（含 Tor/.onion），页面规则，访问控制
+- **性能对标**：https://github.com/h2o/h2o  
+  - 公平对比：吞吐 gap `h2o/ours ≤ 1.2`，延迟 gap `ours/h2o ≤ 1.2`（双门禁）  
+  - 测项矩阵：plain-h1/h2、tls12-h1/h2、tls13-h1/h2  
+  - TLS 可加载/卸载模块：只测 TLS1.3 时不要加载 NSS / libtomcrypt 遗留栈
+- **配置原则**：**几乎全部进 `config.toml`**（热重载）；唯一例外是 GeoIP 外部库/SQLite 数据文件
+- **启动**：`./target/release/webserver --config config.toml`
+- **构建**：`bash scripts/build_release.sh [--restart]`；需 rustup 新版 cargo（lockfile v4 / cargo ≥1.85 量级）；系统旧 cargo 会失败。构建前 **必须 unset 泄漏的 `CARGO_TARGET_DIR`**（应用引擎编译 go/rust sample 时会污染）
+- **Admin UI**：`src/server/admin_ui.html` 经 `include_str!` 编进二进制——改 UI 必须重新 release 链接
+
+---
+
+## 1. 仓库目录树（必须存在）
+
+```
+webserver/
+  Cargo.toml, Cargo.lock
+  config.toml
+  cert.pem, key.pem, cert_ec.pem, key_ec.pem   # 测试证书
+  src/
+    main.rs
+    config.rs                    # Config / ListenerConfig / AppRouteConfig / SslConfig / FileOpenMode / ...
+    server/
+      mod.rs                     # accept 循环、SO_BUSY_POLL、worker 线程、多 listener
+      listener.rs                # 单连接协议分流、HSTS/redirect helpers
+      h1.rs, h1_static.rs
+      h2.rs                      # 自研/fork h2 接线；BATCH_CAP；max_send_buffer
+      h3.rs                      # QUIC/H3 via quinn-boring
+      static_files.rs            # 静态文件、autoindex、file_open 优先级
+      proxy.rs                   # 反向代理 BoxBody
+      admin.rs, admin_ui.html, admin_files.rs, admin_geoip.rs
+      admin_hls.light.min.js     # HLS 预览
+      status_page.html
+      basic_auth.rs, password.rs # argon2id / yescrypt + 每哈希加盐；UI 不让用户手填哈希
+      access.rs / ip 访问控制
+      access_log.rs              # 开关/等级/实时追踪
+      page_rules.rs              # Cloudflare 风格页面规则（UI 文案禁止出现 Cloudflare 字样）
+      headers_mod.rs
+      rate_limit.rs
+      syncookie.rs               # /proc/sys/net/ipv4/tcp_syncookies 动态
+      live_config.rs             # 配置热更新
+      options_catalog.rs
+      l4.rs                      # L4 opaque / stream proxy
+      qmux.rs
+      onion_ca.rs                # onion 相关证书签发辅助
+      ssl_material.rs            # PEM 路径或粘贴正文
+      telemetry.rs
+      geoip_panel/               # 细粒度 GeoIP 面板后端
+        mod.rs, config.rs, db.rs, lookup.rs, covering.rs, aliases.rs,
+        filter_agg.rs, iputil.rs, ops.rs, toml_store.rs
+      tls/
+        mod.rs                   # BoringSSL 主路径 + ClientHello 分流；可卸载 legacy
+        tls_nss.rs               # NSS：SSLv3 / IE6 v2-compatible hello 等遗留
+        tls_tomcrypt.rs          # TomCrypt：更老 SSL
+      apps/
+        mod.rs                   # try_handle / dispatch / reconcile_apps_runtime
+        php.rs                   # php-fpm 优先，php-cgi 回退；绝对路径 conf；PHP_FCGI_CHILDREN
+        fastcgi.rs
+        jsp.rs                   # Jetty sidecar UDS
+        asp.rs                   # AxonASP FFI
+        aspnet.rs                # ASP.NET Core hostfxr FFI
+        tsx.rs                   # 一键编译部署 + watch + 错误上抛 Admin
+        deps.rs                  # .env + init.sh → deps/；mtime 缓存 try_cached；禁止热路径 SHA256
+        app_ffi.rs               # dlopen 模块化引擎；worker pool；c/go/rust 内联执行
+        script_ffi.rs            # Python/Ruby/Perl 静态嵌入 FFI（scriptffi）
+        cgi_script.rs            # 遗留 CGI spawn（C/Go/Rust 最终禁止走这条）
+        native_http.rs           # C/Go/Rust 持久 unix HTTP sidecar（无 .so 时后备；禁止 CGI fallback）
+        lua.rs                   # 若仍有薄封装
+  libs/
+    h2/                          # vendored/forked HTTP/2（含 framed_write、proto/connection、server）
+    quinn-boring/                # H3/QUIC BoringSSL 绑定；peer_identity 须实现勿 todo!
+    app-engines/                 # 模块化 .so 引擎
+      README.md
+      include/appengine.h        # ABI
+      common/appengine_common.{c,h} appengine_util.{c,h}
+      lua/, wsgi/, asgi/, psgi/, rack/, cgi/, uwsgi/
+      samples/c-plugin/, go-plugin/, rust-plugin/
+    axonasp-ffi/                 # Go c-shared：AxonASP
+    aspnet-ffi/                  # C# NativeAOT / hostfxr 导出
+    jsp-sidecar/                 # Maven Jetty Embedded + JDT；UDS
+    script-ffi/ or scriptffi/    # scriptffi.c/h 静态链 python+perl+mruby
+  scripts/
+    build_release.sh
+    build_app_engines.sh
+    bench_app_engines.sh
+    build_jsp_sidecar.sh
+    build_axonasp_ffi.sh
+    build_aspnet_ffi.sh
+    build_script_ffi.sh / build_script_ffi_deps.sh
+    build_mruby.sh
+    build_musl_static.sh
+    lib_app_musl.sh              # 应用侧 glibc|musl 选择；C 编译加 -pthread
+    zig-musl-cc.sh, zig-musl-ld.sh
+    app_native_musl.sh
+    precompile_www_apps.sh
+    update-deps.sh
+    test_app_libc.sh
+    geoip_*.py / geoip_update.sh / geoip_finish.sh / geoip_nap_sync.sh ...
+  www-apps/                      # 各引擎样例 docroot
+    php/, asp/, jsp/, tsx/, lua/, wsgi/, go/, rust/, c/, cgi/, python/, ruby/, perl/, ...
+    各自 init.sh + 可选 .env（APP_HELLO=...）+ deps/
+  bench/
+    h2_fair_gate.py
+    matrix_http_tls.py
+    app_engine_overhead.py       # wrk -t2 -c8 -d3s vs static :9095
+    h2o-fair.conf
+    overnight_loop.sh            # 曾过夜调参；最终应可停止
+    restore_baseline.sh
+    sweep_batch_cap.sh
+    baselines/, snapshots/baseline-plain-h2-wire-20260812/
+    overnight/status.json, matrix_latest.json, app_engines_overhead.json
+  state/                         # 运行时：php/*.sock, native/*/app.sock, jsp, tsx out...
+  target/app-engines/libapp_*.so
+  .cursor/rules/perf-h2o-and-ultra-servers.mdc
+```
+
+---
+
+## 2. Cargo / 依赖要点
+
+- `hyper` 1.x full、`hyper-util`、`http`、`http-body-util`、`bytes`、`tokio`、`anyhow`、`serde`/`toml`、`log`、`libc`
+- BoringSSL 经 `boring` + 本地 `libs/quinn-boring`
+- 可选 feature / cfg：`webserver_nss_stub`、`webserver_scriptffi_static`（build.rs check-cfg）
+- release profile：历史上 `lto=fat` 曾导致链接 bus error / OOM；脚本应支持 thin LTO 回退
+- workspace 成员至少包含：主 crate、`libs/h2`、`libs/quinn-boring`
+
+---
+
+## 3. 配置模型（config.toml）
+
+### 3.1 全局
+- 管理员账号：密码用 **argon2id / yescrypt，每哈希独立盐**；UI 只收集明文密码，**禁止让用户粘贴哈希**
+- `ip_access` allow/deny
+- `syncookie`：enabled、value_on/off、evaluate_interval_ms
+- GeoIP：路径指向库文件；面板字段开关可进 toml；**数据本身不塞进 toml**
+- 访问日志：enable、level、realtime tail
+- 页面规则全局/每站
+- 反向代理 / Tor：SOCKS 优先 **FFI 或 unix socket**，不要整包嵌入 Tor 进程；上游 SSL 模式：强制校验 / 不校验 / 信任自签或自定义根 / 关闭 SSL
+
+### 3.2 `[[listeners]]`（ListenerConfig）
+每站点独立：
+- `address` / `port` / `root`（**不同站点 root 不得相同**）
+- `ssl: Option<SslConfig>`：证书**路径或 PEM 粘贴正文**；版本；密码套件；ECH；PSK；TLS1.3 prefer；可声明是否启用 NSS/TomCrypt 遗留
+- `apps: Vec<AppRouteConfig>`
+- `file_open: BTreeMap<String, FileOpenMode>` — **优先级高于应用引擎**
+- autoindex、上传策略、basic auth、反代规则、页面规则等
+
+**FileOpenMode**：`auto` | `preview` | `download` | `execute`  
+- preview/download：跳过引擎，强制 inline/attachment  
+- execute：优先引擎  
+- auto：兼容旧逻辑  
+
+**生产端口约定（公平 bench）**：
+- 本服务 fair：`:9081` plain、`:9445` TLS1.2、`:9446` TLS1.3  
+- h2o fair：`:9082` / `:8444`  
+- 应用引擎样例：`:9095`  
+- 生产示例：`:8443`（勿用测试页覆盖其 autoindex 优先级设计）
+
+### 3.3 `AppRouteConfig`（路径级引擎）
+字段（演进后应包含）：
+- `paths: Vec<String>`（空=整站 root）
+- `enabled: bool`
+- `engine: String`
+- `socket: Option<String>`（`unix:/path` 优先于 TCP）
+- `extensions: Vec<String>`
+- `index: Option<String>`
+- `php_bin: Option<String>`
+- `workers: usize`（默认 4；PHP 样例曾用 16）
+- `source_dir` / `out_dir` / `entry` / `watch`（TSX）
+- `docroot: Option<String>`
+- `lib: Option<String>`（app-ffi `.so` 路径）
+- `deps_dir` / `init_timeout_secs` / `libc`（`auto|glibc|musl`——**只影响应用侧本地二进制编译，不是强制整个 webserver 用 musl**）
+
+**AppEngineKind（最终应覆盖）**：  
+Php, Fastcgi, Jsp, Asp, Do, Tsx, AspNet,  
+Python, Ruby, Perl,  
+Lua, Wsgi, Asgi, Psgi, Cgi, Uwsgi, Rack,  
+C, Go, Rust, Unknown
+
+引擎匹配：enabled + path 前缀 + 扩展名过滤。  
+**若路径启用了应用引擎，优先级高于 autoindex 下载**（除非 file_open 强制 preview/download）。
+
+### 3.4 样例 apps（:9095）
+- `/php` → php，workers=16，docroot=www-apps/php，fpm  
+- `/lua` → lua，`lib=target/app-engines/libapp_lua.so`  
+- `/cgi` → cgi，`lib=.../libapp_cgi.so`  
+- `/c|/go|/rust` → **必须 `lib=target/app-engines/libapp_{c,go,rust}.so`**（in-process FFI）；**禁止 CGI spawn**  
+- 另有 wsgi/python/ruby/perl/asp/jsp/tsx 等
+
+---
+
+## 4. 核心请求路径
+
+1. TCP accept（可选 `SO_BUSY_POLL=100µs`；**不要** `SO_INCOMING_CPU`——实测假回归）
+2. TLS 分流：BoringSSL 直路径为主；ClientHello 决定是否进 NSS/TomCrypt（可完全不加载）
+3. ALPN → h2 / h1；UDP → h3
+4. `apps::try_handle`：  
+   - file_open 先判  
+   - `deps::try_cached`（mtime）命中则跳过 SHA256/`spawn_blocking`；否则 `ensure_app_deps`  
+   - 按 engine dispatch  
+5. 否则 static_files / autoindex / proxy / page_rules
+
+**Tokio**：benchmark 形态曾用 `worker_threads=2`（与公平门禁一致）。
+
+---
+
+## 5. HTTP/2 性能最终 knobs（保留）
+
+在 `src/server/h2.rs` / accept 路径：
+- `BATCH_CAP = 16`
+- `max_send_buffer_size(128 * 1024)`
+- `SO_BUSY_POLL = 100µs`
+- tokio `worker_threads = 2`
+- **不要**再死磕 BATCH/busy_poll/workers 队列过夜循环（性价比低）
+- 过夜最佳 dual（健康 h2o ≥~750k）：iter28 **713k RPS / 1635µs** vs h2o 796k/1412µs → **1.116× RPS / 1.158× lat**
+- 后续未做完但有价值：DATA coalescing、accept/REUSEPORT；plain-h1 / tls13-h1 延迟仍偏紧
+
+vendored `libs/h2`：注意 framed_write / coalesce_writes；静态 H2 路径曾设 `coalesce_writes=false` 等实验。
+
+---
+
+## 6. TLS / 遗留协议
+
+- **主路径**：BoringSSL（TCP + QUIC）
+- **NSS**：SSLv3、IE6 风格 `SSL_ENABLE_V2_COMPATIBLE_HELLO`；单元测试覆盖
+- **TomCrypt**：更老套件
+- 证书：路径或粘贴 PEM；支持 ECC 副证；ECH keys；PSK on H3
+- OCSP auto-fetch 需要 leaf+issuer 链
+- **禁止**改写 TLS1.3 ClientHello（破坏 transcript）
+- `quinn-boring::peer_identity`：**禁止 `todo!()`**，返回 `Vec<X509>` leaf 在前
+
+---
+
+## 7. 应用引擎架构（核心）
+
+### 7.1 设计铁律
+1. **能 FFI 就不 spawn**；能 unix socket 就不 HTTP API/TCP  
+2. **C / Go / Rust 禁止 CGI per-request spawn**  
+3. 模块化：`dlopen(RTLD_GLOBAL)` + 热卸载（reconcile 无引用则 shutdown+dlclose）  
+4. 解释器（lua/wsgi/...）与编译型插件统一 ABI  
+5. 生产路径无 Python
+
+### 7.2 ABI（`libs/app-engines/include/appengine.h`）
+导出：
+- `appengine_init(engine, lib_hint) -> int`
+- `appengine_execute(script, docroot, method, path, query, content_type, body, body_len, remote, server_name, server_port, extra, out) -> int`
+- `appengine_result_free(out)`
+- `appengine_shutdown()`
+
+`AppEngineResult`：status, headers, headers_len, body, body_len, error
+
+发现顺序：`apps[].lib` → `APPENGINE_<NAME>_LIB` → `target/app-engines/libapp_<name>.so`
+
+### 7.3 已实现引擎 .so
+| slug | so | 说明 |
+|------|-----|------|
+| lua | libapp_lua.so | PUC Lua + ngx.say/header/var 风格 |
+| wsgi/asgi | libapp_wsgi/asgi.so | CPython embed，缓存 application |
+| psgi | libapp_psgi.so | Perl embed |
+| rack | libapp_rack.so | MRI Ruby |
+| cgi | libapp_cgi.so | 委托 handler .so，无 spawn |
+| uwsgi | libapp_uwsgi.so | 需 socket= |
+| c/go/rust | libapp_{c,go,rust}.so | samples：c-shared / cdylib；**最终默认路径** |
+
+`app_ffi.rs`：
+- 通用引擎走 thread pool（≈ CPU clamp 2..4）；rack/psgi **串行**单线程池  
+- **c/go/rust：同线程内联 `exec`，跳过全局 env 锁**  
+- 其他引擎：`with_temp_env_named(engine, ...)` **按引擎分锁**（禁止全进程一把锁把并发打成串行）
+
+### 7.4 PHP
+- **优先 php-fpm**（`pm.max_children = workers`），失败再 php-cgi  
+- fpm conf：**绝对路径** error_log/pid/listen；`chdir = /tmp`；`listen.backlog=4096`；**不要**写 `prefix = /`（部分 fpm 报 unknown entry）  
+- 相对路径曾被错误加成 `/var/state/...`  
+- php-cgi 回退必须设 `PHP_FCGI_CHILDREN` / `PHP_FCGI_MAX_REQUESTS=0`  
+- 若 docroot 在 `/root/...`，需保证 www-data 可 traverse（如 `chmod 711 /root`）  
+- CLI `php` 禁止当 FastCGI；自动 remap 到 php-cgi
+
+### 7.5 JSP / .do
+- Jetty Embedded sidecar（`libs/jsp-sidecar`），UDS 优先  
+- 支持用户上传 .jsp/.jspx/.class；Admin 有编译按钮  
+- `.do`/`.action` 走 ActionBridgeServlet
+
+### 7.6 ASP / ASP.NET
+- Classic ASP：AxonASP FFI（`libs/axonasp-ffi`）  
+- ASP.NET：hostfxr in-process FFI（`libs/aspnet-ffi`），无 HTTP 反代
+
+### 7.7 TSX
+- 任意合法 TSX 必须能 built-in 编译；失败信息必须进 **Web 控制台 + 日志**  
+- watch 热编译；out_dir 静态托管
+
+### 7.8 Python/Ruby/Perl
+- `script_ffi` 静态嵌入（mruby 等），**禁止 spawn**
+
+### 7.9 deps / init.sh
+- 每 app docroot：`init.sh` + `.env` → `deps/`（bin/venv/gems/...）  
+- 变更 wipe 重建；manifest 记录 init/env sha + app_libc  
+- **热路径**：`try_cached` 只比 mtime，**禁止每请求 SHA256 + spawn_blocking**（这是曾导致 FFI「假慢 2×」的根因之一）  
+- C/Go/Rust 无 lib 时：可 spawn **持久** `deps/bin/index` + `WEBSERVER_LISTEN_UNIX`（native_http Hyper 代理 + 连接池）；spawn 失败 **返回错误，禁止 CGI fallback**  
+- native sidecar：sock 路径必须 **canonicalize 绝对路径**；cwd 设 docroot；stderr→sidecar.log；C 应用 pthread keep-alive（`-pthread`）
+
+### 7.10 应用引擎最终性能（wrk -t2 -c8 -d3s :9095，全 2xx）
+| 引擎 | RPS | 延迟 | 模式 |
+|------|-----|------|------|
+| static | 12.5k | 635µs | 文件 |
+| rust | 12.4k | 634µs | FFI cdylib |
+| c | 10.1k | 793µs | FFI .so |
+| cgi | 9.63k | 827µs | FFI handler |
+| go | 9.53k | 841µs | FFI c-shared |
+| php | 7.97k | 2.03ms | php-fpm×16 |
+
+历史对照：CGI spawn 曾 ~0.7–1.9k / 5–12ms；unix sidecar ~5.6–6.0k / 1.3ms；修 deps 缓存+分锁+in-process FFI 后 Rust≈static。  
+Lua FFI 在 wrk 高并发下曾 `abort()`/segfault——需修线程安全，bench 时谨慎。
+
+---
+
+## 8. Admin WebUI（admin_ui.html）
+
+单页管理，嵌入二进制。能力包括但不限于：
+- 多站点 / listener 管理（root 唯一）
+- TLS：路径或粘贴 PEM/KEY；版本与套件
+- 应用引擎：路径级开关、引擎类型、extensions 随引擎变化（修过「选 jsp 仍显示 php 扩展」bug）
+- 文件管理：进目录点目录名；纯文本在线编辑（不靠扩展名，二进制检测）
+- 文件级打开方式：preview/download/execute；视频(mp4/m3u8)/音频/PDF 预览（hls.js）
+- 页面规则（文案：**禁止出现 Cloudflare**；可用「公开 CDN 前缀表」等中性名；scrubBrand）
+- 反向代理 + Tor/.onion
+- 访问日志开关/等级/实时
+- GeoIP 精细面板
+- 账号权限（盐哈希，无手填哈希）
+- JSP 编译按钮、引擎状态（勿显示「9095 在跑但面板没开」类不同步——以 live_config/reconcile 为准）
+- autoindex：子目录链接不要变成 `test%2F` 这种错误编码；引擎启用时不要变成「点了就下载」
+
+---
+
+## 9. GeoIP（摘要；完整规格见 §23）
+
+细粒度到**地级运营商 / 地级数据中心**。离线多源合并 → 单库 `data/geoip/current/geoip.sqlite`；生产查询与 Admin 面板必须用 Rust（`geoip_panel/` + `admin_geoip.rs`）。Python 仅 `scripts/geoip_*` 更新脚本。详情、分层源、covering 合并、面板功能与坑点 → **§23**。
+
+---
+
+## 10. 安全要求（曾审计）
+
+- 防路径穿越、webshell 上传执行面、越权访问  
+- Admin 鉴权与站点隔离  
+- 依赖更新脚本 `scripts/update-deps.sh`  
+- 业务安全优先于「只扫语法」
+
+---
+
+## 11. Bench / 运维脚本行为
+
+- `bench/h2_fair_gate.py`：双门禁  
+- `bench/matrix_http_tls.py`：全矩阵  
+- `bench/app_engine_overhead.py`：相对 static 的引擎开销  
+- `bench/overnight_loop.sh`：可自动改 knobs；**最终应停止**，保留最佳 knobs  
+- `scripts/build_release.sh --restart`：编完杀旧启新；日志 `/tmp/webserver-restart.log`
+
+---
+
+## 12. 已知坑（实现时必须避开）
+
+1. `CARGO_TARGET_DIR` 被 www-apps/rust 污染 → release「Finished」但真正的 `target/release/webserver` 未更新（mtime 旧、无 `WEBSERVER_LISTEN_UNIX` 字符串）  
+2. php-fpm 相对路径 → `/var/...`；`prefix=/` 在部分版本非法  
+3. `/root` 0700 → www-data 无法读脚本  
+4. Admin HTML 不热更新  
+5. 全局 `with_temp_env` 互斥锁 + 每请求 deps SHA → FFI 假慢  
+6. C prefork + keep-alive 占死 worker；应 pthread-per-conn  
+7. Lua/Python embed 在高并发 wrk 下可能 abort——隔离或修锁  
+8. fat LTO 链接可能 bus error；thin LTO 回退  
+9. 测试页勿覆盖 :8443 原 autoindex 站点语义  
+
+---
+
+## 13. 实现顺序建议
+
+1. Skeleton：main + config.toml 解析 + 多 listener accept + 静态文件  
+2. H1/H2（libs/h2）+ 性能 knobs；对标 h2o fair ports  
+3. TLS BoringSSL + 可选 NSS/TomCrypt 模块化加载  
+4. H3 quinn-boring  
+5. Admin UI + live_config  
+6. apps：deps 缓存 → app_ffi ABI → php-fpm → jsp/asp/tsx → c/go/rust plugins  
+7. proxy/Tor/page_rules/access_log/geoip/file_open  
+8. bench 脚本与门禁；修 Lua 并发；保证 C/Go/Rust 无 CGI  
+
+---
+
+## 14. 验收标准
+
+- `cargo build --release` 产出可运行二进制  
+- config.toml 多站点、file_open、apps、ssl 粘贴均生效  
+- :9095 上 rust FFI ≈ static（同 wrk 参数下差距应在噪声内）；c/go 明显优于旧 CGI/sidecar  
+- C/Go/Rust 路径代码审查：**不存在**成功路径调用 `cgi_script::execute_binary`  
+- 双门禁对 h2o：尽力达到 ≤1.2× lat 与 ≥0.8× 吞吐（相对 h2o）  
+- Admin 无 Cloudflare 品牌字样；改 UI 后必须重链二进制  
+- 无 Python 出现在 `src/` 生产路径  
+
+---
+
+## 15. 给执行模型的元指令
+
+- 用中文注释关键设计点；标识符英文  
+- 不要用「占位 TODO」冒充完成（曾修过 `peer_identity` 的 todo!）  
+- 大文件（admin_ui.html）保持可维护；品牌清洗用 scrub 函数  
+- 优先 unix socket / FFI / 静态链接嵌入；拒绝「先 HTTP 反代再说」  
+- 本规格与对话最终状态冲突时：**以第 7.3–7.10、第 5 节与 §22 性能优化做法、§23 GeoIP 为准**（in-process FFI + 禁 CGI + deps mtime 缓存 + H2 knobs + GeoIP Rust 面板）
+
+请从空目录开始创建完整项目**，直到 §19 验收命令全部通过并接近第 7.10 表量级。
+
+---
+
+## 16. 功能规格详解（不可省略）
+
+本节按子系统逐项描述**最终应实现的行为**。实现时以本节 + 第 7 节性能铁律为准；若与早期草稿冲突，以本节为准。
+
+### 16.1 多站点 Listener 生命周期
+
+每个 `[[listeners]]` 在进程内对应一个 **ListenerRuntime**：
+- 独立 `root`（文档根）、`apps`、`file_open`、`ssl`、`proxy`、`page_rules`、`autoindex`、`basic_auth`、`ip_access`、`rate_limit`
+- **不同 listener 的 `root` 必须不同**（Admin 保存时校验；重复则拒绝）
+- `server_names` / `sni_name` 用于 SNI/Host 路由；`all_server_names()` 去重保序
+- `http_versions`：`h1` / `h2` / `h3` 可多选；未启用版本不监听对应 ALPN
+- `port_reuse`：可选 SO_REUSEPORT 多 accept 线程（实验性，非过夜最佳路径核心）
+- `status_path`：可选内置状态页（`status_page.html` 模板）
+- 启动时 `reconcile_apps_runtime`：按 config 拉起/更新/卸载 PHP-FPM、JSP sidecar、TSX watcher、native sidecar、dlopen 引擎
+- `live_config` 热重载：监听 `config.toml` mtime/inotify；**大部分字段可热更**（listener 增删、apps、file_open、ssl 路径变更、page_rules 等）；**Admin HTML 不在此列**（见坑 #4）
+
+**请求分发顺序（单 listener）**：
+1. IP 访问控制 / rate limit / syncookie（若启用）
+2. Basic auth（站点级）
+3. 页面规则（可能 rewrite/redirect/header/cache）
+4. `apps::try_handle`（见 16.3）
+5. 反向代理规则匹配
+6. 静态文件 / autoindex / 上传 API
+7. 404
+
+### 16.2 静态文件与 file_open（细粒度）
+
+**目标**：用户可对**单个 URL 路径**指定打开方式，行为可预测，优先级**高于**应用引擎。
+
+| 模式 | GET 行为 | 是否走引擎 |
+|------|----------|------------|
+| `auto` | 引擎匹配则执行，否则静态（浏览器默认 disposition） | 是 |
+| `preview` | 强制 inline 静态；脚本扩展名用 `text/plain` 展示源码 | **否** |
+| `download` | 强制 `Content-Disposition: attachment` | **否** |
+| `execute` | 引擎匹配则执行，否则静态 | 是 |
+
+**实现要点**：
+- `ListenerConfig::file_open_mode(req_path)`：精确 key 匹配 + 去尾 `/` 回退
+- `try_handle` 开头：Preview/Download → 直接 `return None` 交给静态层
+- `static_files`：`app_owns_path` 在 auto/execute 下若路径匹配引擎则**不**当纯下载；preview/download 例外
+- 小文件内存缓存（H2O 风格）：仅 `auto`/`execute` 且无 Range 时启用
+- Range / HEAD / 206 Partial Content 全支持
+- 符号链接：默认拒绝跟随（或仅允许 root 内非 symlink 父链）
+- autoindex：子目录链接必须是 `/dir/` 而非错误编码的 `dir%2F`；目录名可点击进入
+- 媒体预览：mp4/webm、m3u8（内嵌 `admin_hls.light.min.js`）、常见音频、PDF inline
+- Admin「文件管理」：`set-open` API 写入 `file_open` 并持久化到 toml
+
+**TOML 序列化坑（必实现测试）**：
+- `file_open` **必须**序列化为 listener 内联数组：`file_open = ["/a.txt=download", ...]`
+- **禁止**写出 `[listeners.file_open]` 或 `[[listeners.file_open]]`——会挂到**最后一个** listener，导致 :8443 与 :9095 串台
+- 反序列化仍兼容 legacy map、`{path,mode}` 数组、字符串 `"/path=mode"`
+
+**上传安全**：
+- `would_execute_on_get(cfg, path)`：新上传/重命名目标若会被 PHP/JSP/ASP 等执行 → Admin 拒绝（防 webshell）
+- `file_open=preview` 的路径不算可执行
+
+### 16.3 应用引擎路由与 dispatch
+
+**match_app(cfg, path)**：
+- 遍历 `apps`，`enabled && path_matches && extension_matches`
+- `paths` 空 = 整站；非空 = 任一前缀匹配（规范化 `/`）
+- `extensions` 空 = 使用该引擎默认扩展；fastcgi 空扩展 = paths 下全部
+- 多 app 冲突：**先配置者优先**（文档化行为）
+
+**resolve_script_path**：
+- `docroot` 设置时：strip 匹配的 URL 前缀（`/classic/x.asp` → docroot 下 `x.asp`）
+- 目录请求 / 无扩展名 → 用 `index` 或引擎默认 index
+- **必须**拒绝 `..`、NUL、路径穿越；`canonicalize` 校验在 docroot 内
+
+**deps 管线（每个请求）**：
+```
+try_cached(docroot, app)  -- mtime(init.sh,.env,deps/manifest) 命中 → 直接拿 DepsEnv
+else spawn_blocking(ensure_app_deps)  -- 跑 init.sh，写 deps/manifest
+```
+- `init.sh` 负责编译/安装到 `deps/bin`、`deps/venv` 等
+- `.env` 行 `KEY=VAL` 并入 CGI/FFI 环境
+- `libc` 字段：`auto|glibc|musl` 只影响 **应用侧** `gcc`/`go build`/`cargo`，不是 webserver 本身
+- `init_timeout_secs`：防止 init.sh 卡死
+
+**按引擎 dispatch（最终态）**：
+
+| engine | 执行方式 | socket/lib 要求 |
+|--------|----------|-----------------|
+| php | php-fpm unix → php-cgi 回退 | 自动发现 `php-fpm`/`php-cgi`；禁把 `php` CLI 当 FastCGI |
+| fastcgi | FastCGI over unix/tcp | `socket` 必填 |
+| jsp / do | Jetty sidecar UDS | `socket` 或自动 `state/jsp/*.sock` |
+| asp | AxonASP FFI | `lib` 或内置 |
+| aspx / aspnet | hostfxr FFI | 无 HTTP 反代 |
+| tsx | 内置编译 + watch | 产物由 static 服务；`try_handle` 对 tsx 返回 None |
+| lua/wsgi/asgi/psgi/rack/cgi | dlopen `libapp_*.so` | `lib=` 或默认路径 |
+| uwsgi | libapp_uwsgi.so | 需 `socket=` uwsgi 协议 |
+| python/ruby/perl | script_ffi 静态嵌入 | 禁 spawn |
+| c / go / rust | **in-process FFI 默认** | `lib=target/app-engines/libapp_{c,go,rust}.so`；**禁 CGI** |
+
+**C/Go/Rust 决策树（代码审查必过）**：
+```
+if engine in {c,go,rust} && socket.is_none():
+  if lib_set || default_so.exists():
+    return app_ffi::execute(...)   // 同线程内联，无全局 env 锁
+  else:
+    try ensure_native_sidecar(...) // unix HTTP 持久进程
+    on failure → Err(...)          // 禁止 cgi_script::execute_binary
+```
+
+### 16.4 PHP 内嵌（完整行为）
+
+1. 首次请求或 reconcile：写 `state/php/{listener}-{appidx}.conf` + 启动 php-fpm
+2. fpm pool：`pm = static`，`pm.max_children = workers`（样例 16）
+3. **全部绝对路径**：`error_log`、`pid`、`listen = unix:...`
+4. `chdir = /tmp`（不要 chdir 到 docroot——权限/相对路径坑）
+5. **不要** `prefix = /`（部分版本报 `unknown entry 'prefix'`）
+6. `listen.backlog = 4096`；`listen.owner/group/mode` 按需
+7. FastCGI 参数：`SCRIPT_FILENAME`、`DOCUMENT_ROOT`、`REQUEST_URI` 等完整 CGI 集
+8. fpm 失败 → spawn `php-cgi -b unix:...` + `PHP_FCGI_CHILDREN=workers` + `PHP_FCGI_MAX_REQUESTS=0`
+9. **页面卡死 bug 根因**：fpm 未就绪仍转发、或 sock 路径错误、或 worker 耗尽——reconcile 应 health-check sock 可连接后再标记 ready
+10. docroot 在 `/root/...`：需 `chmod 711 /root` 让 www-data traverse
+
+### 16.5 JSP / .do / Servlet 容器
+
+- `libs/jsp-sidecar`：Maven 构建 Fat JAR，内嵌 Jetty + JDT（或预编译 .class 模式）
+- 监听 `unix:/path`；协议为 HTTP/1.1 over UDS（非 TCP 9000）
+- 支持 `.jsp` `.jspx`；`.do`/`.action` → `ActionBridgeServlet`
+- Admin：**编译按钮**触发 JSP 编译；错误显示在面板
+- 用户可上传 `.jsp`/`.class`；路径级 `docroot`
+- sidecar 日志：`state/jsp/*.log`；崩溃由 reconcile 重启
+
+### 16.6 Classic ASP（AxonASP）与 ASP.NET
+
+- **ASP**：`libs/axonasp-ffi` Go c-shared → `dlopen`；解释 `.asp`
+- **ASP.NET**：`libs/aspnet-ffi` hostfxr 进程内；支持预编译 DLL
+- 均走 FFI，**禁止**起 Kestrel 再 HTTP 反代
+
+### 16.7 TSX 一键编译部署
+
+- `source_dir` + `out_dir` + `entry[]`（默认 `src/main.tsx`）
+- 内置 esbuild/swc 级编译链（具体工具可自选，但必须 bundled）
+- `watch=true`：inotify 变更 → 重编译；失败**不得**静默——写 `admin` 事件 + `log::error!` + 面板「构建日志」
+- **任何合法 TSX 语法**必须能编译；不要白名单限制
+- 编译成功后 `out_dir` 由静态处理器托管；URL 不经过 `try_handle`
+
+### 16.8 模块化 FFI 引擎（lua…rust）
+
+**加载**：
+```c
+dlopen(path, RTLD_NOW | RTLD_GLOBAL);
+dlsym("appengine_init"); dlsym("appengine_execute"); ...
+```
+
+**卸载**（`reconcile_apps_runtime`）：
+- 引用计数为 0 → `appengine_shutdown()` → `dlclose`
+- 热更换 `lib=` 路径：先启新后卸旧
+
+**app_ffi.rs 线程模型**：
+- 默认 pool：`workers = clamp(num_cpus, 2, 4)`
+- rack/psgi：串行单线程池（解释器非线程安全）
+- c/go/rust：`native_inline=true` → **直接当前 async worker 线程调用**，不经 `spawn_blocking`，不经全局 `with_temp_env`
+- 其他：`with_temp_env_named(engine, vars, || execute)` —— **每引擎一把锁**
+
+**环境变量传递**：
+- 标准 CGI 变量 + `deps_env.vars` + `extra` JSON（ABI 的 `extra` 字段）
+
+### 16.9 native HTTP sidecar（C/Go/Rust 无 .so 时）
+
+- 二进制：`deps/bin/index` 或 `init.sh` 产出
+- 环境：`WEBSERVER_LISTEN_UNIX`（绝对路径 sock）、`WEBSERVER_WORKERS`、`DOCUMENT_ROOT`（canonical）、`GATEWAY_INTERFACE=CGI/1.1`
+- `native_http.rs`：Hyper 客户端 + **连接池** + HTTP/1.1 转发完整请求
+- C 样例：`pthread` per connection + keep-alive（**不要 prefork 占死 worker**）
+- Go 样例：`net.Listen("unix")` + `SetUnlinkOnClose(true)`（无返回值，勿 `_ =`）
+- Rust 样例：cdylib 优先；sidecar 用 `WEBSERVER_LISTEN_UNIX` 读环境
+- stderr → `state/native/{key}/sidecar.log`
+
+### 16.10 反向代理与 Tor/.onion
+
+**Proxy 规则**（每 listener `proxy` 配置）：
+- 路径前缀 → upstream URL
+- 支持 WebSocket upgrade
+- 修改请求/响应头（`modify_*_headers`）
+
+**Tor/.onion 上游**：
+- **禁止**内嵌完整 Tor 进程
+- SOCKS：优先 **FFI**（如 `libtor_connect.so`）或 **unix socket** 连外部 tor；其次才是 TCP `127.0.0.1:9050`
+- `.onion` 主机：证书即公钥；SSL 模式四选一：
+  1. `verify`：强制校验
+  2. `no_verify`：TLS 但不校验证书
+  3. `trust_self_signed`：信任自签/自定义根
+  4. `off`：明文（仅测试）
+
+### 16.11 页面规则（WebUI 选项卡必须可见）
+
+- 数据模型：类似 CDN 页面规则（**UI 文案禁止出现 Cloudflare**；用 `scrubBrand()` 清洗）
+- 字段：优先级、匹配（URL/host/header/方法/国家…）、动作（redirect、rewrite、cache、pass、block、header 注入…）
+- 存在独立 **「页面规则」** 选项卡（用户曾反馈「看不到」——必须实现）
+- 规则存在 `config.toml`；热重载生效
+- 公开 CDN 前缀表等功能命名中性化
+
+### 16.12 访问日志
+
+- 全局/每站可配：`enable`、`level`（error/warn/info/debug/trace）、`realtime`（WebSocket/SSE tail）
+- Admin 面板：开关、等级下拉、实时追踪窗口
+- 日志行：时间、client IP、method、path、status、bytes、duration、engine 标签（若有）
+- 生产路径写文件或 ring buffer；**不要用 Python**
+
+### 16.13 访问控制与账号
+
+- `ip_access`：allow/deny CIDR 列表
+- `basic_auth`：站点级
+- Admin `[[admin.users]]`：
+  - UI **只收集明文密码**，后端 `argon2id` 或 `yescrypt` 哈希
+  - **每个密码独立随机盐**；禁止用户粘贴 `password_hash`
+  - 验证时用 constant-time compare
+- 会话：secure cookie + CSRF（Admin POST）
+
+### 16.14 文件管理 Admin API
+
+| action | 功能 |
+|--------|------|
+| list | 列目录；点击进入子目录（非错误编码） |
+| read / write | 文本在线编辑；`is_probably_text()` 嗅探（NUL 拒绝） |
+| mkdir / delete / rename | 路径消毒 `sanitize_path` |
+| upload | 分块/整文件；`upload_on_exists`：rename/skip/overwrite |
+| set-open | 设置 `file_open` 模式 |
+
+- 所有路径 `sanitize_path` + `is_under_root`
+- 上传可执行脚本前检查 `would_execute_on_get`
+
+### 16.15 GeoIP 细粒度面板（摘要 → §23）
+
+- 精度：地级运营商 / 地级数据中心；数据不进 toml
+- 生产 Rust 全功能面板（查询、手改 CIDR、源权重、geofeed、冲突、筛选别名…）
+- 离线 Python 多层拉取合并；covering 字段合并；官方云最高权
+- **完整分层源表、算法、面板清单、坑点见 §23**
+
+### 16.16 TLS / SSL 材料与版本
+
+- `SslConfig`：证书/密钥 **文件路径或 PEM 粘贴正文**（Admin 大文本框）
+- 支持 RSA + ECDSA 双证；TLS1.3 prefer；密码套件可配
+- ECH keys、TLS-PSK（H3）
+- OCSP stapling：需完整链
+- **ClientHello 分流**：现代 → BoringSSL；SSLv3/IE6 hello → NSS；更老 → TomCrypt
+- Feature flag 完全不编进 NSS/TomCrypt = 二进制更小、bench TLS1.3 更公平
+- `quinn-boring`：`peer_identity()` 返回 `Vec<X509>`，**禁止 todo!()**
+
+### 16.17 HTTP/2 / HTTP/3 细节
+
+**H2（最终保留）**：
+- `BATCH_CAP = 16`
+- `max_send_buffer_size(128 * 1024)`
+- `SO_BUSY_POLL` 100µs
+- tokio `worker_threads = 2`（bench 形态）
+- vendored `libs/h2`：`framed_write`、可选 `coalesce_writes` 实验
+
+**H3**：
+- `quinn` + `quinn-boring`
+- `enable_http_datagram`、`enable_connect_udp`、ECN、0-RTT 可配
+- ALPN `h3`
+
+### 16.18 L4 / 其他
+
+- `l4`：TCP/UDP 透传或简单负载
+- `syncookie`：读写 `/proc/sys/net/ipv4/tcp_syncookies`
+- `rate_limit`：令牌桶 per key（IP/路径）
+- `telemetry`：可选 metrics 端点
+
+### 16.19 Admin WebUI 选项卡清单（必须全部存在）
+
+1. **概览 / 状态** — listener 列表、引擎 reconcile 状态（:9095 开了必须在面板显示）
+2. **站点 / Listeners** — 增删改；root 唯一校验
+3. **TLS** — PEM 粘贴、版本、套件、ECH
+4. **应用引擎** — 路径、engine 下拉、**extensions 随 engine 变化**（修过 jsp 仍显示 php 扩展名）
+5. **文件管理** — 浏览/编辑/上传/打开方式
+6. **页面规则** — 独立选项卡
+7. **反向代理** — 含 Tor/.onion、SSL 模式
+8. **访问控制** — IP、basic auth
+9. **访问日志** — 开关/等级/实时
+10. **GeoIP** — 查询与配置
+11. **账号权限** — 用户 CRUD，明文密码
+12. **选项目录** — `options_catalog.rs` 驱动的枚举/帮助文本
+
+嵌入方式：`include_str!("admin_ui.html")` — **改 UI 必须 cargo build release**
+
+---
+
+## 17. 已知坑与反模式（扩展版，实现前必读）
+
+| # | 现象 | 根因 | 正确做法 |
+|---|------|------|----------|
+| 1 | release 编过但行为像旧版 | `CARGO_TARGET_DIR` 被 www-apps/rust 污染 | 编 webserver 前 `unset CARGO_TARGET_DIR`；主二进制固定 `target/release/webserver` |
+| 2 | 二进制无 `WEBSERVER_LISTEN_UNIX` 字符串 | 链到了错误/未更新的 artifact | 检查 mtime；`strings webserver \| grep WEBSERVER` |
+| 3 | php-fpm 起不来 | 相对路径变 `/var/...`；`prefix=/` 非法 | 全绝对路径；`chdir=/tmp`；删 prefix |
+| 4 | Admin 改了不生效 | HTML 编译进二进制 | 改 admin_ui.html 后必须重链 |
+| 5 | FFI 比 static 慢 2× | 每请求 SHA256 init.sh + 全局 env 锁 | `try_cached` mtime；`with_temp_env_named`；c/go/rust 内联 |
+| 6 | C 并发差/假死 | prefork + keep-alive 占满 worker | pthread per connection + `-pthread` |
+| 7 | Go 编译失败 | `SetUnlinkOnClose` 无返回值 | 不要 `_ = ul.SetUnlinkOnClose(true)` |
+| 8 | Rust sample 编失败 | lockfile v4 + 旧 cargo | 用 rustup ≥1.85 的 cargo |
+| 9 | Lua/Python wrk abort | embed 非线程安全 | 串行池或修 GIL/VM 锁；bench 谨慎 |
+| 10 | fat LTO bus error | 链接 OOM | `lto=thin` 回退 |
+| 11 | :8443 autoindex 语义被覆盖 | 测试页抢同一 root | 测试用 :9095 |
+| 12 | file_open 热更错乱 | `[listeners.file_open]` 挂末 listener | 内联 `file_open = ["/p=m"]` + 单测 |
+| 13 | 9095 跑但面板显示关 | UI 未读 reconcile 状态 | API 返回 runtime `active_engines` |
+| 14 | jsp 面板扩展名仍 php | 前端未随 engine 切换 | engine onChange 重置 extensions |
+| 15 | PHP 解释后卡死 | fpm 未 ready 就转发 | reconcile health check + backlog |
+| 16 | www-data 403 php | `/root` 0700 | `chmod 711 /root` 或移 docroot |
+| 17 | php CLI 当 FastCGI | 错误探测顺序 | 只认 php-fpm/php-cgi |
+| 18 | C/Go/Rust 走 CGI | fallback 未删 | 代码审查禁 `cgi_script::execute_binary` 成功路径 |
+| 19 | sidecar sock 找不到 | 相对路径 | `canonicalize` state_dir |
+| 20 | SO_INCOMING_CPU 回归 | 假优化 | 不要启用 |
+| 21 | 过夜调参死循环 | 性价比低 | 保留 iter28 knobs 后停止 |
+| 22 | peer_identity panic | todo! | 实现返回证书链 |
+| 23 | 上传 webshell | 无 ACL | `would_execute_on_get` 拦截 |
+| 24 | autoindex `test%2F` | 错误 URL 编码 | 目录链用 `/path/` |
+| 25 | 引擎路径下载非执行 | file_open 未优先 | preview/download 跳过 try_handle |
+| 26 | Cloudflare 字样 | 复制文案 | scrubBrand 全 UI |
+| 27 | 生产用 Python | 违反约束 | 仅 scripts/bench |
+| 28 | Tor 内嵌进程 | 体积/稳定性 | FFI/unix SOCKS |
+| 29 | HTTP API 调引擎 | 延迟高 | unix > FFI > sidecar UDS |
+| 30 | musl 强绑 webserver | 误解 libc 字段 | 仅应用侧 init.sh 可选 musl |
+| 31 | dlopen 符号冲突 | RTLD_LOCAL | `RTLD_GLOBAL` 仅 app engines |
+| 32 | TSX 失败无日志 | 吞错误 | Admin + tracing 必显 |
+| 33 | JSP 仅 TCP | 性能差 | Jetty UDS |
+| 34 | 多 listener 同 root | 配置歧义 | Admin 拒绝保存 |
+| 35 | h2o 对比不公平 | 遗留 TLS 栈常驻 | TLS1.3 bench 不加载 NSS/TomCrypt |
+
+---
+
+## 18. config.toml 完整样例片段
+
+```toml
+[admin]
+realm = "WebServer Admin"
+[[admin.users]]
+username = "admin"
+# 仅示例哈希；UI 创建用户时由后端生成
+password_hash = "$argon2id$..."
+
+[ip_access]
+allow = ["0.0.0.0/0"]
+deny = []
+
+[[listeners]]
+address = "0.0.0.0"
+port = 9095
+root = "www-apps"
+http_versions = ["h1", "h2"]
+file_open = [
+  "/php/demo.php=preview",
+  "/static/manual.pdf=preview",
+]
+
+[[listeners.apps]]
+paths = ["/php"]
+enabled = true
+engine = "php"
+extensions = [".php"]
+index = "index.php"
+workers = 16
+docroot = "www-apps/php"
+
+[[listeners.apps]]
+paths = ["/rust"]
+enabled = true
+engine = "rust"
+extensions = []
+index = "main.rs"
+workers = 4
+docroot = "www-apps/rust"
+lib = "target/app-engines/libapp_rust.so"
+watch = true
+
+[[listeners.apps]]
+paths = ["/go"]
+enabled = true
+engine = "go"
+docroot = "www-apps/go"
+lib = "target/app-engines/libapp_go.so"
+
+[[listeners.apps]]
+paths = ["/c"]
+enabled = true
+engine = "c"
+docroot = "www-apps/c"
+lib = "target/app-engines/libapp_c.so"
+
+[[listeners]]
+address = "0.0.0.0"
+port = 8443
+root = "www"
+http_versions = ["h1", "h2", "h3"]
+autoindex = { enabled = true, paths = ["/"] }
+
+[listeners.ssl]
+certificate = "-----BEGIN CERTIFICATE-----\n..."
+private_key = "-----BEGIN PRIVATE KEY-----\n..."
+min_version = "1.2"
+```
+
+---
+
+## 19. 构建与验收命令（复制即用）
+
+```bash
+# 1. 构建应用引擎 .so
+bash scripts/build_app_engines.sh
+
+# 2. 构建主程序（注意 TARGET_DIR）
+unset CARGO_TARGET_DIR
+export PATH="$HOME/.cargo/bin:$PATH"
+bash scripts/build_release.sh --restart
+
+# 3. 冒烟
+curl -sS http://127.0.0.1:9095/php/ | head
+curl -sS http://127.0.0.1:9095/rust/ | head
+
+# 4. 性能
+wrk -t2 -c8 -d3s http://127.0.0.1:9095/rust/
+python3 bench/app_engine_overhead.py
+python3 bench/h2_fair_gate.py   # 需 h2o 在 :9082/:8444
+
+# 5. 单元测试
+cargo test --bin webserver file_open
+cargo test --bin webserver would_execute
+cargo test --bin webserver script_rel
+```
+
+**验收门槛**：
+- rust FFI RPS ≥ 11k（wrk -t2 -c8 -d3s），延迟 / static < 1.1
+- c/go ≥ 9k RPS（同参数）
+- `rg 'cgi_script::execute_binary' src/server/apps/mod.rs` 在 c/go/rust 分支**无成功路径**
+- Admin 12 个选项卡均可打开；无 Cloudflare 字符串
+- `file_open` 单测全绿
+
+---
+
+## 20. AppRouteConfig 完整字段（serde 名）
+
+```rust
+pub struct AppRouteConfig {
+    pub paths: Vec<String>,
+    pub enabled: bool,
+    pub engine: String,
+    pub socket: Option<String>,
+    pub extensions: Vec<String>,
+    pub index: Option<String>,
+    pub php_bin: Option<String>,
+    pub workers: usize,              // default 4
+    pub source_dir: Option<String>,  // tsx
+    pub out_dir: Option<String>,
+    pub entry: Vec<String>,
+    pub watch: bool,
+    pub docroot: Option<String>,
+    pub lib: Option<String>,         // app-ffi .so
+    pub deps_dir: Option<String>,
+    pub init_timeout_secs: Option<u64>,
+    pub libc: Option<String>,        // auto|glibc|musl
+}
+```
+
+---
+
+## 21. 给执行 AI 的检查清单（提交前自检）
+
+- [ ] 全配置项可由 `config.toml` + 热重载驱动（GeoIP 数据除外）
+- [ ] 生产 `src/` 无 Python
+- [ ] C/Go/Rust：默认 FFI，无 CGI fallback
+- [ ] `deps::try_cached` 在热路径生效
+- [ ] `with_temp_env_named` 分引擎锁
+- [ ] php-fpm 绝对路径 conf
+- [ ] file_open TOML 不串 listener
+- [ ] Admin 含页面规则选项卡 + 访问日志 + GeoIP
+- [ ] TLS PEM 可粘贴
+- [ ] Tor SOCKS FFI/unix 优先
+- [ ] `peer_identity` 无 todo
+- [ ] bench 脚本可跑并接近 §7.10 表
+- [ ] UI `scrubBrand` 无 Cloudflare
+- [ ] §22 性能 knobs / 热路径 / 禁 CGI / try_cached 已落地
+- [ ] 应用引擎 overhead 接近 §22.4.4 表；H2 dual-gate 可冲刺
+- [ ] §23 GeoIP：Rust 面板+查询、covering、官方云优先、冲突/ASN/筛选齐全
+
+**请从空目录开始创建完整项目**，直到 §19 全部命令通过。
+
+---
+
+## 22. 性能优化做法（必须照做，禁止重踩）
+
+本节记录**已经验证有效**的优化、**已证伪的假优化**、测量方法论与应用引擎热路径改造。重建时按优先级落地；不要重新发明过夜死磕 BATCH 的循环。
+
+### 22.1 目标与双门禁
+
+对标 https://github.com/h2o/h2o，**吞吐 + 延迟**同时约束：
+
+| 门禁 | 公式 | 通过条件 |
+|------|------|----------|
+| 吞吐 | `h2o_rps / ours_rps` | ≤ 1.2（即 ours ≥ 0.833× h2o） |
+| 延迟 | `ours_lat / h2o_lat` | ≤ 1.2 |
+
+- 测项矩阵：`plain-h1`、`plain-h2`、`tls12-h1`、`tls12-h2`、`tls13-h1`、`tls13-h2`（+ 可选 h3）
+- 脚本：`bench/h2_fair_gate.py`（2xx + 双门禁 + 相对 baseline 不回归）
+- 全矩阵：`bench/matrix_http_tls.py`
+- 应用引擎相对 static：`bench/app_engine_overhead.py`（wrk `-t2 -c8 -d3s`，端口 `:9095`）
+
+**公平对比硬规则**：
+1. 同机、同核、同 wrk/`h2load` 参数、同 payload（小静态文件优先）
+2. 只测 TLS1.3 时：**不要加载 NSS / TomCrypt**（可卸载模块 / feature 关掉）
+3. fair 端口约定：ours `:9081` plain / `:9445` TLS1.2 / `:9446` TLS1.3；h2o `:9082` / `:8444`
+4. Tokio bench 形态固定 `worker_threads = 2`（与门禁一致，勿随意改成「满核」再宣称赢了）
+
+### 22.2 HTTP/2 最终 knobs（保留，勿再扫）
+
+过夜调参后**健康 h2o ≥ ~750k** 时的最佳 dual（iter28）：
+
+| | ours | h2o | gap |
+|--|-----:|----:|----:|
+| RPS | **713k** | 796k | **1.116×**（吞吐门禁过） |
+| lat | **1635µs** | 1412µs | **1.158×**（延迟门禁过） |
+
+**必须写死在代码/配置里的 knobs**：
+
+```text
+BATCH_CAP              = 16          # libs/h2 framed_write / server flush 批大小
+max_send_buffer_size   = 128 * 1024  # h2 连接发送缓冲
+SO_BUSY_POLL           = 100µs       # accept/读路径 setsockopt；单位微秒
+tokio::runtime         worker_threads = 2   # bench/fair 形态
+```
+
+**实现位置**：
+- `src/server/h2.rs`：`BATCH_CAP`、`max_send_buffer_size`、与 vendored `libs/h2` 接线
+- `src/server/mod.rs` / accept：`set_busy_poll(TcpStream)`；**不要**绑 `SO_INCOMING_CPU`（实测假回归）
+- vendored `libs/h2`：关注 `framed_write`、`proto/connection`、`coalesce_writes` 实验开关
+
+**已尝试但应停止死磕的方向**（性价比低，过夜后主动停掉）：
+- 继续扫 `BATCH_CAP` / busy_poll / workers 组合（`bench/overnight_loop.sh`、`bench/sweep_batch_cap.sh`）
+- 把 `SO_INCOMING_CPU` / 激进 CPU pin 当银弹
+- fat LTO 当默认（见 22.8）
+
+**仍有价值、可做但别挡主线的后续**：
+- DATA frame coalescing（在正确语义下合并小 DATA）
+- accept 多路 + `SO_REUSEPORT`（实验性；非 iter28 核心）
+- plain-h1 / tls13-h1 延迟仍偏紧时，优先查 H1 路径与 TLS 握手/会话复用，而不是再拧 BATCH
+
+**静态 H2 路径实验备注**：曾对静态响应设 `coalesce_writes=false` 做对比；落地时保留可配置开关，默认以对标门禁数字为准。
+
+### 22.3 热路径总原则（任何「慢」先查这里）
+
+按优先级排查，**不要先怪引擎语言本身**：
+
+1. **是否每请求 `spawn_blocking`？** → 去掉或缓存
+2. **是否每请求 SHA-256 / 读大文件 / 跑 `init.sh`？** → mtime 缓存
+3. **是否全局 Mutex 串行化所有引擎？** → 分引擎锁或内联
+4. **C/Go/Rust 是否误走 CGI spawn？** → 强制 FFI / sidecar，禁 CGI
+5. **是否相对路径导致 fpm/sidecar 起不来、首请求超时重试？** → 绝对路径 + health check
+6. **编出来的二进制是不是旧的？**（`CARGO_TARGET_DIR` 污染）→ `unset` + 查 mtime/`strings`
+
+### 22.4 应用引擎性能改造（已证：假慢 → 真打平）
+
+#### 22.4.1 曾经的「离谱慢」（异常，不是 FFI 成本）
+
+早期测到 C/Go/Rust 「FFI」只有约 0.7–1.9k RPS / 5–12ms，相对 static 差一个数量级。根因**不是** `.so` 调用本身，而是：
+
+| 假慢根因 | 表现 | 修复 |
+|----------|------|------|
+| 每请求 `ensure_app_deps` + SHA-256(`init.sh`) + `spawn_blocking` | 全引擎统一变慢约 2× | `deps::try_cached`：只比 `init.sh` / `.env` / manifest **mtime**；命中直接返回 `DepsEnv` |
+| 进程级 `with_temp_env` 一把大锁 | 多引擎/多连接完全串行 | `with_temp_env_named(engine, …)` **每引擎一把锁**；lua/wsgi/cgi 可并行 |
+| C/Go/Rust 实际走 CGI `execute_binary` | 约 1k RPS | **禁止**成功路径 CGI；默认 `libapp_{c,go,rust}.so` in-process |
+| C prefork + keep-alive 占死 worker | 并发塌缩 | pthread-per-connection + 编译加 `-pthread` |
+| 主二进制未真正重链（TARGET_DIR 污染） | 「Finished」但行为旧、无 `WEBSERVER_LISTEN_UNIX` | 编主程序前 `unset CARGO_TARGET_DIR` |
+
+#### 22.4.2 最终执行模型（性能优先级）
+
+```text
+最快 → 最慢（同功能）：
+  in-process FFI (dlopen + 同线程 exec)
+    > unix sidecar + Hyper 连接池（持久进程）
+      > FastCGI / php-fpm over UDS
+        > HTTP 反代 / TCP
+          > 每请求 CGI spawn（C/Go/Rust 禁用）
+```
+
+**C / Go / Rust 决策（代码审查必过）**：
+```
+if lib_set || default_so.exists():
+    app_ffi::execute  // native_inline：当前线程直接调，跳过 spawn_blocking 与 env 锁
+else:
+    ensure_native_sidecar(UDS)  // 连接池代理
+    on fail → Err  // 禁止 cgi_script::execute_binary
+```
+
+**`app_ffi.rs` 线程模型**：
+- 通用解释器引擎：小线程池（约 `clamp(ncpu, 2, 4)`）
+- rack / psgi：**串行**单线程池（VM 非线程安全）
+- c / go / rust：`native_inline = true` → **同步内联**，不进池、不加全局 env 锁
+- 其他需临时改环境变量的：仅 `with_temp_env_named(engine, …)`
+
+#### 22.4.3 deps 热路径伪代码（必须实现）
+
+```rust
+// 热路径：禁止 SHA-256、禁止无条件 spawn_blocking
+if let Some(env) = deps::try_cached(docroot, app) {
+    env
+} else {
+    spawn_blocking(|| deps::ensure_app_deps(docroot, app)).await??
+    // ensure 成功后 cache_store(mtime, env)
+}
+```
+
+`CachedDeps` 至少保存：`init_mtime`、`env_mtime`、`app_libc`、`DepsEnv`。  
+变更 `init.sh` / `.env` / libc 策略 → mtime 变化 → 自动失效。
+
+#### 22.4.4 应用引擎最终数字（验收锚点）
+
+`wrk -t2 -c8 -d3s` @ `:9095`，全 2xx：
+
+| 引擎 | RPS | 延迟 | 模式 | vs static |
+|------|----:|-----:|------|----------:|
+| static | 12.5k | 635µs | 文件 | 1.00× |
+| rust | 12.4k | 634µs | FFI cdylib | **约 1.00×** |
+| c | 10.1k | 793µs | FFI .so | 约 1.25× |
+| cgi | 9.63k | 827µs | FFI handler.so（无 spawn） | 约 1.30× |
+| go | 9.53k | 841µs | FFI c-shared | 约 1.32× |
+| php | 7.97k | 2.03ms | php-fpm×16 | 约 1.57× RPS |
+
+历史对照（不要退回去）：
+- CGI spawn：约 0.7–1.9k / 5–12ms
+- unix sidecar：约 5.6–6.0k / 约 1.3ms
+- 修 deps 缓存 + 分锁 + in-process FFI 后：Rust ≈ static
+
+**解释器注意**：Lua / Python embed 在高并发 wrk 下曾 `abort()`/segfault → 先串行池或修锁，再冲 RPS；不要为冲数字关掉安全。
+
+### 22.5 PHP-FPM 性能相关做法
+
+- **优先 php-fpm over UDS**，不要默认 php-cgi；cgi 仅回退
+- `pm.max_children = workers`（样例路由用 **16**）
+- `listen.backlog = 4096`
+- conf **绝对路径**；`chdir = /tmp`（避免权限/相对路径拖垮首包）
+- 启动后 **health-check sock 可连** 再对外转发（避免「卡死」重试放大延迟）
+- php-cgi 回退：`PHP_FCGI_CHILDREN`、`PHP_FCGI_MAX_REQUESTS=0`
+- 禁止把 CLI `php` 当 FastCGI（探测顺序错误会导致假超时）
+
+### 22.6 静态文件路径优化
+
+- **小文件内存缓存**（H2O 风格）：无 Range、文件大小 ≤ `SMALL_FILE_CACHE_MAX_FILE`、且 `file_open` 为 `auto`/`execute` 时，用 `(path, mtime, len)` 缓存 `Bytes`
+- `preview`/`download` **跳过**该缓存（Content-Type / Disposition 被覆盖）
+- 支持 Range / 206；HEAD 轻量
+- autoindex 正确编码目录链接（错误 `%2F` 会导致多余 404 重试，间接损吞吐）
+- 引擎已匹配的脚本路径：不要当 attachment 下载（除 `file_open` 强制）
+
+### 22.7 TLS / 协议栈性能
+
+- **主路径 BoringSSL**（TCP + QUIC）；遗留协议按 ClientHello **按需**进 NSS/TomCrypt
+- Bench TLS1.3：**卸载或不加载** NSS/TomCrypt，避免符号/初始化污染与多余分支
+- 禁止改写 TLS1.3 ClientHello（破坏 transcript → 握手失败重试 → 假延迟）
+- `quinn-boring::peer_identity` 必须实现（`todo!` 会在 H3 路径 panic）
+- 会话复用 / 0-RTT / PSK：按 config 打开，测矩阵时注明开关状态
+- OCSP stapling 需要完整链；缺链会导致额外往返
+
+### 22.8 构建与二进制层面
+
+| 做法 | 说明 |
+|------|------|
+| `unset CARGO_TARGET_DIR` | 编主 `webserver` 前必须；否则「Finished」链到错误 target |
+| rustup 新 cargo | lockfile v4；系统旧 cargo 编失败或编错树 |
+| LTO | 默认 **thin**；`lto=fat` 曾 bus error / OOM；脚本提供 `--fat` 可选 |
+| Admin UI | `include_str!`：改 HTML 必须重链才「生效」（否则误判功能/性能） |
+| `scripts/build_release.sh --restart` | 编完杀旧启新；日志 `/tmp/webserver-restart.log` |
+| 校验二进制 | `strings target/release/webserver | grep WEBSERVER_LISTEN_UNIX`；查 mtime |
+
+### 22.9 系统 / 网络侧（accept 路径）
+
+**启用**：
+- `SO_BUSY_POLL = 100µs`（与 iter28 一致）
+- 可选 `SO_REUSEPORT`（多 accept；实验，需单独回归门禁）
+- `tcp_syncookies` 可按负载动态（`syncookie` 配置），勿在公平 bench 时乱抖
+
+**不要启用 / 已证伪**：
+- `SO_INCOMING_CPU`（假回归）
+- 为「好看」把 fair bench 的 tokio workers 调到满核再和 h2o 比
+
+### 22.10 过夜调参方法论（可停）
+
+1. `bench/overnight_loop.sh` 可自动改 knobs 并写 `bench/overnight/status.json`
+2. 以 **dual-gate 通过且 h2o 健康** 的最佳 iter 为准（记录：**iter28 → 713k / 1635µs**）
+3. **性价比低时主动停止**，保留 knobs，改做：应用引擎热路径、H1 延迟、DATA coalescing、REUSEPORT
+4. `bench/restore_baseline.sh`：回滚到冻结的 plain-h2 wire 快照（`bench/snapshots/baseline-plain-h2-wire-20260812/`）
+5. `bench/sweep_batch_cap.sh`：扫 BATCH **不自动 promote**；扫完恢复 snapshot
+
+### 22.11 测量纪律（防自欺）
+
+1. 每次改动后：先 **冒烟 2xx**，再 wrk；不要对着错误页刷 RPS
+2. 应用引擎对比必须带 **static 同端口同参数** 基线
+3. 报告同时给 **RPS 与延迟**；只报一个无效
+4. 确认测到的是新二进制（mtime / 特征字符串）
+5. Lua/Python 不稳时单独标注，勿并进「全引擎平均」掩盖
+6. C/Go/Rust 报表必须注明模式：`FFI` / `sidecar` /（禁止出现）`CGI`
+7. 门禁脚本失败时看是 **本侧回归** 还是 **h2o 不健康**（h2o 掉到很低时 gap 会假通过/假失败）
+
+### 22.12 优化落地顺序（重建时照此）
+
+```text
+P0  正确路径：C/Go/Rust → FFI；禁 CGI；php-fpm UDS 绝对路径
+P0  deps::try_cached（mtime）+ cache_store
+P0  with_temp_env_named；c/go/rust native_inline
+P1  H2 knobs 一次写死：BATCH_CAP=16, send_buf=128K, BUSY_POLL=100µs, workers=2
+P1  小文件 Bytes 缓存；busy_poll；不启 SO_INCOMING_CPU
+P1  TLS1.3 bench 不加载遗留栈
+P2  native sidecar 连接池（无 .so 时）；C pthread 样例
+P2  php-fpm workers/backlog；sock health-check
+P3  DATA coalescing、REUSEPORT、H1/tls13-h1 延迟专项
+P3  修 Lua/Python 线程安全后再冲 RPS
+禁止  无门禁的过夜死磕 BATCH；fat LTO 默认；CGI fallback「先跑起来再说」
+```
+
+### 22.13 性能相关验收清单
+
+- [ ] `BATCH_CAP=16`、`max_send_buffer_size(128KiB)`、`SO_BUSY_POLL=100µs`、tokio `worker_threads=2` 已落地
+- [ ] 无 `SO_INCOMING_CPU`
+- [ ] `deps::try_cached` 命中路径无 SHA-256、无每请求 `spawn_blocking`
+- [ ] `with_temp_env_named`；c/go/rust 内联且不持全局 env 锁
+- [ ] C/Go/Rust 成功路径无 `cgi_script::execute_binary`
+- [ ] `:9095` rust FFI ≈ static（同 wrk 参数，RPS/延迟差在噪声内）
+- [ ] c/go ≥ 约 9k RPS（同参数）；远低于此先查是否又走了 CGI/未缓存 deps
+- [ ] `python3 bench/h2_fair_gate.py` 在健康 h2o 下双门禁可冲刺 ≤1.2
+- [ ] TLS1.3 对比时 NSS/TomCrypt 未加载
+- [ ] 编主程序前 `unset CARGO_TARGET_DIR`；二进制含预期符号
+---
+
+## 23. GeoIP 细粒度规格（完整，不可省略）
+
+**现状说明**：v1/早期章节只有概要；本节是重建时的**唯一完整 GeoIP 规格**。目标精度：**地级运营商**（如「福建福州电信」）与 **地级数据中心**（如「圣何塞腾讯云」）。
+
+**铁律**：
+1. **配置**进 `config.toml`；**数据**在 `data/geoip/`（SQLite 等），**禁止**把 IP 库塞进 toml
+2. **生产运行时查询与面板管理必须用 Rust**（`geoip_panel/` + `admin_geoip.rs`）；**禁止**生产路径调 Python（曾返回 501 不可接受）
+3. Python **仅**允许出现在 `scripts/geoip_*.py` / `geoip_update.sh` 等离线更新/合并脚本
+4. ASN 为 null 或明显错误是**大忌**；城市冲突、覆盖前缀 bug、官方云数据被低权源覆盖都必须处理
+
+### 23.1 目录与产物
+
+```text
+data/geoip/
+  current/
+    geoip.sqlite          # 合并后的权威库（查询用）
+    SOURCES.json          # 各上游 commit SHA / commit_unix / 权重元数据
+    01-cloud/ … 14-geofeed/ …   # 可选原始分层（GEOIP_KEEP_RAW=1 时保留）
+  panel.sqlite            # 面板：手改、冲突、源配置、计划任务状态、审计日志
+  logs/                   # update / nap / rir-geofeed / asn-bgp 等
+scripts/
+  geoip_update.sh         # 拉层 + merge
+  geoip_finish.sh / geoip_nap_sync.sh
+  geoip_merge.py          # 多层 → 单库
+  geoip_lookup.py         # 离线调试查询（非生产）
+  geoip_enrich_*.py       # 各源 enrich
+  geoip_enrich_geofeed.py / geoip_enrich_rir_geofeed.py
+  geoip_enrich_cloud_official.py / geoip_enrich_qqwry.py / geoip_enrich_cernet*.py
+  geoip_enrich_cnnic_whois.py / geoip_enrich_netorg.py / geoip_enrich_campus_geo.py
+  geoip_resolve_asn_bgp.py
+  geoip_tor_pool.py / geoip_http.py / geoip_blacklist.py / geoip_purge_blacklisted.py
+  geoip_panel.py          # 可选离线维护；线上以 Rust 为准
+src/server/
+  admin_geoip.rs
+  geoip_panel/
+    mod.rs, config.rs, db.rs, lookup.rs, covering.rs,
+    aliases.rs, filter_agg.rs, iputil.rs, ops.rs, toml_store.rs
+```
+
+### 23.2 查询结果字段（统一 schema）
+
+单 IP 查询 JSON（`geoip_lookup` / Admin API / 内部 lookup）至少包含：
+
+| 字段 | 含义 |
+|------|------|
+| `country` | ISO 国家码（如 CN） |
+| `province` / `city` / `district` | 省/市/区县 |
+| `isp` | 运营商（电信/联通/移动/教育网等） |
+| `asn` / `as_org` | ASN 编号与组织名（**禁止无故 null**） |
+| `cloud_provider` / `cloud_region` / `cloud_service` | 云厂商 + 区域 + 服务 |
+| `hosting` | 非云 IDC/hosting 名 |
+| `division_code` | 行政区划代码（如 330100） |
+| `bits` | 命中前缀长度 |
+| `prefixes_merged` | 参与字段合并的覆盖前缀数 |
+| `label` | 人类可读拼接（见下） |
+
+**label 拼接规则**：
+- 有云厂商：`{cloud_provider} {cloud_region|city}` + 可选 isp + `AS{asn} {as_org}`
+- 无云：`{province} {city} {district} {isp}` + hosting + ASN
+- 示例：`浙江省 杭州市 中国联通 / AS24409 …`；云：`腾讯云 us-sanjose-1 / AS…`
+
+### 23.3 分层数据源（按功能拼凑，可扩展）
+
+合并进**一个** `geoip.sqlite`。不要局限下列列表——用户曾要求「用更多库得到更准确数据」。
+
+#### 第一层：数据中心 / 云厂商（精确到「圣何塞腾讯云」）
+
+| 库 | 频率 | 栈 | 覆盖 | 获取 |
+|----|------|----|------|------|
+| cloud-provider-ip-addresses (rezmoss) | 每日 | 双栈 | 64+ 厂商（AWS/Azure/GCP/腾讯/阿里/华为/Oracle/CF/DO/Vultr/GitHub/Zoom…），区域+服务如 `us-sanjose-1` | GitHub Releases + jsDelivr |
+| ipapi.is IP to Hosting（免费样本） | 每周 | 双栈 | 4400+ hosting/IDC | GitHub CSV/MMDB |
+| 云厂商**官方** geofeed / JSON | 各异 | 双栈 | Google/AWS/Azure/Akamai/Vultr/阿里/腾讯等 | 官方 URL；**优先级压倒性最高** |
+| Oracle OCI `public_ip_ranges.json` | 官方 | 双栈 | region→城市；kind=`cloud-json`，与 geofeed 同等可配 | 官方 JSON（面板可加源） |
+
+组合：先 cloud-provider → 再 hosting → 都未命中进下一层。  
+盲区：小型机房（如「香港沙田 HGC」）可能只到 ASN/Hosting 级。
+
+#### 第二层：中国运营商
+
+| 库 | 说明 |
+|----|------|
+| china-operator-ip (gaoyifan) | 电信/移动/联通/CERNET/CSTNET/鹏博士/谷歌中国；**仅 CIDR，无城市** → 必须与第三层城市交集得「福州电信」 |
+
+另：`geoip_enrich_cernet.py` / `cernet_school`、QQWry（`geoip_enrich_qqwry.py`）增强国内 ISP/城市。
+
+#### 第三层：城市级地理
+
+**全球**：ip-location-db (sapics)、GeoLite2-City、DB-IP City Lite、ipapi.is geo  
+**中国增强**：GeoCN（区县）；CN 下 **ASCII 小地名让位于 CJK**（GeoCN/ip2region）——DB-IP 曾把国内标成英文乡镇名需抑制  
+推荐：ip-location-db 作每日上游骨架，再叠 GeoCN/ip2region/QQWry。
+
+#### 第四层：ASN / 组织
+
+ip-location-db ASN、IPinfo Lite、GeoLite2-ASN；RIR whois/RDAP；BGP looking glass（见 23.7）。
+
+#### 第五层：RIR / NIC / geofeed / 特殊
+
+- 五大 RIR（APNIC/RIPE/ARIN/LACNIC/AFRINIC）meta + 发现的 **geofeed URL** 批量下载导入（`geoip_enrich_rir_geofeed.py`）
+- **国家 NIC**：CNNIC、AFNIC、JPNIC、AUNIC、HKRID、ZISPA…按 ccTLD 表逐个拉取；**要数据，不要经纬度/RIR status 字段污染**
+- Tor exit pool（`geoip_tor_pool.py`）
+- IANA special / IXP / Google rDNS / campus geo / places / blacklist purge
+- Anycast：RIR 提取 anycast CIDR；查询时国家票冲突则抑制城市（见 23.5）
+
+#### 可选客户端/格式
+
+ip2region xdb（离线微秒级）、Loyalsoldier/geoip 发布物等可作辅助层，**不是**生产唯一依赖。
+
+### 23.4 推荐查询/合并流水线
+
+```text
+1. 数据中心：官方云 geofeed/JSON（最高权）→ cloud-provider-ip → hosting
+2. 中国 ISP：china-operator-ip ∩ 城市层
+3. 城市：CN→GeoCN/ip2region/QQWry；全球→ip-location-db/GeoLite2/DB-IP
+4. ASN：库 + RIR + BGP LG；MOAS 进冲突人工队列
+5. 覆盖前缀字段合并（covering merge，见 23.5）→ 输出 label
+```
+
+场景验收：
+- 福建福州电信 = china-operator∩GeoCN
+- 圣何塞腾讯云 = cloud-provider 直命中
+- 加州 Santa Clara AT&T ≈ City + ASN 拼接
+- `1.2.4.8`（CNNIC DNS）**不得**标成「杭州联通」类错误城市 ISP
+
+### 23.5 合并与查找算法（核心正确性）
+
+1. **单库**：所有层 merge → `geoip.sqlite`（`ipv4` / `ipv6` 表，`start/end/bits` + 各字段 + 每字段 `e_*` epoch/score）
+2. **冲突字段**：两边非空且不同 → **更新的上游 commit_unix（或更高信任分）获胜**；空值永不覆盖非空
+3. **Covering merge（禁止只取最长前缀一行）**：  
+   查询时加载**所有覆盖**该 IP 的前缀，**按字段**用 epoch/权重合并。  
+   否则最长 `/32` 城市行会丢掉更宽的云/运营商段。
+4. **大段覆盖小段全局 bug**：`/22` 错误数据不得压过更小、更高权的 `/24`；实现 longest-prefix **结合**源权重与「路径优先级增益」（见面板）
+5. **官方云数据优先级压倒性**：Google/AWS/Azure/Akamai/Vultr/阿里/腾讯等 geofeed/PTR/官方 JSON **高于**商业 City 库
+6. **Anycast / 国家票冲突**：多源 country 次高票 ≥ 胜者 30% → `country_conflict`；抑制 city/province/district；命中 RIR anycast CIDR 同样处理
+7. **手改（errata）**：高优先级，防被自动更新覆盖；默认编辑**命中 CIDR 段**，**不要**默认 `/32`
+8. 合并可「最新 commit 为准」；面板另支持**人工源权重**与**单条优先级**
+
+### 23.6 Admin GeoIP 面板（功能清单，必须全部有）
+
+生产 **Rust** 实现下列能力（`admin_geoip` + `geoip_panel`）：
+
+| 功能 | 要求 |
+|------|------|
+| 单 IP 查询 | 展示全字段 + label + 覆盖前缀列表 |
+| 手动修改 | 改命中 **CIDR 段**（非默认 /32）；支持**二次编辑**（非只能删） |
+| 手改记录 | 可查询审计历史 |
+| 源管理 | 启用/禁用源、通过源更新、配置更新脚本路径 |
+| 计划任务 | 开启/配置 cron 类更新（配置进 toml；执行脚本） |
+| 数据库字段管理 | 哪些字段展示/参与合并 |
+| **源权重** | 按来源批量改优先级 |
+| **单条优先级** | 人工 errata 后防覆盖 |
+| **路径优先级增益** | 更细 CIDR 但低权威时，可调「详细度增益」，防不准的细数据污染 |
+| 自定义 geofeed 列表 | 添加 URL；**批量刷新** |
+| ASN 源 | 添加/配置 ASN 信息更新 |
+| **冲突栏目** | 冲突归属地的 IP **与** ASN 单独列表，一键编辑处理 |
+| **筛选器** | 按国家/城市/地区/运营商/IPv4|v6 等筛 IP 块；输入后**下拉别名**（`aliases.rs`）：`中国`/`CN`/`中华人民共和国`、`cloudflare`/`CloudFlare Inc` 等价 |
+| 增量维护 | 冲突表增量，**不**依赖定时全库扫描；方便批量审计 |
+
+`config.toml` 可配：DB 路径、面板开关、字段显示、源权重默认、脚本路径；**不含**海量前缀数据。
+
+### 23.7 ASN / BGP / 冲突处理
+
+- ASN null / 错 ASN：**必须修**（多源 + RDAP + BGP）
+- `geoip_resolve_asn_bgp.py`：多源 BGP looking glass，一个限流换下一个（可走 Tor SOCKS 池，`geoip_http.py`）
+- **MOAS**（同 prefix 多 ASN 同时宣告）→ 记入 conflict **manual** 队列等人审；父子前缀不算冲突
+- AFRINIC 等与阿里云「毛里求斯 vs 南非/津巴布韦」类矛盾：依赖官方 geofeed + 冲突 UI，勿静默猜
+
+### 23.8 性能
+
+- 查库必须有正确索引（`start/end` 范围查询）；曾「查库太慢」→ 修索引 / 覆盖查询计划
+- 热路径（若请求链路调用 GeoIP）：只读 mmap/连接池 + 短缓存；勿每请求 spawn 脚本
+- 更新流水线与在线查询隔离（staging → atomic replace `current/`）
+
+### 23.9 更新脚本行为
+
+```bash
+bash scripts/geoip_update.sh              # fetch layers + merge
+bash scripts/geoip_update.sh --only merge  # 仅重合并
+bash scripts/geoip_nap_sync.sh            # 过夜/补齐 RIR+CN enrich（flock 单飞）
+python3 scripts/geoip_lookup.py 1.2.4.8   # 离线校验
+```
+
+- `SOURCES.json` 记录每源 commit 时间供冲突裁决
+- Tor：`GEOIP_TOR_SOCKS` + 多实例规避 RDAP 限速（用户曾要求 20 Tor + 备用）
+- blacklist purge：剔除污染段
+
+### 23.10 Rust 模块职责
+
+| 文件 | 职责 |
+|------|------|
+| `lookup.rs` | covering 合并查询、label、anycast 抑制 |
+| `covering.rs` | 覆盖前缀枚举与字段合并 |
+| `db.rs` | sqlite 打开、索引、只读查询 |
+| `aliases.rs` | 国家/组织别名，供筛选下拉 |
+| `filter_agg.rs` | 面板筛选聚合 |
+| `ops.rs` | 手改、冲突处理、源刷新触发 |
+| `config.rs` / `toml_store.rs` | 面板配置 ↔ toml |
+| `admin_geoip.rs` | HTTP API；**禁止**生产桥接 Python（曾 `geoip_admin_python_disabled`） |
+
+### 23.11 GeoIP 已知坑
+
+| # | 坑 | 正确做法 |
+|---|-----|----------|
+| G1 | 只取最长前缀一行 | covering 按字段合并 |
+| G2 | `/22` 脏数据压 `/24` | 权重 + bits + 官方优先 |
+| G3 | 商业库错标 1.2.4.8 为杭州联通 | 多源共识 + CNNIC/权威 |
+| G4 | Anycast 标成纽约等单播城市 | anycast CIDR + 国家票冲突抑制城市 |
+| G5 | 手改默认 /32 | 默认命中 CIDR 段 |
+| G6 | 手改只能删不能改 | 支持二次编辑 |
+| G7 | 生产 501 / 调 Python | 全 Rust 面板+查询 |
+| G8 | 筛选中国/CN 搜不到 | aliases 归一化 |
+| G9 | 云官方数据被 City 库覆盖 | 官方 geofeed/JSON 最高权 |
+| G10 | ASN null | BGP/RDAP/多源，禁止摆烂 |
+| G11 | Oracle 只当普通冲突 | OCI JSON 作一等 cloud 源 |
+| G12 | 经纬度/RIR status 污染库 | NIC 拉取时丢弃这些字段 |
+| G13 | 无索引慢查 | 建好 start/end 索引 |
+| G14 | 更新与查询同文件写坏 | staging + 原子切换 |
+
+### 23.12 GeoIP 验收
+
+- [ ] `data/geoip/current/geoip.sqlite` 可查；Rust Admin 查询非 501
+- [ ] 生产 `src/` 无 Python GeoIP 桥
+- [ ] 分层源可更新；官方云 > 商业 City
+- [ ] covering merge；大段不错误压小段
+- [ ] 面板：查询/手改(段)/审计/源/权重/geofeed/ASN/冲突/筛选+别名
+- [ ] ASN 冲突走 BGP；MOAS 进 manual
+- [ ] 样例：`1.2.4.8` 合理；云 IP 能出厂商+区域；国内能出城市+运营商

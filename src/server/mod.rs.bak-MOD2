@@ -1,0 +1,268 @@
+//! Accept loop, multi-listener, optional SO_BUSY_POLL (Linux only).
+
+// ── 9 new feature modules (added this session) ──────────────────────────────
+pub mod tor;
+pub mod upload_resume;
+
+// ── existing modules ───────────────────────────────────────────────────────────
+pub mod access;
+pub mod access_log;
+pub mod admin;
+pub mod admin_config_edit;
+pub mod admin_files;
+pub mod admin_geoip;
+pub mod apps;
+pub mod basic_auth;
+pub mod dns;
+pub mod geoip_panel;
+pub mod h1;
+pub mod h1_static;
+pub mod h2;
+pub mod h3;
+pub mod l4;
+pub mod listener;
+pub mod live_config;
+pub mod options_catalog;
+pub mod page_rules;
+pub mod password;
+pub mod proxy;
+pub mod prefixed_stream;
+pub mod rate_limit;
+pub mod ssl_material;
+pub mod static_files;
+pub mod syncookie;
+pub mod telemetry;
+pub mod tls;
+pub mod headers_mod;
+pub mod onion_ca;
+
+use anyhow::{Context, Result};
+use live_config::LiveConfig;
+use std::net::SocketAddr;
+use std::sync::Arc;
+use tokio::net::TcpListener;
+
+pub async fn run(live: Arc<LiveConfig>) -> Result<()> { -> Result<()> {
+{
+pub async fn run(live: Arc<LiveConfig>) -> Result<()> {
+    // 热重载：每 2s 检查 config.toml mtime
+    live_config::spawn_mtime_watcher(Arc::clone(&live), std::time::Duration::from_secs(2));
+    crate::server::apps::reconcile_apps_runtime(&live);
+
+    crate::server::syncookie::spawn_evaluator(Arc::clone(&live));
+    // 早期规格 A.3：Hidden Service（独立 tor 进程，SocksPort 0）——enabled 时拉起。
+    // ensure_hs 幂等（hostname 存在即复用），mtime 热重载后再次调用也安全。
+    {
+        let cfg0 = live.snapshot();
+        // tor_hs::spawn_from_config: deferred (tor_hs removed)
+    }
+    tokio::spawn(async {
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(300)).await;
+            crate::server::rate_limit::cleanup(std::time::Duration::from_secs(600));
+        }
+    });
+
+    // P1-6: GeoIP cron scheduler deferred (ops::spawn_cron_scheduler not yet implemented).
+
+    let active: Arc<tokio::sync::Mutex<std::collections::HashSet<u16>>> =
+        Arc::new(tokio::sync::Mutex::new(std::collections::HashSet::new()));
+
+    // Initial listeners.
+    let cfg = live.snapshot();
+    for (idx, lc) in cfg.listeners.iter().enumerate() {
+        if let Err(e) = spawn_listener_port(
+            Arc::clone(&live),
+            lc.clone(),
+            idx,
+            Arc::clone(&active),
+        )
+        .await
+        {
+            return Err(e);
+        }
+    }
+    if active.lock().await.is_empty() {
+        anyhow::bail!("no listeners configured");
+    }
+
+    // Hot-spawn newly added ports after config reload (removed ports exit accept_loop).
+    {
+        let live_r = Arc::clone(&live);
+        let active_r = Arc::clone(&active);
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(2));
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                tick.tick().await;
+                let snap = live_r.snapshot();
+                for (idx, lc) in snap.listeners.iter().enumerate() {
+                    if active_r.lock().await.contains(&lc.port) {
+                        continue;
+                    }
+                    match spawn_listener_port(
+                        Arc::clone(&live_r),
+                        lc.clone(),
+                        idx,
+                        Arc::clone(&active_r),
+                    )
+                    .await
+                    {
+                        Ok(()) => log::info!("hot-spawned listener port {}", lc.port),
+                        Err(e) => log::warn!("hot-spawn listener port {} failed: {e:#}", lc.port),
+                    }
+                }
+            }
+        });
+    }
+
+    // Stay alive; accept loops + reconciler own the work.
+    loop {
+        tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
+    }
+}
+
+async fn spawn_listener_port(
+    live: Arc<LiveConfig>,
+    lc: crate::config::ListenerConfig,
+    idx: usize,
+    active: Arc<tokio::sync::Mutex<std::collections::HashSet<u16>>>,
+) -> Result<()> {
+    let port = lc.port;
+    {
+        let mut a = active.lock().await;
+        if !a.insert(port) {
+            return Ok(());
+        }
+    }
+    let addr: SocketAddr = format!("{}:{}", lc.address, lc.port)
+        .parse()
+        .with_context(|| format!("parse listener {}:{}", lc.address, lc.port))?;
+    let listener = match TcpListener::bind(addr).await {
+        Ok(l) => l,
+        Err(e) => {
+            active.lock().await.remove(&port);
+            return Err(e).with_context(|| format!("bind {addr}"));
+        }
+    };
+    maybe_set_busy_poll(&listener);
+    log::info!("listener[{idx}] ready on {addr} root={}", lc.root.display());
+
+    let live_c = Arc::clone(&live);
+    let active_c = Arc::clone(&active);
+    tokio::spawn(async move {
+        let res = accept_loop(listener, live_c, port).await;
+        active_c.lock().await.remove(&port);
+        if let Err(e) = res {
+            log::warn!("accept_loop port {port} ended: {e:#}");
+        }
+    });
+
+    if lc.allows_h3() {
+        let udp_addr = addr;
+        let lc_h3 = lc.clone();
+        let live_h3 = Arc::clone(&live);
+        tokio::spawn(async move {
+            loop {
+                if !live_h3.snapshot().listeners.iter().any(|l| l.port == port) {
+                    log::info!("h3 listener port {port} removed; stopping");
+                    break;
+                }
+                if let Err(e) =
+                    crate::server::h3::serve(udp_addr, lc_h3.clone(), Arc::clone(&live_h3)).await
+                {
+                    log::warn!("h3 listener {udp_addr}: {e:#}; retry in 5s");
+                    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                }
+            }
+        });
+    }
+    Ok(())
+}
+
+async fn accept_loop(listener: TcpListener, live: Arc<LiveConfig>, port: u16) -> Result<()> {
+    loop {
+        // Hot-reload: if this port disappeared from config, stop accepting.
+        {
+            let snap = live.snapshot();
+            if !snap.listeners.iter().any(|l| l.port == port) {
+                log::info!(
+                    "listener port {port} removed from config; shutting down accept loop"
+                );
+                return Ok(());
+            }
+        }
+        let accept = listener.accept();
+        tokio::pin!(accept);
+        let (stream, peer) = loop {
+            tokio::select! {
+                res = &mut accept => break res?,
+                _ = tokio::time::sleep(std::time::Duration::from_secs(2)) => {
+                    let snap = live.snapshot();
+                    if !snap.listeners.iter().any(|l| l.port == port) {
+                        log::info!(
+                            "listener port {port} removed from config; shutting down accept loop"
+                        );
+                        return Ok(());
+                    }
+                }
+            }
+        };
+        maybe_set_busy_poll_stream(&stream);
+        // P2-7：SYN 速率信号源——syncookie 评估器按 tick 差值估算速率并动态切换 sysctl。
+        crate::server::syncookie::note_syn();
+        let live_c = Arc::clone(&live);
+        tokio::spawn(async move {
+            if let Err(e) = listener::handle_connection(stream, live_c, port, peer).await {
+                log::debug!("connection {peer} error: {e:#}");
+            }
+        });
+    }
+    Ok(())
+}
+
+#[cfg(all(target_os = "linux", feature = "linux_busy_poll"))]
+fn maybe_set_busy_poll(listener: &TcpListener) {
+    use std::os::fd::AsRawFd;
+    // SO_BUSY_POLL = 100µs — Linux only; do not use SO_INCOMING_CPU.
+    const SO_BUSY_POLL: libc::c_int = 46;
+    let fd = listener.as_raw_fd();
+    let val: libc::c_int = 100;
+    unsafe {
+        let rc = libc::setsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            SO_BUSY_POLL,
+            &val as *const _ as *const libc::c_void,
+            std::mem::size_of_val(&val) as libc::socklen_t,
+        );
+        if rc != 0 {
+            log::debug!("SO_BUSY_POLL set failed: {}", std::io::Error::last_os_error());
+        }
+    }
+}
+
+#[cfg(not(all(target_os = "linux", feature = "linux_busy_poll")))]
+fn maybe_set_busy_poll(_listener: &TcpListener) {
+    // OpenBSD / others: SO_BUSY_POLL unavailable or disabled by configure.
+}
+
+#[cfg(all(target_os = "linux", feature = "linux_busy_poll"))]
+fn maybe_set_busy_poll_stream(stream: &tokio::net::TcpStream) {
+    use std::os::fd::AsRawFd;
+    const SO_BUSY_POLL: libc::c_int = 46;
+    let fd = stream.as_raw_fd();
+    let val: libc::c_int = 100;
+    unsafe {
+        let _ = libc::setsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            SO_BUSY_POLL,
+            &val as *const _ as *const libc::c_void,
+            std::mem::size_of_val(&val) as libc::socklen_t,
+        );
+    }
+}
+
+#[cfg(not(all(target_os = "linux", feature = "linux_busy_poll")))]
+fn maybe_set_busy_poll_stream(_stream: &tokio::net::TcpStream) {}

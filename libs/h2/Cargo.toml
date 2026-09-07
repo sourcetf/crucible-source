@@ -1,0 +1,18 @@
+[package]
+name = "h2"
+version = "0.4.0"
+edition = "2021"
+description = "Thin wrapper around crates.io h2 with BATCH_CAP support"
+
+[dependencies]
+h2-crate = { package = "h2", version = "0.4" }
+bytes = "1"
+http = "1"
+futures-core = "0.3"
+tokio = { version = "1", features = ["io-util"] }
+tokio-util = { version = "0.7", features = ["codec"] }
+tracing = "0.1"
+atomic-waker = "1"
+fnv = "1"
+slab = "0.4"
+indexmap = "2"

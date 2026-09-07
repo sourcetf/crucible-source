@@ -1,0 +1,109 @@
+#!/usr/bin/env python3
+"""HTTP fetch helper for GeoIP enrich scripts (direct or via Tor SOCKS)."""
+from __future__ import annotations
+
+import os
+import socket
+import ssl
+import urllib.error
+import urllib.request
+from typing import Iterable
+
+
+def _socks5_connect(host: str, port: int, proxy: tuple[str, int]) -> socket.socket:
+    s = socket.create_connection(proxy, timeout=60)
+    s.sendall(b"\x05\x01\x00")
+    resp = s.recv(2)
+    if resp != b"\x05\x00":
+        raise OSError(f"socks5 greet failed: {resp!r}")
+    host_b = host.encode("utf-8")
+    req = b"\x05\x01\x00\x03" + bytes([len(host_b)]) + host_b + port.to_bytes(2, "big")
+    s.sendall(req)
+    head = s.recv(4)
+    if len(head) < 4 or head[1] != 0:
+        raise OSError(f"socks5 connect failed: {head!r}")
+    atyp = head[3]
+    if atyp == 0x01:
+        s.recv(6)
+    elif atyp == 0x03:
+        ln = s.recv(1)[0]
+        s.recv(ln + 2)
+    elif atyp == 0x04:
+        s.recv(18)
+    return s
+
+
+def tor_socks_endpoints() -> Iterable[tuple[str, int]]:
+    pool = os.environ.get("GEOIP_TOR_SOCKS", "")
+    if pool:
+        for item in pool.split(","):
+            item = item.strip()
+            if not item:
+                continue
+            host, _, port_s = item.partition(":")
+            yield host, int(port_s or "9050")
+    else:
+        yield "127.0.0.1", 9050
+
+
+def fetch(url: str, *, timeout: int = 120, use_tor: bool = False) -> bytes:
+    """Fetch URL; when use_tor, rotate through GEOIP_TOR_SOCKS pool."""
+    last_err: Exception | None = None
+    if not use_tor:
+        with urllib.request.urlopen(url, timeout=timeout) as resp:
+            return resp.read()
+
+    for proxy in tor_socks_endpoints():
+        try:
+            from urllib.parse import urlparse
+
+            u = urlparse(url)
+            if u.scheme not in ("http", "https"):
+                raise ValueError("only http/https supported via socks")
+            port = u.port or (443 if u.scheme == "https" else 80)
+            raw = _socks5_connect(u.hostname or "", port, proxy)
+            if u.scheme == "https":
+                ctx = ssl.create_default_context()
+                if os.environ.get("GEOIP_HTTP_INSECURE") == "1":
+                    ctx.check_hostname = False
+                    ctx.verify_mode = ssl.CERT_NONE
+                raw = ctx.wrap_socket(raw, server_hostname=u.hostname)
+            path = u.path or "/"
+            if u.query:
+                path += "?" + u.query
+            req = (
+                f"GET {path} HTTP/1.1\r\nHost: {u.hostname}\r\n"
+                f"Connection: close\r\nUser-Agent: crucible-geoip/1.0\r\n\r\n"
+            ).encode()
+            raw.sendall(req)
+            chunks = []
+            while True:
+                part = raw.recv(65536)
+                if not part:
+                    break
+                chunks.append(part)
+            raw.close()
+            data = b"".join(chunks)
+            sep = data.find(b"\r\n\r\n")
+            if sep < 0:
+                raise OSError("invalid http response via socks")
+            body = data[sep + 4 :]
+            status_line = data.split(b"\r\n", 1)[0]
+            if b" 200 " not in status_line:
+                raise OSError(f"http error via socks: {status_line!r}")
+            return body
+        except Exception as e:  # noqa: BLE001 — rotate pool
+            last_err = e
+            continue
+    raise last_err or OSError("tor fetch failed")
+
+
+if __name__ == "__main__":
+    import sys
+
+    if len(sys.argv) < 2:
+        print("usage: geoip_http.py URL [--tor]", file=sys.stderr)
+        raise SystemExit(2)
+    use_tor = "--tor" in sys.argv
+    url = sys.argv[1]
+    print(fetch(url, use_tor=use_tor)[:200])

@@ -1,0 +1,301 @@
+use std::sync::Arc;
+//! Go engine via shared memory + Unix notify (OpenBSD production path).
+//!
+//! Go cannot build `-buildmode=c-shared` on openbsd/amd64, so configure sets
+//! `GO_ENGINE_MODE=shm` and Cargo feature `go_shm_ipc`. Dispatch uses this when
+//! `libapp_go.so` is absent (`native_http::lib_available` is false).
+//!
+//! Only compiled with `go_shm_ipc` **and** Unix (see `apps/mod.rs`).
+
+#![cfg(unix)]
+
+use crate::config::{AppRouteConfig, ListenerConfig};
+use crate::server::h1::{full, BoxBody};
+use anyhow::{bail, Context, Result};
+use bytes::Bytes;
+use http::{Request, Response, StatusCode};
+use http_body_util::BodyExt;
+use hyper::body::Incoming;
+use once_cell::sync::Lazy;
+use parking_lot::Mutex;
+use std::collections::HashMap;
+use std::fs::{self, OpenOptions};
+use std::io::{Read, Write};
+use std::net::SocketAddr;
+use std::os::unix::net::UnixStream;
+use std::path::{Path, PathBuf};
+use std::process::{Child, Command, Stdio};
+use std::time::Duration;
+
+const GO_SHM_MAGIC: u32 = 0x4352_474f;
+const GO_SHM_VERSION: u32 = 1;
+const GO_SHM_SLOTS: u32 = 64;
+const GO_SHM_BODY_MAX: u32 = 65536;
+const GO_SHM_PATH_MAX: usize = 512;
+const GO_SHM_METHOD_MAX: usize = 16;
+
+const STATE_IDLE: u32 = 0;
+const STATE_REQ_READY: u32 = 1;
+const STATE_RESP_READY: u32 = 2;
+
+#[repr(C)]
+struct GoShmHeader {
+    magic: u32,
+    version: u32,
+    slot_count: u32,
+    slot_stride: u32,
+    body_cap: u32,
+}
+
+#[repr(C)]
+struct GoShmSlotMeta {
+    state: u32,
+    http_status: u32,
+    req_body_len: u32,
+    resp_body_len: u32,
+    method: [u8; GO_SHM_METHOD_MAX],
+    path: [u8; GO_SHM_PATH_MAX],
+}
+
+struct Runtime {
+    shm_path: PathBuf,
+    notify_path: PathBuf,
+    child: Child,
+    mmap: memmap2::MmapMut,
+    header: GoShmHeaderLayout,
+}
+
+struct GoShmHeaderLayout {
+    slot_stride: usize,
+    body_cap: usize,
+    slot_count: u32,
+    data_offset: usize,
+}
+
+static RUNTIMES: Lazy<Mutex<HashMap<String, Runtime>>> = Lazy::new(|| Mutex::new(HashMap::new()));
+static RT_LOCKS: Lazy<Mutex<HashMap<String, Arc<Mutex<()>>>>> =
+    Lazy::new(|| Mutex::new(HashMap::new()));
+
+pub fn available() -> bool {
+    server_binary().is_some()
+}
+
+pub async fn execute(
+    req: Request<Incoming>,
+    lc: &ListenerConfig,
+    _app: &AppRouteConfig,
+    app_idx: usize,
+    peer: SocketAddr,
+) -> Result<Response<BoxBody>> {
+    let key = format!("{}-{}-go", lc.port, app_idx);
+    ensure_runtime(&key)?;
+    let method = req.method().as_str().to_string();
+    let path = req.uri().path().to_string();
+    let body = req.into_body().collect().await?.to_bytes();
+
+    // Serialize per app-key only — different Go apps don't block each other on one global mutex
+    // for the whole IPC round-trip (still holds RUNTIMES during slot I/O; RT_LOCKS scopes apps).
+    let slot_lock = {
+        let mut locks = RT_LOCKS.lock();
+        locks
+            .entry(key.clone())
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .clone()
+    };
+    let _slot_guard = slot_lock.lock();
+    let (status, resp_body) = {
+        let mut map = RUNTIMES.lock();
+        let rt = map.get_mut(&key).context("go shm runtime")?;
+        exec_slot(rt, &method, &path, &body, peer, lc.port)?
+    };
+
+    Ok(Response::builder()
+        .status(StatusCode::from_u16(status).unwrap_or(StatusCode::OK))
+        .header(http::header::CONTENT_TYPE, "text/plain; charset=utf-8")
+        .body(full(resp_body))
+        .unwrap())
+}
+
+fn exec_slot(
+    rt: &mut Runtime,
+    method: &str,
+    path: &str,
+    body: &Bytes,
+    _peer: SocketAddr,
+    _port: u16,
+) -> Result<(u16, Bytes)> {
+    if body.len() > rt.header.body_cap {
+        bail!("request body too large for go shm slot");
+    }
+    let slot_id = acquire_slot(rt)?;
+    write_slot(rt, slot_id, method, path, body)?;
+    notify_and_wait(rt, slot_id)?;
+    read_response(rt, slot_id)
+}
+
+fn write_slot(rt: &mut Runtime, slot_id: u32, method: &str, path: &str, body: &Bytes) -> Result<()> {
+    let off = rt.header.data_offset + (slot_id as usize) * rt.header.slot_stride;
+    write_u32(&mut rt.mmap, off + 4, 200);
+    write_u32(&mut rt.mmap, off + 8, body.len() as u32);
+    write_u32(&mut rt.mmap, off + 12, 0);
+
+    let method_off = off + 16;
+    let path_off = off + 16 + GO_SHM_METHOD_MAX;
+    write_str(&mut rt.mmap, method_off, method, GO_SHM_METHOD_MAX);
+    write_str(&mut rt.mmap, path_off, path, GO_SHM_PATH_MAX);
+
+    let req_body_off = off + std::mem::size_of::<GoShmSlotMeta>();
+    rt.mmap[req_body_off..req_body_off + body.len()].copy_from_slice(body);
+    write_u32(&mut rt.mmap, off, STATE_REQ_READY);
+    Ok(())
+}
+
+fn acquire_slot(rt: &mut Runtime) -> Result<u32> {
+    for _attempt in 0..1000 {
+        for id in 0..rt.header.slot_count {
+            let off = rt.header.data_offset + (id as usize) * rt.header.slot_stride;
+            if read_u32(&rt.mmap, off) == STATE_IDLE {
+                return Ok(id);
+            }
+        }
+        std::thread::sleep(Duration::from_micros(50));
+    }
+    bail!("no free go shm slot")
+}
+
+fn read_response(rt: &mut Runtime, slot_id: u32) -> Result<(u16, Bytes)> {
+    let off = rt.header.data_offset + (slot_id as usize) * rt.header.slot_stride;
+    let status = read_u32(&rt.mmap, off + 4) as u16;
+    let len = read_u32(&rt.mmap, off + 12) as usize;
+    let resp_off = off + std::mem::size_of::<GoShmSlotMeta>() + rt.header.body_cap;
+    let body = Bytes::copy_from_slice(&rt.mmap[resp_off..resp_off + len.min(rt.header.body_cap)]);
+    write_u32(&mut rt.mmap, off, STATE_IDLE);
+    Ok((status, body))
+}
+
+fn notify_and_wait(rt: &Runtime, slot_id: u32) -> Result<()> {
+    let mut conn = UnixStream::connect(&rt.notify_path)
+        .with_context(|| format!("connect {}", rt.notify_path.display()))?;
+    conn.set_read_timeout(Some(Duration::from_secs(10)))?;
+    conn.set_write_timeout(Some(Duration::from_secs(10)))?;
+    let mut msg = [0u8; 5];
+    msg[0..4].copy_from_slice(&slot_id.to_le_bytes());
+    msg[4] = 1;
+    conn.write_all(&msg)?;
+    conn.read_exact(&mut msg)?;
+    if u32::from_le_bytes(msg[0..4].try_into().unwrap()) != slot_id || msg[4] != 2 {
+        bail!("go shm notify mismatch");
+    }
+    Ok(())
+}
+
+fn ensure_runtime(key: &str) -> Result<()> {
+    {
+        let map = RUNTIMES.lock();
+        if map.contains_key(key) {
+            return Ok(());
+        }
+    }
+    let bin = server_binary().context("go-shm-server binary missing; run make engines")?;
+    let state_dir = abs_path(Path::new("state/go-ipc")).join(key);
+    fs::create_dir_all(&state_dir)?;
+    let shm_path = state_dir.join("shm");
+    let notify_path = state_dir.join("notify.sock");
+    let _ = fs::remove_file(&notify_path);
+    let layout = init_shm_file(&shm_path)?;
+    let log_path = state_dir.join("server.log");
+    let log_file = fs::File::create(&log_path)?;
+
+    let mut cmd = Command::new(&bin);
+    cmd.env("GO_SHM_FILE", &shm_path)
+        .env("GO_SHM_NOTIFY_SOCKET", &notify_path)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::from(log_file));
+    let child = crate::server::apps::child_registry::spawn_tracked(
+        &mut cmd,
+        &format!("go-shm-server {key}"),
+    )
+    .with_context(|| format!("spawn {}", bin.display()))?;
+
+    let start = std::time::Instant::now();
+    while start.elapsed() < Duration::from_secs(5) {
+        if notify_path.exists() {
+            if UnixStream::connect(&notify_path).is_ok() {
+                break;
+            }
+        }
+        std::thread::sleep(Duration::from_millis(40));
+    }
+
+    let file = OpenOptions::new().read(true).write(true).open(&shm_path)?;
+    let mmap = unsafe { memmap2::MmapMut::map_mut(&file)? };
+    RUNTIMES.lock().insert(
+        key.to_string(),
+        Runtime {
+            shm_path,
+            notify_path,
+            child,
+            mmap,
+            header: layout,
+        },
+    );
+    Ok(())
+}
+
+fn init_shm_file(path: &Path) -> Result<GoShmHeaderLayout> {
+    let slot_meta = std::mem::size_of::<GoShmSlotMeta>();
+    let body_cap = GO_SHM_BODY_MAX as usize;
+    let slot_stride = slot_meta + body_cap * 2;
+    let header_size = std::mem::size_of::<GoShmHeader>();
+    let total = header_size + slot_stride * GO_SHM_SLOTS as usize;
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(path)?;
+    file.set_len(total as u64)?;
+    let mut mmap = unsafe { memmap2::MmapMut::map_mut(&file)? };
+    write_u32(&mut mmap, 0, GO_SHM_MAGIC);
+    write_u32(&mut mmap, 4, GO_SHM_VERSION);
+    write_u32(&mut mmap, 8, GO_SHM_SLOTS);
+    write_u32(&mut mmap, 12, slot_stride as u32);
+    write_u32(&mut mmap, 16, body_cap as u32);
+    Ok(GoShmHeaderLayout {
+        slot_stride,
+        body_cap,
+        slot_count: GO_SHM_SLOTS,
+        data_offset: header_size,
+    })
+}
+
+fn server_binary() -> Option<PathBuf> {
+    let p = abs_path(Path::new("target/app-engines/go-shm-server"));
+    p.is_file().then_some(p)
+}
+
+fn abs_path(p: &Path) -> PathBuf {
+    if p.is_absolute() {
+        p.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .unwrap_or_else(|_| PathBuf::from("."))
+            .join(p)
+    }
+}
+
+fn read_u32(m: &memmap2::MmapMut, off: usize) -> u32 {
+    u32::from_le_bytes(m[off..off + 4].try_into().unwrap())
+}
+
+fn write_u32(m: &mut memmap2::MmapMut, off: usize, v: u32) {
+    m[off..off + 4].copy_from_slice(&v.to_le_bytes());
+}
+
+fn write_str(m: &mut memmap2::MmapMut, off: usize, s: &str, max: usize) {
+    let b = s.as_bytes();
+    let n = b.len().min(max - 1);
+    m[off..off + n].copy_from_slice(&b[..n]);
+    m[off + n] = 0;
+}

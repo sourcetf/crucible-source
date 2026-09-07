@@ -1,0 +1,239 @@
+configure: TARGET_OS=openbsd GO_ENGINE_MODE=shm
+configure: CARGO_FEATURES=tls,tls_boring,go_shm_ipc,tls_nss,tls_tomcrypt
+configure: wrote config.mk and build/crucible-build.toml
+boringssl: /crucible/target/tls-libs/boringssl/lib/libssl.a exists
+libtomcrypt: /crucible/target/tls-libs/libtomcrypt.a exists (RC4 stream ok)
+   Compiling crucible v0.1.0 (/crucible)
+warning: unused imports: `serve_simple` and `serve`
+ --> src/server/h1_static.rs:3:39
+  |
+3 | pub use crate::server::static_files::{serve, serve_simple};
+  |                                       ^^^^^  ^^^^^^^^^^^^
+  |
+  = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused import: `futures_util::StreamExt`
+ --> src/server/h2.rs:8:5
+  |
+8 | use futures_util::StreamExt;
+  |     ^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `std::io::Read as _`
+  --> src/server/h2.rs:11:5
+   |
+11 | use std::io::Read as _;
+   |     ^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `std::pin::Pin`
+  --> src/server/h2.rs:13:5
+   |
+13 | use std::pin::Pin;
+   |     ^^^^^^^^^^^^^
+
+warning: unused imports: `Context` and `Poll`
+  --> src/server/h2.rs:15:17
+   |
+15 | use std::task::{Context, Poll};
+   |                 ^^^^^^^  ^^^^
+
+warning: unused import: `ReadBuf`
+  --> src/server/h2.rs:16:40
+   |
+16 | use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+   |                                        ^^^^^^^
+
+warning: unused import: `Context`
+ --> src/server/syncookie.rs:4:14
+  |
+4 | use anyhow::{Context, Result};
+  |              ^^^^^^^
+
+warning: unexpected `cfg` condition name: `tls_nss_enabled`
+  --> src/server/tls/boring_path.rs:32:38
+   |
+32 |     if cfg!(all(feature = "tls_nss", tls_nss_enabled)) {
+   |                                      ^^^^^^^^^^^^^^^
+   |
+   = help: expected names are: `docsrs`, `feature`, and `test` and 31 more
+   = help: consider using a Cargo feature instead
+   = help: or consider adding in `Cargo.toml` the `check-cfg` lint config for the lint:
+            [lints.rust]
+            unexpected_cfgs = { level = "warn", check-cfg = ['cfg(tls_nss_enabled)'] }
+   = help: or consider adding `println!("cargo::rustc-check-cfg=cfg(tls_nss_enabled)");` to the top of the `build.rs`
+   = note: see <https://doc.rust-lang.org/nightly/rustc/check-cfg/cargo-specifics.html> for more information about checking conditional configuration
+   = note: `#[warn(unexpected_cfgs)]` on by default
+
+warning: unexpected `cfg` condition name: `tls_tomcrypt_enabled`
+  --> src/server/tls/boring_path.rs:35:43
+   |
+35 |     if cfg!(all(feature = "tls_tomcrypt", tls_tomcrypt_enabled)) {
+   |                                           ^^^^^^^^^^^^^^^^^^^^
+   |
+   = help: consider using a Cargo feature instead
+   = help: or consider adding in `Cargo.toml` the `check-cfg` lint config for the lint:
+            [lints.rust]
+            unexpected_cfgs = { level = "warn", check-cfg = ['cfg(tls_tomcrypt_enabled)'] }
+   = help: or consider adding `println!("cargo::rustc-check-cfg=cfg(tls_tomcrypt_enabled)");` to the top of the `build.rs`
+   = note: see <https://doc.rust-lang.org/nightly/rustc/check-cfg/cargo-specifics.html> for more information about checking conditional configuration
+
+warning: unexpected `cfg` condition name: `tls_tomcrypt_enabled`
+  --> src/server/tls/client_hello.rs:48:74
+   |
+48 |             if ssl.enable_tomcrypt && cfg!(all(feature = "tls_tomcrypt", tls_tomcrypt_enabled)) {
+   |                                                                          ^^^^^^^^^^^^^^^^^^^^
+   |
+   = help: consider using a Cargo feature instead
+   = help: or consider adding in `Cargo.toml` the `check-cfg` lint config for the lint:
+            [lints.rust]
+            unexpected_cfgs = { level = "warn", check-cfg = ['cfg(tls_tomcrypt_enabled)'] }
+   = help: or consider adding `println!("cargo::rustc-check-cfg=cfg(tls_tomcrypt_enabled)");` to the top of the `build.rs`
+   = note: see <https://doc.rust-lang.org/nightly/rustc/check-cfg/cargo-specifics.html> for more information about checking conditional configuration
+
+warning: unexpected `cfg` condition name: `tls_nss_enabled`
+  --> src/server/tls/client_hello.rs:55:64
+   |
+55 |             if ssl.enable_nss && cfg!(all(feature = "tls_nss", tls_nss_enabled)) {
+   |                                                                ^^^^^^^^^^^^^^^
+   |
+   = help: consider using a Cargo feature instead
+   = help: or consider adding in `Cargo.toml` the `check-cfg` lint config for the lint:
+            [lints.rust]
+            unexpected_cfgs = { level = "warn", check-cfg = ['cfg(tls_nss_enabled)'] }
+   = help: or consider adding `println!("cargo::rustc-check-cfg=cfg(tls_nss_enabled)");` to the top of the `build.rs`
+   = note: see <https://doc.rust-lang.org/nightly/rustc/check-cfg/cargo-specifics.html> for more information about checking conditional configuration
+
+warning: type `crucible_nss_conn` should have an upper camel case name
+  --> src/server/tls/tls_nss.rs:34:14
+   |
+34 |     pub enum crucible_nss_conn {}
+   |              ^^^^^^^^^^^^^^^^^ help: convert the identifier to upper camel case: `CrucibleNssConn`
+   |
+   = note: `#[warn(non_camel_case_types)]` (part of `#[warn(nonstandard_style)]`) on by default
+
+warning: type `crucible_tomcrypt_conn` should have an upper camel case name
+  --> src/server/tls/tls_tomcrypt.rs:36:14
+   |
+36 |     pub enum crucible_tomcrypt_conn {}
+   |              ^^^^^^^^^^^^^^^^^^^^^^ help: convert the identifier to upper camel case: `CrucibleTomcryptConn`
+
+error[E0308]: mismatched types
+   --> src/server/tls/boring_path.rs:212:36
+    |
+212 |     let tls = tokio_boring::accept(acceptor, io)
+    |               -------------------- ^^^^^^^^ expected `&SslAcceptor`, found `SslAcceptor`
+    |               |
+    |               arguments to this function are incorrect
+    |
+note: function defined here
+   --> /root/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tokio-boring-5.2.0/src/lib.rs:63:14
+    |
+ 63 | pub async fn accept<S>(acceptor: &SslAcceptor, stream: S) -> Result<SslStream<S>, HandshakeError<S>>
+    |              ^^^^^^
+help: consider borrowing here
+    |
+212 |     let tls = tokio_boring::accept(&acceptor, io)
+    |                                    +
+
+error[E0277]: `PrefixedStream` doesn't implement `std::fmt::Debug`
+   --> src/server/tls/boring_path.rs:214:57
+    |
+214 |         .map_err(|e| anyhow::anyhow!("boringssl accept: {e:?}"))?;
+    |                                                         ^^^^^ `PrefixedStream` cannot be formatted using `{:?}` because it doesn't implement `std::fmt::Debug`
+    |
+    = help: the trait `std::fmt::Debug` is not implemented for `PrefixedStream`
+    = note: add `#[derive(Debug)]` to `PrefixedStream` or manually `impl std::fmt::Debug for PrefixedStream`
+help: the trait `std::fmt::Debug` is implemented for `tokio_boring::HandshakeError<S>`
+   --> /root/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tokio-boring-5.2.0/src/lib.rs:305:1
+    |
+305 | / impl<S> fmt::Debug for HandshakeError<S>
+306 | | where
+307 | |     S: fmt::Debug,
+    | |__________________^
+    = note: required for `tokio_boring::HandshakeError<PrefixedStream>` to implement `std::fmt::Debug`
+    = note: this error originates in the macro `$crate::__private::format_args` which comes from the expansion of the macro `anyhow::anyhow` (in Nightly builds, run with -Z macro-backtrace for more info)
+help: consider annotating `PrefixedStream` with `#[derive(Debug)]`
+   --> src/server/prefixed_stream.rs:10:1
+    |
+ 10 + #[derive(Debug)]
+ 11 | pub struct PrefixedStream {
+    |
+
+warning: unused import: `http_body_util::BodyExt`
+ --> src/server/static_files.rs:8:5
+  |
+8 | use http_body_util::BodyExt;
+  |     ^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused variable: `app`
+  --> src/server/apps/go_shm.rs:79:5
+   |
+79 |     app: &AppRouteConfig,
+   |     ^^^ help: if this is intentional, prefix it with an underscore: `_app`
+   |
+   = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: value assigned to `off` is never read
+   --> src/server/tls/client_hello.rs:113:19
+    |
+113 |     let mut off = 43usize; // after session_id_len byte at 43 — need session id skip
+    |                   ^^^^^^^
+    |
+    = help: maybe it is overwritten before being read?
+    = note: `#[warn(unused_assignments)]` (part of `#[warn(unused)]`) on by default
+
+error[E0596]: cannot borrow data in dereference of `Pin<&mut LegacySyncIo<T>>` as mutable
+  --> src/server/tls/legacy_io.rs:52:48
+   |
+52 |         let n = tokio::task::block_in_place(|| self.0.read(unfilled))?;
+   |                                                ^^^^^^ cannot borrow as mutable
+   |
+   = help: trait `DerefMut` is required to modify through a dereference, but it is not implemented for `Pin<&mut LegacySyncIo<T>>`
+
+warning: variable does not need to be mutable
+  --> src/server/tls/legacy_io.rs:47:9
+   |
+47 |         mut self: Pin<&mut Self>,
+   |         ----^^^^
+   |         |
+   |         help: remove this `mut`
+   |
+   = note: `#[warn(unused_mut)]` (part of `#[warn(unused)]`) on by default
+
+error[E0596]: cannot borrow data in dereference of `Pin<&mut LegacySyncIo<T>>` as mutable
+  --> src/server/tls/legacy_io.rs:64:52
+   |
+64 |         Poll::Ready(tokio::task::block_in_place(|| self.0.write(data)))
+   |                                                    ^^^^^^ cannot borrow as mutable
+   |
+   = help: trait `DerefMut` is required to modify through a dereference, but it is not implemented for `Pin<&mut LegacySyncIo<T>>`
+
+warning: variable does not need to be mutable
+  --> src/server/tls/legacy_io.rs:60:9
+   |
+60 |         mut self: Pin<&mut Self>,
+   |         ----^^^^
+   |         |
+   |         help: remove this `mut`
+
+error[E0596]: cannot borrow data in dereference of `Pin<&mut LegacySyncIo<T>>` as mutable
+  --> src/server/tls/legacy_io.rs:68:52
+   |
+68 |         Poll::Ready(tokio::task::block_in_place(|| self.0.flush()))
+   |                                                    ^^^^^^ cannot borrow as mutable
+   |
+   = help: trait `DerefMut` is required to modify through a dereference, but it is not implemented for `Pin<&mut LegacySyncIo<T>>`
+
+warning: variable does not need to be mutable
+  --> src/server/tls/legacy_io.rs:67:19
+   |
+67 |     fn poll_flush(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+   |                   ----^^^^
+   |                   |
+   |                   help: remove this `mut`
+
+Some errors have detailed explanations: E0277, E0308, E0596.
+For more information about an error, try `rustc --explain E0277`.
+warning: `crucible` (bin "webserver") generated 19 warnings
+error: could not compile `crucible` (bin "webserver") due to 5 previous errors; 19 warnings emitted
+*** Error 101 in /crucible (Makefile:35 'release': @cd "/crucible" && unset CARGO_TARGET_DIR; export CARGO_TARGET_DIR="/crucible/target";  e...)
+

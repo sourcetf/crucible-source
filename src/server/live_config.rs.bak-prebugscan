@@ -1,0 +1,91 @@
+//! Hot-reloadable configuration snapshot + periodic mtime watch.
+
+use crate::config::Config;
+use parking_lot::RwLock;
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::time::{Duration, SystemTime};
+
+pub struct LiveConfig {
+    inner: RwLock<Config>,
+    path: PathBuf,
+    last_mtime: RwLock<Option<SystemTime>>,
+}
+
+impl LiveConfig {
+    pub fn new(cfg: Config, path: PathBuf) -> Self {
+        let mtime = std::fs::metadata(&path)
+            .and_then(|m| m.modified())
+            .ok();
+        Self {
+            inner: RwLock::new(cfg),
+            path,
+            last_mtime: RwLock::new(mtime),
+        }
+    }
+
+    pub fn snapshot(&self) -> Config {
+        self.inner.read().clone()
+    }
+
+    pub fn path(&self) -> &PathBuf {
+        &self.path
+    }
+
+    pub fn reload(&self) -> anyhow::Result<()> {
+        let cfg = Config::load(&self.path)?;
+        *self.inner.write() = cfg;
+        if let Ok(m) = std::fs::metadata(&self.path).and_then(|m| m.modified()) {
+            *self.last_mtime.write() = Some(m);
+        }
+        crate::server::apps::reconcile_apps_runtime(self);
+        log::info!("config reloaded from {}", self.path.display());
+        Ok(())
+    }
+
+    pub fn replace(&self, cfg: Config) {
+        *self.inner.write() = cfg;
+    }
+
+    pub fn update_admin_hash(&self, hash: String) {
+        let mut cfg = self.inner.write();
+        if let Some(u) = cfg.admin.users.first_mut() {
+            u.password_hash = hash;
+        } else {
+            cfg.admin.users.push(crate::config::AdminUser {
+                username: "admin".into(),
+                password_hash: hash,
+            });
+        }
+    }
+
+    /// 若 mtime 变化则 reload；供后台轮询调用。
+    pub fn reload_if_changed(&self) -> anyhow::Result<bool> {
+        let meta = std::fs::metadata(&self.path)?;
+        let mtime = meta.modified()?;
+        let prev = *self.last_mtime.read();
+        if prev == Some(mtime) {
+            return Ok(false);
+        }
+        self.reload()?;
+        Ok(true)
+    }
+}
+
+pub type SharedLive = Arc<LiveConfig>;
+
+/// 周期性监视 config.toml mtime（OpenBSD 无可靠 inotify 时用轮询即可）。
+pub fn spawn_mtime_watcher(live: Arc<LiveConfig>, interval: Duration) {
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(interval);
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            tick.tick().await;
+            match live.reload_if_changed() {
+                Ok(true) => {}
+                Ok(false) => {}
+                Err(e) => log::warn!("config watch reload failed: {e:#}"),
+            }
+        }
+    });
+}

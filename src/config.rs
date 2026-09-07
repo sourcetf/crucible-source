@@ -1,0 +1,1035 @@
+//! Configuration model parsed from `config.toml`.
+//!
+//! §16.2: `file_open` 必须序列化为 listener 内联 `["/path=mode", ...]`，
+//! 禁止 `[listeners.file_open]` 挂到错误 listener。
+
+use anyhow::{Context, Result};
+// DNS 模块类型 re-export（dot_doh / h1 / admin_api 经 crate::config 引用）
+pub use crate::server::dns::{DnsConfig, DohCfg, DotCfg};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use std::collections::BTreeMap;
+use std::fs;
+use std::path::{Path, PathBuf};
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct Config {
+    #[serde(default)]
+    pub admin: AdminConfig,
+    #[serde(default)]
+    pub access_log: AccessLogConfig,
+    #[serde(default)]
+    pub ip_access: IpAccessConfig,
+    #[serde(default)]
+    pub syncookie: SyncookieConfig,
+    #[serde(default)]
+    pub geoip: GeoIpConfig,
+    #[serde(default)]
+    pub tor_hs: TorHsConfig,
+    #[serde(default)]
+    pub telemetry: TelemetryConfig,
+    #[serde(default)]
+    pub dns: DnsConfig,
+    #[serde(default)]
+    pub listeners: Vec<ListenerConfig>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TelemetryConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_telemetry_path")]
+    pub path: String,
+}
+
+impl Default for TelemetryConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            path: default_telemetry_path(),
+        }
+    }
+}
+
+fn default_telemetry_path() -> String {
+    "/__metrics".into()
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RateLimitConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_rate_per_sec")]
+    pub rate_per_sec: f64,
+    #[serde(default = "default_rate_burst")]
+    pub burst: f64,
+    /// When true, bucket key includes request path prefix (per-path limiting).
+    #[serde(default)]
+    pub per_path: bool,
+}
+
+impl Default for RateLimitConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            rate_per_sec: default_rate_per_sec(),
+            burst: default_rate_burst(),
+            per_path: false,
+        }
+    }
+}
+
+fn default_rate_per_sec() -> f64 {
+    100.0
+}
+
+fn default_rate_burst() -> f64 {
+    200.0
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AdminUser {
+    pub username: String,
+    pub password_hash: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AdminConfig {
+    #[serde(default = "default_admin_realm")]
+    pub realm: String,
+    #[serde(default = "default_admin_path")]
+    pub path: String,
+    #[serde(default)]
+    pub users: Vec<AdminUser>,
+    /// P2-21（任务 4）：admin 面板仅在列出的端口可达；空 = 全部 listener 可达
+    /// （兼容旧行为）。建议生产配置只列 TLS 端口，避免 Basic 凭据在明文口暴露。
+    #[serde(default)]
+    pub listeners_allow: Vec<u16>,
+}
+
+impl Default for AdminConfig {
+    fn default() -> Self {
+        Self {
+            realm: default_admin_realm(),
+            path: default_admin_path(),
+            users: vec![AdminUser {
+                username: default_admin_user(),
+                password_hash: String::new(),
+            }],
+            listeners_allow: Vec::new(),
+        }
+    }
+}
+
+impl AdminConfig {
+    /// P2-21：admin 是否在该端口暴露（listeners_allow 为空 = 全部可达，兼容旧行为）。
+    pub fn listener_allowed(&self, port: u16) -> bool {
+        self.listeners_allow.is_empty() || self.listeners_allow.contains(&port)
+    }
+
+    /// 兼容旧版扁平 `[admin] username/password_hash` 字段。
+    pub fn normalize_legacy(&mut self, legacy_user: Option<String>, legacy_hash: Option<String>) {
+        if !self.users.is_empty() {
+            return;
+        }
+        if let Some(u) = legacy_user.filter(|s| !s.is_empty()) {
+            self.users.push(AdminUser {
+                username: u,
+                password_hash: legacy_hash.unwrap_or_default(),
+            });
+        }
+    }
+
+    pub fn primary_user(&self) -> Option<&AdminUser> {
+        self.users.first()
+    }
+}
+
+fn default_admin_realm() -> String {
+    "WebServer Admin".into()
+}
+fn default_admin_user() -> String {
+    "admin".into()
+}
+fn default_admin_path() -> String {
+    "/__admin".into()
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AccessLogConfig {
+    #[serde(default = "default_true")]
+    pub enable: bool,
+    #[serde(default = "default_log_level")]
+    pub level: String,
+    #[serde(default)]
+    pub realtime: bool,
+}
+
+impl Default for AccessLogConfig {
+    fn default() -> Self {
+        Self {
+            enable: true,
+            level: default_log_level(),
+            realtime: false,
+        }
+    }
+}
+
+fn default_true() -> bool {
+    true
+}
+fn default_log_level() -> String {
+    "info".into()
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct IpAccessConfig {
+    #[serde(default)]
+    pub allow: Vec<String>,
+    #[serde(default)]
+    pub deny: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SyncookieConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_syncookie_on")]
+    pub value_on: String,
+    #[serde(default = "default_syncookie_off")]
+    pub value_off: String,
+    #[serde(default = "default_syncookie_interval")]
+    pub evaluate_interval_ms: u64,
+}
+
+impl Default for SyncookieConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            value_on: default_syncookie_on(),
+            value_off: default_syncookie_off(),
+            evaluate_interval_ms: default_syncookie_interval(),
+        }
+    }
+}
+
+fn default_syncookie_on() -> String {
+    "1".into()
+}
+fn default_syncookie_off() -> String {
+    "0".into()
+}
+fn default_syncookie_interval() -> u64 {
+    5000
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct GeoIpConfig {
+    #[serde(default)]
+    pub db_path: Option<PathBuf>,
+    #[serde(default)]
+    pub enabled: bool,
+}
+
+/// §18: `autoindex = true` 或 `autoindex = { enabled, paths }`
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AutoindexConfig {
+    pub enabled: bool,
+    pub paths: Vec<String>,
+    /// 规格 5：autoindex 开启时可启用界面上传按钮（serde 走下方自定义实现）。
+    pub enable_upload: bool,
+    /// 上传并行线程数（默认 4，可配）。
+    pub upload_threads: u16,
+}
+
+fn default_upload_threads() -> u16 {
+    4
+}
+
+impl Default for AutoindexConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            paths: vec!["/".into()],
+            enable_upload: false,
+            upload_threads: 4,
+        }
+    }
+}
+
+impl AutoindexConfig {
+    pub fn allows(&self, url_path: &str) -> bool {
+        if !self.enabled {
+            return false;
+        }
+        if self.paths.is_empty() || self.paths.iter().any(|p| p == "/" || p == "*") {
+            return true;
+        }
+        self.paths
+            .iter()
+            .any(|p| url_path == p || url_path.starts_with(&format!("{}/", p.trim_end_matches('/'))))
+    }
+}
+
+impl<'de> Deserialize<'de> for AutoindexConfig {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum De {
+            Bool(bool),
+            Table {
+                #[serde(default)]
+                enabled: bool,
+                #[serde(default)]
+                paths: Vec<String>,
+                #[serde(default)]
+                enable_upload: bool,
+                #[serde(default = "default_upload_threads")]
+                upload_threads: u16,
+            },
+        }
+        match De::deserialize(deserializer)? {
+            De::Bool(b) => Ok(Self {
+                enabled: b,
+                paths: vec!["/".into()],
+                enable_upload: false,
+                upload_threads: 4,
+            }),
+            De::Table { enabled, paths, enable_upload, upload_threads } => Ok(Self {
+                enabled,
+                paths: if paths.is_empty() {
+                    vec!["/".into()]
+                } else {
+                    paths
+                },
+                enable_upload,
+                upload_threads: upload_threads.max(1),
+            }),
+        }
+    }
+}
+
+impl Serialize for AutoindexConfig {
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        if self.paths == ["/".to_string()] {
+            serializer.serialize_bool(self.enabled)
+        } else {
+            #[derive(serde::Serialize)]
+            struct T<'a> {
+                enabled: bool,
+                paths: &'a [String],
+                #[serde(default)]
+                enable_upload: bool,
+                #[serde(default)]
+                upload_threads: u16,
+            }
+            T {
+                enabled: self.enabled,
+                paths: &self.paths,
+                enable_upload: self.enable_upload,
+                upload_threads: self.upload_threads,
+            }
+            .serialize(serializer)
+        }
+    }
+}
+
+/// URL path / legacy extension → open mode.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct FileOpenTable(BTreeMap<String, FileOpenMode>);
+
+impl FileOpenTable {
+    pub fn mode_for_path(&self, req_path: &str) -> FileOpenMode {
+        let key = normalize_path_key(req_path);
+        if let Some(m) = self.0.get(&key) {
+            return *m;
+        }
+        let trimmed = key.trim_end_matches('/');
+        if trimmed != key {
+            if let Some(m) = self.0.get(trimmed) {
+                return *m;
+            }
+        }
+        if let Some(ext) = Path::new(&key)
+            .extension()
+            .and_then(|e| e.to_str())
+            .filter(|e| !e.is_empty())
+        {
+            if let Some(m) = self.0.get(ext) {
+                return *m;
+            }
+            if let Some(m) = self.0.get(&format!(".{ext}")) {
+                return *m;
+            }
+        }
+        self.0.get("*").copied().unwrap_or(FileOpenMode::Auto)
+    }
+
+    pub fn insert(&mut self, key: impl AsRef<str>, mode: FileOpenMode) {
+        self.0.insert(key.as_ref().to_string(), mode);
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+}
+
+fn normalize_path_key(path: &str) -> String {
+    let p = path.trim();
+    if p.is_empty() || p == "/" {
+        return "/".into();
+    }
+    if p.starts_with('/') {
+        p.to_string()
+    } else {
+        format!("/{p}")
+    }
+}
+
+mod file_open_serde {
+    use super::*;
+    use serde::de::Error;
+
+    #[derive(Deserialize)]
+    struct Entry {
+        path: String,
+        mode: FileOpenMode,
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> std::result::Result<FileOpenTable, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum De {
+            Inline(Vec<String>),
+            Entries(Vec<Entry>),
+            Map(BTreeMap<String, FileOpenMode>),
+        }
+        let table = match De::deserialize(deserializer)? {
+            De::Inline(rows) => parse_inline_rows(&rows).map_err(D::Error::custom)?,
+            De::Entries(entries) => {
+                let mut m = BTreeMap::new();
+                for e in entries {
+                    m.insert(e.path, e.mode);
+                }
+                m
+            }
+            De::Map(m) => m,
+        };
+        Ok(FileOpenTable(table))
+    }
+
+    pub fn serialize<S>(table: &FileOpenTable, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        use serde::ser::SerializeSeq;
+        let mut rows: Vec<String> = table
+            .0
+            .iter()
+            .map(|(k, v)| format!("{k}={}", mode_str(*v)))
+            .collect();
+        rows.sort();
+        let mut seq = serializer.serialize_seq(Some(rows.len()))?;
+        for row in rows {
+            seq.serialize_element(&row)?;
+        }
+        seq.end()
+    }
+
+    fn parse_inline_rows(rows: &[String]) -> Result<BTreeMap<String, FileOpenMode>> {
+        let mut m = BTreeMap::new();
+        for row in rows {
+            let (k, v) = row
+                .split_once('=')
+                .with_context(|| format!("invalid file_open entry: {row}"))?;
+            m.insert(k.trim().to_string(), parse_mode(v.trim())?);
+        }
+        Ok(m)
+    }
+
+    fn parse_mode(s: &str) -> Result<FileOpenMode> {
+        match s.to_ascii_lowercase().as_str() {
+            "auto" => Ok(FileOpenMode::Auto),
+            "preview" => Ok(FileOpenMode::Preview),
+            "download" => Ok(FileOpenMode::Download),
+            "execute" => Ok(FileOpenMode::Execute),
+            other => anyhow::bail!("unknown file_open mode: {other}"),
+        }
+    }
+
+    fn mode_str(m: FileOpenMode) -> &'static str {
+        match m {
+            FileOpenMode::Auto => "auto",
+            FileOpenMode::Preview => "preview",
+            FileOpenMode::Download => "download",
+            FileOpenMode::Execute => "execute",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ListenerConfig {
+    pub address: String,
+    pub port: u16,
+    pub root: PathBuf,
+    #[serde(default)]
+    pub ssl: Option<SslConfig>,
+    #[serde(default)]
+    pub apps: Vec<AppRouteConfig>,
+    #[serde(default, with = "file_open_serde")]
+    pub file_open: FileOpenTable,
+    #[serde(default)]
+    pub autoindex: AutoindexConfig,
+    #[serde(default = "default_http_versions")]
+    pub http_versions: Vec<String>,
+    #[serde(default)]
+    pub basic_auth: Option<BasicAuthConfig>,
+    #[serde(default)]
+    pub proxy_rules: Vec<ProxyRuleConfig>,
+    #[serde(default)]
+    pub page_rules: Vec<PageRuleConfig>,
+    #[serde(default)]
+    pub server_name: Option<String>,
+    #[serde(default)]
+    pub status_path: Option<String>,
+    #[serde(default)]
+    pub address_v6: Option<String>,
+    pub port_reuse: bool,
+    #[serde(default)]
+    pub rate_limit: Option<RateLimitConfig>,
+    /// §16.18 L4 不透明转发：配置后整条连接双向透传（不做 HTTP/TLS 解析）。
+    #[serde(default)]
+    pub l4_forward: Option<String>,
+}
+
+impl Default for ListenerConfig {
+    fn default() -> Self {
+        Self {
+            address: "0.0.0.0".into(),
+            port: 0,
+            root: PathBuf::from("."),
+            ssl: None,
+            apps: Vec::new(),
+            file_open: FileOpenTable::default(),
+            autoindex: AutoindexConfig::default(),
+            http_versions: default_http_versions(),
+            basic_auth: None,
+            proxy_rules: Vec::new(),
+            page_rules: Vec::new(),
+            server_name: None,
+            status_path: None,
+            address_v6: None,
+            port_reuse: false,
+             rate_limit: None,
+            l4_forward: None,
+        }
+    }
+}
+
+impl ListenerConfig {
+    pub fn file_open_mode(&self, req_path: &str) -> FileOpenMode {
+        self.file_open.mode_for_path(req_path)
+    }
+
+    pub fn allows_h1(&self) -> bool {
+        self.http_versions
+            .iter()
+            .any(|v| v.eq_ignore_ascii_case("h1") || v.eq_ignore_ascii_case("http/1.1"))
+    }
+
+    pub fn allows_h2(&self) -> bool {
+        self.http_versions
+            .iter()
+            .any(|v| v.eq_ignore_ascii_case("h2") || v.eq_ignore_ascii_case("http/2"))
+    }
+
+    pub fn allows_h3(&self) -> bool {
+        self.http_versions
+            .iter()
+            .any(|v| v.eq_ignore_ascii_case("h3") || v.eq_ignore_ascii_case("http/3"))
+    }
+}
+
+fn default_http_versions() -> Vec<String> {
+    vec!["h1".into(), "h2".into()]
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SslConfig {
+    #[serde(default)]
+    pub cert: Option<String>,
+    #[serde(default)]
+    pub key: Option<String>,
+    #[serde(default)]
+    pub cert_ec: Option<String>,
+    #[serde(default)]
+    pub key_ec: Option<String>,
+    #[serde(default)]
+    pub versions: Vec<String>,
+    #[serde(default)]
+    pub ciphers: Vec<String>,
+    #[serde(default)]
+    pub prefer_tls13: bool,
+    #[serde(default)]
+    pub ech: bool,
+    /// ECH config / keys PEM (path or inline); used by BoringSSL when `ech = true`.
+    #[serde(default)]
+    pub ech_keys: Option<String>,
+    #[serde(default)]
+    pub psk: bool,
+    /// P1-10：TLS-PSK 身份（配置后严格匹配客户端 identity；空=接受任意 identity）。
+    #[serde(default)]
+    pub psk_identity: Option<String>,
+    /// P1-10：PSK 材料（偶长 hex / base64 / 文件路径）；优先于 CRUCIBLE_TLS_PSK 环境变量。
+    #[serde(default)]
+    pub psk_key: Option<String>,
+    /// P1-8：OCSP stapling DER 文件路径（leaf+issuer 链生成；支持 PEM 自动剥壳；空=关闭）。
+    #[serde(default)]
+    pub ocsp_der_path: Option<String>,
+    /// Enable post-quantum hybrid group X25519MLKEM768 (BoringSSL default when groups empty).
+    #[serde(default)]
+    pub pqc: bool,
+    /// Explicit TLS 1.3 group list (`:`-separated names, e.g. `X25519MLKEM768:X25519:P-256`).
+    #[serde(default)]
+    pub groups: Vec<String>,
+    #[serde(default)]
+    pub enable_nss: bool,
+    #[serde(default)]
+    pub enable_tomcrypt: bool,
+    /// §1a：SNI 仅匹配模式——不回落证书，直接 421 Misdirected Request。
+    #[serde(default)]
+    pub sni_only: bool,
+    /// §1a：指定 SNI 名称（精确字符串），用于 sni_only 模式。
+    #[serde(default)]
+    pub sni_name: Option<String>,
+    /// 早期规格 1a：ECH 自动配置——public-name（对外身份，如 v.qq.com）。
+    #[serde(default)]
+    pub ech_public_name: Option<String>,
+    /// ECH HPKE 对称套件（如 HKDF-SHA384/AES-256-GCM）。
+    #[serde(default)]
+    pub ech_cipher_suite: Option<String>,
+    /// ECH maximum_name_length（默认 64）。
+    #[serde(default)]
+    pub ech_max_name_length: Option<u16>,
+    /// ECH advertise：YES 时生成/加载配置并在 HTTPS(type65) DNS 记录发布。
+    #[serde(default = "default_true")]
+    pub ech_advertise: bool,
+    /// 早期规格 3：0-RTT 默认关闭；显式开启才接受 early data。
+    #[serde(default)]
+    pub early_data: bool,
+}
+
+impl SslConfig {
+    /// 规格 1a：ECH advertise 就绪（开关开且密钥材料就位）。
+    pub fn ech_advertise_enabled(&self) -> bool {
+        self.ech && self.ech_advertise && self.ech_keys.is_some()
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AppRouteConfig {
+    #[serde(default)]
+    pub paths: Vec<String>,
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    pub engine: String,
+    #[serde(default)]
+    pub socket: Option<String>,
+    #[serde(default)]
+    pub extensions: Vec<String>,
+    #[serde(default)]
+    pub index: Option<String>,
+    #[serde(default)]
+    pub php_bin: Option<String>,
+    #[serde(default = "default_workers")]
+    pub workers: usize,
+    #[serde(default)]
+    pub source_dir: Option<PathBuf>,
+    #[serde(default)]
+    pub out_dir: Option<PathBuf>,
+    #[serde(default)]
+    pub entry: Vec<String>,
+    #[serde(default)]
+    pub watch: bool,
+    #[serde(default)]
+    pub docroot: Option<PathBuf>,
+    #[serde(default)]
+    pub lib: Option<PathBuf>,
+    #[serde(default)]
+    pub deps_dir: Option<PathBuf>,
+    #[serde(default = "default_init_timeout_opt")]
+    pub init_timeout_secs: Option<u64>,
+    #[serde(default = "default_libc_opt")]
+    pub libc: Option<String>,
+}
+
+fn default_workers() -> usize {
+    4
+}
+fn default_init_timeout_opt() -> Option<u64> {
+    Some(120)
+}
+fn default_libc_opt() -> Option<String> {
+    Some("auto".into())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum FileOpenMode {
+    Auto,
+    Preview,
+    Download,
+    Execute,
+}
+
+impl Default for FileOpenMode {
+    fn default() -> Self {
+        Self::Auto
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BasicAuthConfig {
+    pub realm: String,
+    pub username: String,
+    pub password_hash: String,
+}
+
+/// 早期规格 A.3：Hidden Service（独立 tor 进程，SocksPort 0——HS 不出站）。
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub struct TorHsConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub ports: Vec<(u16, u16)>,
+    #[serde(default)]
+    pub data_dir: Option<String>,
+    #[serde(default)]
+    pub tor_bin: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProxyRuleConfig {
+    pub path: String,
+    pub upstream: String,
+    #[serde(default)]
+    pub ssl_mode: String,
+    /// Inject/replace request headers before forwarding upstream.
+    #[serde(default)]
+    pub modify_request_headers: std::collections::HashMap<String, String>,
+    /// Inject/replace response headers before returning to client.
+    #[serde(default)]
+    pub modify_response_headers: std::collections::HashMap<String, String>,
+    /// 规格 11：回源 TLS 版本（tls1.2/tls1.3；不配=自动）。
+    #[serde(default)]
+    pub upstream_tls_version: Option<String>,
+    /// 规格 11：回源 HTTP 版本（h1/h2；不配=h1 自动）。
+    #[serde(default)]
+    pub upstream_http_version: Option<String>,
+    /// 早期规格 3：连接池/多路复用默认禁用，显式 true 才启用。
+    #[serde(default)]
+    pub connection_pool: bool,
+    /// 早期规格 A.1：强制走 Tor（needs_tor）。
+    #[serde(default)]
+    pub via_tor: bool,
+    /// 覆盖 SOCKS 端点：unix:/path 或 127.0.0.1:9050（仅 loopback TCP）；
+    /// 空 = 内置优先链（arti → UDS → loopback）。
+    #[serde(default)]
+    pub tor_socks: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PageRuleConfig {
+    pub match_url: String,
+    #[serde(default)]
+    pub action: String,
+    #[serde(default)]
+    pub target: Option<String>,
+}
+
+/// 兼容旧版 `[admin] username/password_hash` 扁平字段。
+#[derive(Debug, Deserialize)]
+struct ConfigRaw {
+    #[serde(default)]
+    admin: AdminConfigRaw,
+    #[serde(default)]
+    access_log: AccessLogConfig,
+    #[serde(default)]
+    ip_access: IpAccessConfig,
+    #[serde(default)]
+    syncookie: SyncookieConfig,
+    #[serde(default)]
+    geoip: GeoIpConfig,
+    #[serde(default)]
+    tor_hs: TorHsConfig,
+    #[serde(default)]
+    telemetry: TelemetryConfig,
+    #[serde(default)]
+    dns: DnsConfig,
+    #[serde(default)]
+    listeners: Vec<ListenerConfig>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct AdminConfigRaw {
+    #[serde(default)]
+    realm: String,
+    #[serde(default)]
+    path: String,
+    #[serde(default)]
+    users: Vec<AdminUser>,
+    #[serde(default)]
+    username: String,
+    #[serde(default)]
+    password_hash: String,
+    #[serde(default)]
+    listeners_allow: Vec<u16>,
+}
+
+impl Config {
+    pub fn load(path: &Path) -> Result<Self> {
+        let base = path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."))
+            .to_path_buf();
+        let raw = fs::read_to_string(path)
+            .with_context(|| format!("read {}", path.display()))?;
+        let raw_cfg: ConfigRaw = toml::from_str(&raw).context("parse config.toml")?;
+        let mut admin = AdminConfig {
+            realm: if raw_cfg.admin.realm.is_empty() {
+                default_admin_realm()
+            } else {
+                raw_cfg.admin.realm
+            },
+            path: if raw_cfg.admin.path.is_empty() {
+                default_admin_path()
+            } else {
+                raw_cfg.admin.path
+            },
+            users: raw_cfg.admin.users,
+            listeners_allow: raw_cfg.admin.listeners_allow,
+        };
+        admin.normalize_legacy(
+            (!raw_cfg.admin.username.is_empty()).then_some(raw_cfg.admin.username),
+            Some(raw_cfg.admin.password_hash),
+        );
+        let mut cfg = Config {
+            admin,
+            access_log: raw_cfg.access_log,
+            ip_access: raw_cfg.ip_access,
+            syncookie: raw_cfg.syncookie,
+            geoip: raw_cfg.geoip,
+            tor_hs: raw_cfg.tor_hs,
+            telemetry: raw_cfg.telemetry,
+            dns: raw_cfg.dns,
+            listeners: raw_cfg.listeners,
+        };
+        cfg.resolve_paths(&base)?;
+        cfg.validate()?;
+        Ok(cfg)
+    }
+
+    fn resolve_paths(&mut self, base: &Path) -> Result<()> {
+        for l in &mut self.listeners {
+            if !l.root.is_absolute() {
+                l.root = base.join(&l.root);
+            }
+            if let Some(ssl) = &mut l.ssl {
+                resolve_ssl_material(&mut ssl.cert, base);
+                resolve_ssl_material(&mut ssl.key, base);
+                resolve_ssl_material(&mut ssl.cert_ec, base);
+                resolve_ssl_material(&mut ssl.key_ec, base);
+            }
+            for app in &mut l.apps {
+                if let Some(d) = &app.docroot {
+                    if !d.is_absolute() {
+                        app.docroot = Some(base.join(d));
+                    }
+                }
+                if let Some(lib) = &mut app.lib {
+                    if !lib.is_absolute() {
+                        *lib = base.join(&*lib);
+                    }
+                }
+                if let Some(d) = &app.deps_dir {
+                    if !d.is_absolute() {
+                        app.deps_dir = Some(base.join(d));
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        let mut roots = BTreeMap::<String, u16>::new();
+        for l in &self.listeners {
+            // L4 透传 listener 的 root 字段无业务意义，不参与唯一性校验
+            if l.l4_forward.is_some() { continue; }
+            let key = l.root.display().to_string();
+            if let Some(prev) = roots.insert(key.clone(), l.port) {
+                anyhow::bail!(
+                    "duplicate listener root {} on ports {} and {}",
+                    key,
+                    prev,
+                    l.port
+                );
+            }
+        }
+        {
+            use std::collections::HashSet;
+            let mut seen = HashSet::new();
+            for l in &self.listeners {
+                if l.port == 0 {
+                    anyhow::bail!("listener port must not be 0");
+                }
+                let key = (l.address.clone(), l.port);
+                if !seen.insert(key) {
+                    anyhow::bail!(
+                        "duplicate listener address:port {}:{}",
+                        l.address,
+                        l.port
+                    );
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    pub fn to_toml_string(&self) -> Result<String> {
+        Ok(toml::to_string_pretty(self)?)
+    }
+}
+
+fn resolve_ssl_material(field: &mut Option<String>, base: &Path) {
+    let Some(v) = field.as_ref() else {
+        return;
+    };
+    if v.contains("-----BEGIN") || Path::new(v).is_absolute() {
+        return;
+    }
+    *field = Some(base.join(v).display().to_string());
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn file_open_inline_array_roundtrip() {
+        let raw = r#"
+            file_open = ["/php/demo.php=preview", "/static/manual.pdf=preview", "zip=download"]
+        "#;
+        #[derive(Deserialize)]
+        struct Wrap {
+            #[serde(default, with = "file_open_serde")]
+            file_open: FileOpenTable,
+        }
+        let w: Wrap = toml::from_str(raw).unwrap();
+        assert_eq!(
+            w.file_open.mode_for_path("/php/demo.php"),
+            FileOpenMode::Preview
+        );
+        assert_eq!(
+            w.file_open.mode_for_path("/static/manual.pdf"),
+            FileOpenMode::Preview
+        );
+        assert_eq!(
+            w.file_open.mode_for_path("/archive.zip"),
+            FileOpenMode::Download
+        );
+    }
+
+    #[test]
+    fn file_open_serializes_inline_array() {
+        let mut t = FileOpenTable::default();
+        t.insert("/a.txt", FileOpenMode::Download);
+        t.insert("/b.pdf", FileOpenMode::Preview);
+        #[derive(Serialize)]
+        struct Wrap {
+            #[serde(with = "file_open_serde")]
+            file_open: FileOpenTable,
+        }
+        let s = toml::to_string(&Wrap { file_open: t }).unwrap();
+        assert!(s.contains("\"/a.txt=download\""));
+        assert!(s.contains("\"/b.pdf=preview\""));
+        assert!(!s.contains("[listeners.file_open]"));
+    }
+
+    #[test]
+    fn listeners_file_open_do_not_share() {
+        let raw = r#"
+            [[listeners]]
+            address = "0.0.0.0"
+            port = 9095
+            root = "/crucible/www-apps"
+            file_open = ["/php/demo.php=preview"]
+
+            [[listeners]]
+            address = "0.0.0.0"
+            port = 8443
+            root = "/crucible/www"
+            file_open = ["/secret.zip=download"]
+        "#;
+        let cfg: ConfigRaw = toml::from_str(raw).unwrap();
+        assert_eq!(cfg.listeners.len(), 2);
+        assert_eq!(
+            cfg.listeners[0].file_open.mode_for_path("/php/demo.php"),
+            FileOpenMode::Preview
+        );
+        assert_eq!(
+            cfg.listeners[1].file_open.mode_for_path("/secret.zip"),
+            FileOpenMode::Download
+        );
+        assert_eq!(
+            cfg.listeners[0].file_open.mode_for_path("/secret.zip"),
+            FileOpenMode::Auto
+        );
+    }
+
+    #[test]
+    fn autoindex_bool_or_struct() {
+        #[derive(Deserialize)]
+        struct Wrap {
+            autoindex: AutoindexConfig,
+        }
+        let a: Wrap = toml::from_str("autoindex = true").unwrap();
+        assert!(a.autoindex.enabled);
+        let b: Wrap =
+            toml::from_str(r#"autoindex = { enabled = true, paths = ["/pub"] }"#).unwrap();
+        assert!(b.autoindex.enabled);
+        assert_eq!(b.autoindex.paths, vec!["/pub".to_string()]);
+    }
+
+    #[test]
+    fn admin_users_legacy_migration() {
+        let raw = r#"
+            [admin]
+            username = "legacy"
+            password_hash = "hash"
+        "#;
+        let raw_cfg: ConfigRaw = toml::from_str(raw).unwrap();
+        let mut admin = AdminConfig {
+            realm: default_admin_realm(),
+            path: default_admin_path(),
+            users: raw_cfg.admin.users,
+            listeners_allow: Vec::new(),
+        };
+        admin.normalize_legacy(
+            Some(raw_cfg.admin.username),
+            Some(raw_cfg.admin.password_hash),
+        );
+        assert_eq!(admin.users.len(), 1);
+        assert_eq!(admin.users[0].username, "legacy");
+    }
+}

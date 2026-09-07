@@ -1,0 +1,29 @@
+//! ISP / region alias tables for GeoIP labels.
+
+use once_cell::sync::Lazy;
+use std::collections::HashMap;
+
+static ISP_ALIASES: Lazy<HashMap<&'static str, &'static str>> = Lazy::new(|| {
+    HashMap::from([
+        ("CHINANET", "China Telecom"),
+        ("CHINA UNICOM", "China Unicom"),
+        ("CHINA MOBILE", "China Mobile"),
+        ("AMAZON", "AWS"),
+        ("AMAZON.COM", "AWS"),
+        ("GOOGLE", "Google Cloud"),
+        ("MICROSOFT", "Microsoft Azure"),
+        ("DIGITALOCEAN", "DigitalOcean"),
+        ("CLOUDFLARE", "Cloudflare"),
+    ])
+});
+
+/// Resolve a display alias for an ISP name (case-insensitive substring match).
+pub fn resolve_isp_alias(name: &str) -> String {
+    let upper = name.to_ascii_uppercase();
+    for (key, alias) in ISP_ALIASES.iter() {
+        if upper.contains(key) {
+            return (*alias).to_string();
+        }
+    }
+    name.trim().to_string()
+}

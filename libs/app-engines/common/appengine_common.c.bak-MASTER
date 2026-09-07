@@ -1,0 +1,102 @@
+#include "appengine_common.h"
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+char *appengine_strdup(const char *s)
+{
+    size_t n;
+    char *p;
+
+    if (s == NULL)
+        return NULL;
+    n = strlen(s) + 1;
+    p = (char *)malloc(n);
+    if (p == NULL)
+        return NULL;
+    memcpy(p, s, n);
+    return p;
+}
+
+int appengine_result_alloc(AppEngineResult *out)
+{
+    if (out == NULL)
+        return -1;
+    memset(out, 0, sizeof(*out));
+    return 0;
+}
+
+int appengine_result_set_body(AppEngineResult *out, const void *data, size_t len)
+{
+    char *p;
+
+    if (out == NULL)
+        return -1;
+    free(out->body);
+    out->body = NULL;
+    out->body_len = 0;
+    if (data == NULL || len == 0)
+        return 0;
+    p = (char *)malloc(len + 1);
+    if (p == NULL)
+        return -1;
+    memcpy(p, data, len);
+    p[len] = '\0';
+    out->body = p;
+    out->body_len = len;
+    return 0;
+}
+
+int appengine_result_set_headers(AppEngineResult *out, const char *headers)
+{
+    if (out == NULL)
+        return -1;
+    free(out->headers);
+    out->headers = NULL;
+    out->headers_len = 0;
+    if (headers == NULL)
+        return 0;
+    out->headers = appengine_strdup(headers);
+    if (out->headers == NULL)
+        return -1;
+    out->headers_len = strlen(out->headers);
+    return 0;
+}
+
+int appengine_result_set_error(AppEngineResult *out, const char *msg)
+{
+    if (out == NULL)
+        return -1;
+    free(out->error);
+    out->error = appengine_strdup(msg);
+    return out->error == NULL && msg != NULL ? -1 : 0;
+}
+
+int appengine_fill_hello(AppEngineResult *out, const char *engine_name, const char *path)
+{
+    char buf[512];
+    int n;
+
+    if (appengine_result_alloc(out) != 0)
+        return -1;
+    out->status = 200;
+    if (appengine_result_set_headers(out, "Content-Type: text/plain; charset=utf-8\r\n") != 0)
+        return -1;
+    n = snprintf(buf, sizeof(buf), "hello from %s engine path=%s\n",
+                 engine_name ? engine_name : "unknown",
+                 path ? path : "/");
+    if (n < 0)
+        return -1;
+    return appengine_result_set_body(out, buf, (size_t)n);
+}
+
+void appengine_result_free(AppEngineResult *out)
+{
+    if (out == NULL)
+        return;
+    free(out->headers);
+    free(out->body);
+    free(out->error);
+    memset(out, 0, sizeof(*out));
+}

@@ -1,0 +1,291 @@
+# Crucible test config — NON-STANDARD ports (avoid clash with prod 8443/9081/9095/9445/9446)
+# Ports: apps=19095 plain=19081 tls12=19445 tls13=19446 prod=18443
+
+[admin]
+realm = "WebServer Admin"
+path = "/__admin"
+
+[[admin.users]]
+username = "admin"
+password_hash = "$argon2id$v=19$m=19456,t=2,p=1$E/RLobwgix2BWMRMT++urA$yEympjJtiDh0ezwSQsnkbsfYAoSzeDAHYw3EsUMBsj4"  # sample password: admin — change immediately
+
+[access_log]
+enable = true
+level = "info"
+realtime = false
+
+[ip_access]
+allow = []
+deny = []
+
+[geoip]
+enabled = true
+db_path = "data/geoip/current/geoip.sqlite"
+
+[telemetry]
+enabled = true
+path = "/__metrics"
+
+# Apps :19095
+[[listeners]]
+address = "127.0.0.1"
+port = 19095
+root = "www-apps"
+autoindex = true
+http_versions = ["h1", "h2"]
+server_name = "apps-test.crucible.local"
+file_open = [
+  "/php/demo.php=preview",
+  "pdf=preview",
+  "zip=download",
+  "php=execute",
+]
+
+[[listeners.apps]]
+paths = ["/php"]
+enabled = true
+engine = "php"
+extensions = ["php", ""]
+workers = 16
+docroot = "www-apps/php"
+index = "index.php"
+
+[[listeners.apps]]
+paths = ["/rust"]
+enabled = true
+engine = "rust"
+extensions = ["rs", ""]
+lib = "target/app-engines/libapp_rust.so"
+docroot = "www-apps/rust"
+
+[[listeners.apps]]
+paths = ["/c"]
+enabled = true
+engine = "c"
+lib = "target/app-engines/libapp_c.so"
+docroot = "www-apps/c"
+
+[[listeners.apps]]
+paths = ["/go"]
+enabled = true
+engine = "go"
+lib = "target/app-engines/libapp_go.so"
+docroot = "www-apps/go"
+
+[[listeners.apps]]
+paths = ["/lua"]
+enabled = true
+engine = "lua"
+lib = "target/app-engines/libapp_lua.so"
+docroot = "www-apps/lua"
+
+[[listeners.apps]]
+paths = ["/asp"]
+enabled = true
+engine = "asp"
+extensions = ["asp", ""]
+lib = "target/app-engines/libapp_asp.so"
+docroot = "www-apps/asp"
+index = "index.asp"
+
+[[listeners.apps]]
+paths = ["/python"]
+enabled = true
+engine = "python"
+extensions = ["py", ""]
+lib = "target/app-engines/libapp_python.so"
+docroot = "www-apps/python"
+index = "index.py"
+
+[[listeners.apps]]
+paths = ["/ruby"]
+enabled = true
+engine = "ruby"
+extensions = ["rb", ""]
+lib = "target/app-engines/libapp_ruby.so"
+docroot = "www-apps/ruby"
+index = "index.rb"
+
+[[listeners.apps]]
+paths = ["/perl"]
+enabled = true
+engine = "perl"
+extensions = ["pl", ""]
+lib = "target/app-engines/libapp_perl.so"
+docroot = "www-apps/perl"
+index = "index.pl"
+
+[[listeners.apps]]
+paths = ["/jsp"]
+enabled = true
+engine = "jsp"
+extensions = ["jsp", ""]
+docroot = "www-apps/jsp"
+index = "index.jsp"
+socket = "state/jsp/test.sock"
+
+[[listeners.apps]]
+paths = ["/do"]
+enabled = true
+engine = "do"
+extensions = ["jsp", "do", ""]
+docroot = "www-apps/jsp"
+index = "index.jsp"
+socket = "state/jsp/test.sock"
+
+[[listeners.apps]]
+paths = ["/wsgi"]
+enabled = true
+engine = "wsgi"
+lib = "target/app-engines/libapp_wsgi.so"
+docroot = "www-apps/wsgi"
+index = "index.py"
+
+[[listeners.apps]]
+paths = ["/asgi"]
+enabled = true
+engine = "asgi"
+lib = "target/app-engines/libapp_asgi.so"
+docroot = "www-apps/asgi"
+index = "index.py"
+
+[[listeners.apps]]
+paths = ["/psgi"]
+enabled = true
+engine = "psgi"
+lib = "target/app-engines/libapp_psgi.so"
+docroot = "www-apps/psgi"
+index = "index.psgi"
+
+[[listeners.apps]]
+paths = ["/rack"]
+enabled = true
+engine = "rack"
+lib = "target/app-engines/libapp_rack.so"
+docroot = "www-apps/rack"
+index = "index.ru"
+
+[[listeners.apps]]
+paths = ["/cgi"]
+enabled = true
+engine = "cgi"
+lib = "target/app-engines/libapp_cgi.so"
+docroot = "www-apps/cgi"
+index = "index.cgi"
+
+[[listeners.apps]]
+paths = ["/uwsgi"]
+enabled = true
+engine = "uwsgi"
+lib = "target/app-engines/libapp_uwsgi.so"
+docroot = "www-apps/uwsgi"
+
+[[listeners.apps]]
+paths = ["/tsx"]
+enabled = true
+engine = "tsx"
+extensions = ["tsx", "ts", ""]
+lib = "target/app-engines/libapp_tsx.so"
+docroot = "www-apps/tsx"
+index = "index.tsx"
+
+[[listeners.apps]]
+paths = ["/aspnet"]
+enabled = true
+engine = "aspnet"
+lib = "target/app-engines/libapp_aspnet.so"
+docroot = "www-apps/aspnet"
+index = "index.aspx"
+
+# Fair plain :19081
+[[listeners]]
+address = "127.0.0.1"
+port = 19081
+root = "www-static-fair"
+autoindex = true
+http_versions = ["h1", "h2"]
+server_name = "fair-plain-test.crucible.local"
+
+# Fair TLS1.2 :19445
+[[listeners]]
+address = "127.0.0.1"
+port = 19445
+root = "www-static-fair-tls12"
+autoindex = true
+http_versions = ["h1", "h2"]
+server_name = "fair-tls12-test.crucible.local"
+ssl = { cert = "cert.pem", key = "key.pem", prefer_tls13 = false, versions = ["TLSv1.2"], enable_nss = true, enable_tomcrypt = true }
+
+# Fair TLS1.3 :19446
+[[listeners]]
+address = "127.0.0.1"
+port = 19446
+root = "www-static-fair-tls13"
+autoindex = true
+http_versions = ["h1", "h2"]
+server_name = "fair-tls13-test.crucible.local"
+ssl = { cert = "cert.pem", key = "key.pem", prefer_tls13 = true, versions = ["TLSv1.2", "TLSv1.3"] }
+
+# Prod-like TLS :18443 (H3 enabled)
+[[listeners]]
+address = "127.0.0.1"
+port = 18443
+root = "www"
+autoindex = { enabled = true, paths = ["/"] }
+http_versions = ["h1", "h2", "h3"]
+server_name = "prod-test.crucible.local"
+ssl = { cert = "cert.pem", key = "key.pem", cert_ec = "cert_ec.pem", key_ec = "key_ec.pem", prefer_tls13 = true, pqc = true, ech = true, ech_keys = "state/ech/ech_keys.pem", enable_nss = true, enable_tomcrypt = true }
+
+# ---------- DNS (bind9 named) 测试配置 ----------
+# test_mode=true → named 127.0.0.1:5353 / rndc 1953 / DoT 11853，不碰系统 named 的 53
+[dns]
+enabled = true
+test_mode = true
+modes = { root = false, recursive = true, authoritative = true }
+listen_addr = "127.0.0.1"
+recursion_acl = ["127.0.0.0/8"]
+axfr_out_acl = ["127.0.0.0/8"]
+
+[dns.dnssec]
+enabled = true
+algorithm = "ECDSAP256SHA256"
+rotation_enabled = true
+rotation_days = 30
+ksk_lifetime_days = 365
+nsec3 = true
+nsec3_iterations = 0
+
+[dns.dot]
+enabled = true
+port = 11853
+cert = "cert.pem"
+key = "key.pem"
+
+[dns.doh]
+enabled = true
+path = "/dns-query"
+hostnames = ["dns.crucible.local", "127.0.0.1:19095"]
+
+[dns.geo]
+enabled = true
+
+[[dns.geo.lines]]
+name = "lab-a"
+cidrs = ["192.0.2.0/24"]
+
+[[dns.geo.lines]]
+name = "lab-b"
+cidrs = ["198.51.100.0/24"]
+
+[[dns.rpz]]
+name = "blocked.crucible.test"
+rtype = "nxdomain"
+value = ""
+
+[[dns.rpz]]
+name = "www.crucible.test"
+rtype = "A"
+value = "192.0.2.88"
+
+[dns.rootzone]
+enabled = false

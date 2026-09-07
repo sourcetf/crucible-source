@@ -1,0 +1,12 @@
+[package]
+name = "quinn-boring"
+version = "0.1.0"
+edition = "2021"
+description = "QUIC/H3 BoringSSL helpers for Crucible (peer_identity + PEM-validated BoringQuicConfig)"
+
+[features]
+default = []
+boring = ["dep:boring"]
+
+[dependencies]
+boring = { version = "5", optional = true, features = ["pq-experimental"] }

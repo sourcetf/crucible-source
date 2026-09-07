@@ -1,0 +1,1 @@
+uwsgi: libapp_uwsgi.so

@@ -1,0 +1,87 @@
+[workspace]
+members = [".", "libs/h2", "libs/quinn-boring"]
+exclude = ["libs/app-engines/samples/rust-plugin"]
+resolver = "2"
+
+[package]
+name = "crucible"
+version = "0.1.0"
+edition = "2021"
+default-run = "webserver"
+build = "build.rs"
+
+[[bin]]
+name = "webserver"
+path = "src/main.rs"
+
+[features]
+# `tls` = TLS accept paths compiled in (marker). Primary stack is BoringSSL.
+# rustls is opt-in fallback only (`tls_rustls`) so TLS1.3 benches stay clean.
+default = ["tls", "tls_boring"]
+tls = ["dep:rustls", "dep:rustls-pemfile"]
+tls_rustls = ["dep:rustls", "dep:tokio-rustls", "dep:rustls-pemfile"]
+tls_boring = ["dep:boring", "dep:tokio-boring", "dep:boring-sys", "quinn-boring/boring"]
+linux_busy_poll = []
+linux_syncookie = []
+go_shm_ipc = []
+tls_nss = []
+tls_tomcrypt = []
+
+[dependencies]
+h2 = { path = "libs/h2" }
+boring = { version = "5", optional = true, features = [
+    "pq-experimental"] }
+boring-sys = { version = "5", optional = true }
+tokio-boring = { version = "5", optional = true }
+quinn-boring = { path = "libs/quinn-boring" }
+quinn = { version = "0.11", default-features = false, features = [
+    "runtime-tokio", "rustls"] }
+h3 = "0.0.8"
+h3-quinn = "0.0.10"
+hyper = { version = "1", features = [
+    "full"] }
+hyper-util = { version = "0.1", features = [
+    "full"] }
+http = "1"
+http-body-util = "0.1"
+bytes = "1"
+tokio = { version = "1", features = [
+    "full"] }
+anyhow = "1"
+serde = { version = "1", features = [
+    "derive"] }
+toml = "0.8"
+log = "0.4"
+env_logger = "0.11"
+libc = "0.2"
+argon2 = { version = "0.5", features = [
+    "std"] }
+password-hash = { version = "0.5", features = [
+    "rand_core"] }
+rand_core = { version = "0.6", features = [
+    "getrandom"] }
+yescrypt = "0.1"
+rusqlite = { version = "0.32", features = [
+    "bundled"] }
+mime_guess = "2"
+percent-encoding = "2"
+serde_json = "1"
+futures-util = "0.3"
+pin-project-lite = "0.2"
+parking_lot = "0.12"
+libloading = "0.8"
+once_cell = "1"
+tokio-util = { version = "0.7", features = [
+    "io"] }
+memmap2 = "0.9"
+rustls = { version = "0.23", optional = true, features = [
+    "ring"] }
+tokio-rustls = { version = "0.26", optional = true }
+rustls-pemfile = { version = "2", optional = true }
+
+[build-dependencies]
+cc = "1"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1

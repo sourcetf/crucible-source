@@ -1,0 +1,12 @@
+[package]
+name = "app_rust_plugin"
+version = "0.1.0"
+edition = "2021"
+
+[workspace]
+
+[lib]
+crate-type = ["cdylib"]
+name = "app_rust"
+
+[dependencies]

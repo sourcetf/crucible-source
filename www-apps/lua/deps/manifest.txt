@@ -1,0 +1,1 @@
+lua: FFI engine libapp_lua.so (no sidecar binary needed)

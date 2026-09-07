@@ -1,0 +1,404 @@
+[access_log]
+enable = true
+level = "info"
+realtime = false
+
+[admin]
+realm = "diff_merge_test"
+
+[dns]
+axfr_out_acl = ["127.0.0.0/8"]
+enabled = true
+listen_addr = "any"
+recursion_acl = ["0.0.0.0/0"]
+test_mode = false
+
+[dns.dnssec]
+algorithm = "ECDSAP256SHA256"
+enabled = true
+ksk_lifetime_days = 365
+nsec3 = true
+nsec3_iterations = 0
+rotation_days = 30
+rotation_enabled = true
+
+[dns.doh]
+enabled = true
+hostnames = []
+path = "/dns-query"
+
+[dns.dot]
+cert = "cert.pem"
+enabled = true
+key = "key.pem"
+port = 853
+
+[dns.geo]
+enabled = true
+
+[[dns.geo.lines]]
+cidrs = ["192.0.2.0/24"]
+name = "lab-a"
+
+[[dns.geo.lines]]
+cidrs = ["198.51.100.0/24"]
+name = "lab-b"
+
+[dns.modes]
+authoritative = true
+recursive = true
+root = true
+
+[dns.rootzone]
+enabled = false
+
+[[dns.rpz]]
+name = "blocked.crucible.test"
+rtype = "nxdomain"
+value = ""
+
+[[dns.rpz]]
+name = "www.crucible.test"
+rtype = "A"
+value = "192.0.2.88"
+
+[geoip]
+db_path = "data/geoip/current/geoip.sqlite"
+enabled = true
+
+[ip_access]
+allow = []
+deny = []
+
+[[listeners]]
+address = "0.0.0.0"
+address_v6 = "::"
+autoindex = true
+file_open = [
+    "/php/demo.php=preview",
+    "pdf=preview",
+    "zip=download",
+    "php=execute",
+]
+http_versions = [
+    "h1",
+    "h2",
+]
+port = 19095
+root = "www-apps"
+server_name = "apps-test.crucible.local"
+
+[[listeners.apps]]
+docroot = "www-apps/php"
+enabled = true
+engine = "php"
+extensions = [
+    "php",
+    "",
+]
+index = "index.php"
+paths = ["/php"]
+workers = 16
+
+[[listeners.apps]]
+docroot = "www-apps/rust"
+enabled = true
+engine = "rust"
+extensions = [
+    "rs",
+    "",
+]
+lib = "target/app-engines/libapp_rust.so"
+paths = ["/rust"]
+
+[[listeners.apps]]
+docroot = "www-apps/c"
+enabled = true
+engine = "c"
+lib = "target/app-engines/libapp_c.so"
+paths = ["/c"]
+
+[[listeners.apps]]
+docroot = "www-apps/go"
+enabled = true
+engine = "go"
+lib = "target/app-engines/libapp_go.so"
+paths = ["/go"]
+
+[[listeners.apps]]
+docroot = "www-apps/lua"
+enabled = true
+engine = "lua"
+lib = "target/app-engines/libapp_lua.so"
+paths = ["/lua"]
+
+[[listeners.apps]]
+docroot = "www-apps/asp"
+enabled = true
+engine = "asp"
+extensions = [
+    "asp",
+    "",
+]
+index = "index.asp"
+lib = "target/app-engines/libapp_asp.so"
+paths = ["/asp"]
+
+[[listeners.apps]]
+docroot = "www-apps/python"
+enabled = true
+engine = "python"
+extensions = [
+    "py",
+    "",
+]
+index = "index.py"
+lib = "target/app-engines/libapp_python.so"
+paths = ["/python"]
+
+[[listeners.apps]]
+docroot = "www-apps/ruby"
+enabled = true
+engine = "ruby"
+extensions = [
+    "rb",
+    "",
+]
+index = "index.rb"
+lib = "target/app-engines/libapp_ruby.so"
+paths = ["/ruby"]
+
+[[listeners.apps]]
+docroot = "www-apps/perl"
+enabled = true
+engine = "perl"
+extensions = [
+    "pl",
+    "",
+]
+index = "index.pl"
+lib = "target/app-engines/libapp_perl.so"
+paths = ["/perl"]
+
+[[listeners.apps]]
+docroot = "www-apps/jsp"
+enabled = true
+engine = "jsp"
+extensions = [
+    "jsp",
+    "",
+]
+index = "index.jsp"
+paths = ["/jsp"]
+socket = "state/jsp/test.sock"
+
+[[listeners.apps]]
+docroot = "www-apps/jsp"
+enabled = true
+engine = "do"
+extensions = [
+    "jsp",
+    "do",
+    "",
+]
+index = "index.jsp"
+paths = ["/do"]
+socket = "state/jsp/test.sock"
+
+[[listeners.apps]]
+docroot = "www-apps/wsgi"
+enabled = true
+engine = "wsgi"
+index = "index.py"
+lib = "target/app-engines/libapp_wsgi.so"
+paths = ["/wsgi"]
+
+[[listeners.apps]]
+docroot = "www-apps/asgi"
+enabled = true
+engine = "asgi"
+index = "index.py"
+lib = "target/app-engines/libapp_asgi.so"
+paths = ["/asgi"]
+
+[[listeners.apps]]
+docroot = "www-apps/psgi"
+enabled = true
+engine = "psgi"
+index = "index.psgi"
+lib = "target/app-engines/libapp_psgi.so"
+paths = ["/psgi"]
+
+[[listeners.apps]]
+docroot = "www-apps/rack"
+enabled = true
+engine = "rack"
+index = "index.ru"
+lib = "target/app-engines/libapp_rack.so"
+paths = ["/rack"]
+
+[[listeners.apps]]
+docroot = "www-apps/cgi"
+enabled = true
+engine = "cgi"
+index = "index.cgi"
+lib = "target/app-engines/libapp_cgi.so"
+paths = ["/cgi"]
+
+[[listeners.apps]]
+docroot = "www-apps/uwsgi"
+enabled = true
+engine = "uwsgi"
+lib = "target/app-engines/libapp_uwsgi.so"
+paths = ["/uwsgi"]
+
+[[listeners.apps]]
+docroot = "www-apps/tsx"
+enabled = true
+engine = "tsx"
+extensions = [
+    "tsx",
+    "ts",
+    "",
+]
+index = "index.tsx"
+lib = "target/app-engines/libapp_tsx.so"
+paths = ["/tsx"]
+
+[[listeners.apps]]
+docroot = "www-apps/aspnet"
+enabled = true
+engine = "aspnet"
+index = "index.aspx"
+lib = "target/app-engines/libapp_aspnet.so"
+paths = ["/aspnet"]
+
+[[listeners]]
+address = "0.0.0.0"
+address_v6 = "::"
+autoindex = true
+http_versions = [
+    "h1",
+    "h2",
+]
+port = 19081
+root = "www-static-fair"
+server_name = "fair-plain-test.crucible.local"
+status_path = "/__status"
+
+[[listeners]]
+address = "0.0.0.0"
+address_v6 = "::"
+autoindex = true
+http_versions = [
+    "h1",
+    "h2",
+]
+port = 19445
+root = "www-static-fair-tls12"
+server_name = "fair-tls12-test.crucible.local"
+
+[listeners.ssl]
+cert = "cert.pem"
+enable_nss = true
+enable_tomcrypt = true
+key = "key.pem"
+prefer_tls13 = false
+versions = ["TLSv1.2"]
+
+[[listeners]]
+address = "0.0.0.0"
+address_v6 = "::"
+autoindex = true
+http_versions = [
+    "h1",
+    "h2",
+]
+port = 19446
+root = "www-static-fair-tls13"
+server_name = "fair-tls13-test.crucible.local"
+
+[listeners.ssl]
+cert = "cert.pem"
+key = "key.pem"
+prefer_tls13 = true
+versions = [
+    "TLSv1.2",
+    "TLSv1.3",
+]
+
+[[listeners]]
+address = "0.0.0.0"
+address_v6 = "::"
+http_versions = [
+    "h1",
+    "h2",
+    "h3",
+]
+port = 18443
+root = "www"
+server_name = "prod-test.crucible.local"
+
+[listeners.autoindex]
+enabled = true
+paths = ["/"]
+
+[listeners.ssl]
+cert = "cert.pem"
+cert_ec = "cert_ec.pem"
+ech = true
+ech_keys = "state/ech/ech_keys.pem"
+enable_nss = true
+enable_tomcrypt = true
+key = "key.pem"
+key_ec = "key_ec.pem"
+pqc = true
+prefer_tls13 = true
+
+[[listeners]]
+address = "0.0.0.0"
+address_v6 = "::"
+http_versions = [
+    "h1",
+    "h2",
+    "h3",
+]
+port = 8443
+root = "www-doh"
+server_name = "crucible.local"
+
+[listeners.autoindex]
+enabled = true
+paths = ["/"]
+
+[listeners.ssl]
+cert = "cert.pem"
+cert_ec = "cert_ec.pem"
+ech = true
+ech_keys = "state/ech/ech_keys.pem"
+key = "key.pem"
+key_ec = "key_ec.pem"
+pqc = true
+prefer_tls13 = true
+
+[[listeners]]
+address = "0.0.0.0"
+address_v6 = "::"
+l4_forward = "127.0.0.1:55556"
+port = 55555
+root = "www-static-fair"
+
+[[listeners]]
+address = "0.0.0.0"
+address_v6 = "::"
+http_versions = ["h1"]
+port = 55556
+root = "state/l4auto"
+
+[listeners.autoindex]
+enabled = true
+paths = ["/"]
+
+[telemetry]
+enabled = true
+path = "/__metrics"

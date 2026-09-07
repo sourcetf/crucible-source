@@ -1,0 +1,174 @@
+//! Hot-reloadable configuration snapshot + periodic mtime watch.
+
+use crate::config::Config;
+use parking_lot::RwLock;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::time::{Duration, SystemTime};
+
+pub struct LiveConfig {
+    inner: RwLock<Config>,
+    path: PathBuf,
+    last_mtime: RwLock<Option<SystemTime>>,
+}
+
+
+fn persist_admin_hash_structured(path: &Path, username: &str, hash: &str) -> anyhow::Result<()> {
+    use crate::server::admin_config_edit as cfg_edit;
+    // Build a one-shot LiveConfig-like write via tree APIs used by admin_config_edit.
+    let mut tree = cfg_edit::load_tree(path)?;
+    // Reuse persist logic by mutating tree then validating write.
+    let table = tree
+        .as_table_mut()
+        .ok_or_else(|| anyhow::anyhow!("config root not a table"))?;
+    let admin = table
+        .entry("admin".to_string())
+        .or_insert_with(|| toml::Value::Table(toml::map::Map::new()));
+    let at = admin
+        .as_table_mut()
+        .ok_or_else(|| anyhow::anyhow!("[admin] not a table"))?;
+    let users = at
+        .entry("users".to_string())
+        .or_insert_with(|| toml::Value::Array(Vec::new()));
+    let arr = users
+        .as_array_mut()
+        .ok_or_else(|| anyhow::anyhow!("admin.users not array"))?;
+    let mut found = false;
+    for u in arr.iter_mut() {
+        if u.get("username").and_then(|x| x.as_str()) == Some(username) {
+            if let Some(t) = u.as_table_mut() {
+                t.insert("password_hash".into(), toml::Value::String(hash.to_string()));
+                found = true;
+            }
+        }
+    }
+    if !found {
+        let mut m = toml::map::Map::new();
+        m.insert("username".into(), toml::Value::String(username.into()));
+        m.insert("password_hash".into(), toml::Value::String(hash.to_string()));
+        arr.push(toml::Value::Table(m));
+    }
+    let text = toml::to_string_pretty(&tree).map_err(|e| anyhow::anyhow!("toml encode: {e}"))?;
+    let tmp_validate = path.with_extension("toml.validate");
+    std::fs::write(&tmp_validate, &text)?;
+    let parsed = crate::config::Config::load(&tmp_validate).map_err(|e| {
+        let _ = std::fs::remove_file(&tmp_validate);
+        anyhow::anyhow!("config validate: {e}")
+    })?;
+    let _ = std::fs::remove_file(&tmp_validate);
+    parsed.validate()?;
+    let tmp = path.with_extension("toml.tmp");
+    std::fs::write(&tmp, text)?;
+    std::fs::rename(&tmp, path)?;
+    Ok(())
+}
+
+impl LiveConfig {
+    pub fn new(cfg: Config, path: PathBuf) -> Self {
+        let mtime = std::fs::metadata(&path)
+            .and_then(|m| m.modified())
+            .ok();
+        Self {
+            inner: RwLock::new(cfg),
+            path,
+            last_mtime: RwLock::new(mtime),
+        }
+    }
+
+    pub fn snapshot(&self) -> Config {
+        self.inner.read().clone()
+    }
+
+    pub fn path(&self) -> &PathBuf {
+        &self.path
+    }
+
+    pub fn reload(&self) -> anyhow::Result<()> {
+        let cfg = Config::load(&self.path)?;
+        let old_binds: std::collections::BTreeSet<(String, u16)> = {
+            let cur = self.inner.read();
+            cur.listeners
+                .iter()
+                .map(|l| (l.address.clone(), l.port))
+                .collect()
+        };
+        let new_binds: std::collections::BTreeSet<(String, u16)> = cfg
+            .listeners
+            .iter()
+            .map(|l| (l.address.clone(), l.port))
+            .collect();
+        if old_binds != new_binds {
+            let added: Vec<_> = new_binds.difference(&old_binds).cloned().collect();
+            let removed: Vec<_> = old_binds.difference(&new_binds).cloned().collect();
+            log::info!(
+                "config reload: listener binds changed (added={added:?} removed={removed:?});                  removed ports stop accepting; added ports are hot-spawned by reconciler"
+            );
+        }
+        if let Ok(meta) = std::fs::metadata(&self.path) {
+            *self.last_mtime.write() = meta.modified().ok();
+        }
+        *self.inner.write() = cfg;
+        crate::server::apps::reconcile_apps_runtime(self);
+        log::info!("config reloaded from {}", self.path.display());
+        Ok(())
+    }
+
+    pub fn replace(&self, cfg: Config) {
+        *self.inner.write() = cfg;
+    }
+
+    pub fn update_admin_hash(&self, hash: String) {
+        {
+            let mut cfg = self.inner.write();
+            if let Some(u) = cfg.admin.users.first_mut() {
+                u.password_hash = hash.clone();
+            } else {
+                cfg.admin.users.push(crate::config::AdminUser {
+                    username: "admin".into(),
+                    password_hash: hash.clone(),
+                });
+            }
+        }
+        // 持久化到 config 文件：否则 mtime watcher 重载 / 重启后新密码被冲掉。
+        self.persist_admin_hash(&hash);
+    }
+
+    fn persist_admin_hash(&self, hash: &str) {
+        // Structured TOML edit via admin_config_edit (no first-line scan).
+        if let Err(e) = persist_admin_hash_structured(&self.path, "admin", hash) {
+            log::warn!("persist_admin_hash failed: {e:#}");
+        } else {
+            let _ = self.reload();
+        }
+    }
+
+    /// 若 mtime 变化则 reload；供后台轮询调用。
+    pub fn reload_if_changed(&self) -> anyhow::Result<bool> {
+        let meta = std::fs::metadata(&self.path)?;
+        let mtime = meta.modified()?;
+        let prev = *self.last_mtime.read();
+        if prev == Some(mtime) {
+            return Ok(false);
+        }
+        self.reload()?;
+        Ok(true)
+    }
+}
+
+pub type SharedLive = Arc<LiveConfig>;
+
+/// 周期性监视 config.toml mtime（OpenBSD 无可靠 inotify 时用轮询即可）。
+pub fn spawn_mtime_watcher(live: Arc<LiveConfig>, interval: Duration) {
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(interval);
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            tick.tick().await;
+            match live.reload_if_changed() {
+                Ok(true) => {}
+                Ok(false) => {}
+                Err(e) => log::warn!("config watch reload failed: {e:#}"),
+            }
+        }
+    });
+}

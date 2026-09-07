@@ -1,0 +1,585 @@
+//! dlopen-based app engine FFI (RTLD_GLOBAL).
+//!
+//! §7.3 最终态：c/go/rust 同线程内联 exec（跳过 env 锁）；其余引擎走专用
+//! 线程池（通用 clamp(2..=4)，rack/psgi 串行单线程）+ 按引擎分锁。
+//! ABI 的 headers 块与请求 body/content_type 全量透传（旧实现把引擎设置
+//! 的响应头整体丢弃，导致 ngx.header / WSGI 自定义头失效、POST 空 body）。
+
+use crate::config::{AppRouteConfig, ListenerConfig};
+use crate::server::apps::env_lock;
+use crate::server::h1::{full, BoxBody};
+use anyhow::{bail, Context, Result};
+use bytes::Bytes;
+use http::{Request, Response, StatusCode};
+use http_body_util::BodyExt;
+use hyper::body::Incoming;
+use once_cell::sync::Lazy;
+use parking_lot::Mutex;
+use std::collections::HashMap;
+use std::ffi::{CStr, CString};
+use std::net::SocketAddr;
+use std::os::raw::{c_char, c_int, c_void};
+use std::path::PathBuf;
+use std::sync::Arc;
+
+#[repr(C)]
+struct AppEngineResult {
+    status: c_int,
+    headers: *mut c_char,
+    headers_len: usize,
+    body: *mut u8,
+    body_len: usize,
+    error: *mut c_char,
+}
+
+type InitFn = unsafe extern "C" fn(*const c_char, *const c_char) -> c_int;
+type ExecFn = unsafe extern "C" fn(
+    *const c_char,
+    *const c_char,
+    *const c_char,
+    *const c_char,
+    *const c_char,
+    *const c_char,
+    *const u8,
+    usize,
+    *const c_char,
+    *const c_char,
+    c_int,
+    *const c_char,
+    *mut AppEngineResult,
+) -> c_int;
+type FreeFn = unsafe extern "C" fn(*mut AppEngineResult);
+type ShutdownFn = unsafe extern "C" fn();
+
+struct EngineLib {
+    engine: String,
+    path: String,
+    handle: *mut c_void,
+    #[allow(dead_code)]
+    init: InitFn,
+    exec: ExecFn,
+    free: FreeFn,
+    shutdown: ShutdownFn,
+}
+
+unsafe impl Send for EngineLib {}
+unsafe impl Sync for EngineLib {}
+
+impl Drop for EngineLib {
+    fn drop(&mut self) {
+        // Deferred reconcile unload: last Arc drops → shutdown + dlclose.
+        unsafe {
+            (self.shutdown)();
+            if !self.handle.is_null() {
+                libc::dlclose(self.handle);
+                self.handle = std::ptr::null_mut();
+            }
+        }
+    }
+}
+
+
+/// 缓存键 = .so 路径字符串（同引擎多 lib 并存时不串台）。
+static LIBS: Lazy<Mutex<HashMap<String, Arc<EngineLib>>>> =
+    Lazy::new(|| Mutex::new(HashMap::new()));
+
+/// §7.2 引擎单次执行的结果（状态码 + 头块 + body）。
+pub struct ExecOutcome {
+    pub status: i32,
+    pub headers: Vec<(String, String)>,
+    pub body: Bytes,
+}
+
+pub async fn execute(
+    req: Request<Incoming>,
+    lc: &ListenerConfig,
+    app: &AppRouteConfig,
+    peer: SocketAddr,
+) -> Result<Response<BoxBody>> {
+    let (parts, body) = req.into_parts();
+    let method = parts.method.as_str().to_string();
+    let path = parts.uri.path().to_string();
+    let query = parts.uri.query().unwrap_or("").to_string();
+    let content_type = parts
+        .headers
+        .get(http::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+    // §7.10 热路径：GET/HEAD 无 body 时不 collect，保持 rust≈static 的延迟。
+    let body_bytes = if request_has_body(&parts.method, &parts.headers) {
+        body.collect()
+            .await
+            .context("read app request body")?
+            .to_bytes()
+    } else {
+        Bytes::new()
+    };
+    let outcome = exec_dispatch(
+        &method, &path, &query, &content_type, &body_bytes, lc, app, peer,
+    )
+    .await?;
+    Ok(response_from_outcome(outcome))
+}
+
+/// `Request<()>` 变体（H2/H3 static 短路路径），无 body。
+pub async fn execute_simple(
+    req: &Request<()>,
+    lc: &ListenerConfig,
+    app: &AppRouteConfig,
+    peer: SocketAddr,
+) -> Result<ExecOutcome> {
+    let method = req.method().as_str().to_string();
+    let path = req.uri().path().to_string();
+    let query = req.uri().query().unwrap_or("").to_string();
+    let content_type = req
+        .headers()
+        .get(http::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+    exec_dispatch(
+        &method,
+        &path,
+        &query,
+        &content_type,
+        &Bytes::new(),
+        lc,
+        app,
+        peer,
+    )
+    .await
+}
+
+async fn exec_dispatch(
+    method: &str,
+    path: &str,
+    query: &str,
+    content_type: &str,
+    body: &Bytes,
+    lc: &ListenerConfig,
+    app: &AppRouteConfig,
+    peer: SocketAddr,
+) -> Result<ExecOutcome> {
+    let engine = app.engine.to_ascii_lowercase();
+    let lib_path = resolve_lib(app, &engine)?;
+    let docroot = app.docroot.clone().unwrap_or_else(|| lc.root.clone());
+    // §7.1 防穿越：script 必须留在 docroot 下（裸 join 可 /engine/../../ 读任意文件）。
+    let script = crate::server::admin_files::script_rel(&docroot, path.trim_start_matches('/'))
+        .map_err(|e| anyhow::anyhow!("script path rejected: {e:#}"))?;
+    let port = lc.port;
+    let server_name = lc.server_name.clone().unwrap_or_else(|| "crucible".into());
+    let inline = matches!(engine.as_str(), "c" | "go" | "rust");
+
+    let m = method.to_string();
+    let p = path.to_string();
+    let q = query.to_string();
+    let ct = content_type.to_string();
+    let b = body.clone();
+
+    if inline {
+        // c/go/rust：同线程内联 exec，跳过 env 锁（§7.3）。
+        run_inline(
+            &engine, &lib_path, &script, &docroot, &m, &p, &q, &ct, &b, peer, port, &server_name,
+        )
+    } else {
+        let serial = serial_engine(&engine);
+        let engine_for_pool = engine.clone();
+        let job = move || {
+            env_lock::with_temp_env_named(&engine, &[], || {
+                let lib = load_engine(&engine, &lib_path)?;
+                call_exec(
+                    &lib, &engine, &script, &docroot, &m, &p, &q, &ct, &b, peer, port,
+                    &server_name,
+                )
+            })
+        };
+        if serial {
+            // rack/psgi：串行单线程池（解释器非线程安全）。
+            Ok(serial_pool(&engine_for_pool).run(job).await?)
+        } else {
+            Ok(GENERIC_POOL.run(job).await?)
+        }
+    }
+}
+
+/// POST/PUT/PATCH 或带 Content-Length/Transfer-Encoding 的请求才收 body。
+fn request_has_body(m: &http::Method, h: &http::HeaderMap) -> bool {
+    if matches!(*m, http::Method::POST | http::Method::PUT | http::Method::PATCH) {
+        return true;
+    }
+    if h.contains_key(http::header::TRANSFER_ENCODING) {
+        return true;
+    }
+    h.get(http::header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .unwrap_or(0)
+        > 0
+}
+
+fn run_inline(
+    engine: &str,
+    lib_path: &PathBuf,
+    script: &PathBuf,
+    docroot: &PathBuf,
+    method: &str,
+    path: &str,
+    query: &str,
+    content_type: &str,
+    body: &Bytes,
+    peer: SocketAddr,
+    port: u16,
+    server_name: &str,
+) -> Result<ExecOutcome> {
+    let lib = load_engine(engine, lib_path)?;
+    call_exec(
+        &lib, engine, script, docroot, method, path, query, content_type, body, peer, port,
+        server_name,
+    )
+}
+
+pub fn resolve_lib(app: &AppRouteConfig, engine: &str) -> Result<PathBuf> {
+    if let Some(p) = &app.lib {
+        return Ok(p.clone());
+    }
+    let env_key = format!("APPENGINE_{}_LIB", engine.to_ascii_uppercase());
+    if let Ok(p) = std::env::var(&env_key) {
+        return Ok(PathBuf::from(p));
+    }
+    Ok(PathBuf::from(format!(
+        "target/app-engines/libapp_{engine}.so"
+    )))
+}
+
+// ---------------------------------------------------------------- 线程池 (§7.3)
+
+type PoolJob = Box<dyn FnOnce() + Send + 'static>;
+
+struct EnginePool {
+    tx: std::sync::mpsc::Sender<PoolJob>,
+}
+
+static GENERIC_POOL: Lazy<EnginePool> =
+    Lazy::new(|| EnginePool::start(generic_pool_threads(), "appffi"));
+static SERIAL_POOLS: Lazy<Mutex<HashMap<String, Arc<EnginePool>>>> =
+    Lazy::new(|| Mutex::new(HashMap::new()));
+
+fn generic_pool_threads() -> usize {
+    let cpu = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(2);
+    cpu.clamp(2, 4)
+}
+
+fn serial_engine(engine: &str) -> bool {
+    matches!(engine, "rack" | "psgi")
+}
+
+impl EnginePool {
+    fn start(threads: usize, name: &str) -> EnginePool {
+        let (tx, rx) = std::sync::mpsc::channel::<PoolJob>();
+        let rx = Arc::new(Mutex::new(rx));
+        for i in 0..threads.max(1) {
+            let rx = Arc::clone(&rx);
+            let _ = std::thread::Builder::new()
+                .name(format!("cruc-{name}-{i}"))
+                .spawn(move || loop {
+                    let job = {
+                        let guard = rx.lock();
+                        guard.recv()
+                    };
+                    match job {
+                        Ok(j) => j(),
+                        Err(_) => break,
+                    }
+                });
+        }
+        EnginePool { tx }
+    }
+
+    async fn run<T, F>(&self, f: F) -> Result<T>
+    where
+        T: Send + 'static,
+        F: FnOnce() -> Result<T> + Send + 'static,
+    {
+        let (otx, orx) = tokio::sync::oneshot::channel();
+        self.tx
+            .send(Box::new(move || {
+                let _ = otx.send(f());
+            }))
+            .map_err(|_| anyhow::anyhow!("engine thread pool closed"))?;
+        orx.await.map_err(|_| anyhow::anyhow!("engine worker dropped"))?
+    }
+}
+
+fn serial_pool(engine: &str) -> Arc<EnginePool> {
+    SERIAL_POOLS
+        .lock()
+        .entry(engine.to_string())
+        .or_insert_with(|| Arc::new(EnginePool::start(1, engine)))
+        .clone()
+}
+
+// ---------------------------------------------------------------- dlopen / exec
+
+fn load_engine(engine: &str, lib_path: &PathBuf) -> Result<Arc<EngineLib>> {
+    let key = lib_path.to_string_lossy().into_owned();
+    {
+        let map = LIBS.lock();
+        if let Some(l) = map.get(&key) {
+            return Ok(Arc::clone(l));
+        }
+    }
+    if !lib_path.is_file() {
+        bail!("missing engine lib {}", lib_path.display());
+    }
+    let c_path = CString::new(lib_path.to_string_lossy().as_bytes()).context("lib path")?;
+    unsafe {
+        let flags = libc::RTLD_NOW | libc::RTLD_GLOBAL;
+        let handle = libc::dlopen(c_path.as_ptr(), flags);
+        if handle.is_null() {
+            let err = CStr::from_ptr(libc::dlerror());
+            bail!("dlopen {}: {}", lib_path.display(), err.to_string_lossy());
+        }
+        macro_rules! sym {
+            ($name:expr) => {{
+                let n = CString::new($name).unwrap();
+                let p = libc::dlsym(handle, n.as_ptr());
+                if p.is_null() {
+                    libc::dlclose(handle);
+                    bail!("missing symbol {}", $name);
+                }
+                p
+            }};
+        }
+        let init: InitFn = std::mem::transmute(sym!("appengine_init"));
+        let exec: ExecFn = std::mem::transmute(sym!("appengine_execute"));
+        let free: FreeFn = std::mem::transmute(sym!("appengine_result_free"));
+        let shutdown: ShutdownFn = std::mem::transmute(sym!("appengine_shutdown"));
+        let eng = CString::new(engine).unwrap();
+        let hint = CString::new(lib_path.to_string_lossy().as_bytes()).unwrap();
+        let rc = init(eng.as_ptr(), hint.as_ptr());
+        if rc != 0 {
+            libc::dlclose(handle);
+            bail!("appengine_init failed: {rc}");
+        }
+        let lib = Arc::new(EngineLib {
+            engine: engine.to_string(),
+            path: key.clone(),
+            handle,
+            init,
+            exec,
+            free,
+            shutdown,
+        });
+        LIBS.lock().insert(key, Arc::clone(&lib));
+        Ok(lib)
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn call_exec(
+    lib: &EngineLib,
+    engine: &str,
+    script: &PathBuf,
+    docroot: &PathBuf,
+    method: &str,
+    path: &str,
+    query: &str,
+    content_type: &str,
+    body: &Bytes,
+    peer: SocketAddr,
+    port: u16,
+    server_name: &str,
+) -> Result<ExecOutcome> {
+    let c_script = CString::new(script.to_string_lossy().as_bytes())?;
+    let c_doc = CString::new(docroot.to_string_lossy().as_bytes())?;
+    let c_method = CString::new(method)?;
+    let c_path = CString::new(path)?;
+    let c_query = CString::new(query)?;
+    let c_ct = CString::new(content_type)?;
+    let c_remote = CString::new(peer.ip().to_string())?;
+    let c_server = CString::new(server_name)?;
+    let c_extra = CString::new(engine)?;
+    let mut out = AppEngineResult {
+        status: 500,
+        headers: std::ptr::null_mut(),
+        headers_len: 0,
+        body: std::ptr::null_mut(),
+        body_len: 0,
+        error: std::ptr::null_mut(),
+    };
+    let (body_ptr, body_len) = if body.is_empty() {
+        (std::ptr::null(), 0usize)
+    } else {
+        (body.as_ptr(), body.len())
+    };
+    unsafe {
+        let rc = (lib.exec)(
+            c_script.as_ptr(),
+            c_doc.as_ptr(),
+            c_method.as_ptr(),
+            c_path.as_ptr(),
+            c_query.as_ptr(),
+            c_ct.as_ptr(),
+            body_ptr,
+            body_len,
+            c_remote.as_ptr(),
+            c_server.as_ptr(),
+            port as c_int,
+            c_extra.as_ptr(),
+            &mut out,
+        );
+        if rc != 0 {
+            let msg = if !out.error.is_null() {
+                CStr::from_ptr(out.error).to_string_lossy().into_owned()
+            } else {
+                format!("exec rc={rc}")
+            };
+            (lib.free)(&mut out);
+            bail!("{msg}");
+        }
+        let headers = parse_result_headers(out.headers, out.headers_len);
+        let body_out = if out.body.is_null() || out.body_len == 0 {
+            Bytes::new()
+        } else {
+            Bytes::copy_from_slice(std::slice::from_raw_parts(out.body, out.body_len))
+        };
+        let status = out.status;
+        (lib.free)(&mut out);
+        Ok(ExecOutcome {
+            status,
+            headers,
+            body: body_out,
+        })
+    }
+}
+
+/// 解析 ABI headers 块（"Name: value\r\n" NUL 结尾），带注入净化。
+fn parse_result_headers(ptr: *mut c_char, len: usize) -> Vec<(String, String)> {
+    if ptr.is_null() {
+        return Vec::new();
+    }
+    let text: String = unsafe {
+        if len > 0 {
+            String::from_utf8_lossy(std::slice::from_raw_parts(ptr as *const u8, len)).into_owned()
+        } else {
+            CStr::from_ptr(ptr).to_string_lossy().into_owned()
+        }
+    };
+    let mut out = Vec::new();
+    for line in text.lines() {
+        let line = line.trim_end_matches('\r').trim();
+        if line.is_empty() {
+            continue;
+        }
+        if let Some((k, v)) = line.split_once(':') {
+            let k = k.trim();
+            let v = v.trim();
+            if valid_header_kv(k, v) {
+                out.push((k.to_string(), v.to_string()));
+            }
+        }
+        if out.len() >= 64 {
+            break;
+        }
+    }
+    out
+}
+
+/// 头注入防护：名 token 字符；值可见 ASCII/tab；长度受限。
+pub fn valid_header_kv(k: &str, v: &str) -> bool {
+    !k.is_empty()
+        && k.len() <= 256
+        && k.bytes().all(|b| b.is_ascii_graphic() && b != b':')
+        && v.len() <= 8192
+        && v.bytes().all(|b| (0x20..=0x7e).contains(&b) || b == b'\t')
+}
+
+fn status_code(status: i32) -> StatusCode {
+    StatusCode::from_u16(status.clamp(100, 599) as u16).unwrap_or(StatusCode::OK)
+}
+
+/// FFI 结果 → 完整响应；引擎未给 Content-Type 时回退 text/plain。
+pub fn response_from_outcome(outcome: ExecOutcome) -> Response<BoxBody> {
+    let mut builder = Response::builder().status(status_code(outcome.status));
+    let mut has_ct = false;
+    for (k, v) in &outcome.headers {
+        if k.eq_ignore_ascii_case("content-type") {
+            has_ct = true;
+        }
+        builder = builder.header(k.as_str(), v.as_str());
+    }
+    if !has_ct {
+        builder = builder.header(http::header::CONTENT_TYPE, "text/plain; charset=utf-8");
+    }
+    builder.body(full(outcome.body)).unwrap_or_else(|_| {
+        Response::builder()
+            .status(StatusCode::BAD_GATEWAY)
+            .body(full("engine response build error"))
+            .unwrap()
+    })
+}
+
+/// `Response<Bytes>` 变体（H2/H3 simple 路径）。
+pub fn simple_response_from_outcome(outcome: ExecOutcome) -> Response<Bytes> {
+    let mut builder = Response::builder().status(status_code(outcome.status));
+    let mut has_ct = false;
+    for (k, v) in &outcome.headers {
+        if k.eq_ignore_ascii_case("content-type") {
+            has_ct = true;
+        }
+        builder = builder.header(k.as_str(), v.as_str());
+    }
+    if !has_ct {
+        builder = builder.header(http::header::CONTENT_TYPE, "text/plain; charset=utf-8");
+    }
+    builder.body(outcome.body).unwrap_or_else(|_| {
+        Response::builder()
+            .status(StatusCode::BAD_GATEWAY)
+            .body(Bytes::from_static(b"engine response build error"))
+            .unwrap()
+    })
+}
+
+/// 强制卸载指定引擎的全部 .so（admin / 配置清理入口）。
+#[allow(dead_code)]
+pub fn shutdown_engine(engine: &str) {
+    let mut map = LIBS.lock();
+    let keys: Vec<String> = map
+        .iter()
+        .filter(|(_, l)| l.engine == engine)
+        .map(|(k, _)| k.clone())
+        .collect();
+    for k in keys {
+        if let Some(lib) = map.remove(&k) {
+            drop(lib); // Drop → shutdown + dlclose
+        }
+    }
+}
+
+/// §7.3 热卸载：配置不再引用、且无在途请求（强引用仅剩缓存表）的引擎 →
+/// shutdown + dlclose。有在途请求时仅出表，句柄随最后一个引用释放。
+pub fn reconcile_unload(active: &[(String, String)]) {
+    let mut map = LIBS.lock();
+    let stale: Vec<String> = map
+        .iter()
+        .filter(|(_, l)| !active.iter().any(|(e, p)| e == &l.engine && p == &l.path))
+        .map(|(k, _)| k.clone())
+        .collect();
+    for k in stale {
+        let lib = match map.remove(&k) {
+            Some(l) => l,
+            None => continue,
+        };
+        if Arc::strong_count(&lib) == 1 {
+            log::info!("app_ffi: unload engine {} ({})", lib.engine, lib.path);
+            // Drop impl performs shutdown+dlclose.
+            drop(lib);
+        } else {
+            log::debug!("app_ffi: engine {} in-flight; defer dlclose via Drop", lib.engine);
+            // Leave Arc to drop when in-flight requests finish.
+        }
+    }
+}

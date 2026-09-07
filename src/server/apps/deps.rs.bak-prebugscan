@@ -1,0 +1,103 @@
+//! App deps: init.sh + .env → deps/; hot path uses mtime-only try_cached.
+
+use crate::config::AppRouteConfig;
+use crate::server::live_config::LiveConfig;
+use anyhow::{Context, Result};
+use once_cell::sync::Lazy;
+use parking_lot::Mutex;
+use std::collections::HashMap;
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::sync::Arc;
+use std::time::SystemTime;
+
+#[derive(Clone, Debug)]
+struct CacheKey {
+    init_mtime: Option<SystemTime>,
+    env_mtime: Option<SystemTime>,
+}
+
+static DEPS_CACHE: Lazy<Mutex<HashMap<PathBuf, CacheKey>>> =
+    Lazy::new(|| Mutex::new(HashMap::new()));
+
+/// Hot path: compare mtimes only — never SHA256 / spawn_blocking per request.
+pub async fn try_cached(live: &Arc<LiveConfig>, app: &AppRouteConfig) -> Result<()> {
+    let docroot = resolve_docroot(live, app)?;
+    let init = docroot.join("init.sh");
+    let envp = docroot.join(".env");
+    let deps_dir = app
+        .deps_dir
+        .clone()
+        .unwrap_or_else(|| docroot.join("deps"));
+
+    let init_m = mtime_of(&init);
+    let env_m = mtime_of(&envp);
+
+    {
+        let cache = DEPS_CACHE.lock();
+        if let Some(prev) = cache.get(&docroot) {
+            if prev.init_mtime == init_m && prev.env_mtime == env_m && deps_dir.is_dir() {
+                return Ok(());
+            }
+        }
+    }
+
+    ensure_app_deps(&docroot, &deps_dir, &init, app.init_timeout_secs.unwrap_or(120))?;
+    DEPS_CACHE.lock().insert(
+        docroot,
+        CacheKey {
+            init_mtime: init_m,
+            env_mtime: env_m,
+        },
+    );
+    Ok(())
+}
+
+fn resolve_docroot(live: &Arc<LiveConfig>, app: &AppRouteConfig) -> Result<PathBuf> {
+    if let Some(d) = &app.docroot {
+        return Ok(d.clone());
+    }
+    // Fall back to first listener root (core skeleton).
+    let cfg = live.snapshot();
+    cfg.listeners
+        .first()
+        .map(|l| l.root.clone())
+        .context("no docroot")
+}
+
+fn mtime_of(p: &Path) -> Option<SystemTime> {
+    fs::metadata(p).and_then(|m| m.modified()).ok()
+}
+
+fn ensure_app_deps(
+    docroot: &Path,
+    deps_dir: &Path,
+    init: &Path,
+    timeout_secs: u64,
+) -> Result<()> {
+    let _ = timeout_secs;
+    if !init.is_file() {
+        let _ = fs::create_dir_all(deps_dir);
+        return Ok(());
+    }
+    if deps_dir.exists() {
+        let _ = fs::remove_dir_all(deps_dir);
+    }
+    fs::create_dir_all(deps_dir)?;
+    let init_script = if init.is_file() {
+        init.to_path_buf()
+    } else {
+        docroot.join("init.sh")
+    };
+    let status = Command::new("sh")
+        .arg(&init_script)
+        .current_dir(docroot)
+        .env("DEPS_DIR", deps_dir)
+        .status()
+        .with_context(|| format!("run {}", init.display()))?;
+    if !status.success() {
+        anyhow::bail!("init.sh failed: {status}");
+    }
+    Ok(())
+}

@@ -1,0 +1,1575 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<title>Crucible Admin</title>
+<style>
+:root{--bg:#0f1419;--panel:#1a2332;--panel2:#141b26;--text:#e7ecf3;--muted:#8b9bb4;--accent:#3d8bfd;--ok:#3fb96f;--err:#e5534b;--line:#2a3548}
+*{box-sizing:border-box}
+body{margin:0;font-family:"Segoe UI","PingFang SC","Noto Sans SC",sans-serif;background:var(--bg);color:var(--text)}
+header{padding:1rem 1.25rem;border-bottom:1px solid var(--line);display:flex;align-items:center;gap:1rem}
+header h1{margin:0;font-size:1.15rem;letter-spacing:.04em}
+nav{display:flex;flex-wrap:wrap;gap:.35rem;padding:.75rem 1rem;border-bottom:1px solid var(--line);background:var(--panel)}
+nav button{background:transparent;border:1px solid var(--line);color:var(--muted);padding:.4rem .7rem;cursor:pointer;border-radius:4px;font-size:.85rem}
+nav button.active{color:var(--text);border-color:var(--accent);background:#243049}
+main{padding:1.25rem;max-width:1200px}
+.tab{display:none}
+.tab.active{display:block}
+.card{background:var(--panel);border:1px solid var(--line);border-radius:6px;padding:1rem;margin-bottom:1rem}
+h2{margin:.1rem 0 .6rem;font-size:1.05rem}
+h3.sub{margin:.2rem 0 .5rem;font-size:.95rem;color:var(--muted)}
+label{display:block;margin:.5rem 0 .2rem;color:var(--muted);font-size:.82rem}
+input,select,textarea{background:#121821;border:1px solid var(--line);color:var(--text);padding:.45rem .5rem;border-radius:4px;font-family:inherit;font-size:.85rem}
+input,select{max-width:100%}
+textarea{min-height:110px;font-family:ui-monospace,Consolas,monospace;font-size:.82rem;width:100%}
+textarea.tall{min-height:340px}
+.hint{color:var(--muted);font-size:.8rem;margin:.4rem 0}
+button.act{margin:.5rem .4rem .2rem 0;background:var(--accent);color:#fff;border:0;padding:.42rem .85rem;border-radius:4px;cursor:pointer;font-size:.85rem}
+button.ghost{background:transparent;border:1px solid var(--line);color:var(--muted)}
+button.danger{background:var(--err);border:0;color:#fff}
+button.mini{padding:.15rem .45rem;font-size:.75rem;margin:0 .2rem}
+pre{background:#121821;padding:.7rem;overflow:auto;border-radius:4px;font-size:.78rem;max-height:420px}
+pre.ok{border:1px solid var(--ok)}
+pre.err{border:1px solid var(--err)}
+.row{display:flex;gap:.5rem;flex-wrap:wrap;align-items:flex-end}
+.row label{margin:0 .3rem .2rem 0}
+.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(210px,1fr));gap:.4rem .9rem}
+table.data{border-collapse:collapse;width:100%;font-size:.82rem}
+table.data th,table.data td{border:1px solid var(--line);padding:.3rem .45rem;text-align:left;vertical-align:top}
+table.data th{color:var(--muted);font-weight:600;background:var(--panel2)}
+table.data input,table.data select{width:100%;min-width:70px;padding:.25rem .3rem;font-size:.78rem}
+table.data td.actions{white-space:nowrap}
+.tag{display:inline-block;padding:.05rem .4rem;border:1px solid var(--line);border-radius:3px;font-size:.72rem;color:var(--muted);margin-right:.25rem}
+.toast{position:fixed;right:1rem;bottom:1rem;background:var(--panel);border:1px solid var(--accent);padding:.6rem .9rem;border-radius:6px;font-size:.85rem;display:none;max-width:40rem;z-index:9}
+.toast.bad{border-color:var(--err)}
+.file-list{list-style:none;padding:0;margin:0;font-size:.85rem}
+.file-list li{padding:.3rem .35rem;border-bottom:1px solid var(--line);display:flex;align-items:center;gap:.5rem;flex-wrap:wrap}
+.file-list li:hover{background:#1d2737}
+.file-list a{color:var(--text);text-decoration:none;cursor:pointer}
+.file-list a:hover{color:var(--accent)}
+.crumb{color:var(--muted);font-size:.85rem;margin:.3rem 0}
+.crumb a{color:var(--accent);cursor:pointer;text-decoration:none}
+video.preview,audio.preview{width:100%;max-height:360px}
+iframe.preview{width:100%;height:480px;border:1px solid var(--line);border-radius:4px;background:#fff}
+img.preview{max-width:100%;max-height:420px}
+.kv{font-size:.85rem}
+.kv b{color:var(--muted);font-weight:600;margin-right:.3rem}
+</style>
+</head>
+<body>
+<header><h1>Crucible</h1><span class="hint">管理面板 · 配置几乎全部落 config.toml（热重载）</span></header>
+<nav id="tabs">
+  <button data-tab="overview" class="active">概览</button>
+  <button data-tab="listeners">站点/监听</button>
+  <button data-tab="tls">TLS</button>
+  <button data-tab="apps">应用引擎</button>
+  <button data-tab="files">文件管理</button>
+  <button data-tab="pagerules">页面规则</button>
+  <button data-tab="proxy">反向代理</button>
+  <button data-tab="access">访问控制</button>
+  <button data-tab="accesslog">访问日志</button>
+  <button data-tab="geoip">GeoIP</button>
+  <button data-tab="dns">DNS</button>
+  <button data-tab="global">全局</button>
+  <button data-tab="toml">配置源码</button>
+  <button data-tab="accounts">账号</button>
+</nav>
+<main>
+<div id="toast" class="toast"></div>
+
+  <section class="tab active" id="tab-overview">
+    <div class="card">
+      <h2>概览</h2>
+      <p class="hint">服务状态、监听端口摘要与 TLS 栈。站点内容在「站点/监听」维护。</p>
+      <button class="act" id="btnOverview">刷新</button>
+      <pre id="overviewOut">加载中…</pre>
+    </div>
+  </section>
+
+  <section class="tab" id="tab-listeners">
+    <div class="card">
+      <h2>站点 / Listeners</h2>
+      <p class="hint">root 全局唯一（保存时服务端校验）。新增/删除端口需重启进程；<b>已有端口的内容修改保存后即时热生效</b>（每连接取最新快照）。</p>
+      <button class="act" id="btnListeners">刷新列表</button>
+      <button class="act ghost" id="btnListenerNew">新增站点</button>
+      <div id="listenersOut"></div>
+    </div>
+    <div class="card" id="listenerEditCard" style="display:none">
+      <h3 class="sub" id="listenerEditTitle">编辑站点</h3>
+      <div class="row">
+        <div><label>address</label><input id="leAddress" value="0.0.0.0"/></div>
+        <div><label>port</label><input id="lePort" size="6"/></div>
+        <div style="flex:1"><label>root（站点目录，全局唯一）</label><input id="leRoot" style="width:100%"/></div>
+      </div>
+      <div class="row">
+        <div><label>server_name</label><input id="leServerName"/></div>
+        <div><label>status_path（可选）</label><input id="leStatusPath" placeholder="/__status"/></div>
+      </div>
+      <div class="row">
+        <div><label>HTTP 版本</label>
+          <span class="tag"><input type="checkbox" id="leH1"/> h1</span>
+          <span class="tag"><input type="checkbox" id="leH2"/> h2</span>
+          <span class="tag"><input type="checkbox" id="leH3"/> h3（UDP/QUIC）</span>
+        </div>
+      </div>
+      <div class="row">
+        <div><label>autoindex 目录列表</label>
+          <select id="leAutoindex"><option value="true">开启</option><option value="false">关闭</option></select>
+        </div>
+        <div style="flex:1"><label>autoindex 限定路径（逗号分隔，/ = 全站）</label><input id="leAutoindexPaths" value="/" style="width:100%"/></div>
+      </div>
+      <div class="row">
+        <div><label>autoindex 上传按钮</label>
+          <select id="leAutoindexUpload"><option value="false">关闭</option><option value="true">开启</option></select>
+        </div>
+        <div><label>上传并行线程数</label><input id="leUploadThreads" value="4" size="3"/></div>
+        <div style="flex:1"><label>（上传走管理 API 分片断点续传，路径受 safe_join 保护）</label></div>
+      </div>
+      <button class="act" id="btnListenerSave">保存站点</button>
+      <button class="act ghost" id="btnListenerCancel">取消</button>
+      <pre id="listenerEditOut"></pre>
+    </div>
+  </section>
+
+  <section class="tab" id="tab-tls">
+    <div class="card">
+      <h2>TLS</h2>
+      <p class="hint">证书支持「路径」或直接粘贴 PEM 正文。主路径 BoringSSL；NSS / TomCrypt 为遗留栈（按站点声明按需加载，未声明不加载）。</p>
+      <div class="row">
+        <div><label>站点（端口）</label><select id="tlsPort"></select></div>
+        <div><label>启用 SSL</label><select id="tlsEnabled"><option value="1">是</option><option value="0">否</option></select></div>
+      </div>
+      <div class="grid" style="margin-top:.6rem">
+        <div><label>版本 TLSv1.2</label><input type="checkbox" id="tlsV12"/></div>
+        <div><label>版本 TLSv1.3</label><input type="checkbox" id="tlsV13"/></div>
+        <div><label>prefer_tls13</label><input type="checkbox" id="tlsPrefer13"/></div>
+        <div><label>pqc（X25519MLKEM768）</label><input type="checkbox" id="tlsPqc"/></div>
+        <div><label>ech</label><input type="checkbox" id="tlsEch"/></div>
+        <div><label>psk</label><input type="checkbox" id="tlsPsk"/></div>
+        <div><label>enable_nss（遗留）</label><input type="checkbox" id="tlsNss"/></div>
+        <div><label>enable_tomcrypt（遗留）</label><input type="checkbox" id="tlsTc"/></div>
+      </div>
+      <label>cert（路径或 PEM 正文）</label>
+      <textarea id="tlsCert" placeholder="cert.pem 或 -----BEGIN CERTIFICATE-----"></textarea>
+      <label>key（路径或 PEM 正文）</label>
+      <textarea id="tlsKey" placeholder="key.pem 或 -----BEGIN PRIVATE KEY-----"></textarea>
+      <div class="row">
+        <div style="flex:1"><label>cert_ec（ECC 副证，可选）</label><input id="tlsCertEc" style="width:100%"/></div>
+        <div style="flex:1"><label>key_ec（可选）</label><input id="tlsKeyEc" style="width:100%"/></div>
+      </div>
+      <div class="row">
+        <div style="flex:1"><label>ech_keys（路径/PEM，可选）</label><input id="tlsEchKeys" style="width:100%"/></div>
+        <div><label>groups（冒号分隔，可选）</label><input id="tlsGroups" placeholder="X25519MLKEM768:X25519"/></div>
+      </div>
+      <div class="row">
+        <div style="flex:1"><label>ech_public_name（对外身份，如 v.qq.com）</label><input id="tlsEchPublicName" style="width:100%"/></div>
+        <div style="flex:1"><label>ech_cipher_suite（HPKE 对称，可选）</label><input id="tlsEchSuite" placeholder="HKDF-SHA256/AES-128-GCM" style="width:100%"/></div>
+        <div><label>ech_max_name_length</label><input id="tlsEchMaxName" value="64" size="5"/></div>
+      </div>
+      <div class="grid" style="margin-top:.4rem">
+        <div><label>ech_advertise（HTTPS DNS 记录）</label><input type="checkbox" id="tlsEchAdv"/></div>
+        <div><label>early_data（0-RTT，默认关）</label><input type="checkbox" id="tlsEarlyData"/></div>
+        <div><label>sni_only（错/空 SNI 静默丢弃）</label><input type="checkbox" id="tlsSniOnly"/></div>
+      </div>
+      <div class="row" style="margin-top:.4rem">
+        <div style="flex:1"><label>sni_name（sni_only 必配）</label><input id="tlsSniName" style="width:100%"/></div>
+        <div style="flex:1"><label>ocsp_der_path（留空=自动获取）</label><input id="tlsOcspDer" style="width:100%"/></div>
+      </div>
+      <div class="row">
+        <div style="flex:1"><label>psk_identity</label><input id="tlsPskIdentity" style="width:100%"/></div>
+        <div style="flex:1"><label>psk_key（hex/base64/路径）</label><input id="tlsPskKey" style="width:100%"/></div>
+      </div>
+      <button class="act" id="btnTlsSave">保存 TLS</button>
+      <button class="act ghost" id="btnTlsProbe">探测证书材料（cert 栏内容）</button>
+      <pre id="tlsOut"></pre>
+    </div>
+  </section>
+
+  <section class="tab" id="tab-apps">
+    <div class="card">
+      <h2>应用引擎</h2>
+      <p class="hint">路径级引擎（§3.3）。extensions 随引擎自动带出默认值，可改。C/Go/Rust 走进程内 FFI（无 .so 时持久 unix sidecar，<b>禁止 CGI spawn</b>）。</p>
+      <div class="row">
+        <div><label>站点（端口）</label><select id="appsPort"></select></div>
+        <div><button class="act" id="btnAppsLoad">载入</button><button class="act ghost" id="btnAppAdd">加一行</button><button class="act" id="btnAppsSave">保存应用引擎</button></div>
+      </div>
+      <div id="appsOut"></div>
+      <h3 class="sub">引擎选项目录（/api/catalog）</h3>
+      <pre id="catalogOut" style="max-height:220px">加载中…</pre>
+    </div>
+  </section>
+
+  <section class="tab" id="tab-files">
+    <div class="card">
+      <h2>文件管理</h2>
+      <div class="row">
+        <div><label>站点（端口）</label><select id="filePort"></select></div>
+        <div style="flex:1"><label>路径</label><input id="filePath" style="width:100%" value=""/></div>
+        <div><button class="act" id="btnFileList">列出</button><button class="act ghost" id="btnFileMkdir">新建目录</button></div>
+      </div>
+      <div class="crumb" id="fileCrumb"></div>
+      <div class="row"><div style="flex:1"><div id="fileListWrap"></div></div></div>
+      <h3 class="sub">纯文本编辑 / 上传</h3>
+      <div class="row">
+        <div style="flex:1"><label>当前文件</label><input id="fileEditPath" style="width:100%" readonly/></div>
+        <div><label>上传到（相对路径文件名）</label><input id="fileUploadPath"/></div>
+        <div><button class="act ghost" id="btnFileUpload">上传编辑器内容</button></div>
+      </div>
+      <textarea id="fileEditor" placeholder="点击左侧文件名加载文本；二进制文件会提示并以站点 URL 预览/下载。"></textarea>
+      <button class="act" id="btnFileSave">保存</button>
+      <pre id="fileOut"></pre>
+      <h3 class="sub">预览</h3>
+      <div id="filePreview"></div>
+    </div>
+  </section>
+
+  <section class="tab" id="tab-pagerules">
+    <div class="card">
+      <h2>页面规则</h2>
+      <p class="hint">CDN 风格页面规则：redirect(可 "301:"/"307:"/"308:" 前缀)/block/rewrite/pass/cache/header。匹配按 match_url 前缀/通配。</p>
+      <div class="row">
+        <div><label>站点（端口）</label><select id="prPort"></select></div>
+        <div><button class="act" id="btnPrLoad">载入</button><button class="act ghost" id="btnPrAdd">加一行</button><button class="act" id="btnPrSave">保存规则</button></div>
+      </div>
+      <div id="prOut"></div>
+    </div>
+  </section>
+
+  <section class="tab" id="tab-proxy">
+    <div class="card">
+      <h2>反向代理</h2>
+      <p class="hint">上游 SSL 模式：verify（强制校验）/ no_verify / trust_self_signed（信任自签）/ off（关闭 SSL）。
+      Tor/.onion：SOCKS 连接顺序 FFI → unix socket → TCP(127.0.0.1:9050)；.onion 上游 verify 模式强制校验 v3 公钥。</p>
+      <div class="row">
+        <div><label>站点（端口）</label><select id="pxPort"></select></div>
+        <div><button class="act" id="btnPxLoad">载入</button><button class="act ghost" id="btnPxAdd">加一行</button><button class="act" id="btnPxSave">保存反代</button></div>
+      </div>
+      <div id="pxOut"></div>
+    </div>
+  </section>
+
+  <section class="tab" id="tab-access">
+    <div class="card">
+      <h2>访问控制</h2>
+      <p class="hint">ip_access allow / deny（每行一条，支持 CIDR）。deny 优先。</p>
+      <div class="row">
+        <div style="flex:1"><label>Allow</label><textarea id="accessAllow" placeholder="10.0.0.0/8"></textarea></div>
+        <div style="flex:1"><label>Deny</label><textarea id="accessDeny" placeholder="203.0.113.0/24"></textarea></div>
+      </div>
+      <button class="act" id="btnAccessSave">保存访问控制</button>
+      <pre id="accessOut"></pre>
+    </div>
+  </section>
+
+  <section class="tab" id="tab-accesslog">
+    <div class="card">
+      <h2>访问日志</h2>
+      <div class="row">
+        <div><label>启用</label><select id="logEnable"><option value="true">true</option><option value="false">false</option></select></div>
+        <div><label>等级</label><select id="logLevel"><option>error</option><option>warn</option><option>info</option><option>debug</option><option>trace</option></select></div>
+        <div><label>实时（realtime）</label><select id="logRealtime"><option value="true">true</option><option value="false">false</option></select></div>
+      </div>
+      <button class="act" id="btnLogSave">保存访问日志</button>
+      <pre id="logOut"></pre>
+    </div>
+  </section>
+
+  <section class="tab" id="tab-geoip">
+    <div class="card">
+      <h2>GeoIP 精细面板</h2>
+      <p class="hint">细粒度到地级运营商 / 数据中心（多源融合：云厂商 IP、RIR geofeed、QQWry、CERNET、ASN、Tor 池等）。<b>数据文件不进 toml</b>，toml 只放开关与路径。</p>
+      <div class="row">
+        <div><label>启用</label><select id="geoEnabled"><option value="true">true</option><option value="false">false</option></select></div>
+        <div style="flex:1"><label>db_path</label><input id="geoDbPath" style="width:100%"/></div>
+        <div><button class="act" id="btnGeoSave">保存开关/路径</button></div>
+      </div>
+      <pre id="geoStatusOut">加载中…</pre>
+    </div>
+
+    <div class="card">
+      <h3 class="sub">查询（含 covering 前缀明细）</h3>
+      <div class="row">
+        <div><label>IP</label><input id="geoipIp" placeholder="1.2.4.8"/></div>
+        <div><button class="act" id="btnGeoipLookup">查询</button></div>
+      </div>
+      <div id="geoipResult"></div>
+    </div>
+
+    <div class="card">
+      <h3 class="sub">筛选</h3>
+      <div class="row">
+        <div><label>country / 省市</label><input id="geoCountry" size="10"/></div>
+        <div><label>isp</label><input id="geoIsp" size="10"/></div>
+        <div><label>cloud</label><input id="geoCloud" size="10"/></div>
+        <div><label>limit</label><input id="geoLimit" size="5" value="50"/></div>
+        <div><button class="act" id="btnGeoFilter">筛选</button></div>
+      </div>
+      <div id="geoFilterOut"></div>
+    </div>
+
+    <div class="card">
+      <h3 class="sub">手工覆盖（权重高于多源融合结果）</h3>
+      <div class="row">
+        <div><label>prefix（如 1.2.4.0/24）</label><input id="gepPrefix" size="16"/></div>
+        <div><label>field</label>
+          <select id="gepField">
+            <option>country</option><option>province</option><option>city</option><option>district</option>
+            <option>isp</option><option>asn</option><option>as_org</option>
+            <option>cloud_provider</option><option>cloud_region</option><option>cloud_service</option>
+            <option>hosting</option><option>division_code</option><option>dc</option>
+          </select>
+        </div>
+        <div><label>value</label><input id="gepValue" size="14"/></div>
+        <div><label>weight</label><input id="gepWeight" size="5" value="200"/></div>
+        <div><button class="act" id="btnGeoEditSave">写入覆盖</button></div>
+      </div>
+      <button class="act ghost" id="btnGeoEdits">刷新覆盖列表</button>
+      <div id="geoEditsOut"></div>
+    </div>
+
+    <div class="card">
+      <h3 class="sub">多源冲突</h3>
+      <p class="hint">多源字段不一致时在此列出；可一键「以此为准」写入手工覆盖，或标记已处理。</p>
+      <button class="act ghost" id="btnGeoConflicts">刷新冲突</button>
+      <div id="geoConflictsOut"></div>
+    </div>
+
+    <div class="card">
+      <h3 class="sub">数据源</h3>
+      <button class="act ghost" id="btnGeoSources">刷新源列表</button>
+      <div id="geoSourcesOut"></div>
+    </div>
+
+    <div class="card">
+      <h3 class="sub">定时任务</h3>
+      <div class="row">
+        <div><label>name</label><input id="cronName" size="12" placeholder="geoip_update"/></div>
+        <div><label>schedule</label><input id="cronSched" size="10" placeholder="daily"/></div>
+        <div><label>enabled</label><select id="cronEnabled"><option value="1">true</option><option value="0">false</option></select></div>
+        <div><button class="act" id="btnCronSave">保存任务</button></div>
+        <div><button class="act ghost" id="btnCronLoad">刷新</button></div>
+      </div>
+      <div id="geoCronOut"></div>
+    </div>
+
+    <div class="card">
+      <h3 class="sub">离线合并 / 审计</h3>
+      <button class="act" id="btnGeoUpdate">触发离线更新（geoip_update.sh）</button>
+      <button class="act ghost" id="btnGeoAudit">刷新审计日志</button>
+      <pre id="geoAuditOut"></pre>
+    </div>
+  </section>
+
+  <section class="tab" id="tab-dns">
+    <div class="card">
+      <h3>DNS 状态（bind9 named）</h3>
+      <button id="btnDnsStatus">刷新状态</button>
+      <pre id="dnsStatusOut"></pre>
+    </div>
+    <div class="card">
+      <h3>模式开关（根服务器 / 公共递归 / 权威）</h3>
+      <label><input type="checkbox" id="dnsEnabled"> 启用 DNS 模块</label>
+      <label><input type="checkbox" id="dnsModeRoot"> 根服务器（服务 root zone）</label>
+      <label><input type="checkbox" id="dnsModeRec"> 公共递归</label>
+      <label><input type="checkbox" id="dnsModeAuth"> 权威</label>
+      <label>递归白名单 CIDR(逗号分隔) <input id="dnsRecAcl" placeholder="10.0.0.0/8,192.168.0.0/16"></label>
+      <button id="btnDnsModes">保存模式并应用</button>
+      <pre id="dnsModesOut"></pre>
+    </div>
+    <div class="card">
+      <h3>域名（zones）</h3>
+      <label>域名 <input id="dnsZoneName" placeholder="example.com"></label>
+      <label>类型 <select id="dnsZoneKind"><option value="master">master</option><option value="slave">slave</option></select></label>
+      <label>primaries(逗号分隔,slave) <input id="dnsZonePrimaries" placeholder="1.2.3.4"></label>
+      <label>AXFR传入白名单CIDR(逗号分隔) <input id="dnsZoneAxfr" placeholder="5.6.7.0/24"></label>
+      <label>刷新频率(小时) <input id="dnsZoneRefresh" value="24" size="4"></label>
+      <button id="btnDnsZoneAdd">添加/更新</button>
+      <button id="btnDnsZoneDel">删除</button>
+      <button id="btnDnsZoneList">列出</button>
+      <pre id="dnsZonesOut"></pre>
+    </div>
+    <div class="card">
+      <h3>记录（RFC 完整类型）</h3>
+      <label>zone <input id="dnsRecZone" placeholder="example.com"></label>
+      <label>名称 <input id="dnsRecName" value="@"></label>
+      <label>类型 <select id="dnsRecType"><option>A</option><option>AAAA</option><option>CNAME</option><option>NS</option><option>MX</option><option>TXT</option><option>SRV</option><option>CAA</option><option>SOA</option><option>DS</option><option>DNSKEY</option><option>RRSIG</option><option>CDS</option><option>CDNSKEY</option><option>NSEC3</option><option>NSEC3PARAM</option><option>PTR</option><option>TLSA</option></select></label>
+      <label>TTL <input id="dnsRecTtl" value="3600" size="6"></label>
+      <label>线路(空=默认) <input id="dnsRecLine" size="8"></label>
+      <label>值 <input id="dnsRecData" placeholder="1.2.3.4"></label>
+      <button id="btnDnsRecAdd">添加/更新</button>
+      <button id="btnDnsRecList">列出</button>
+      <pre id="dnsRecOut"></pre>
+    </div>
+    <div class="card">
+      <h3>DNSSEC（KASP：算法/轮换/多key/NSEC3/CDS）</h3>
+      <label><input type="checkbox" id="dsEnabled"> 启用签名</label>
+      <label>算法 <select id="dsAlg"><option>ECDSAP256SHA256</option><option>ECDSAP384SHA384</option><option>RSASHA256</option><option>RSASHA512</option><option>ED25519</option></select></label>
+      <label><input type="checkbox" id="dsRotate"> 定期轮换</label>
+      <label>ZSK周期(天) <input id="dsDays" value="30" size="4"></label>
+      <label>KSK周期(天,空=不轮换) <input id="dsKskDays" size="4"></label>
+      <label><input type="checkbox" id="dsNsec3" checked> NSEC3(默认开,关闭=NSEC)</label>
+      <label>迭代 <input id="dsIter" value="0" size="3"></label>
+      <label><input type="checkbox" id="dsOptout"> optout</label>
+      <label><input type="checkbox" id="dsCds" checked> 发布 CDS/CDNSKEY</label>
+      <button id="btnDnssecSave">保存策略并应用</button>
+      <hr>
+      <label>一键生成: zone <input id="dsKeyZone" placeholder="example.com" size="14"> role <select id="dsKeyRole"><option>zsk</option><option>ksk</option><option>csk</option></select></label>
+      <button id="btnDsKeygen">生成</button>
+      <label>私钥上传: 文件名 <input id="dsUpName" size="18"> base64 <input id="dsUpB64" size="30"></label>
+      <button id="btnDsUpload">上传密钥</button>
+      <pre id="dnssecOut"></pre>
+    </div>
+    <div class="card">
+      <h3>AXFR 传出全局白名单</h3>
+      <label>CIDR(逗号分隔,空=none) <input id="dnsAxfrOut" placeholder="9.9.9.9,2001:db8::/32"></label>
+      <button id="btnDnsAxfrOut">保存</button>
+      <pre id="dnsAxfrOut2"></pre>
+    </div>
+    <div class="card">
+      <h3>Override（RPZ，public DNS 记录覆盖）</h3>
+      <label>触发名 <input id="rpzName" placeholder="ads.example.com 或 *.ads.example.com"></label>
+      <label>动作 <select id="rpzType"><option>nxdomain</option><option>nodata</option><option>A</option><option>AAAA</option><option>CNAME</option><option>TXT</option></select></label>
+      <label>值 <input id="rpzValue" placeholder="nxdomain/nodata 留空"></label>
+      <button id="btnRpzAdd">添加</button>
+      <button id="btnRpzDel">删除</button>
+      <pre id="rpzOut"></pre>
+    </div>
+    <div class="card">
+      <h3>分线路解析（GeoDNS，全默认线路时不启用）</h3>
+      <label><input type="checkbox" id="geoDnsEnabled"> 启用分线路</label>
+      <label>线路 JSON（name+cidrs）<br><textarea id="geoDnsLines" rows="4" cols="60">[{"name":"cn-ct","cidrs":["202.96.0.0/16"]}]</textarea></label>
+      <button id="btnGeoDnsSave">保存并应用</button>
+      <pre id="geoDnsOut"></pre>
+    </div>
+    <div class="card">
+      <h3>DoT / DoH 服务器</h3>
+      <label><input type="checkbox" id="dotEnabled"> DoT 启用</label>
+      <label>端口 <input id="dotPort" value="853" size="5"></label>
+      <label>证书路径 <input id="dotCert" size="20"></label>
+      <label>私钥路径 <input id="dotKey" size="20"></label>
+      <label><input type="checkbox" id="dohEnabled"> DoH 启用</label>
+      <label>路径 <input id="dohPath" value="/dns-query" size="10"></label>
+      <label>域名白名单(逗号分隔,空=任意) <input id="dohHosts" placeholder="dns.example.com"></label>
+      <button id="btnDotDohSave">保存并应用</button>
+      <pre id="dotDohOut"></pre>
+    </div>
+    <div class="card">
+      <h3>Root Zone（AXFR/整区增量，默认 daily）</h3>
+      <label>刷新频率(小时) <input id="rzHours" value="24" size="4"></label>
+      <button id="btnRzSet">设置频率</button>
+      <button id="btnRzNow">立即刷新</button>
+      <pre id="rzOut"></pre>
+    </div>
+    <div class="card">
+      <h3>ACME / Let's Encrypt（DoT·DoH 证书自动签发）</h3>
+      <label><input type="checkbox" id="acmeEnabled"> 启用自动签发</label>
+      <label>域名 <input id="acmeDomain" placeholder="dns.example.com" size="20"></label>
+      <label>邮箱 <input id="acmeEmail" placeholder="admin@example.com" size="18"></label>
+      <label>续期检查(天) <input id="acmeRenew" value="60" size="4"></label>
+      <button id="btnAcmeSave">保存</button>
+      <button id="btnAcmeStatus">证书状态</button>
+      <button id="btnAcmeIssue">立即签发/续期</button>
+      <pre id="acmeOut"></pre>
+    </div>
+    <div class="card">
+      <h3>分线路调试（test-split）</h3>
+      <label>客户端 IP <input id="tsIp" placeholder="192.0.2.7" size="16"></label>
+      <button id="btnTestSplit">命中线路</button>
+      <pre id="tsOut"></pre>
+    </div>
+    <div class="card">
+      <h3>named 控制</h3>
+      <button id="btnDnsReload">重新加载配置（reconcile + rndc reload）</button>
+      <pre id="dnsReloadOut"></pre>
+    </div>
+    <div class="card">
+      <h3>JSP 编译</h3>
+      <label>docroot <input id="jspDocroot" value="www-apps/jsp" size="20"></label>
+      <button id="btnJspCompile">编译</button>
+      <pre id="jspOut"></pre>
+    </div>
+  </section>
+  <section class="tab" id="tab-global">
+    <div class="card">
+      <h2>全局项（与 config.toml 全量对齐）</h2>
+      <h3>SYN Cookie（动态防护）</h3>
+      <div class="grid">
+        <div><label>enabled</label><input type="checkbox" id="scEnabled"/></div>
+        <div><label>value_on</label><input id="scOn" value="1"/></div>
+        <div><label>value_off</label><input id="scOff" value="0"/></div>
+        <div><label>evaluate_interval_ms</label><input id="scInterval" value="1000"/></div>
+      </div>
+      <button class="act" id="btnSynSave">保存 SYN Cookie</button>
+      <h3>Telemetry（/metrics）</h3>
+      <div class="grid">
+        <div><label>enabled</label><input type="checkbox" id="tmEnabled"/></div>
+        <div style="flex:1"><label>path</label><input id="tmPath" value="/metrics"/></div>
+      </div>
+      <button class="act" id="btnTmSave">保存 Telemetry</button>
+      <h3>Admin 暴露面</h3>
+      <div class="grid">
+        <div style="flex:1"><label>realm</label><input id="adRealm" style="width:100%"/></div>
+        <div style="flex:1"><label>path</label><input id="adPath" placeholder="/__admin"/></div>
+        <div style="flex:1"><label>listeners_allow（端口逗号分隔，空=全口可达）</label><input id="adAllow" placeholder="18443,19446"/></div>
+      </div>
+      <button class="act" id="btnAdminSave">保存 Admin 设置</button>
+      <pre id="globalOut"></pre>
+    </div>
+  </section>
+
+  <section class="tab" id="tab-toml">
+    <div class="card">
+      <h2>配置源码（config.toml 全文）</h2>
+      <p class="hint">直接编辑全文：保存前服务端会做完整校验（解析 + root 唯一等），失败则拒绝写盘并回显原因。
+      注意：结构化表单保存会以 TOML 规范格式重写文件并丢弃注释；需要保留注释请用本编辑器。</p>
+      <button class="act" id="btnTomlLoad">重新载入</button>
+      <button class="act" id="btnTomlSave">校验并保存（含热重载）</button>
+      <textarea id="tomlText" class="tall" spellcheck="false"></textarea>
+      <pre id="tomlOut"></pre>
+    </div>
+  </section>
+
+  <section class="tab" id="tab-accounts">
+    <div class="card">
+      <h2>账号权限</h2>
+      <p class="hint">服务端使用 argon2id / yescrypt <b>每哈希独立盐</b>存储；UI 只收集明文，<b>禁止手填哈希</b>。保存后写入 config.toml 并热重载。</p>
+      <label>用户名</label><input id="adminUser" readonly/>
+      <div class="row">
+        <div><label>新密码</label><input id="adminPass" type="password" autocomplete="new-password"/></div>
+        <div><label>确认密码</label><input id="adminPass2" type="password" autocomplete="new-password"/></div>
+      </div>
+      <button class="act" id="btnPass">更新密码</button>
+      <pre id="acctOut"></pre>
+    </div>
+  </section>
+</main>
+<script src="hls.light.min.js"></script>
+<script>
+"use strict";
+/* ============ 基础设施 ============ */
+const $=id=>document.getElementById(id);
+
+function bindGeoipActionButtons(root){
+  (root||document).querySelectorAll('button.conflict-use').forEach(b=>{
+    b.onclick=()=>useConflict(Number(b.dataset.id), b.dataset.prefix, b.dataset.field);
+  });
+  (root||document).querySelectorAll('button.src-save').forEach(b=>{
+    b.onclick=()=>saveSource(b.dataset.name);
+  });
+  (root||document).querySelectorAll('button.src-toggle').forEach(b=>{
+    b.onclick=()=>toggleSource(b.dataset.name, Number(b.dataset.en));
+  });
+}
+
+function esc(s){if(s==null)return '';return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;');}
+function scrubBrand(s){if(!s)return s;return String(s).replace(/cloudflare/gi,'公开 CDN').replace(/\bCF\b/g,'公开 CDN')}
+const base=(location.pathname.replace(/\/+$/,'')||'/__admin');
+async function api(path,opts){
+  const r=await fetch(base+path,opts||{});
+  const t=await r.text();
+  return {ok:r.ok,status:r.status,text:t};
+}
+let toastTimer=null;
+function toast(msg,bad){
+  const el=$('toast');
+  el.textContent=msg;
+  el.className='toast'+(bad?' bad':'');
+  el.style.display='block';
+  clearTimeout(toastTimer);
+  toastTimer=setTimeout(()=>{el.style.display='none'},5000);
+}
+function out(el,text,ok){
+  const p=$(el);
+  p.textContent=text;
+  p.className=ok?'ok':(text?'err':'');
+  if(ok===undefined)p.className='';
+}
+async function apiJson(path,opts){
+  const r=await api(path,opts);
+  try{return {ok:r.ok,status:r.status,json:JSON.parse(r.text),text:r.text};}
+  catch(e){return {ok:r.ok,status:r.status,json:null,text:r.text};}
+}
+function jpost(obj){return {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(obj)}}
+function fpost(form){return {method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:new URLSearchParams(form).toString()}}
+
+/* ============ 全局配置状态 ============ */
+let CFG=null;         // /api/config/json 快照
+let CATALOG=null;     // /api/catalog
+let EDIT_PORT=null;   // 当前编辑的 listener（orig_port）
+async function loadCfg(){
+  const r=await apiJson('/api/config/json');
+  if(!r.ok||!r.json){toast('载入配置失败: '+r.text,true);return false;}
+  CFG=r.json;return true;
+}
+function listenerByPort(port){return (CFG.listeners||[]).find(l=>String(l.port)===String(port));}
+function fillPortSelect(sel,keep){
+  const cur=keep!==undefined?keep:(sel.value||'');
+  sel.innerHTML='';
+  (CFG.listeners||[]).forEach(l=>{
+    const o=document.createElement('option');
+    o.value=l.port;o.textContent=l.port+' — '+(l.server_name||l.root);
+    sel.appendChild(o);
+  });
+  if(cur&&listenerByPort(cur))sel.value=cur;
+}
+function refreshAccounts(){
+  const u=(CFG.admin&&CFG.admin.users&&CFG.admin.users[0])||{username:'admin'};
+  $('adminUser').value=u.username;
+}
+
+/* ============ tab 切换 ============ */
+document.querySelectorAll('#tabs button').forEach(btn=>{
+  btn.addEventListener('click',async()=>{
+    document.querySelectorAll('#tabs button').forEach(b=>b.classList.remove('active'));
+    document.querySelectorAll('.tab').forEach(t=>t.classList.remove('active'));
+    btn.classList.add('active');
+    const el=$('tab-'+btn.getAttribute('data-tab'));
+    if(el)el.classList.add('active');
+    await ensureTab(btn.getAttribute('data-tab'));
+  });
+});
+async function ensureTab(name){
+  if(!CFG&&!await loadCfg())return;
+  refreshAccounts();
+  if(name==='overview')return doOverview();
+  if(name==='listeners')return renderListeners();
+  if(name==='tls')return initTlsTab();
+  if(name==='apps')return initAppsTab();
+  if(name==='files')return initFilesTab();
+  if(name==='pagerules')return initPrTab();
+  if(name==='proxy')return initPxTab();
+  if(name==='access')return initAccessTab();
+  if(name==='accesslog')return initLogTab();
+  if(name==='geoip')return initGeoTab();
+  if(name==='dns')return initDnsTab();
+  if(name==='toml')return loadToml();
+  if(name==='accounts')return;
+}
+
+/* ============ 概览 ============ */
+async function doOverview(){
+  const r=await api('/api/overview');
+  out('overviewOut',scrubBrand(r.text),r.ok);
+}
+$('btnOverview').onclick=doOverview;
+
+/* ============ 站点/监听 ============ */
+async function renderListeners(){
+  const wrap=$('listenersOut');
+  if(!CFG.listeners||!CFG.listeners.length){wrap.innerHTML='<p class="hint">暂无站点。</p>';return;}
+  let h='<table class="data"><tr><th>端口</th><th>地址</th><th>root</th><th>TLS</th><th>版本</th><th>应用数</th><th>server_name</th><th>操作</th></tr>';
+  CFG.listeners.forEach(l=>{
+    h+='<tr><td>'+esc(l.port)+'</td><td>'+esc(l.address)+'</td><td>'+esc(l.root)+'</td><td>'+(l.ssl?'<span class="tag">ssl</span>':'—')+'</td>'
+      +'<td>'+esc((l.http_versions||[]).join(','))+'</td><td>'+((l.apps||[]).length)+'</td><td>'+esc(l.server_name||'')+'</td>'
+      +'<td class="actions"><button class="act mini" onclick="editListener('+l.port+')">编辑</button>'
+      +'<button class="act mini danger" onclick="delListener('+l.port+')">删除</button></td></tr>';
+  });
+  h+='</table>';
+  wrap.innerHTML=h; bindGeoipActionButtons(wrap);
+}
+window.editListener=function(port){
+  const l=listenerByPort(port);
+  EDIT_PORT=port;
+  $('listenerEditCard').style.display='block';
+  $('listenerEditTitle').textContent='编辑站点 :'+port+'（改端口会替换原条目）';
+  $('leAddress').value=l.address;$('lePort').value=l.port;$('leRoot').value=l.root;
+  $('leServerName').value=l.server_name||'';$('leStatusPath').value=l.status_path||'';
+  const vs=(l.http_versions||[]).map(v=>v.toLowerCase());
+  $('leH1').checked=vs.some(v=>v==='h1'||v==='http/1.1');
+  $('leH2').checked=vs.some(v=>v==='h2'||v==='http/2');
+  $('leH3').checked=vs.some(v=>v==='h3'||v==='http/3');
+  let ai=l.autoindex,paths=['/'];
+  if(typeof ai==='boolean')ai={enabled:ai,paths:['/']};
+  let ai2=ai&&typeof ai==='object'?ai:{enable_upload:false,upload_threads:4};
+  if(ai2&&typeof ai2==='object'){paths=ai2.paths||['/'];ai=ai2.enabled;}
+  $('leAutoindexUpload').value=String(!!ai2.enable_upload);
+  $('leUploadThreads').value=ai2.upload_threads||4;
+  $('leAutoindex').value=String(!!ai);
+  $('leAutoindexPaths').value=(paths||['/']).join(',');
+};
+$('btnListenerNew').onclick=()=>{
+  EDIT_PORT=null;
+  $('listenerEditCard').style.display='block';
+  $('listenerEditTitle').textContent='新增站点';
+  $('leAddress').value='0.0.0.0';$('lePort').value='';$('leRoot').value='';
+  $('leServerName').value='';$('leStatusPath').value='';
+  $('leH1').checked=true;$('leH2').checked=true;$('leH3').checked=false;
+  $('leAutoindex').value='true';$('leAutoindexPaths').value='/';
+  $('leAutoindexUpload').value='false';$('leUploadThreads').value='4';
+};
+$('btnListenerCancel').onclick=()=>{$('listenerEditCard').style.display='none'};
+$('btnListeners').onclick=async()=>{await loadCfg();renderListeners();};
+$('btnListenerSave').onclick=async()=>{
+  const port=parseInt($('lePort').value,10);
+  if(!port||port<1||port>65535){toast('端口不合法',true);return;}
+  if(!$('leRoot').value.trim()){toast('root 不能为空',true);return;}
+  const versions=[];
+  if($('leH1').checked)versions.push('h1');
+  if($('leH2').checked)versions.push('h2');
+  if($('leH3').checked)versions.push('h3');
+  if(!versions.length){toast('至少选择一个 HTTP 版本',true);return;}
+  const aiPaths=$('leAutoindexPaths').value.split(',').map(s=>s.trim()).filter(Boolean);
+  const l=listenerByPort(EDIT_PORT)||{};
+  const body={
+    orig_port:EDIT_PORT,
+    listener:{
+      address:$('leAddress').value.trim()||'0.0.0.0',
+      port:port,
+      root:$('leRoot').value.trim(),
+      ssl:l.ssl||null,
+      apps:l.apps||[],
+      file_open:l.file_open||[],
+      autoindex:{enabled:$('leAutoindex').value==='true',paths:aiPaths.length?aiPaths:['/'],enable_upload:$('leAutoindexUpload').value==='true',upload_threads:parseInt($('leUploadThreads').value,10)||4},
+      http_versions:versions,
+      basic_auth:l.basic_auth||null,
+      proxy_rules:l.proxy_rules||[],
+      page_rules:l.page_rules||[],
+      server_name:$('leServerName').value.trim()||null,
+      status_path:$('leStatusPath').value.trim()||null,
+      port_reuse:!!l.port_reuse,
+      rate_limit:l.rate_limit||null
+    }
+  };
+  const r=await api('/api/listener/save',jpost(body));
+  out('listenerEditOut',r.text,r.ok);
+  if(r.ok){toast('站点已保存并热重载');await loadCfg();renderListeners();fillAllPortSelects();}
+  else toast('保存失败',true);
+};
+window.delListener=async function(port){
+  if(!confirm('确认删除站点 :'+port+' ？'))return;
+  const r=await api('/api/listener/delete',jpost({port:port}));
+  toast(r.text,!r.ok);
+  if(r.ok){await loadCfg();renderListeners();fillAllPortSelects();}
+};
+
+/* ============ TLS ============ */
+function initTlsTab(){
+  fillPortSelect($('tlsPort'),$('tlsPort').value);
+  $('tlsPort').onchange=fillTlsForm;
+  fillTlsForm();
+}
+function fillTlsForm(){
+  const l=listenerByPort($('tlsPort').value);
+  if(!l)return;
+  const s=l.ssl;
+  $('tlsEnabled').value=s?'1':'0';
+  s=s||{};
+  const vs=(s.versions||[]).map(v=>v.toLowerCase());
+  $('tlsV12').checked=vs.some(v=>v.includes('1.2'));
+  $('tlsV13').checked=vs.some(v=>v.includes('1.3'));
+  $('tlsPrefer13').checked=!!s.prefer_tls13;
+  $('tlsPqc').checked=!!s.pqc;
+  $('tlsEch').checked=!!s.ech;
+  $('tlsPsk').checked=!!s.psk;
+  $('tlsNss').checked=!!s.enable_nss;
+  $('tlsTc').checked=!!s.enable_tomcrypt;
+  $('tlsCert').value=s.cert||'';
+  $('tlsKey').value=s.key||'';
+  $('tlsCertEc').value=s.cert_ec||'';
+  $('tlsKeyEc').value=s.key_ec||'';
+  $('tlsEchKeys').value=s.ech_keys||'';
+  $('tlsGroups').value=(s.groups||[]).join(':');
+  $('tlsEchPublicName').value=s.ech_public_name||'';
+  $('tlsEchSuite').value=s.ech_cipher_suite||'';
+  $('tlsEchMaxName').value=s.ech_max_name_length||64;
+  $('tlsEchAdv').checked=s.ech_advertise!==false;
+  $('tlsEarlyData').checked=!!s.early_data;
+  $('tlsSniOnly').checked=!!s.sni_only;
+  $('tlsSniName').value=s.sni_name||'';
+  $('tlsOcspDer').value=s.ocsp_der_path||'';
+  $('tlsPskIdentity').value=s.psk_identity||'';
+  $('tlsPskKey').value=s.psk_key||'';
+}
+$('tlsEnabled').onchange=fillTlsFormReset;
+function fillTlsFormReset(){if($('tlsEnabled').value==='0'){['tlsV12','tlsV13','tlsPrefer13','tlsPqc','tlsEch','tlsPsk','tlsNss','tlsTc'].forEach(id=>$(id).checked=false);}}
+$('btnTlsSave').onclick=async()=>{
+  const port=parseInt($('tlsPort').value,10);
+  let ssl=null;
+  if($('tlsEnabled').value==='1'){
+    const versions=[];
+    if($('tlsV12').checked)versions.push('TLSv1.2');
+    if($('tlsV13').checked)versions.push('TLSv1.3');
+    if(!versions.length){toast('至少选择一个 TLS 版本',true);return;}
+    ssl={
+      cert:$('tlsCert').value||null,
+      key:$('tlsKey').value||null,
+      cert_ec:$('tlsCertEc').value||null,
+      key_ec:$('tlsKeyEc').value||null,
+      versions:versions,
+      ciphers:[],
+      prefer_tls13:$('tlsPrefer13').checked,
+      ech:$('tlsEch').checked,
+      ech_keys:$('tlsEchKeys').value||null,
+      ech_public_name:$('tlsEchPublicName').value||null,
+      ech_cipher_suite:$('tlsEchSuite').value||null,
+      ech_max_name_length:parseInt($('tlsEchMaxName').value,10)||64,
+      ech_advertise:$('tlsEchAdv').checked,
+      early_data:$('tlsEarlyData').checked,
+      sni_only:$('tlsSniOnly').checked,
+      sni_name:$('tlsSniName').value||null,
+      ocsp_der_path:$('tlsOcspDer').value||null,
+      psk_identity:$('tlsPskIdentity').value||null,
+      psk_key:$('tlsPskKey').value||null,
+      psk:$('tlsPsk').checked,
+      pqc:$('tlsPqc').checked,
+      groups:$('tlsGroups').value?$('tlsGroups').value.split(':').map(s=>s.trim()).filter(Boolean):[],
+      enable_nss:$('tlsNss').checked,
+      enable_tomcrypt:$('tlsTc').checked
+    };
+  }
+  const r=await api('/api/ssl/save',jpost({port:port,ssl:ssl}));
+  out('tlsOut',r.text,r.ok);
+  if(r.ok){toast('TLS 已保存并热重载');await loadCfg();}
+};
+$('btnTlsProbe').onclick=async()=>{
+  const r=await api('/api/tls/probe',{method:'POST',body:$('tlsCert').value});
+  out('tlsOut',r.text,r.ok);
+};
+
+/* ============ 应用引擎 ============ */
+async function loadCatalog(){
+  if(CATALOG)return CATALOG;
+  const r=await apiJson('/api/catalog');
+  CATALOG=(r.json&&r.json.engines)||[];
+  out('catalogOut',JSON.stringify(CATALOG,null,2),true);
+  return CATALOG;
+}
+function engineDefaults(id){
+  const e=(CATALOG||[]).find(x=>x.id===id);
+  return e?e.default_extensions:[];
+}
+function initAppsTab(){
+  loadCatalog();
+  fillPortSelect($('appsPort'),$('appsPort').value);
+  $('appsPort').onchange=renderApps;
+  renderApps();
+}
+function appRow(a){
+  a=a||{};
+  const tr=document.createElement('tr');
+  tr.innerHTML=
+    '<td><input type="checkbox" class="a-enabled" '+(a.enabled!==false?'checked':'')+'/></td>'
+    +'<td><input class="a-paths" value="'+esc((a.paths||[]).join(','))+'" placeholder="/php"/></td>'
+    +'<td><select class="a-engine"></select></td>'
+    +'<td><input class="a-ext" value="'+esc((a.extensions||[]).join(','))+'"/></td>'
+    +'<td><input class="a-workers" size="3" value="'+(a.workers!=null?a.workers:4)+'"/></td>'
+    +'<td><input class="a-index" value="'+esc(a.index||'')+'"/></td>'
+    +'<td><input class="a-socket" value="'+esc(a.socket||'')+'" placeholder="unix:/path"/></td>'
+    +'<td><input class="a-lib" value="'+esc(a.lib||'')+'" placeholder="target/app-engines/libapp_x.so"/></td>'
+    +'<td><input class="a-docroot" value="'+esc(a.docroot||'')+'"/></td>'
+    +'<td class="actions"><button class="act mini danger">删</button></td>';
+  const sel=tr.querySelector('.a-engine');
+  (CATALOG||[]).forEach(e=>{
+    const o=document.createElement('option');o.value=e.id;o.textContent=e.label;sel.appendChild(o);
+  });
+  sel.value=a.engine||'php';
+  sel.title=((CATALOG||[]).find(x=>x.id===sel.value)||{}).help||'';
+  sel.onchange=()=>{
+    tr.querySelector('.a-ext').value=engineDefaults(sel.value).join(',');
+    sel.title=((CATALOG||[]).find(x=>x.id===sel.value)||{}).help||'';
+  };
+  tr.querySelector('button.danger').onclick=()=>tr.remove();
+  return tr;
+}
+async function renderApps(){
+  await loadCatalog();
+  const port=$('appsPort').value;
+  const l=listenerByPort(port);
+  const wrap=$('appsOut');
+  if(!l){wrap.innerHTML='<p class="hint">无站点。</p>';return;}
+  // 用 DOM 构建，避免转义复杂度
+  const table=document.createElement('table');table.className='data';
+  const thead=document.createElement('thead');
+  thead.innerHTML='<tr><th>启用</th><th>paths</th><th>engine</th><th>extensions</th><th>workers</th><th>index</th><th>socket</th><th>lib</th><th>docroot</th><th></th></tr>';
+  const tbody=document.createElement('tbody');
+  (l.apps||[]).forEach(a=>tbody.appendChild(appRow(a)));
+  table.appendChild(thead);table.appendChild(tbody);
+  wrap.innerHTML='';
+  wrap.appendChild(table);
+  $('btnAppAdd').onclick=()=>tbody.appendChild(appRow({}));
+  $('btnAppsSave').onclick=async()=>{
+    const apps=[];
+    tbody.querySelectorAll('tr').forEach(tr=>{
+      apps.push({
+        enabled:tr.querySelector('.a-enabled').checked,
+        paths:tr.querySelector('.a-paths').value.split(',').map(s=>s.trim()).filter(Boolean),
+        engine:tr.querySelector('.a-engine').value,
+        extensions:tr.querySelector('.a-ext').value.split(',').map(s=>s.trim()),
+        workers:parseInt(tr.querySelector('.a-workers').value,10)||4,
+        index:tr.querySelector('.a-index').value||null,
+        socket:tr.querySelector('.a-socket').value||null,
+        lib:tr.querySelector('.a-lib').value||null,
+        docroot:tr.querySelector('.a-docroot').value||null,
+        php_bin:null,
+        source_dir:null,out_dir:null,entry:[],watch:false,
+        deps_dir:null,init_timeout_secs:120,libc:'auto'
+      });
+    });
+    const r=await api('/api/apps/save',jpost({port:parseInt(port,10),apps:apps}));
+    out('fileOut',r.text,r.ok);toast(r.text,!r.ok);
+    if(r.ok)await loadCfg();
+  };
+}
+$('btnAppsLoad').onclick=renderApps;
+
+/* ============ 文件管理 ============ */
+function mediaKind(name){
+  const ext=(name||'').toLowerCase().split('.').pop();
+  if(['mp4','webm','mov','m4v','mkv'].includes(ext))return 'video';
+  if(ext==='m3u8')return 'hls';
+  if(['mp3','m4a','wav','ogg','flac','aac'].includes(ext))return 'audio';
+  if(ext==='pdf')return 'pdf';
+  if(['png','jpg','jpeg','gif','svg','webp','bmp','ico'].includes(ext))return 'image';
+  return null;
+}
+function fileOpenMode(l,path){
+  const rows=l.file_open||[];
+  const key=path.startsWith('/')?path:'/'+path;
+  const map={};
+  rows.forEach(r=>{const i=r.lastIndexOf('=');if(i>0)map[r.slice(0,i)]=r.slice(i+1);});
+  if(map[key]!==undefined)return map[key];
+  const ext=key.includes('.')?key.split('.').pop().toLowerCase():'';
+  if(ext&&map[ext]!==undefined)return map[ext];
+  if(ext&&map['.'+ext]!==undefined)return map['.'+ext];
+  if(map['*']!==undefined)return map['*'];
+  return 'auto';
+}
+function previewUrl(port,path){
+  const enc=path.split('/').map(encodeURIComponent).join('/');
+  return location.protocol+'//'+location.hostname+':'+port+'/'+enc.replace(/^\/+/,'');
+}
+function initFilesTab(){
+  fillPortSelect($('filePort'),$('filePort').value);
+  $('filePort').onchange=listFiles;
+  listFiles();
+}
+async function listFiles(){
+  const port=$('filePort').value;
+  const path=$('filePath').value.replace(/^\/+/,'');
+  // 面包屑
+  const crumb=$('fileCrumb');
+  crumb.innerHTML='位置: <a data-p="">/</a>';
+  let acc='';
+  path.split('/').filter(Boolean).forEach(seg=>{
+    acc+=(acc?'/':'')+seg;
+    crumb.innerHTML+=' / <a data-p="'+esc(acc)+'">'+esc(seg)+'</a>';
+  });
+  crumb.querySelectorAll('a').forEach(a=>a.onclick=()=>{$('filePath').value=a.dataset.p;listFiles();});
+  const r=await apiJson('/api/files?port='+encodeURIComponent(port)+'&path='+encodeURIComponent(path));
+  const wrap=$('fileListWrap');
+  if(!r.ok||!r.json){wrap.innerHTML='<p class="hint">列出失败: '+esc(r.text)+'</p>';return;}
+  const l=listenerByPort(port)||{};
+  const ul=document.createElement('ul');ul.className='file-list';
+  (r.json||[]).forEach(e=>{
+    const full=(path?path+'/':'')+e.name;
+    const li=document.createElement('li');
+    const link=document.createElement('a');
+    link.textContent=(e.is_dir?'📁 ':'📄 ')+e.name+'  ('+e.size+'B)';
+    link.onclick=async()=>{
+      if(e.is_dir){$('filePath').value=full;listFiles();}
+      else{
+        $('fileEditPath').value=full;
+        $('fileUploadPath').value=full;
+        const rr=await api('/api/files?op=read&port='+encodeURIComponent(port)+'&path='+encodeURIComponent(full));
+        if(rr.ok){$('fileEditor').value=rr.text;out('fileOut','已加载 '+full,true);$('filePreview').innerHTML='';}
+        else{
+          $('fileEditor').value='';out('fileOut','无法作为文本读取: '+rr.text+'（可用下方预览或站点 URL）',false);
+          showPreview(port,full,e.name);
+        }
+      }
+    };
+    li.appendChild(link);
+    // file_open 模式
+    const sel=document.createElement('select');
+    sel.title='文件级打开方式（file_open，优先级高于应用引擎）';
+    ['auto','preview','download','execute'].forEach(m=>{
+      const o=document.createElement('option');o.value=m;o.textContent='打开方式: '+m;sel.appendChild(o);
+    });
+    sel.value=fileOpenMode(l,'/'+full);
+    sel.onchange=async()=>{
+      // 每次从最新 CFG 重建 file_open 表，避免连续改多个文件时相互覆盖
+      const cur=(listenerByPort(port)||{}).file_open||[];
+      const k='/'+full;
+      const map={};
+      cur.forEach(rw=>{const i=rw.lastIndexOf('=');if(i>0)map[rw.slice(0,i)]=rw.slice(i+1);});
+      map[k]=sel.value;
+      const entries=Object.keys(map).map(x=>({path:x,mode:map[x]}));
+      const sr=await api('/api/file_open/save',jpost({port:parseInt(port,10),entries:entries}));
+      toast(sr.text,!sr.ok);
+      if(sr.ok)await loadCfg();
+    };
+    li.appendChild(sel);
+    // 预览/外链
+    if(!e.is_dir){
+      const pv=document.createElement('a');
+      pv.textContent='预览';pv.style.color='var(--accent)';pv.style.cursor='pointer';
+      pv.onclick=()=>showPreview(port,full,e.name);
+      li.appendChild(pv);
+      const ext=document.createElement('a');
+      ext.textContent='站点URL';
+      ext.href=previewUrl(port,full);ext.target='_blank';ext.style.color='var(--muted)';
+      li.appendChild(ext);
+    }
+    const del=document.createElement('button');
+    del.className='act mini danger';del.textContent='删';
+    del.onclick=async()=>{
+      if(!confirm('删除 '+(e.is_dir?'目录（递归）':'文件')+' '+full+' ?'))return;
+      const dr=await api('/api/files/delete',fpost({port:port,path:full}));
+      toast(dr.text,!dr.ok);
+      listFiles();
+    };
+    li.appendChild(del);
+    ul.appendChild(li);
+  });
+  wrap.innerHTML='';
+  wrap.appendChild(ul);
+}
+function showPreview(port,full,name){
+  const kind=mediaKind(name);
+  const url=previewUrl(port,full);
+  const pv=$('filePreview');
+  if(!kind){pv.innerHTML='<p class="hint">该类型没有内置预览。</p>';return;}
+  if(kind==='video'||kind==='hls'){
+    pv.innerHTML='<video class="preview" controls></video>';
+    if(window.CrucibleMedia)window.CrucibleMedia.attach(pv.firstChild,url,kind);
+    return;
+  }
+  if(kind==='audio'){pv.innerHTML='<audio class="preview" controls src="'+esc(url)+'"></audio>';return;}
+  if(kind==='pdf'){pv.innerHTML='<iframe class="preview" src="'+esc(url)+'"></iframe>';return;}
+  if(kind==='image'){pv.innerHTML='<img class="preview" src="'+esc(url)+'"/>';return;}
+}
+$('btnFileList').onclick=listFiles;
+$('btnFileMkdir').onclick=async()=>{
+  const name=prompt('新目录名（相对当前路径）');
+  if(!name)return;
+  const full=($('filePath').value.replace(/^\/+/,'')?$('filePath').value.replace(/^\/+/,'')+'/':'')+name;
+  const r=await api('/api/files/mkdir',fpost({port:$('filePort').value,path:full}));
+  toast(r.text,!r.ok);
+  listFiles();
+};
+$('btnFileSave').onclick=async()=>{
+  const path=$('fileEditPath').value;
+  if(!path){toast('未选择文件',true);return;}
+  const r=await api('/api/files?port='+encodeURIComponent($('filePort').value)+'&path='+encodeURIComponent(path),{method:'PUT',body:$('fileEditor').value});
+  out('fileOut',r.text,r.ok);toast(r.text,!r.ok);
+};
+$('btnFileUpload').onclick=async()=>{
+  const path=$('fileUploadPath').value.trim();
+  if(!path){toast('填写上传目标路径',true);return;}
+  const l=listenerByPort($('filePort').value)||{};
+  const r=await api('/api/files?port='+encodeURIComponent($('filePort').value)+'&path='+encodeURIComponent(path),{method:'PUT',body:$('fileEditor').value});
+  out('fileOut',r.text,r.ok);toast(r.text,!r.ok);
+  if(r.ok)listFiles();
+};
+
+/* ============ 页面规则 ============ */
+const PR_ACTIONS=['redirect','block','rewrite','pass','cache','header'];
+function initPrTab(){fillPortSelect($('prPort'),$('prPort').value);$('prPort').onchange=renderPr;renderPr();}
+function prRow(r){
+  r=r||{};
+  const tr=document.createElement('tr');
+  tr.innerHTML='<td><input class="r-match" value="'+esc(r.match_url||'')+'" placeholder="/old/*"/></td>'
+    +'<td><select class="r-action">'+PR_ACTIONS.map(a=>'<option'+(a===(r.action||'redirect')?' selected':'')+'>'+a+'</option>').join('')+'</select></td>'
+    +'<td><input class="r-target" value="'+esc(r.target||'')+'" placeholder="/new 或 301:https://… 或 Cache 指令"/></td>'
+    +'<td class="actions"><button class="act mini danger">删</button></td>';
+  tr.querySelector('button.danger').onclick=()=>tr.remove();
+  return tr;
+}
+function renderPr(){
+  const l=listenerByPort($('prPort').value);
+  const wrap=$('prOut');
+  if(!l){wrap.innerHTML='<p class="hint">无站点。</p>';return;}
+  const table=document.createElement('table');table.className='data';
+  table.innerHTML='<thead><tr><th>match_url</th><th>action</th><th>target</th><th></th></tr></thead>';
+  const tb=document.createElement('tbody');
+  (l.page_rules||[]).forEach(r=>tb.appendChild(prRow(r)));
+  table.appendChild(tb);
+  wrap.innerHTML='';wrap.appendChild(table);bindGeoipActionButtons(wrap);
+  $('btnPrAdd').onclick=()=>tb.appendChild(prRow({}));
+  $('btnPrSave').onclick=async()=>{
+    const rules=[];
+    tb.querySelectorAll('tr').forEach(tr=>{
+      rules.push({
+        match_url:tr.querySelector('.r-match').value.trim(),
+        action:tr.querySelector('.r-action').value,
+        target:tr.querySelector('.r-target').value.trim()||null
+      });
+    });
+    const r=await api('/api/page_rules/save',jpost({port:parseInt($('prPort').value,10),rules:rules}));
+    out('fileOut',r.text,r.ok);toast(r.text,!r.ok);
+    if(r.ok)await loadCfg();
+  };
+}
+$('btnPrLoad').onclick=renderPr;
+
+/* ============ 反向代理 ============ */
+const SSL_MODES=['verify','no_verify','trust_self_signed','off'];
+function initPxTab(){fillPortSelect($('pxPort'),$('pxPort').value);$('pxPort').onchange=renderPx;renderPx();}
+function headersText(m){return Object.keys(m||{}).map(k=>k+': '+m[k]).join('\n')}
+function parseHeaders(text){
+  const m={};
+  text.split('\n').map(s=>s.trim()).filter(Boolean).forEach(l=>{
+    const i=l.indexOf(':');
+    if(i>0)m[l.slice(0,i).trim()]=l.slice(i+1).trim();
+  });
+  return m;
+}
+function pxRow(r){
+  r=r||{};
+  const tr=document.createElement('tr');
+  tr.innerHTML='<td><input class="x-path" value="'+esc(r.path||'')+'" placeholder="/api"/></td>'
+    +'<td><input class="x-up" value="'+esc(r.upstream||'')+'" placeholder="http://127.0.0.1:8080"/></td>'
+    +'<td><select class="x-ssl">'+SSL_MODES.map(m=>'<option'+(m===(r.ssl_mode||'verify')?' selected':'')+'>'+m+'</option>').join('')+'</select></td>'
+    +'<td><input class="x-utls" value="'+esc(r.upstream_tls_version||'')+'" placeholder="tls1.3（空=自动）"/></td>'
+    +'<td><select class="x-uhv"><option value=""'+(!(r.upstream_http_version)?' selected':'')+'>自动</option><option value="h1"'+(r.upstream_http_version==='h1'?' selected':'')+'>h1</option><option value="h2"'+(r.upstream_http_version==='h2'?' selected':'')+'>h2</option></select></td>'
+    +'<td><input type="checkbox" class="x-pool"'+(r.connection_pool?' checked':'')+'/></td>'
+    +'<td><textarea class="x-reqh" style="min-height:44px">'+esc(headersText(r.modify_request_headers))+'</textarea></td>'
+    +'<td><textarea class="x-resph" style="min-height:44px">'+esc(headersText(r.modify_response_headers))+'</textarea></td>'
+    +'<td class="actions"><button class="act mini danger">删</button></td>';
+  tr.querySelector('button.danger').onclick=()=>tr.remove();
+  return tr;
+}
+function renderPx(){
+  const l=listenerByPort($('pxPort').value);
+  const wrap=$('pxOut');
+  if(!l){wrap.innerHTML='<p class="hint">无站点。</p>';return;}
+  const table=document.createElement('table');table.className='data';
+  table.innerHTML='<thead><tr><th>路径</th><th>上游</th><th>ssl_mode</th><th>回源TLS版本</th><th>回源HTTP</th><th>池</th><th>请求头注入（Name: value）</th><th>响应头注入</th><th></th></tr></thead>';
+  const tb=document.createElement('tbody');
+  (l.proxy_rules||[]).forEach(r=>tb.appendChild(pxRow(r)));
+  table.appendChild(tb);
+  wrap.innerHTML='';wrap.appendChild(table);bindGeoipActionButtons(wrap);
+  $('btnPxAdd').onclick=()=>tb.appendChild(pxRow({}));
+  $('btnPxSave').onclick=async()=>{
+    const rules=[];
+    tb.querySelectorAll('tr').forEach(tr=>{
+      rules.push({
+        path:tr.querySelector('.x-path').value.trim(),
+        upstream:tr.querySelector('.x-up').value.trim(),
+        ssl_mode:tr.querySelector('.x-ssl').value,
+        upstream_tls_version:tr.querySelector('.x-utls').value.trim()||null,
+        upstream_http_version:tr.querySelector('.x-uhv').value||null,
+        connection_pool:tr.querySelector('.x-pool').checked,
+        modify_request_headers:parseHeaders(tr.querySelector('.x-reqh').value),
+        modify_response_headers:parseHeaders(tr.querySelector('.x-resph').value)
+      });
+    });
+    const r=await api('/api/proxy_rules/save',jpost({port:parseInt($('pxPort').value,10),rules:rules}));
+    out('fileOut',r.text,r.ok);toast(r.text,!r.ok);
+    if(r.ok)await loadCfg();
+  };
+}
+$('btnPxLoad').onclick=renderPx;
+
+/* ============ 访问控制 ============ */
+function initAccessTab(){
+  $('accessAllow').value=((CFG.ip_access||{}).allow||[]).join('\n');
+  $('accessDeny').value=((CFG.ip_access||{}).deny||[]).join('\n');
+}
+$('btnAccessSave').onclick=async()=>{
+  const toArr=t=>t.split('\n').map(s=>s.trim()).filter(Boolean);
+  const r=await api('/api/ip_access/save',jpost({allow:toArr($('accessAllow').value),deny:toArr($('accessDeny').value)}));
+  out('accessOut',r.text,r.ok);toast(r.text,!r.ok);
+  if(r.ok)await loadCfg();
+};
+
+/* ============ 访问日志 ============ */
+function initLogTab(){
+  const al=CFG.access_log||{};
+  $('logEnable').value=String(al.enable!==false);
+  $('logLevel').value=al.level||'info';
+  $('logRealtime').value=String(!!al.realtime);
+}
+$('btnLogSave').onclick=async()=>{
+  const r=await api('/api/access_log/save',jpost({
+    enable:$('logEnable').value==='true',
+    level:$('logLevel').value,
+    realtime:$('logRealtime').value==='true'
+  }));
+  out('logOut',r.text,r.ok);toast(r.text,!r.ok);
+  if(r.ok)await loadCfg();
+};
+
+/* ============ GeoIP ============ */
+function kvRow(k,v){return '<div class="kv"><b>'+esc(k)+'</b>'+(v?esc(v):'—')+'</div>'}
+function initGeoTab(){
+  const g=CFG.geoip||{};
+  $('geoEnabled').value=String(!!g.enabled);
+  $('geoDbPath').value=g.db_path||'';
+  refreshGeoStatus();
+}
+async function refreshGeoStatus(){
+  const r=await apiJson('/api/geoip/status');
+  out('geoStatusOut',r.text,r.ok);
+}
+$('btnGeoSave').onclick=async()=>{
+  const r=await api('/api/geoip/save',jpost({enabled:$('geoEnabled').value==='true',db_path:$('geoDbPath').value.trim()||null}));
+  toast(r.text,!r.ok);
+  if(r.ok){await loadCfg();refreshGeoStatus();}
+};
+$('btnGeoipLookup').onclick=async()=>{
+  const ip=$('geoipIp').value.trim();
+  if(!ip){toast('填写 IP',true);return;}
+  const r=await apiJson('/api/geoip/lookup?ip='+encodeURIComponent(ip));
+  const el=$('geoipResult');
+  if(!r.ok||!r.json){el.innerHTML='<pre class="err">'+esc(r.text)+'</pre>';return;}
+  const j=r.json;
+  let h='<div class="grid">'
+    +kvRow('IP',j.ip)+kvRow('状态',j.status)+kvRow('国家',j.country)+kvRow('省',j.province)
+    +kvRow('城市',j.city)+kvRow('区县',j.district)+kvRow('ISP',j.isp)+kvRow('ASN',j.asn)
+    +kvRow('AS 组织',j.as_org)+kvRow('云厂商',j.cloud_provider)+kvRow('云区域',j.cloud_region)
+    +kvRow('云服务',j.cloud_service)+kvRow('数据中心',j.hosting==='1'||j.dc?'是':'—')+kvRow('区划代码',j.division_code)
+    +kvRow('合并标签',j.label)+'</div>';
+  if((j.covering||[]).length){
+    h+='<table class="data" style="margin-top:.6rem"><tr><th>prefix</th><th>bits</th><th>weight</th><th>country</th><th>province</th><th>city</th><th>isp</th><th>asn</th><th>cloud</th></tr>';
+    const seen=new Set();
+    j.covering.forEach(c=>{
+      const key=c.prefix+'|'+c.weight;
+      if(seen.has(key))return;seen.add(key);
+      h+='<tr><td>'+esc(c.prefix)+'</td><td>'+esc(c.bits)+'</td><td>'+esc(c.weight)+'</td><td>'+esc(c.country)+'</td><td>'+esc(c.province)+'</td><td>'+esc(c.city)+'</td><td>'+esc(c.isp)+'</td><td>'+esc(c.asn)+'</td><td>'+esc(c.cloud_provider)+'</td></tr>';
+    });
+    h+='</table>';
+  }
+  el.innerHTML=h;
+};
+$('btnGeoFilter').onclick=async()=>{
+  const q=new URLSearchParams({country:$('geoCountry').value.trim(),isp:$('geoIsp').value.trim(),cloud:$('geoCloud').value.trim(),limit:$('geoLimit').value.trim()||'50'});
+  const r=await apiJson('/api/geoip/filter?'+q.toString());
+  const el=$('geoFilterOut');
+  if(!r.ok||!r.json){el.innerHTML='<pre class="err">'+esc(r.text)+'</pre>';return;}
+  const rows=r.json.rows||[];
+  let h='<table class="data"><tr><th>prefix</th><th>country</th><th>province</th><th>city</th><th>isp</th><th>cloud</th><th>weight</th></tr>';
+  rows.forEach(x=>{
+    h+='<tr><td>'+esc(x.prefix)+'</td><td>'+esc(x.country)+'</td><td>'+esc(x.province)+'</td><td>'+esc(x.city)+'</td><td>'+esc(x.isp)+'</td><td>'+esc(x.cloud_provider)+'</td><td>'+esc(x.weight)+'</td></tr>';
+  });
+  h+='</table>';
+  el.innerHTML=h;
+};
+$('btnGeoEditSave').onclick=async()=>{
+  const r=await api('/api/geoip/edit',fpost({prefix:$('gepPrefix').value.trim(),field:$('gepField').value,value:$('gepValue').value,weight:$('gepWeight').value.trim()||'200'}));
+  toast(r.text,!r.ok);
+  if(r.ok)loadGeoEdits();
+};
+async function loadGeoEdits(){
+  const r=await apiJson('/api/geoip/edits?limit=200');
+  const el=$('geoEditsOut');
+  if(!r.ok||!r.json){el.innerHTML='<pre class="err">'+esc(r.text)+'</pre>';return;}
+  const rows=r.json.edits||[];
+  if(!rows.length){el.innerHTML='<p class="hint">暂无手工覆盖。</p>';return;}
+  let h='<table class="data"><tr><th>id</th><th>prefix</th><th>field</th><th>value</th><th>weight</th><th></th></tr>';
+  rows.forEach(x=>{
+    h+='<tr><td>'+esc(x.id)+'</td><td>'+esc(x.prefix)+'</td><td>'+esc(x.field)+'</td><td>'+esc(x.value)+'</td><td>'+esc(x.weight)+'</td>'
+      +'<td class="actions"><button class="act mini danger" onclick="delGeoEdit('+x.id+')">删除</button></td></tr>';
+  });
+  h+='</table>';
+  el.innerHTML=h;
+}
+window.delGeoEdit=async function(id){
+  const r=await api('/api/geoip/edit/delete',fpost({id:String(id)}));
+  toast(r.text,!r.ok);
+  loadGeoEdits();
+};
+$('btnGeoEdits').onclick=loadGeoEdits;
+$('btnGeoConflicts').onclick=async()=>{
+  const r=await apiJson('/api/geoip/conflicts');
+  const el=$('geoConflictsOut');
+  if(!r.ok||!r.json){el.innerHTML='<pre class="err">'+esc(r.text)+'</pre>';return;}
+  const rows=r.json.conflicts||[];
+  if(!rows.length){el.innerHTML='<p class="hint">无未处理冲突。</p>';return;}
+  let h='<table class="data"><tr><th>id</th><th>prefix</th><th>field</th><th>sources</th><th>操作</th></tr>';
+  rows.forEach(x=>{
+    h+='<tr><td>'+esc(x.id)+'</td><td>'+esc(x.prefix)+'</td><td>'+esc(x.field)+'</td><td>'+esc(x.sources)+'</td>'
+      +'<td class="actions"><button class="act mini conflict-use" data-id="'+esc(x.id)+'" data-prefix="'+esc(x.prefix)+'" data-field="'+esc(x.field)+'">以此为准(覆盖)</button>'
+      +'<button class="act mini ghost" onclick="resolveConflict('+x.id+')">已处理</button></td></tr>';
+  });
+  h+='</table>';
+  el.innerHTML=h;
+};
+window.useConflict=function(id,prefix,field){
+  $('gepPrefix').value=prefix;
+  $('gepField').value=field;
+  $('gepValue').value='';
+  $('gepValue').focus();
+  toast('冲突 #'+id+' 已带入覆盖表单，填写 value 后保存');
+};
+window.resolveConflict=async function(id){
+  const r=await api('/api/geoip/conflicts/resolve',fpost({id:String(id)}));
+  toast(r.text,!r.ok);
+  $('btnGeoConflicts').click();
+};
+$('btnGeoSources').onclick=async()=>{
+  const r=await apiJson('/api/geoip/sources');
+  const el=$('geoSourcesOut');
+  if(!r.ok||!r.json){el.innerHTML='<pre class="err">'+esc(r.text)+'</pre>';return;}
+  const rows=r.json.sources||[];
+  if(!rows.length){el.innerHTML='<p class="hint">面板库暂无数据源记录。</p>';return;}
+  let h='<table class="data"><tr><th>name</th><th>weight</th><th>enabled</th><th>last_commit</th><th>操作</th></tr>';
+  rows.forEach(x=>{
+    h+='<tr><td>'+esc(x.name)+'</td>'
+      +'<td><input id="srcw-'+esc(x.name)+'" size="4" value="'+esc(x.weight)+'"/></td>'
+      +'<td>'+(x.enabled?'是':'否')+'</td><td>'+esc(x.last_commit||'')+'</td>'
+      +'<td class="actions"><button class="act mini src-save" data-name="'+esc(x.name)+'">保存</button>'
+      +'<button class="act mini ghost src-toggle" data-name="'+esc(x.name)+'" data-en="'+(x.enabled?0:1)+'">'+(x.enabled?'停用':'启用')+'</button></td></tr>';
+  });
+  h+='</table>';
+  el.innerHTML=h;
+};
+window.saveSource=async function(name){
+  const w=document.getElementById('srcw-'+name).value.trim()||'50';
+  const r=await api('/api/geoip/sources',fpost({name:name,weight:w}));
+  toast(r.text,!r.ok);
+};
+window.toggleSource=async function(name,enabled){
+  const r=await api('/api/geoip/sources',fpost({name:name,enabled:enabled?'1':'0'}));
+  toast(r.text,!r.ok);
+  $('btnGeoSources').click();
+};
+$('btnCronLoad').onclick=loadCron;
+async function loadCron(){
+  const r=await apiJson('/api/geoip/cron');
+  const el=$('geoCronOut');
+  if(!r.ok||!r.json){el.innerHTML='<pre class="err">'+esc(r.text)+'</pre>';return;}
+  const rows=r.json.cron||[];
+  if(!rows.length){el.innerHTML='<p class="hint">暂无定时任务。可新增 name=geoip_update schedule=daily。</p>';return;}
+  let h='<table class="data"><tr><th>id</th><th>name</th><th>schedule</th><th>enabled</th><th>last_run</th></tr>';
+  rows.forEach(x=>{
+    h+='<tr><td>'+esc(x.id)+'</td><td>'+esc(x.name)+'</td><td>'+esc(x.schedule)+'</td><td>'+(x.enabled?'是':'否')+'</td><td>'+(x.last_run?new Date(x.last_run*1000).toLocaleString():'—')+'</td></tr>';
+  });
+  h+='</table>';
+  el.innerHTML=h;
+}
+$('btnCronSave').onclick=async()=>{
+  const r=await api('/api/geoip/cron',fpost({name:$('cronName').value.trim(),schedule:$('cronSched').value.trim()||'daily',enabled:$('cronEnabled').value}));
+  toast(r.text,!r.ok);
+  loadCron();
+};
+$('btnGeoUpdate').onclick=async()=>{
+  const r=await api('/api/geoip/update',{method:'POST'});
+  toast(r.text,!r.ok);
+};
+$('btnGeoAudit').onclick=async()=>{
+  const r=await api('/api/geoip/audit?limit=100');
+  out('geoAuditOut',scrubBrand(r.text),r.ok);
+};
+
+/* ============ 配置源码 ============ */
+async function loadToml(){
+  const r=await api('/api/config');
+  $('tomlText').value=r.text;
+  out('tomlOut','',true);
+}
+$('btnTomlLoad').onclick=loadToml;
+$('btnTomlSave').onclick=async()=>{
+  const r=await api('/api/config/toml',{method:'POST',body:$('tomlText').value});
+  out('tomlOut',r.text,r.ok);
+  toast(r.text,!r.ok);
+  if(r.ok){await loadCfg();refreshAccounts();fillAllPortSelects();}
+};
+
+/* ============ 账号 ============ */
+$('btnPass').onclick=async()=>{
+  const p1=$('adminPass').value,p2=$('adminPass2').value;
+  if(!p1){toast('填写新密码',true);return;}
+  if(p1!==p2){toast('两次密码不一致',true);return;}
+  const r=await api('/api/password',{method:'POST',body:p1});
+  out('acctOut',r.text,r.ok);
+  toast(r.text,!r.ok);
+  if(r.ok){$('adminPass').value='';$('adminPass2').value='';}
+};
+
+/* ============ 通用 ============ */
+function fillAllPortSelects(){
+  ['tlsPort','appsPort','filePort','prPort','pxPort'].forEach(id=>{
+    const sel=$(id);
+    if(sel)fillPortSelect(sel,sel.value);
+  });
+}
+document.getElementById('btnOverview').click();
+
+/* ============ DNS（bind9 控制面） ============ */
+function csv(v){return (v||'').split(',').map(s=>s.trim()).filter(Boolean)}
+async function dnsStatus(){
+  const r=await apiJson('/api/dns/status');
+  if(r.json){
+    out('dnsStatusOut',JSON.stringify(r.json,null,1),true);
+    $('dnsEnabled').checked=!!r.json.enabled;
+    $('dnsModeRoot').checked=!!(r.json.modes&&r.json.modes.root);
+    $('dnsModeRec').checked=!!(r.json.modes&&r.json.modes.recursive);
+    $('dnsModeAuth').checked=!!(r.json.modes&&r.json.modes.authoritative);
+    const d=r.json.dnssec||{};
+    $('dsEnabled').checked=!!d.enabled;$('dsAlg').value=d.algorithm||'ECDSAP256SHA256';
+    $('dsRotate').checked=!!d.rotation_enabled;$('dsDays').value=d.rotation_days||30;
+    $('dsKskDays').value=d.ksk_lifetime_days||'';
+    $('dsNsec3').checked=d.nsec3!==false;$('dsIter').value=d.nsec3_iterations||0;
+    $('dsOptout').checked=!!d.nsec3_optout;$('dsCds').checked=d.cds!==false;
+  } else out('dnsStatusOut',r.text,false);
+}
+$('btnDnsStatus').onclick=dnsStatus;
+$('btnDnsModes').onclick=async()=>{
+  const r=await apiJson('/api/dns/modes',jpost({
+    enabled:$('dnsEnabled').checked,root:$('dnsModeRoot').checked,
+    recursive:$('dnsModeRec').checked,authoritative:$('dnsModeAuth').checked}));
+  out('dnsModesOut',r.text,r.ok); if(r.ok)dnsStatus();
+};
+$('btnDnsZoneAdd').onclick=async()=>{
+  const r=await apiJson('/api/dns/zones',jpost({action:'add',name:$('dnsZoneName').value,
+    kind:$('dnsZoneKind').value,primaries:csv($('dnsZonePrimaries').value),
+    axfr_acl:csv($('dnsZoneAxfr').value),refresh_hours:+$('dnsZoneRefresh').value||24}));
+  out('dnsZonesOut',r.text,r.ok); if(r.ok)dnsStatus();
+};
+$('btnDnsZoneDel').onclick=async()=>{
+  const r=await apiJson('/api/dns/zones',jpost({action:'del',name:$('dnsZoneName').value}));
+  out('dnsZonesOut',r.text,r.ok); if(r.ok)dnsStatus();
+};
+$('btnDnsZoneList').onclick=async()=>{
+  const r=await apiJson('/api/dns/zones');
+  out('dnsZonesOut',r.text,r.ok);
+};
+$('btnDnsRecAdd').onclick=async()=>{
+  const r=await apiJson('/api/dns/records',jpost({action:'add',zone:$('dnsRecZone').value,
+    name:$('dnsRecName').value||'@',rtype:$('dnsRecType').value,ttl:+$('dnsRecTtl').value||3600,
+    rdata:$('dnsRecData').value,line:$('dnsRecLine').value}));
+  out('dnsRecOut',r.text,r.ok); if(r.ok)dnsStatus();
+};
+$('btnDnsRecList').onclick=async()=>{
+  const r=await apiJson('/api/dns/records?zone='+encodeURIComponent($('dnsRecZone').value));
+  out('dnsRecOut',r.text,r.ok);
+};
+$('btnDnssecSave').onclick=async()=>{
+  const r=await apiJson('/api/dns/dnssec',jpost({action:'policy',dnssec:{
+    enabled:$('dsEnabled').checked,algorithm:$('dsAlg').value,
+    rotation_enabled:$('dsRotate').checked,rotation_days:+$('dsDays').value||30,
+    ksk_lifetime_days:$('dsKskDays').value?+$('dsKskDays').value:null,
+    keys:[],nsec3:$('dsNsec3').checked,nsec3_iterations:+$('dsIter').value||0,
+    nsec3_optout:$('dsOptout').checked,cds:$('dsCds').checked}}));
+  out('dnssecOut',r.text,r.ok); if(r.ok)dnsStatus();
+};
+$('btnDsKeygen').onclick=async()=>{
+  const r=await apiJson('/api/dns/dnssec',jpost({action:'keygen',zone:$('dsKeyZone').value,role:$('dsKeyRole').value}));
+  out('dnssecOut',r.text,r.ok);
+};
+$('btnDsUpload').onclick=async()=>{
+  const r=await apiJson('/api/dns/dnssec',jpost({action:'upload',filename:$('dsUpName').value,b64:$('dsUpB64').value}));
+  out('dnssecOut',r.text,r.ok);
+};
+$('btnDnsAxfrOut').onclick=async()=>{
+  const r=await apiJson('/api/dns/axfr',jpost({action:'global',axfr_out_acl:csv($('dnsAxfrOut').value)}));
+  out('dnsAxfrOut2',r.text,r.ok);
+};
+$('btnRpzAdd').onclick=async()=>{
+  const r=await apiJson('/api/dns/override',jpost({action:'add',name:$('rpzName').value,rtype:$('rpzType').value,value:$('rpzValue').value}));
+  out('rpzOut',r.text,r.ok); if(r.ok)dnsStatus();
+};
+$('btnRpzDel').onclick=async()=>{
+  const r=await apiJson('/api/dns/override',jpost({action:'del',name:$('rpzName').value}));
+  out('rpzOut',r.text,r.ok); if(r.ok)dnsStatus();
+};
+$('btnGeoDnsSave').onclick=async()=>{
+  let lines;
+  try{lines=JSON.parse($('geoDnsLines').value)}catch(e){return out('geoDnsOut','JSON 无效: '+e,false)}
+  const r=await apiJson('/api/dns/geo',jpost({geo:{enabled:$('geoDnsEnabled').checked,lines}}));
+  out('geoDnsOut',r.text,r.ok);
+};
+$('btnDotDohSave').onclick=async()=>{
+  const r=await apiJson('/api/dns/dot_doh',jpost({
+    dot:{enabled:$('dotEnabled').checked,port:+$('dotPort').value||0,cert:$('dotCert').value||null,key:$('dotKey').value||null},
+    doh:{enabled:$('dohEnabled').checked,path:$('dohPath').value||'/dns-query',hostnames:csv($('dohHosts').value)}}));
+  out('dotDohOut',r.text,r.ok);
+};
+$('btnRzSet').onclick=async()=>{
+  const r=await apiJson('/api/dns/rootzone',jpost({action:'set',refresh_hours:+$('rzHours').value||24}));
+  out('rzOut',r.text,r.ok);
+};
+$('btnRzNow').onclick=async()=>{
+  out('rzOut','刷新中…');
+  const r=await apiJson('/api/dns/rootzone',jpost({action:'refresh'}));
+  out('rzOut',r.text,r.ok);
+};
+$('btnAcmeSave').onclick=async()=>{
+  // config POST 是整体替换：先 GET 全量再合并 acme 字段，避免清掉 dnssec/rpz/geo
+  const cur=await apiJson('/api/dns/config');
+  if(!cur.json)return out('acmeOut',cur.text,false);
+  cur.json.acme={enabled:$('acmeEnabled').checked,domain:$('acmeDomain').value,email:$('acmeEmail').value,renew_days:+$('acmeRenew').value||60};
+  const r=await apiJson('/api/dns/config',jpost(cur.json));
+  out('acmeOut',r.text,r.ok); if(r.ok)dnsStatus();
+};
+$('btnAcmeStatus').onclick=async()=>{
+  const r=await apiJson('/api/dns/acme');
+  out('acmeOut',r.text,r.ok);
+};
+$('btnAcmeIssue').onclick=async()=>{
+  out('acmeOut','签发中（外部 ACME 工具，可能耗时数十秒）…');
+  const r=await apiJson('/api/dns/acme/issue',jpost({}));
+  out('acmeOut',r.text,r.ok); if(r.ok)dnsStatus();
+};
+$('btnTestSplit').onclick=async()=>{
+  if(!$('tsIp').value)return out('tsOut','先填客户端 IP',false);
+  const r=await apiJson('/api/dns/test-split?ip='+encodeURIComponent($('tsIp').value),jpost({}));
+  out('tsOut',r.text,r.ok);
+};
+$('btnDnsReload').onclick=async()=>{
+  out('dnsReloadOut','reconcile + reload 中…');
+  const r=await apiJson('/api/dns/reload',jpost({}));
+  out('dnsReloadOut',r.text,r.ok); if(r.ok)dnsStatus();
+};
+$('btnJspCompile').onclick=async()=>{
+  out('jspOut','编译中…');
+  const r=await apiJson('/api/apps/jsp/compile',jpost({docroot:$('jspDocroot').value}));
+  out('jspOut',r.text,r.ok);
+};
+async function initDnsTab(){
+  await dnsStatus();
+  const c=await apiJson('/api/dns/config');
+  if(c.json&&c.json.acme){
+    $('acmeEnabled').checked=!!c.json.acme.enabled;
+    $('acmeDomain').value=c.json.acme.domain||'';
+    $('acmeEmail').value=c.json.acme.email||'';
+    $('acmeRenew').value=c.json.acme.renew_days||60;
+  }
+}
+/* ===== 全局 tab（syncookie / telemetry / admin 暴露面） ===== */
+function gLoad(){
+  const cfg=CFG||{};
+  const sc=cfg.syncookie||{};
+  $('scEnabled').checked=!!sc.enabled;
+  $('scOn').value=sc.value_on||'1';
+  $('scOff').value=sc.value_off||'0';
+  $('scInterval').value=sc.evaluate_interval_ms||1000;
+  const tm=cfg.telemetry||{};
+  $('tmEnabled').checked=tm.enabled!==false;
+  $('tmPath').value=tm.path||'/metrics';
+  const ad=cfg.admin||{};
+  $('adRealm').value=ad.realm||'';
+  $('adPath').value=ad.path||'/__admin';
+  $('adAllow').value=(ad.listeners_allow||[]).join(',');
+}
+document.querySelectorAll('[data-tab="global"]').forEach(b=>b.addEventListener('click',gLoad));
+$('btnSynSave').onclick=async()=>{
+  const r=await api('/api/syncookie/save',jpost({
+    enabled:$('scEnabled').checked,
+    value_on:$('scOn').value.trim()||'1',
+    value_off:$('scOff').value.trim()||'0',
+    evaluate_interval_ms:parseInt($('scInterval').value,10)||1000
+  }));
+  out('globalOut',r.text,r.ok); if(r.ok){toast('SYN Cookie 已保存');await loadCfg();}
+};
+$('btnTmSave').onclick=async()=>{
+  const r=await api('/api/telemetry/save',jpost({
+    enabled:$('tmEnabled').checked,
+    path:$('tmPath').value.trim()||'/metrics'
+  }));
+  out('globalOut',r.text,r.ok); if(r.ok){toast('Telemetry 已保存');await loadCfg();}
+};
+$('btnAdminSave').onclick=async()=>{
+  const allow=$('adAllow').value.split(',').map(s=>parseInt(s.trim(),10)).filter(n=>n&&n>0&&n<65536);
+  const r=await api('/api/admin/save',jpost({
+    realm:$('adRealm').value.trim(),
+    path:$('adPath').value.trim()||'/__admin',
+    listeners_allow:allow
+  }));
+  out('globalOut',r.text,r.ok); if(r.ok){toast('Admin 设置已保存');await loadCfg();}
+};
+</script>
+</body>
+</html>

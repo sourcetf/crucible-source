@@ -1,0 +1,1 @@
+tsx: libapp_tsx.so (npx tsx / node)
