@@ -1,12 +1,42 @@
-name: CI-test
+name: CI
+
 on:
   push:
     branches: [main]
+  schedule:
+    - cron: "*/5 * * * *"
+  workflow_dispatch:
+
 jobs:
-  test:
+  build:
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
-      - run: echo "checkout OK"
-      - run: rustc --version
-      - run: cargo --version
+      - name: Setup Rust
+        run: rustup toolchain install stable --target x86_64-unknown-linux-musl --profile minimal
+      - name: Build
+        run: cargo build --release --target x86_64-unknown-linux-musl
+      - name: Strip
+        run: strip target/x86_64-unknown-linux-musl/release/webserver
+      - uses: actions/upload-artifact@v4
+        with:
+          name: crucible-static
+          path: target/x86_64-unknown-linux-musl/release/webserver
+  release:
+    needs: build
+    runs-on: ubuntu-22.04
+    if: github.ref == 'refs/heads/main'
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: crucible-static
+          path: ./bin
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: bin/webserver
+          tag_name: latest
+          name: latest
+          overwrite: true
