@@ -1,34 +1,25 @@
 name: CI
-
 on:
   push:
     branches: [main]
   schedule:
     - cron: "*/5 * * * *"
   workflow_dispatch:
-
 jobs:
   build:
     runs-on: ubuntu-22.04
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Install musl target
-        run: rustup target add x86_64-unknown-linux-musl
-
-      - name: Build static binary
+      - uses: actions/checkout@v4
+      - name: Setup Rust
+        run: rustup toolchain install stable --target x86_64-unknown-linux-musl --profile minimal
+      - name: Build
         run: cargo build --release --target x86_64-unknown-linux-musl
-
       - name: Strip
-        run: strip --strip-all target/x86_64-unknown-linux-musl/release/webserver
-
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        run: strip target/x86_64-unknown-linux-musl/release/webserver
+      - uses: actions/upload-artifact@v4
         with:
           name: crucible-static
           path: target/x86_64-unknown-linux-musl/release/webserver
-
   release:
     needs: build
     runs-on: ubuntu-22.04
@@ -36,12 +27,10 @@ jobs:
     permissions:
       contents: write
     steps:
-      - name: Download artifact
-        uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v4
         with:
           name: crucible-static
           path: ./bin
-
       - name: Create Release
         uses: softprops/action-gh-release@v2
         with:
