@@ -54,7 +54,7 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Install deps (ubuntu)
-        if: matrix.os == "ubuntu-22.04"
+        if: matrix.os == 'ubuntu-22.04'
         run: sudo apt-get update && sudo apt-get install -y build-essential pkg-config libssl-dev cmake clang
 
       - uses: dtolnay/rust-toolchain@master
@@ -81,13 +81,13 @@ jobs:
         run: cargo fmt --check || true
 
       - name: Build minimal (no crypto extras)
-        if: matrix.tier == "minimal"
+        if: matrix.tier == 'minimal'
         run: |
           cargo build --release -j 2
           cargo clippy -- -D warnings
 
       - name: Build full (BoringSSL TLS)
-        if: matrix.tier == "full"
+        if: matrix.tier == 'full'
         run: |
           cargo build --release --bin webserver --features "tls,tls_boring,go_shm_ipc,tls_nss,tls_tomcrypt" -j 2
           cargo clippy -- -D warnings
