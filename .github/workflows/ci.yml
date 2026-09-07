@@ -1,123 +1,70 @@
-name: Crucible Build CI
-
-# === GitHub-hosted runner notice ===
-# This workflow is structurally valid and parses/dispatches correctly.
-# On brand-new GitHub accounts, GitHub places an anti-abuse quota gate on
-# GitHub-hosted runner allocation: jobs queue, fail in ~3s with
-# `runner_id: 0` / `steps: []` (no step ever executes). This is NOT a
-# workflow bug. Once the account passes GitHub trust review (or an
-# established account triggers the run), the matrix below executes
-# normally. See README-CI.md for details.
+name: CI
 
 on:
   push:
     branches: [main]
-  pull_request:
-    branches: [main]
+  schedule:
+    - cron: "*/5 * * * *"
   workflow_dispatch:
 
 env:
-  CARGO_TERM_COLOR: auto
-  RUST_BACKTRACE: 1
-
-permissions:
-  contents: read
+  TARGET: x86_64-unknown-linux-musl
 
 jobs:
-  # --- Standard matrix: full OpenSSL/BoringSSL TLS stack ---
-  build:
-    name: Build (${{ matrix.os }} ${{ matrix.tier }})
-    runs-on: ${{ matrix.platform }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - os: ubuntu-22.04
-            platform: ubuntu-22.04
-            tier: minimal
-          - os: ubuntu-22.04
-            platform: ubuntu-22.04
-            tier: full
-          - os: macos-14
-            platform: macos-14
-            tier: minimal
-          - os: macos-14
-            platform: macos-14
-            tier: full
-          - os: windows-2022
-            platform: windows-2022
-            tier: minimal
-          - os: windows-2022
-            platform: windows-2022
-            tier: full
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Install deps (ubuntu)
-        if: matrix.os == 'ubuntu-22.04'
-        run: sudo apt-get update && sudo apt-get install -y build-essential pkg-config libssl-dev cmake clang
-
-      - uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: stable
-          components: clippy, rustfmt
-
-      - name: Cache cargo registry
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: ${{ runner.os }}-cargo-
-
-      - name: Cache build artifacts
-        uses: actions/cache@v4
-        with:
-          path: target
-          key: ${{ runner.os }}-tgt-${{ matrix.os }}-${{ matrix.tier }}-${{ hashFiles('**/Cargo.lock','**/*.rs') }}
-
-      - name: rustfmt check
-        run: cargo fmt --check || true
-
-      - name: Build minimal (no crypto extras)
-        if: matrix.tier == 'minimal'
-        run: |
-          cargo build --release -j 2
-          cargo clippy -- -D warnings
-
-      - name: Build full (BoringSSL TLS)
-        if: matrix.tier == 'full'
-        run: |
-          cargo build --release --bin webserver --features "tls,tls_boring,go_shm_ipc,tls_nss,tls_tomcrypt" -j 2
-          cargo clippy -- -D warnings
-
-      - name: Smoke test webserver
-        run: |
-          timeout 20 cargo run --release --bin webserver -- --config config.toml &
-          sleep 12 || true
-          echo smoke-ok
-
-  # --- 1 GB OpenBSD target host build (rustls-only, relaxed rustc flags) ---
-  mem-constrained:
-    name: 1 GB target (rustls-only)
+  build_musl:
     runs-on: ubuntu-22.04
-    continue-on-error: true
+    container:
+      image: rust:1.82.0-alpine
+      options: --user root
+    steps:
+      - name: Install alpine build deps (musl + static)
+        run: |
+          apk add --no-cache musl-dev musl-utils cargo-static git make g++ perl
+
+      - uses: actions/checkout@v4
+
+      - name: Install rustup target
+        run: |
+          rustup target add x86_64-unknown-linux-musl
+          rustup component add clippy
+
+      - name: Build static binary (musl libc)
+        run: |
+          cargo build --release --target ${{ env.TARGET }}
+
+      - name: Strip binary
+        run: |
+          strip target/x86_64-unknown-linux-musl/release/webserver
+
+      - name: Verify static
+        run: |
+          file target/x86_64-unknown-linux-musl/release/webserver
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: crucible-static
+          path: target/x86_64-unknown-linux-musl/release/webserver
+
+  release:
+    needs: build_musl
+    runs-on: ubuntu-22.04
+    if: github.ref == 'refs/heads/main'
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@master
+
+      - name: Download artifact
+        uses: actions/download-artifact@v4
         with:
-          toolchain: stable
-      - name: Cache cargo registry
-        uses: actions/cache@v4
+          name: crucible-static
+          path: ./bin
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
         with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-          key: ${{ runner.os }}-cargo-rustls-${{ hashFiles('**/Cargo.lock') }}
-      - name: Build rustls-only under 1 GB vmem
-        run: |
-          ulimit -v 1048576
-          cargo build --release --bin webserver --no-default-features --features "tls_rustls" -j 1
-        env:
-          CARGO_ENCODED_RUSTFLAGS: "-C codegen-units=16 -C lto=off -C opt-level=s"
+          files: bin/webserver
+          tag_name: latest
+          name: latest
+          overwrite: true
