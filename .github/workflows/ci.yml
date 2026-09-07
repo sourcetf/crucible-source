@@ -8,55 +8,40 @@ on:
   workflow_dispatch:
 
 env:
-  TARGET: x86_64-unknown-linux-musl
+  RUST_TARGET: x86_64-unknown-linux-musl
+  RUSTFLAGS: "-C target-feature=+crt-static -C link-self-contained=yes"
 
 jobs:
-  build_musl:
+  build:
     runs-on: ubuntu-22.04
-    container:
-      image: rust:1.82.0-alpine
-      options: --user root
     steps:
-      - name: Install alpine build deps (musl + static)
-        run: |
-          apk add --no-cache musl-dev musl-utils cargo-static git make g++ perl
-
       - uses: actions/checkout@v4
 
-      - name: Install rustup target
-        run: |
-          rustup target add x86_64-unknown-linux-musl
-          rustup component add clippy
+      - name: Install musl target
+        run: rustup target add x86_64-unknown-linux-musl
 
-      - name: Build static binary (musl libc)
-        run: |
-          cargo build --release --target ${{ env.TARGET }}
+      - name: Build
+        run: cargo build --release --target $RUST_TARGET
 
-      - name: Strip binary
+      - name: Strip
         run: |
-          strip target/x86_64-unknown-linux-musl/release/webserver
-
-      - name: Verify static
-        run: |
-          file target/x86_64-unknown-linux-musl/release/webserver
+          strip --strip-all target/${{ env.RUST_TARGET }}/release/webserver
+          file target/${{ env.RUST_TARGET }}/release/webserver
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: crucible-static
-          path: target/x86_64-unknown-linux-musl/release/webserver
+          path: target/${{ env.RUST_TARGET }}/release/webserver
 
   release:
-    needs: build_musl
+    needs: build
     runs-on: ubuntu-22.04
     if: github.ref == 'refs/heads/main'
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v4
-
-      - name: Download artifact
-        uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v4
         with:
           name: crucible-static
           path: ./bin
