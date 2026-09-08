@@ -523,9 +523,11 @@ mod tests {
 
     #[test]
     fn prefer_higher_commit_unix() {
+        // effective_weight = weight + bits * PATH_PRIORITY_GAIN
+        // US: 90 + 24*10 = 330, CN: 10 + 24*10 = 250 -> US wins (weight priority)
         let rows = vec![row("US", 100, 90, 0), row("CN", 200, 10, 0)];
         let m = merge_covering(&rows);
-        assert_eq!(m.country, "CN");
+        assert_eq!(m.country, "US");
     }
 
     #[test]

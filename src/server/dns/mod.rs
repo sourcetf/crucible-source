@@ -63,6 +63,9 @@ pub struct DnsConfig {
     pub doh: DohCfg,
     #[serde(default)]
     pub rootzone: RootZoneCfg,
+    /// EDNS Client Subnet 开关（需求 12）：递归时传递，权威时接收。默认打开。
+    #[serde(default = "default_true")]
+    pub ecs: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]

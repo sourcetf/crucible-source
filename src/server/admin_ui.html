@@ -374,6 +374,7 @@ img.preview{max-width:100%;max-height:420px}
       <label><input type="checkbox" id="dnsModeRec"> 公共递归</label>
       <label><input type="checkbox" id="dnsModeAuth"> 权威</label>
       <label>递归白名单 CIDR(逗号分隔) <input id="dnsRecAcl" placeholder="10.0.0.0/8,192.168.0.0/16"></label>
+      <label><input type="checkbox" id="dnsEcs" checked> EDNS Client Subnet (ECS，RFC7871)</label>
       <button id="btnDnsModes">保存模式并应用</button>
       <pre id="dnsModesOut"></pre>
     </div>
@@ -1397,6 +1398,7 @@ async function dnsStatus(){
     $('dnsModeRoot').checked=!!(r.json.modes&&r.json.modes.root);
     $('dnsModeRec').checked=!!(r.json.modes&&r.json.modes.recursive);
     $('dnsModeAuth').checked=!!(r.json.modes&&r.json.modes.authoritative);
+    $('dnsEcs').checked=!!r.json.ecs;
     const d=r.json.dnssec||{};
     $('dsEnabled').checked=!!d.enabled;$('dsAlg').value=d.algorithm||'ECDSAP256SHA256';
     $('dsRotate').checked=!!d.rotation_enabled;$('dsDays').value=d.rotation_days||30;
@@ -1409,7 +1411,7 @@ $('btnDnsStatus').onclick=dnsStatus;
 $('btnDnsModes').onclick=async()=>{
   const r=await apiJson('/api/dns/modes',jpost({
     enabled:$('dnsEnabled').checked,root:$('dnsModeRoot').checked,
-    recursive:$('dnsModeRec').checked,authoritative:$('dnsModeAuth').checked}));
+    recursive:$('dnsModeRec').checked,authoritative:$('dnsModeAuth').checked,ecs:$('dnsEcs').checked}));
   out('dnsModesOut',r.text,r.ok); if(r.ok)dnsStatus();
 };
 $('btnDnsZoneAdd').onclick=async()=>{

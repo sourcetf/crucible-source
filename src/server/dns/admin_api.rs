@@ -82,6 +82,7 @@ async fn handle_inner(
                     .or_else(|| v["auth"].as_bool())
                     .unwrap_or(dc.modes.authoritative);
                 dc.enabled = v["enabled"].as_bool().unwrap_or(true);
+                dc.ecs = v["ecs"].as_bool().unwrap_or(dc.ecs);
                 persist_and_reconcile(&dc).await?;
                 Ok(json!({"ok": true, "modes": dc.modes}))
             }

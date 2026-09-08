@@ -24,9 +24,14 @@ pub async fn udp_query(
     use tokio::net::UdpSocket;
     let port = cfg.port_or_default();
     // ECS（RFC7871）：v4 固定 /24、v6 /56，客户端自带 ECS 也重写（禁止 /32 出网）
-    let wire = match client {
-        Some(ip) => super::ecs::inject_ecs(&wire, ip).unwrap_or(wire),
-        None => wire,
+    // ECS (RFC7871): only inject when enabled and we have a client IP
+    let wire = if cfg.ecs {
+        match client {
+            Some(ip) => super::ecs::inject_ecs(&wire, ip).unwrap_or(wire),
+            None => wire,
+        }
+    } else {
+        wire
     };
     let fwd_dest = super::resolve_fwd_dest(cfg, client);
     let bind = if fwd_dest.is_ipv6() {
