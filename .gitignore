@@ -79,3 +79,4 @@ scripts/*/mmdb2jsonl
 *.bak
 *.bak-*
 contact.txt
+*.sh
