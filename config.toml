@@ -18,11 +18,11 @@ allow = []
 deny = []
 
 [geoip]
-enabled = false
+enabled = true
 db_path = "data/geoip/current/geoip.sqlite"
 
 [telemetry]
-enabled = false
+enabled = true
 path = "/__metrics"
 
 # 应用引擎样例 :9095
@@ -224,18 +224,18 @@ ssl = { cert = "cert.pem", key = "key.pem", prefer_tls13 = true, versions = ["TL
 address = "0.0.0.0"
 port = 8443
 root = "www"
-autoindex = { enabled = false, paths = [] }
+autoindex = { enabled = true, paths = [] }
 http_versions = ["h1", "h2", "h3"]
 server_name = "prod.crucible.local"
 ssl = { cert = "cert.pem", key = "key.pem", cert_ec = "cert_ec.pem", key_ec = "key_ec.pem", prefer_tls13 = true, pqc = true, ech = true, ech_keys = "state/ech/ech_keys.pem", enable_nss = true, enable_tomcrypt = true }
 
 # ============ DNS 模块（bind9/named 自守护） ============
 [dns]
-enabled = false
-test_mode = true
+enabled = true
+test_mode = false
 listen_addr = "0.0.0.0"
-port = 0          # test_mode 下取 5353
-rndc_port = 0     # test_mode 下取 1953
+port = 53          # test_mode 下取 5353
+rndc_port = 953     # test_mode 下取 1953
 
 [dns.modes]
 root = false
@@ -243,7 +243,7 @@ recursive = true
 authoritative = true
 
 [dns.dnssec]
-enabled = false
+enabled = true
 algorithm = "ECDSAP256SHA256"
 rotation_enabled = true
 rotation_days = 30
@@ -255,19 +255,19 @@ rtype = "nxdomain"
 value = ""
 
 [dns.geo]
-enabled = false
+enabled = true
 lines = []
 
 [dns.dot]
-enabled = false
-port = 0          # test_mode 下 11853
+enabled = true
+port = 53          # test_mode 下 11853
 
 [dns.doh]
-enabled = false
+enabled = true
 path = "/dns-query"
 hostnames = []
 
 [dns.rootzone]
-enabled = false
+enabled = true
 axfr_servers = ["198.133.219.4", "2001:503:ba3e::2:30"]
 refresh_hours = 24
