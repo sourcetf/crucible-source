@@ -78,3 +78,4 @@ www-apps/go/deps/bin/
 scripts/*/mmdb2jsonl
 *.bak
 *.bak-*
+contact.txt

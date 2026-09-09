@@ -17,6 +17,12 @@ use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
 
+
+/// HSTS header value (RFC 6797) — applied to all HTTPS responses.
+pub fn hsts_header() -> &'static str {
+    "max-age=31536000; includeSubDomains; preload"
+}
+
 pub type BoxBody = http_body_util::combinators::BoxBody<Bytes, std::convert::Infallible>;
 
 /// admin 请求体缓冲上限：admin::handle 侧本就全量缓冲 body（写文件/读 TOML），
@@ -305,8 +311,15 @@ async fn handle_request_inner(
         return tag(resp, "proxy");
     }
     let resp_mods = crate::server::page_rules::response_headers(&lc, &path);
-    let mut resp = dispatch_tail(req, live, lc, peer, path).await;
+    let mut resp = dispatch_tail(req, live, lc.clone(), peer, path).await;
     crate::server::headers_mod::apply_response(resp.headers_mut(), &resp_mods);
+    // HTTPS responses get HSTS header (P1-7)
+    if lc.ssl.is_some() {
+        resp.headers_mut().insert(
+            http::header::STRICT_TRANSPORT_SECURITY,
+            http::HeaderValue::from_static(hsts_header()),
+        );
+    }
     resp
 }
 

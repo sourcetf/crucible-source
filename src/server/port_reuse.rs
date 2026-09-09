@@ -10,8 +10,8 @@ pub fn peek_sni(buf: &[u8]) -> Option<String> {
 
 pub async fn proxy_to_ssl_listener(plain: tokio::net::TcpStream, target: SocketAddr) -> std::io::Result<()> {
     let mut upstream = tokio::net::TcpStream::connect(target).await?;
-    let (mut pr, mut pw) = plain.split();
-    let (mut ur, mut uw) = upstream.split();
+    let (mut pr, mut pw) = plain.into_split();
+    let (mut ur, mut uw) = upstream.into_split();
     let _ = tokio::try_join!(
         tokio::io::copy(&mut pr, &mut uw),
         tokio::io::copy(&mut ur, &mut pw),

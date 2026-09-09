@@ -3,6 +3,22 @@
 use anyhow::{Context, Result};
 use std::path::Path;
 
+
+fn base64_std(data: &[u8]) -> String {
+    const TABLE: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::new();
+    for chunk in data.chunks(3) {
+        let b0 = chunk[0];
+        let b1 = if chunk.len() > 1 { chunk[1] } else { 0 };
+        let b2 = if chunk.len() > 2 { chunk[2] } else { 0 };
+        out.push(TABLE[(b0 >> 2) as usize] as char);
+        out.push(TABLE[((b0 & 0x03) << 4 | (b1 >> 4)) as usize] as char);
+        out.push(if chunk.len() > 1 { TABLE[((b1 & 0x0f) << 2 | (b2 >> 6)) as usize] as char } else { '=' });
+        out.push(if chunk.len() > 2 { TABLE[(b2 & 0x3f) as usize] as char } else { '=' });
+    }
+    out
+}
+
 pub struct EchConfigList { pub bytes: Vec<u8>, pub base64: String }
 
 pub fn generate_ech_config_list(public_name: &str, _max_name_length: u16, _cipher_suite: u16) -> anyhow::Result<EchConfigList> {

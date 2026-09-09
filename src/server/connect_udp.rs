@@ -9,7 +9,7 @@ pub fn parse_target_path(path: &str) -> Result<(String, u16), String> {
     let p = path.trim_start_matches('/');
     if p.is_empty() { return Err("missing target".into()); }
     if let Some((h, ps)) = p.rsplit_once(':') {
-        let port = u16::from_str(ps).map_err(|_| "bad port".into())?;
+        let port = u16::from_str(ps).map_err(|_| "bad port".to_string())?;
         Ok((h.to_string(), port))
     } else {
         Err("missing port".into())

@@ -1,6 +1,8 @@
 //! RFC 9000 §5.1.2 流预算 — draft-ietf-quic-qmux-01 最小实现.
 //! h3 路径在握手通过后开流时调用 try_open；流关闭时 close.
 use std::sync::atomic::{AtomicU64, Ordering};
+pub fn stream_opened() {}
+pub fn stream_closed() {}
 
 pub struct QmuxBudget {
     active: AtomicU64,

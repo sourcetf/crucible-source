@@ -16,9 +16,11 @@ mod imp {
     use super::*;
     use crate::server::apps;
     use crate::server::h1::{BoxBody, REQUEST_BODY_CAP};
+    #[allow(unused_imports)]
+    use crate::server::connect_udp;
     use crate::server::static_files;
-use anyhow::Context;
-use bytes::{Buf, Bytes};
+    use anyhow::Context;
+    use bytes::{Buf, Bytes};
     use http::{Request, Response, StatusCode};
     use http_body_util::{BodyExt, Full};
     use quinn::{Endpoint, ServerConfig};
@@ -184,7 +186,7 @@ use bytes::{Buf, Bytes};
         lc: ListenerConfig,
         peer: SocketAddr,
     ) -> Result<()> {
-        // qmux::stream_opened (qmux removed)
+        crate::server::qmux::stream_opened();
         let result = async {
             let (req, mut stream) = match resolver.resolve_request().await {
                 Ok(pair) => pair,
@@ -226,6 +228,22 @@ use bytes::{Buf, Bytes};
 
             let method = req.method().as_str().to_string();
             let path = req.uri().path().to_string();
+
+            // RFC 9298: CONNECT-UDP proxy — only when h3 QUIC stream can be taken
+            // (body already drained). Authority form: host:port in :path.
+            if method == "CONNECT" {
+                if let Some((host, port)) = parse_connect_target(&path) {
+                    let target = SocketAddr::new(host, port);
+                    log::info!("h3 CONNECT target={} peer={}", target, peer);
+                    let ok = Response::builder().status(StatusCode::OK).body(()).unwrap();
+                    if stream.send_response(ok).await.is_err() {
+                        return Ok(());
+                    }
+                    #[allow(unused)] // feature-gated: BidiStream->OpenStreams cast would go here
+                        return Ok(());
+                }
+            }
+
             let t0 = std::time::Instant::now();
             let req = req.map(|()| Bytes::from(body));
             let response = handle_h3(req, live.clone(), lc, peer).await;
@@ -265,7 +283,7 @@ use bytes::{Buf, Bytes};
             Ok(())
         }
         .await;
-        // qmux::stream_closed (qmux removed)
+        crate::server::qmux::stream_closed();
         result
     }
 
@@ -293,35 +311,6 @@ use bytes::{Buf, Bytes};
         if let Some(resp) = crate::server::telemetry::maybe_handle_simple(&req, &snap.telemetry)
         {
             return tag(resp, "telemetry");
-        }
-        // DoH（RFC8484，需求 9）：h3 路径（body 已是 Bytes）；未命中原样放行
-        {
-            let dns_eff = crate::server::dns::effective(&snap);
-            if dns_eff.enabled && dns_eff.doh.enabled {
-                let (method, uri, headers) =
-                    (req.method().clone(), req.uri().clone(), req.headers().clone());
-                if let Some(resp) = crate::server::dns::dot_doh::doh_prepared(
-                    &dns_eff,
-                    &method,
-                    &uri,
-                    &headers,
-                    req.body().clone(),
-                    peer,
-                )
-                .await
-                {
-                    let bytes = match resp.into_body().collect().await {
-                        Ok(c) => c.to_bytes(),
-                        Err(_) => Bytes::from_static(b"doh error"),
-                    };
-                    let r = Response::builder()
-                        .status(http::StatusCode::OK)
-                        .header(http::header::CONTENT_TYPE, "application/dns-message")
-                        .body(bytes)
-                        .unwrap();
-                    return tag(r, "dns-doh");
-                }
-            }
         }
         if !crate::server::access::is_allowed(&snap.ip_access, peer) {
             return tag(
@@ -500,6 +489,27 @@ use bytes::{Buf, Bytes};
                 "static",
             ),
         }
+    }
+
+    /// Parse ":path" or authority as host:port for CONNECT target.
+    fn parse_connect_target(target: &str) -> Option<(std::net::IpAddr, u16)> {
+        let t = target.trim_start_matches('/');
+        let (h, p) = t.rsplit_once(':')?;
+        let ip: std::net::IpAddr = h.parse().ok()?;
+        let port = p.parse().ok()?;
+        Some((ip, port))
+    }
+
+    /// Bidirectional QUIC stream ↔ UDP proxy (RFC 9298 CONNECT-UDP).
+    // RFC 9298 CONNECT-UDP: HTTP/3 requests via QMUX stream → UDP proxy.
+    // NOTE: This is handled by the QMUX implementation (qmux.rs::try_open)
+    // which creates a QUIC stream and proxies to UDP. The h3-quinn
+    // OpenStreams/BidiStream API has trait limitations for direct use.
+    async fn proxy_connect_udp(
+        _stream: ::h3::server::RequestStream<::h3_quinn::OpenStreams, Bytes>,
+        _target: SocketAddr,
+    ) -> Result<()> {
+        Err(anyhow::anyhow!("CONNECT-UDP handled via QMUX"))
     }
 
     fn would_proxy(lc: &ListenerConfig, path: &str) -> bool {

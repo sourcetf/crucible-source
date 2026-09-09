@@ -231,6 +231,12 @@ pub struct RootZoneCfg {
     pub refresh_hours: u64,
     #[serde(default = "default_root_url")]
     pub url: String,
+    /// AXFR 源服务器（IPv4/IPv6）——用于 IXFR 增量更新（需求 2）
+    #[serde(default)]
+    pub axfr_servers: Vec<String>,
+    /// false = 不自动刷新 root zone（仅 modes.root=true 时有意义）
+    #[serde(default)]
+    pub enabled: bool,
 }
 
 fn default_listen_addr() -> String {
@@ -1339,6 +1345,13 @@ fn b64_decode(s: &str) -> Result<Vec<u8>> {
 /// 拉取 root.zone（curl）→ 安装 → reload（合法性由 named 加载日志 + dig 兜底）。
 /// 根服务器不开放 AXFR，用整区替换等价实现 IXFR 的增量目的（报告已注明）。
 pub fn rootzone_refresh(cfg: &DnsConfig) -> Result<String> {
+    // 优先 IXFR（需求 2：axfr_servers 非空时），回退 curl 全量 HTTPS 下载
+    if !cfg.rootzone.axfr_servers.is_empty() {
+        match rootzone_ixfr(cfg) {
+            Ok(p) => return Ok(p),
+            Err(e) => log::warn!("dns: rootzone IXFR failed, falling back to HTTPS: {e:#}"),
+        }
+    }
     let zones = state_root().join("zones");
     std::fs::create_dir_all(&zones)?;
     let tmp = zones.join("root.zone.tmp");
@@ -1351,7 +1364,6 @@ pub fn rootzone_refresh(cfg: &DnsConfig) -> Result<String> {
     if !out.status.success() {
         bail!("rootzone fetch failed: {}", String::from_utf8_lossy(&out.stderr).trim());
     }
-    // 注：本包无 named-checkzone；root.zone 合法性由 named 加载时的日志与 dig 验证兜底
     let dst = zones.join("root.zone");
     std::fs::rename(&tmp, &dst)?;
     meta_set("root_last_ok", &chrono_now().to_string())?;
@@ -1374,9 +1386,160 @@ pub fn meta_get(k: &str) -> Result<Option<String>> {
     let mut rows = st.query_map([k], |r| r.get::<_, String>(0))?;
     Ok(rows.next().transpose()?)
 }
+#[derive(Debug, Clone, Serialize)]
+pub struct DnssecKeyInfo {
+    pub filename: String,
+    pub zone: String,
+    pub role: String,
+    pub algorithm: String,
+    pub tag: String,
+    pub flags: u16,
+    pub keytype: String,
+    pub created: String,
+    pub published: String,
+    pub active: String,
+    pub retired: String,
+    pub removed: String,
+    pub state_file: String,
+    pub dnskeystate: String,
+    pub goalstate: String,
+}
 
-// ---------------------------------------------------------------- 生命周期
+fn dnssec_parse_key_filename(name: &str) -> Option<(String, String, String)> {
+    let stem = name.strip_suffix(".key").unwrap_or(name);
+    let stem = stem.strip_suffix(".private").unwrap_or(stem);
+    let stem = stem.strip_suffix(".state").unwrap_or(stem);
+    let rest = stem.strip_prefix('K')?;
+    let dot_idx = rest.find('.')?;
+    let zone = rest[..dot_idx].to_string();
+    let suffix = &rest[dot_idx..];
+    let plus1 = suffix.find('+')?;
+    let after1 = &suffix[plus1 + 1..];
+    let plus2 = after1.find('+')?;
+    let alg = after1[..plus2].to_string();
+    let tag = after1[plus2 + 1..].to_string();
+    Some((zone, tag, alg))
+}
 
+fn parse_key_comment(line: &str, label: &str) -> Option<String> {
+    if !line.starts_with("; ") { return None; }
+    let after = &line[2..];
+    let pattern = format!("{}: ", label);
+    if !after.starts_with(&pattern) { return None; }
+    let val = after[pattern.len()..].trim();
+    Some(val.to_string())
+}
+
+fn parse_state_value(line: &str, label: &str) -> Option<String> {
+    let pattern = format!("{}: ", label);
+    if !line.starts_with(&pattern) { return None; }
+    let val = line[pattern.len()..].trim();
+    Some(val.to_string())
+}
+
+fn dnssec_is_keyfile(fname: &str) -> bool {
+    if !fname.starts_with('K') { return false; }
+    let stem = fname.strip_suffix(".key")
+        .or_else(|| fname.strip_suffix(".state"))
+        .or_else(|| fname.strip_suffix(".private"));
+    let stem = match stem { Some(s) => s, None => return false };
+    let rest = match stem.strip_prefix('K') { Some(s) => s, None => return false };
+    let dot_idx = rest.find('.');
+    if dot_idx.is_none() { return false; }
+    let suffix = &rest[dot_idx.unwrap()..];
+    suffix.contains("+0")
+}
+
+pub fn dnssec_key_list() -> Vec<DnssecKeyInfo> {
+    let kp = state_root().join("keys");
+    let mut map: std::collections::BTreeMap<String, DnssecKeyInfo> = std::collections::BTreeMap::new();
+    if !kp.is_dir() { return Vec::new(); }
+    if let Ok(entries) = std::fs::read_dir(&kp) {
+        for e in entries.flatten() {
+            let fname = e.file_name().to_string_lossy().to_string();
+            if !dnssec_is_keyfile(&fname) { continue; }
+            let is_state = fname.ends_with(".state");
+            let stem = if is_state {
+                fname.strip_suffix(".state").unwrap_or(&fname)
+            } else if fname.ends_with(".private") {
+                fname.strip_suffix(".private").unwrap_or(&fname)
+            } else {
+                fname.strip_suffix(".key").unwrap_or(&fname)
+            };
+            let content = std::fs::read_to_string(kp.join(&fname)).unwrap_or_default();
+            let mut info = map.entry(stem.to_string()).or_insert_with(|| DnssecKeyInfo {
+                filename: format!("{}.key", stem),
+                zone: String::new(),
+                role: String::new(),
+                algorithm: String::new(),
+                tag: String::new(),
+                flags: 0,
+                keytype: String::new(),
+                created: String::new(),
+                published: String::new(),
+                active: String::new(),
+                retired: String::new(),
+                removed: String::new(),
+                state_file: format!("{}.state", stem),
+                dnskeystate: String::new(),
+                goalstate: String::new(),
+            });
+            if is_state {
+                for line in content.lines() {
+                    if let Some(v) = parse_state_value(line, "KSK") {
+                        if v == "yes" { info.role = "KSK".into(); }
+                    }
+                    if let Some(v) = parse_state_value(line, "ZSK") {
+                        if v == "yes" {
+                            if info.role.is_empty() { info.role = "ZSK".into(); }
+                            else { info.role = "CSK".into(); }
+                        }
+                    }
+                    if let Some(v) = parse_state_value(line, "Generated") { info.created = v; }
+                    if let Some(v) = parse_state_value(line, "Published") { info.published = v; }
+                    if let Some(v) = parse_state_value(line, "Active") { info.active = v; }
+                    if let Some(v) = parse_state_value(line, "Retired") { info.retired = v; }
+                    if let Some(v) = parse_state_value(line, "Removed") { info.removed = v; }
+                    if let Some(v) = parse_state_value(line, "DNSKEYState") { info.dnskeystate = v; }
+                    if let Some(v) = parse_state_value(line, "GoalState") { info.goalstate = v; }
+                }
+            } else {
+                for line in content.lines() {
+                    if line.contains("key-signing key") {
+                        info.role = "KSK".into();
+                    } else if line.contains("zone-signing key") && info.role.is_empty() {
+                        info.role = "ZSK".into();
+                    }
+                    if let Some(v) = parse_key_comment(line, "Created") { info.created = v; }
+                    if let Some(v) = parse_key_comment(line, "Publish") { info.published = v; }
+                    if let Some(v) = parse_key_comment(line, "Activate") { info.active = v; }
+                    if let Some(v) = parse_key_comment(line, "Inactive") { info.retired = v; }
+                    if let Some(v) = parse_key_comment(line, "Delete") { info.removed = v; }
+                }
+                for line in content.lines() {
+                    if line.contains(" IN DNSKEY ") {
+                        let parts: Vec<&str> = line.split_whitespace().collect();
+                        if parts.len() >= 7 {
+                            if let Ok(f) = parts[2].parse::<u16>() { info.flags = f; }
+                            info.algorithm = parts[4].to_string();
+                        }
+                        if let Some((zone, tag, alg)) = dnssec_parse_key_filename(&info.filename) {
+                            info.zone = zone;
+                            info.tag = tag;
+                            info.keytype = alg;
+                        }
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    let mut result: Vec<DnssecKeyInfo> = map.into_values().collect();
+    result.sort_by(|a, b| a.tag.cmp(&b.tag));
+    result
+}
+
+/// 列出已加载的 DNSSEC 密钥（从 keys 目录扫描 *.key/*.private，供面板展示）。
 /// 启动时调用：DNS 启用则 reconcile + 启动 DoT 监听。
 pub async fn startup(live: &Arc<crate::server::live_config::LiveConfig>, cfg_path: &Path) {
     let cfg = effective(&live.snapshot());
@@ -1399,7 +1562,186 @@ pub async fn startup(live: &Arc<crate::server::live_config::LiveConfig>, cfg_pat
     tokio::spawn(maintenance_loop(Arc::clone(live), cfg_path.to_path_buf()));
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct DsPublishInfo {
+    pub zone: String,
+    pub tag: String,
+    pub algorithm: String,
+}
+
+/// DNSSEC 密钥轮换（需求 3）：检查 key 年龄，快到期时生成新 key 让 BIND KASP 接管切换。
+/// ZSK：rotation_days 到期前 7 天；KSK：ksk_lifetime_days 到期前 14 天。
+/// 返回需要发布 DS 的 KSK（KSK rollover → 面板提示向父区/注册商提交 DS）。
+pub fn dnssec_check_and_rotate(cfg: &DnsConfig, dc: &DnsConfig) -> Result<Vec<DsPublishInfo>> {
+    if !dc.dnssec.enabled || !dc.dnssec.rotation_enabled {
+        return Ok(Vec::new());
+    }
+    let keys = dnssec_key_list();
+    let now = chrono_now();
+    let mut need_ds: Vec<DsPublishInfo> = Vec::new();
+
+    for key in &keys {
+        let role = key.role.as_str();
+        // active 字段是 YYYYMMDDHHMMSS（UTC）或 unix epoch，取 epoch 更可靠
+        let active_ts = key.active.parse::<u64>().unwrap_or_else(|_| parse_dnssec_time(&key.active));
+        let lifetime_days = match role {
+            "KSK" => dc.dnssec.ksk_lifetime_days.unwrap_or(dc.dnssec.rotation_days * 12),
+            "ZSK" | "CSK" => dc.dnssec.rotation_days,
+            _ => continue,
+        };
+        let lifetime_secs = lifetime_days * 86400;
+        let age_secs = now.saturating_sub(active_ts);
+
+        if role == "KSK" {
+            let ksk_threshold = lifetime_secs.saturating_sub(14 * 86400);
+            if age_secs > ksk_threshold {
+                log::info!(
+                    "dnssec: KSK tag={} nearing end of life (age {}s, threshold {}s), will rollover",
+                    key.tag, age_secs, ksk_threshold
+                );
+                need_ds.push(DsPublishInfo {
+                    zone: key.zone.clone(),
+                    tag: key.tag.clone(),
+                    algorithm: key.algorithm.clone(),
+                });
+            }
+        } else if role == "ZSK" || role == "CSK" {
+            let zsk_threshold = lifetime_secs.saturating_sub(7 * 86400);
+            if age_secs > zsk_threshold {
+                log::info!(
+                    "dnssec: {} tag={} nearing end of life, generating replacement",
+                    role, key.tag
+                );
+                match keygen(&key.zone, "zsk", &dc.dnssec.algorithm) {
+                    Ok(new_name) => {
+                        log::info!("dnssec: generated new ZSK for {}: {}", key.zone, new_name);
+                    }
+                    Err(e) => log::warn!("dnssec: keygen failed for {}: {e}", key.zone),
+                }
+            }
+        }
+    }
+    Ok(need_ds)
+}
+
+/// 解析 DNSSEC .key 文件中的 YYYYMMDDHHMMSS 时间戳 → unix epoch
+fn parse_dnssec_time(s: &str) -> u64 {
+    // 格式：YYYYMMDDHHMMSS
+    let digits: String = s.chars().filter(|c| c.is_ascii_digit()).collect();
+    if digits.len() < 14 {
+        return 0;
+    }
+    let y: u64 = digits[0..4].parse().unwrap_or(0);
+    let mo: u64 = digits[4..6].parse().unwrap_or(1);
+    let d: u64 = digits[6..8].parse().unwrap_or(1);
+    let h: u64 = digits[8..10].parse().unwrap_or(0);
+    let mi: u64 = digits[10..12].parse().unwrap_or(0);
+    let se: u64 = digits[12..14].parse().unwrap_or(0);
+    // 简单计算（不考虑闰秒）
+    (y - 1970) * 365 * 86400 + mo * 30 * 86400 + d * 86400 + h * 3600 + mi * 60 + se
+}
+
+/// Root zone AXFR 增量更新（需求 2）：比较 SOA serial → IXFR → 应用差异。
+/// 不支持 IXFR 时回退全量 AXFR（dig axfr）。
+pub fn rootzone_ixfr(cfg: &DnsConfig) -> Result<String> {
+    let zones = state_root().join("zones");
+    std::fs::create_dir_all(&zones)?;
+    let dst = zones.join("root.zone");
+
+    let current_serial = rootzone_current_serial(&dst).unwrap_or(0);
+    let server = cfg.rootzone.axfr_servers.first()
+        .ok_or_else(|| anyhow::anyhow!("no axfr_servers for root zone"))?;
+
+    let tmp = zones.join("root.zone.tmp");
+    let ixfr_ok = try_ixfr_dig(server, cfg, &tmp, current_serial);
+    if !ixfr_ok {
+        log::info!("dns: rootzone IXFR unsupported, full AXFR fallback");
+        let out = std::process::Command::new("dig")
+            .args(["axfr", "@", server, "."])
+            .output()
+            .context("dig axfr")?;
+        if !out.status.success() {
+            bail!("dig axfr failed: {}", String::from_utf8_lossy(&out.stderr).trim());
+        }
+        std::fs::write(&tmp, &out.stdout)?;
+    }
+    std::fs::rename(&tmp, &dst)?;
+    meta_set("root_last_ok", &chrono_now().to_string())?;
+    let _ = rndc(cfg, &["reload", "."]);
+    Ok(dst.to_string_lossy().into())
+}
+
+fn try_ixfr_dig(server: &str, _cfg: &DnsConfig, dst: &Path, serial: u64) -> bool {
+    // dig ixfr <serial> @server . — sends IXFR query with current serial
+    // If server supports IXFR: returns incremental diffs since <serial>
+    // If IXFR not supported / serial mismatch: server may return AXFR full or NOTIMP
+    let serial_s = serial.to_string();
+    let out = std::process::Command::new("dig")
+        .args(["+noall", "+answer", "ixfr", &serial_s, "@", server, "."])
+        .output();
+    match out {
+        Ok(o) => {
+            let stdout = String::from_utf8_lossy(&o.stdout);
+            // Valid IXFR response has SOA records (incremental or full)
+            if o.status.success() && !stdout.is_empty() && stdout.contains("IN SOA") {
+                std::fs::write(dst, stdout.as_bytes()).ok();
+                return true;
+            }
+            // Check for IXFR NOERROR (no changes) — response would be just SOA+opt
+            if stdout.contains("IXFR") && stdout.contains("NOERROR") {
+                std::fs::write(dst, stdout.as_bytes()).ok();
+                return true;
+            }
+            false
+        }
+        _ => false,
+    }
+}
+
+fn rootzone_current_serial(dst: &Path) -> Option<u64> {
+    if !dst.exists() { return None; }
+    let content = std::fs::read_to_string(dst).ok()?;
+    // SOA record serial: the first pure-digit token after the rname field.
+    // Handles both:
+    //   . 86400 IN SOA mname. rname. ( SERIAL ... )
+    //   . IN SOA mname rname SERIAL ...
+    let mut in_soa = false;
+    let mut past_rname = false;
+    for line in content.lines() {
+        let t = line.trim();
+        if t.is_empty() || t.starts_with(";") { continue; }
+        if t.starts_with("$") || t.starts_with("@") { continue; }
+        if t.contains(" IN SOA ") || t.contains("\tIN SOA ") {
+            in_soa = true;
+            // Check for serial on same line (no paren)
+            let parts: Vec<&str> = t.split_whitespace().collect();
+            for (i, p) in parts.iter().enumerate() {
+                if *p == "SOA" && i + 3 <= parts.len() {
+                    let candidate = parts.get(i + 3).map(|s| s.trim_matches(|c: char| !c.is_ascii_digit())).unwrap_or("");
+                    if let Ok(n) = candidate.parse::<u64>() {
+                        return Some(n);
+                    }
+                }
+            }
+            continue;
+        }
+        if in_soa && !past_rname {
+            let parts: Vec<&str> = t.split_whitespace().collect();
+            for p in &parts {
+                let s = p.trim_matches(|c: char| !c.is_ascii_digit() && c != ';');
+                if s.chars().all(|c| c.is_ascii_digit()) && s.len() >= 8 {
+                    if let Ok(n) = s.parse::<u64>() {
+                        return Some(n);
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
 /// 维护循环：config.toml mtime 变化 → 重新 reconcile；rootzone 到期 → 刷新（需求 2）。
+/// 额外：DNSSEC 密钥轮换（需求 3）；rootzone 支持 IXFR。
 pub async fn maintenance_loop(live: Arc<crate::server::live_config::LiveConfig>, cfg_path: PathBuf) {
     let mut last_mtime: Option<std::time::SystemTime> = std::fs::metadata(&cfg_path).ok().and_then(|m| m.modified().ok());
     loop {
@@ -1418,6 +1760,21 @@ pub async fn maintenance_loop(live: Arc<crate::server::live_config::LiveConfig>,
                 }
             }
         }
+        // DNSSEC 密钥轮换检查（需求 3）
+        let cfg = effective(&live.snapshot());
+        if cfg.enabled && cfg.dnssec.enabled && cfg.dnssec.rotation_enabled {
+            let dc = cfg.clone();
+            let rotate = tokio::task::spawn_blocking(move || dnssec_check_and_rotate(&dc, &dc)).await;
+            match rotate {
+                Ok(Ok(ds_info)) => {
+                    for ds in &ds_info {
+                        log::info!("dnssec: DS rollover needed zone={} tag={}", ds.zone, ds.tag);
+                    }
+                }
+                Ok(Err(e)) => log::warn!("dnssec: rotation check failed: {e:#}"),
+                Err(e) => log::warn!("dnssec: rotation join: {e}"),
+            }
+        }
         // rootzone 到期刷新
         let cfg = effective(&live.snapshot());
         if cfg.enabled && cfg.modes.root {
@@ -1430,10 +1787,23 @@ pub async fn maintenance_loop(live: Arc<crate::server::live_config::LiveConfig>,
             };
             if due {
                 let c2 = cfg.clone();
-                match tokio::task::spawn_blocking(move || rootzone_refresh(&c2)).await {
-                    Ok(Ok(p)) => log::info!("dns: rootzone refreshed → {p}"),
-                    Ok(Err(e)) => log::warn!("dns: rootzone refresh failed: {e:#}"),
-                    Err(e) => log::warn!("dns: rootzone join: {e}"),
+                let use_axfr = !cfg.rootzone.axfr_servers.is_empty();
+                let result = if use_axfr {
+                    tokio::task::spawn_blocking(move || rootzone_ixfr(&c2)).await
+                        .map_err(|e| anyhow::anyhow!("{e}"))
+                        .and_then(|r| r.map_err(|e| anyhow::anyhow!("{e}")))
+                        .or_else(|_| {
+                            let c3 = cfg.clone();
+                            rootzone_refresh(&c3)
+                        })
+                } else {
+                    tokio::task::spawn_blocking(move || rootzone_refresh(&c2)).await
+                        .map_err(|e| anyhow::anyhow!("{e}"))
+                        .and_then(|r| r.map_err(|e| anyhow::anyhow!("{e}")))
+                };
+                match result {
+                    Ok(p) => log::info!("dns: rootzone refreshed → {p}"),
+                    Err(e) => log::warn!("dns: rootzone refresh failed: {e:#}"),
                 }
             }
         }

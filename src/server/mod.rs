@@ -2,6 +2,9 @@
 
 // ── 9 new feature modules (added this session) ──────────────────────────────
 pub mod ecn;
+pub mod connect_udp;
+pub mod port_reuse;
+pub mod ech_auto;
 pub mod ocsp_wiring;
 pub mod type65_api;
 

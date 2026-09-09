@@ -1399,6 +1399,23 @@ async function dnsStatus(){
     $('dnsModeRec').checked=!!(r.json.modes&&r.json.modes.recursive);
     $('dnsModeAuth').checked=!!(r.json.modes&&r.json.modes.authoritative);
     $('dnsEcs').checked=!!r.json.ecs;
+    // AXFR 全局白名单
+    if(r.json.axfr_out_acl){$('dnsAxfrOut').value=r.json.axfr_out_acl.join(',');}
+    // 递归 ACL
+    if(r.json.recursion_acl){$('dnsRecAcl').value=r.json.recursion_acl.join(',');}
+    // DoT / DoH
+    if(r.json.dot){$('dotEnabled').checked=!!r.json.dot.enabled;$('dotPort').value=r.json.dot.port||853;$('dotCert').value=r.json.dot.cert||'';$('dotKey').value=r.json.dot.key||'';}
+    if(r.json.doh){$('dohEnabled').checked=!!r.json.doh.enabled;$('dohPath').value=r.json.doh.path||'/dns-query';$('dohHosts').value=(r.json.doh.hostnames||[]).join(',');}
+    // Root zone
+    if(r.json.rootzone){$('rzHours').value=r.json.rootzone.refresh_hours||24;}
+    // GeoDNS
+    if(r.json.geo){$('geoDnsEnabled').checked=!!r.json.geo.enabled;
+      if(r.json.geo.lines&&r.json.geo.lines.length)$('geoDnsLines').value=JSON.stringify(r.json.geo.lines,null,1);
+      if(r.json.geo.mmdb&&r.json.geo.mmdb.city_db)$('geoCityDb').value=r.json.geo.mmdb.city_db;
+      if(r.json.geo.mmdb&&r.json.geo.mmdb.asn_db)$('geoAsnDb').value=r.json.geo.mmdb.asn_db;
+    }
+    // DNSSEC key list display
+    if(r.json.dnssec_keys&&r.json.dnssec_keys.length){$('dsKeyList').textContent=r.json.dnssec_keys.join('\n');}
     const d=r.json.dnssec||{};
     $('dsEnabled').checked=!!d.enabled;$('dsAlg').value=d.algorithm||'ECDSAP256SHA256';
     $('dsRotate').checked=!!d.rotation_enabled;$('dsDays').value=d.rotation_days||30;
@@ -1522,12 +1539,20 @@ $('btnJspCompile').onclick=async()=>{
 };
 async function initDnsTab(){
   await dnsStatus();
+  // ACME 字段已在 dnsStatus 中从 /api/dns/status 返回（status_json 现包含 acme）
   const c=await apiJson('/api/dns/config');
   if(c.json&&c.json.acme){
     $('acmeEnabled').checked=!!c.json.acme.enabled;
     $('acmeDomain').value=c.json.acme.domain||'';
     $('acmeEmail').value=c.json.acme.email||'';
     $('acmeRenew').value=c.json.acme.renew_days||60;
+  } else if(statusCache && statusCache.acme){
+    // Fallback to status cache
+    const a=statusCache.acme;
+    $('acmeEnabled').checked=!!a.enabled;
+    $('acmeDomain').value=a.domain||'';
+    $('acmeEmail').value=a.email||'';
+    $('acmeRenew').value=a.renew_days||60;
   }
 }
 /* ===== 全局 tab（syncookie / telemetry / admin 暴露面） ===== */

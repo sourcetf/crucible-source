@@ -239,7 +239,7 @@ rndc_port = 0     # test_mode 下取 1953
 
 [dns.modes]
 root = false
-recursive = false
+recursive = true
 authoritative = true
 
 [dns.dnssec]
