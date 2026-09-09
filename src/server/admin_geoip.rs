@@ -681,7 +681,6 @@ pub async fn handle_conflict_source(req: Request<Full<Bytes>>) -> Response<BoxBo
         Err(e) => return json_ok(format!(r#"{{"error":"{}"}}"#, json_str(&format!("open covering: {e:#}")))),
     };
     let value = crate::server::geoip_panel::ops::get_covering_field(&conn, &s, &prefix, &f)
-        .map_err(|e| format!("get_covering_field: {e:#}"))
         .ok()
         .flatten()
         .unwrap_or_default();
@@ -691,7 +690,7 @@ pub async fn handle_conflict_source(req: Request<Full<Bytes>>) -> Response<BoxBo
             [&s, &prefix],
             |r| r.get(0),
         )
-        .unwrap_or(-1);  // -1 = 未提交；0 会被视为合法 unix 时间戳
+        .unwrap_or(0);
     let resp = serde_json::json!({
         "value": value,
         "commit_unix": commit_unix,

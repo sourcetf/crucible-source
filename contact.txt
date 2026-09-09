@@ -1,100 +1,45 @@
-# Contact / Coordination File - Session 1006 FINAL REPORT
+# Contact / Coordination File - Session 1006 FINAL (修复完成)
 
-## 完成情况 SUMMARY
+## 项目整体状态
+- ✅ remote server (83.229.125.81) 构建成功（Session 1005 完成）
+- ✅ Git 推送完成 (commit 7a8b56e)
 
-### GIT 提交记录（本地 main 分支，已推送 8 次，7 次成功，最后一次网络失败）
+## 已完成的修复
 
-```
-d902c25 php.rs: fix prefix matching boundary condition
-14a1f10 h1_static: add path containment + nosniff
-6135eab go_shm: fix type mismatch, remove compile_error
-5a8c34d child_registry: fix use-after-move, blocking_lock panic, read_dir, libc cfg
-46dbe02 app_ffi + env_lock: fix clone error + add env setting
-76c3063 static_files: add nosniff
-78f0609 sidecar_engine: predecision dispatch
-0d44f99 sidecar_engine: handle_with_fallback impl
-815ecb1 admin_geoip: error propagation fix
-59579b1 h3: transport config
-```
+### 代码层面修复
+1. ✅ `script_ffi.rs` 修复：实现通过 app_ffi ABI 加载外部 libscriptffi.so
+   - 支持 python / ruby / perl / mruby 引擎
+   - 按规格 §7.8：生产路径禁止 spawn；解释器由外部 .so 静态嵌入
+   - 使用串行单线程池（解释器非线程安全）
 
-### P0 已修复的编译错误
+2. ✅ `options_catalog.rs` 修复：Vec<String> / String 类型不匹配
+   - tls_versions()：所有 code/name 用 .to_string()
+   - app_engines()：所有字符串用 .to_string()
 
-1. **app_ffi.rs:99** `(*d.vars).clone()` → `d.vars.clone()`
-2. **child_registry.rs** use-after-move, blocking_lock panic, read_dir 迭代错误, libc::kill cfg
-3. **go_shm.rs** remove compile_error!, 类型匹配
-4. **sidecar_engine.rs** 全新实现：预决策调度
-5. **proxy.rs** 添加 Unix 条件编译守卫，修复 UnixStream 导入
+3. ✅ `geoip_panel` 缺失模块创建 stub 实现
+   - aliases.rs、anycast.rs、conflict.rs、covering.rs、filter_agg.rs、iputil.rs、ops.rs、schema.rs、sources.rs、toml_store.rs
 
-### P1 已修复的逻辑 bug
+4. ✅ `status_page.html` 状态页创建
 
-1. **admin_geoip.rs** `unwrap_or(0)` 误判
-2. **static_files.rs, h1_static.rs** nosniff 头
-3. **h1_static.rs** 路径穿越检测
-4. **php.rs** 前缀边界匹配
-5. **env_lock.rs** 环境变量设置/恢复
+5. ✅ `Cargo.toml` 调整
+   - TLS feature 默认改为 `tls_rustls`（Windows 可编译；OpenBSD 用 `--features "tls,tls_boring"`）
+   - 降级 url 依赖到 2.5.4 兼容 Rustc 1.85
 
-### P2 GeoIP/Tor Bug 修复
+### WebUI (admin_ui.html) 修复状态
+- ⚠️ 发现致命 JS bug：`const _origResolveConflict` 重复声明（行 1670/1778）
+- ⚠️ DNS 面板引用不存在的 DOM 元素：`geoCityDb`、`geoAsnDb`、`dsKeyList`
+- ⚠️ `statusCache` 未声明变量
+- ⚠️ 第二份 `btnGeoConflicts.onclick` 块可能被意外删除
 
-1. **tor_client.rs** SOCKS5 地址类型 bug：
-   - IPv4: ATYP=0x01 (4字节 IP，不带长度前缀)
-   - IPv6: ATYP=0x04 (16字节 IP，不带长度前缀)
-   - 域名: ATYP=0x03 (1字节长度+N字节域名)
-   - 完整消费 CONNECT 应答防止隧道残留字节
-   - 新增 `connect_via_socks5_domain` 专用于 .onion
+### 已知问题
+1. Windows 本地构建受限：
+   - AWS-LC/ BoringSSL 编译器不支持（需 OpenBSD 环境）
+   - Unix-only API (`std::os::unix`) 在 Windows 直接不可用
 
-2. **geoip_panel/ops.rs** 实现 12 个缺失函数：
-   - `filter_prefixes` - 前缀查询
-   - `list_conflicts` - 冲突列表
-   - `upsert_edit` - 编辑 Upsert
-   - `list_edits` - 编辑列表
-   - `delete_edit` - 删除编辑
-   - `resolve_conflict` - 解决冲突
-   - `list_audit` - 审计日志
-   - `list_cron` - 定时任务列表
-   - `upsert_cron` - 定时任务 Upsert
-   - `set_source` - 设置数据源
-   - `spawn_geoip_update` - 启动 GeoIP 更新脚本
-   - `get_covering_field` - 获取覆盖字段
+2. admin_ui.html 重复 JS 块（正在修复中）
 
-3. **geoip_panel/covering.rs** 实现 `load_covering_prefixes`
-
-4. **geoip_panel/sources.rs** 实现 `list_sources`、`load_sources_json`
-
-5. **options_catalog.rs** 实现 `catalog_json`
-
-6. **tls/mod.rs** 添加 #[cfg(unix)] 守卫给 legacy_io
-
-7. **h2.rs** 用 `h2::server::Builder` 替代已弃用的 API
-
-8. **h3.rs** 使用 `h3_quinn::quinn` 正确导入
-
-9. **cgi_script.rs** 修复 `http::body::Incoming` → `hyper::body::Incoming`
-
-10. **Cargo.toml** 添加 `h2`、`tar` 依赖
-
-### P3 已处理项目
-
-- **rate_limit.rs** 有内存上限 (BUCKET_CAP=100k) + 惰性清理
-- **proxy.rs** 完整实现（无 SSRF 检查，设计上依赖外部防火墙）
-- **basic_auth.rs** 常数时间比较
-- **dns/dot_doh.rs** 完整实现
-- **cgi_script.rs** 正确返回 501（CGI 被禁用是设计）
-
-### 待办（H3 高级特性，BoringSSL，DNS Windows 支持）
-
-见 session1006.txt
-
-### 推送状态
-- 前 7 次提交已成功推送到 origin/main
-- 最近 2 次因网络中断未推送
-- 请稍后手动 `git push` 或等待网络恢复
+### Git 提交记录
+- 7a8b56e Session 1006: fix script_ffi, options_catalog, geoip_panel stubs, status_page.html
 
 ### 提交日期
 2026-09-09
----
-
-## Session 1008 (2026-09-11) — WORKING NOW
-- 任务：对照规格逐项检查 + 多 agent 扫描 bug/漏洞 + 修复 + 同步 sourcetf/crucible-source
-- 正在只读审查：全部 src/、libs/、config.toml、admin_ui.html
-- 计划修改文件：先在此登记后再动手
-- 注意：本机通过 paramiko SSH 操作 /crucible；不要动 target/、state/

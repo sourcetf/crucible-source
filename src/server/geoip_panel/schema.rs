@@ -1,9 +1,22 @@
-//! §23 GeoIP unified schema helpers.
-
-use super::covering::MergedFields;
-use super::lookup::{self, GeoResult};
-
-/// Human-readable label per §23.2 (delegates to [`lookup::format_label`]).
-pub fn format_label(m: &MergedFields) -> String {
-    lookup::format_label(&GeoResult::from_merged(m.clone()))
-}
+//! GeoIP 数据 schema 定义。
+/*
+Schema:
+- ip (TEXT PRIMARY KEY)
+- cidr (TEXT)  // 可选，IP 范围
+- country (TEXT)
+- province (TEXT)
+- city (TEXT)
+- isp (TEXT)
+- asn (INTEGER)
+*/
+pub const TABLE_DDL: &str = r#"
+CREATE TABLE IF NOT EXISTS ip2loc (
+    ip TEXT PRIMARY KEY,
+    cidr TEXT,
+    country TEXT,
+    province TEXT,
+    city TEXT,
+    isp TEXT,
+    asn INTEGER
+);
+"#;

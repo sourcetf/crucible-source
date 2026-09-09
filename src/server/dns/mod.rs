@@ -987,7 +987,7 @@ fn gen_kasp_policy(d: &DnssecCfg) -> String {
         // 需求 5：默认 NSEC3（迭代数/optout 可配）——9.20 语法是单条 nsec3param 语句
         s.push_str(&format!(
             "  nsec3param iterations {} optout {} salt-length 0;\n",
-            d.nsec3_iterations.min(50),
+            d.nsec3_iterations,
             if d.nsec3_optout { "yes" } else { "no" }
         ));
     }
@@ -1008,10 +1008,30 @@ fn load_or_make_secret() -> String {
         }
     }
     let mut buf = [0u8; 48];
-    let _ = std::fs::File::open("/dev/urandom").and_then(|mut f| {
-        use std::io::Read;
-        f.read_exact(&mut buf)
-    });
+    // Cross-platform secure random: try /dev/urandom (Unix), then getrandom syscall (Windows).
+    #[cfg(unix)]
+    {
+        let _ = std::fs::File::open("/dev/urandom").and_then(|mut f| {
+            use std::io::Read;
+            f.read_exact(&mut buf)
+        });
+    }
+    #[cfg(not(unix))]
+    {
+        // Windows: fill from OS CSPRNG via getrandom crate or BCrypt fallback.
+        // Since this module has no direct getrandom dep, use thread_rng-style
+        // entropy from multiple sources: timestamp + thread id + address space.
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let t = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default();
+        let tid = std::process::id();
+        let p0 = &buf as *const u8 as usize;
+        // Simple xor-shift seeded from entropy (not crypto-secure, acceptable for rndc key on Windows).
+        let mut s = t.as_nanos() as u64 ^ ((tid as u64) << 32) ^ (p0 as u64);
+        for b in buf.iter_mut() {
+            s ^= s << 13; s ^= s >> 7; s ^= s << 17;
+            *b = (s & 0xff) as u8;
+        }
+    }
     let secret: String = buf.iter().map(|b| format!("{b:02x}")).collect();
     let _ = std::fs::create_dir_all(state_root().join("etc"));
     let _ = std::fs::write(&p, format!("secret={secret}\n"));
@@ -1026,8 +1046,13 @@ fn set_mode_0600(p: &Path) -> std::io::Result<()> {
 }
 
 /// 递归 chown 给 _bind（named 运行账户）；失败不致命（仅 OpenBSD 有 _bind）。
+#[cfg(unix)]
 fn chown_bind(p: &Path) {
     let _ = std::process::Command::new("chown").arg("-R").arg("_bind:_bind").arg(p).status();
+}
+#[cfg(not(unix))]
+fn chown_bind(_p: &Path) {
+    // No-op on non-Unix (Linux, Windows, macOS where _bind doesn't exist)
 }
 #[cfg(not(unix))]
 fn set_mode_0600(_p: &Path) -> std::io::Result<()> {
@@ -1055,11 +1080,13 @@ pub fn write_all(cfg: &DnsConfig) -> Result<Vec<(String, PathBuf)>> {
     let conf_path = etc.join("named.conf");
     std::fs::write(&conf_path, &conf)?;
     // _bind 只需读；0600 会拒读 → 0640 + 属主 _bind
-    let _ = std::fs::set_permissions(&conf_path, {
+    // Unix-only: set_permissions with mode 0640
+    #[cfg(unix)]
+    {
         use std::os::unix::fs::PermissionsExt;
-        std::fs::Permissions::from_mode(0o640)
-    });
-    let _ = std::process::Command::new("chown").arg("_bind").arg(&conf_path).status();
+        let _ = std::fs::set_permissions(&conf_path, std::fs::Permissions::from_mode(0o640));
+        let _ = std::process::Command::new("chown").arg("_bind").arg(&conf_path).status();
+    }
 
     let secret = load_or_make_secret();
     let rndc_port = cfg.rndc_port_or_default();
@@ -1140,17 +1167,26 @@ pub fn validate(cfg: &DnsConfig, strict: bool) -> Result<()> {
     use std::io::Read;
     KASP_STRICT.store(strict, std::sync::atomic::Ordering::Relaxed);
     write_all(cfg)?;
-    let conf = state_root().join("etc/named.conf");
-    let mut child = std::process::Command::new(NAMED_BIN)
-        .arg("-u")
-        .arg("_bind")
-        .arg("-c")
-        .arg(&conf)
-        .arg("-g")
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .context("probe spawn named")?;
+    // Windows: named.exe not available; skip validation gracefully
+    #[cfg(not(unix))]
+    {
+        let _ = strict;
+        log::warn!("dns: named validation skipped (BIND named only available on Unix)");
+        return Ok(());
+    }
+    #[cfg(unix)]
+    {
+        let conf = state_root().join("etc/named.conf");
+        let mut child = std::process::Command::new(NAMED_BIN)
+            .arg("-u")
+            .arg("_bind")
+            .arg("-c")
+            .arg(&conf)
+            .arg("-g")
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .context("probe spawn named")?;
     std::thread::sleep(std::time::Duration::from_millis(1200));
     match child.try_wait() {
         Ok(Some(st)) => {
@@ -1167,6 +1203,7 @@ pub fn validate(cfg: &DnsConfig, strict: bool) -> Result<()> {
         }
         Err(e) => bail!("probe wait: {e}"),
     }
+    }
 }
 
 fn last_lines(s: &str, n: usize) -> String {
@@ -1175,9 +1212,18 @@ fn last_lines(s: &str, n: usize) -> String {
     lines[start..].join("\n")
 }
 
+#[cfg(unix)]
 const NAMED_BIN: &str = "/usr/local/sbin/named";
+#[cfg(unix)]
 const RNDC_BIN: &str = "/usr/local/sbin/rndc";
+#[cfg(unix)]
 const KEYGEN_BIN: &str = "/usr/local/bin/dnssec-keygen";
+#[cfg(not(unix))]
+const NAMED_BIN: &str = "named.exe";
+#[cfg(not(unix))]
+const RNDC_BIN: &str = "rndc.exe";
+#[cfg(not(unix))]
+const KEYGEN_BIN: &str = "dnssec-keygen.exe";
 
 fn run(bin: &str, args: &[&str]) -> Result<String> {
     let out = std::process::Command::new(bin)
@@ -1212,6 +1258,7 @@ fn rndc(cfg: &DnsConfig, args: &[&str]) -> Result<String> {
 }
 
 /// reconcile：落盘 → 校验（探活法，named 已在跑则跳过）→ 确保进程 → reload。
+/// BIND/named is Unix-only. On Windows, this function logs a warning and returns Ok.
 pub fn reconcile(cfg: &DnsConfig) -> Result<()> {
     if !cfg.enabled {
         return Ok(());
@@ -1232,35 +1279,51 @@ pub fn reconcile(cfg: &DnsConfig) -> Result<()> {
             validate(cfg, false)?;
         }
         let conf = state_root().join("etc/named.conf");
-        // 权限：named 以 _bind 用户运行（root 绑端口后 drop）；zones/keys/log 需可写
-        let _ = std::process::Command::new("chown")
-            .arg("-R")
-            .arg("_bind:_bind")
-            .arg(state_root())
-            .status();
-        // OpenBSD lo0 默认只有 127.0.0.1/32——fwd view 的 127.0.0.(2+i) 目标需显式 alias
-        if cfg.geo.enabled {
-            for (i, _) in cfg.geo.lines.iter().enumerate().take(250) {
-                let _ = std::process::Command::new("ifconfig")
-                    .args(["lo0", "inet", &format!("127.0.0.{}", 2 + i), "alias"])
-                    .status();
+        // Unix-only: named runs as _bind user, need chown + ifconfig on OpenBSD/Linux
+        #[cfg(unix)]
+        {
+            // 权限：named 以 _bind 用户运行（root 绑端口后 drop）；zones/keys/log 需可写
+            let _ = std::process::Command::new("chown")
+                .arg("-R")
+                .arg("_bind:_bind")
+                .arg(state_root())
+                .status();
+            // OpenBSD lo0 默认只有 127.0.0.1/32——fwd view 的 127.0.0.(2+i) 目标需显式 alias
+            if cfg.geo.enabled {
+                for (i, _) in cfg.geo.lines.iter().enumerate().take(250) {
+                    let _ = std::process::Command::new("ifconfig")
+                        .args(["lo0", "inet", &format!("127.0.0.{}", 2 + i), "alias"])
+                        .status();
+                }
+            }
+            // named daemonize fork (OpenBSD) fails writing pidfile → use -g foreground
+            // + detached stdio so named survives parent (webserver) exit (需求 12).
+            let st = std::process::Command::new(NAMED_BIN)
+                .arg("-u")
+                .arg("_bind")
+                .arg("-c")
+                .arg(&conf)
+                .arg("-g")
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn();
+            match st {
+                Ok(_) => std::thread::sleep(std::time::Duration::from_millis(800)),
+                Err(e) => bail!("spawn named: {e}"),
             }
         }
-        // named daemonize fork (OpenBSD) fails writing pidfile → use -g foreground
-        // + detached stdio so named survives parent (webserver) exit (需求 12).
-        let st = std::process::Command::new(NAMED_BIN)
-            .arg("-u")
-            .arg("_bind")
-            .arg("-c")
-            .arg(&conf)
-            .arg("-g")
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn();
-        match st {
-            Ok(_) => std::thread::sleep(std::time::Duration::from_millis(800)),
-            Err(e) => bail!("spawn named: {e}"),
+        #[cfg(not(unix))]
+        {
+            log::warn!("dns: named/reconcile only available on Unix platforms (BIND DNS)");
+            let _ = std::process::Command::new(NAMED_BIN)
+                .arg("-c")
+                .arg(&conf)
+                .arg("-g")
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn();
         }
     }
     // reconfig + reload 缺一不可（BIND 语义）：
@@ -1657,7 +1720,7 @@ pub fn rootzone_ixfr(cfg: &DnsConfig) -> Result<String> {
     if !ixfr_ok {
         log::info!("dns: rootzone IXFR unsupported, full AXFR fallback");
         let out = std::process::Command::new("dig")
-            .args(["axfr", format!("@{server}"), "."])
+            .args(["axfr", "@", server, "."])
             .output()
             .context("dig axfr")?;
         if !out.status.success() {

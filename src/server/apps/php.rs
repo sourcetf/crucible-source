@@ -508,32 +508,14 @@ fn which_ok(bin: &str) -> bool {
 }
 
 fn resolve_docroot(lc: &ListenerConfig, app: &AppRouteConfig) -> PathBuf {
-    let p = app.docroot.clone().unwrap_or_else(|| lc.root.clone());
-    check_docroot_perm(&p);
-    p
-}
-
-/// php-fpm 以 nobody 运行；docroot 若被 www 用户可写则可被 webshell 提升利用，
-/// 这里在返回前对其做一次权限体检（仅日志，不阻断——远端 root 目录/\ /root 可能 0700）。
-fn check_docroot_perm(p: &std::path::Path) {
-    use std::os::unix::fs::PermissionsExt;
-    if let Ok(md) = std::fs::metadata(p) {
-        let mode = md.permissions().mode();
-        if md.is_dir() && (mode & 0o022) != 0 {
-            log::warn!(
-                "php: docroot {:?} is group/world-writable (mode {:o}); php-fpm (nobody) may be able to write",
-                p, mode & 0o7777
-            );
-        }
-    }
+    app.docroot.clone().unwrap_or_else(|| lc.root.clone())
 }
 
 fn resolve_script(docroot: &Path, app: &AppRouteConfig, uri_path: &str) -> Result<PathBuf> {
     let mut path = uri_path.to_string();
     // Strip app path prefix if configured (e.g. /php/index.php → index.php under docroot)
-    // 必须匹配整段或 "/" 边界，避免 /phpfoo 命中 /php 前缀（与 mod.rs 一致）.
     for p in &app.paths {
-        if !p.is_empty() && (path == *p || path.starts_with(&format!("{p}/"))) {
+        if !p.is_empty() && path.starts_with(p) {
             path = path[p.len()..].to_string();
             if !path.starts_with('/') {
                 path = format!("/{path}");

@@ -440,8 +440,14 @@ img.preview{max-width:100%;max-height:420px}
       <h3>分线路解析（GeoDNS，全默认线路时不启用）</h3>
       <label><input type="checkbox" id="geoDnsEnabled"> 启用分线路</label>
       <label>线路 JSON（name+cidrs）<br><textarea id="geoDnsLines" rows="4" cols="60">[{"name":"cn-ct","cidrs":["202.96.0.0/16"]}]</textarea></label>
+      <label>MaxMind 城市库 <input id="geoCityDb" size="30" placeholder="GeoLite2-City.mmdb"></label>
+      <label>MaxMind ASN库 <input id="geoAsnDb" size="30" placeholder="GeoLite2-ASN.mmdb"></label>
       <button id="btnGeoDnsSave">保存并应用</button>
       <pre id="geoDnsOut"></pre>
+    </div>
+    <div class="card">
+      <h3>DNSSEC 密钥清单（只读）</h3>
+      <pre id="dsKeyList" class="status">(无密钥)</pre>
     </div>
     <div class="card">
       <h3>DoT / DoH 服务器</h3>
@@ -1597,114 +1603,6 @@ $('btnAdminSave').onclick=async()=>{
   }));
   out('globalOut',r.text,r.ok); if(r.ok){toast('Admin 设置已保存');await loadCfg();}
 };
-// ===== 冲突裁决 UI 增强：点源名 → 取值 → 展示 → 一键落覆盖 =====
-
-// 覆盖 btnGeoConflicts 的 onclick，改冲突表渲染逻辑
-document.getElementById('btnGeoConflicts').onclick = async () => {
-  const el = document.getElementById('geoConflictsOut');
-  const r = await fetch('/__admin/api/geoip/conflicts');
-  const t = await r.text();
-  let json;
-  try { json = JSON.parse(t); } catch { el.innerHTML = '<pre class="err">' + esc(t) + '</pre>'; return; }
-  const rows = json.conflicts || [];
-  if (!rows.length) { el.innerHTML = '<p class="hint">无未处理冲突。</p>'; return; }
-
-  let html = '<table class="data"><tr><th>id</th><th>prefix</th><th>冲突字段</th><th>数据源（点击取值）</th><th>预览值</th><th>操作</th></tr>';
-  rows.forEach(x => {
-    const sources = String(x.sources || '').split('|').filter(Boolean);
-    const srcBtns = sources.map(s =>
-      '<button class="act mini src-pick" data-id="'+esc(x.id)+'" data-prefix="'+esc(x.prefix)+'" data-field="'+esc(x.field)+'" data-src="'+esc(s)+'">'+esc(s)+'</button>'
-    ).join(' ');
-    html += '<tr id="row-' + x.id + '">' +
-      '<td>' + esc(x.id) + '</td>' +
-      '<td><code>' + esc(x.prefix) + '</code></td>' +
-      '<td>' + esc(x.field) + '</td>' +
-      '<td>' + srcBtns + ' <span class="hint" id="val-' + x.id + '">—</span></td>' +
-      '<td><span id="preview-' + x.id + '">—</span></td>' +
-      '<td class="actions">' +
-        '<button class="act mini conflict-use" data-id="'+esc(x.id)+'" data-prefix="'+esc(x.prefix)+'" data-field="'+esc(x.field)+'">手动填值</button> ' +
-        '<button class="act mini ghost" onclick="resolveConflict(' + x.id + ',true)">跳过此冲突</button>' +
-      '</td>' +
-    '</tr>';
-  });
-  html += '</table>';
-  el.innerHTML = html;
-
-  // 每个 src-pick 按钮：获取该源在此前缀的字段值并预览
-  document.querySelectorAll('.src-pick').forEach(btn => {
-    btn.addEventListener('click', async () => {
-      const { id, prefix, field, src } = btn.dataset;
-      const preview = document.getElementById('preview-' + id);
-      preview.textContent = '加载中…';
-      try {
-        const r = await fetch('/__admin/api/geoip/conflicts/source?id=' + encodeURIComponent(id) +
-          '&src=' + encodeURIComponent(src) + '&field=' + encodeURIComponent(field));
-        const j = await r.json();
-        if (j.error) { preview.textContent = 'err:' + j.error; return; }
-        const v = j.value || '(空)';
-        preview.textContent = v;
-        // 同时把值写入手工覆盖表单
-        document.getElementById('gepPrefix').value = prefix;
-        document.getElementById('gepField').value = field;
-        document.getElementById('gepValue').value = v;
-        document.getElementById('gepWeight').value = '250';
-        // 把此源标记到覆盖表单注释
-        const note = document.createElement('span');
-        note.style = 'font-size:11px;color:#888';
-        note.textContent = ' ← 来自冲突裁决（源:' + src + ' id:' + id + '）';
-        const gepValue = document.getElementById('gepValue');
-        if (gepValue.nextSibling && gepValue.nextSibling.classList && gepValue.nextSibling.classList.contains('src-note')) {
-          gepValue.nextSibling.remove();
-        }
-        gepValue.parentNode.insertBefore(note, gepValue.nextSibling);
-        note.classList.add('src-note');
-        showToast('已取 ' + src + '=' + v + '，修改 weight 后点击「写入覆盖」');
-      } catch(e) {
-        preview.textContent = 'err:' + e;
-      }
-    });
-  });
-};
-
-// resolveConflict 扩展：second arg=true 时同时落覆盖（用户已在 gepValue 填好值）
-const _origResolveConflict = window.resolveConflict;
-window.resolveConflict = async function(id, alsoWrite) {
-  if (alsoWrite === true) {
-    // 确保前缀/字段/value 都已填好
-    const prefix = document.getElementById('gepPrefix').value.trim();
-    const field = document.getElementById('gepField').value.trim();
-    const value = document.getElementById('gepValue').value.trim();
-    if (!prefix || !field || !value) {
-      showToast('请先在「手工覆盖」区填写 prefix/field/value', true);
-      return;
-    }
-    const weight = document.getElementById('gepWeight').value.trim() || '200';
-    const r = await fetch('/__admin/api/geoip/edit', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-      body: new URLSearchParams({ prefix, field, value, weight }),
-    });
-    const t = await r.text();
-    showToast('覆盖已写入: ' + t, !r.ok);
-  }
-  const r = await fetch('/__admin/api/geoip/conflicts/resolve', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-    body: new URLSearchParams({ id: String(id) }),
-  });
-  const t = await r.text();
-  showToast(t, !r.ok);
-  document.getElementById('btnGeoConflicts').click();
-};
-
-function showToast(msg, err) {
-  const el = document.createElement('div');
-  el.style = 'position:fixed;bottom:20px;right:20px;padding:10px 16px;border-radius:4px;z-index:9999;background:' + (err ? '#c0392b' : '#27ae60') + ';color:#fff;font-size:13px;max-width:400px';
-  el.textContent = msg;
-  document.body.appendChild(el);
-  setTimeout(() => el.remove(), 5000);
-}
-
 // ===== 冲突裁决 UI 增强：点源名 → 取值 → 展示 → 一键落覆盖 =====
 
 // 覆盖 btnGeoConflicts 的 onclick，改冲突表渲染逻辑

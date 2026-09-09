@@ -1,179 +1,49 @@
-//! Engine names and help strings for Admin UI option catalog.
+//! 选项目录：暴露可用的配置选项和功能。
+//! Admin UI 使用此模块获取功能列表。
 
-/// One selectable engine entry for Admin dropdowns.
-#[derive(Clone, Debug)]
-pub struct EngineOption {
-    pub id: &'static str,
-    pub label: &'static str,
-    pub help: &'static str,
-    pub default_extensions: &'static [&'static str],
+use serde::{Deserialize, Serialize};
+
+/// TLS 版本选项
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TlsVersionOption {
+    pub code: String,
+    pub name: String,
+    pub available: bool,
 }
 
-/// All application engines exposed in Admin.
-pub fn app_engines() -> &'static [EngineOption] {
-    &[
-        EngineOption {
-            id: "php",
-            label: "PHP (php-fpm / php-cgi)",
-            help: "FastCGI PHP via php-fpm with php-cgi fallback.",
-            default_extensions: &["php"],
-        },
-        EngineOption {
-            id: "fastcgi",
-            label: "External FastCGI",
-            help: "Proxy to an external FastCGI backend.",
-            default_extensions: &["php"],
-        },
-        EngineOption {
-            id: "c",
-            label: "C plugin (FFI)",
-            help: "In-process libapp_c.so or native HTTP sidecar.",
-            default_extensions: &["c"],
-        },
-        EngineOption {
-            id: "rust",
-            label: "Rust plugin (FFI)",
-            help: "In-process libapp_rust.so or native HTTP sidecar.",
-            default_extensions: &["rs"],
-        },
-        EngineOption {
-            id: "go",
-            label: "Go plugin",
-            help: "Go shared library or go-shm sidecar.",
-            default_extensions: &["go"],
-        },
-        EngineOption {
-            id: "lua",
-            label: "Lua",
-            help: "Embedded Lua via app-engines.",
-            default_extensions: &["lua"],
-        },
-        EngineOption {
-            id: "wsgi",
-            label: "Python WSGI",
-            help: "WSGI app-engine shared library.",
-            default_extensions: &["py", "wsgi"],
-        },
-        EngineOption {
-            id: "asgi",
-            label: "Python ASGI",
-            help: "ASGI app-engine shared library.",
-            default_extensions: &["py", "asgi"],
-        },
-        EngineOption {
-            id: "psgi",
-            label: "Perl PSGI",
-            help: "PSGI app-engine shared library.",
-            default_extensions: &["pl", "psgi"],
-        },
-        EngineOption {
-            id: "rack",
-            label: "Ruby Rack",
-            help: "Rack app-engine shared library.",
-            default_extensions: &["rb", "ru"],
-        },
-        EngineOption {
-            id: "cgi",
-            label: "Legacy CGI",
-            help: "Spawn CGI processes (discouraged for C/Go/Rust).",
-            default_extensions: &["cgi"],
-        },
-        EngineOption {
-            id: "uwsgi",
-            label: "uWSGI protocol",
-            help: "uWSGI app-engine shared library / protocol bridge.",
-            default_extensions: &["py", "uwsgi"],
-        },
-        EngineOption {
-            id: "python",
-            label: "Python (script FFI)",
-            help: "Embedded / script FFI Python handler.",
-            default_extensions: &["py"],
-        },
-        EngineOption {
-            id: "ruby",
-            label: "Ruby (script FFI)",
-            help: "Embedded / script FFI Ruby handler.",
-            default_extensions: &["rb"],
-        },
-        EngineOption {
-            id: "perl",
-            label: "Perl (script FFI)",
-            help: "Embedded / script FFI Perl handler.",
-            default_extensions: &["pl", "pm"],
-        },
-        EngineOption {
-            id: "jsp",
-            label: "JSP (Jetty sidecar)",
-            help: "Java JSP via Jetty UDS sidecar.",
-            default_extensions: &["jsp"],
-        },
-        EngineOption {
-            id: "asp",
-            label: "Classic ASP (AxonASP)",
-            help: "AxonASP FFI sidecar.",
-            default_extensions: &["asp"],
-        },
-        EngineOption {
-            id: "aspnet",
-            label: "ASP.NET Core",
-            help: "hostfxr / NativeAOT FFI.",
-            default_extensions: &["cshtml", "aspx"],
-        },
-        EngineOption {
-            id: "tsx",
-            label: "TypeScript / TSX",
-            help: "One-click compile + watch deploy.",
-            default_extensions: &["tsx", "ts"],
-        },
+/// 获取可用的 TLS 版本列表
+pub fn tls_versions() -> Vec<TlsVersionOption> {
+    vec![
+        TlsVersionOption { code: "SSLv2".to_string(), name: "SSLv2".to_string(), available: cfg!(feature = "tls_tomcrypt") },
+        TlsVersionOption { code: "SSLv3".to_string(), name: "SSLv3".to_string(), available: cfg!(feature = "tls_nss") },
+        TlsVersionOption { code: "TLSv1.0".to_string(), name: "TLS 1.0".to_string(), available: cfg!(feature = "tls_nss") },
+        TlsVersionOption { code: "TLSv1.1".to_string(), name: "TLS 1.1".to_string(), available: cfg!(feature = "tls_nss") },
+        TlsVersionOption { code: "TLSv1.2".to_string(), name: "TLS 1.2".to_string(), available: true },
+        TlsVersionOption { code: "TLSv1.3".to_string(), name: "TLS 1.3".to_string(), available: true },
     ]
 }
 
-/// Lookup help text for a given engine id (case-insensitive).
-pub fn engine_help(id: &str) -> Option<&'static str> {
-    let key = id.to_ascii_lowercase();
-    app_engines()
-        .iter()
-        .find(|e| e.id == key)
-        .map(|e| e.help)
+/// 获取可用的应用引擎
+pub fn app_engines() -> Vec<String> {
+    vec![
+        "php".to_string(), "fastcgi".to_string(), "jsp".to_string(), "asp".to_string(), "aspnet".to_string(), "tsx".to_string(), "do".to_string(),
+        "python".to_string(), "ruby".to_string(), "perl".to_string(), "lua".to_string(), "wsgi".to_string(), "asgi".to_string(), "psgi".to_string(), "rack".to_string(),
+        "cgi".to_string(), "uwsgi".to_string(), "c".to_string(), "go".to_string(), "rust".to_string(),
+    ]
 }
 
-/// Serialize engines as a JSON array for `/api/catalog`.
-pub fn engines_json() -> String {
-    let mut s = String::from("[\n");
-    for (i, e) in app_engines().iter().enumerate() {
-        if i > 0 {
-            s.push_str(",\n");
-        }
-        let exts: Vec<String> = e
-            .default_extensions
-            .iter()
-            .map(|x| format!("\"{x}\""))
-            .collect();
-        s.push_str(&format!(
-            "  {{\"id\":\"{}\",\"label\":{},\"help\":{},\"default_extensions\":[{}]}}",
-            e.id,
-            json_escape(e.label),
-            json_escape(e.help),
-            exts.join(",")
-        ));
-    }
-    s.push_str("\n]");
-    s
+/// 获取可用的 DNSKEY 模式
+pub fn dnssec_algorithms() -> Vec<&'static str> {
+    vec![
+        "RSASHA256",
+        "RSASHA512",
+        "ECDSAP256SHA256",
+        "ECDSAP384SHA384",
+        "ED25519",
+    ]
 }
 
 /// 获取可用的 DNSKEY 角色
 pub fn dnssec_roles() -> Vec<&'static str> {
     vec!["ksk", "zsk", "csk"]
-}
-
-/// 返回功能目录的 JSON 格式（Admin API 使用）
-pub fn catalog_json() -> String {
-    let catalog = serde_json::json!({
-        "tls_versions": tls_versions(),
-        "app_engines": app_engines(),
-        "dnssec_algorithms": dnssec_algorithms(),
-        "dnssec_roles": dnssec_roles(),
-    });
-    catalog.to_string()
 }

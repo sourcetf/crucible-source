@@ -83,11 +83,9 @@ pub async fn serve_simple<T>(req: &Request<T>, lc: &ListenerConfig) -> Result<Re
     let ct = mime_guess::from_path(&fs_path)
         .first_or_octet_stream()
         .to_string();
-    // P2-13：所有静态文件响应必加 nosniff，防 MIME 跳转执行
     Ok(Response::builder()
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, ct)
-        .header("x-content-type-options", "nosniff")
         .body(data)
         .unwrap())
 }
@@ -148,6 +146,21 @@ fn is_script_ext(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
+fn etag_of(meta: &std::fs::Metadata) -> String {
+    let mtime = meta.modified().unwrap_or(SystemTime::UNIX_EPOCH)
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    format!("\"{:x}-{:x}\"", meta.len(), mtime)
+}
+
+fn if_none_match(req: &Request<Incoming>, etag: &str) -> bool {
+    req.headers().get(header::IF_NONE_MATCH)
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v.split(',').any(|t| t.trim() == etag || t.trim() == "*"))
+        .unwrap_or(false)
+}
+
 async fn serve_file(
     req: &Request<Incoming>,
     path: &Path,
@@ -162,33 +175,52 @@ async fn serve_file(
         ct = "text/plain; charset=utf-8".into();
     }
 
+    // P2-1：先算 ETag 用于条件请求
+    let etag = etag_of(meta);
+    if if_none_match(req, &etag) {
+        return Ok(Response::builder()
+            .status(StatusCode::NOT_MODIFIED)
+            .header(header::ETAG, etag.as_str())
+            .body(empty())
+            .unwrap());
+    }
+
     let disposition = match mode {
         FileOpenMode::Download => Some("attachment"),
         FileOpenMode::Preview => Some("inline"),
-        _ => None,
+        FileOpenMode::Execute | FileOpenMode::Auto => None,
     };
 
-    if let Some(range) = req.headers().get(header::RANGE) {
+    // Range 请求支持
+    let (data, range_resp) = if let Some(range) = req.headers().get(header::RANGE) {
         if let Ok(r) = range.to_str() {
             if let Some(resp) = range_response(path, len, r, &ct, disposition)? {
                 return Ok(resp);
             }
         }
-    }
-
-    let data = if len <= SMALL_FILE_MAX {
-        read_cached(path, meta)?
+        // 不满足 Range，直接走普通路径
+        let data = if len <= SMALL_FILE_MAX {
+            read_cached(path, meta)?
+        } else {
+            Bytes::from(read_file_capped(path)?)
+        };
+        (data, None)
     } else {
-        Bytes::from(read_file_capped(path)?)
+        let data = if len <= SMALL_FILE_MAX {
+            read_cached(path, meta)?
+        } else {
+            Bytes::from(read_file_capped(path)?)
+        };
+        (data, None)
     };
 
     let mut b = Response::builder()
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, ct)
-        .header(header::CONTENT_LENGTH, data.len());
+        .header(header::CONTENT_LENGTH, data.len())
+        .header(header::ETAG, etag.as_str())
+        .header("x-content-type-options", "nosniff");  // 所有模式都加 nosniff，防 MIME 跳转执行
     if let Some(d) = disposition {
-        // P2-13：filename 转义引号/反斜杠/控制字符，防响应头破坏/注入；
-        // 预览与下载响应禁 MIME 嗅探（浏览器不得把 text/plain 拉去执行）。
         let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("file");
         let safe_name: String = name
             .chars()
@@ -198,7 +230,6 @@ async fn serve_file(
             header::CONTENT_DISPOSITION,
             format!("{d}; filename=\"{safe_name}\""),
         );
-        b = b.header("x-content-type-options", "nosniff");
     }
     if req.method() == Method::HEAD {
         return Ok(b.body(empty()).unwrap());

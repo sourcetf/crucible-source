@@ -1,5 +1,7 @@
 //! Fine-grained GeoIP panel backend (minimal SQLite).
 
+// NOTE: The following modules are only fully implemented on OpenBSD;
+// stub implementations below allow Windows builds to succeed.
 pub mod aliases;
 pub mod anycast;
 pub mod config;

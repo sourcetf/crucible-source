@@ -1,69 +1,47 @@
-//! Re-inject bytes already read from a socket (TLS ClientHello peek, H2 preface, etc.).
+//! 前缀流包装器：为 HTTP/2 与 HTTP/1.1 提供统一的流接口。
+//! 主要用于 h2::serve_with_prefix 中的流包装。
 
-use std::io::Cursor;
 use std::pin::Pin;
 use std::task::{Context, Poll};
-use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
-use tokio::net::TcpStream;
+use tokio::io::{AsyncRead, AsyncWrite};
 
-/// Stream that serves `prefix` bytes before delegating to `inner`.
-#[derive(Debug)]
-pub struct PrefixedStream {
-    prefix: Cursor<Vec<u8>>,
-    inner: TcpStream,
+/// 包装已读取前缀的 TCP 流
+pub struct PrefixedStream<R, W> {
+    reader: R,
+    writer: W,
+    prefix: Vec<u8>,
+    prefix_pos: usize,
 }
 
-impl PrefixedStream {
-    pub fn new(inner: TcpStream, prefix: Vec<u8>) -> Self {
+impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> PrefixedStream<R, W> {
+    pub fn new(reader: R, writer: W, prefix: Vec<u8>) -> Self {
         Self {
-            prefix: Cursor::new(prefix),
-            inner,
+            reader,
+            writer,
+            prefix,
+            prefix_pos: 0,
         }
     }
 }
 
-impl AsyncRead for PrefixedStream {
+impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> AsyncRead
+    for PrefixedStream<R, W>
+{
     fn poll_read(
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
-        buf: &mut ReadBuf<'_>,
-    ) -> Poll<std::io::Result<()>> {
-        use std::io::Read;
-        if self.prefix.position() < self.prefix.get_ref().len() as u64 {
-            let mut tmp = vec![0u8; buf.remaining()];
-            match self.prefix.read(&mut tmp) {
-                Ok(0) => {}
-                Ok(n) => {
-                    buf.put_slice(&tmp[..n]);
-                    return Poll::Ready(Ok(()));
-                }
-                Err(e) => return Poll::Ready(Err(e)),
-            }
+        buf: &mut [u8],
+    ) -> Poll<std::io::Result<usize>> {
+        // 先返回前缀
+        if self.prefix_pos < self.prefix.len() {
+            let available = self.prefix.len() - self.prefix_pos;
+            let to_copy = buf.len().min(available);
+            buf[..to_copy].copy_from_slice(
+                &self.prefix[self.prefix_pos..self.prefix_pos + to_copy],
+            );
+            self.prefix_pos += to_copy;
+            return Poll::Ready(Ok(to_copy));
         }
-        Pin::new(&mut self.inner).poll_read(cx, buf)
-    }
-}
-
-impl AsyncWrite for PrefixedStream {
-    fn poll_write(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &[u8],
-    ) -> Poll<Result<usize, std::io::Error>> {
-        Pin::new(&mut self.inner).poll_write(cx, buf)
-    }
-
-    fn poll_flush(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-    ) -> Poll<Result<(), std::io::Error>> {
-        Pin::new(&mut self.inner).poll_flush(cx)
-    }
-
-    fn poll_shutdown(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-    ) -> Poll<Result<(), std::io::Error>> {
-        Pin::new(&mut self.inner).poll_shutdown(cx)
+        Pin::new(&mut self.reader).poll_read(cx, buf)
     }
 }
