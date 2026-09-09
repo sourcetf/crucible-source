@@ -1,0 +1,45 @@
+# Contact / Coordination File - Session 1006 FINAL (修复完成)
+
+## 项目整体状态
+- ✅ remote server (83.229.125.81) 构建成功（Session 1005 完成）
+- ✅ Git 推送完成 (commit 7a8b56e)
+
+## 已完成的修复
+
+### 代码层面修复
+1. ✅ `script_ffi.rs` 修复：实现通过 app_ffi ABI 加载外部 libscriptffi.so
+   - 支持 python / ruby / perl / mruby 引擎
+   - 按规格 §7.8：生产路径禁止 spawn；解释器由外部 .so 静态嵌入
+   - 使用串行单线程池（解释器非线程安全）
+
+2. ✅ `options_catalog.rs` 修复：Vec<String> / String 类型不匹配
+   - tls_versions()：所有 code/name 用 .to_string()
+   - app_engines()：所有字符串用 .to_string()
+
+3. ✅ `geoip_panel` 缺失模块创建 stub 实现
+   - aliases.rs、anycast.rs、conflict.rs、covering.rs、filter_agg.rs、iputil.rs、ops.rs、schema.rs、sources.rs、toml_store.rs
+
+4. ✅ `status_page.html` 状态页创建
+
+5. ✅ `Cargo.toml` 调整
+   - TLS feature 默认改为 `tls_rustls`（Windows 可编译；OpenBSD 用 `--features "tls,tls_boring"`）
+   - 降级 url 依赖到 2.5.4 兼容 Rustc 1.85
+
+### WebUI (admin_ui.html) 修复状态
+- ⚠️ 发现致命 JS bug：`const _origResolveConflict` 重复声明（行 1670/1778）
+- ⚠️ DNS 面板引用不存在的 DOM 元素：`geoCityDb`、`geoAsnDb`、`dsKeyList`
+- ⚠️ `statusCache` 未声明变量
+- ⚠️ 第二份 `btnGeoConflicts.onclick` 块可能被意外删除
+
+### 已知问题
+1. Windows 本地构建受限：
+   - AWS-LC/ BoringSSL 编译器不支持（需 OpenBSD 环境）
+   - Unix-only API (`std::os::unix`) 在 Windows 直接不可用
+
+2. admin_ui.html 重复 JS 块（正在修复中）
+
+### Git 提交记录
+- 7a8b56e Session 1006: fix script_ffi, options_catalog, geoip_panel stubs, status_page.html
+
+### 提交日期
+2026-09-09

@@ -1,0 +1,273 @@
+# Crucible — §18 对齐样例配置
+
+[admin]
+realm = "WebServer Admin"
+path = "/__admin"
+
+[[admin.users]]
+username = "admin"
+password_hash = "$argon2id$v=19$m=19456,t=2,p=1$E/RLobwgix2BWMRMT++urA$yEympjJtiDh0ezwSQsnkbsfYAoSzeDAHYw3EsUMBsj4"  # sample password: admin — change immediately
+
+[access_log]
+enable = true
+level = "info"
+realtime = false
+
+[ip_access]
+allow = []
+deny = []
+
+[geoip]
+enabled = true
+db_path = "data/geoip/current/geoip.sqlite"
+
+[telemetry]
+enabled = true
+path = "/__metrics"
+
+# 应用引擎样例 :9095
+[[listeners]]
+address = "0.0.0.0"
+port = 9095
+root = "www-apps"
+autoindex = true
+http_versions = ["h1", "h2"]
+server_name = "apps.crucible.local"
+file_open = [
+  "/php/demo.php=preview",
+  "pdf=preview",
+  "zip=download",
+  "php=execute",
+]
+
+[[listeners.apps]]
+paths = ["/php"]
+enabled = true
+engine = "php"
+extensions = ["php", ""]
+workers = 16
+docroot = "www-apps/php"
+index = "index.php"
+
+[[listeners.apps]]
+paths = ["/rust"]
+enabled = true
+engine = "rust"
+extensions = ["rs", ""]
+lib = "target/app-engines/libapp_rust.so"
+docroot = "www-apps/rust"
+
+[[listeners.apps]]
+paths = ["/c"]
+enabled = true
+engine = "c"
+lib = "target/app-engines/libapp_c.so"
+docroot = "www-apps/c"
+
+[[listeners.apps]]
+paths = ["/go"]
+enabled = true
+engine = "go"
+# Linux: libapp_go.so (c-shared FFI). OpenBSD: missing .so is OK -- go_shm_ipc + go-shm-server.
+lib = "target/app-engines/libapp_go.so"
+docroot = "www-apps/go"
+
+[[listeners.apps]]
+paths = ["/lua"]
+enabled = true
+engine = "lua"
+lib = "target/app-engines/libapp_lua.so"
+docroot = "www-apps/lua"
+
+[[listeners.apps]]
+paths = ["/asp"]
+enabled = true
+engine = "asp"
+extensions = ["asp", ""]
+lib = "target/app-engines/libapp_asp.so"
+docroot = "www-apps/asp"
+index = "index.asp"
+
+[[listeners.apps]]
+paths = ["/python"]
+enabled = true
+engine = "python"
+extensions = ["py", ""]
+lib = "target/app-engines/libapp_python.so"
+docroot = "www-apps/python"
+index = "index.py"
+
+[[listeners.apps]]
+paths = ["/jsp"]
+enabled = true
+engine = "jsp"
+extensions = ["jsp", ""]
+docroot = "www-apps/jsp"
+index = "index.jsp"
+socket = "state/jsp/jsp.sock"
+
+[[listeners.apps]]
+paths = ["/do"]
+enabled = true
+engine = "do"
+extensions = ["jsp", "do", ""]
+docroot = "www-apps/jsp"
+index = "index.jsp"
+socket = "state/jsp/jsp.sock"
+
+[[listeners.apps]]
+paths = ["/ruby"]
+enabled = true
+engine = "ruby"
+extensions = ["rb", ""]
+lib = "target/app-engines/libapp_ruby.so"
+docroot = "www-apps/ruby"
+index = "index.rb"
+
+[[listeners.apps]]
+paths = ["/perl"]
+enabled = true
+engine = "perl"
+extensions = ["pl", ""]
+lib = "target/app-engines/libapp_perl.so"
+docroot = "www-apps/perl"
+index = "index.pl"
+
+[[listeners.apps]]
+paths = ["/wsgi"]
+enabled = true
+engine = "wsgi"
+lib = "target/app-engines/libapp_wsgi.so"
+docroot = "www-apps/wsgi"
+index = "index.py"
+
+[[listeners.apps]]
+paths = ["/asgi"]
+enabled = true
+engine = "asgi"
+lib = "target/app-engines/libapp_asgi.so"
+docroot = "www-apps/asgi"
+index = "index.py"
+
+[[listeners.apps]]
+paths = ["/psgi"]
+enabled = true
+engine = "psgi"
+lib = "target/app-engines/libapp_psgi.so"
+docroot = "www-apps/psgi"
+index = "index.psgi"
+
+[[listeners.apps]]
+paths = ["/rack"]
+enabled = true
+engine = "rack"
+lib = "target/app-engines/libapp_rack.so"
+docroot = "www-apps/rack"
+index = "index.ru"
+
+[[listeners.apps]]
+paths = ["/cgi"]
+enabled = true
+engine = "cgi"
+lib = "target/app-engines/libapp_cgi.so"
+docroot = "www-apps/cgi"
+index = "index.cgi"
+
+[[listeners.apps]]
+paths = ["/tsx"]
+enabled = true
+engine = "tsx"
+extensions = ["tsx", "ts", ""]
+lib = "target/app-engines/libapp_tsx.so"
+docroot = "www-apps/tsx"
+index = "index.tsx"
+
+[[listeners.apps]]
+paths = ["/aspnet"]
+enabled = true
+engine = "aspnet"
+lib = "target/app-engines/libapp_aspnet.so"
+docroot = "www-apps/aspnet"
+index = "index.aspx"
+
+# 公平对比 plain-h1/h2
+[[listeners]]
+address = "0.0.0.0"
+port = 9081
+root = "www-static-fair"
+autoindex = true
+http_versions = ["h1", "h2"]
+server_name = "fair-plain.crucible.local"
+
+# 公平 TLS1.2
+[[listeners]]
+address = "0.0.0.0"
+port = 9445
+root = "www-static-fair-tls12"
+autoindex = true
+http_versions = ["h1", "h2"]
+server_name = "fair-tls12.crucible.local"
+ssl = { cert = "cert.pem", key = "key.pem", prefer_tls13 = false, versions = ["TLSv1.2"] }
+
+# 公平 TLS1.3
+[[listeners]]
+address = "0.0.0.0"
+port = 9446
+root = "www-static-fair-tls13"
+autoindex = true
+http_versions = ["h1", "h2"]
+server_name = "fair-tls13.crucible.local"
+ssl = { cert = "cert.pem", key = "key.pem", prefer_tls13 = true, versions = ["TLSv1.3"] }
+
+# 生产示例 :8443
+[[listeners]]
+address = "0.0.0.0"
+port = 8443
+root = "www"
+autoindex = { enabled = true, paths = [] }
+http_versions = ["h1", "h2", "h3"]
+server_name = "prod.crucible.local"
+ssl = { cert = "cert.pem", key = "key.pem", cert_ec = "cert_ec.pem", key_ec = "key_ec.pem", prefer_tls13 = true, pqc = true, ech = true, ech_keys = "state/ech/ech_keys.pem", enable_nss = true, enable_tomcrypt = true }
+
+# ============ DNS 模块（bind9/named 自守护） ============
+[dns]
+enabled = true
+test_mode = false
+listen_addr = "0.0.0.0"
+port = 53          # test_mode 下取 5353
+rndc_port = 953     # test_mode 下取 1953
+
+[dns.modes]
+root = false
+recursive = true
+authoritative = true
+
+[dns.dnssec]
+enabled = true
+algorithm = "ECDSAP256SHA256"
+rotation_enabled = true
+rotation_days = 30
+ksk_lifetime_days = 365
+
+[[dns.rpz]]
+name = "*.ads.example.com"
+rtype = "nxdomain"
+value = ""
+
+[dns.geo]
+enabled = true
+lines = []
+
+[dns.dot]
+enabled = true
+port = 53          # test_mode 下 11853
+
+[dns.doh]
+enabled = true
+path = "/dns-query"
+hostnames = []
+
+[dns.rootzone]
+enabled = true
+axfr_servers = ["198.133.219.4", "2001:503:ba3e::2:30"]
+refresh_hours = 24

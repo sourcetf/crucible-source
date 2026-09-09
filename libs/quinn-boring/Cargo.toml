@@ -1,0 +1,14 @@
+[package]
+name = "quinn-boring"
+version = "0.0.1"
+edition = "2021"
+
+[features]
+default = ["boring"]
+boring = []
+
+[dependencies]
+quinn = { version = "0.11", default-features = false, features = ["runtime-tokio"] }
+boring = { version = "5", features = ["pq-experimental"] }
+tokio-boring = { version = "5" }
+boring-sys = { version = "5" }
