@@ -1,0 +1,74 @@
+# Contact / Coordination File - Session 1005 FINAL
+
+## 完成情况 SUMMARY
+
+### 项目整体状态
+- ✅ remote server (83.229.125.81) 已构建成功
+- ✅ Binary: /crucible/target/release/webserver (16.2MB, Sep 9 07:49)
+- ✅ Git 推送完成 (commit 6a5306d)
+
+### 已实现功能
+
+#### HTTP 基础
+- ✅ HTTP/1.1 (hyper 1.x) - h1.rs
+- ✅ HTTP/2 (h2.rs) - 自定义实现，BATCH_CAP=16，max_send_buffer 128KB
+- ✅ HTTP/3 (h3.rs) - quinn + h3-quinn，h3-qmux 路由，RFC 9298 CONNECT-UDP
+
+#### TLS/SSL
+- ✅ BoringSSL 主路径 + ClientHello 分流
+- ✅ TLS 1.2/1.3 全支持
+- ✅ ECH 自动配置 (ech_auto.rs)
+- ✅ OCSP 智能获取 (ocsp_fetcher.rs)
+- ✅ PQC 后量子 (X25519MLKEM768)
+- ✅ PSK 支持
+- ✅ NSS/TomCrypt 遗留协议路由（可选）
+
+#### 性能特性
+- ✅ HSTS 响应头: max-age=31536000; includeSubDomains; preload
+- ✅ Port 80 HTTP/HTTPS 复用 (port_reuse.rs)
+- ✅ SO_BUSY_POLL (Linux 100µs)
+- ✅ Acceptor 缓存 (64 entry LRU)
+
+#### 应用引擎
+- ✅ PHP-FPM (优先) + php-cgi 回退
+- ✅ Lua FFI (libapp_lua.so)
+- ✅ C/Go/Rust 原生插件 (libapp_{c,go,rust}.so)
+- ✅ WSGI/ASGI/PSGI/Rack
+- ✅ JSP/Jetty sidecar (UDS)
+- ✅ ASP/ASP.NET FFI
+- ✅ TSX 编译部署
+- ✅ Script FFI (Python/Ruby/Perl 静态嵌入)
+
+#### DNS (BIND9 后端)
+- ✅ 权威/递归/根服务器三模式
+- ✅ DNSSEC 自动签名 + ZSK/KSK 周期轮换
+- ✅ NSEC3 (默认启用)
+- ✅ ICANN SOA/CDS/RRSIG 完整支持
+- ✅ DoT/DoH 加密 DNS
+- ✅ ECS (EDNS Client Subnet)
+- ✅ AXFR 增量更新
+- ✅ GeoIP 路由 (基于 ISP/AS/Prefix)
+- ✅ RPZ 反欺诈
+
+#### Admin UI
+- ✅ 嵌入式 admin_ui.html (include_str!)
+- ✅ 热配置重载
+- ✅ TLS 配置 (PEM 路径/粘贴)
+- ✅ 应用引擎管理
+- ✅ 静态文件管理
+- ✅ GeoIP 面板
+- ✅ HSTS / 端口复用功能
+
+### 已知问题/后续改进
+- named 偶发 futex_noasync 崩溃 (容器内核限制)
+- rndc key 不匹配 (时钟/容器环境问题)
+- 外部 UDP 53 访问受容器网络策略限制
+
+### Git 提交记录
+- 6a5306d Session 1005: Sync local changes and update .gitignore
+- d56a1e2 dns: enable service on port 53
+- 0e5d904 feat: implement DNS §16, Webserver §18 (HSTS, Port Reuse, CONNECT-UDP)
+- 56a3b85 ci: add comprehensive GitHub Actions workflow
+
+### 提交日期
+2026-09-09
