@@ -70,12 +70,15 @@ use http::{HeaderMap, HeaderName, HeaderValue, Request, Response, StatusCode, Ur
 use http_body_util::{BodyExt, Full};
 use hyper_util::rt::TokioIo;
 use std::net::{IpAddr, SocketAddr};
+#[cfg(unix)]
 use std::os::unix::io::FromRawFd;
 use std::pin::Pin;
 use std::str::FromStr;
 use std::task::{Context as TaskContext, Poll};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
-use tokio::net::{TcpListener, TcpStream, UnixStream};
+use tokio::net::{TcpListener, TcpStream};
+#[cfg(unix)]
+use tokio::net::UnixStream;
 
 /// Object-safe read+write stream for upstream TLS/plain TCP.
 trait AsyncReadWrite: AsyncRead + AsyncWrite + Unpin + Send {}
@@ -802,6 +805,7 @@ async fn connect_tor_socks(host: &str, port: u16) -> Result<TcpStream> {
     if let Some(stream) = try_tor_ffi_connect(host, port).await {
         return stream;
     }
+    #[cfg(unix)]
     if let Ok(unix_path) = std::env::var("CRUCIBLE_TOR_SOCKS_UNIX") {
         if !unix_path.is_empty() {
             let unix = UnixStream::connect(&unix_path)
@@ -904,6 +908,7 @@ async fn socks5_connect(mut tcp: TcpStream, host: &str, port: u16) -> Result<Tcp
 }
 
 /// After SOCKS5 on a Unix socket, bridge bytes to a local TcpStream for Hyper.
+#[cfg(unix)]
 async fn socks5_unix_bridge(mut unix: UnixStream, host: &str, port: u16) -> Result<TcpStream> {
     do_socks5(&mut unix, host, port).await?;
     let listener = TcpListener::bind("127.0.0.1:0")

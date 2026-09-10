@@ -25,14 +25,13 @@ tls_nss = []
 tls_tomcrypt = []
 
 [dependencies]
-h3 = "0.0.8"
-h3-quinn = "0.0.10"
+h2 = "0.4"
 hyper = { version = "1", features = ["full"] }
 hyper-util = { version = "0.1", features = ["full"] }
 http = "1"
 http-body-util = "0.1"
 bytes = "1"
-tokio = { version = "1", features = ["full"] }
+tokio = { version = "1", features = ["full", "process", "signal"] }
 anyhow = "1"
 serde = { version = "1", features = ["derive"] }
 toml = "0.8"
@@ -42,6 +41,7 @@ libc = "0.2"
 argon2 = { version = "0.5", features = ["std"] }
 password-hash = { version = "0.5", features = ["rand_core"] }
 rand_core = { version = "0.6", features = ["getrandom"] }
+getrandom = "0.2"
 yescrypt = "0.1"
 rusqlite = { version = "0.32", features = ["bundled"] }
 mime_guess = "2"
@@ -62,6 +62,7 @@ flate2 = "1"
 rustls = { version = "0.23", features = ["ring"] }
 tokio-rustls = { version = "0.26" }
 rustls-pemfile = { version = "2" }
+tar = "0.4"
 
 [build-dependencies]
 cc = "1"

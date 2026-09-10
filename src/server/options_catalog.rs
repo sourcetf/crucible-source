@@ -47,3 +47,14 @@ pub fn dnssec_algorithms() -> Vec<&'static str> {
 pub fn dnssec_roles() -> Vec<&'static str> {
     vec!["ksk", "zsk", "csk"]
 }
+
+/// 返回功能目录的 JSON 格式（Admin API 使用）
+pub fn catalog_json() -> String {
+    let catalog = serde_json::json!({
+        "tls_versions": tls_versions(),
+        "app_engines": app_engines(),
+        "dnssec_algorithms": dnssec_algorithms(),
+        "dnssec_roles": dnssec_roles(),
+    });
+    catalog.to_string()
+}

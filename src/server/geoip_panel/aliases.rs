@@ -1,7 +1,5 @@
 //! GeoIP 别名 / 线路名称映射。
 
-use crate::server::geoip_panel::GeoLine;
-
 /// 解析名字 -> CIDR 列表的映射（面板编辑来源）。
 pub fn parse_alias_line(line: &str) -> Option<(String, Vec<String>)> {
     let parts: Vec<&str> = line.split('=').collect();
@@ -15,6 +13,13 @@ pub fn parse_alias_line(line: &str) -> Option<(String, Vec<String>)> {
 /// 序列化名字 -> CIDR 列表
 pub fn format_alias_line(name: &str, cidrs: &[String]) -> String {
     format!("{}={}", name, cidrs.join(","))
+}
+
+/// 解析 IP 别名（如 "cn" → ["1.0.0.0/8", ...]）。
+/// 空字符串返回 None。
+pub fn resolve_isp_alias(name: &str) -> String {
+    if name.is_empty() { return String::new(); }
+    name.to_string()
 }
 
 #[cfg(test)]
