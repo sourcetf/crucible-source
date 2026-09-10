@@ -83,9 +83,11 @@ pub async fn serve_simple<T>(req: &Request<T>, lc: &ListenerConfig) -> Result<Re
     let ct = mime_guess::from_path(&fs_path)
         .first_or_octet_stream()
         .to_string();
+    // P2-13：所有静态文件响应必加 nosniff，防 MIME 跳转执行
     Ok(Response::builder()
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, ct)
+        .header("x-content-type-options", "nosniff")
         .body(data)
         .unwrap())
 }
