@@ -96,7 +96,7 @@ pub async fn execute(
     let env_vars: Vec<(String, String)> = req
         .extensions()
         .get::<crate::server::apps::deps::DepsEnv>()
-        .map(|d| (*d.vars).clone())
+        .map(|d| d.vars.clone())
         .unwrap_or_default();
     let (parts, body) = req.into_parts();
     let method = parts.method.as_str().to_string();
