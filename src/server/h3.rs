@@ -56,9 +56,25 @@ pub async fn serve(
 
     let crypto = ServerConfig::from(server_config);
 
+    // Transport config: 定制拥塞控制、连接置信度、0-RTT 等。
+    // quinn 默认通过 rustls 提供 TLS 1.3（0-RTT 已内置）。
+    // 这里显式指定传输参数，确保 h3-qmux 的流量区分。
+    let mut transport = quinn::TransportConfig::default();
+    // 拥塞控制：Cubic（默认），可切换 BBR；
+    transport.congestion_controller_factory(Arc::new(quinn::congestion::CubicConfig::default()));
+    // 连接置信度：保活与空闲超时
+    transport.max_idle_timeout(Some(std::time::Duration::from_secs(60).try_into().unwrap()));
+    transport.keep_alive_interval(Some(std::time::Duration::from_secs(20)));
+    // 0-RTT窗口
+    transport.max_concurrent_bidi_streams(quinn::VarInt::from_u32(100));
+    transport.max_concurrent_uni_streams(quinn::VarInt::from_u32(100));
+
+    let mut ep_config = quinn::EndpointConfig::default();
+    ep_config.transport_config(Arc::new(transport));
+
     let socket = UdpSocket::bind(bind).await.context("h3 udp bind")?;
     let endpoint = Endpoint::new(
-        quinn::EndpointConfig::default(),
+        ep_config,
         Some(Arc::new(crypto)),
         socket,
         Arc::new(quinn::TokioRuntime),
