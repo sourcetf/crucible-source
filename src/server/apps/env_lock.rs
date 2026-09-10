@@ -5,50 +5,87 @@ use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::ffi::OsString;
 use std::sync::Arc;
+use parking_lot::Mutex;
 
-/// P2-18：锁表改为动态注册——已知引擎预置，未知引擎首次使用时按名建锁。
-/// 旧实现把未知名落到单把全局 FALLBACK 锁，新增引擎名会悄悄把并发打成全局串行。
-static ENV_LOCKS: Lazy<Mutex<HashMap<String, Arc<Mutex<()>>>>> = Lazy::new(|| {
-    let engines = [
-        "php", "lua", "wsgi", "asgi", "psgi", "rack", "cgi", "uwsgi", "python", "ruby", "perl",
-    ];
-    Mutex::new(
-        engines
-            .iter()
-            .map(|e| (e.to_string(), Arc::new(Mutex::new(()))))
-            .collect(),
-    )
-});
+static ENV_LOCKS: once_cell::sync::Lazy<Mutex<HashMap<String, Arc<std::sync::Semaphore>>>> =
+    once_cell::sync::Lazy::new(Default::default);
 
+/// 同步版本：获取指定引擎的环境锁，在闭包内设置临时环境变量。
+/// 用于线程池中的同步执行（app_ffi.rs 的 PoolJob）。
 pub fn with_temp_env_named<T, F>(engine: &str, vars: &[(&str, &str)], f: F) -> T
 where
     F: FnOnce() -> T,
 {
-    let lock = ENV_LOCKS
-        .lock()
-        .entry(engine.to_string())
-        .or_default()
-        .clone();
-    let _guard = lock.lock();
-    let prev: Vec<(OsString, Option<OsString>)> = vars
-        .iter()
-        .map(|(k, v)| {
-            let key = OsString::from(*k);
-            let old = std::env::var_os(*k);
-            if v.is_empty() {
-                std::env::remove_var(*k);
-            } else {
-                std::env::set_var(*k, v);
-            }
-            (key, old)
-        })
-        .collect();
-    let out = f();
-    for (k, old) in prev {
-        match old {
-            Some(v) => std::env::set_var(&k, v),
-            None => std::env::remove_var(&k),
+    let sem = {
+        let mut locks = ENV_LOCKS.lock();
+        locks
+            .entry(engine.to_string())
+            .or_insert_with(|| Arc::new(std::sync::Semaphore::new(1)))
+            .clone()
+    };
+    let _permit = sem.acquire().expect("semaphore closed");
+    
+    // 设置临时环境变量
+    let mut saved = Vec::new();
+    for (k, v) in vars {
+        if let Ok(old) = std::env::var(k) {
+            saved.push((k.to_string(), Some(old)));
+        } else {
+            saved.push((k.to_string(), None));
+        }
+        std::env::set_var(k, v);
+    }
+    
+    let result = f();
+    
+    // 恢复环境变量
+    for (k, old) in saved {
+        if let Some(v) = old {
+            std::env::set_var(&k, v);
+        } else {
+            std::env::remove_var(&k);
         }
     }
-    out
+    
+    result
+}
+
+/// 异步版本：用于 tokio::spawn 中的异步执行。
+pub async fn with_temp_env_named_async<T, F, Fut>(engine: &str, vars: Vec<(String, String)>, f: F) -> T
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = T>,
+{
+    let sem = {
+        let mut locks = ENV_LOCKS.lock();
+        locks
+            .entry(engine.to_string())
+            .or_insert_with(|| Arc::new(std::sync::Semaphore::new(1)))
+            .clone()
+    };
+    let _permit = sem.acquire().expect("semaphore closed");
+    
+    // 设置临时环境变量
+    let mut saved = Vec::new();
+    for (k, v) in &vars {
+        if let Ok(old) = std::env::var(k) {
+            saved.push((k.clone(), Some(old)));
+        } else {
+            saved.push((k.clone(), None));
+        }
+        std::env::set_var(k, v);
+    }
+    
+    let result = f().await;
+    
+    // 恢复环境变量
+    for (k, old) in saved {
+        if let Some(v) = old {
+            std::env::set_var(&k, v);
+        } else {
+            std::env::remove_var(&k);
+        }
+    }
+    
+    result
 }
