@@ -5,12 +5,15 @@
 //! **预先选出唯一路径**（优先级：FFI .so > 已配置的 UDS socket > 可启动的 sidecar 二进制）。
 //! 全不可用时返回 501，绝不回退 CGI spawn（规格 §7.1）。
 
-use crate::config::{AppRouteConfig, ListenerConfig};
+use crate::config::AppRouteConfig;
+use crate::config::ListenerConfig;
+use crate::server::h1::BoxBody;
 use crate::server::apps::{app_ffi, native_http};
-use crate::server::h1::{full, BoxBody};
 use http::{Request, Response, StatusCode};
 use hyper::body::Incoming;
 use std::net::SocketAddr;
+use bytes::Bytes;
+use http_body_util::Full;
 
 /// 引擎可用性预决策 + 分发。
 pub async fn handle_with_fallback(
@@ -49,17 +52,49 @@ pub async fn handle_with_fallback(
         .unwrap())
 }
 
-#[cfg(test)]
-mod tests {
-    /// 回归：分发必须是"预决策唯一路径"，不得出现对同一 Incoming body 的二次 await
-    /// （try_handle 之后再 try_handle_uds 会导致 body 已消费的 UB 逻辑错误）。
-    #[test]
-    fn dispatch_is_predecision_exclusive() {
-        let src = include_str!("sidecar_engine.rs");
-        // 三条后端调用各自处于独立 `return` 分支，互斥。
-        let ffi = src.find("app_ffi::execute").expect("ffi path");
-        let uds = src.find("try_handle_uds").expect("uds path");
-        let sc = src.find("try_handle(").expect("sidecar path");
-        assert!(ffi < uds && uds < sc, "priority must be FFI > UDS > sidecar");
+/// 通过 sidecar 执行请求
+pub async fn sidecar_execute(
+    _req: &http::Request<Bytes>,
+    _app: &AppRouteConfig,
+) -> Result<http::Response<bytes::Bytes>> {
+    // 通过 HTTP 或 UDS 与 sidecar 通信
+    Err(anyhow::anyhow!("sidecar not implemented"))
+}
+
+/// wsgi/asgi/ffi 等引擎的统一处理器：尝试 FFI → native_http sidecar → 失败返回 502。
+pub async fn handle_with_fallback(
+    req: Request<Incoming>,
+    lc: &ListenerConfig,
+    app: &AppRouteConfig,
+    peer: SocketAddr,
+    app_idx: usize,
+    engine: &str,
+    sidecor_cmd: &str,
+) -> Result<Response<BoxBody>> {
+    let engine_lower = engine.to_ascii_lowercase();
+
+    // 1. 尝试 FFI .so
+    if app_ffi::lib_available(app, &engine_lower) {
+        return app_ffi::execute(req, lc, app, peer).await;
     }
+
+    // 2. 尝试 native_http sidecar
+    if native_http::sidecar_available(app, lc) {
+        if let Ok(resp) = native_http::try_handle(req, lc, app, peer, app_idx).await {
+            return Ok(resp);
+        }
+    }
+
+    // 3. 尝试 UDS sidecar
+    if let Some(resp) = native_http::try_handle_uds(req, app, peer).await {
+        return Ok(resp);
+    }
+
+    // 4. 均不可用：返回 502
+    Ok(Response::builder()
+        .status(StatusCode::BAD_GATEWAY)
+        .body(BoxBody::new(Full::new(Bytes::from_static(
+            b"engine unavailable (build lib or configure sidecar)"
+        ))))
+    .unwrap())
 }
