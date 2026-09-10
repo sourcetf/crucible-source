@@ -11,32 +11,21 @@
 //! OpenBSD 无 /proc，进程枚举统一走 `ps -axww -o pid=,command=`。
 
 use anyhow::Result;
-use once_cell::sync::Lazy;
 use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::process::{Child, Command};
 
-static REGISTRY: Lazy<Mutex<HashMap<i32, String>>> = Lazy::new(|| Mutex::new(HashMap::new()));
+static CHILD_REGISTRY: once_cell::sync::Lazy<Arc<Mutex<HashMap<String, u32>>>> =
+    once_cell::sync::Lazy::new(|| Arc::new(Mutex::new(HashMap::new())));
 
-pub fn register(pid: i32, name: &str) {
-    REGISTRY.lock().insert(pid, name.to_string());
-}
-
-pub fn unregister(pid: i32) {
-    REGISTRY.lock().remove(&pid);
-}
-
-/// 终止所有已注册子进程（SIGTERM → 短等 → SIGKILL）。
-/// 在 spawn_blocking 中调用（内含 thread::sleep）。
-pub fn kill_all() {
-    let entries: Vec<(i32, String)> = REGISTRY
-        .lock()
-        .iter()
-        .map(|(k, v)| (*k, v.clone()))
-        .collect();
-    for (pid, name) in &entries {
-        log::info!("child_registry: SIGTERM {name} pid={pid}");
-        let _ = unsafe { libc::kill(*pid, libc::SIGTERM) };
+/// 启动跟踪的子进程。key 为 php-fpm port / sidecar key 等唯一标识。
+/// 返回的 Child 由调用方持有，`kill_on_drop(true)` 确保进程退出时自动清理。
+pub fn spawn_tracked(cmd: &mut Command, key: &str) -> Result<tokio::process::Child> {
+    let mut child = cmd.spawn()?;
+    // 进程退出时自动 kill，防止僭居子进程。
+    child.kill_on_drop(true);
+    if let Some(pid) = child.id() {
+        CHILD_REGISTRY.lock().insert(key.to_string(), pid);
     }
     std::thread::sleep(std::time::Duration::from_millis(300));
     for (pid, name) in &entries {
@@ -55,20 +44,28 @@ pub fn spawn_tracked(cmd: &mut Command, name: &str) -> Result<Child> {
     Ok(child)
 }
 
-/// 杀死 Child 并从注册表注销（用于替换/移除 runtime 时）。
-/// 先 SIGTERM 让 fpm/sidecar 优雅退出并清理 socket，再 SIGKILL 兜底。
-pub fn kill_child(child: &mut Child) {
-    let pid = child.id() as i32;
-    let _ = unsafe { libc::kill(pid, libc::SIGTERM) };
-    for _ in 0..10 {
-        match child.try_wait() {
-            Ok(Some(_)) => break,
-            _ => std::thread::sleep(std::time::Duration::from_millis(50)),
-        }
+/// 退出时 kill 所有注册子进程（兜底；正常由 kill_on_drop 处理）。
+pub fn kill_all() {
+    let mut guard = CHILD_REGISTRY.lock();
+    for (key, pid) in guard.drain() {
+        let _ = kill_by_pid(pid);
+        log::debug!("killed child {} (pid {pid}) on shutdown", key);
     }
-    let _ = child.kill();
-    let _ = child.wait();
-    unregister(pid);
+}
+
+/// 用进程 ID 发 SIGTERM。
+fn kill_by_pid(pid: u32) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        let result = unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) };
+        if result == 0 { Ok(()) } else { Err(std::io::Error::last_os_error()) }
+    }
+    #[cfg(not(unix))]
+    {
+        // Windows：无法通过 PID 发信号；进程终止由子进程自身处理。
+        let _ = pid;
+        Ok(())
+    }
 }
 
 /// 若 pid 存活且命令行包含 `expect`，则终止之（防 pid 复用误杀）。
@@ -97,98 +94,38 @@ pub fn kill_if_matches(pid: i32, expect: &str) {
 /// 终止引用本仓库 state/ 目录或 app-engines 二进制的遗留进程。
 /// （若存在存活实例，这些进程归它所有，不动。）
 pub fn cleanup_orphans_at_startup() {
-    let root = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
-    let root_str = root
-        .canonicalize()
-        .unwrap_or(root)
-        .display()
-        .to_string();
-    let self_pid = std::process::id() as i32;
-
-    let Some(text) = ps_all() else {
-        return;
+    let state_dir = match std::env::current_dir() {
+        Ok(d) => d.join("state"),
+        Err(_) => return,
     };
-
-    let mut live_webserver = false;
-    let mut orphans: Vec<(i32, String)> = Vec::new();
-    for line in text.lines() {
-        let line = line.trim();
-        let Some((pid_s, cmd)) = line.split_once(' ') else {
-            continue;
-        };
-        let Ok(pid) = pid_s.trim().parse::<i32>() else {
-            continue;
-        };
-        if pid == self_pid {
-            continue;
-        }
-        // 其它存活 webserver 实例（含测试实例）拥有这些 sidecar → 跳过清理
-        if cmd.contains("webserver") && cmd.contains("--config") {
-            live_webserver = true;
-        }
-        let stale = (cmd.contains("php-fpm") && cmd.contains(&format!("{root_str}/state/")))
-            || cmd.contains(&format!("{root_str}/target/app-engines/"))
-            || (cmd.contains("jsp_sidecar") && cmd.contains(&format!("{root_str}/state/")))
-            || (cmd.contains("deps/bin") && cmd.contains(&format!("{root_str}/www-apps/")));
-        if stale {
-            orphans.push((pid, cmd.to_string()));
-        }
-    }
-
-    if live_webserver && !orphans.is_empty() {
-        log::info!(
-            "child_registry: {} orphan candidate(s) skipped — another webserver instance is live",
-            orphans.len()
-        );
+    let php_dir = state_dir.join("php");
+    if !php_dir.is_dir() {
         return;
     }
-    for (pid, cmd) in &orphans {
-        log::info!("child_registry: cleanup orphan pid={pid} cmd={cmd}");
-        let _ = unsafe { libc::kill(*pid, libc::SIGTERM) };
+    // 读取目录（忽略错误）
+    let entries = match std::fs::read_dir(&php_dir) {
+        Ok(rd) => rd,
+        Err(_) => return,
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().map(|e| e == "pid").unwrap_or(false) {
+            let _ = cleanup_pid_file(&path);
+        }
     }
-    if !orphans.is_empty() {
-        std::thread::sleep(std::time::Duration::from_millis(300));
-        for (pid, cmd) in &orphans {
-            if unsafe { libc::kill(*pid, 0) } == 0 {
-                log::warn!("child_registry: SIGKILL orphan pid={pid} cmd={cmd}");
-                let _ = unsafe { libc::kill(*pid, libc::SIGKILL) };
+}
+
+fn cleanup_pid_file(pid_path: &std::path::Path) -> Result<()> {
+    let pid_str = std::fs::read_to_string(pid_path)?;
+    if let Ok(pid) = pid_str.trim().parse::<i32>() {
+        // 发送 SIGTERM；如果进程存活则清理，否则仅删文件
+        #[cfg(unix)]
+        {
+            if unsafe { libc::kill(pid, 0) == 0 } {
+                unsafe { libc::kill(pid, libc::SIGTERM) };
             }
         }
     }
-}
-
-/// `ps -axww -o pid=,command=` 全量列表。
-fn ps_all() -> Option<String> {
-    let out = Command::new("ps")
-        .arg("-axww")
-        .arg("-o")
-        .arg("pid=,command=")
-        .output()
-        .ok()?;
-    Some(String::from_utf8_lossy(&out.stdout).into_owned())
-}
-
-fn ps_command(pid: i32) -> Option<String> {
-    let out = Command::new("ps")
-        .arg("-axww")
-        .arg("-o")
-        .arg("command=")
-        .arg("-p")
-        .arg(pid.to_string())
-        .output()
-        .ok()?;
-    Some(String::from_utf8_lossy(&out.stdout).trim().to_string())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn registry_register_unregister_roundtrip() {
-        register(999999, "test");
-        assert!(REGISTRY.lock().contains_key(&999999));
-        unregister(999999);
-        assert!(!REGISTRY.lock().contains_key(&999999));
-    }
+    let _ = std::fs::remove_file(pid_path);
+    Ok(())
 }
