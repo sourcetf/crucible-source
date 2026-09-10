@@ -531,8 +531,9 @@ fn check_docroot_perm(p: &std::path::Path) {
 fn resolve_script(docroot: &Path, app: &AppRouteConfig, uri_path: &str) -> Result<PathBuf> {
     let mut path = uri_path.to_string();
     // Strip app path prefix if configured (e.g. /php/index.php → index.php under docroot)
+    // 必须匹配整段或 "/" 边界，避免 /phpfoo 命中 /php 前缀（与 mod.rs 一致）.
     for p in &app.paths {
-        if !p.is_empty() && path.starts_with(p) {
+        if !p.is_empty() && (path == *p || path.starts_with(&format!("{p}/"))) {
             path = path[p.len()..].to_string();
             if !path.starts_with('/') {
                 path = format!("/{path}");
