@@ -6,8 +6,9 @@ use std::collections::HashMap;
 use std::ffi::OsString;
 use std::sync::Arc;
 use parking_lot::Mutex;
+use tokio::sync::Semaphore as TokioSemaphore;
 
-static ENV_LOCKS: once_cell::sync::Lazy<Mutex<HashMap<String, Arc<std::sync::Semaphore>>>> =
+static ENV_LOCKS: once_cell::sync::Lazy<Mutex<HashMap<String, Arc<TokioSemaphore>>>> =
     once_cell::sync::Lazy::new(Default::default);
 
 /// 同步版本：获取指定引擎的环境锁，在闭包内设置临时环境变量。
@@ -16,14 +17,11 @@ pub fn with_temp_env_named<T, F>(engine: &str, vars: &[(&str, &str)], f: F) -> T
 where
     F: FnOnce() -> T,
 {
-    let sem = {
-        let mut locks = ENV_LOCKS.lock();
-        locks
-            .entry(engine.to_string())
-            .or_insert_with(|| Arc::new(std::sync::Semaphore::new(1)))
-            .clone()
-    };
-    let _permit = sem.acquire().expect("semaphore closed");
+    // 同步上下文使用 parking_lot::Mutex 直接保护状态
+    static SYNC_LOCK: once_cell::sync::Lazy<parking_lot::Mutex<()>> =
+        once_cell::sync::Lazy::new(Default::default);
+
+    let _guard = SYNC_LOCK.lock();
     
     // 设置临时环境变量
     let mut saved = Vec::new();
@@ -60,10 +58,10 @@ where
         let mut locks = ENV_LOCKS.lock();
         locks
             .entry(engine.to_string())
-            .or_insert_with(|| Arc::new(std::sync::Semaphore::new(1)))
+            .or_insert_with(|| Arc::new(TokioSemaphore::new(1)))
             .clone()
     };
-    let _permit = sem.acquire().expect("semaphore closed");
+    let _permit = sem.acquire().await.expect("semaphore closed");
     
     // 设置临时环境变量
     let mut saved = Vec::new();

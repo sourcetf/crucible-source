@@ -162,14 +162,18 @@ pub fn engines_json() -> String {
     s
 }
 
-/// Full catalog payload for `GET /api/catalog`.
-pub fn catalog_json() -> String {
-    format!("{{\n  \"engines\": {}\n}}", engines_json())
+/// 获取可用的 DNSKEY 角色
+pub fn dnssec_roles() -> Vec<&'static str> {
+    vec!["ksk", "zsk", "csk"]
 }
 
-fn json_escape(s: &str) -> String {
-    format!(
-        "\"{}\"",
-        s.replace('\\', "\\\\").replace('"', "\\\"").replace('\n', "\\n")
-    )
+/// 返回功能目录的 JSON 格式（Admin API 使用）
+pub fn catalog_json() -> String {
+    let catalog = serde_json::json!({
+        "tls_versions": tls_versions(),
+        "app_engines": app_engines(),
+        "dnssec_algorithms": dnssec_algorithms(),
+        "dnssec_roles": dnssec_roles(),
+    });
+    catalog.to_string()
 }

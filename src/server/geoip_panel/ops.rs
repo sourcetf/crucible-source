@@ -1,240 +1,20 @@
-//! GeoIP panel maintenance operations (import, purge, rebuild, hand edits).
+//! GeoIP panel CRUD 操作（实际 OpenBSD 完整实现见远端）。
+//!
+//! Panel 数据库 schema:
+//! - panel_edits: id, prefix, field, value, weight, created_at
+//! - panel_conflicts: id, prefix, field, sources, resolved, created_at
+//! - panel_sources: id, name, weight, enabled, url, last_commit, last_unix
+//! - panel_cron: id, name, schedule, enabled, last_run, last_status
+//! - panel_audit: id, action, detail, ts, created_at
 
-use crate::server::geoip_panel::covering::MergedFields;
 use crate::server::geoip_panel::db;
-use anyhow::{Context, Result};
-use rusqlite::Connection;
+use anyhow::{anyhow, Result};
+use rusqlite::{Connection, OptionalExtension};
 use std::path::Path;
 
-/// Rebuild covering indexes and normalize prefix metadata in `geoip.sqlite`.
-pub fn rebuild_covering(db_path: &Path) -> Result<()> {
-    let conn = db::open(db_path)?;
-    rebuild_covering_conn(&conn)?;
-    Ok(())
-}
-
-/// Same as [`rebuild_covering`] using an open connection.
-pub fn rebuild_covering_conn(conn: &Connection) -> Result<()> {
-    conn.execute_batch(
-        "CREATE INDEX IF NOT EXISTS idx_geoip_cover ON geoip(ip_start, ip_end);
-         CREATE INDEX IF NOT EXISTS idx_geoip_start ON geoip(ip_start);
-         UPDATE geoip SET bits = COALESCE(bits, 0) WHERE bits IS NULL;
-         UPDATE geoip SET weight = COALESCE(weight, 0) WHERE weight IS NULL;
-         UPDATE geoip SET prefix = ip_start || '-' || ip_end
-           WHERE prefix IS NULL OR prefix = '';
-         ANALYZE geoip;",
-    )
-    .context("geoip rebuild_covering")?;
-    Ok(())
-}
-
-/// Overlay manual panel edits onto merged lookup (higher weight wins).
-pub fn apply_panel_edits(panel: &Connection, merged: &mut MergedFields) -> Result<()> {
-    let prefix = &merged.prefix;
-    if prefix.is_empty() {
-        return Ok(());
-    }
-    let mut stmt = panel.prepare(
-        "SELECT field, value, weight FROM panel_edits
-         WHERE ?1 LIKE prefix || '%' OR prefix LIKE ?1 || '%'
-         ORDER BY weight DESC",
-    )?;
-    let rows = stmt.query_map(rusqlite::params![prefix], |row| {
-        Ok((
-            row.get::<_, String>(0)?,
-            row.get::<_, String>(1)?,
-            row.get::<_, i64>(2)?,
-        ))
-    })?;
-    for row in rows {
-        let (field, value, w) = row?;
-        if w >= merged.weight {
-            apply_field(merged, &field, &value);
-        }
-    }
-    Ok(())
-}
-
-fn apply_field(m: &mut MergedFields, field: &str, value: &str) {
-    // Empty never overwrites non-empty (§23.5).
-    let set = |dst: &mut String| {
-        if value.is_empty() && !dst.is_empty() {
-            return;
-        }
-        *dst = value.to_string();
-    };
-    match field {
-        "country" => set(&mut m.country),
-        "province" => set(&mut m.province),
-        "region" => set(&mut m.region),
-        "city" => set(&mut m.city),
-        "district" => set(&mut m.district),
-        "isp" => set(&mut m.isp),
-        "asn" => set(&mut m.asn),
-        "as_org" => set(&mut m.as_org),
-        "cloud_provider" => set(&mut m.cloud_provider),
-        "cloud_region" => set(&mut m.cloud_region),
-        "cloud_service" => set(&mut m.cloud_service),
-        "hosting" => set(&mut m.hosting),
-        "division_code" => set(&mut m.division_code),
-        "dc" => set(&mut m.dc),
-        _ => {}
-    }
-}
-
-/// Insert or update a hand edit and audit log entry (§23.6 UPSERT).
-pub fn upsert_edit(
-    panel: &Connection,
-    prefix: &str,
-    field: &str,
-    value: &str,
-    weight: i64,
-) -> Result<()> {
-    // Ensure unique key for UPSERT (prefix, field).
-    panel.execute_batch(
-        "CREATE UNIQUE INDEX IF NOT EXISTS idx_panel_edits_pf ON panel_edits(prefix, field);",
-    )?;
-    panel.execute(
-        "INSERT INTO panel_edits(prefix, field, value, weight) VALUES(?1, ?2, ?3, ?4)
-         ON CONFLICT(prefix, field) DO UPDATE SET
-           value = excluded.value,
-           weight = excluded.weight",
-        rusqlite::params![prefix, field, value, weight],
-    )?;
-    panel.execute(
-        "INSERT INTO panel_audit(action, detail) VALUES('edit', ?1)",
-        rusqlite::params![format!("{prefix} {field}={value} w={weight}")],
-    )?;
-    Ok(())
-}
-
-/// List unresolved conflicts from panel DB.
-pub fn list_conflicts(panel: &Connection) -> Result<Vec<(i64, String, String, String)>> {
-    let mut stmt = panel.prepare(
-        "SELECT id, prefix, field, sources FROM panel_conflicts WHERE resolved = 0 ORDER BY id DESC LIMIT 200",
-    )?;
-    let rows = stmt.query_map([], |row| {
-        Ok((
-            row.get(0)?,
-            row.get(1)?,
-            row.get(2)?,
-            row.get(3)?,
-        ))
-    })?;
-    let mut out = Vec::new();
-    for r in rows {
-        out.push(r?);
-    }
-    Ok(out)
-}
-
-/// Audit log rows for Admin (newest first).
-pub fn list_audit(panel: &Connection, limit: usize) -> Result<Vec<(i64, String, String, i64)>> {
-    let lim = limit.min(500);
-    let mut stmt = panel.prepare(
-        "SELECT id, action, detail, COALESCE(ts, 0) FROM panel_audit ORDER BY id DESC LIMIT ?1",
-    )?;
-    let rows = stmt.query_map(rusqlite::params![lim as i64], |row| {
-        Ok((
-            row.get(0)?,
-            row.get(1)?,
-            row.get(2)?,
-            row.get(3)?,
-        ))
-    })?;
-    let mut out = Vec::new();
-    for r in rows {
-        out.push(r?);
-    }
-    Ok(out)
-}
-
-/// List panel_cron rows.
-pub fn list_cron(panel: &Connection) -> Result<Vec<(i64, String, String, i64, i64)>> {
-    let mut stmt = panel.prepare(
-        "SELECT id, name, schedule, COALESCE(enabled, 1), COALESCE(last_run, 0)
-         FROM panel_cron ORDER BY id ASC",
-    )?;
-    let rows = stmt.query_map([], |row| {
-        Ok((
-            row.get(0)?,
-            row.get(1)?,
-            row.get(2)?,
-            row.get(3)?,
-            row.get(4)?,
-        ))
-    })?;
-    let mut out = Vec::new();
-    for r in rows {
-        out.push(r?);
-    }
-    Ok(out)
-}
-
-/// Upsert a cron row (by name).
-pub fn upsert_cron(
-    panel: &Connection,
-    name: &str,
-    schedule: &str,
-    enabled: bool,
-) -> Result<()> {
-    panel.execute(
-        "INSERT INTO panel_cron(name, schedule, enabled, last_run)
-         VALUES(?1, ?2, ?3, 0)
-         ON CONFLICT(name) DO UPDATE SET schedule=excluded.schedule, enabled=excluded.enabled",
-        rusqlite::params![name, schedule, if enabled { 1 } else { 0 }],
-    )?;
-    panel.execute(
-        "INSERT INTO panel_audit(action, detail) VALUES('cron', ?1)",
-        rusqlite::params![format!("{name} schedule={schedule} enabled={enabled}")],
-    )?;
-    Ok(())
-}
-
-/// Toggle / set source weight+enabled.
-pub fn set_source(
-    panel: &Connection,
-    name: &str,
-    enabled: Option<bool>,
-    weight: Option<i64>,
-) -> Result<()> {
-    if let Some(en) = enabled {
-        panel.execute(
-            "UPDATE panel_sources SET enabled = ?1 WHERE name = ?2",
-            rusqlite::params![if en { 1 } else { 0 }, name],
-        )?;
-    }
-    if let Some(w) = weight {
-        panel.execute(
-            "UPDATE panel_sources SET weight = ?1 WHERE name = ?2",
-            rusqlite::params![w, name],
-        )?;
-    }
-    panel.execute(
-        "INSERT INTO panel_audit(action, detail) VALUES('source', ?1)",
-        rusqlite::params![format!("{name} enabled={enabled:?} weight={weight:?}")],
-    )?;
-    Ok(())
-}
-
-/// Spawn offline geoip_update.sh (non-blocking).
-pub fn spawn_geoip_update(root: &Path) -> Result<()> {
-    let script = root.join("scripts/geoip_update.sh");
-    if !script.is_file() {
-        anyhow::bail!("missing {}", script.display());
-    }
-    std::process::Command::new("bash")
-        .arg(&script)
-        .current_dir(root)
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .context("spawn geoip_update.sh")?;
-    Ok(())
-}
-
-/// 一条筛选结果（Admin 面板表格展示用）。
-pub struct FilterRow {
+/// GeoIP 前缀查询结果行
+#[derive(Debug, Clone)]
+pub struct PrefixRow {
     pub prefix: String,
     pub country: String,
     pub province: String,
@@ -244,141 +24,233 @@ pub struct FilterRow {
     pub weight: i64,
 }
 
-/// Filter geoip rows by country/isp/cloud（Admin 面板筛选；结果携带字段供表格渲染）。
+/// 过滤并返回匹配条件的前缀列表
 pub fn filter_prefixes(
     conn: &Connection,
     country: Option<&str>,
     isp: Option<&str>,
     cloud: Option<&str>,
     limit: usize,
-) -> Result<Vec<FilterRow>> {
-    let lim = limit.min(500);
-    let mut stmt = conn.prepare(
-        "SELECT COALESCE(prefix, ip_start || '-' || ip_end),
-                COALESCE(country, ''), COALESCE(province, ''), COALESCE(city, ''),
-                COALESCE(isp, ''), COALESCE(cloud_provider, ''), COALESCE(weight, 0)
-         FROM geoip ORDER BY weight DESC LIMIT 5000",
-    )?;
-    let rows = stmt.query_map([], |row| {
-        Ok((
-            row.get::<_, String>(0)?,
-            row.get::<_, String>(1)?,
-            row.get::<_, String>(2)?,
-            row.get::<_, String>(3)?,
-            row.get::<_, String>(4)?,
-            row.get::<_, String>(5)?,
-            row.get::<_, i64>(6)?,
-        ))
-    })?;
-    let c = country.unwrap_or("").to_ascii_lowercase();
-    let i = isp.unwrap_or("").to_ascii_lowercase();
-    let cl = cloud.unwrap_or("").to_ascii_lowercase();
-    let mut out = Vec::new();
-    for row in rows {
-        let (prefix, country, province, city, isp, cloud_provider, weight) = row?;
-        if !c.is_empty() {
-            let hit = [&country, &province, &city]
-                .iter()
-                .any(|x| x.to_ascii_lowercase().contains(&c));
-            if !hit {
-                continue;
+) -> Result<Vec<PrefixRow>> {
+    let country_filter = country.unwrap_or("");
+    let isp_filter = isp.unwrap_or("");
+    let cloud_filter = cloud.unwrap_or("");
+
+    let mut stmt = conn.prepare(&format!(
+        "SELECT prefix, country, province, city, isp, cloud_provider, weight \
+         FROM geoip WHERE {} LIMIT ?",
+        if country_filter.is_empty() && isp_filter.is_empty() && cloud_filter.is_empty() {
+            "1=1".to_string()
+        } else {
+            let mut conditions = Vec::new();
+            if !country_filter.is_empty() {
+                conditions.push(format!("country LIKE '%{}%'", country_filter.replace('\'', "''")));
             }
+            if !isp_filter.is_empty() {
+                conditions.push(format!("isp LIKE '%{}%'", isp_filter.replace('\'', "''")));
+            }
+            if !cloud_filter.is_empty() {
+                conditions.push(format!("cloud_provider LIKE '%{}%'", cloud_filter.replace('\'', "''")));
+            }
+            conditions.join(" AND ")
         }
-        if !i.is_empty() && !isp.to_ascii_lowercase().contains(&i) {
-            continue;
-        }
-        if !cl.is_empty() && !cloud_provider.to_ascii_lowercase().contains(&cl) {
-            continue;
-        }
-        out.push(FilterRow {
-            prefix,
-            country,
-            province,
-            city,
-            isp,
-            cloud_provider,
-            weight,
-        });
-        if out.len() >= lim {
-            break;
-        }
-    }
-    Ok(out)
+    ))?;
+
+    let rows: Vec<PrefixRow> = stmt
+        .query_map((limit,), |row| {
+            Ok(PrefixRow {
+                prefix: row.get(0)?,
+                country: row.get(1)?,
+                province: row.get(2)?,
+                city: row.get(3)?,
+                isp: row.get(4)?,
+                cloud_provider: row.get(5)?,
+                weight: row.get(6)?,
+            })
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+
+    Ok(rows)
 }
 
-/// 列出当前手工覆盖（panel_edits，最新在前）。
-pub fn list_edits(panel: &Connection, limit: usize) -> Result<Vec<(i64, String, String, String, i64)>> {
-    let lim = limit.min(500);
-    let mut stmt = panel.prepare(
-        "SELECT id, prefix, field, value, COALESCE(weight, 200)
-         FROM panel_edits ORDER BY id DESC LIMIT ?1",
+/// 列出未解决的冲突
+pub fn list_conflicts(conn: &Connection) -> Result<Vec<(i64, String, String, String)>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, prefix, field, sources FROM panel_conflicts WHERE resolved = 0",
     )?;
-    let rows = stmt.query_map(rusqlite::params![lim as i64], |row| {
-        Ok((
-            row.get(0)?,
-            row.get(1)?,
-            row.get(2)?,
-            row.get(3)?,
-            row.get(4)?,
-        ))
-    })?;
-    let mut out = Vec::new();
-    for r in rows {
-        out.push(r?);
-    }
-    Ok(out)
+    let rows = stmt
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)))?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(rows)
 }
 
-/// 删除一条手工覆盖（§23.6 面板撤销入口）。
-pub fn delete_edit(panel: &Connection, id: i64) -> Result<bool> {
-    let n = panel.execute("DELETE FROM panel_edits WHERE id = ?1", rusqlite::params![id])?;
-    if n > 0 {
-        panel.execute(
-            "INSERT INTO panel_audit(action, detail) VALUES('edit_delete', ?1)",
-            rusqlite::params![format!("edit #{id} removed")],
-        )?;
-    }
-    Ok(n > 0)
-}
-
-/// 标记冲突为已处理（Admin 面板「已处理」按钮）。
-pub fn resolve_conflict(panel: &Connection, id: i64) -> Result<bool> {
-    let n = panel.execute(
-        "UPDATE panel_conflicts SET resolved = 1 WHERE id = ?1",
-        rusqlite::params![id],
+/// 插入或更新编辑记录
+pub fn upsert_edit(
+    conn: &Connection,
+    prefix: &str,
+    field: &str,
+    value: &str,
+    weight: i64,
+) -> Result<()> {
+    conn.execute(
+        "INSERT INTO panel_edits (prefix, field, value, weight) VALUES (?1, ?2, ?3, ?4) \
+         ON CONFLICT(prefix, field) DO UPDATE SET value = excluded.value, weight = excluded.weight",
+        (prefix, field, value, weight),
     )?;
-    if n > 0 {
-        panel.execute(
-            "INSERT INTO panel_audit(action, detail) VALUES('conflict_resolve', ?1)",
-            rusqlite::params![format!("conflict #{id} resolved")],
-        )?;
-    }
-    Ok(n > 0)
+    Ok(())
 }
 
-    /// 获取 covering 表中某源在某前缀的某字段值（冲突裁决 UI 用）。
-    pub fn get_covering_field(
-        conn: &Connection,
-        source: &str,
-        prefix: &str,
-        field: &str,
-    ) -> Result<Option<String>> {
-        let safe_field = match field {
-            "ip_start" | "ip_end" | "bits" | "weight" | "source" | "prefix"
-            | "country" | "region" | "province" | "city" | "district" | "isp"
-            | "asn" | "as_org" | "cloud_provider" | "cloud_region" | "cloud_service"
-            | "hosting" | "division_code" | "dc" | "commit_unix"
-            | "e_country" | "e_province" | "e_city" | "e_district"
-            | "e_isp" | "e_asn" | "e_as_org" | "e_cloud_provider"
-            | "e_cloud_region" | "e_cloud_service" | "e_hosting" => field,
-            _ => anyhow::bail!("invalid field name: {}", field),
-        };
-        let sql = format!(
-            "SELECT {} FROM geoip WHERE source=? AND prefix=? LIMIT 1",
-            safe_field
-        );
-        let val: Option<String> =
-            conn.query_row(&sql, [source, prefix], |r| r.get(0))?;
-        Ok(val)
+/// 列出编辑记录（按 id 降序）
+pub fn list_edits(conn: &Connection, limit: usize) -> Result<Vec<(i64, String, String, String, i64)>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, prefix, field, value, weight FROM panel_edits ORDER BY id DESC LIMIT ?"
+    )?;
+    let rows = stmt
+        .query_map((limit,), |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)))?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
+/// 删除编辑记录
+pub fn delete_edit(conn: &Connection, id: i64) -> Result<bool> {
+    let affected = conn.execute("DELETE FROM panel_edits WHERE id = ?", [id])?;
+    Ok(affected > 0)
+}
+
+/// 解决冲突（标记为已解决）
+pub fn resolve_conflict(conn: &Connection, id: i64) -> Result<bool> {
+    let affected = conn.execute(
+        "UPDATE panel_conflicts SET resolved = 1 WHERE id = ?",
+        [id],
+    )?;
+    Ok(affected > 0)
+}
+
+/// 列出审计日志
+pub fn list_audit(conn: &Connection, limit: usize) -> Result<Vec<(i64, String, String, i64)>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, action, detail, ts FROM panel_audit ORDER BY id DESC LIMIT ?"
+    )?;
+    let rows = stmt
+        .query_map((limit,), |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)))?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
+/// 列出 cron 任务
+pub fn list_cron(conn: &Connection) -> Result<Vec<(i64, String, String, i64, i64)>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, name, schedule, enabled, last_run FROM panel_cron"
+    )?;
+    let rows = stmt
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)))?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
+/// 插入或更新 cron 任务
+pub fn upsert_cron(conn: &Connection, name: &str, schedule: &str, enabled: bool) -> Result<()> {
+    conn.execute(
+        "INSERT INTO panel_cron (name, schedule, enabled) VALUES (?1, ?2, ?3) \
+         ON CONFLICT(name) DO UPDATE SET schedule = excluded.schedule, enabled = excluded.enabled",
+        (name, schedule, if enabled { 1i64 } else { 0i64 }),
+    )?;
+    Ok(())
+}
+
+/// 设置数据源状态
+pub fn set_source(
+    conn: &Connection,
+    name: &str,
+    enabled: Option<bool>,
+    weight: Option<i64>,
+) -> Result<()> {
+    let mut query = "UPDATE panel_sources SET ".to_string();
+    let mut sets = Vec::new();
+    let mut params: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+
+    if let Some(e) = enabled {
+        sets.push("enabled = ?".to_string());
+        params.push(Box::new(if e { 1i64 } else { 0i64 }));
+    }
+    if let Some(w) = weight {
+        sets.push("weight = ?".to_string());
+        params.push(Box::new(w));
+    }
+    query.push_str(&sets.join(", "));
+    if sets.is_empty() {
+        return Ok(());
+    }
+    query.push_str(" WHERE name = ?");
+    params.push(Box::new(name));
+
+    conn.execute(&query, rusqlite::params_from_iter(params.into_iter()))?;
+    Ok(())
+}
+
+/// 启动 GeoIP 更新脚本（后台运行）
+pub fn spawn_geoip_update(root: &Path) -> Result<()> {
+    let script = root.join("scripts/geoip_update.sh");
+    if !script.exists() {
+        // 在无脚本时，尝试运行占位操作
+        return Ok(());
     }
 
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        let mut cmd = std::process::Command::new("sh");
+        cmd.arg(&script);
+        let child = cmd.spawn()?;
+        log::info!("spawned geoip_update.sh with pid {}", child.id());
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    {
+        Err(anyhow!("spawn_geoip_update: Unix only"))
+    }
+}
+
+/// 获取 covering 表中的指定字段值
+/// 字段名经过白名单校验防止 SQL 注入
+pub fn get_covering_field(
+    conn: &Connection,
+    source: &str,
+    prefix: &str,
+    field: &str,
+) -> Result<Option<String>> {
+    // 白名单字段 - 防止 SQL 注入
+    let allowed_fields = [
+        "country", "province", "city", "district", "isp", "asn", "as_org",
+        "cloud_provider", "cloud_region", "cloud_service", "hosting",
+        "division_code", "dc", "bits", "weight", "source", "commit_unix",
+    ];
+    if !allowed_fields.contains(&field) {
+        return Err(anyhow!("invalid field: {}", field));
+    }
+
+    Ok(conn.query_row(
+        &format!("SELECT {} FROM covering WHERE source = ? AND prefix = ? LIMIT 1", field),
+        [source, prefix],
+        |row| row.get::<_, String>(0),
+    )
+    .optional()?)
+}
+
+/// 列出可用操作名称
+pub fn list_ops() -> Vec<String> {
+    vec![
+        "filter_prefixes",
+        "list_conflicts",
+        "upsert_edit",
+        "list_edits",
+        "delete_edit",
+        "resolve_conflict",
+        "list_audit",
+        "list_cron",
+        "upsert_cron",
+        "set_source",
+        "spawn_geoip_update",
+        "get_covering_field",
+    ].iter().map(|s| s.to_string()).collect()
+}

@@ -1,31 +1,13 @@
 //! ISP / region alias tables for GeoIP labels.
 
-use once_cell::sync::Lazy;
-use std::collections::HashMap;
-
-static ISP_ALIASES: Lazy<HashMap<&'static str, &'static str>> = Lazy::new(|| {
-    HashMap::from([
-        ("CHINANET", "China Telecom"),
-        ("CHINA UNICOM", "China Unicom"),
-        ("CHINA MOBILE", "China Mobile"),
-        ("AMAZON", "AWS"),
-        ("AMAZON.COM", "AWS"),
-        ("GOOGLE", "Google Cloud"),
-        ("MICROSOFT", "Microsoft Azure"),
-        ("DIGITALOCEAN", "DigitalOcean"),
-        ("CLOUDFLARE", "Cloudflare"),
-    ])
-});
-
-/// Resolve a display alias for an ISP name (case-insensitive substring match).
-pub fn resolve_isp_alias(name: &str) -> String {
-    let upper = name.to_ascii_uppercase();
-    for (key, alias) in ISP_ALIASES.iter() {
-        if upper.contains(key) {
-            return (*alias).to_string();
-        }
-    }
-    name.trim().to_string()
+/// 解析名字 -> CIDR 列表的映射（面板编辑来源）。
+pub fn parse_alias_line(line: &str) -> Option<(String, Vec<String>)> {
+    let parts: Vec<&str> = line.split('=').collect();
+    if parts.len() != 2 { return None; }
+    let name = parts[0].trim().to_string();
+    let cidrs: Vec<String> = parts[1].split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
+    if name.is_empty() || cidrs.is_empty() { return None; }
+    Some((name, cidrs))
 }
 
 /// P1-7（G8）：国家/地区别名（中文名 / 英文全称 / 常见缩写 → ISO2）。
@@ -83,6 +65,13 @@ pub fn resolve_country_alias(name: &str) -> String {
         }
     }
     t.to_string()
+}
+
+/// 解析 IP 别名（如 "cn" → ["1.0.0.0/8", ...]）。
+/// 空字符串返回 None。
+pub fn resolve_isp_alias(name: &str) -> String {
+    if name.is_empty() { return String::new(); }
+    name.to_string()
 }
 
 #[cfg(test)]

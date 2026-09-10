@@ -28,25 +28,13 @@ tls_nss = []
 tls_tomcrypt = []
 
 [dependencies]
-h2 = { path = "libs/h2" }
-boring = { version = "5", optional = true, features = [
-    "pq-experimental"] }
-boring-sys = { version = "5", optional = true }
-tokio-boring = { version = "5", optional = true }
-quinn-boring = { path = "libs/quinn-boring" }
-quinn = { version = "0.11", default-features = false, features = [
-    "runtime-tokio", "rustls"] }
-h3 = "0.0.8"
-h3-quinn = "0.0.10"
-hyper = { version = "1", features = [
-    "full"] }
-hyper-util = { version = "0.1", features = [
-    "full"] }
+h2 = "0.4"
+hyper = { version = "1", features = ["full"] }
+hyper-util = { version = "0.1", features = ["full"] }
 http = "1"
 http-body-util = "0.1"
 bytes = "1"
-tokio = { version = "1", features = [
-    "full"] }
+tokio = { version = "1", features = ["full", "process", "signal"] }
 anyhow = "1"
 serde = { version = "1", features = [
     "derive"] }
@@ -54,12 +42,10 @@ toml = "0.8"
 log = "0.4"
 env_logger = "0.11"
 libc = "0.2"
-argon2 = { version = "0.5", features = [
-    "std"] }
-password-hash = { version = "0.5", features = [
-    "rand_core"] }
-rand_core = { version = "0.6", features = [
-    "getrandom"] }
+argon2 = { version = "0.5", features = ["std"] }
+password-hash = { version = "0.5", features = ["rand_core"] }
+rand_core = { version = "0.6", features = ["getrandom"] }
+getrandom = "0.2"
 yescrypt = "0.1"
 rusqlite = { version = "0.32", features = [
     "bundled"] }
@@ -79,11 +65,10 @@ geoip2 = "0.1"
 ureq = { version = "2", default-features = false, features = ["tls"] }
 url = "2"
 flate2 = "1"
+rustls = { version = "0.23", features = ["ring"] }
+tokio-rustls = { version = "0.26" }
+rustls-pemfile = { version = "2" }
 tar = "0.4"
-rustls = { version = "0.23", optional = true, features = [
-    "ring"] }
-tokio-rustls = { version = "0.26", optional = true }
-rustls-pemfile = { version = "2", optional = true }
 
 [build-dependencies]
 cc = "1"

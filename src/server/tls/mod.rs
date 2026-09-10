@@ -14,15 +14,16 @@ pub mod boring_path;
 pub mod client_hello;
 #[cfg(feature = "tls_boring")]
 pub mod ech_pem;
+#[cfg(unix)]
 pub mod legacy_io;
 #[cfg(all(feature = "tls_rustls", not(feature = "tls_boring")))]
 pub mod rustls_path;
 
-#[cfg(feature = "tls_nss")]
+#[cfg(all(unix, feature = "tls_nss"))]
 #[path = "tls_nss.rs"]
 pub mod nss;
 
-#[cfg(feature = "tls_tomcrypt")]
+#[cfg(all(unix, feature = "tls_tomcrypt"))]
 #[path = "tls_tomcrypt.rs"]
 pub mod tomcrypt;
 
