@@ -57,13 +57,87 @@ mod imp {
 
         let leaf_chain = cert_pem;
 
-        while let Some(incoming) = endpoint.accept().await {
-            let live_c = Arc::clone(&live);
-            let lc_c = lc.clone();
-            let leaf = leaf_chain.clone();
-            tokio::spawn(async move {
-                if let Err(e) = handle_incoming(incoming, live_c, lc_c, leaf).await {
-                    log::warn!("h3 connection: {e:#}");
+    // Transport config: 定制拥塞控制、连接置信度、0-RTT 等。
+    // quinn 默认通过 rustls 提供 TLS 1.3（0-RTT 已内置）。
+    // 这里显式指定传输参数，确保 h3-qmux 的流量区分。
+    let mut transport = quinn::TransportConfig::default();
+    // 拥塞控制：Cubic（默认），可切换 BBR；
+    transport.congestion_controller_factory(Arc::new(quinn::congestion::CubicConfig::default()));
+    // 连接置信度：保活与空闲超时
+    transport.max_idle_timeout(Some(std::time::Duration::from_secs(60).try_into().unwrap()));
+    transport.keep_alive_interval(Some(std::time::Duration::from_secs(20)));
+    // 0-RTT窗口
+    transport.max_concurrent_bidi_streams(quinn::VarInt::from_u32(100));
+    transport.max_concurrent_uni_streams(quinn::VarInt::from_u32(100));
+
+    let mut ep_config = quinn::EndpointConfig::default();
+    ep_config.transport_config(Arc::new(transport));
+
+    let socket = UdpSocket::bind(bind).await.context("h3 udp bind")?;
+    let endpoint = Endpoint::new(
+        ep_config,
+        Some(Arc::new(crypto)),
+        socket,
+        Arc::new(quinn::TokioRuntime),
+    ).context("h3 quinn endpoint")?;
+
+    log::info!("h3 quinn endpoint ready on {bind}");
+
+    while let Some(incoming) = endpoint.accept().await {
+        let live_c = Arc::clone(&live);
+        let lc_c = lc.clone();
+        let endpoint_c = endpoint.clone();
+        tokio::spawn(async move {
+            if let Err(e) = handle_connection(incoming, live_c, lc_c, endpoint_c).await {
+                log::warn!("h3 connection error: {e:#}");
+            }
+        });
+    }
+
+    Ok(())
+}
+
+async fn handle_connection(
+    incoming: quinn::Incoming,
+    live: Arc<LiveConfig>,
+    lc: ListenerConfig,
+    endpoint: Endpoint,
+) -> Result<()> {
+    let connection = match incoming.await {
+        Ok(c) => c,
+        Err(e) => {
+            log::debug!("h3 connection soft-fail: {e}");
+            return Ok(());
+        }
+    };
+    let peer = connection.remote_address();
+
+    let h3_conn = ::h3_quinn::Connection::new(connection);
+    let mut server = match ::h3::server::Connection::new(h3_conn).await {
+        Ok(s) => s,
+        Err(e) => {
+            log::warn!("h3 server connection peer={peer}: {e}");
+            return Ok(());
+        }
+    };
+
+    loop {
+        match server.accept().await {
+            Ok(Some(resolver)) => {
+                let live_c = Arc::clone(&live);
+                let lc_c = lc.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = handle_request(resolver, live_c, lc_c, peer).await {
+                        log::debug!("h3 request soft-fail peer={peer}: {e}");
+                    }
+                });
+            }
+            Ok(None) => break,
+            Err(e) => {
+                let msg = format!("{e}");
+                if msg.contains("reset") || msg.contains("RESET") {
+                    log::info!("h3 stream reset peer={peer}");
+                    break;
                 }
             });
         }
