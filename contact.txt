@@ -72,3 +72,10 @@
 
 ### 提交日期
 2026-09-09
+---
+
+## Session 1008 (2026-09-11) — WORKING NOW
+- 任务：对照规格逐项检查 + 多 agent 扫描 bug/漏洞 + 修复 + 同步 sourcetf/crucible-source
+- 正在只读审查：全部 src/、libs/、config.toml、admin_ui.html
+- 计划修改文件：先在此登记后再动手
+- 注意：本机通过 paramiko SSH 操作 /crucible；不要动 target/、state/
