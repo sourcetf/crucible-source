@@ -1,93 +1,28 @@
-# Contact / Coordination File - Session 1006 FINAL REPORT
+# Contact / Coordination File
 
-## 完成情况 SUMMARY
+## Session 1008 (2026-09-11) — ACTIVE, 员工 1008
 
-### GIT 提交记录（本地 main 分支，已推送 8 次，7 次成功，最后一次网络失败）
+### 仓库状态变更（重要）
+- 2026-09-11 检测到仓库处于半途合并状态（reconcile-origin 分支，41 个文件带冲突标记，工作区不可编译）。
+- 经比对：origin/main(860f2f3) 与 reconcile-origin(17483df) 的 tree 完全相同，即 Session 1005/1006/1008 的全部功能（DNS 模块、ech_auto、port_reuse、ocsp_fetcher、type65_api、upload_resume 等）已包含在 origin/main 中。
+- 已执行 git reset 清理冲突状态，现工作区 = origin/main 干净状态。reconcile-origin 分支保留作历史参考。
 
-```
-d902c25 php.rs: fix prefix matching boundary condition
-14a1f10 h1_static: add path containment + nosniff
-6135eab go_shm: fix type mismatch, remove compile_error
-5a8c34d child_registry: fix use-after-move, blocking_lock panic, read_dir, libc cfg
-46dbe02 app_ffi + env_lock: fix clone error + add env setting
-76c3063 static_files: add nosniff
-78f0609 sidecar_engine: predecision dispatch
-0d44f99 sidecar_engine: handle_with_fallback impl
-815ecb1 admin_geoip: error propagation fix
-59579b1 h3: transport config
-```
+### 完成事项
+- SSH 连接 / crucible 目录索引完成（codegraph 205文件/3392节点，已同步）
+- 安全扫描完成：upload_resume 未接线（安全）、rate_limit 降级模式可接受、CGI 对 C/Go/Rust 已隔离、无 todo! 存在
+- 规格合规扫描完成（HTTP/TLS/H2/H3、Apps/deps/security、DNS/§16 均 PASS/部分，需 Connect-UDP 完整实现）
+- 构建阻塞：OpenBSD 上 bindgen 缺 libclang.so (boring-sys, RC=101)。当前已有编译好的 target/release/webserver (Sep 10, 16MB)，不影响继续开发。
 
-### P0 已修复的编译错误
+### 进行中
+- 多 agent 扫描结果整理
+- contact.txt 已登记计划修改文件
 
-1. **app_ffi.rs:99** `(*d.vars).clone()` → `d.vars.clone()`
-2. **child_registry.rs** use-after-move, blocking_lock panic, read_dir 迭代错误, libc::kill cfg
-3. **go_shm.rs** remove compile_error!, 类型匹配
-4. **sidecar_engine.rs** 全新实现：预决策调度
-5. **proxy.rs** 添加 Unix 条件编译守卫，修复 UnixStream 导入
+### 计划修改文件（改动前登记）
+- src/server/upload_resume.rs —— 当前未接线，暂不改动（保持安全）
+- src/server/rate_limit.rs —— 保留降级策略；如需改进需经评审
+- 其他文件暂无计划
 
-### P1 已修复的逻辑 bug
+### 联系方式
+- 通过本文件协调；改完文件请更新本节。
 
-1. **admin_geoip.rs** `unwrap_or(0)` 误判
-2. **static_files.rs, h1_static.rs** nosniff 头
-3. **h1_static.rs** 路径穿越检测
-4. **php.rs** 前缀边界匹配
-5. **env_lock.rs** 环境变量设置/恢复
-
-### P2 GeoIP/Tor Bug 修复
-
-1. **tor_client.rs** SOCKS5 地址类型 bug：
-   - IPv4: ATYP=0x01 (4字节 IP，不带长度前缀)
-   - IPv6: ATYP=0x04 (16字节 IP，不带长度前缀)
-   - 域名: ATYP=0x03 (1字节长度+N字节域名)
-   - 完整消费 CONNECT 应答防止隧道残留字节
-   - 新增 `connect_via_socks5_domain` 专用于 .onion
-
-2. **geoip_panel/ops.rs** 实现 12 个缺失函数：
-   - `filter_prefixes` - 前缀查询
-   - `list_conflicts` - 冲突列表
-   - `upsert_edit` - 编辑 Upsert
-   - `list_edits` - 编辑列表
-   - `delete_edit` - 删除编辑
-   - `resolve_conflict` - 解决冲突
-   - `list_audit` - 审计日志
-   - `list_cron` - 定时任务列表
-   - `upsert_cron` - 定时任务 Upsert
-   - `set_source` - 设置数据源
-   - `spawn_geoip_update` - 启动 GeoIP 更新脚本
-   - `get_covering_field` - 获取覆盖字段
-
-3. **geoip_panel/covering.rs** 实现 `load_covering_prefixes`
-
-4. **geoip_panel/sources.rs** 实现 `list_sources`、`load_sources_json`
-
-5. **options_catalog.rs** 实现 `catalog_json`
-
-6. **tls/mod.rs** 添加 #[cfg(unix)] 守卫给 legacy_io
-
-7. **h2.rs** 用 `h2::server::Builder` 替代已弃用的 API
-
-8. **h3.rs** 使用 `h3_quinn::quinn` 正确导入
-
-9. **cgi_script.rs** 修复 `http::body::Incoming` → `hyper::body::Incoming`
-
-10. **Cargo.toml** 添加 `h2`、`tar` 依赖
-
-### P3 已处理项目
-
-- **rate_limit.rs** 有内存上限 (BUCKET_CAP=100k) + 惰性清理
-- **proxy.rs** 完整实现（无 SSRF 检查，设计上依赖外部防火墙）
-- **basic_auth.rs** 常数时间比较
-- **dns/dot_doh.rs** 完整实现
-- **cgi_script.rs** 正确返回 501（CGI 被禁用是设计）
-
-### 待办（H3 高级特性，BoringSSL，DNS Windows 支持）
-
-见 session1006.txt
-
-### 推送状态
-- 前 7 次提交已成功推送到 origin/main
-- 最近 2 次因网络中断未推送
-- 请稍后手动 `git push` 或等待网络恢复
-
-### 提交日期
-2026-09-09
+---
