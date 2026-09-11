@@ -987,7 +987,7 @@ fn gen_kasp_policy(d: &DnssecCfg) -> String {
         // 需求 5：默认 NSEC3（迭代数/optout 可配）——9.20 语法是单条 nsec3param 语句
         s.push_str(&format!(
             "  nsec3param iterations {} optout {} salt-length 0;\n",
-            d.nsec3_iterations,
+            d.nsec3_iterations.min(50),
             if d.nsec3_optout { "yes" } else { "no" }
         ));
     }
@@ -1657,7 +1657,7 @@ pub fn rootzone_ixfr(cfg: &DnsConfig) -> Result<String> {
     if !ixfr_ok {
         log::info!("dns: rootzone IXFR unsupported, full AXFR fallback");
         let out = std::process::Command::new("dig")
-            .args(["axfr", "@", server, "."])
+            .args(["axfr", format!("@{server}"), "."])
             .output()
             .context("dig axfr")?;
         if !out.status.success() {
