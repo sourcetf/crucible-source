@@ -3,3 +3,10 @@
 
 [target.x86_64-unknown-openbsd]
 rustflags = ["-C", "link-arg=-pthread"]
+
+# boring-sys: link against prebuilt BoringSSL (scripts/build_boringssl.sh output);
+# bindgen regenerates bindings against these headers via LLVM19 libclang.
+[env]
+BORING_BSSL_PATH = "/crucible/target/tls-libs/boringssl"
+BORING_BSSL_INCLUDE_PATH = "/crucible/target/tls-libs/boringssl/include"
+LIBCLANG_PATH = "/usr/local/llvm19/lib"

@@ -1,4 +1,4 @@
-# Crucible — run ./configure first
+# Crucible - run ./configure first
 -include config.mk
 
 .PHONY: all configure test clean engines release install deploy tls-deps acceptance accept-test
@@ -31,7 +31,7 @@ release: tls-deps
 		export BORING_BSSL_INCLUDE_PATH="$(ROOT)/target/tls-libs/boringssl/include"; \
 		if [ -d /usr/local/llvm19/lib ]; then export LIBCLANG_PATH=/usr/local/llvm19/lib; \
 		elif [ -d /usr/local/llvm20/lib ]; then export LIBCLANG_PATH=/usr/local/llvm20/lib; \
-		elif [ -d /usr/local/llvm21/lib ]; then export LIBCLANG_PATH=/usr/local/llvm21/lib; fi; \
+		elif [ -d /usr/local/llvm19/lib ]; then export LIBCLANG_PATH=/usr/local/llvm19/lib; fi; \
 		cargo build --release --features "$(CARGO_FEATURES)"
 
 test: tls-deps
@@ -41,7 +41,7 @@ test: tls-deps
 		export BORING_BSSL_INCLUDE_PATH="$(ROOT)/target/tls-libs/boringssl/include"; \
 		if [ -d /usr/local/llvm19/lib ]; then export LIBCLANG_PATH=/usr/local/llvm19/lib; \
 		elif [ -d /usr/local/llvm20/lib ]; then export LIBCLANG_PATH=/usr/local/llvm20/lib; \
-		elif [ -d /usr/local/llvm21/lib ]; then export LIBCLANG_PATH=/usr/local/llvm21/lib; fi; \
+		elif [ -d /usr/local/llvm19/lib ]; then export LIBCLANG_PATH=/usr/local/llvm19/lib; fi; \
 		cargo test --bin webserver --features "$(CARGO_FEATURES)"
 
 clean:
@@ -49,7 +49,7 @@ clean:
 	@$(MAKE) -s -C "$(ROOT)" -f /dev/null config.mk 2>/dev/null || rm -f config.mk
 
 install:
-	@test -f "$(ROOT)/target/release/webserver" || (echo "Build first: make all" && exit 1)
+	@test -f "$(ROOT)/target/release/webserver" || (echo "Build first: make release" && exit 1)
 	install -d "$(PREFIX)/bin"
 	install -m 755 "$(ROOT)/target/release/webserver" "$(PREFIX)/bin/webserver"
 
