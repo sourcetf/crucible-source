@@ -527,13 +527,24 @@ pub async fn handle(req: Request<Full<Bytes>>, live: Arc<LiveConfig>) -> Respons
     }
 
     // TLS material probe
+    //
+    // 这个端点只用来校验管理员**粘贴**的 PEM 正文（前端传的是 textarea 内容）。
+    // 旧实现把任意字符串当路径 fs::read，并回 `ok bytes={len}`——于是它同时是
+    // 「任意文件存在性 + 精确大小」探测口。只接受 PEM 正文，不接受路径。
     if path.ends_with("/api/tls/probe") && method == Method::POST {
         let bytes = match collect_body(req).await {
             Ok(b) => b,
             Err(e) => return text_err(StatusCode::BAD_REQUEST, e),
         };
         let s = String::from_utf8_lossy(&bytes);
-        return match crate::server::ssl_material::load_bytes(s.trim()) {
+        let s = s.trim();
+        if !crate::server::ssl_material::is_pem_body(s) {
+            return text_err(
+                StatusCode::BAD_REQUEST,
+                "expected pasted PEM body (-----BEGIN ...); file paths are not accepted here",
+            );
+        }
+        return match crate::server::ssl_material::load_bytes(s) {
             Ok(b) => text_ok(format!("ok bytes={}", b.len())),
             Err(e) => text_err(StatusCode::BAD_REQUEST, format!("{e:#}")),
         };
