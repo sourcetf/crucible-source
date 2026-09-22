@@ -193,6 +193,13 @@ pub async fn handle(req: Request<Full<Bytes>>, live: Arc<LiveConfig>) -> Respons
     if path.ends_with("/api/geoip/edit") && method == Method::POST {
         return admin_geoip::handle_edit(req).await;
     }
+    // P0：手工覆盖列表 / 删除——UI 已在调用（loadGeoEdits / delGeoEdit），此前未接线恒 404。
+    if path.ends_with("/api/geoip/edits") && method == Method::GET {
+        return admin_geoip::handle_edits(&req).await;
+    }
+    if path.ends_with("/api/geoip/edit/delete") && method == Method::POST {
+        return admin_geoip::handle_edit_delete(req).await;
+    }
     if path.ends_with("/api/geoip/audit") && method == Method::GET {
         return admin_geoip::handle_audit(&req).await;
     }

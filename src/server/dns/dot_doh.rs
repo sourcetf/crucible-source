@@ -13,6 +13,9 @@ use hyper::body::Incoming;
 use http_body_util::BodyExt;
 use std::sync::Arc;
 
+/// DoH 请求体上限（DNS wire over UDP 最大 65535）：h1 侧有界收集，防 chunked 无上限 OOM。
+const DOH_WIRE_CAP: usize = 65535;
+
 /// 把 DNS wire 报文转发到本机 named 的 UDP 口（递归语义下附 EDNS Client Subnet /24）。
 /// 分线路（需求 10）：客户端 IP 命中 geo.lines → 转发到 127.0.0.(2+i)
 /// （named 侧 fwd-<line> view 以 match-destinations 承接，view 内是 per-line zone 数据）。
@@ -80,19 +83,22 @@ pub async fn h1_try_handle(
             .and_then(|v| v.to_str().ok())
             .and_then(|s| s.parse::<usize>().ok())
         {
-            if cl > 65535 {
+            if cl > DOH_WIRE_CAP {
                 return Ok(resp_text(StatusCode::PAYLOAD_TOO_LARGE, "dns message too large"));
             }
         }
     }
     let (_, body) = req.into_parts();
-    let body_bytes = match body.collect().await {
+    // 有界收集：chunked / 伪造 Content-Length 也不能让 body 无上限增长（OOM 防护）。
+    let body_bytes = match http_body_util::Limited::new(body, DOH_WIRE_CAP).collect().await {
         Ok(c) => c.to_bytes(),
-        Err(_) => bytes::Bytes::new(),
+        Err(_) => {
+            return Ok(resp_text(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "dns message too large",
+            ))
+        }
     };
-    if body_bytes.len() > 65535 {
-        return Ok(resp_text(StatusCode::PAYLOAD_TOO_LARGE, "dns message too large"));
-    }
     match doh_prepared(&dns_cfg, &method, &uri, &headers, body_bytes, peer).await {
         // 上面已判 path/host，这里必然 Some；None 时兜底 415（防御）
         None => Ok(resp_text(StatusCode::UNSUPPORTED_MEDIA_TYPE, "doh not applicable")),

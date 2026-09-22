@@ -621,6 +621,12 @@ fn json_str(s: &str) -> String {
     format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""))
 }
 
+/// 与 `json_str` 相同但**不带外层引号**，用于已预置引号的 JSON 字面量内部
+/// （避免出现 `""…""` 这种非法 JSON）。
+fn json_escape(s: &str) -> String {
+    s.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
 fn json_ok(body: String) -> Response<BoxBody> {
     Response::builder()
         .status(StatusCode::OK)
@@ -663,7 +669,7 @@ pub async fn handle_conflict_source(req: Request<Full<Bytes>>) -> Response<BoxBo
     let panel_path = std::path::Path::new("data/geoip/panel.sqlite");
     let panel = match db::open_panel(panel_path) {
         Ok(c) => c,
-        Err(e) => return json_ok(format!(r#"{{"error":"{}"}}"#, json_str(&format!("{e:#}")))),
+        Err(e) => return json_ok(format!(r#"{{"error":"{}"}}"#, json_escape(&format!("{e:#}")))),
     };
     let row: Option<(String, String)> = panel
         .query_row(
@@ -678,10 +684,9 @@ pub async fn handle_conflict_source(req: Request<Full<Bytes>>) -> Response<BoxBo
     let covering_path = std::path::Path::new("data/geoip/current/geoip.sqlite");
     let conn = match db::open(covering_path) {
         Ok(c) => c,
-        Err(e) => return json_ok(format!(r#"{{"error":"{}"}}"#, json_str(&format!("open covering: {e:#}")))),
+        Err(e) => return json_ok(format!(r#"{{"error":"{}"}}"#, json_escape(&format!("open covering: {e:#}")))),
     };
     let value = crate::server::geoip_panel::ops::get_covering_field(&conn, &s, &prefix, &f)
-        .map_err(|e| format!("get_covering_field: {e:#}"))
         .ok()
         .flatten()
         .unwrap_or_default();
@@ -691,7 +696,7 @@ pub async fn handle_conflict_source(req: Request<Full<Bytes>>) -> Response<BoxBo
             [&s, &prefix],
             |r| r.get(0),
         )
-        .unwrap_or(-1);  // -1 = 未提交；0 会被视为合法 unix 时间戳
+        .unwrap_or(0);
     let resp = serde_json::json!({
         "value": value,
         "commit_unix": commit_unix,

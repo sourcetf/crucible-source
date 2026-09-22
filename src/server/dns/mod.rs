@@ -1657,7 +1657,7 @@ pub fn rootzone_ixfr(cfg: &DnsConfig) -> Result<String> {
     if !ixfr_ok {
         log::info!("dns: rootzone IXFR unsupported, full AXFR fallback");
         let out = std::process::Command::new("dig")
-            .args(["axfr", format!("@{server}"), "."])
+            .args(["axfr".to_string(), format!("@{server}"), ".".to_string()])
             .output()
             .context("dig axfr")?;
         if !out.status.success() {

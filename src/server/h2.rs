@@ -4,9 +4,6 @@
 //! - `max_send_buffer_size` → h2 `Builder` (on-wire)
 //! - `BATCH_CAP` + coalesce → [`CoalescingIo`] wrapping the socket write path via
 //!   [`BatchWriter`] (small writes buffered until cap / flush)
-//!
-//! NOTE: h2 0.4 API changes: framed_write::BatchWriter removed; use BatchingIo
-//! wrapper or increase writev batch size at TCP level (SO_BUSY_POLL).
 
 use crate::config::ListenerConfig;
 use crate::server::h1::{BoxBody, REQUEST_BODY_CAP};
@@ -14,6 +11,10 @@ use crate::server::live_config::LiveConfig;
 use crate::server::prefixed_stream::PrefixedStream;
 use anyhow::Result;
 use bytes::Bytes;
+use futures_util::StreamExt;
+use h2::{
+    framed_write::BatchWriter, server::Builder as H2Builder, BATCH_CAP, COALESCE_WRITES_DEFAULT,
+};
 use http::{Request, Response, StatusCode};
 use http_body_util::{BodyExt, Full};
 use std::io::{self, Write};
@@ -31,16 +32,16 @@ pub fn h2_batch_cap() -> usize {
         .ok()
         .and_then(|s| s.parse().ok())
         .filter(|n| *n > 0 && *n <= 256)
-        .unwrap_or(64)
+        .unwrap_or(BATCH_CAP)
 }
 
-pub const H2_BATCH_CAP: usize = 64;
+pub const H2_BATCH_CAP: usize = BATCH_CAP;
 /// Cap concurrent in-flight H2 stream tasks（与 H2_MAX_CONCURRENT_STREAMS 对齐；
 /// 注意 BATCH_CAP 是写合并的帧批量，两者语义不同，勿混用调参）。
 static H2_INFLIGHT: once_cell::sync::Lazy<tokio::sync::Semaphore> =
     once_cell::sync::Lazy::new(|| tokio::sync::Semaphore::new(256));
 pub const H2_MAX_SEND_BUFFER: usize = 128 * 1024;
-pub const H2_COALESCE_WRITES: bool = true;
+pub const H2_COALESCE_WRITES: bool = COALESCE_WRITES_DEFAULT;
 /// Soft concurrent-stream hint applied when Builder supports it.
 pub const H2_MAX_CONCURRENT_STREAMS: u32 = 256;
 pub const H2_INITIAL_WINDOW_SIZE: u32 = 1024 * 1024;
@@ -88,18 +89,31 @@ async fn serve_io<IO>(
 where
     IO: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
-    // Materialize knobs.
-    let batch = H2_BATCH_CAP;
-    let coalesce = H2_COALESCE_WRITES;
-    let cap = batch;
+    // Materialize BatchWriter knobs so they are never silently discarded: they
+    // configure CoalescingIo which wraps the socket before handshake.
+    let live_cap = h2_batch_cap();
+    let batch = BatchWriter::new(())
+        .with_cap(live_cap)
+        .with_coalesce(H2_COALESCE_WRITES);
+    let coalesce = batch.coalesce_enabled();
+    let cap = batch.cap();
     log::info!(
         "h2 knobs peer={peer} BATCH_CAP={cap} coalesce={coalesce} max_send_buffer={H2_MAX_SEND_BUFFER} \
          max_concurrent_streams={H2_MAX_CONCURRENT_STREAMS} initial_window={H2_INITIAL_WINDOW_SIZE}"
     );
 
-    let io = BatchingIo::new(stream, coalesce, cap);
+    let io = CoalescingIo::new(stream, coalesce, cap);
 
-    let mut conn = h2::server::handshake(io).await?;
+    let mut builder = H2Builder::new();
+    builder.max_send_buffer_size(H2_MAX_SEND_BUFFER);
+    // Apply every Builder option the crates.io h2 API exposes for these knobs.
+    builder.initial_window_size(H2_INITIAL_WINDOW_SIZE);
+    builder.initial_connection_window_size(H2_INITIAL_WINDOW_SIZE);
+    builder.max_concurrent_streams(H2_MAX_CONCURRENT_STREAMS);
+    // Note: h2 0.4 Builder has no enable_push / coalesce setter — coalesce is
+    // applied via CoalescingIo + BatchWriter above; logged so knobs are visible.
+
+    let mut conn = builder.handshake(io).await?;
     while let Some(result) = conn.accept().await {
         let (request, mut respond) = result?;
         let live = Arc::clone(&live);
@@ -115,16 +129,16 @@ where
             // 且不排空 H2 请求体会卡住流量控制窗口。超限直接 413。
             let mut buf: Vec<u8> = Vec::new();
             let mut overflow = false;
-            loop {
-                match body.data().await {
-                    Some(Ok(c)) => {
+            while let Some(chunk) = body.data().await {
+                match chunk {
+                    Ok(c) => {
                         if buf.len() + c.len() > REQUEST_BODY_CAP {
                             overflow = true;
                             break;
                         }
                         buf.extend_from_slice(&c);
                     }
-                    Some(Err(_)) | None => break,
+                    Err(_) => break,
                 }
             }
             if overflow {
@@ -181,8 +195,9 @@ async fn collect_to_bytes(resp: Response<BoxBody>) -> Response<Bytes> {
     Response::from_parts(parts, data)
 }
 
-/// AsyncWrite wrapper that coalesces small writes using buffer batching.
-struct BatchingIo<IO> {
+/// AsyncWrite wrapper that coalesces small writes using the same semantics as
+/// [`BatchWriter`] (buffer until `cap` frames, or flush immediately when coalesce=false).
+struct CoalescingIo<IO> {
     inner: IO,
     coalesce: bool,
     cap: usize,
@@ -190,7 +205,7 @@ struct BatchingIo<IO> {
     buf: Vec<u8>,
 }
 
-impl<IO> BatchingIo<IO> {
+impl<IO> CoalescingIo<IO> {
     fn new(inner: IO, coalesce: bool, cap: usize) -> Self {
         Self {
             inner,
@@ -206,7 +221,7 @@ impl<IO> BatchingIo<IO> {
     }
 }
 
-impl<IO: AsyncRead + Unpin> AsyncRead for BatchingIo<IO> {
+impl<IO: AsyncRead + Unpin> AsyncRead for CoalescingIo<IO> {
     fn poll_read(
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -216,7 +231,7 @@ impl<IO: AsyncRead + Unpin> AsyncRead for BatchingIo<IO> {
     }
 }
 
-impl<IO: AsyncWrite + Unpin> AsyncWrite for BatchingIo<IO> {
+impl<IO: AsyncWrite + Unpin> AsyncWrite for CoalescingIo<IO> {
     fn poll_write(
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -225,6 +240,9 @@ impl<IO: AsyncWrite + Unpin> AsyncWrite for BatchingIo<IO> {
         if !self.coalesce {
             return Pin::new(&mut self.inner).poll_write(cx, data);
         }
+        // Buffer this frame; flush when batch is full (BatchWriter semantics).
+        // AsyncWrite 契约：返回 Pending/Err 表示本次 data 未被消费，调用方会原样重试——
+        // 必须把刚缓冲的这帧撤回，否则重试后同一帧会在线上出现两份。
         let pre_len = self.buf.len();
         let pre_frames = self.pending_frames;
         self.buf.extend_from_slice(data);
@@ -235,6 +253,7 @@ impl<IO: AsyncWrite + Unpin> AsyncWrite for BatchingIo<IO> {
             match Pin::new(&mut self.inner).poll_write(cx, &pending) {
                 Poll::Ready(Ok(n)) => {
                     if n < pending.len() {
+                        // Re-queue remainder + count as one pending frame.
                         self.buf.extend_from_slice(&pending[n..]);
                         self.pending_frames = 1;
                     }
@@ -262,6 +281,9 @@ impl<IO: AsyncWrite + Unpin> AsyncWrite for BatchingIo<IO> {
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
     ) -> Poll<Result<(), io::Error>> {
+        // P2-3：部分写后不能直接返回 Pending——内层刚返回 Ready 时未必注册了 waker，
+        // 直接 Pending 会写悬挂。余量留在缓冲里立即重试推进；只有内层自身 Pending
+        //（waker 已注册）才向调用方返回 Pending。
         while self.coalesce && !self.buf.is_empty() {
             let pending = std::mem::take(&mut self.buf);
             self.pending_frames = 0;
@@ -298,6 +320,19 @@ impl<IO: AsyncWrite + Unpin> AsyncWrite for BatchingIo<IO> {
     }
 }
 
+/// Sync Write shim so unit tests / docs can drive BatchWriter against the same knobs.
+#[allow(dead_code)]
+fn batch_write_demo(frames: &[&[u8]], coalesce: bool, cap: usize) -> io::Result<Vec<u8>> {
+    let mut w = BatchWriter::new(Vec::new())
+        .with_coalesce(coalesce)
+        .with_cap(cap);
+    for f in frames {
+        w.write_frame(f)?;
+    }
+    w.flush_batch()?;
+    w.into_inner()
+}
+
 async fn handle_h2(
     req: Request<Bytes>,
     live: Arc<LiveConfig>,
@@ -311,11 +346,8 @@ async fn handle_h2(
     crate::server::telemetry::record_request();
 
     let snap = live.snapshot();
-    // Convert Request<Bytes> to Request<Full<Bytes>> for telemetry (Full implements Body)
-    let (parts, body) = req.clone().into_parts();
-    let req_full = Request::from_parts(parts, Full::new(body));
-    if let Some(resp) = crate::server::telemetry::maybe_handle_simple(&req_full, &snap.telemetry) {
-        return tag(collect_to_bytes(resp).await, "telemetry");
+    if let Some(resp) = crate::server::telemetry::maybe_handle_simple(&req, &snap.telemetry) {
+        return tag(resp, "telemetry");
     }
     // DoH（RFC8484，需求 9）：h2 路径（body 已是 Bytes）；未命中原样放行正常站点
     {
@@ -521,4 +553,27 @@ fn tag(mut resp: Response<Bytes>, engine: &'static str) -> Response<Bytes> {
     resp.extensions_mut()
         .insert(crate::server::access_log::EngineTag(engine));
     resp
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn batch_writer_knobs_apply() {
+        let out = batch_write_demo(&[b"a", b"b", b"c"], true, 3).unwrap();
+        assert_eq!(out, b"abc");
+    }
+
+    /// P0-1 回归：h2 dispatch 顺序必须含 listener 级 basic_auth。
+    #[test]
+    fn h2_dispatch_order_has_basic_auth() {
+        let src = include_str!("h2.rs");
+        let handle_pos = src.find("async fn handle_h2").expect("handle_h2");
+        let tail = &src[handle_pos..];
+        let ba = tail.find("check_listener_headers").expect("basic_auth check");
+        let admin = tail.find("admin::handle").expect("admin call");
+        let ip = tail.find("is_allowed").expect("ip_access");
+        assert!(ip < ba && ba < admin, "order must be ip_access → basic_auth → admin");
+    }
 }

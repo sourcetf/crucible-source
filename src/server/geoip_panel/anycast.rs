@@ -72,6 +72,19 @@ pub fn anycast_prefixes() -> Vec<(String, u32)> {
     out
 }
 
+/// IPv4 前缀掩码：`/0` → 0（匹配全部），`>= /32` → u32::MAX，其余左移 `(32 - bits)`。
+/// 注意：对 `u32::MAX` 直接左移 32 位会触发移位溢出 panic（debug）/错误结果，
+/// 因此 bits==0 必须单独处理。
+fn v4_mask(bits: u32) -> u32 {
+    if bits == 0 {
+        0
+    } else if bits >= 32 {
+        u32::MAX
+    } else {
+        u32::MAX << (32 - bits)
+    }
+}
+
 pub fn is_anycast(ip: IpAddr) -> bool {
     let IpAddr::V4(v4) = ip else {
         return false;
@@ -79,11 +92,7 @@ pub fn is_anycast(ip: IpAddr) -> bool {
     let n = u32::from(v4);
     for (base, bits) in ANYCAST_V4 {
         if let Ok(b) = base.parse::<std::net::Ipv4Addr>() {
-            let mask = if *bits >= 32 {
-                u32::MAX
-            } else {
-                u32::MAX << (32 - bits)
-            };
+            let mask = v4_mask(*bits);
             if (n & mask) == (u32::from(b) & mask) {
                 return true;
             }
@@ -92,11 +101,7 @@ pub fn is_anycast(ip: IpAddr) -> bool {
     // P2-16：面板追加段一并参与判定。
     for (base, bits) in EXTRA_ANYCAST.lock().iter() {
         if let Ok(b) = base.parse::<std::net::Ipv4Addr>() {
-            let mask = if *bits >= 32 {
-                u32::MAX
-            } else {
-                u32::MAX << (32 - bits)
-            };
+            let mask = v4_mask(*bits);
             if (n & mask) == (u32::from(b) & mask) {
                 return true;
             }

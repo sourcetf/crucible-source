@@ -30,10 +30,36 @@ pub async fn serve_static(
     }
     let _ = (live, peer);
 
-    let file_path = lc.root.join(&path[1..]);
-    if file_path.exists() {
-        let mime = mime_guess::from_path(&file_path).first_or_octet_stream();
-        let body = std::fs::read(&file_path).unwrap_or_default();
+    // P2-1：去掉前导 '/' 后若仍为绝对路径（Windows 盘符 / `\\` 前缀），
+    // `Path::join` 会丢弃 root 直接指向该绝对路径——任意文件读取。
+    // 同时拒绝 NUL 字节（截断文件名校验）。
+    let rel = path.trim_start_matches('/');
+    if rel.is_empty() || rel.contains('\0') {
+        return Ok(Response::builder()
+            .status(StatusCode::FORBIDDEN)
+            .body(Bytes::from_static(b"forbidden"))
+            .unwrap());
+    }
+    let rel_path = std::path::Path::new(rel);
+    if rel_path.is_absolute() {
+        return Ok(Response::builder()
+            .status(StatusCode::FORBIDDEN)
+            .body(Bytes::from_static(b"forbidden"))
+            .unwrap());
+    }
+    let file_path = lc.root.join(rel_path);
+    // containment：join 后必须仍在 root 之下（canonicalize 解析 symlink 后复核）。
+    let canon_root = lc.root.canonicalize().unwrap_or_else(|_| lc.root.clone());
+    let canon = file_path.canonicalize().unwrap_or_else(|_| file_path.clone());
+    if !canon.starts_with(&canon_root) {
+        return Ok(Response::builder()
+            .status(StatusCode::FORBIDDEN)
+            .body(Bytes::from_static(b"forbidden"))
+            .unwrap());
+    }
+    if canon.exists() {
+        let mime = mime_guess::from_path(&canon).first_or_octet_stream();
+        let body = std::fs::read(&canon).unwrap_or_default();
         Ok(Response::builder()
             .status(StatusCode::OK)
             .header(http::header::CONTENT_TYPE, mime.essence_str())

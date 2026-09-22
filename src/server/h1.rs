@@ -109,7 +109,16 @@ pub async fn handle_request(
     let t0 = std::time::Instant::now();
     let method = req.method().as_str().to_string();
     let path0 = req.uri().path().to_string();
-    let resp = handle_request_inner(req, Arc::clone(&live), lc, peer).await;
+    let is_https = lc.ssl.is_some();
+    let mut resp = handle_request_inner(req, Arc::clone(&live), lc, peer).await;
+    // P1-7：所有 HTTPS 响应统一补 HSTS。此前只在 dispatch_tail 之后加，telemetry/
+    // geoip/DoH/acl 拒绝/限速/basic_auth/admin/status/rule/proxy 等提前返回分支全部漏掉。
+    // entry().or_insert 不覆盖分支已显式设置的值。
+    if is_https {
+        resp.headers_mut()
+            .entry(http::header::STRICT_TRANSPORT_SECURITY)
+            .or_insert_with(|| http::HeaderValue::from_static(hsts_header()));
+    }
     let engine = resp
         .extensions()
         .get::<crate::server::access_log::EngineTag>()
@@ -299,7 +308,20 @@ async fn handle_request_inner(
     if let Some((murl, upstream)) = crate::server::page_rules::pass_upstream(&lc, &path) {
         // 反代本就全量缓冲 body：这里收齐后转 Full 交反代（语义不变，见 proxy.rs）。
         let (parts, body) = req.into_parts();
-        let bytes = body.collect().await.map(|c| c.to_bytes()).unwrap_or_default();
+        // 上限与 proxy.rs 一致（UPSTREAM_BODY_CAP）：无界 collect 会被超大 body 撑爆内存，
+        // 使 proxy.rs 内部的上限形同虚设。
+        let bytes = match Limited::new(body, UPSTREAM_BODY_CAP).collect().await {
+            Ok(c) => c.to_bytes(),
+            Err(_) => {
+                return tag(
+                    Response::builder()
+                        .status(StatusCode::PAYLOAD_TOO_LARGE)
+                        .body(full("request body too large"))
+                        .unwrap(),
+                    "proxy",
+                )
+            }
+        };
         let resp = crate::server::proxy::proxy_page_rule(
             Request::from_parts(parts, Full::new(bytes)),
             &murl,
@@ -352,8 +374,20 @@ async fn dispatch_tail(
 
     if would_proxy(&lc, &path) {
         // 反代本就全量缓冲 body：收齐后转 Full 交反代（行为不变）。
+        // 上限与 proxy.rs 一致（UPSTREAM_BODY_CAP）：无界 collect 会被超大 body 撑爆内存。
         let (parts, body) = req.into_parts();
-        let bytes = body.collect().await.map(|c| c.to_bytes()).unwrap_or_default();
+        let bytes = match Limited::new(body, UPSTREAM_BODY_CAP).collect().await {
+            Ok(c) => c.to_bytes(),
+            Err(_) => {
+                return tag(
+                    Response::builder()
+                        .status(StatusCode::PAYLOAD_TOO_LARGE)
+                        .body(full("request body too large"))
+                        .unwrap(),
+                    "proxy",
+                )
+            }
+        };
         let req = Request::from_parts(parts, Full::new(bytes));
         if let Some((_matched, resp)) = crate::server::proxy::try_proxy(&lc, req, peer.ip()).await {
             return tag(resp, "proxy");
