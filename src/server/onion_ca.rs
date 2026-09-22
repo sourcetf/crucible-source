@@ -24,7 +24,9 @@ impl OnionSslMode {
             "no_verify" | "noverify" | "tor" => Self::NoVerify,
             "trust_self_signed" | "trust" => Self::TrustSelfSigned,
             "off" | "plain" => Self::Off,
-            _ => Self::NoVerify,
+            // 未知值一律按最严格处理：宁可能连不上，也不能静默不校验。
+            // （`ssl_mode` 默认值已是 "verify"，此处兜住手写配置里的拼写错误。）
+            _ => Self::Verify,
         }
     }
 

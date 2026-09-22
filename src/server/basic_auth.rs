@@ -6,9 +6,13 @@ use http::header::{self, HeaderMap};
 use http::Request;
 
 /// True when admin panel must require credentials.
-/// Any configured user list enables the gate; empty hashes never authenticate.
-pub fn admin_requires_auth(admin: &AdminConfig) -> bool {
-    !admin.users.is_empty()
+///
+/// 恒为 true（fail-closed）：admin 面板是远程控制面（改配置、写文件、跑 DNS、
+/// 签发证书）。此前实现是「有用户才鉴权」，于是配置里没有 `[[admin.users]]` 时
+/// 整个面板**完全无认证**，任何能访问 `/__admin` 的人都能改配置、上传文件、
+/// 下发 DNS 与证书操作。配置缺失是运维疏忽，不能变成免认证后门。
+pub fn admin_requires_auth(_admin: &AdminConfig) -> bool {
+    true
 }
 
 /// 泛型化：admin 入口可能收到 Request<Incoming>（h1）或 Request<BoxBody>（h2/h3 复用
@@ -19,7 +23,9 @@ pub fn check_admin<T>(req: &Request<T>, admin: &AdminConfig) -> bool {
 
 pub fn check_admin_headers(headers: &HeaderMap, admin: &AdminConfig) -> bool {
     if admin.users.is_empty() {
-        return true;
+        // 未配置任何用户 → 拒绝，而不是放行。启动时会打 warn 提示补配置。
+        log::warn!("admin: no [[admin.users]] configured; admin panel is inaccessible");
+        return false;
     }
     // Only users with a real hash participate; empty-hash entries never grant access.
     let active: Vec<_> = admin

@@ -675,6 +675,10 @@ pub struct AppRouteConfig {
 fn default_workers() -> usize {
     4
 }
+/// 回源 TLS 默认强制校验证书链与主机名。
+fn default_proxy_ssl_mode() -> String {
+    "verify".into()
+}
 fn default_init_timeout_opt() -> Option<u64> {
     Some(120)
 }
@@ -721,7 +725,10 @@ pub struct TorHsConfig {
 pub struct ProxyRuleConfig {
     pub path: String,
     pub upstream: String,
-    #[serde(default)]
+    /// 回源 TLS 校验模式。默认 `verify`：不写该字段时按最安全处理。
+    /// 此前 `#[serde(default)]` 得到空串，而 `OnionSslMode::parse` 把未知/空串
+    /// 映射为 NoVerify——于是手写 config.toml 的 https 上游默认**不校验证书**。
+    #[serde(default = "default_proxy_ssl_mode")]
     pub ssl_mode: String,
     /// Inject/replace request headers before forwarding upstream.
     #[serde(default)]
@@ -898,6 +905,51 @@ impl Config {
                     anyhow::bail!(
                         "duplicate listener address:port {}:{}",
                         l.address,
+                        l.port
+                    );
+                }
+            }
+        }
+
+        // deps_dir 必须位于该应用 docroot 之内。
+        //
+        // 依据：deps::ensure_app_deps 在 init.sh 存在时会 **递归删除 deps_dir 再重建**，
+        // 并从 `<deps_dir>/bin/index` 执行 sidecar 二进制。若 deps_dir 指向 docroot
+        // 之外的任意目录（面板 /api/apps/save 可直接写该字段），一次应用请求就能
+        // 删掉任意目录树，并让服务端执行放在那里的可执行文件。
+        for l in &self.listeners {
+            for app in &l.apps {
+                let Some(deps) = &app.deps_dir else { continue };
+                let Some(docroot) = &app.docroot else {
+                    // 无 docroot 时 deps_dir 没有合法的相对基准，直接拒绝。
+                    anyhow::bail!(
+                        "app deps_dir {} requires a docroot on listener :{}",
+                        deps.display(),
+                        l.port
+                    );
+                };
+                // 用规范化路径比较（两者此时都已解析为绝对路径）；目录可能尚不存在，
+                // 故回退到「按组件消除 ..」的字典序规范化，避免绕过。
+                let norm = |p: &std::path::Path| -> std::path::PathBuf {
+                    let mut out = std::path::PathBuf::new();
+                    for c in p.components() {
+                        match c {
+                            std::path::Component::ParentDir => {
+                                out.pop();
+                            }
+                            std::path::Component::CurDir => {}
+                            other => out.push(other.as_os_str()),
+                        }
+                    }
+                    out
+                };
+                let nd = norm(deps);
+                let nr = norm(docroot);
+                if nd == nr || !nd.starts_with(&nr) {
+                    anyhow::bail!(
+                        "app deps_dir {} must be inside its docroot {} (listener :{})",
+                        deps.display(),
+                        docroot.display(),
                         l.port
                     );
                 }

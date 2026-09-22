@@ -200,6 +200,15 @@ async fn ensure_app_deps(
     init: &Path,
     timeout_secs: u64,
 ) -> Result<()> {
+    // 兜底（Config::validate 已拦一次）：下面会递归删除 deps_dir。
+    // 任何不在 docroot 之内的路径都拒绝，避免删掉任意目录树。
+    if !path_inside(docroot, deps_dir) {
+        anyhow::bail!(
+            "refusing deps_dir {} outside docroot {}",
+            deps_dir.display(),
+            docroot.display()
+        );
+    }
     if !init.is_file() {
         // 无 init.sh：仅保证 deps 目录存在（应用可能自带 deps 产物）。
         fs::create_dir_all(deps_dir).with_context(|| format!("create {}", deps_dir.display()))?;
@@ -242,4 +251,23 @@ async fn ensure_app_deps(
             )
         }
     }
+}
+
+/// `child` 是否位于 `root` 之内（按组件消除 `..` 后比较，不要求路径已存在）。
+fn path_inside(root: &Path, child: &Path) -> bool {
+    fn norm(p: &Path) -> std::path::PathBuf {
+        let mut out = std::path::PathBuf::new();
+        for c in p.components() {
+            match c {
+                std::path::Component::ParentDir => {
+                    out.pop();
+                }
+                std::path::Component::CurDir => {}
+                other => out.push(other.as_os_str()),
+            }
+        }
+        out
+    }
+    let (nr, nc) = (norm(root), norm(child));
+    nc != nr && nc.starts_with(&nr)
 }

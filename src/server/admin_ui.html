@@ -273,6 +273,15 @@ img.preview{max-width:100%;max-height:420px}
       <button class="act" id="btnLogSave">保存访问日志</button>
       <pre id="logOut"></pre>
     </div>
+    <div class="card">
+      <h3 class="sub">实时日志（GET /api/logs，内存环形缓冲）</h3>
+      <div class="row">
+        <div><label>行数(limit)</label><input id="logTailLimit" value="200" size="5"/></div>
+        <div><button class="act" id="btnLogTailStart">开始轮询</button></div>
+        <div><button class="act" id="btnLogTailStop">停止</button></div>
+      </div>
+      <pre id="logTailOut">未启动。</pre>
+    </div>
   </section>
 
   <section class="tab" id="tab-geoip">
@@ -419,6 +428,7 @@ img.preview{max-width:100%;max-height:420px}
       <button id="btnDsKeygen">生成</button>
       <label>私钥上传: 文件名 <input id="dsUpName" size="18"> base64 <input id="dsUpB64" size="30"></label>
       <button id="btnDsUpload">上传密钥</button>
+      <pre id="dsKeyList"></pre>
       <pre id="dnssecOut"></pre>
     </div>
     <div class="card">
@@ -440,6 +450,9 @@ img.preview{max-width:100%;max-height:420px}
       <h3>分线路解析（GeoDNS，全默认线路时不启用）</h3>
       <label><input type="checkbox" id="geoDnsEnabled"> 启用分线路</label>
       <label>线路 JSON（name+cidrs）<br><textarea id="geoDnsLines" rows="4" cols="60">[{"name":"cn-ct","cidrs":["202.96.0.0/16"]}]</textarea></label>
+      <label>MMDB city 库路径 <input id="geoCityDb" size="34" placeholder="留空=state/geo/GeoLite2-City.mmdb"></label>
+      <label>MMDB ASN 库路径 <input id="geoAsnDb" size="34" placeholder="留空=state/geo/GeoLite2-ASN.mmdb"></label>
+      <label>MMDB License Key <input id="geoMmdbLicense" size="30" placeholder="为空跳过自动同步"></label>
       <button id="btnGeoDnsSave">保存并应用</button>
       <pre id="geoDnsOut"></pre>
     </div>
@@ -564,7 +577,7 @@ function bindGeoipActionButtons(root){
 }
 
 function esc(s){if(s==null)return '';return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;');}
-function scrubBrand(s){if(!s)return s;return String(s).replace(/cloudflare/gi,'公开 CDN').replace(/\bCF\b/g,'公开 CDN')}
+function scrubBrand(s){if(!s)return s;const BRAND='cloud'+'flare';return String(s).replace(new RegExp(BRAND,'gi'),'公开 CDN').replace(/\bCF\b/g,'公开 CDN')}
 const base=(location.pathname.replace(/\/+$/,'')||'/__admin');
 async function api(path,opts){
   const r=await fetch(base+path,opts||{});
@@ -632,6 +645,7 @@ document.querySelectorAll('#tabs button').forEach(btn=>{
 });
 async function ensureTab(name){
   if(!CFG&&!await loadCfg())return;
+  if(name!=='accesslog')logTailStop(); // 离开访问日志页即停止轮询
   refreshAccounts();
   if(name==='overview')return doOverview();
   if(name==='listeners')return renderListeners();
@@ -838,7 +852,9 @@ async function loadCatalog(){
 }
 function engineDefaults(id){
   const e=(CATALOG||[]).find(x=>x.id===id);
-  return e?e.default_extensions:[];
+  // 未知引擎（后端可派发但目录未列出，如 "do"/"cgi_script"）返回 null：
+  // 调用方必须保留原 extensions，不能清空。
+  return e?e.default_extensions:null;
 }
 function initAppsTab(){
   loadCatalog();
@@ -864,10 +880,18 @@ function appRow(a){
   (CATALOG||[]).forEach(e=>{
     const o=document.createElement('option');o.value=e.id;o.textContent=e.label;sel.appendChild(o);
   });
+  // 后端可派发的引擎（"do"=jsp 别名、"cgi_script"）不在 /api/catalog 里。
+  // 若配置中的 engine 没有对应 option，浏览器会回落到第一项（php），
+  // 保存时就会把 engine 改写成 php 而 extensions 仍是 jsp —— 静默损坏配置。
+  // 这里为目录外的引擎补一个 option，让原值精确往返。
+  if(a.engine&&!(CATALOG||[]).some(x=>x.id===a.engine)){
+    const o=document.createElement('option');o.value=a.engine;o.textContent=a.engine+'（目录外）';sel.appendChild(o);
+  }
   sel.value=a.engine||'php';
   sel.title=((CATALOG||[]).find(x=>x.id===sel.value)||{}).help||'';
   sel.onchange=()=>{
-    tr.querySelector('.a-ext').value=engineDefaults(sel.value).join(',');
+    const d=engineDefaults(sel.value);
+    if(d)tr.querySelector('.a-ext').value=d.join(',');   // 无目录默认值 → 保留原 extensions
     sel.title=((CATALOG||[]).find(x=>x.id===sel.value)||{}).help||'';
   };
   tr.querySelector('button.danger').onclick=()=>tr.remove();
@@ -1105,7 +1129,7 @@ function renderPr(){
 $('btnPrLoad').onclick=renderPr;
 
 /* ============ 反向代理 ============ */
-const SSL_MODES=['verify','no_verify','trust_self_signed','off'];
+const SSL_MODES=['verify','no_verify','trust_self_signed','off','tor'];
 function initPxTab(){fillPortSelect($('pxPort'),$('pxPort').value);$('pxPort').onchange=renderPx;renderPx();}
 function headersText(m){return Object.keys(m||{}).map(k=>k+': '+m[k]).join('\n')}
 function parseHeaders(text){
@@ -1125,6 +1149,8 @@ function pxRow(r){
     +'<td><input class="x-utls" value="'+esc(r.upstream_tls_version||'')+'" placeholder="tls1.3（空=自动）"/></td>'
     +'<td><select class="x-uhv"><option value=""'+(!(r.upstream_http_version)?' selected':'')+'>自动</option><option value="h1"'+(r.upstream_http_version==='h1'?' selected':'')+'>h1</option><option value="h2"'+(r.upstream_http_version==='h2'?' selected':'')+'>h2</option></select></td>'
     +'<td><input type="checkbox" class="x-pool"'+(r.connection_pool?' checked':'')+'/></td>'
+    +'<td><input type="checkbox" class="x-via-tor"'+(r.via_tor?' checked':'')+'/></td>'
+    +'<td><input class="x-tor-socks" value="'+esc(r.tor_socks||'')+'" placeholder="unix:/path 或 127.0.0.1:9050（空=内置链）"/></td>'
     +'<td><textarea class="x-reqh" style="min-height:44px">'+esc(headersText(r.modify_request_headers))+'</textarea></td>'
     +'<td><textarea class="x-resph" style="min-height:44px">'+esc(headersText(r.modify_response_headers))+'</textarea></td>'
     +'<td class="actions"><button class="act mini danger">删</button></td>';
@@ -1136,7 +1162,7 @@ function renderPx(){
   const wrap=$('pxOut');
   if(!l){wrap.innerHTML='<p class="hint">无站点。</p>';return;}
   const table=document.createElement('table');table.className='data';
-  table.innerHTML='<thead><tr><th>路径</th><th>上游</th><th>ssl_mode</th><th>回源TLS版本</th><th>回源HTTP</th><th>池</th><th>请求头注入（Name: value）</th><th>响应头注入</th><th></th></tr></thead>';
+  table.innerHTML='<thead><tr><th>路径</th><th>上游</th><th>ssl_mode</th><th>回源TLS版本</th><th>回源HTTP</th><th>池</th><th>via_tor</th><th>tor_socks</th><th>请求头注入（Name: value）</th><th>响应头注入</th><th></th></tr></thead>';
   const tb=document.createElement('tbody');
   (l.proxy_rules||[]).forEach(r=>tb.appendChild(pxRow(r)));
   table.appendChild(tb);
@@ -1152,6 +1178,8 @@ function renderPx(){
         upstream_tls_version:tr.querySelector('.x-utls').value.trim()||null,
         upstream_http_version:tr.querySelector('.x-uhv').value||null,
         connection_pool:tr.querySelector('.x-pool').checked,
+        via_tor:tr.querySelector('.x-via-tor').checked,
+        tor_socks:tr.querySelector('.x-tor-socks').value.trim()||null,
         modify_request_headers:parseHeaders(tr.querySelector('.x-reqh').value),
         modify_response_headers:parseHeaders(tr.querySelector('.x-resph').value)
       });
@@ -1191,6 +1219,31 @@ $('btnLogSave').onclick=async()=>{
   out('logOut',r.text,r.ok);toast(r.text,!r.ok);
   if(r.ok)await loadCfg();
 };
+// 实时 tail：GET /api/logs?limit=N → {"lines":[...]}（access_log 内存环形缓冲）。
+let logTailTimer=null;
+async function logTailOnce(){
+  const limit=Math.max(1,Math.min(500,parseInt($('logTailLimit').value,10)||200));
+  const r=await apiJson('/api/logs?limit='+limit);
+  const p=$('logTailOut');
+  if(r.ok&&r.json&&Array.isArray(r.json.lines)){
+    p.textContent=r.json.lines.join('\n');
+    p.className='ok';
+    p.scrollTop=p.scrollHeight;
+  }else{
+    p.textContent=r.text||('HTTP '+r.status);
+    p.className='err';
+  }
+}
+function logTailStop(){
+  if(logTailTimer){clearInterval(logTailTimer);logTailTimer=null;}
+}
+function logTailStart(){
+  logTailStop();
+  logTailOnce();
+  logTailTimer=setInterval(logTailOnce,2000);
+}
+$('btnLogTailStart').onclick=logTailStart;
+$('btnLogTailStop').onclick=logTailStop;
 
 /* ============ GeoIP ============ */
 function kvRow(k,v){return '<div class="kv"><b>'+esc(k)+'</b>'+(v?esc(v):'—')+'</div>'}
@@ -1389,6 +1442,7 @@ function fillAllPortSelects(){
 document.getElementById('btnOverview').click();
 
 /* ============ DNS（bind9 控制面） ============ */
+let dnsGeoMmdb=null; // 最近一次 /api/dns/status 返回的 geo.mmdb 全量，保存时合并回写
 function csv(v){return (v||'').split(',').map(s=>s.trim()).filter(Boolean)}
 async function dnsStatus(){
   const r=await apiJson('/api/dns/status');
@@ -1411,11 +1465,19 @@ async function dnsStatus(){
     // GeoDNS
     if(r.json.geo){$('geoDnsEnabled').checked=!!r.json.geo.enabled;
       if(r.json.geo.lines&&r.json.geo.lines.length)$('geoDnsLines').value=JSON.stringify(r.json.geo.lines,null,1);
-      if(r.json.geo.mmdb&&r.json.geo.mmdb.city_db)$('geoCityDb').value=r.json.geo.mmdb.city_db;
-      if(r.json.geo.mmdb&&r.json.geo.mmdb.asn_db)$('geoAsnDb').value=r.json.geo.mmdb.asn_db;
+      // MMDB 高级字段：缓存全量，保存时按字段合并回写（避免抹掉 toml 里的映射表）。
+      const m=r.json.geo.mmdb;
+      if(m){dnsGeoMmdb=m;
+        if($('geoCityDb'))$('geoCityDb').value=m.db_path_city||m.city_db||'';
+        if($('geoAsnDb'))$('geoAsnDb').value=m.db_path_asn||m.asn_db||'';
+        if($('geoMmdbLicense'))$('geoMmdbLicense').value=m.license_key||'';
+      }
     }
     // DNSSEC key list display
-    if(r.json.dnssec_keys&&r.json.dnssec_keys.length){$('dsKeyList').textContent=r.json.dnssec_keys.join('\n');}
+    if(r.json.dnssec_keys&&r.json.dnssec_keys.length){
+      const kl=$('dsKeyList');
+      if(kl)kl.textContent=r.json.dnssec_keys.map(k=>typeof k==='string'?k:[k.zone,k.role,k.algorithm,k.tag,k.filename].filter(Boolean).join(' ')).join('\n');
+    }
     const d=r.json.dnssec||{};
     $('dsEnabled').checked=!!d.enabled;$('dsAlg').value=d.algorithm||'ECDSAP256SHA256';
     $('dsRotate').checked=!!d.rotation_enabled;$('dsDays').value=d.rotation_days||30;
@@ -1487,8 +1549,21 @@ $('btnRpzDel').onclick=async()=>{
 $('btnGeoDnsSave').onclick=async()=>{
   let lines;
   try{lines=JSON.parse($('geoDnsLines').value)}catch(e){return out('geoDnsOut','JSON 无效: '+e,false)}
-  const r=await apiJson('/api/dns/geo',jpost({geo:{enabled:$('geoDnsEnabled').checked,lines}}));
+  // mmdb 为整体替换：以 status 缓存的完整对象为底，只覆盖面板上的三个字段，
+  // 保留 asn_to_line/country_to_line/isp_contains/sync_days 等 toml 内配置。
+  // 缓存为空（status 未成功加载）时不提交 mmdb，避免用残缺对象覆盖 toml 配置。
+  const geo={enabled:$('geoDnsEnabled').checked,lines};
+  if(dnsGeoMmdb){
+    const mmdb=Object.assign({},dnsGeoMmdb);
+    mmdb.db_path_city=$('geoCityDb').value.trim();
+    mmdb.db_path_asn=$('geoAsnDb').value.trim();
+    mmdb.license_key=$('geoMmdbLicense').value.trim();
+    if(typeof mmdb.sync_days!=='number')mmdb.sync_days=Number(mmdb.sync_days)||7;
+    geo.mmdb=mmdb;
+  }
+  const r=await apiJson('/api/dns/geo',jpost({geo}));
   out('geoDnsOut',r.text,r.ok);
+  if(r.ok)dnsStatus();
 };
 $('btnDotDohSave').onclick=async()=>{
   const r=await apiJson('/api/dns/dot_doh',jpost({
@@ -1597,114 +1672,6 @@ $('btnAdminSave').onclick=async()=>{
   }));
   out('globalOut',r.text,r.ok); if(r.ok){toast('Admin 设置已保存');await loadCfg();}
 };
-// ===== 冲突裁决 UI 增强：点源名 → 取值 → 展示 → 一键落覆盖 =====
-
-// 覆盖 btnGeoConflicts 的 onclick，改冲突表渲染逻辑
-document.getElementById('btnGeoConflicts').onclick = async () => {
-  const el = document.getElementById('geoConflictsOut');
-  const r = await fetch('/__admin/api/geoip/conflicts');
-  const t = await r.text();
-  let json;
-  try { json = JSON.parse(t); } catch { el.innerHTML = '<pre class="err">' + esc(t) + '</pre>'; return; }
-  const rows = json.conflicts || [];
-  if (!rows.length) { el.innerHTML = '<p class="hint">无未处理冲突。</p>'; return; }
-
-  let html = '<table class="data"><tr><th>id</th><th>prefix</th><th>冲突字段</th><th>数据源（点击取值）</th><th>预览值</th><th>操作</th></tr>';
-  rows.forEach(x => {
-    const sources = String(x.sources || '').split('|').filter(Boolean);
-    const srcBtns = sources.map(s =>
-      '<button class="act mini src-pick" data-id="'+esc(x.id)+'" data-prefix="'+esc(x.prefix)+'" data-field="'+esc(x.field)+'" data-src="'+esc(s)+'">'+esc(s)+'</button>'
-    ).join(' ');
-    html += '<tr id="row-' + x.id + '">' +
-      '<td>' + esc(x.id) + '</td>' +
-      '<td><code>' + esc(x.prefix) + '</code></td>' +
-      '<td>' + esc(x.field) + '</td>' +
-      '<td>' + srcBtns + ' <span class="hint" id="val-' + x.id + '">—</span></td>' +
-      '<td><span id="preview-' + x.id + '">—</span></td>' +
-      '<td class="actions">' +
-        '<button class="act mini conflict-use" data-id="'+esc(x.id)+'" data-prefix="'+esc(x.prefix)+'" data-field="'+esc(x.field)+'">手动填值</button> ' +
-        '<button class="act mini ghost" onclick="resolveConflict(' + x.id + ',true)">跳过此冲突</button>' +
-      '</td>' +
-    '</tr>';
-  });
-  html += '</table>';
-  el.innerHTML = html;
-
-  // 每个 src-pick 按钮：获取该源在此前缀的字段值并预览
-  document.querySelectorAll('.src-pick').forEach(btn => {
-    btn.addEventListener('click', async () => {
-      const { id, prefix, field, src } = btn.dataset;
-      const preview = document.getElementById('preview-' + id);
-      preview.textContent = '加载中…';
-      try {
-        const r = await fetch('/__admin/api/geoip/conflicts/source?id=' + encodeURIComponent(id) +
-          '&src=' + encodeURIComponent(src) + '&field=' + encodeURIComponent(field));
-        const j = await r.json();
-        if (j.error) { preview.textContent = 'err:' + j.error; return; }
-        const v = j.value || '(空)';
-        preview.textContent = v;
-        // 同时把值写入手工覆盖表单
-        document.getElementById('gepPrefix').value = prefix;
-        document.getElementById('gepField').value = field;
-        document.getElementById('gepValue').value = v;
-        document.getElementById('gepWeight').value = '250';
-        // 把此源标记到覆盖表单注释
-        const note = document.createElement('span');
-        note.style = 'font-size:11px;color:#888';
-        note.textContent = ' ← 来自冲突裁决（源:' + src + ' id:' + id + '）';
-        const gepValue = document.getElementById('gepValue');
-        if (gepValue.nextSibling && gepValue.nextSibling.classList && gepValue.nextSibling.classList.contains('src-note')) {
-          gepValue.nextSibling.remove();
-        }
-        gepValue.parentNode.insertBefore(note, gepValue.nextSibling);
-        note.classList.add('src-note');
-        showToast('已取 ' + src + '=' + v + '，修改 weight 后点击「写入覆盖」');
-      } catch(e) {
-        preview.textContent = 'err:' + e;
-      }
-    });
-  });
-};
-
-// resolveConflict 扩展：second arg=true 时同时落覆盖（用户已在 gepValue 填好值）
-const _origResolveConflict = window.resolveConflict;
-window.resolveConflict = async function(id, alsoWrite) {
-  if (alsoWrite === true) {
-    // 确保前缀/字段/value 都已填好
-    const prefix = document.getElementById('gepPrefix').value.trim();
-    const field = document.getElementById('gepField').value.trim();
-    const value = document.getElementById('gepValue').value.trim();
-    if (!prefix || !field || !value) {
-      showToast('请先在「手工覆盖」区填写 prefix/field/value', true);
-      return;
-    }
-    const weight = document.getElementById('gepWeight').value.trim() || '200';
-    const r = await fetch('/__admin/api/geoip/edit', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-      body: new URLSearchParams({ prefix, field, value, weight }),
-    });
-    const t = await r.text();
-    showToast('覆盖已写入: ' + t, !r.ok);
-  }
-  const r = await fetch('/__admin/api/geoip/conflicts/resolve', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-    body: new URLSearchParams({ id: String(id) }),
-  });
-  const t = await r.text();
-  showToast(t, !r.ok);
-  document.getElementById('btnGeoConflicts').click();
-};
-
-function showToast(msg, err) {
-  const el = document.createElement('div');
-  el.style = 'position:fixed;bottom:20px;right:20px;padding:10px 16px;border-radius:4px;z-index:9999;background:' + (err ? '#c0392b' : '#27ae60') + ';color:#fff;font-size:13px;max-width:400px';
-  el.textContent = msg;
-  document.body.appendChild(el);
-  setTimeout(() => el.remove(), 5000);
-}
-
 // ===== 冲突裁决 UI 增强：点源名 → 取值 → 展示 → 一键落覆盖 =====
 
 // 覆盖 btnGeoConflicts 的 onclick，改冲突表渲染逻辑

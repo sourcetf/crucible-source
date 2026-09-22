@@ -436,6 +436,21 @@ fn valid_hostname_label(n: &str) -> bool {
         && n.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-'))
 }
 
+/// geo 线路名（GeoLine.name）的合法性校验。
+///
+/// 这个值会被用在三个地方：`named.conf` 的 `view "{name}"`、以及
+/// `root.{tag}.zone` / `rpz.{tag}.zone` / `answers.{tag}.zone` 的文件名。
+/// 未校验时：`name = "../x"` 让 `zones_dir.join(..)` 写出目录之外；
+/// `name` 里带 `\n` + `}; zone ...` 则直接注入 named 指令。
+/// 只允许 DNS label 字符集，彻底堵死两类注入。
+pub fn valid_line_name(n: &str) -> bool {
+    !n.is_empty()
+        && n.len() <= 63
+        && !n.starts_with('-')
+        && !n.ends_with('-')
+        && n.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_'))
+}
+
 pub fn add_zone(kind: &str, name: &str, primaries: &[String], axfr_acl: &[String], refresh_hours: u64) -> Result<i64> {
     if !valid_name(name) {
         bail!("bad zone name {name:?}");
@@ -1039,6 +1054,19 @@ fn set_mode_0600(_p: &Path) -> std::io::Result<()> {
 
 /// 全量落盘：named.conf / rndc.conf / 各 zone 文件 / rpz / rootzone 占位。
 pub fn write_all(cfg: &DnsConfig) -> Result<Vec<(String, PathBuf)>> {
+    // 先校验所有进入文件名 / named.conf 的用户可控字符串，再落盘。
+    // validate() 会先调 write_all 再探活 named，所以检查必须放在这里，
+    // 否则恶意 name 已经在盘上了（路径穿越的写入发生在探活之前）。
+    for l in &cfg.geo.lines {
+        if !valid_line_name(&l.name) {
+            bail!("bad geo line name {:?}", l.name);
+        }
+    }
+    for r in &cfg.rpz {
+        if !valid_name(&r.name) {
+            bail!("bad rpz name {:?}", r.name);
+        }
+    }
     let etc = state_root().join("etc");
     let zones_dir = state_root().join("zones");
     std::fs::create_dir_all(&etc)?;
