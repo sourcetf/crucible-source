@@ -55,14 +55,11 @@ mod imp {
         .context("h3 quinn endpoint")?;
         log::info!("h3 quinn endpoint ready on {bind} (boring crypto preferred)");
 
-        let leaf_chain = cert_pem;
-
         while let Some(incoming) = endpoint.accept().await {
             let live_c = Arc::clone(&live);
             let lc_c = lc.clone();
-            let leaf = leaf_chain.clone();
             tokio::spawn(async move {
-                if let Err(e) = handle_incoming(incoming, live_c, lc_c, leaf).await {
+                if let Err(e) = handle_incoming(incoming, live_c, lc_c).await {
                     log::warn!("h3 connection: {e:#}");
                 }
             });
@@ -87,7 +84,6 @@ mod imp {
         incoming: quinn::Incoming,
         live: Arc<LiveConfig>,
         lc: ListenerConfig,
-        leaf_der: Vec<u8>,
     ) -> Result<()> {
         let connection = match incoming.await {
             Ok(c) => c,
@@ -99,7 +95,7 @@ mod imp {
         };
         let peer = connection.remote_address();
 
-        let identity = identity_from_connection(&connection, &leaf_der);
+        let identity = identity_from_connection(&connection);
         if let Some(leaf) = identity.first() {
             log::debug!(
                 "h3 peer_identity leaf_der_len={} chain_len={} peer={peer}",
@@ -158,10 +154,13 @@ mod imp {
         Ok(())
     }
 
-    fn identity_from_connection(
-        connection: &quinn::Connection,
-        fallback_pem_or_der: &[u8],
-    ) -> Vec<quinn_boring::X509> {
+    /// 从 QUIC 连接取对端证书链（leaf 在前）。
+    ///
+    /// 之前这里在 `peer_identity()` 为 None 时**回退到服务器自己的证书**，
+    /// 于是「对端身份」变成「本机证书」——任何拿这个结果做鉴权的调用方都会被骗。
+    /// QUIC 服务端默认 `verify_peer(false)`（见 libs/quinn-boring server/mod.rs），
+    /// 客户端不带证书是常态，此时正确结果是**空链**，不是服务器证书。
+    fn identity_from_connection(connection: &quinn::Connection) -> Vec<quinn_boring::X509> {
         if let Some(any) = connection.peer_identity() {
             if let Some(certs) = any.downcast_ref::<Vec<CertificateDer<'static>>>() {
                 let chain =
@@ -177,7 +176,7 @@ mod imp {
                 }
             }
         }
-        quinn_boring::peer_identity_from_der(fallback_pem_or_der)
+        Vec::new()
     }
 
     async fn handle_resolver(
@@ -229,19 +228,33 @@ mod imp {
             let method = req.method().as_str().to_string();
             let path = req.uri().path().to_string();
 
-            // RFC 9298: CONNECT-UDP proxy — only when h3 QUIC stream can be taken
-            // (body already drained). Authority form: host:port in :path.
+            // RFC 9298 CONNECT-UDP（以及普通 CONNECT 隧道）。
+            //
+            // 之前这里无条件回 200 OK 就 return——客户端以为隧道已建立，
+            // 实际一个字节都没转发。这比直接报错更坏：把「没实现」伪装成成功。
+            // 现在如实回 501，并记录原因，等真正的 QUIC 流↔UDP 转发接上再放开。
             if method == "CONNECT" {
-                if let Some((host, port)) = parse_connect_target(&path) {
-                    let target = SocketAddr::new(host, port);
-                    log::info!("h3 CONNECT target={} peer={}", target, peer);
-                    let ok = Response::builder().status(StatusCode::OK).body(()).unwrap();
-                    if stream.send_response(ok).await.is_err() {
-                        return Ok(());
-                    }
-                    #[allow(unused)] // feature-gated: BidiStream->OpenStreams cast would go here
-                        return Ok(());
-                }
+                let wants_udp = crate::server::connect_udp::is_connect_udp(
+                    req.headers()
+                        .get("connect-udp")
+                        .and_then(|v| v.to_str().ok()),
+                ) || req
+                    .headers()
+                    .get(":protocol")
+                    .and_then(|v| v.to_str().ok())
+                    .map(|p| p.eq_ignore_ascii_case("connect-udp"))
+                    .unwrap_or(false);
+                let target = parse_connect_target(&path);
+                log::warn!(
+                    "h3 CONNECT (udp={wants_udp}) path={path} peer={peer} target={target:?}: \
+                     tunnel forwarding not implemented, replying 501"
+                );
+                let resp = Response::builder()
+                    .status(StatusCode::NOT_IMPLEMENTED)
+                    .body(())
+                    .unwrap();
+                let _ = stream.send_response(resp).await;
+                return Ok(());
             }
 
             let t0 = std::time::Instant::now();

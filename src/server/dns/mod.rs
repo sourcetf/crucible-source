@@ -234,8 +234,9 @@ pub struct RootZoneCfg {
     /// AXFR 源服务器（IPv4/IPv6）——用于 IXFR 增量更新（需求 2）
     #[serde(default)]
     pub axfr_servers: Vec<String>,
-    /// false = 不自动刷新 root zone（仅 modes.root=true 时有意义）
-    #[serde(default)]
+    /// false = 不自动刷新 root zone（仅 modes.root=true 时有意义）。
+    /// 默认 true：需求 2 要求「默认 daily」自动增量更新。
+    #[serde(default = "default_true")]
     pub enabled: bool,
 }
 
@@ -1643,6 +1644,12 @@ fn parse_dnssec_time(s: &str) -> u64 {
 
 /// Root zone AXFR 增量更新（需求 2）：比较 SOA serial → IXFR → 应用差异。
 /// 不支持 IXFR 时回退全量 AXFR（dig axfr）。
+///
+/// 注意：`dig ixfr` 的应答是 RFC1995 **差异流**（SOA(new) / 删除段 / SOA(old) /
+/// 新增段 / SOA(new)），不是完整 zone 文件。旧实现把这段原始文本直接
+/// `fs::write` 成 root.zone，等于用差异覆盖整区——zone 立刻损坏、named 起不来。
+/// 现在差异会被真正应用到现有 zone 上，并在替换前校验 serial；
+/// 任何一步不成立就返回 false，交给调用方走全量 AXFR。
 pub fn rootzone_ixfr(cfg: &DnsConfig) -> Result<String> {
     let zones = state_root().join("zones");
     std::fs::create_dir_all(&zones)?;
@@ -1652,50 +1659,172 @@ pub fn rootzone_ixfr(cfg: &DnsConfig) -> Result<String> {
     let server = cfg.rootzone.axfr_servers.first()
         .ok_or_else(|| anyhow::anyhow!("no axfr_servers for root zone"))?;
 
-    let tmp = zones.join("root.zone.tmp");
-    let ixfr_ok = try_ixfr_dig(server, cfg, &tmp, current_serial);
-    if !ixfr_ok {
-        log::info!("dns: rootzone IXFR unsupported, full AXFR fallback");
-        let out = std::process::Command::new("dig")
-            .args(["axfr".to_string(), format!("@{server}"), ".".to_string()])
-            .output()
-            .context("dig axfr")?;
-        if !out.status.success() {
-            bail!("dig axfr failed: {}", String::from_utf8_lossy(&out.stderr).trim());
+    // 先尝试 IXFR 差异应用（就地改 dst，成功后 atomic 替换）。
+    match try_ixfr_apply(server, &dst, current_serial) {
+        Ok(true) => {
+            meta_set("root_last_ok", &chrono_now().to_string())?;
+            let _ = rndc(cfg, &["reload", "."]);
+            return Ok(dst.to_string_lossy().into());
         }
-        std::fs::write(&tmp, &out.stdout)?;
+        Ok(false) => log::info!("dns: rootzone IXFR unsupported/not applicable, full AXFR fallback"),
+        Err(e) => log::warn!("dns: rootzone IXFR failed ({e:#}), full AXFR fallback"),
     }
+
+    // 全量 AXFR：dig 的 axfr 输出本身就是 master file 格式。
+    let out = std::process::Command::new("dig")
+        .args(["axfr".to_string(), format!("@{server}"), ".".to_string()])
+        .output()
+        .context("dig axfr")?;
+    if !out.status.success() {
+        bail!("dig axfr failed: {}", String::from_utf8_lossy(&out.stderr).trim());
+    }
+    // 校验拿到的确实是完整 zone（至少要有 SOA），避免把错误文本写进 zone 文件。
+    let text = String::from_utf8_lossy(&out.stdout);
+    if !text.contains("IN\tSOA") && !text.contains("IN SOA") {
+        bail!("dig axfr output has no SOA; refusing to overwrite zone");
+    }
+    let tmp = zones.join("root.zone.tmp");
+    std::fs::write(&tmp, &out.stdout)?;
     std::fs::rename(&tmp, &dst)?;
     meta_set("root_last_ok", &chrono_now().to_string())?;
     let _ = rndc(cfg, &["reload", "."]);
     Ok(dst.to_string_lossy().into())
 }
 
-fn try_ixfr_dig(server: &str, _cfg: &DnsConfig, dst: &Path, serial: u64) -> bool {
-    // dig ixfr <serial> @server . — sends IXFR query with current serial
-    // If server supports IXFR: returns incremental diffs since <serial>
-    // If IXFR not supported / serial mismatch: server may return AXFR full or NOTIMP
-    let serial_s = serial.to_string();
-    let out = std::process::Command::new("dig")
-        .args(["+noall", "+answer", "ixfr", &serial_s, "@", server, "."])
-        .output();
-    match out {
-        Ok(o) => {
-            let stdout = String::from_utf8_lossy(&o.stdout);
-            // Valid IXFR response has SOA records (incremental or full)
-            if o.status.success() && !stdout.is_empty() && stdout.contains("IN SOA") {
-                std::fs::write(dst, stdout.as_bytes()).ok();
-                return true;
-            }
-            // Check for IXFR NOERROR (no changes) — response would be just SOA+opt
-            if stdout.contains("IXFR") && stdout.contains("NOERROR") {
-                std::fs::write(dst, stdout.as_bytes()).ok();
-                return true;
-            }
-            false
-        }
-        _ => false,
+/// 把 IXFR 差异应用到现有 zone。
+///
+/// 返回 `Ok(true)` = 已应用并替换成功（含「无变化」）；
+/// `Ok(false)` = 该源不适用 IXFR，调用方应回退全量；
+/// `Err` = 尝试过但失败（同样回退）。
+fn try_ixfr_apply(server: &str, dst: &Path, current_serial: u64) -> Result<bool> {
+    if current_serial == 0 || !dst.exists() {
+        return Ok(false); // 没有本地 zone 可比对，直接走全量
     }
+    // 正确的写法是单个 `@server` 参数；旧代码拆成 "@" + server 两个 argv，
+    // dig 会把 server 当成第二个查询名。
+    let out = std::process::Command::new("dig")
+        .args([
+            "+noall",
+            "+answer",
+            "ixfr",
+            &current_serial.to_string(),
+            &format!("@{server}"),
+            ".",
+        ])
+        .output()
+        .context("dig ixfr")?;
+    if !out.status.success() {
+        return Ok(false);
+    }
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let records: Vec<&str> = stdout
+        .lines()
+        .map(|l| l.trim())
+        .filter(|l| !l.is_empty())
+        .collect();
+    let soa_idx: Vec<usize> = records
+        .iter()
+        .enumerate()
+        .filter(|(_, l)| l.contains("SOA"))
+        .map(|(i, _)| i)
+        .collect();
+    if soa_idx.is_empty() {
+        return Ok(false);
+    }
+    // 单个 SOA：要么「无变化」，要么不是完整区。按 serial 判定，绝不写文件。
+    if soa_idx.len() == 1 {
+        let new_serial = soa_serial_from_line(records[soa_idx[0]]);
+        if new_serial == Some(current_serial) {
+            log::info!("dns: rootzone already at serial {current_serial}");
+            return Ok(true);
+        }
+        return Ok(false);
+    }
+
+    // 多 SOA → 标准 IXFR 差异流。逐段应用：SOA(new) → 删除段 → SOA(old) →
+    // 新增段 → SOA(new) …
+    let target_serial = soa_serial_from_line(records[soa_idx[0]]);
+    let original = std::fs::read_to_string(dst).context("read current zone")?;
+    let mut lines: Vec<String> = original.lines().map(|l| l.to_string()).collect();
+
+    let mut i = 1usize;
+    let mut applied_segments = 0usize;
+    while i < records.len() {
+        // 删除段：直到下一个 SOA
+        let del_start = i;
+        while i < records.len() && !records[i].contains("SOA") {
+            i += 1;
+        }
+        let deletions = &records[del_start..i];
+        if i >= records.len() {
+            break; // 没有配对的 SOA(old)，差异流不完整
+        }
+        i += 1; // 跳过 SOA(old)
+        // 新增段：直到下一个 SOA
+        let add_start = i;
+        while i < records.len() && !records[i].contains("SOA") {
+            i += 1;
+        }
+        let additions = &records[add_start..i];
+        if i < records.len() {
+            i += 1; // 跳过 SOA(new)，继续下一段
+        }
+
+        // 先删后加。记录按规范化文本比对（dig 与 zone 文件的 TTL/空白格式可能不同）。
+        for d in deletions {
+            let key = normalize_rr(d);
+            if let Some(pos) = lines.iter().position(|l| normalize_rr(l) == key) {
+                lines.remove(pos);
+            }
+        }
+        for a in additions {
+            lines.push((*a).to_string());
+        }
+        applied_segments += 1;
+    }
+
+    if applied_segments == 0 {
+        return Ok(false);
+    }
+
+    // 校验：应用后的 zone 必须能解析出目标 serial，否则回退全量。
+    let new_text = lines.join("\n") + "\n";
+    let got_serial = serial_from_zone_text(&new_text);
+    if target_serial.is_none() || got_serial != target_serial {
+        log::warn!(
+            "dns: IXFR apply serial check failed (want {target_serial:?} got {got_serial:?}); \
+             falling back to full AXFR"
+        );
+        return Ok(false);
+    }
+
+    let tmp = dst.with_extension("zone.tmp");
+    std::fs::write(&tmp, new_text.as_bytes())?;
+    std::fs::rename(&tmp, dst)?;
+    log::info!(
+        "dns: rootzone IXFR applied {applied_segments} segment(s) → serial {:?}",
+        target_serial
+    );
+    Ok(true)
+}
+
+/// 规范化一条 RR 文本用于比对：去掉注释、压缩空白、去尾点差异。
+fn normalize_rr(line: &str) -> String {
+    let no_comment = line.split(';').next().unwrap_or("");
+    no_comment.split_whitespace().collect::<Vec<_>>().join(" ").to_lowercase()
+}
+
+/// 从 `... SOA mname rname SERIAL ...` 行里取 serial。
+fn soa_serial_from_line(line: &str) -> Option<u64> {
+    let toks: Vec<&str> = line.split_whitespace().collect();
+    let soa = toks.iter().position(|t| t.eq_ignore_ascii_case("SOA"))?;
+    // SOA 之后：mname rname serial …
+    toks.get(soa + 3)?.parse::<u64>().ok()
+}
+
+/// 从完整 zone 文本里取 SOA serial。
+fn serial_from_zone_text(text: &str) -> Option<u64> {
+    text.lines().find_map(soa_serial_from_line)
 }
 
 fn rootzone_current_serial(dst: &Path) -> Option<u64> {
@@ -1777,7 +1906,10 @@ pub async fn maintenance_loop(live: Arc<crate::server::live_config::LiveConfig>,
         }
         // rootzone 到期刷新
         let cfg = effective(&live.snapshot());
-        if cfg.enabled && cfg.modes.root {
+        // rootzone.enabled 是需求 2 的开关（默认 false）：root 模式下也允许
+        // 管理员只托管一个静态 root.zone 而不自动去 AXFR/下载。
+        // 旧代码从不读这个字段，等于开关失效。
+        if cfg.enabled && cfg.modes.root && cfg.rootzone.enabled {
             let due = match meta_get("root_last_ok") {
                 Ok(Some(t)) => t
                     .parse::<u64>()

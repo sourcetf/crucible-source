@@ -197,8 +197,24 @@ async fn handle_inner(
                 Ok(json!({"ok": true, "rpz": dc.rpz}))
             }
             // 分线路（需求 10）
+            //
+            // 面板只提交 {enabled, lines}，若整体替换 `dc.geo`，`#[serde(default)]`
+            // 会把管理员在 config.toml 里写的 mmdb（city/asn 库路径、license_key、
+            // asn_to_line/country_to_line/isp_contains 映射）全部抹成空值——
+            // 一次「保存并应用」就静默丢掉分线路数据库配置。改为按字段合并。
             p if p.ends_with("/api/dns/geo") => {
-                dc.geo = serde_json::from_value(v["geo"].clone()).map_err(|e| format!("geo: {e}"))?;
+                if let Some(enabled) = v["geo"]["enabled"].as_bool() {
+                    dc.geo.enabled = enabled;
+                }
+                if v["geo"]["lines"].is_array() {
+                    dc.geo.lines = serde_json::from_value(v["geo"]["lines"].clone())
+                        .map_err(|e| format!("geo.lines: {e}"))?;
+                }
+                // 高级字段仅在显式提交时才覆盖，缺省保留原值。
+                if v["geo"].get("mmdb").map(|x| x.is_object()).unwrap_or(false) {
+                    dc.geo.mmdb = serde_json::from_value(v["geo"]["mmdb"].clone())
+                        .map_err(|e| format!("geo.mmdb: {e}"))?;
+                }
                 persist_and_reconcile(&dc).await?;
                 Ok(json!({"ok": true, "lines": dc.geo.lines.len()}))
             }
