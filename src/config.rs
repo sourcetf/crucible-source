@@ -629,9 +629,41 @@ pub struct SslConfig {
 }
 
 impl SslConfig {
-    /// 规格 1a：ECH advertise 就绪（开关开且密钥材料就位）。
+    /// OCSP 自动获取使用的「站点身份」主机名。
+    ///
+    /// 用途有两个：作为 `state/ocsp/{host}.der` 缓存键，以及日志里标识是哪个站点。
+    /// 取值优先 `sni_name`（本 listener 配置的 SNI 身份），其次 `ech_public_name`
+    /// （同样是管理员配置的对外身份）。两者都没配 → 返回 None，
+    /// 自动装订路径据此跳过（没有稳定身份就无法安全复用缓存）。
+    pub fn ocsp_host(&self) -> Option<String> {
+        self.sni_name
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .or_else(|| {
+                self.ech_public_name
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+            })
+            .map(|s| s.to_string())
+    }
+
+    /// 规格 1a：ECH advertise 就绪。
+    ///
+    /// 密钥材料可以来自两条路：管理员显式给的 `ssl.ech_keys`，
+    /// 或 **自动配置**（`ech_auto`：复用/生成 `state/ech/ech_keys.pem`，需要 public-name）。
+    /// 早期实现要求 `ech_keys.is_some()`，于是开了 advertise 但没手填 keys 时
+    /// 前端永远拿不到 HTTPS 记录——而自动配置正是为这条路准备的。
     pub fn ech_advertise_enabled(&self) -> bool {
-        self.ech && self.ech_advertise && self.ech_keys.is_some()
+        self.ech
+            && self.ech_advertise
+            && (self.ech_keys.is_some()
+                || self
+                    .ech_public_name
+                    .as_deref()
+                    .map(|s| !s.trim().is_empty())
+                    .unwrap_or(false))
     }
 }
 

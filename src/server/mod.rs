@@ -1,11 +1,14 @@
 //! Accept loop, multi-listener, optional SO_BUSY_POLL (Linux only).
 
-// ── 9 new feature modules (added this session) ──────────────────────────────
+// ── 新增特性模块 ─────────────────────────────────────────────────────────────
 pub mod ecn;
 pub mod connect_udp;
 pub mod port_reuse;
 pub mod ech_auto;
-pub mod ocsp_wiring;
+// OCSP 自动获取 + 后台续期（boring_path::apply_ocsp_auto 依赖）。
+// 此前这个文件存在但**从未声明**，于是 boring_path 里那整条自动装订路径
+// 一直解析不到 `crate::server::ocsp_fetcher`，编译直接失败。
+pub mod ocsp_fetcher;
 pub mod type65_api;
 
 // ── existing modules ───────────────────────────────────────────────────────────

@@ -382,6 +382,100 @@ pub async fn handle(req: Request<Full<Bytes>>, live: Arc<LiveConfig>) -> Respons
         .await;
     }
 
+    // ---------- ECH / HTTPS(type65) DNS 记录（规格 §16 1.a） ----------
+    //
+    // 面板需要拿到「HTTPS 类型 DNS 记录」以便把 ECH 配置发布出去。
+    // 自动配置已经落盘（state/ech/），这里只做读取/发布/删除的轻量视图。
+    if path.ends_with("/api/ech/type65") && method == Method::GET {
+        let auto_list = crate::server::ech_auto::persisted_config_list_base64();
+        let auto_ready = crate::server::ech_auto::has_persisted();
+        let mut s = String::from("{\"records\":");
+        s.push_str(&crate::server::type65_api::list());
+        s.push_str(",\"auto\":{");
+        s.push_str(&format!("\"ready\":{auto_ready}"));
+        s.push_str(&format!(
+            ",\"pem_path\":{}",
+            json_str(&crate::server::ech_auto::pem_path().display().to_string())
+        ));
+        match &auto_list {
+            Some(b64) => {
+                s.push_str(&format!(",\"config_list_b64\":{}", json_str(b64)));
+            }
+            None => s.push_str(",\"config_list_b64\":null"),
+        }
+        s.push_str("}}");
+        return json_ok(s);
+    }
+
+    if path.ends_with("/api/ech/type65/publish") && method == Method::POST {
+        let bytes = match collect_body(req).await {
+            Ok(b) => b,
+            Err(e) => return text_err(StatusCode::BAD_REQUEST, e),
+        };
+        let v: serde_json::Value = match serde_json::from_slice(&bytes) {
+            Ok(v) => v,
+            Err(e) => return text_err(StatusCode::BAD_REQUEST, format!("json: {e}")),
+        };
+        // name 缺省时用自动配置的 public-name：面板只需点一下就能发布。
+        let name = match v["name"].as_str().map(|s| s.trim().to_string()) {
+            Some(n) if !n.is_empty() => n,
+            _ => {
+                let snap = live.snapshot();
+                snap.listeners
+                    .iter()
+                    .filter_map(|l| l.ssl.as_ref())
+                    .filter_map(|s| s.ech_public_name.clone())
+                    .next()
+                    .unwrap_or_default()
+            }
+        };
+        if name.is_empty() {
+            return text_err(
+                StatusCode::BAD_REQUEST,
+                "name required (or configure ssl.ech_public_name)",
+            );
+        }
+        // ech_config_list 缺省时取自动配置生成的 list。
+        let b64 = match v["ech_config_list"].as_str().map(|s| s.trim().to_string()) {
+            Some(s) if !s.is_empty() => Some(s),
+            _ => crate::server::ech_auto::persisted_config_list_base64(),
+        };
+        let Some(b64) = b64 else {
+            return text_err(
+                StatusCode::BAD_REQUEST,
+                "no ech_config_list given and none generated (set ssl.ech_public_name)",
+            );
+        };
+        let req65 = crate::server::type65_api::Type65Request {
+            name: name.clone(),
+            ech_config_list: Some(b64),
+            ttl: v["ttl"].as_u64().map(|t| t as u32),
+        };
+        return match crate::server::type65_api::publish(req65) {
+            Ok(msg) => text_ok(msg),
+            Err(e) => text_err(StatusCode::BAD_REQUEST, e),
+        };
+    }
+
+    if path.ends_with("/api/ech/type65/delete") && method == Method::POST {
+        let bytes = match collect_body(req).await {
+            Ok(b) => b,
+            Err(e) => return text_err(StatusCode::BAD_REQUEST, e),
+        };
+        let v: serde_json::Value = match serde_json::from_slice(&bytes) {
+            Ok(v) => v,
+            Err(e) => return text_err(StatusCode::BAD_REQUEST, format!("json: {e}")),
+        };
+        let name = v["name"].as_str().unwrap_or("").trim().to_string();
+        if name.is_empty() {
+            return text_err(StatusCode::BAD_REQUEST, "name required");
+        }
+        return match crate::server::type65_api::delete(&name) {
+            Ok(()) => text_ok(format!("deleted {name}")),
+            Err(e) => text_err(StatusCode::NOT_FOUND, e),
+        };
+    }
+
     // ---------- 账号 ----------
     if path.ends_with("/api/password") && method == Method::POST {
         let bytes = match collect_body(req).await {

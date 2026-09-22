@@ -176,22 +176,56 @@ fn apply_groups(builder: &mut SslAcceptorBuilder, ssl: &SslConfig) -> Result<()>
     Ok(())
 }
 
+/// 应用 ECH 密钥。
+///
+/// 三条路径，优先级从高到低：
+///   1. `ssl.ech_keys` 显式配置 → 用管理员材料（原行为不变）；
+///   2. 未配置 → **自动配置**（规格 §16 1.a）：先复用 `state/ech/ech_keys.pem`
+///      里已生成且仍匹配当前 public-name/suite/max-name-length 的配置，
+///      不匹配则用真实 X25519 keypair 重新生成并落盘；
+///   3. 自动配置失败（如未填 `ech_public_name`）→ 仅 warn，不阻断 TLS。
+///
+/// 早期实现只走路径 1：`ech_keys` 没配就直接放弃，于是「ECH 自动配置」实际不存在。
 fn apply_ech(builder: &mut SslAcceptorBuilder, ssl: &SslConfig) -> Result<()> {
     if !ssl.ech && !ssl.ech_advertise {
         return Ok(());
     }
-    let Some(keys_path) = ssl.ech_keys.as_deref() else {
-        log::warn!("ssl.ech=true but ssl.ech_keys unset; continuing without ECH");
+    if let Some(keys_path) = ssl.ech_keys.as_deref() {
+        match ssl_material::load_bytes(keys_path) {
+            Ok(pem) => {
+                if let Err(e) = apply_ech_keys(builder, &pem) {
+                    log::warn!("ECH keys invalid ({keys_path}): {e:#}; continuing without ECH");
+                }
+            }
+            Err(e) => {
+                log::warn!("ECH keys unavailable ({keys_path}): {e:#}; continuing without ECH");
+            }
+        }
         return Ok(());
-    };
-    match ssl_material::load_bytes(keys_path) {
-        Ok(pem) => {
-            if let Err(e) = apply_ech_keys(builder, &pem) {
-                log::warn!("ECH keys invalid ({keys_path}): {e:#}; continuing without ECH");
+    }
+
+    // 自动配置路径（规格 §16 1.a）
+    match crate::server::ech_auto::ensure_from_config(
+        ssl.ech_public_name.as_deref(),
+        ssl.ech_cipher_suite.as_deref(),
+        ssl.ech_max_name_length,
+    ) {
+        Ok(mat) => {
+            let pem = mat.to_pem();
+            match apply_ech_keys(builder, pem.as_bytes()) {
+                Ok(()) => log::info!(
+                    "ECH 自动配置就绪 (reused={} public_name={} config_list_b64_len={})",
+                    mat.reused,
+                    ssl.ech_public_name.as_deref().unwrap_or("?"),
+                    mat.config_list_base64().len()
+                ),
+                Err(e) => log::warn!("ECH 自动配置装载失败: {e:#}; continuing without ECH"),
             }
         }
         Err(e) => {
-            log::warn!("ECH keys unavailable ({keys_path}): {e:#}; continuing without ECH");
+            log::warn!(
+                "ECH 自动配置不可用（配置 ssl.ech_public_name 后可用）: {e:#}; continuing without ECH"
+            );
         }
     }
     Ok(())
@@ -203,13 +237,24 @@ fn apply_ech_keys(builder: &mut SslAcceptorBuilder, pem: &[u8]) -> Result<()> {
     Ok(())
 }
 
-/// P1-8（§16.16/§22.7）：server 端 OCSP stapling——BoringSSL 文档路径：
-/// select-certificate 回调内 SSL_set_ocsp_response（boring: ClientHello::ssl_mut）。
-/// ocsp_der_path 支持 DER 原文或 PEM（自动剥壳）；缺省/读取失败仅 warn，不阻断 TLS。
+/// P1-8（§16.16/§22.7）+ 早期规格 1b：server 端 OCSP stapling。
+///
+/// 两种来源，**静态路径优先**：
+/// 1. `ssl.ocsp_der_path` 已配置 → 原行为不变（读文件 → 剥 PEM → 回调装订）。
+/// 2. 未配置 → 自动获取：从 `ssl.cert` 全链 + 叶子 AIA 解析出 OCSP 目标，
+///    经 `ocsp_fetcher::prepare_stapling` 建槽（只读本地 `state/ocsp` 缓存，**不触网**），
+///    真正的网络抓取由 `ocsp_fetcher` 的后台续期线程完成，取回后回调自动装订。
+///
+/// 两条路径都失败时仅 warn，绝不阻断 TLS。
 fn apply_ocsp(builder: &mut SslAcceptorBuilder, ssl: &SslConfig) -> Result<()> {
-    let Some(path) = ssl.ocsp_der_path.as_deref() else {
-        return Ok(());
-    };
+    if let Some(path) = ssl.ocsp_der_path.as_deref() {
+        return apply_ocsp_static(builder, path);
+    }
+    apply_ocsp_auto(builder, ssl)
+}
+
+/// 静态路径（`ssl.ocsp_der_path`）——历史行为，逐字节保持不变。
+fn apply_ocsp_static(builder: &mut SslAcceptorBuilder, path: &str) -> Result<()> {
     let raw = match ssl_material::load_bytes(path) {
         Ok(d) if !d.is_empty() => d,
         Ok(_) => {
@@ -229,6 +274,42 @@ fn apply_ocsp(builder: &mut SslAcceptorBuilder, ssl: &SslConfig) -> Result<()> {
         Ok(())
     });
     log::info!("ocsp stapling enabled ({} bytes from {path})", der_len);
+    Ok(())
+}
+
+/// 自动获取路径（早期规格 1b）：`ocsp_der_path` 未配置时启用。
+/// 叶子无 AIA / 链不完整 → 静默保持无装订（与静态路径缺文件同语义）。
+fn apply_ocsp_auto(builder: &mut SslAcceptorBuilder, ssl: &SslConfig) -> Result<()> {
+    let (Some(cert_path), Some(host)) = (ssl.cert.as_deref(), ssl.ocsp_host()) else {
+        return Ok(());
+    };
+    let cert_pem = match ssl_material::load_bytes(cert_path) {
+        Ok(b) => b,
+        Err(e) => {
+            log::warn!("ocsp auto: ssl.cert 不可读: {e:#}；OCSP stapling 关闭");
+            return Ok(());
+        }
+    };
+    let leaf = match X509::from_pem(&cert_pem) {
+        Ok(x) => x,
+        Err(e) => {
+            log::warn!("ocsp auto: leaf 解析失败: {e:#}；OCSP stapling 关闭");
+            return Ok(());
+        }
+    };
+    // 全链材料（叶 + 中间链）——issuer 查找与 caIssuers 兜底都用它。
+    let Some(slot) = crate::server::ocsp_fetcher::prepare_stapling(&host, &leaf, &cert_pem) else {
+        return Ok(());
+    };
+    builder.enable_ocsp_stapling();
+    // 回调内只读槽内快照（纯内存）；网络刷新在后台线程，握手永不阻塞。
+    builder.set_select_certificate_callback(move |mut ch| {
+        if let Some(der) = slot.current() {
+            let _ = ch.ssl_mut().set_ocsp_status(&der);
+        }
+        Ok(())
+    });
+    log::info!("ocsp stapling enabled (auto-fetch, host={host})");
     Ok(())
 }
 
