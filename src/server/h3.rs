@@ -259,7 +259,18 @@ mod imp {
 
             let t0 = std::time::Instant::now();
             let req = req.map(|()| Bytes::from(body));
-            let response = handle_h3(req, live.clone(), lc, peer).await;
+            // HSTS 判定要在 handle_h3 之前取：lc 会被 move 进去。
+            let is_https = lc.ssl.is_some();
+            let mut response = handle_h3(req, live.clone(), lc, peer).await;
+            // HTTPS(H3) 响应统一补 HSTS——与 h1/h2 同一语义，见 h2.rs 处的说明。
+            if is_https {
+                response
+                    .headers_mut()
+                    .entry(http::header::STRICT_TRANSPORT_SECURITY)
+                    .or_insert_with(|| {
+                        http::HeaderValue::from_static(crate::server::h1::hsts_header())
+                    });
+            }
             let (parts, body_out) = response.into_parts();
             let engine = parts
                 .extensions

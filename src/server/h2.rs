@@ -155,7 +155,20 @@ where
             let fake = Request::from_parts(parts, Bytes::from(buf));
             let path = fake.uri().path().to_string();
             let t0 = std::time::Instant::now();
-            let response = handle_h2(fake, live.clone(), lc, peer).await;
+            // HSTS 判定要在 handle_h2 之前取：lc 会被 move 进去。
+            let is_https = lc.ssl.is_some();
+            let mut response = handle_h2(fake, live.clone(), lc, peer).await;
+            // HTTPS 响应统一补 HSTS。此前只有 h1.rs 做了这件事，h2/h3 完全没有——
+            // 而 h2/h3 才是主用协议，等于「开了 TLS 却不发 HSTS」。
+            // entry().or_insert 不覆盖分支已显式设置的值，与 h1 语义一致。
+            if is_https {
+                response
+                    .headers_mut()
+                    .entry(http::header::STRICT_TRANSPORT_SECURITY)
+                    .or_insert_with(|| {
+                        http::HeaderValue::from_static(crate::server::h1::hsts_header())
+                    });
+            }
             let (parts, data) = response.into_parts();
             let engine = parts
                 .extensions
