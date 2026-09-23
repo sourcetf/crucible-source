@@ -37,7 +37,10 @@ pub fn apply_panel_edits(panel: &Connection, merged: &mut MergedFields) -> Resul
     let mut stmt = panel.prepare(
         "SELECT field, value, weight FROM panel_edits
          WHERE ?1 LIKE prefix || '%' OR prefix LIKE ?1 || '%'
-         ORDER BY weight DESC",
+         -- 必须升序：下面的 apply_field 是无条件覆盖，最后写入的那条生效。
+         -- 原来写 DESC，于是权重**最低**的那条最后被应用 —— 与「高权重胜出」
+         -- 的语义正好相反（上面那行 w >= merged.weight 的注释也这么写着）。
+         ORDER BY weight ASC",
     )?;
     let rows = stmt.query_map(rusqlite::params![prefix], |row| {
         Ok((

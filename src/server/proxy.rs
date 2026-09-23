@@ -157,6 +157,24 @@ const HOP_BY_HOP: &[&str] = &[
     "upgrade",
 ];
 
+/// WebSocket 直写路径要跳过的头。与 HOP_BY_HOP 的区别：**保留** `upgrade`/`connection`
+/// （缺了握手不成立），但报文定界相关的头一律不转发 —— 否则客户端可以同时带上
+/// `Transfer-Encoding: chunked`，而我们会自己追加 `Content-Length`，
+/// 上游就会同时看到 TE 与 CL，这正是 TE.CL 请求走私的形态。
+/// 另外客户端自带的 X-Forwarded-* 也不转发，避免来源被伪造。
+const WS_SKIP: &[&str] = &[
+    "keep-alive",
+    "proxy-authenticate",
+    "proxy-authorization",
+    "proxy-connection",
+    "te",
+    "trailer",
+    "transfer-encoding",
+    "content-length",
+    "x-forwarded-for",
+    "x-forwarded-proto",
+];
+
 pub async fn try_proxy(
     lc: &ListenerConfig,
     req: Request<Full<Bytes>>,
@@ -214,6 +232,15 @@ fn join_upstream(upstream: &str, rest: &str) -> Result<String> {
         bail!("proxy refused absolute URL suffix");
     }
     let upstream = upstream.trim_end_matches('/');
+    // 必须补分隔符：`rest` 不一定以 '/' 开头 —— rule.path 以 '/' 结尾时
+    // strip_prefix 会留下 `v1/x` 这样的尾巴，直接拼接会把尾巴并进 authority：
+    // `http://backend` + `.evil.tld/x` 就是发给**攻击者指定的** `backend.evil.tld`
+    // （只要他控制一个首标签匹配的域名）；上游带端口时拼出来是非法 URI，全部 502。
+    let rest = if rest.starts_with('/') {
+        rest.to_string()
+    } else {
+        format!("/{rest}")
+    };
     Ok(format!("{upstream}{rest}"))
 }
 
@@ -335,6 +362,21 @@ async fn proxy_once(
     for (k, v) in parts.headers.iter() {
         let kl = k.as_str().to_ascii_lowercase();
         if k == HOST || HOP_BY_HOP.contains(&kl.as_str()) || conn_tokens.iter().any(|t| *t == kl) {
+            continue;
+        }
+        // XFF/XFP 由下面自行计算后注入。这里若把客户端那份也转发，
+        // builder.header 是**追加**语义，上游会同时收到两份且客户端的排在前面 ——
+        // 后端按「取第一个」解析时就被伪造了（例如明文口上谎称 X-Forwarded-Proto: https）。
+        if kl == "x-forwarded-for" || kl == "x-forwarded-proto" {
+            continue;
+        }
+        // 规则里 modify_request_headers 指定的头同理：交给下面统一注入，
+        // 否则「注入/替换」语义退化成「客户端值在前 + 规则值在后」。
+        if rule
+            .modify_request_headers
+            .keys()
+            .any(|mk| mk.eq_ignore_ascii_case(&kl))
+        {
             continue;
         }
         builder = builder.header(k, v);
@@ -783,6 +825,17 @@ async fn write_raw_request(
     let mut lines = format!("{method} {path_q} HTTP/1.1\r\nHost: {host}\r\n");
     for (k, v) in parts.headers.iter() {
         if k == HOST {
+            continue;
+        }
+        let kl = k.as_str().to_ascii_lowercase();
+        if WS_SKIP.contains(&kl.as_str()) {
+            continue;
+        }
+        if rule
+            .modify_request_headers
+            .keys()
+            .any(|mk| mk.eq_ignore_ascii_case(&kl))
+        {
             continue;
         }
         if let Ok(vs) = v.to_str() {

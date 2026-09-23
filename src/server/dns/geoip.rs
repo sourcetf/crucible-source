@@ -117,7 +117,21 @@ fn lookup_asn(cfg: &GeoMmdbCfg, ip: IpAddr) -> Option<GeoInfo> {
 
 /// 根据 cfg + 客户端 IP 返回匹配线路名 (None = default)
 pub fn line_for(cfg: &GeoMmdbCfg, ip: IpAddr) -> Option<String> {
-    let info = lookup_city(cfg, ip).or_else(|| lookup_asn(cfg, ip))?;
+    // 必须**两个库都查**再做字段级合并。原先用 `or_else`：GeoLite2-City 覆盖了
+    // 绝大多数可路由地址，于是 lookup_asn 几乎永远不会被调用，info.asn /
+    // isp_contains 恒为空 —— cfg.asn_to_line / ISP 规则永不命中（分线路静默失效，
+    // 只剩 country 兜底），且没有任何日志或错误提示。
+    let info = match (lookup_city(cfg, ip), lookup_asn(cfg, ip)) {
+        (Some(mut c), Some(a)) => {
+            c.asn = c.asn.or(a.asn);
+            c.as_org = c.as_org.or(a.as_org);
+            c.isp_contains = c.isp_contains.or(a.isp_contains);
+            c
+        }
+        (Some(c), None) => c,
+        (None, Some(a)) => a,
+        (None, None) => return None,
+    };
     // 优先 asn → isp_contains → country
     if let Some(asn) = &info.asn {
         let asn_num = asn.trim_start_matches("AS");

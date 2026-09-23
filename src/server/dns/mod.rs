@@ -1012,17 +1012,39 @@ pub fn cidr_contains(cidr: &str, ip: std::net::IpAddr) -> bool {
     }
 }
 
+/// FNV-1a 32 位：给文件名加一个**可复现**的去重后缀。
+/// 自己实现而不用 std 的 DefaultHasher —— 后者的输出不保证跨 Rust 版本稳定，
+/// 会让生成的 zone 文件名在升级工具链后整体变一次。
+fn fnv1a32(s: &str) -> u32 {
+    let mut h: u32 = 0x811c_9dc5;
+    for b in s.as_bytes() {
+        h ^= *b as u32;
+        h = h.wrapping_mul(0x0100_0193);
+    }
+    h
+}
+
 fn zone_file_name(z: &ZoneRow, line_tag: &str) -> String {
+    // 只把非字母数字替换成 '_' 是不够的：`a-b.com` 和 `a_b.com`（两者都是合法
+    // zone 名，且 zones.name 唯一）会映射到**同一个** .zone 文件；线路名同理
+    // （`cn-north` 与 `cn_north`）。于是 write_all 覆盖写同一个文件、named.conf
+    // 里两个 view 指向同一文件 —— named 会以「writeable file already in use」拒载，
+    // 或者一个线路读到另一个线路的记录。后缀原始名字的哈希保证唯一。
     let safe: String = z
         .name
         .chars()
         .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
         .collect();
+    let tag = format!("{:08x}", fnv1a32(&z.name));
     if line_tag.is_empty() {
-        format!("{safe}.zone")
+        format!("{safe}.{tag}.zone")
     } else {
-        let safe_line: String = line_tag.chars().map(|c| if c.is_ascii_alphanumeric() { c } else { '_' }).collect();
-        format!("{safe}.{safe_line}.zone")
+        let safe_line: String = line_tag
+            .chars()
+            .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+            .collect();
+        let ltag = format!("{:08x}", fnv1a32(line_tag));
+        format!("{safe}.{tag}.{safe_line}.{ltag}.zone")
     }
 }
 

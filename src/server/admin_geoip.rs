@@ -690,9 +690,15 @@ pub async fn handle_conflict_source(req: Request<Full<Bytes>>) -> Response<BoxBo
         .ok()
         .flatten()
         .unwrap_or_default();
+    // 表名是 `geoip`（另有 ipv4/ipv6/anycast/panel_edits/panel_conflicts），
+    // **没有** `covering` 这张表 —— 原查询每次都报 "no such table"，
+    // 又被 .unwrap_or(0) 吞掉，于是冲突解决界面永远显示 commit_unix=0，
+    // 管理员据此判断「哪个来源更可信」时看到的是错的来源时间戳。
+    // 另外：同一前缀可能有多个来源，按 commit_unix 取最新的一条。
     let commit_unix: i64 = conn
         .query_row(
-            "SELECT commit_unix FROM covering WHERE source=? AND prefix=? LIMIT 1",
+            "SELECT COALESCE(commit_unix, 0) FROM geoip WHERE source = ? AND prefix = ?
+             ORDER BY COALESCE(commit_unix, 0) DESC LIMIT 1",
             [&s, &prefix],
             |r| r.get(0),
         )

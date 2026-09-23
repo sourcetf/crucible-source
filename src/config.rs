@@ -359,8 +359,9 @@ impl FileOpenTable {
             .extension()
             .and_then(|e| e.to_str())
             .filter(|e| !e.is_empty())
+            .map(|e| e.to_ascii_lowercase())
         {
-            if let Some(m) = self.0.get(ext) {
+            if let Some(m) = self.0.get(&ext) {
                 return *m;
             }
             if let Some(m) = self.0.get(&format!(".{ext}")) {
@@ -371,7 +372,7 @@ impl FileOpenTable {
     }
 
     pub fn insert(&mut self, key: impl AsRef<str>, mode: FileOpenMode) {
-        self.0.insert(key.as_ref().to_string(), mode);
+        self.0.insert(store_key(key.as_ref()), mode);
     }
 
     pub fn is_empty(&self) -> bool {
@@ -381,13 +382,39 @@ impl FileOpenTable {
 
 fn normalize_path_key(path: &str) -> String {
     let p = path.trim();
-    if p.is_empty() || p == "/" {
+    if p.is_empty() {
         return "/".into();
     }
-    if p.starts_with('/') {
-        p.to_string()
+    // 必须与 static_files::resolve_path 的解析方式保持一致：那边是
+    // 「去掉全部前导 '/' → percent-decode → join」。只做 trim 的话，
+    // `//uploads/x.html`、`/uploads/./x.html`、`/uploads/x%2Ehtml`
+    // 都会查不到 file_open 表（落到 Auto = 按真实 MIME 内联返回），
+    // 而文件本身照样被解析并送出 —— 管理员配的 preview/download 被绕过。
+    let decoded = percent_encoding::percent_decode_str(p.trim_start_matches('/'))
+        .decode_utf8_lossy()
+        .to_string();
+    let mut parts: Vec<&str> = Vec::new();
+    for seg in decoded.split('/') {
+        match seg {
+            "" | "." => {}
+            s => parts.push(s),
+        }
+    }
+    if parts.is_empty() {
+        return "/".into();
+    }
+    format!("/{}", parts.join("/"))
+}
+
+/// file_open 表里键的归一化：路径键走 [`normalize_path_key`]，扩展名键（`html`、`.html`）
+/// 与通配 `*` 原样保留（但折叠大小写——`mime_guess` 不区分大小写，`/x.PHP` 照样会被
+/// 按 php 处理，若键不折叠就查不到 `php` 规则）。
+fn store_key(k: &str) -> String {
+    let k = k.trim();
+    if k.contains('/') {
+        normalize_path_key(k)
     } else {
-        format!("/{p}")
+        k.to_ascii_lowercase()
     }
 }
 
@@ -417,11 +444,11 @@ mod file_open_serde {
             De::Entries(entries) => {
                 let mut m = BTreeMap::new();
                 for e in entries {
-                    m.insert(e.path, e.mode);
+                    m.insert(store_key(&e.path), e.mode);
                 }
                 m
             }
-            De::Map(m) => m,
+            De::Map(m) => m.into_iter().map(|(k, v)| (store_key(&k), v)).collect(),
         };
         Ok(FileOpenTable(table))
     }
@@ -450,7 +477,7 @@ mod file_open_serde {
             let (k, v) = row
                 .split_once('=')
                 .with_context(|| format!("invalid file_open entry: {row}"))?;
-            m.insert(k.trim().to_string(), parse_mode(v.trim())?);
+            m.insert(store_key(k), parse_mode(v.trim())?);
         }
         Ok(m)
     }
