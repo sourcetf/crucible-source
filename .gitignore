@@ -83,3 +83,6 @@ contact.txt
 .agents-backups-1008/
 crucible_project.tar.gz
 _commit_msg.txt
+www-apps/*/deps/
+src/**/*.orig
+src/**/*.broken

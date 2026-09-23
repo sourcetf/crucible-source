@@ -282,6 +282,9 @@ static char *render_asp(const char *src, size_t len, const char *path,
         char foot[256];
         int n = snprintf(foot, sizeof(foot), "\n<!-- axonasp path=%s -->\n",
                          path ? path : "");
+        /* 截断时 n 是「本来要写多长」——大于 sizeof(foot) 即越界读栈。 */
+        if (n > 0 && (size_t)n > sizeof(foot) - 1)
+            n = (int)sizeof(foot) - 1;
         if (n > 0)
             append(&out, &o, &cap, foot, (size_t)n);
     }

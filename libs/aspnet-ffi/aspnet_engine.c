@@ -326,6 +326,12 @@ int appengine_execute(
             path ? path : "/", script && script[0] ? script : "index.aspx",
             method ? method : "GET", query ? query : "",
             g_hostfxr_ok ? "loaded" : "absent");
+        /* 截断时 n 是「本来要写多长」：先夹到 msg 的真实容量再当长度用
+         * （与 appengine_fill_hello 同一类 bug，审计时容易漏）。 */
+        if (n < 0)
+            n = 0;
+        if ((size_t)n >= sizeof(msg))
+            n = (int)sizeof(msg) - 1;
         out->status = 200;
         appengine_result_set_headers(out,
                                      "Content-Type: text/plain; charset=utf-8\r\n"

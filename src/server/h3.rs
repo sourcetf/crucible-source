@@ -248,6 +248,69 @@ mod imp {
         // 「发完 HEADERS 就等 200」的客户端会一直阻塞在 `recv_data()` 上：
         // CONNECT-UDP 的负载本来就要等 200 之后才发，于是隧道还没建就先卡死。
         if req.method() == http::Method::CONNECT {
+            // 分流提前了，但**不能连访问控制一起绕过**：原先这里直接 return
+            // proxy_connect_udp，于是 ip_access / 限流 / listener Basic Auth
+            // 三项检查（都在下面的 handle_h3 里）对 CONNECT 完全失效 ——
+            // 任何能连上 QUIC 口的客户端都能拿到一个匿名 UDP 中继（RFC 9298），
+            // 既绕过 IP 白名单也绕过监听口密码。这里按同一顺序补上。
+            let path = req.uri().path().to_string();
+            let t0 = std::time::Instant::now();
+            let snap = live.snapshot();
+            if !crate::server::access::is_allowed(&snap.ip_access, peer) {
+                connect_reject(
+                    &mut stream,
+                    &live,
+                    peer,
+                    &path,
+                    StatusCode::FORBIDDEN,
+                    t0,
+                    "ip access denied",
+                )
+                .await;
+                return Ok(());
+            }
+            if let Some(rl) = &lc.rate_limit {
+                if rl.enabled {
+                    let ok = if rl.per_path {
+                        crate::server::rate_limit::allow_path(
+                            peer.ip(),
+                            &path,
+                            rl.rate_per_sec,
+                            rl.burst,
+                        )
+                    } else {
+                        crate::server::rate_limit::allow(peer.ip(), rl.rate_per_sec, rl.burst)
+                    };
+                    if !ok {
+                        connect_reject(
+                            &mut stream,
+                            &live,
+                            peer,
+                            &path,
+                            StatusCode::TOO_MANY_REQUESTS,
+                            t0,
+                            "rate limit exceeded",
+                        )
+                        .await;
+                        return Ok(());
+                    }
+                }
+            }
+            if let Some(ba) = &lc.basic_auth {
+                if !crate::server::basic_auth::check_listener_headers(req.headers(), ba) {
+                    connect_reject(
+                        &mut stream,
+                        &live,
+                        peer,
+                        &path,
+                        StatusCode::UNAUTHORIZED,
+                        t0,
+                        "unauthorized",
+                    )
+                    .await;
+                    return Ok(());
+                }
+            }
             return proxy_connect_udp(&req, stream, &live, peer).await;
         }
 

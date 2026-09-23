@@ -100,9 +100,26 @@ pub async fn try_handle_simple(
             deps::DepsEnv::default()
         }
     };
-    let outcome = app_ffi::execute_simple(req, lc, app, peer, &deps_env)
-        .await
-        .ok()?;
+    // 引擎执行失败**不能**变成 None。原先是 `execute_simple(...).await.ok()?`：
+    // 路由已经匹配上（match_app 成功）、引擎却报错时，返回 None 会被 h2/h3 当成
+    // 「没有 app 命中」，于是一路落到 proxy/static —— `.php` 文件被当静态文件
+    // 原样回给客户端，**源码泄露**（h2/h3 上默认配置即可复现；同一 URL 在 h1 上
+    // 是由 php-fpm 正常执行的）。这里改成与 h1 的 dispatch 一致：回 502。
+    let outcome = match app_ffi::execute_simple(req, lc, app, peer, &deps_env).await {
+        Ok(o) => o,
+        Err(e) => {
+            log::warn!("app engine {} failed (simple path): {e:#}", app.engine);
+            return Some(
+                Response::builder()
+                    .status(StatusCode::BAD_GATEWAY)
+                    .body(Bytes::from(format!(
+                        "{} engine error: {e:#}",
+                        app.engine
+                    )))
+                    .unwrap(),
+            );
+        }
+    };
     Some(app_ffi::simple_response_from_outcome(outcome))
 }
 

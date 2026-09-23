@@ -88,6 +88,11 @@ int appengine_fill_hello(AppEngineResult *out, const char *engine_name, const ch
                  path ? path : "/");
     if (n < 0)
         return -1;
+    /* snprintf 返回的是「本来要写多长」：被截断时它 >= sizeof(buf)。
+     * 直接把它当长度用，会从栈上的 buf 越界读并把栈内容塞进响应体
+     * （远程内存泄露；路径足够长时还会跑出线程栈）。 */
+    if ((size_t)n >= sizeof(buf))
+        n = (int)sizeof(buf) - 1;
     return appengine_result_set_body(out, buf, (size_t)n);
 }
 

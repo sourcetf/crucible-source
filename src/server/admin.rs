@@ -318,6 +318,121 @@ pub async fn handle(req: Request<Full<Bytes>>, live: Arc<LiveConfig>) -> Respons
         })
         .await;
     }
+    // 规格：syncookie / telemetry / admin 全局项——TOML 可配即可面板配。
+    //
+    // 这三条路由曾经整段丢失（admin.rs 被替换成一份少了它们的版本，残缺副本
+    // 作为 admin.rs.orig / admin.rs.broken 留在仓库里）。UI 的「全局」tab 三个
+    // 保存按钮（btnSynSave/btnTmSave/btnAdminSave）一直在 POST 这三个地址，
+    // 后端恒 404 —— 与 geoip edits/edit/delete 那次「UI 已在调用、未接线」同类。
+    if path.ends_with("/api/syncookie/save") && method == Method::POST {
+        return with_json(req, |v| {
+            let enabled = v.get("enabled").and_then(|b| b.as_bool()).unwrap_or(false);
+            let value_on = v.get("value_on").and_then(|s| s.as_str()).unwrap_or("1");
+            let value_off = v.get("value_off").and_then(|s| s.as_str()).unwrap_or("0");
+            let interval = v
+                .get("evaluate_interval_ms")
+                .and_then(|n| n.as_u64())
+                .unwrap_or(1000);
+            let mut tree = match cfg_edit::load_tree(live.path()) {
+                Ok(t) => t,
+                Err(e) => return text_err(StatusCode::BAD_REQUEST, format!("{e:#}")),
+            };
+            let table = toml_table(&[
+                ("enabled", toml::Value::Boolean(enabled)),
+                ("value_on", toml::Value::String(value_on.into())),
+                ("value_off", toml::Value::String(value_off.into())),
+                ("evaluate_interval_ms", toml::Value::Integer(interval as i64)),
+            ]);
+            if let Err(e) = cfg_edit::set_top_level_table(&mut tree, "syncookie", table) {
+                return text_err(StatusCode::BAD_REQUEST, format!("{e:#}"));
+            }
+            finish_write(&live, &tree, "syncookie saved")
+        })
+        .await;
+    }
+    if path.ends_with("/api/telemetry/save") && method == Method::POST {
+        return with_json(req, |v| {
+            let enabled = v.get("enabled").and_then(|b| b.as_bool()).unwrap_or(true);
+            let tpath = v.get("path").and_then(|s| s.as_str()).unwrap_or("/metrics");
+            let mut tree = match cfg_edit::load_tree(live.path()) {
+                Ok(t) => t,
+                Err(e) => return text_err(StatusCode::BAD_REQUEST, format!("{e:#}")),
+            };
+            let table = toml_table(&[
+                ("enabled", toml::Value::Boolean(enabled)),
+                ("path", toml::Value::String(tpath.into())),
+            ]);
+            if let Err(e) = cfg_edit::set_top_level_table(&mut tree, "telemetry", table) {
+                return text_err(StatusCode::BAD_REQUEST, format!("{e:#}"));
+            }
+            finish_write(&live, &tree, "telemetry saved")
+        })
+        .await;
+    }
+    if path.ends_with("/api/admin/save") && method == Method::POST {
+        return with_json(req, |v| {
+            let realm = v
+                .get("realm")
+                .and_then(|s| s.as_str())
+                .unwrap_or("")
+                .trim()
+                .to_string();
+            let apath = v
+                .get("path")
+                .and_then(|s| s.as_str())
+                .unwrap_or("")
+                .trim()
+                .to_string();
+            let allow: Vec<u16> = v
+                .get("listeners_allow")
+                .and_then(|a| a.as_array())
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|x| x.as_u64().map(|n| n as u16))
+                        .collect()
+                })
+                .unwrap_or_default();
+            let mut tree = match cfg_edit::load_tree(live.path()) {
+                Ok(t) => t,
+                Err(e) => return text_err(StatusCode::BAD_REQUEST, format!("{e:#}")),
+            };
+            // 只在给了非空值时才覆盖 realm/path，避免把面板上的空输入写成空串
+            // （空 path 会让 admin 面板挂到根路径上）。
+            //
+            // 必须**基于现有 [admin] 表**改，不能从空表重建：set_top_level_table 是
+            // insert（整表替换），而 AdminConfig 还有 [[admin.users]]。从空表重建会把
+            // 用户数组删掉 —— finish_write → reload 后 check_admin_headers 见
+            // users.is_empty() 对一切请求 401，管理面被永久锁死，只能手工改
+            // config.toml 再重启才能恢复。
+            let mut table = tree
+                .get("admin")
+                .and_then(|v| v.as_table())
+                .cloned()
+                .unwrap_or_default();
+            if !realm.is_empty() {
+                table.insert("realm".into(), toml::Value::String(realm));
+            }
+            if !apath.is_empty() {
+                table.insert("path".into(), toml::Value::String(apath));
+            }
+            table.insert(
+                "listeners_allow".into(),
+                toml::Value::Array(
+                    allow
+                        .into_iter()
+                        .map(|p| toml::Value::Integer(p as i64))
+                        .collect(),
+                ),
+            );
+            if let Err(e) =
+                cfg_edit::set_top_level_table(&mut tree, "admin", toml::Value::Table(table))
+            {
+                return text_err(StatusCode::BAD_REQUEST, format!("{e:#}"));
+            }
+            finish_write(&live, &tree, "admin saved")
+        })
+        .await;
+    }
     if path.ends_with("/api/ip_access/save") && method == Method::POST {
         return with_json(req, |v| {
             let Some(allow) = v.get("allow").and_then(|a| a.as_array()) else {
@@ -549,6 +664,15 @@ pub async fn handle(req: Request<Full<Bytes>>, live: Arc<LiveConfig>) -> Respons
         let Some(lc) = cfg.listeners.iter().find(|l| l.port == port) else {
             return text_err(StatusCode::BAD_REQUEST, "unknown listener port");
         };
+        // webshell 闸门必须也管 rename：先上传 `php/shell.txt`（扩展名放行），
+        // 再 rename 成 `php/shell.php`，就能绕过上传检查拿到执行权。
+        // 只查目标名——把可执行文件改名成不可执行的（拆掉执行权）是正常的清理操作。
+        if admin_files::would_execute_on_get(lc, &to) {
+            return text_err(
+                StatusCode::FORBIDDEN,
+                "rename blocked: target path would execute via app engine on GET",
+            );
+        }
         return match admin_files::rename_path(&lc.root, &from, &to) {
             Ok(()) => text_ok("renamed"),
             Err(e) => text_err(StatusCode::BAD_REQUEST, format!("{e:#}")),
@@ -810,6 +934,26 @@ fn save_autoindex(live: &Arc<LiveConfig>, v: &Json) -> Response<BoxBody> {
                 .collect(),
         ),
     );
+    // 规格 5：autoindex 上传开关与并行线程数（面板可配）。
+    // UI（admin_ui.html 的 leAutoindexUpload / leUploadThreads）会发这两个键，
+    // 这里不写回就等于「面板上改了、保存后消失」——autoindex 整表是重写的。
+    let enable_upload = v
+        .get("enable_upload")
+        .and_then(|b| b.as_bool())
+        .unwrap_or(false);
+    let upload_threads = v
+        .get("upload_threads")
+        .and_then(|n| n.as_u64())
+        .unwrap_or(4)
+        .clamp(1, 16) as u16;
+    t.insert(
+        "enable_upload".into(),
+        toml::Value::Boolean(enable_upload),
+    );
+    t.insert(
+        "upload_threads".into(),
+        toml::Value::Integer(upload_threads as i64),
+    );
     let mut tree = match cfg_edit::load_tree(live.path()) {
         Ok(x) => x,
         Err(e) => return text_err(StatusCode::BAD_REQUEST, format!("{e:#}")),
@@ -949,6 +1093,40 @@ fn save_proxy_rules(live: &Arc<LiveConfig>, v: &Json) -> Response<BoxBody> {
         t.insert("ssl_mode".into(), toml::Value::String(ssl_mode));
         t.insert("modify_request_headers".into(), req_headers);
         t.insert("modify_response_headers".into(), resp_headers);
+        // 规格 11/3、A.1：回源 TLS/HTTP 版本、连接池、Tor 出口都必须落盘。
+        // 这里原本只写 5 个键，而 UI（admin_ui.html 的代理规则表）会发 10 个键 ——
+        // 面板每保存一次，就会把 upstream_tls_version / upstream_http_version /
+        // connection_pool / via_tor / tor_socks **静默抹掉**（整段 rules 是重写的）。
+        // upstream_http_version / connection_pool / tor_socks 也是本轮才真正被
+        // proxy.rs 读取，抹掉的后果从「无害」变成「功能消失」。
+        if let Some(tv) = r.get("upstream_tls_version").and_then(|x| x.as_str()) {
+            if !tv.trim().is_empty() {
+                t.insert(
+                    "upstream_tls_version".into(),
+                    toml::Value::String(tv.trim().into()),
+                );
+            }
+        }
+        if let Some(hv) = r.get("upstream_http_version").and_then(|x| x.as_str()) {
+            if !hv.trim().is_empty() {
+                t.insert(
+                    "upstream_http_version".into(),
+                    toml::Value::String(hv.trim().into()),
+                );
+            }
+        }
+        if let Some(cp) = r.get("connection_pool").and_then(|x| x.as_bool()) {
+            t.insert("connection_pool".into(), toml::Value::Boolean(cp));
+        }
+        if let Some(vt) = r.get("via_tor").and_then(|x| x.as_bool()) {
+            t.insert("via_tor".into(), toml::Value::Boolean(vt));
+        }
+        if let Some(ts) = r.get("tor_socks").and_then(|x| x.as_str()) {
+            let ts = ts.trim();
+            if !ts.is_empty() {
+                t.insert("tor_socks".into(), toml::Value::String(ts.into()));
+            }
+        }
         out.push(toml::Value::Table(t));
     }
     let mut tree = match cfg_edit::load_tree(live.path()) {

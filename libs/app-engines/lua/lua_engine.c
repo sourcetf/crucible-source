@@ -162,6 +162,10 @@ static int l_ngx_header_newindex(lua_State *L) {
     if (c && k && v) {
         char line[512];
         int n = snprintf(line, sizeof(line), "%s: %s\r\n", k, v);
+        /* 头值超过 ~505 字节时 snprintf 返回「本来要写多长」> sizeof(line)，
+         * 后面的 memcpy 会读出 line 之外的栈数据。先夹到缓冲区真实容量。 */
+        if (n > 0 && (size_t)n > sizeof(line) - 1)
+            n = (int)sizeof(line) - 1;
         if (n > 0 && c->headers_len + (size_t)n + 1 < sizeof(c->headers)) {
             memcpy(c->headers + c->headers_len, line, (size_t)n);
             c->headers_len += (size_t)n;

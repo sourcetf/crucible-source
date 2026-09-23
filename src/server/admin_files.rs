@@ -185,13 +185,34 @@ fn abs(p: &Path) -> PathBuf {
     }
 }
 
+/// 把请求里的相对路径归一化成「GET 时真正会用到的 web 路径」。
+///
+/// 去掉空段与 `.`、折叠重复 `/`；遇到 `..` 或含反斜杠的段返回 `None`
+/// （`safe_join` 会拒绝它们）。
+///
+/// 闸门必须归一化：`safe_join` 会把 `/./php/shell.php` 解析成
+/// `<root>/php/shell.php`，而闸门原先拿**原始字符串**去做路由前缀匹配 ——
+/// `/./php/shell.php` 不以 `/php/` 开头，于是闸门放行、文件却落进可执行目录，
+/// 直接拿到 GET 执行权（webshell）。`%2F.%2Fphp%2F…` URL 解码后同理。
+fn web_path_of(rel: &str) -> Option<String> {
+    let mut parts: Vec<&str> = Vec::new();
+    for seg in rel.split('/') {
+        match seg {
+            "" | "." => {}
+            ".." => return None,
+            s if s.contains('\\') => return None,
+            s => parts.push(s),
+        }
+    }
+    Some(format!("/{}", parts.join("/")))
+}
+
 /// True if a GET of `rel` under `root` would execute via an app engine (webshell gate).
 pub fn would_execute_on_get(lc: &crate::config::ListenerConfig, rel: &str) -> bool {
-    use crate::config::FileOpenMode;
-    let path = if rel.starts_with('/') {
-        rel.to_string()
-    } else {
-        format!("/{rel}")
+    // 归一化失败（`..` / 反斜杠）时 fail-closed：宁可拒绝一次上传，
+    // 也不要放过一条会落进可执行目录的路径。
+    let Some(path) = web_path_of(rel) else {
+        return true;
     };
     // P1-3（§16.2 定案）：file_open=preview/download 的路径不算可执行——放行上传，
     // GET 时静态展示/下载、绝不执行（would_handle 对 preview/download 本就返回 false）。

@@ -59,6 +59,9 @@ int appengine_execute(
         n = snprintf(buf, sizeof(buf), "%s path=%s\n", hello, path ? path : "/");
         if (n < 0 || appengine_result_alloc(out) != 0)
             return -1;
+        /* 同 appengine_fill_hello：截断时 n 是「本来要写多长」，须夹到缓冲区容量。 */
+        if ((size_t)n >= sizeof(buf))
+            n = (int)sizeof(buf) - 1;
         out->status = 200;
         if (appengine_result_set_headers(out, "Content-Type: text/plain; charset=utf-8\r\n") != 0)
             return -1;

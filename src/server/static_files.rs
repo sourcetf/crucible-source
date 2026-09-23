@@ -181,6 +181,11 @@ const SCRIPT_EXTS: &[&str] = &[
     "lua", "tcl", "sh", "bash", "zsh", "ksh", "c", "cc", "cpp", "cxx", "h", "hpp",
     "rs", "go", "java", "jsp", "jspx", "asp", "aspx", "asa", "shtml", "ts", "tsx",
     "vue", "jsx", "sql", "conf", "ini", "yaml", "yml", "toml", "env",
+    // 浏览器会**主动渲染/执行**的类型。原先只列脚本语言，漏了这些，
+    // 于是「preview 强制 text/plain」对 .html/.js/.svg 完全不生效：
+    // 管理员把 /uploads/x.html 配成 preview，拿到的仍是 text/html + inline，
+    // 上传的页面照常在站点 origin 下渲染并执行脚本（存储型 XSS）。
+    "html", "htm", "xhtml", "hta", "js", "mjs", "cjs", "svg", "xml", "xsl", "xslt",
 ];
 
 fn is_script_ext(path: &Path) -> bool {
@@ -188,6 +193,16 @@ fn is_script_ext(path: &Path) -> bool {
         .and_then(|e| e.to_str())
         .map(|e| SCRIPT_EXTS.iter().any(|s| e.eq_ignore_ascii_case(s)))
         .unwrap_or(false)
+}
+
+/// `Content-Disposition` 值；文件名转义引号/反斜杠/控制字符，防响应头破坏/注入。
+fn disposition_value(path: &Path, d: &str) -> String {
+    let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("file");
+    let safe_name: String = name
+        .chars()
+        .map(|c| if c.is_ascii_graphic() && c != '"' && c != '\\' { c } else { '_' })
+        .collect();
+    format!("{d}; filename=\"{safe_name}\"")
 }
 
 async fn serve_file(
@@ -210,6 +225,23 @@ async fn serve_file(
         _ => None,
     };
 
+    // HEAD 必须在 Range 与整读**之前**短路。hyper 会丢弃 HEAD 的 body，但这里
+    // 仍会 range_response（最多 32MiB 的 vec![0u8; take] + read_exact）或
+    // read_file_capped（最多 16MiB）把数据读一遍再扔掉 —— 一个 ~120 字节的
+    // `HEAD /big.bin` + `Range: bytes=0-33554431` 就是一次 32MiB 放大。
+    if req.method() == Method::HEAD {
+        let mut b = Response::builder()
+            .status(StatusCode::OK)
+            .header(header::CONTENT_TYPE, ct)
+            .header(header::CONTENT_LENGTH, len)
+            .header(header::ACCEPT_RANGES, "bytes");
+        if let Some(d) = disposition {
+            b = b.header(header::CONTENT_DISPOSITION, disposition_value(path, d));
+            b = b.header("x-content-type-options", "nosniff");
+        }
+        return Ok(b.body(empty()).unwrap());
+    }
+
     if let Some(range) = req.headers().get(header::RANGE) {
         if let Ok(r) = range.to_str() {
             if let Some(resp) = range_response(path, len, r, &ct, disposition)? {
@@ -229,21 +261,9 @@ async fn serve_file(
         .header(header::CONTENT_TYPE, ct)
         .header(header::CONTENT_LENGTH, data.len());
     if let Some(d) = disposition {
-        // P2-13：filename 转义引号/反斜杠/控制字符，防响应头破坏/注入；
         // 预览与下载响应禁 MIME 嗅探（浏览器不得把 text/plain 拉去执行）。
-        let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("file");
-        let safe_name: String = name
-            .chars()
-            .map(|c| if c.is_ascii_graphic() && c != '"' && c != '\\' { c } else { '_' })
-            .collect();
-        b = b.header(
-            header::CONTENT_DISPOSITION,
-            format!("{d}; filename=\"{safe_name}\""),
-        );
+        b = b.header(header::CONTENT_DISPOSITION, disposition_value(path, d));
         b = b.header("x-content-type-options", "nosniff");
-    }
-    if req.method() == Method::HEAD {
-        return Ok(b.body(empty()).unwrap());
     }
     Ok(b.body(full(data)).unwrap())
 }
