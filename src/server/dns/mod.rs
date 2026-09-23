@@ -1205,6 +1205,15 @@ pub fn write_all(cfg: &DnsConfig) -> Result<Vec<(String, PathBuf)>> {
             break;
         }
         for z in &zones {
+            // 从区（secondary/slave）的 zone 文件归 **named 自己**维护：
+            // gen_named_conf 为它写的是 `type secondary; primaries { ... };`，
+            // AXFR/IXFR 与 refresh/retry/expire 全部由 named 负责，文件内容也由它落盘。
+            // 这里若照样生成，就会用本地的空记录覆盖掉 named 刚传下来的区；
+            // 而且生成出来的文本没有 SOA（下面只有 kind==master 才补 SOA/NS），
+            // named 会以「不是合法的 master file」拒载 —— 从区等于永远起不来。
+            if z.kind != "master" {
+                continue;
+            }
             let recs: Vec<RecordRow> = list_records(&z.name)?.into_iter().filter(|r| r.line == *line_tag).collect();
             let path = zones_dir.join(zone_file_name(z, view_tag));
             // serial 单调：读回本次覆盖前的 SOA serial，保证严格递增，
