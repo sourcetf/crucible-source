@@ -86,3 +86,6 @@ _commit_msg.txt
 www-apps/*/deps/
 src/**/*.orig
 src/**/*.broken
+build*.log
+base-build*.log
+*.tgz
