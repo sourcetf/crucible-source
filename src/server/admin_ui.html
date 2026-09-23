@@ -579,10 +579,20 @@ function bindGeoipActionButtons(root){
 function esc(s){if(s==null)return '';return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;');}
 function scrubBrand(s){if(!s)return s;const BRAND='cloud'+'flare';return String(s).replace(new RegExp(BRAND,'gi'),'公开 CDN').replace(/\bCF\b/g,'公开 CDN')}
 const base=(location.pathname.replace(/\/+$/,'')||'/__admin');
+// 传输层失败以前会**直接抛出**：fetch 一 reject，调用方的 `const r=await api(...)`
+// 就中断，而整个文件只有 2 处 try——结果是面板静默什么都不做：没有 toast、
+// 没有提示文字、表格空白，看起来就像「这个按钮坏了」或「这页没实现」。
+// 这里统一兜住，把原因经由既有字段 r.text 回给调用方，
+// 所有 out(el,r.text,r.ok) / toast(r.text,!r.ok) 都能把它显示出来。
 async function api(path,opts){
-  const r=await fetch(base+path,opts||{});
-  const t=await r.text();
-  return {ok:r.ok,status:r.status,text:t};
+  try{
+    const r=await fetch(base+path,opts||{});
+    const t=await r.text();
+    return {ok:r.ok,status:r.status,text:t};
+  }catch(e){
+    const why=(e&&e.message)?e.message:String(e);
+    return {ok:false,status:0,text:'请求失败: '+why};
+  }
 }
 let toastTimer=null;
 function toast(msg,bad){
@@ -616,11 +626,13 @@ async function loadCfg(){
   if(!r.ok||!r.json){toast('载入配置失败: '+r.text,true);return false;}
   CFG=r.json;return true;
 }
-function listenerByPort(port){return (CFG.listeners||[]).find(l=>String(l.port)===String(port));}
+// CFG 为 null 时（首次 /api/config/json 没拿到）不能直接取 .listeners：
+// 那会抛 TypeError，把调用它的每个 tab 处理函数一起带死。
+function listenerByPort(port){return ((CFG&&CFG.listeners)||[]).find(l=>String(l.port)===String(port));}
 function fillPortSelect(sel,keep){
   const cur=keep!==undefined?keep:(sel.value||'');
   sel.innerHTML='';
-  (CFG.listeners||[]).forEach(l=>{
+  ((CFG&&CFG.listeners)||[]).forEach(l=>{
     const o=document.createElement('option');
     o.value=l.port;o.textContent=l.port+' — '+(l.server_name||l.root);
     sel.appendChild(o);
