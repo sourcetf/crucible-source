@@ -132,12 +132,21 @@ pub fn resolve_target(host: &str, port: u16) -> Result<SocketAddr, String> {
 /// 明显不应转发的目标地址（环回 / 私有 / 保留 / 多播 / 未指定……）。
 ///
 /// 与 `dns/geoip.rs::is_disallowed_ip` 同一取向（那里是 MaxMind 下载用的出向校验），
-/// 额外做一件事：把 IPv4-mapped IPv6（`::ffff:10.0.0.1`）折回 IPv4 再判定。
-/// 不做这步的话，`::ffff:` 写法可以整体绕过 v4 的全部规则。
+/// 额外做两件事：
+///
+/// 1. 把 IPv4-mapped IPv6（`::ffff:10.0.0.1`）折回 IPv4 再判定。不做这步的话，
+///    `::ffff:` 写法可以整体绕过 v4 的全部规则；
+/// 2. 同样折回 **NAT64**（`64:ff9b::/96`，RFC 6052）与 **6to4**（`2002::/16`，
+///    RFC 3056）里嵌的 v4。这两个前缀本身就是「v4 装进 v6」的过渡机制：包一出本机，
+///    网关/转换器就把它解回内网的 v4 投递，所以 `64:ff9b::a00:1` 等价于
+///    `10.0.0.1`、`2002:0a00:0001::` 等价于 `10.0.0.1` —— 不折回就是再绕过一次
+///    v4 规则。Teredo（`2001:0000::/32`）内嵌地址带混淆位、CGNAT（`100.64.0.0/10`，
+///    RFC 6598 共享地址空间）根本不是 v6 过渡机制但同样不是公网单播，两者无法可靠
+///    折回判定，直接整体拒绝。
 pub fn is_disallowed_ip(ip: &IpAddr) -> bool {
     use std::net::IpAddr::*;
     if let V6(v) = ip {
-        if let Some(v4) = v4_mapped(*v) {
+        if let Some(v4) = embedded_v4(*v) {
             return is_disallowed_ip(&V4(v4));
         }
     }
@@ -150,6 +159,7 @@ pub fn is_disallowed_ip(ip: &IpAddr) -> bool {
                 || v.is_broadcast()
                 || v.is_multicast()
                 || v.is_documentation()
+                || is_cgnat(*v)
                 || v.octets()[0] == 0 // 0.0.0.0/8
         }
         V6(v) => {
@@ -158,18 +168,48 @@ pub fn is_disallowed_ip(ip: &IpAddr) -> bool {
                 || v.is_multicast()
                 || v.is_unique_local()
                 || v.is_unicast_link_local()
+                || is_teredo_or_nat64_local(*v)
         }
     }
 }
 
-/// `::ffff:0:0/96` → IPv4，其余为 `None`。
-fn v4_mapped(v: Ipv6Addr) -> Option<Ipv4Addr> {
+/// 过渡前缀里嵌的 IPv4。折回后就能套用全部 v4 规则（含 `|| is_cgnat(...)`）。
+fn embedded_v4(v: Ipv6Addr) -> Option<Ipv4Addr> {
     let o = v.octets();
+    // `::ffff:0:0/96`（IPv4-mapped，RFC 4291 §2.5.5.2）：双栈栈上直接当 v4 投递。
     if o[..10] == [0u8; 10] && o[10] == 0xff && o[11] == 0xff {
-        Some(Ipv4Addr::new(o[12], o[13], o[14], o[15]))
-    } else {
-        None
+        return Some(Ipv4Addr::new(o[12], o[13], o[14], o[15]));
     }
+    // `64:ff9b::/96`（NAT64 well-known prefix）：后 32 位是 v4，中间 64 位必须为 0
+    // （RFC 6052 §2.2 规定 WKP 只放 v4，不再嵌接口标识）。
+    if o[..4] == [0x00, 0x64, 0xff, 0x9b] && o[4..12] == [0u8; 8] {
+        return Some(Ipv4Addr::new(o[12], o[13], o[14], o[15]));
+    }
+    // `2002::/16`（6to4，RFC 3056 §2）：第 3–6 字节是 6to4 网关之后的 v4 目标。
+    if o[0] == 0x20 && o[1] == 0x02 {
+        return Some(Ipv4Addr::new(o[2], o[3], o[4], o[5]));
+    }
+    // `::/96`（IPv4-compatible，RFC 4291 §2.5.5.1 已废弃）：`::127.0.0.1` 这种写法在
+    // 部分协议栈（历史 Windows、KAME 时代 BSD）仍按 v4 投递，按同一取向折回。
+    // 纯 `::` 与 `::1` 也会命中这里，但折回后落在 is_unspecified/is_loopback，结论不变。
+    if o[..12] == [0u8; 12] {
+        return Some(Ipv4Addr::new(o[12], o[13], o[14], o[15]));
+    }
+    None
+}
+
+/// `100.64.0.0/10`（RFC 6598 §7 共享地址空间）：运营商 CGNAT、云内网大量使用，
+/// `is_private()` 不覆盖它。`Ipv4Addr::is_shared()` 目前仍是 unstable，故手写位判定。
+fn is_cgnat(v: Ipv4Addr) -> bool {
+    let o = v.octets();
+    o[0] == 100 && (o[1] & 0b1100_0000) == 0b0100_0000
+}
+
+/// `2001:0000::/32`（Teredo）与 `64:ff9b:1::/48`（RFC 8215 本地 NAT64 前缀）：
+/// 内嵌 v4 的位置不固定（Teredo 还带混淆位），无法折回，整体拒绝。
+fn is_teredo_or_nat64_local(v: Ipv6Addr) -> bool {
+    let o = v.octets();
+    o[..4] == [0x20, 0x01, 0x00, 0x00] || o[..6] == [0x00, 0x64, 0xff, 0x9b, 0x00, 0x01]
 }
 
 /// RFC 9000 §16：变长整数编码（自动取最短长度）。
@@ -306,6 +346,20 @@ mod tests {
         // IPv4-mapped 必须折回 v4 判定，否则整条 v4 规则被绕过。
         assert!(is_disallowed_ip(&"::ffff:10.0.0.1".parse().unwrap()));
         assert!(is_disallowed_ip(&"::ffff:127.0.0.1".parse().unwrap()));
+        // 过渡前缀同理：NAT64 / 6to4 / IPv4-compatible 里嵌的都是 v4 地址。
+        assert!(is_disallowed_ip(&"64:ff9b::a00:1".parse().unwrap())); // NAT64 → 10.0.0.1
+        assert!(is_disallowed_ip(&"64:ff9b::7f00:1".parse().unwrap())); // NAT64 → 127.0.0.1
+        assert!(is_disallowed_ip(&"2002:a00:1::".parse().unwrap())); // 6to4 → 10.0.0.1
+        assert!(is_disallowed_ip(&"::7f00:1".parse().unwrap())); // v4-compatible → 127.0.0.1
+        // 位置不固定 / 非公网单播的过渡前缀整体拒绝。
+        assert!(is_disallowed_ip(&"2001::1".parse().unwrap())); // Teredo
+        assert!(is_disallowed_ip(&"64:ff9b:1::1".parse().unwrap())); // 本地 NAT64
+        assert!(is_disallowed_ip(&"100.64.0.1".parse().unwrap())); // CGNAT
+        assert!(is_disallowed_ip(&"100.127.255.254".parse().unwrap())); // CGNAT 上界
+        // 折回后是公网单播的过渡地址不误杀；CGNAT 边界外也不误杀。
+        assert!(!is_disallowed_ip(&"64:ff9b::101:101".parse().unwrap()));
+        assert!(!is_disallowed_ip(&"100.63.255.255".parse().unwrap()));
+        assert!(!is_disallowed_ip(&"100.128.0.0".parse().unwrap()));
         // 与 geoip.rs 一致：RFC 5737 文档地址（192.0.2.0/24 等）也在拒绝之列。
         assert!(is_disallowed_ip(&"192.0.2.1".parse().unwrap()));
         // 真正的公网单播才放行。

@@ -25,41 +25,62 @@ from urllib.parse import urlparse
 from geoip_tor_pool import tor_newnym_port
 
 
+def _recv_exact(s: socket.socket, n: int) -> bytes:
+    """收满 n 字节。
+
+    SOCKS5 应答是定长的，`recv(n)` 却只保证「不超过 n」。短读会让后面按 ATYP
+    跳过绑定地址的长度算错，把剩下的应答字节留在流里当成隧道数据 —— 上游收到的
+    请求前面就会多出垃圾，表现为「JSON 解析莫名其妙失败」这种难查的错。
+    """
+    buf = b""
+    while len(buf) < n:
+        chunk = s.recv(n - len(buf))
+        if not chunk:
+            raise OSError(f"socks5 short read: want {n} bytes, got {len(buf)}")
+        buf += chunk
+    return buf
+
+
 def _socks5_connect(host: str, port: int, proxy: tuple[str, int],
-                    username: str | None = None) -> socket.socket:
+                    username: str | None = None,
+                    timeout: float = 60) -> socket.socket:
     """SOCKS5 CONNECT：传主机名不做本地 DNS（.onion 必须）。
     username 非空时走用户名/密码认证——Tor IsolateSOCKSAuth 使不同用户名
-    使用不同电路（stream isolation）。"""
-    s = socket.create_connection(proxy, timeout=60)
+    使用不同电路（stream isolation）。timeout 同时管建连与每次收发：
+    此前这里写死 60，调用方 `http_get(timeout=…)` 传下来的值被整个丢掉。"""
+    s = socket.create_connection(proxy, timeout=timeout)
     if username:
         s.sendall(b"\x05\x01\x02")
     else:
         s.sendall(b"\x05\x01\x00")
-    resp = s.recv(2)
-    if len(resp) < 2 or resp[0] != 5:
+    resp = _recv_exact(s, 2)
+    if resp[0] != 5:
         raise OSError(f"socks5 greet failed: {resp!r}")
     if resp[1] == 2:  # 需要用户名/密码（我们主动提供了）
         u = username.encode("utf-8") if username else b""
         s.sendall(b"\x01" + bytes([len(u)]) + u + b"\x00")
-        resp = s.recv(2)
-        if len(resp) < 2 or resp[1] != 0:
+        resp = _recv_exact(s, 2)
+        if resp[1] != 0:
             raise OSError(f"socks5 auth failed: {resp!r}")
     elif resp[1] != 0:
         raise OSError(f"socks5 no-auth rejected: {resp!r}")
     host_b = host.encode("utf-8")
     req = b"\x05\x01\x00\x03" + bytes([len(host_b)]) + host_b + port.to_bytes(2, "big")
     s.sendall(req)
-    head = s.recv(4)
-    if len(head) < 4 or head[1] != 0:
+    head = _recv_exact(s, 4)
+    if head[1] != 0:
         raise OSError(f"socks5 connect failed: {head!r}")
     atyp = head[3]
     if atyp == 0x01:
-        s.recv(6)
+        _recv_exact(s, 6)
     elif atyp == 0x03:
-        ln = s.recv(1)[0]
-        s.recv(ln + 2)
+        ln = _recv_exact(s, 1)[0]
+        _recv_exact(s, ln + 2)
     elif atyp == 0x04:
-        s.recv(18)
+        _recv_exact(s, 18)
+    else:
+        # 未知 ATYP 下「不消费就返回」等于把应答残字节当隧道数据，必须报错。
+        raise OSError(f"socks5 connect failed: bad ATYP {atyp:#x}")
     return s
 
 
@@ -83,8 +104,12 @@ def tor_socks_endpoints_fallback() -> Iterable[tuple[str, int]]:
 def _fetch_via_socks(url: str, proxy: tuple[str, int],
                      username: str | None = None, timeout: int = 120) -> bytes:
     u = urlparse(url)
+    if not u.hostname:
+        # 否则 host.encode() 直接 AttributeError —— 调用方只捕 OSError/RuntimeError，
+        # 整个 enrich 步骤会因此整套挂掉，而不是跳过这一个 URL。
+        raise OSError(f"no host in url {url!r}")
     s = _socks5_connect(u.hostname, u.port or (443 if u.scheme == "https" else 80),
-                        proxy, username=username)
+                        proxy, username=username, timeout=timeout)
     if u.scheme == "https":
         ctx = ssl.create_default_context()
         ctx.check_hostname = False

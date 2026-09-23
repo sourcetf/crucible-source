@@ -3,7 +3,12 @@
 use crate::config::{AdminConfig, BasicAuthConfig};
 use crate::server::password;
 use http::header::{self, HeaderMap};
-use http::Request;
+use http::{Request, StatusCode};
+use once_cell::sync::Lazy;
+use parking_lot::Mutex;
+use std::collections::HashMap;
+use std::net::IpAddr;
+use std::time::{Duration, Instant};
 
 /// True when admin panel must require credentials.
 ///
@@ -42,13 +47,36 @@ pub fn check_admin_headers(headers: &HeaderMap, admin: &AdminConfig) -> bool {
         .any(|u| check_user_pass_headers(headers, &u.username, &u.password_hash))
 }
 
-pub fn check_listener<T>(req: &Request<T>, ba: &BasicAuthConfig) -> bool {
-    check_listener_headers(req.headers(), ba)
+/// h1 入口：listener 级 Basic Auth（带来源 IP 的失败退避，见文末 FailTable）。
+/// 泛型化：admin 入口可能收到 Request<Incoming>（h1）或 Request<BoxBody>（h2/h3 复用
+/// 完整 admin::handle），鉴权只读 headers，与 body 类型无关。
+pub fn check_listener<T>(req: &Request<T>, ba: &BasicAuthConfig, ip: IpAddr) -> BasicCheck {
+    check_listener_headers_at(req.headers(), ba, ip)
 }
 
 /// 供 h2/h3 复用：无 Request 包装，直接对 headers 校验 listener 级 Basic Auth。
 pub fn check_listener_headers(headers: &HeaderMap, ba: &BasicAuthConfig) -> bool {
     check_user_pass_headers(headers, &ba.username, &ba.password_hash)
+}
+
+/// 带退避的 listener 级校验（h2/h3 与 h1 共用同一语义）。
+pub fn check_listener_headers_at(
+    headers: &HeaderMap,
+    ba: &BasicAuthConfig,
+    ip: IpAddr,
+) -> BasicCheck {
+    // 退避期内**不跑 argon2**：否则「退避」只是回个错，CPU 照样被每次尝试烧掉，
+    // 攻击者用错口令并发打过来仍然能把 argon2 打满。
+    if let Some(d) = LISTENER_FAILS.blocked(ip) {
+        return BasicCheck::Throttled(d);
+    }
+    if check_listener_headers(headers, ba) {
+        LISTENER_FAILS.note_success(ip);
+        BasicCheck::Ok
+    } else {
+        LISTENER_FAILS.note_failure(ip);
+        BasicCheck::Unauthorized
+    }
 }
 
 fn check_user_pass_headers(headers: &HeaderMap, username: &str, password_hash: &str) -> bool {
@@ -119,4 +147,360 @@ fn decode_base64(input: &str) -> Option<Vec<u8>> {
         i += 4;
     }
     Some(out)
+}
+
+// ===== 失败退避 / 失败锁定（按来源 IP）=====
+//
+// 为什么必须加：每次校验都要跑一遍 argon2id（yescrypt 同样慢），这是**故意**的
+// 口令哈希成本，但此前没有任何失败计数——于是两件事同时成立：
+//   1. 在线爆破：可以无限次尝试管理口令；
+//   2. CPU 放大：`POST /__admin/...` 不带凭据/带错口令并发打过来，每个请求都换一次
+//      百毫秒级的 argon2，几台肉鸡就能把 CPU 打满（连带拖垮所有 listener 的静态服务）。
+// 参数刻意保守，避免误伤真人管理员：只在**同一来源 IP 同一作用域**连续失败到阈值后
+// 才开始退避，退避有上界（≤64s），任何一次成功立刻清零，超过窗口没失败也清零。
+
+/// Listener 级校验的失败计数。
+static LISTENER_FAILS: Lazy<FailTable> = Lazy::new(FailTable::new);
+/// admin 路径校验的失败计数。
+///
+/// 为什么与 listener 分开记：两条链路可以在同一 IP 上「先成功后失败」——
+/// listener Basic 过了、admin Basic 没过。若共用一份计数，每次请求的 listener 成功
+/// 都会把 admin 的失败计数清零，admin 口令爆破就永远不会触发退避。
+static ADMIN_FAILS: Lazy<FailTable> = Lazy::new(FailTable::new);
+
+/// 连续失败多少次后进入退避（前几次立即返回错误，够真人改对口令）。
+const FAIL_THRESHOLD: u32 = 8;
+/// 退避时长上界（防止把合法管理员长期锁在门外）。
+const MAX_BLOCK: Duration = Duration::from_secs(300);
+/// 计数有效期：距上次失败超过这么久则计数清零。
+const FAIL_WINDOW: Duration = Duration::from_secs(900);
+/// 表容量上限（无界内存防护）：只记「正在失败」的来源，正常流量下几乎为空；
+/// 满时淘汰最旧一条（见 note_failure）。
+const FAIL_TABLE_CAP: usize = 4096;
+
+/// listener 级 Basic Auth 的判定结果。
+///
+/// 比 bool 多一档 `Throttled`：退避期回 429 而不是 401 —— 401 会让浏览器反复弹
+/// 口令框重试，反而放大请求量；429 带 Retry-After，客户端能正确退让。
+pub enum BasicCheck {
+    Ok,
+    Unauthorized,
+    Throttled(Duration),
+}
+
+/// admin 路径入口的**廉价**门（不跑 argon2、不碰请求体）。
+pub enum AdminGate {
+    Proceed,
+    Unauthorized,
+    Throttled(Duration),
+}
+
+/// admin 路径在**收请求体之前**的鉴权门（三协议必须一致）。
+///
+/// 为什么要有它：h1 会先收满 32MiB body 再交给 admin::handle，而 admin::handle 的
+/// 第一件事才是鉴权 —— 于是一个不带凭据的并发 POST 就能让每个连接各占 32MiB
+/// （h2/h3 各 8MiB），不需要通过鉴权即可放大内存。
+/// 判定顺序：退避 → 有没有携带 Basic 凭据（纯头部解析，零哈希成本）→ 完整校验。
+///
+/// 注意这里会跑一次 argon2id，而 admin::handle 里还会再跑一次（同一份 headers、
+/// 同一份配置）—— 这次重复是**故意**的：宁可让合法的管理请求多花一次哈希
+///（管理面请求量极小），也不要让「带任意垃圾凭据」的请求拿到 32MiB/请求 的缓冲。
+/// 本函数的校验结果同时是失败计数/退避的唯一记账点。
+pub fn admin_gate(headers: &HeaderMap, admin: &AdminConfig, ip: IpAddr) -> AdminGate {
+    if let Some(d) = ADMIN_FAILS.blocked(ip) {
+        return AdminGate::Throttled(d);
+    }
+    if !has_basic_credentials(headers) {
+        // 没凭据 → 立刻回 401，不跑哈希也不收 body。
+        return AdminGate::Unauthorized;
+    }
+    if check_admin_headers(headers, admin) {
+        ADMIN_FAILS.note_success(ip);
+        AdminGate::Proceed
+    } else {
+        ADMIN_FAILS.note_failure(ip);
+        AdminGate::Unauthorized
+    }
+}
+
+/// admin::handle 返回后的**兜底**记账。
+///
+/// gate 已经用同一份 headers/配置验过凭据并记过账，所以正常路径这里什么都不做；
+/// 只有「gate 通过、admin::handle 却回了 401」这种边角（两次校验之间配置被热重载、
+/// 口令被改）才补一次失败计数，避免这种请求白跑。
+pub fn note_admin_result(ip: IpAddr, status: StatusCode) {
+    if status == StatusCode::UNAUTHORIZED {
+        ADMIN_FAILS.note_failure(ip);
+    }
+}
+
+/// 429 响应用的 `Retry-After`（秒，最小 1）。
+pub fn retry_after_secs(d: Duration) -> u64 {
+    d.as_secs().max(1)
+}
+
+/// 是否携带 Basic 凭据（只看头，**不验口令**）。解析口径与
+/// `check_user_pass_headers` 一致，避免「门放行、校验必然失败」的错配。
+fn has_basic_credentials(headers: &HeaderMap) -> bool {
+    headers
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.strip_prefix("Basic "))
+        .is_some_and(|b64| !b64.trim().is_empty())
+}
+
+struct FailState {
+    count: u32,
+    last: Instant,
+    blocked_until: Instant,
+}
+
+/// 一张按 IP 记录的失败表。用 Mutex<HashMap> 而不是无锁结构：命中退避的请求本来
+/// 就应该被挡住、不该有吞吐，热路径上也只是加锁查一次 map。
+struct FailTable {
+    map: Mutex<HashMap<IpAddr, FailState>>,
+}
+
+impl FailTable {
+    /// 注意别写成 `const fn`：`HashMap::new` 在当前工具链里还不是 const fn。
+    fn new() -> Self {
+        Self {
+            map: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// 处于退避期则返回剩余时长；顺带把过窗口的记录清掉（惰性回收，无后台任务）。
+    fn blocked(&self, ip: IpAddr) -> Option<Duration> {
+        let now = Instant::now();
+        let mut map = self.map.lock();
+        let (last, until) = match map.get(&ip) {
+            Some(s) => (s.last, s.blocked_until),
+            None => return None,
+        };
+        if now.duration_since(last) > FAIL_WINDOW {
+            map.remove(&ip);
+            return None;
+        }
+        (until > now).then(|| until - now)
+    }
+
+    fn note_failure(&self, ip: IpAddr) {
+        let now = Instant::now();
+        let mut map = self.map.lock();
+        // 内存防护：满时淘汰最旧的一条，**绝不整表清空**——整表清空等于攻击者用
+        // 垃圾来源 IP 刷满表就把所有人的退避状态一起重置（限流/退避反而被主动解除）。
+        // 淘汰顺序刻意优先挑「未处于退避期」的最旧条目：退避中的条目留在表里，
+        // 否则背着一身失败计数的攻击者只要继续刷表，就能把自己的封禁挤掉。
+        if map.len() >= FAIL_TABLE_CAP && !map.contains_key(&ip) {
+            let victim = map
+                .iter()
+                .filter(|(_, s)| s.blocked_until <= now)
+                .min_by_key(|(_, s)| s.last)
+                .map(|(k, _)| *k)
+                .or_else(|| {
+                    map.iter()
+                        .min_by_key(|(_, s)| s.last)
+                        .map(|(k, _)| *k)
+                });
+            if let Some(v) = victim {
+                map.remove(&v);
+            }
+        }
+        let e = map.entry(ip).or_insert(FailState {
+            count: 0,
+            last: now,
+            blocked_until: now,
+        });
+        if now.duration_since(e.last) > FAIL_WINDOW {
+            e.count = 0;
+        }
+        e.count = e.count.saturating_add(1);
+        e.last = now;
+        e.blocked_until = if e.count >= FAIL_THRESHOLD {
+            // 阈值以上指数退避（1s、2s、4s…），封顶 MAX_BLOCK：退避有上界，
+            // 合法管理员打错口令最多等一小会儿，不会被永久锁死。
+            let over = (e.count - FAIL_THRESHOLD).min(6);
+            now + Duration::from_secs(1u64 << over).min(MAX_BLOCK)
+        } else {
+            now
+        };
+    }
+
+    fn note_success(&self, ip: IpAddr) {
+        self.map.lock().remove(&ip);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ba_with(hash: &str) -> BasicAuthConfig {
+        BasicAuthConfig {
+            realm: "t".into(),
+            username: "u".into(),
+            password_hash: hash.into(),
+        }
+    }
+
+    fn admin_with_hash(hash: &str) -> AdminConfig {
+        AdminConfig {
+            realm: "r".into(),
+            path: "/__admin".into(),
+            users: vec![crate::config::AdminUser {
+                username: "u".into(),
+                password_hash: hash.into(),
+            }],
+            listeners_allow: vec![],
+        }
+    }
+
+    fn b64(s: &str) -> String {
+        const T: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        let b = s.as_bytes();
+        let mut out = String::new();
+        for c in b.chunks(3) {
+            let n = ((c[0] as u32) << 16)
+                | ((*c.get(1).unwrap_or(&0) as u32) << 8)
+                | (*c.get(2).unwrap_or(&0) as u32);
+            out.push(T[(n >> 18) as usize & 63] as char);
+            out.push(T[(n >> 12) as usize & 63] as char);
+            out.push(if c.len() > 1 { T[(n >> 6) as usize & 63] as char } else { '=' });
+            out.push(if c.len() > 2 { T[n as usize & 63] as char } else { '=' });
+        }
+        out
+    }
+
+    fn headers_with_basic(user: &str, pass: &str) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        h.insert(
+            header::AUTHORIZATION,
+            http::HeaderValue::from_str(&format!("Basic {}", b64(&format!("{user}:{pass}"))))
+                .unwrap(),
+        );
+        h
+    }
+
+    /// 无凭据 → 立即拒绝（收 body 之前就该挡住，且不跑口令哈希）。
+    #[test]
+    fn admin_gate_rejects_missing_credentials() {
+        // 空 hash 的配置：真出现在 check_admin_headers 里也不会跑 argon2。
+        let cfg = admin_with_hash("");
+        let h = HeaderMap::new();
+        assert!(matches!(
+            admin_gate(&h, &cfg, "10.9.9.9".parse().unwrap()),
+            AdminGate::Unauthorized
+        ));
+        // 非 Basic 方案同样拒绝。
+        let mut h2 = HeaderMap::new();
+        h2.insert(
+            header::AUTHORIZATION,
+            http::HeaderValue::from_static("Bearer xyz"),
+        );
+        assert!(matches!(
+            admin_gate(&h2, &cfg, "10.9.9.10".parse().unwrap()),
+            AdminGate::Unauthorized
+        ));
+    }
+
+    /// 口令正确才 Proceed；错误口令被 gate 直接拒（不会带着 body 进 admin::handle）。
+    #[test]
+    fn admin_gate_verifies_credentials_before_body() {
+        let hash = password::hash_password("pw").unwrap();
+        let cfg = admin_with_hash(&hash);
+        let ip: IpAddr = "10.9.9.16".parse().unwrap();
+        assert!(matches!(
+            admin_gate(&headers_with_basic("u", "pw"), &cfg, ip),
+            AdminGate::Proceed
+        ));
+        assert!(matches!(
+            admin_gate(&headers_with_basic("u", "nope"), &cfg, ip),
+            AdminGate::Unauthorized
+        ));
+    }
+
+    /// 阈值内的失败不退避；达到阈值后同一 IP 被 429 挡住。
+    #[test]
+    fn admin_failures_escalate_to_throttle_for_same_ip() {
+        let ip: IpAddr = "10.9.9.11".parse().unwrap();
+        let other: IpAddr = "10.9.9.12".parse().unwrap();
+        // 空 hash 恒失败且不跑 argon2，计数路径与真实失败一致。
+        let cfg = admin_with_hash("");
+        let h = headers_with_basic("u", "wrong");
+        for i in 0..FAIL_THRESHOLD {
+            assert!(
+                matches!(admin_gate(&h, &cfg, ip), AdminGate::Unauthorized),
+                "attempt {i} must be rejected"
+            );
+        }
+        assert!(matches!(admin_gate(&h, &cfg, ip), AdminGate::Throttled(_)));
+        // 别的 IP 不受影响（不做全局封锁）。
+        assert!(matches!(
+            admin_gate(&h, &cfg, other),
+            AdminGate::Unauthorized
+        ));
+        // 成功即清零（用 listener 表验证同一套清零语义）。
+        LISTENER_FAILS.note_failure(other);
+        assert!(LISTENER_FAILS.blocked(other).is_some());
+        LISTENER_FAILS.note_success(other);
+        assert!(LISTENER_FAILS.blocked(other).is_none());
+    }
+
+    /// listener 校验在退避期内快速失败（不再进口令哈希路径）。
+    #[test]
+    fn listener_check_throttles_after_threshold() {
+        let ip: IpAddr = "10.9.9.15".parse().unwrap();
+        // 空 hash 恒失败且不跑 argon2，计数路径与真实失败一致。
+        let ba = ba_with("");
+        let h = headers_with_basic("u", "wrong");
+        for _ in 0..FAIL_THRESHOLD {
+            assert!(matches!(
+                check_listener_headers_at(&h, &ba, ip),
+                BasicCheck::Unauthorized
+            ));
+        }
+        assert!(matches!(
+            check_listener_headers_at(&h, &ba, ip),
+            BasicCheck::Throttled(_)
+        ));
+    }
+
+    /// 成功一次就清零（真人不该被自己几次手误锁死）。
+    #[test]
+    fn success_clears_failures() {
+        let ip: IpAddr = "10.9.9.13".parse().unwrap();
+        for _ in 0..FAIL_THRESHOLD {
+            LISTENER_FAILS.note_failure(ip);
+        }
+        assert!(LISTENER_FAILS.blocked(ip).is_some());
+        LISTENER_FAILS.note_success(ip);
+        assert!(LISTENER_FAILS.blocked(ip).is_none());
+    }
+
+    /// 表满时淘汰最旧，而不是清空全表（否则攻击者刷满表即解除全部退避）。
+    #[test]
+    fn table_full_evicts_oldest_but_keeps_throttled_entries() {
+        let t = FailTable::new();
+        let victim: IpAddr = "10.0.0.1".parse().unwrap();
+        // 推到阈值以上若干次，让退避时长升到秒级上限 —— 测试期间它必须一直处于
+        // 「退避中」，这样淘汰逻辑只能用「未退避的最旧条目」来腾位置。
+        for _ in 0..(FAIL_THRESHOLD + 6) {
+            t.note_failure(victim);
+        }
+        assert!(t.blocked(victim).is_some(), "victim must be throttled");
+        for i in 0..(FAIL_TABLE_CAP as u32 + 16) {
+            let ip: IpAddr = IpAddr::V4(std::net::Ipv4Addr::from(0x0b00_0000 + i));
+            t.note_failure(ip);
+        }
+        assert!(t.map.lock().len() <= FAIL_TABLE_CAP, "cap must hold");
+        assert!(
+            t.map.lock().len() > FAIL_TABLE_CAP / 2,
+            "must not wipe the table"
+        );
+        // 退避中的条目仍在（未被整表清空、也没被自己的刷表挤掉）。
+        assert!(
+            t.blocked(victim).is_some(),
+            "throttle state must survive eviction"
+        );
+    }
 }

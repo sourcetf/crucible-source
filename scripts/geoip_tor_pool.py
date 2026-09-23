@@ -65,16 +65,38 @@ def _write_torrc(i: int) -> Path:
     return torrc
 
 
+def _pid_alive(i: int) -> bool:
+    """实例 i 是否已有存活进程（pidfile 有效）；过期 pidfile 顺手删掉。"""
+    pidfile = Path(POOL_DIR) / f"w{i}" / "tor.pid"
+    if not pidfile.is_file():
+        return False
+    try:
+        os.kill(int(pidfile.read_text().strip()), 0)
+        return True
+    except (ValueError, ProcessLookupError, PermissionError):
+        pidfile.unlink(missing_ok=True)
+        return False
+
+
+def _kill_instance(i: int) -> None:
+    """按 pidfile 收掉实例 i（拉起后等不到 SOCKS 口时调用）。"""
+    pidfile = Path(POOL_DIR) / f"w{i}" / "tor.pid"
+    if not _pid_alive(i):
+        return
+    try:
+        pid = int(pidfile.read_text().strip())
+        os.kill(pid, signal.SIGTERM)
+        print(f"tor_pool: SIGTERM w{i} pid={pid} (not ready)", file=sys.stderr)
+    except (ValueError, ProcessLookupError, PermissionError):
+        pass
+    pidfile.unlink(missing_ok=True)
+
+
 def _spawn_instance(i: int) -> bool:
     torrc = _write_torrc(i)
     pidfile = Path(POOL_DIR) / f"w{i}" / "tor.pid"
-    if pidfile.is_file():
-        try:
-            pid = int(pidfile.read_text().strip())
-            os.kill(pid, 0)
-            return True  # 仍在跑
-        except (ValueError, ProcessLookupError, PermissionError):
-            pidfile.unlink(missing_ok=True)
+    if _pid_alive(i):
+        return True  # 仍在跑
     try:
         proc = subprocess.Popen(
             ["tor", "-f", str(torrc), "--RunAsDaemon", "1",
@@ -90,7 +112,13 @@ def _spawn_instance(i: int) -> bool:
 
 
 def ensure_tor_pool(n: int) -> list[str]:
-    """确保 n 个实例就绪（n 上限 MAX_POOL）；返回可用 SOCKS 端点列表。"""
+    """确保 n 个实例就绪（n 上限 MAX_POOL）；返回可用 SOCKS 端点列表。
+
+    起不来或等不到 SOCKS 口的实例一律收掉。此前只打印一行「socks not ready」
+    就继续下一个：一次失败就在机器上留下最多 MAX_POOL 个常驻 tor（各带自己的
+    DataDirectory / SocksPort / ControlPort），而调用方只看得到「池为空 → 回退
+    9050」—— 泄漏既不可见，也不会被 stop_tor_pool 之外的任何路径回收。
+    """
     n = max(1, min(n, MAX_POOL))
     ports: list[str] = []
     for i in range(n):
@@ -98,16 +126,24 @@ def ensure_tor_pool(n: int) -> list[str]:
         if _socks_alive("127.0.0.1", SOCKS_BASE + i):
             ports.append(socks)
             continue
-        if _spawn_instance(i):
-            # 等待 bootstrap 出 SOCKS 口（最多 ~20s；未就绪也先记录，后续重试）
-            deadline = time.time() + 20
-            while time.time() < deadline:
-                if _socks_alive("127.0.0.1", SOCKS_BASE + i):
-                    ports.append(socks)
-                    break
-                time.sleep(0.5)
-            else:
-                print(f"tor_pool: w{i} socks not ready", file=sys.stderr)
+        was_running = _pid_alive(i)
+        if not _spawn_instance(i):
+            # _spawn_instance 只在 tor 二进制缺失时返回 False：后面每个 i 都会
+            # 以同样的方式失败，重复 24 次只会刷 24 行同样的错误。
+            break
+        # 等待 bootstrap 出 SOCKS 口（最多 ~20s；未就绪也先记录，后续重试）
+        deadline = time.time() + 20
+        while time.time() < deadline:
+            if _socks_alive("127.0.0.1", SOCKS_BASE + i):
+                ports.append(socks)
+                break
+            time.sleep(0.5)
+        else:
+            print(f"tor_pool: w{i} socks not ready", file=sys.stderr)
+            # 只收掉本次新拉起的：既有实例可能只是这一瞬间忙，杀错了要等它重新
+            # bootstrap 才能补回来。
+            if not was_running:
+                _kill_instance(i)
     if not ports:
         print(f"tor_pool: empty; fallback {FALLBACK}", file=sys.stderr)
         return [FALLBACK]
@@ -126,10 +162,21 @@ def _cookie_hex(ctrl_port: int) -> str | None:
 
 
 def tor_newnym_port(socks: str) -> bool:
-    """对池内实例发 SIGNAL NEWNYM（cookie 认证）；成功后 sleep ~2s。"""
+    """对池内实例发 SIGNAL NEWNYM（cookie 认证）；成功后 sleep ~2s。
+
+    只接受池内端口：非池端点（如池空时回退的 9050）按 `+（CTRL_BASE-SOCKS_BASE）`
+    偏移会算出**另一个实例**的 ControlPort，而那个实例的 cookie 又读不到
+    （`_cookie_hex` 用 ctrl 端口反查目录），AUTHENTICATE 必然失败；端口巧合时
+    更糟 —— 会给别人的出口发 NEWNYM，把别人正在用的电路换掉。
+    """
     host, _, port_s = socks.partition(":")
-    ctrl_port = int(port_s or 0) + (CTRL_BASE - SOCKS_BASE)
-    hexcookie = _cookie_hex(int(port_s) if port_s else 0)
+    if not port_s.isdigit():
+        return False
+    idx = int(port_s) - SOCKS_BASE
+    if idx < 0 or idx >= MAX_POOL:
+        return False
+    ctrl_port = CTRL_BASE + idx
+    hexcookie = _cookie_hex(ctrl_port)
     try:
         s = socket.create_connection((host, ctrl_port), timeout=10)
         if hexcookie:

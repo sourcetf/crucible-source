@@ -10,8 +10,9 @@
 //! operators may point at an experimental helper that will later expose
 //! `crucible_tor_connect`. Until then, SOCKS remains the supported path.
 //!
-//! §3：连接池默认禁用；connection_pool=true 时按 (host,port,h2?,use_tor?) 维度复用
-//! 已建立的 SendRequest，空闲上限 16，坏连接自动重建。
+//! §3：连接池默认禁用；connection_pool=true 时按
+//! (host,port,h2?,use_tor?,ssl_mode?,upstream_tls_version?) 维度复用已建立的
+//! SendRequest，空闲上限 16，坏连接自动重建。
 //!
 //! # Onion TLS (`ssl_mode`)
 //! For `.onion` hosts, [`onion_ca::validate_onion_upstream`] always runs.
@@ -30,8 +31,21 @@ use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::collections::hash_map::DefaultHasher;
 
-/// §3 连接池（每 upstream host:port:scheme 维度，上限 16）。
+/// §3 连接池（每 upstream host:port:h2:出口:TLS 策略 维度，上限 16）。
 const POOL_CAP: usize = 16;
+
+/// 回源分阶段超时。此前整条链路一个 deadline 都没有：一个「接受连接但永不回包」
+/// 的上游会永久占住请求、任务与缓冲（body 缓冲上限 64MiB/请求）。取值理由：
+///
+/// - connect 10s：TCP + SOCKS5 握手 + TLS 握手全在这一段。公网 RTT 在数十 ms、
+///   Tor 建路在数秒量级，10s 留了 20 倍以上余量，同时保证连不上时及时失败。
+/// - head 30s：请求已发出、等响应头。上游可能要现做一次 RDAP/DB 查询，Tor 冷启动
+///   首包常达 3–10s；30s 覆盖这类慢启动，又能把僵死上游在 30s 内踢掉。
+/// - body 300s：响应体本身是合法的长时间传输（64MiB 上限对 300s 相当于
+///   ≥218KB/s），所以这里只兜「一个字节都不再发」的上游，把总时长框住。
+const UPSTREAM_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+const UPSTREAM_HEAD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+const UPSTREAM_BODY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
 
 #[derive(Clone, Copy)]
 struct PoolKey(u64);
@@ -41,9 +55,28 @@ impl Hash for PoolKey {
     fn hash<H: Hasher>(&self, state: &mut H) { self.0.hash(state); }
 }
 impl PoolKey {
-    fn new(host: &str, port: u16, h2: bool, use_tor: bool) -> Self {
+    /// 池键维度：目的地 + h2 + 出口（是否经 Tor）+ TLS 策略。
+    ///
+    /// use_tor 必须进来：同一 host:port 经 Tor 与直连建立的是语义完全不同的两条
+    /// 连接（此前这里传的是 `scheme == "https"`，参数名却是 use_tor —— 于是
+    /// 「经 Tor 的规则」会复用「直连规则」留下的连接，本该经 Tor 的请求从本机直连
+    /// 发了出去，出口反了）。
+    ///
+    /// TLS 策略同理：两条规则可以指向同一 host:port 却要求不同校验档
+    /// （verify / no_verify），共用连接会让 no_verify 建立的连接被 verify 规则复用，
+    /// 把「要求校验」降级成「不校验」。这里哈希原始字符串，同义写法（大小写/空格）
+    /// 只会少复用、不会错复用。
+    fn new(
+        host: &str,
+        port: u16,
+        h2: bool,
+        use_tor: bool,
+        ssl_mode: &str,
+        tls_version: Option<&str>,
+    ) -> Self {
         let mut s = DefaultHasher::new();
         host.hash(&mut s); port.hash(&mut s); h2.hash(&mut s); use_tor.hash(&mut s);
+        ssl_mode.hash(&mut s); tls_version.hash(&mut s);
         PoolKey(s.finish())
     }
 }
@@ -95,11 +128,6 @@ impl UpstreamIo {
             inner: Box::pin(tcp),
             negotiated_h2: false,
         }
-    }
-
-    /// 从任意读写流构造（tor_client 的 TorStream 等）。
-    fn from_rw(inner: Pin<Box<dyn AsyncReadWrite>>) -> Self {
-        Self { inner, negotiated_h2: false }
     }
 
     fn from_tls<S>(s: S) -> Self
@@ -296,11 +324,9 @@ async fn proxy_once(
     let target = join_upstream(upstream, rest)?;
     let uri = Uri::from_str(&target).context("upstream uri")?;
 
-    let host = uri.host().unwrap_or("127.0.0.1").to_string();
-    let scheme = uri.scheme_str().unwrap_or("http");
-    let port = uri.port_u16().unwrap_or(if scheme == "https" { 443 } else { 80 });
+    let (host, scheme, port) = upstream_parts(&uri)?;
 
-    let stream = connect_upstream(&host, port, scheme, rule).await?;
+    let stream = connect_upstream(&host, port, &scheme, rule).await?;
     // 规格 11：未配置 upstream_http_version 时按上游 ALPN 协商结果自动选 h2/h1。
     let alpn_h2 = stream.negotiated_h2;
     let io = TokioIo::new(stream);
@@ -310,7 +336,14 @@ async fn proxy_once(
 
     let want_h2 = rule.upstream_http_version.as_deref() == Some("h2")
         || (rule.upstream_http_version.is_none() && alpn_h2);
-    let pool_key = PoolKey::new(&host, port, want_h2, scheme == "https");
+    let pool_key = PoolKey::new(
+        &host,
+        port,
+        want_h2,
+        needs_tor(&host, rule),
+        &rule.ssl_mode,
+        rule.upstream_tls_version.as_deref(),
+    );
     // §3 连接池：仅当规则显式 `connection_pool = true` 时复用上游连接（默认关闭）。
     // 此前 POOL / pool_give / pool_take 三个都是死代码（无任何调用者），
     // 配置项开了也没有任何效果。
@@ -381,7 +414,7 @@ async fn proxy_once(
         }
         builder = builder.header(k, v);
     }
-    builder = builder.header(HOST, &host);
+    builder = builder.header(HOST, upstream_host_header(&host, port, &scheme));
     // P2-5：标准代理头注入——XFF 追加客户端 IP；proto 按 listener 是否 TLS。
     let xff = match parts.headers.get("x-forwarded-for").and_then(|v| v.to_str().ok()) {
         Some(existing) => format!("{existing}, {peer_ip}"),
@@ -399,17 +432,35 @@ async fn proxy_once(
         .body(Full::new(bytes))
         .context("build upstream req")?;
 
-    let resp = sender
-        .send_request(upstream_req)
+    // 「发出请求 + 读到响应头」共用一段 deadline：hyper 的 send_request 在响应头
+    // 到达（h1 解析完状态行与头，h2 收到 HEADERS 帧）时才 resolve，body 另行流式读。
+    // 上游「收下连接但不回包」就卡在这里，没有这个 timeout 请求会永远挂着。
+    let resp = tokio::time::timeout(UPSTREAM_HEAD_TIMEOUT, sender.send_request(upstream_req))
         .await
+        .map_err(|_| {
+            anyhow::anyhow!(
+                "upstream response head timed out after {}s",
+                UPSTREAM_HEAD_TIMEOUT.as_secs()
+            )
+        })?
         .context("upstream send")?;
     let (rparts, rbody) = resp.into_parts();
     // 任务 6（OOM 防护）：上游响应体上限 64MiB。
-    let rbytes = http_body_util::Limited::new(rbody, crate::server::h1::UPSTREAM_BODY_CAP)
-        .collect()
-        .await
-        .map_err(|e| anyhow::anyhow!("read upstream response body: {e}"))?
-        .to_bytes();
+    // 超时与上限互补：上限管「发太多」，超时管「一个字节都不发」（僵死上游）。
+    // 已超时/出错的连接不还池（提前 return，sender 随作用域析构）。
+    let rbytes = tokio::time::timeout(
+        UPSTREAM_BODY_TIMEOUT,
+        http_body_util::Limited::new(rbody, crate::server::h1::UPSTREAM_BODY_CAP).collect(),
+    )
+    .await
+    .map_err(|_| {
+        anyhow::anyhow!(
+            "upstream response body timed out after {}s",
+            UPSTREAM_BODY_TIMEOUT.as_secs()
+        )
+    })?
+    .map_err(|e| anyhow::anyhow!("read upstream response body: {e}"))?
+    .to_bytes();
     let mut out = Response::builder().status(rparts.status);
     // 响应侧同样剥 hop-by-hop（上游的 Connection/TE/Upgrade 透传会污染客户端）。
     for (k, v) in rparts.headers.iter() {
@@ -439,9 +490,22 @@ async fn proxy_websocket(
 
     let (target, host, port, scheme) = resolve_upstream_target(&parts.uri, rule)?;
     let target_uri = Uri::from_str(&target).context("websocket upstream uri")?;
+    let host_hdr = upstream_host_header(&host, port, &scheme);
     let mut upstream = connect_upstream(&host, port, &scheme, rule).await?;
-    write_raw_request(&mut upstream, &parts, &body_bytes, &host, &target_uri, rule).await?;
-    let (status, headers) = read_http_head(&mut upstream).await?;
+    // 写握手请求 + 读 101 响应头共用一段 deadline：read_http_head 自身没有超时，
+    // 上游若收下升级请求后不回包，这个任务会一直挂在这里（连接与两端口都被占住）。
+    let (status, headers) =
+        tokio::time::timeout(UPSTREAM_HEAD_TIMEOUT, async {
+            write_raw_request(&mut upstream, &parts, &body_bytes, &host_hdr, &target_uri, rule).await?;
+            read_http_head(&mut upstream).await
+        })
+        .await
+        .map_err(|_| {
+            anyhow::anyhow!(
+                "websocket upstream handshake timed out after {}s",
+                UPSTREAM_HEAD_TIMEOUT.as_secs()
+            )
+        })??;
     if status != StatusCode::SWITCHING_PROTOCOLS {
         // Do not upgrade client unless upstream accepted the handshake.
         let mut out = Response::builder().status(StatusCode::BAD_GATEWAY);
@@ -504,15 +568,75 @@ fn resolve_upstream_target(
         .unwrap_or(suffix.as_str());
     let target = join_upstream(upstream, rest)?;
     let parsed = Uri::from_str(&target).context("upstream uri")?;
-    let host = parsed.host().unwrap_or("127.0.0.1").to_string();
-    let scheme = parsed.scheme_str().unwrap_or("http").to_string();
-    let port = parsed
-        .port_u16()
-        .unwrap_or(if scheme == "https" { 443 } else { 80 });
+    let (host, scheme, port) = upstream_parts(&parsed)?;
     Ok((target, host, port, scheme))
 }
 
+/// 从上游 URI 取 (host, scheme, port)。
+///
+/// 旧写法是 `uri.host().unwrap_or("127.0.0.1")`：相对形式（`/foo`、漏写 scheme 的
+/// `backend:8080`）解析不出 host，于是被**静默**改成对本机 80 端口的请求 ——
+/// 配置写错一个字符就从「转发到上游」退化成「打本机」。这里改成显式报错。
+fn upstream_parts(uri: &Uri) -> Result<(String, String, u16)> {
+    let host = uri
+        .host()
+        .with_context(|| format!("proxy upstream `{uri}` has no host (need http://host[:port] form)"))?
+        .to_string();
+    let scheme = uri
+        .scheme_str()
+        .with_context(|| format!("proxy upstream `{uri}` has no scheme (need http:// or https://)"))?
+        .to_ascii_lowercase();
+    if scheme != "http" && scheme != "https" {
+        bail!("proxy upstream scheme `{scheme}` is not supported (http/https only)");
+    }
+    let port = uri
+        .port_u16()
+        .unwrap_or(if scheme == "https" { 443 } else { 80 });
+    Ok((host, scheme, port))
+}
+
+/// 是否必须经 Tor 出站（早期规格 A.1）。连接与连接池判定必须用同一份逻辑，
+/// 否则会出现「建连接时走 Tor、复用时走直连」这种出口不一致。
+fn needs_tor(host: &str, rule: &ProxyRuleConfig) -> bool {
+    rule.via_tor || is_onion_host(host) || rule.ssl_mode.eq_ignore_ascii_case("tor")
+}
+
+/// 回源 Host 头的值（RFC 9110 §7.2：非默认端口必须写进 Host）。
+///
+/// `Uri::host()` 只给主机名，直接用它当 Host 会把 `http://backend:8080/` 写成
+/// `Host: backend` —— 按 vhost + 端口挑站点的后端会挑不到（或落到默认站点），
+/// h2 上游还会与我们自己填的 `:authority`（hyper 由 URI 生成，带端口）不一致。
+fn upstream_host_header(host: &str, port: u16, scheme: &str) -> String {
+    let default_port = if scheme.eq_ignore_ascii_case("https") { 443 } else { 80 };
+    if port == default_port {
+        host.to_string()
+    } else {
+        format!("{host}:{port}")
+    }
+}
+
 async fn connect_upstream(
+    host: &str,
+    port: u16,
+    scheme: &str,
+    rule: &ProxyRuleConfig,
+) -> Result<UpstreamIo> {
+    // 连接阶段统一 deadline：TCP connect、SOCKS5 握手、TLS 握手都在这一段里，
+    // 上游或 SOCKS 端「接受连接后不推进握手」会被这里掐断（future 一并取消）。
+    tokio::time::timeout(
+        UPSTREAM_CONNECT_TIMEOUT,
+        connect_upstream_inner(host, port, scheme, rule),
+    )
+    .await
+    .map_err(|_| {
+        anyhow::anyhow!(
+            "upstream connect timed out after {}s ({host}:{port})",
+            UPSTREAM_CONNECT_TIMEOUT.as_secs()
+        )
+    })?
+}
+
+async fn connect_upstream_inner(
     host: &str,
     port: u16,
     scheme: &str,
@@ -524,7 +648,7 @@ async fn connect_upstream(
     if rule.ssl_mode.eq_ignore_ascii_case("tor") && !is_onion {
         bail!("ssl_mode=tor requires a .onion upstream host");
     }
-    let needs_tor = rule.via_tor || is_onion || rule.ssl_mode.eq_ignore_ascii_case("tor");
+    let via_tor = needs_tor(host, rule);
 
     // 校验 .onion 主机（verify 档要求 v3 pubkey）。
     if is_onion && !validate_onion_upstream(host, &rule.ssl_mode) {
@@ -536,10 +660,10 @@ async fn connect_upstream(
 
     // 走 Tor：FFI → unix SOCKS → TCP SOCKS（优先 rule.tor_socks，其次环境变量）。
     //
-    // 此前这里是无条件 bail!("tor upstream not supported")，而 needs_tor 对任何
+    // 此前这里是无条件 bail!("tor upstream not supported")，而「是否走 Tor」对任何
     // .onion 目标都为真——于是下面的 SOCKS 实现、以及 via_tor / ssl_mode=tor /
     // rule.tor_socks 三个配置项全部成了死代码，Tor 反代从未真正可用过。
-    let tcp = if needs_tor {
+    let tcp = if via_tor {
         connect_tor_socks(host, port, rule.tor_socks.as_deref()).await?
     } else {
         TcpStream::connect((host, port))
@@ -813,7 +937,7 @@ async fn write_raw_request(
     stream: &mut UpstreamIo,
     parts: &http::request::Parts,
     body: &[u8],
-    host: &str,
+    host_hdr: &str,
     upstream_uri: &Uri,
     rule: &ProxyRuleConfig,
 ) -> Result<()> {
@@ -822,7 +946,7 @@ async fn write_raw_request(
         .map(|pq| pq.as_str())
         .unwrap_or("/");
     let method = parts.method.as_str();
-    let mut lines = format!("{method} {path_q} HTTP/1.1\r\nHost: {host}\r\n");
+    let mut lines = format!("{method} {path_q} HTTP/1.1\r\nHost: {host_hdr}\r\n");
     for (k, v) in parts.headers.iter() {
         if k == HOST {
             continue;
@@ -853,6 +977,10 @@ async fn write_raw_request(
     Ok(())
 }
 
+/// 读取上游响应头（上限 64KiB，读到 `\r\n\r\n` 即返回）。
+///
+/// **自身没有 deadline**：上游可以「收下连接后一个字节都不发」，那时这里永远不返回。
+/// 调用方必须把它套在 [`UPSTREAM_HEAD_TIMEOUT`] 里（见 [`proxy_websocket`]）。
 async fn read_http_head(stream: &mut UpstreamIo) -> Result<(StatusCode, HeaderMap)> {
     let mut buf = Vec::with_capacity(4096);
     let mut tmp = [0u8; 1024];
@@ -922,6 +1050,7 @@ async fn connect_tor_socks(
             return socks5_unix_bridge(unix, host, port).await;
         }
         let addr: SocketAddr = spec.parse().with_context(|| format!("tor_socks {spec}"))?;
+        ensure_loopback_socks(addr, "tor_socks")?;
         let tcp = TcpStream::connect(addr)
             .await
             .with_context(|| format!("tor socks connect {addr}"))?;
@@ -938,10 +1067,28 @@ async fn connect_tor_socks(
     let socks = std::env::var("CRUCIBLE_TOR_SOCKS")
         .unwrap_or_else(|_| "127.0.0.1:9050".into());
     let addr: SocketAddr = socks.parse().context("CRUCIBLE_TOR_SOCKS parse")?;
+    ensure_loopback_socks(addr, "CRUCIBLE_TOR_SOCKS")?;
     let tcp = TcpStream::connect(addr)
         .await
         .with_context(|| format!("tor socks connect {addr}"))?;
     socks5_connect(tcp, host, port).await
+}
+
+/// SOCKS5 端点若走 TCP，必须是 loopback。
+///
+/// SOCKS5 请求是**明文**的：目标主机名与端口都写在里面（.onion 尤其敏感——它同时
+/// 暴露「谁在访问哪个隐藏服务」）。把 `tor_socks` / `CRUCIBLE_TOR_SOCKS` 指到远端
+/// 等于把每条 Tor 规则的访问目标交给那台机器，而它并不受本机信任约束（面板占位符
+/// 也只承诺 `unix:/path` 与 `127.0.0.1:9050` 两种形态）。UDS 不在此限：它没有网络
+/// 暴露面。原先这条约束只写在已死的 tor_client.rs 里，实际在跑的这条路径没有。
+fn ensure_loopback_socks(addr: SocketAddr, source: &str) -> Result<()> {
+    if !addr.ip().is_loopback() {
+        bail!(
+            "{source}={addr} refused: TCP SOCKS must be loopback \
+             (127.0.0.0/8 or ::1); use unix:/path for a proxy on another host"
+        );
+    }
+    Ok(())
 }
 
 /// Optional `CRUCIBLE_TOR_FFI_LIB` dlopen path.

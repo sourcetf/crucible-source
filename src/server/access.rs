@@ -27,6 +27,28 @@ pub fn deny_response() -> (http::StatusCode, &'static str) {
     (http::StatusCode::FORBIDDEN, "forbidden by ip_access")
 }
 
+/// 浏览器跨站请求判定（`Sec-Fetch-Site: cross-site`）——admin 路径的 CSRF 补强。
+///
+/// 为什么放在 h1/h2/h3 而不是只靠 admin.rs：`admin.rs` 的 CSRF 检查形如
+/// 「若存在 `Origin` 头则比对 Host」，**缺 `Origin` 时整段跳过**，而且它只覆盖
+/// POST/PUT/DELETE/PATCH —— GET 从不带 `Origin`，所以跨站 GET（`<img>`/`<script>`
+/// 触发，浏览器会给带缓存 Basic 凭据的同源请求自动附上凭据）完全没有防线。
+/// `Sec-Fetch-Site` 由浏览器自己写入、脚本改不了，且对**所有**方法都发；
+/// 管理面 UI 恒为 `same-origin`（用户在地址栏直接打开是 `none`），
+/// 而非浏览器客户端（curl/运维脚本）根本不带这个头 —— 保持 admin.rs 注释里
+/// 「非浏览器请求由 Basic 凭据本身鉴权」的既有策略，不会把自动化挡在门外。
+pub fn cross_site_blocked(headers: &http::HeaderMap) -> bool {
+    headers
+        .get("sec-fetch-site")
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v.trim().eq_ignore_ascii_case("cross-site"))
+}
+
+/// 跨站请求被拒时的状态码/文案（三协议共用，保持响应一致）。
+pub fn cross_site_response() -> (http::StatusCode, &'static str) {
+    (http::StatusCode::FORBIDDEN, "cross-site request blocked")
+}
+
 fn cidr_or_exact(pattern: &str, ip: IpAddr) -> bool {
     let pattern = pattern.trim();
     if pattern.is_empty() || pattern == "*" {
@@ -102,5 +124,21 @@ mod tests {
         };
         assert!(!is_allowed(&cfg, "10.1.2.3:9".parse().unwrap()));
         assert!(is_allowed(&cfg, "192.168.0.1:9".parse().unwrap()));
+    }
+
+    /// 只拦 cross-site：同源/无该头（非浏览器客户端）一律放行。
+    #[test]
+    fn cross_site_only_blocks_cross_site() {
+        use http::HeaderValue;
+        let mut h = http::HeaderMap::new();
+        assert!(!cross_site_blocked(&h), "no header must not block (curl/脚本)");
+        h.insert("sec-fetch-site", HeaderValue::from_static("same-origin"));
+        assert!(!cross_site_blocked(&h));
+        h.insert("sec-fetch-site", HeaderValue::from_static("none"));
+        assert!(!cross_site_blocked(&h));
+        h.insert("sec-fetch-site", HeaderValue::from_static("same-site"));
+        assert!(!cross_site_blocked(&h));
+        h.insert("sec-fetch-site", HeaderValue::from_static("Cross-Site"));
+        assert!(cross_site_blocked(&h));
     }
 }

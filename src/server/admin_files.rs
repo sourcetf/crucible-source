@@ -41,17 +41,75 @@ pub fn safe_join(root: &Path, rel: &str) -> Result<PathBuf> {
         }
         Ok(canon)
     } else {
-        let parent = out.parent().unwrap_or(&root);
-        let parent_canon = if parent.exists() {
-            fs::canonicalize(parent)?
-        } else {
-            parent.to_path_buf()
-        };
-        if !parent_canon.starts_with(&root) && parent_canon != root {
+        // 目标**尚不存在**：不能只做词法包含检查。
+        //
+        // 旧实现：父目录存在就 canonicalize 父目录，父目录不存在就直接用词法拼接的
+        // parent 去比前缀 —— 而词法拼接的前缀当然落在 root 里，于是 `root/link/sub/x`
+        // （`link` 是指向 root 外的符号链接、`sub` 还不存在）被判为"合法"，
+        // 随后的 create_dir_all/fs::write 会顺着 link 把目录/文件建到 root 外
+        //（典型后果：`mkdir link/../../etc/x` 被拒，但 `mkdir link/etc/x` 逃逸成功）。
+        // 改为与 static_files::resolve_path 同一策略：对**最深的已存在祖先**做
+        // canonicalize（符号链接在此被解析）并强制 containment，再把剩余还不存在的
+        // 段原样拼回去。
+        let mut base = out.clone();
+        let mut rest: Vec<std::ffi::OsString> = Vec::new();
+        while !base.exists() {
+            let parent = base
+                .parent()
+                .map(|p| p.to_path_buf())
+                .ok_or_else(|| anyhow::anyhow!("path escapes root"))?;
+            rest.push(base.file_name().unwrap_or_default().to_os_string());
+            base = parent;
+        }
+        let mut canon_base =
+            fs::canonicalize(&base).with_context(|| format!("canon {}", base.display()))?;
+        if !canon_base.starts_with(&root) && canon_base != root {
             bail!("path escapes root");
         }
-        Ok(out)
+        for seg in rest.iter().rev() {
+            canon_base.push(seg);
+        }
+        Ok(canon_base)
     }
+}
+
+/// 在 `root_canon` 内**逐级**创建目录树（`dir` 必须来自 [`safe_join`]）。
+///
+/// 逐级建、逐级 canonicalize 复核，是为了把「校验 → 创建」之间的 TOCTOU 窗口压到最小：
+/// 任何一级解析后跑出 root 就立刻删掉这一级并报错，而不是等 create_dir_all 把整棵树
+/// 建在 root 外。旧实现直接 create_dir_all，创建后不复核 —— 一旦中间段是符号链接，
+/// 逃逸既不会报错也不会回滚。
+fn create_dir_all_within(root_canon: &Path, dir: &Path) -> Result<()> {
+    let mut base = dir.to_path_buf();
+    let mut missing: Vec<PathBuf> = Vec::new();
+    while !base.exists() {
+        missing.push(base.clone());
+        match base.parent() {
+            Some(p) => base = p.to_path_buf(),
+            None => bail!("path escapes root"),
+        }
+    }
+    // 最深的已存在祖先必须是 root 内的真实路径（符号链接已被 canonicalize 解析掉）。
+    let existing =
+        fs::canonicalize(&base).with_context(|| format!("canon {}", base.display()))?;
+    if !existing.starts_with(root_canon) {
+        bail!("path escapes root");
+    }
+    for d in missing.iter().rev() {
+        match fs::create_dir(d) {
+            Ok(()) => {}
+            // 竞态下别人先建了 -> 交给下面的复核判定，不作为错误。
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(e) => return Err(e).with_context(|| format!("mkdir {}", d.display())),
+        }
+        let canon = fs::canonicalize(d).with_context(|| format!("re-canon {}", d.display()))?;
+        if !canon.starts_with(root_canon) {
+            // 只回滚刚建的这一级（remove_dir 只删空目录，不会动 root 外已有的内容）。
+            let _ = fs::remove_dir(d);
+            bail!("mkdir escaped root (symlink race?)");
+        }
+    }
+    Ok(())
 }
 
 pub fn list_dir(root: &Path, rel: &str) -> Result<Vec<DirEntryInfo>> {
@@ -82,8 +140,16 @@ pub fn read_file(root: &Path, rel: &str, max_bytes: usize) -> Result<(Vec<u8>, b
     if !path.is_file() {
         bail!("not a file");
     }
+    // 先按元数据判上限再读：旧实现是 `fs::read` 之后才比较长度，于是「读一个比上限大得多的
+    // 文件」会先把整文件读进内存（root 下放一个几 GB 的文件就能把内存打爆），
+    // 之后的 bail 只是事后报错，不省内存。
+    let len = fs::metadata(&path)?.len();
+    if len > max_bytes as u64 {
+        bail!("file too large ({len} > {max_bytes})");
+    }
     let data = fs::read(&path)?;
     let binary = is_likely_binary(&data);
+    // 读期间文件可能被并发改写/替换 → 再核一次真实长度（上限语义不能被 TOCTOU 绕过）。
     if data.len() > max_bytes {
         bail!("file too large ({} > {max_bytes})", data.len());
     }
@@ -92,12 +158,13 @@ pub fn read_file(root: &Path, rel: &str, max_bytes: usize) -> Result<(Vec<u8>, b
 
 pub fn write_file(root: &Path, rel: &str, data: &[u8]) -> Result<()> {
     let path = safe_join(root, rel)?;
+    let root_canon = fs::canonicalize(root).unwrap_or_else(|_| abs(root));
     if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
+        // 与 mkdir 同一套「逐级创建 + 复核」：别顺着符号链接把父目录建到 root 外。
+        create_dir_all_within(&root_canon, parent)?;
     }
     fs::write(&path, data).with_context(|| format!("write {}", path.display()))?;
     // TOCTOU: after write, canonicalize and re-check containment (symlink race).
-    let root_canon = fs::canonicalize(root).unwrap_or_else(|_| abs(root));
     let written = fs::canonicalize(&path).with_context(|| format!("re-canon {}", path.display()))?;
     if !written.starts_with(&root_canon) {
         let _ = fs::remove_file(&path);
@@ -109,10 +176,20 @@ pub fn write_file(root: &Path, rel: &str, data: &[u8]) -> Result<()> {
 /// 在 root 下创建目录（含父目录）；已存在同名目录时报错。
 pub fn mkdir(root: &Path, rel: &str) -> Result<()> {
     let path = safe_join(root, rel)?;
+    let root_canon = fs::canonicalize(root).unwrap_or_else(|_| abs(root));
     if path.is_dir() {
         bail!("directory already exists");
     }
-    fs::create_dir_all(&path).with_context(|| format!("mkdir {}", path.display()))
+    create_dir_all_within(&root_canon, &path)?;
+    // 后置复核（与 write_file/rename_path 一致的 TOCTOU 兜底）：建完再解析一次，
+    // 跑出 root 就回滚刚建的目录。旧实现的 mkdir 完全没有创建后校验，
+    // 顺符号链接建到 root 外时既不报错也不回滚。
+    let made = fs::canonicalize(&path).with_context(|| format!("re-canon {}", path.display()))?;
+    if !made.starts_with(&root_canon) {
+        let _ = fs::remove_dir(&path);
+        bail!("mkdir escaped root after create (symlink race?)");
+    }
+    Ok(())
 }
 
 /// 删除 root 下的文件或目录（目录递归）。
@@ -148,7 +225,7 @@ pub fn rename_path(root: &Path, from_rel: &str, to_rel: &str) -> Result<()> {
         bail!("target already exists");
     }
     if let Some(parent) = to.parent() {
-        fs::create_dir_all(parent)?;
+        create_dir_all_within(&root_canon, parent)?;
     }
     let res = fs::rename(&from, &to)
         .with_context(|| format!("rename {} -> {}", from.display(), to.display()));
@@ -345,5 +422,34 @@ mod tests {
         assert!(script_rel(&root, "../outside").is_err());
         assert!(script_rel(&root, "ok/../../../etc").is_err());
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// 符号链接逃逸回归：`root/link` → root 外的目录，且中间段 `sub` 不存在。
+    /// 词法前缀检查看不出问题（旧实现因此放行），create_dir_all/fs::write 会顺着
+    /// link 把目录与文件建到 root 外。加固后必须直接报错且不留下任何外部痕迹。
+    #[cfg(unix)]
+    #[test]
+    fn mkdir_and_write_cannot_escape_via_symlinked_ancestor() {
+        use std::os::unix::fs::symlink;
+        let base = std::env::temp_dir().join("crucible_admin_escape_test");
+        let _ = std::fs::remove_dir_all(&base);
+        let root = base.join("root");
+        let outside = base.join("outside");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        symlink(&outside, root.join("link")).unwrap();
+
+        assert!(mkdir(&root, "link/sub/dir").is_err(), "mkdir must refuse escaping path");
+        assert!(
+            !outside.join("sub").exists(),
+            "mkdir must not create anything outside root"
+        );
+        assert!(
+            write_file(&root, "link/sub/x.txt", b"pwn").is_err(),
+            "write must refuse escaping path"
+        );
+        assert!(!outside.join("sub").join("x.txt").exists());
+
+        let _ = std::fs::remove_dir_all(&base);
     }
 }

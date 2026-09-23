@@ -3,7 +3,7 @@
 //! 独立 tor 进程：SocksPort 0（故意不开出站 SOCKS——HS 不出站，避免与反代
 //! 出站策略搅在一起，见 C 坑表）；HiddenServiceDir 由配置指定；启动后读取
 //! hostname 文件得到 .onion 名并写 state/tor-hs/hostname.log 供面板显示。
-//! 反代出站使用 tor_client.rs（arti/UDS/loopback），不复用本 torrc。
+//! 反代出站使用 proxy.rs::connect_tor_socks（FFI → UDS → loopback SOCKS），不复用本 torrc。
 
 use anyhow::{bail, Context, Result};
 use crate::config::TorHsConfig;

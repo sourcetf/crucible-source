@@ -54,12 +54,24 @@ pub fn maybe_handle(
 }
 
 /// H2/H3 path uses bodyless requests.
+///
+/// 与 h1 的 [`maybe_handle`] 同语义：方法不是 GET 时回 **405**（而不是 None 落到
+/// 静态文件/404）—— 否则同一条 `POST /__metrics` 在 h1 上是 405、在 h2/h3 上是 404，
+/// 行为随协议而变。
 pub fn maybe_handle_simple<T>(
     req: &Request<T>,
     cfg: &TelemetryConfig,
 ) -> Option<Response<Bytes>> {
-    if !cfg.enabled || req.method() != http::Method::GET || req.uri().path() != cfg.path {
+    if !cfg.enabled || req.uri().path() != cfg.path {
         return None;
+    }
+    if req.method() != http::Method::GET {
+        return Some(
+            Response::builder()
+                .status(StatusCode::METHOD_NOT_ALLOWED)
+                .body(Bytes::from_static(b"method not allowed"))
+                .unwrap(),
+        );
     }
     let body = metrics_body();
     Some(

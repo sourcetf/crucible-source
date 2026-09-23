@@ -9,6 +9,16 @@ pub fn is_onion_host(host: &str) -> bool {
 }
 
 /// Map proxy ssl_mode strings to verification behaviour for onion upstreams.
+///
+/// 这里只解析「档位」，不执行校验 —— 校验动作在 `proxy.rs::wrap_upstream_tls_*`：
+/// - 非 onion 的 `verify` → BoringSSL `SslVerifyMode::PEER`（系统 CA 链）；
+/// - onion 的 `verify` → `NONE` + 手工比对 leaf 里的 ed25519 公钥
+///   （[`onion_cert_matches_host`]），rustls 分支对应 `OnionVerifier`。
+///
+/// 早先这里还有个 `verify_peer()`（只有 `Verify` 返回 true）。删掉它是因为：它没有
+/// 任何调用者，而唯一看起来「该调它」的地方恰恰不能用 —— onion 的 verify 必须是
+/// TLS `NONE` + 证书即公钥，用 `verify_peer()` 去开 `set_verify(PEER)` 会让
+/// `.onion`（自签、无 CA 链）**永远握手失败**。
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum OnionSslMode {
     Verify,
@@ -28,10 +38,6 @@ impl OnionSslMode {
             // （`ssl_mode` 默认值已是 "verify"，此处兜住手写配置里的拼写错误。）
             _ => Self::Verify,
         }
-    }
-
-    pub fn verify_peer(&self) -> bool {
-        matches!(self, Self::Verify)
     }
 }
 

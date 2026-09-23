@@ -36,7 +36,6 @@ pub mod proxy;
 pub mod prefixed_stream;
 pub mod rate_limit;
 pub mod ssl_material;
-pub mod tor_client;
 pub mod tor_hs;
 pub mod static_files;
 pub mod qmux;

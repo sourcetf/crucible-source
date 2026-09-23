@@ -165,14 +165,11 @@ async fn handle_request_inner(
     crate::server::telemetry::record_request();
 
     let snap = live.snapshot();
-    if let Some(resp) = crate::server::telemetry::maybe_handle(&req, &snap.telemetry) {
-        return tag(resp, "telemetry");
-    }
     if let Some(resp) = crate::server::admin_geoip::try_handle_public(&req, &live).await {
         return tag(resp, "geoip");
     }
 
-    // 请求路径：IP access → rate limit → DoH → basic auth → page_rules → admin → apps → proxy → static
+    // 请求路径：IP access → rate limit → metrics → DoH → basic auth → page_rules → admin → apps → proxy → static
     //
     // DoH 必须排在 ACL/限速**之后**：此前它排在前面，等于任何能连上 TLS 口的人
     // 都绕过监听器 IP 白名单与限速，白拿一个公共递归解析器（DoS/滥用放大器）。
@@ -208,6 +205,15 @@ async fn handle_request_inner(
         }
     }
 
+    // /__metrics 必须排在 ip_access + 限流**之后**：此前它是本函数的第一个分支，
+    // 于是「用 IP 白名单当边界」的部署把指标（请求总数、活跃 H3 流）暴露给任何人。
+    // 位置与 DoH 对齐——排在 basic_auth **之前**：Prometheus/uptime 探针这类抓取端
+    // 通常不带凭据（虽然也支持 basic_auth，但不该强制），把「谁能抓」交给
+    // ip_access 白名单与限流来定；要口令的场景给 listener 配 ip_access 即可。
+    if let Some(resp) = crate::server::telemetry::maybe_handle(&req, &snap.telemetry) {
+        return tag(resp, "telemetry");
+    }
+
     // DoH（RFC8484，需求 9）：按 Host/路径分流；未命中（非 DoH 域名）原样放行，
     // 保证同一 443 上正常 HTTPS 站点不受影响。
     let req = match crate::server::dns::dot_doh::h1_try_handle(req, &snap, peer).await {
@@ -216,18 +222,36 @@ async fn handle_request_inner(
     };
 
     if let Some(ba) = &lc.basic_auth {
-        if !crate::server::basic_auth::check_listener(&req, ba) {
-            return tag(
-                Response::builder()
-                    .status(StatusCode::UNAUTHORIZED)
-                    .header(
-                        http::header::WWW_AUTHENTICATE,
-                        format!("Basic realm=\"{}\"", ba.realm),
-                    )
-                    .body(full("unauthorized"))
-                    .unwrap(),
-                "acl",
-            );
+        match crate::server::basic_auth::check_listener(&req, ba, peer.ip()) {
+            crate::server::basic_auth::BasicCheck::Ok => {}
+            crate::server::basic_auth::BasicCheck::Unauthorized => {
+                return tag(
+                    Response::builder()
+                        .status(StatusCode::UNAUTHORIZED)
+                        .header(
+                            http::header::WWW_AUTHENTICATE,
+                            format!("Basic realm=\"{}\"", ba.realm),
+                        )
+                        .body(full("unauthorized"))
+                        .unwrap(),
+                    "acl",
+                )
+            }
+            // 失败退避（见 basic_auth 文末）：回 429 + Retry-After，且这一档**不跑**
+            // 口令哈希——否则并发错口令依旧每次烧一次 argon2，退避只是个摆设。
+            crate::server::basic_auth::BasicCheck::Throttled(d) => {
+                return tag(
+                    Response::builder()
+                        .status(StatusCode::TOO_MANY_REQUESTS)
+                        .header(
+                            http::header::RETRY_AFTER,
+                            crate::server::basic_auth::retry_after_secs(d).to_string(),
+                        )
+                        .body(full("too many failed authentication attempts"))
+                        .unwrap(),
+                    "acl",
+                )
+            }
         }
     }
 
@@ -308,6 +332,49 @@ async fn handle_request_inner(
 
     // admin：在 ip_access / rate limit / basic auth 之后、页面规则改写之前
     if path.starts_with(&snap.admin.path) {
+        // CSRF 补强（详见 access::cross_site_blocked）：admin.rs 的检查缺 `Origin` 时
+        // 整段跳过、且 GET 从不带 `Origin`，这里用浏览器自写的 Sec-Fetch-Site 拒跨站。
+        // 与 h2/h3 同序：先判跨站（403），再判鉴权（401/429）。
+        if crate::server::access::cross_site_blocked(req.headers()) {
+            let (st, msg) = crate::server::access::cross_site_response();
+            return tag(Response::builder().status(st).body(full(msg)).unwrap(), "acl");
+        }
+        // 鉴权门必须放在**收 body 之前**：admin::handle 的第一步才是鉴权，而这里
+        // 一旦先收满 body（上限 32MiB），一个不带凭据的并发 POST 就能让每个连接各占
+        // 32MiB —— 不用通过鉴权（或随便带个垃圾凭据）就能放大内存占用。
+        // 门内做的就是完整鉴权（含失败退避），因此未经校验的请求一个字节 body 都不收；
+        // 代价是合法管理请求会跑两次 argon2id（admin::handle 里还会再验一次，
+        // 见 basic_auth::admin_gate 的说明）—— 管理面请求量极小，换来的是
+        // 「任意垃圾凭据也能占住 32MiB/请求」这条放大路径被彻底掐掉。
+        match crate::server::basic_auth::admin_gate(req.headers(), &snap.admin, peer.ip()) {
+            crate::server::basic_auth::AdminGate::Proceed => {}
+            crate::server::basic_auth::AdminGate::Unauthorized => {
+                return tag(
+                    Response::builder()
+                        .status(StatusCode::UNAUTHORIZED)
+                        .header(
+                            http::header::WWW_AUTHENTICATE,
+                            format!("Basic realm=\"{}\"", snap.admin.realm),
+                        )
+                        .body(full("unauthorized"))
+                        .unwrap(),
+                    "acl",
+                )
+            }
+            crate::server::basic_auth::AdminGate::Throttled(d) => {
+                return tag(
+                    Response::builder()
+                        .status(StatusCode::TOO_MANY_REQUESTS)
+                        .header(
+                            http::header::RETRY_AFTER,
+                            crate::server::basic_auth::retry_after_secs(d).to_string(),
+                        )
+                        .body(full("too many failed authentication attempts"))
+                        .unwrap(),
+                    "acl",
+                )
+            }
+        }
         // P1-4：admin::handle 统一吃 Request<Full<Bytes>>——admin 侧本就全量缓冲 body，
         // 入口收齐（32MiB 上限）后 h2/h3 才能复用同一处理函数（API 不再只回 UI shell）。
         let (parts, body) = req.into_parts();
@@ -328,6 +395,9 @@ async fn handle_request_inner(
             live,
         )
         .await;
+        // 兜底记账：失败计数/退避已在 admin_gate 完成，这里只在「过了门却仍回 401」
+        // （两次校验之间配置被热重载）时补记一次，不重复清零。
+        crate::server::basic_auth::note_admin_result(peer.ip(), resp.status());
         resp.extensions_mut()
             .insert(crate::server::access_log::EngineTag("admin"));
         return resp;

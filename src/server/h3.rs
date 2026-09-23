@@ -297,18 +297,39 @@ mod imp {
                 }
             }
             if let Some(ba) = &lc.basic_auth {
-                if !crate::server::basic_auth::check_listener_headers(req.headers(), ba) {
-                    connect_reject(
-                        &mut stream,
-                        &live,
-                        peer,
-                        &path,
-                        StatusCode::UNAUTHORIZED,
-                        t0,
-                        "unauthorized",
-                    )
-                    .await;
-                    return Ok(());
+                match crate::server::basic_auth::check_listener_headers_at(
+                    req.headers(),
+                    ba,
+                    peer.ip(),
+                ) {
+                    crate::server::basic_auth::BasicCheck::Ok => {}
+                    crate::server::basic_auth::BasicCheck::Unauthorized => {
+                        connect_reject(
+                            &mut stream,
+                            &live,
+                            peer,
+                            &path,
+                            StatusCode::UNAUTHORIZED,
+                            t0,
+                            "unauthorized",
+                        )
+                        .await;
+                        return Ok(());
+                    }
+                    // 退避中的来源：429（并记一条访问日志），不进口令哈希路径。
+                    crate::server::basic_auth::BasicCheck::Throttled(_) => {
+                        connect_reject(
+                            &mut stream,
+                            &live,
+                            peer,
+                            &path,
+                            StatusCode::TOO_MANY_REQUESTS,
+                            t0,
+                            "too many failed authentication attempts",
+                        )
+                        .await;
+                        return Ok(());
+                    }
                 }
             }
             return proxy_connect_udp(&req, stream, &live, peer).await;
@@ -331,6 +352,78 @@ mod imp {
                 return Ok(());
             }
         };
+
+        // admin 前置门（与 h1/h2 同序、同语义）：**先判鉴权/CSRF，再收 body**。
+        // 否则不带凭据的并发 POST 每个都占住 REQUEST_BODY_CAP（8MiB）缓冲，
+        // 不用通过鉴权就能放大内存。守卫是 RAII 的，早退不会漏 qmux 账。
+        {
+            let snap = live.snapshot();
+            if req.uri().path().starts_with(&snap.admin.path) {
+                use crate::server::basic_auth::{admin_gate, retry_after_secs, AdminGate};
+                let t0 = std::time::Instant::now();
+                // (状态码, Retry-After, 文案)；None = 已过鉴权门，交给 admin::handle
+                // 判定顺序与 h1/h2 的「ACL → CSRF → 鉴权门」一致：ACL 是**无状态**的纯判定，
+                // 提前到收 body 之前做不影响限流计数，因此这里先补判一次；限流是有状态的
+                // （消耗令牌），仍留在 handle_h3 里只算一次。
+                let reject: Option<(StatusCode, Option<u64>, &'static str)> =
+                    if !crate::server::access::is_allowed(&snap.ip_access, peer) {
+                        let (st, msg) = crate::server::access::deny_response();
+                        Some((st, None, msg))
+                    } else if !snap.admin.listener_allowed(lc.port) {
+                        // P2-21：非允许端口上的 admin 路径回 **404** 而不是 401 —— 401 会触发
+                        // 浏览器 Basic 口令框，等于诱导口令在未授权/明文口上传输。
+                        // h1 的这条检查位于 admin 分支之前，这里提前补上，保证三协议同语义。
+                        Some((StatusCode::NOT_FOUND, None, "not found"))
+                    } else if crate::server::access::cross_site_blocked(req.headers()) {
+                        let (st, msg) = crate::server::access::cross_site_response();
+                        Some((st, None, msg))
+                    } else {
+                        match admin_gate(req.headers(), &snap.admin, peer.ip()) {
+                            AdminGate::Proceed => None,
+                            AdminGate::Unauthorized => {
+                                Some((StatusCode::UNAUTHORIZED, None, "unauthorized"))
+                            }
+                            AdminGate::Throttled(d) => Some((
+                                StatusCode::TOO_MANY_REQUESTS,
+                                Some(retry_after_secs(d)),
+                                "too many failed authentication attempts",
+                            )),
+                        }
+                    };
+                if let Some((status, retry, msg)) = reject {
+                    // 安全拒绝也要落访问日志（与 h1/h2 一致；下面正常路径的日志在 async
+                    // 块里，提前 return 会绕过它，而这条路径正是爆破/扫描最可能命中的）。
+                    crate::server::access_log::log_response(
+                        &live,
+                        peer,
+                        "h3",
+                        req.method().as_str(),
+                        req.uri().path(),
+                        status.as_u16(),
+                        None,
+                        t0.elapsed(),
+                        "acl",
+                    );
+                    let mut b = Response::builder().status(status);
+                    if status == StatusCode::UNAUTHORIZED {
+                        b = b.header(
+                            http::header::WWW_AUTHENTICATE,
+                            format!("Basic realm=\"{}\"", snap.admin.realm),
+                        );
+                    }
+                    if let Some(secs) = retry {
+                        b = b.header(http::header::RETRY_AFTER, secs.to_string());
+                    }
+                    if let Ok(resp) = b.body(()) {
+                        if stream.send_response(resp).await.is_ok() {
+                            let _ = stream.send_data(Bytes::from_static(msg.as_bytes())).await;
+                        }
+                    }
+                    let _ = stream.finish().await;
+                    return Ok(());
+                }
+            }
+        }
 
         let result = async {
             // P1-9：收齐 H3 请求体（上限 8MiB）——POST/PUT 才能把 body 交给引擎/admin；
@@ -440,11 +533,6 @@ mod imp {
         let path = req.uri().path().to_string();
 
         let snap = live.snapshot();
-        // Metrics / telemetry path
-        if let Some(resp) = crate::server::telemetry::maybe_handle_simple(&req, &snap.telemetry)
-        {
-            return tag(resp, "telemetry");
-        }
         if !crate::server::access::is_allowed(&snap.ip_access, peer) {
             return tag(
                 Response::builder()
@@ -479,20 +567,49 @@ mod imp {
             }
         }
 
+        // /__metrics 排在 ip_access + 限流**之后**（此前是 handle_h3 的第一个分支，
+        // 用 IP 白名单当边界的部署等于把指标公开）。与 h1/h2 同位置：basic_auth 之前，
+        // 因为监控抓取通常不带凭据，「谁能抓」由 ip_access 白名单与限流决定。
+        if let Some(resp) = crate::server::telemetry::maybe_handle_simple(&req, &snap.telemetry)
+        {
+            return tag(resp, "telemetry");
+        }
+
         // P0-1：listener 级 Basic Auth（§16.1）——与 h1/h2 对齐，堵住 h3 绕过。
         if let Some(ba) = &lc.basic_auth {
-            if !crate::server::basic_auth::check_listener_headers(req.headers(), ba) {
-                return tag(
-                    Response::builder()
-                        .status(StatusCode::UNAUTHORIZED)
-                        .header(
-                            http::header::WWW_AUTHENTICATE,
-                            format!("Basic realm=\"{}\"", ba.realm),
-                        )
-                        .body(Bytes::from_static(b"unauthorized"))
-                        .unwrap(),
-                    "acl",
-                );
+            match crate::server::basic_auth::check_listener_headers_at(
+                req.headers(),
+                ba,
+                peer.ip(),
+            ) {
+                crate::server::basic_auth::BasicCheck::Ok => {}
+                crate::server::basic_auth::BasicCheck::Unauthorized => {
+                    return tag(
+                        Response::builder()
+                            .status(StatusCode::UNAUTHORIZED)
+                            .header(
+                                http::header::WWW_AUTHENTICATE,
+                                format!("Basic realm=\"{}\"", ba.realm),
+                            )
+                            .body(Bytes::from_static(b"unauthorized"))
+                            .unwrap(),
+                        "acl",
+                    )
+                }
+                // 失败退避（与 h1/h2 同一张表、同一响应语义）。
+                crate::server::basic_auth::BasicCheck::Throttled(d) => {
+                    return tag(
+                        Response::builder()
+                            .status(StatusCode::TOO_MANY_REQUESTS)
+                            .header(
+                                http::header::RETRY_AFTER,
+                                crate::server::basic_auth::retry_after_secs(d).to_string(),
+                            )
+                            .body(Bytes::from_static(b"too many failed authentication attempts"))
+                            .unwrap(),
+                        "acl",
+                    )
+                }
             }
         }
 
@@ -523,6 +640,9 @@ mod imp {
         // 注：旧实现把 admin 放在 ip_access 之前，这里一并修正为规格顺序。
         if path.starts_with(&snap.admin.path) {
             let resp = crate::server::admin::handle(req.map(Full::new), live).await;
+            // 兜底记账（与 h1/h2 同语义）：鉴权与失败退避已在 admin_gate 里完成，
+            // 这里只在「过了门却仍回 401」（两次校验之间配置被热重载）时补记一次。
+            crate::server::basic_auth::note_admin_result(peer.ip(), resp.status());
             let mut resp = collect_to_bytes(resp).await;
             resp.extensions_mut()
                 .insert(crate::server::access_log::EngineTag("admin"));

@@ -20,6 +20,26 @@ use std::time::Duration;
 static SIDECARS: Lazy<Mutex<HashMap<String, Sidecar>>> =
     Lazy::new(|| Mutex::new(HashMap::new()));
 
+/// 每个 key 一把「创建中」锁：并发首次请求只允许一个真正 spawn。
+///
+/// 没有它时，N 个并发的首次请求会各自走完 entire ensure 流程：每个都
+/// `remove_file(sock)` + spawn + 等到自己的 sock 就绪 —— 最后只有最后一个被登记进
+/// SIDECARS，前面几个进程直接变成没人管、也不再被复用的孤儿（且共用同一个 sock 路径，
+/// 后 spawn 的会把先 spawn 的 socket 覆盖掉）。
+/// key 的集合由配置决定（port-app_idx-engine），数量有界，无需淘汰。
+#[cfg(unix)]
+static SPAWN_LOCKS: Lazy<Mutex<HashMap<String, std::sync::Arc<tokio::sync::Mutex<()>>>>> =
+    Lazy::new(|| Mutex::new(HashMap::new()));
+
+#[cfg(unix)]
+fn spawn_lock(key: &str) -> std::sync::Arc<tokio::sync::Mutex<()>> {
+    SPAWN_LOCKS
+        .lock()
+        .entry(key.to_string())
+        .or_insert_with(|| std::sync::Arc::new(tokio::sync::Mutex::new(())))
+        .clone()
+}
+
 struct Sidecar {
     sock: PathBuf,
     #[allow(dead_code)]
@@ -64,8 +84,23 @@ async fn ensure_sidecar(key: &str, lc: &ListenerConfig, app: &AppRouteConfig) ->
             }
         }
     }
-    // Remove dead entry
-    SIDECARS.lock().remove(key);
+    // 快路径未命中：串行化创建（拿锁后必须重查 SIDECARS —— 等锁期间可能已经有人建好了）。
+    // 这是并发首请求只 spawn 一个进程的关键。
+    let lock = spawn_lock(key);
+    let _guard = lock.lock().await;
+    {
+        let map = SIDECARS.lock();
+        if let Some(s) = map.get(key) {
+            if sock_alive(&s.sock) {
+                return Ok(());
+            }
+        }
+    }
+    // Remove dead entry（顺带收掉它的子进程：只从表里删掉等于把它变成没人管的孤儿，
+    // sock 死了不代表进程已经退出）。
+    if let Some(mut dead) = SIDECARS.lock().remove(key) {
+        crate::server::apps::child_registry::kill_child(&mut dead.child);
+    }
 
     let docroot = app
         .docroot
@@ -101,7 +136,7 @@ async fn ensure_sidecar(key: &str, lc: &ListenerConfig, app: &AppRouteConfig) ->
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::from(log_file));
-    let child = crate::server::apps::child_registry::spawn_tracked(
+    let mut child = crate::server::apps::child_registry::spawn_tracked(
         &mut cmd,
         &format!("native sidecar {key}"),
     )
@@ -121,8 +156,13 @@ async fn ensure_sidecar(key: &str, lc: &ListenerConfig, app: &AppRouteConfig) ->
         }
         tokio::time::sleep(Duration::from_millis(40)).await;
     }
+    // 超时失败路径必须**收拾掉刚拉起的子进程**：只 `bail!` 的话 child 被 drop 但不
+    // 终止（child_registry 的注释也点明了 Drop 不会杀进程），于是每次「sock 未就绪」
+    // 都会留下一个活着却永远不被复用的 sidecar —— 反复请求就能把进程数堆起来。
+    // kill_child = SIGTERM → 短暂等待 → SIGKILL → wait 回收 → 注销注册表。
+    crate::server::apps::child_registry::kill_child(&mut child);
     bail!(
-        "native sidecar sock not ready: {} (see {})",
+        "native sidecar sock not ready: {} (see {}; spawned child killed)",
         sock.display(),
         log_path.display()
     );
