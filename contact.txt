@@ -396,3 +396,42 @@ ACCEPTANCE DONE (non-std ports 19095/19081/19445/19446/18443/18444, dns 5353/dot
   验收流程里的 unit tests 步骤目前跑不动**（release 构建与全部网络/协议检查都已通过）。
 - 期间发现 `/root/ReMgr` 的 `cargo check` 是**另一位同事**的进程，我没有动它。
 - 生产已用 round-4 二进制重启（PID 803），9095/8443/9081 + admin 全部 200。
+
+### Session 1008 (2026-09-23) — 进展 8（第五轮：上轮「已复核未修」清单的前几项）
+提交并推送 `6850660`（`cargo check --release` 全特性 0 error），
+已构建并**部署到生产**（PID 91716），实测无回归：7 个引擎全 200、
+`/rust/` body 正确、h2/h3 均 200、DNS 正常、admin 200。
+file_open 的归一化改动会影响所有分发路径（`mode_for_path` 在 apps 之前被查），
+所以专门跑了引擎回归。
+
+**本轮修掉**
+- proxy：WebSocket 升级路径转发 `Transfer-Encoding` 且自行追加 `Content-Length`
+  （TE.CL 走私）；普通转发路径把客户端 XFF/XFP 也转发，与自行注入的那份叠加
+  （上游取第一个 → 来源可伪造）；`join_upstream` 缺分隔符导致 authority 被拼接
+  （`http://backend` + `.evil.tld/x` → `backend.evil.tld`）。均已修。
+- `file_open` 键归一化：请求侧只 trim，解析侧却 percent-decode + join，
+  `//uploads/x.html`、`/uploads/./x.html`、`/uploads/x%2Ehtml` 都能绕过
+  preview/download 缓解。改为两侧同一套归一化（并折叠扩展名大小写）。
+- geoip：面板编辑权重优先级反了（DESC + 无条件覆盖 → 低权重胜出）；
+  `line_for` 用 `or_else` 导致 ASN/ISP 分线路永不命中（City 库覆盖了绝大多数地址）；
+  `admin_geoip` 查了不存在的 `covering` 表且吞掉错误（冲突界面时间戳恒 0）。
+- DNS：`zone_file_name` 把 `-` 与 `_` 映射到同一文件名（`a-b.com`/`a_b.com`、
+  线路 `cn-north`/`cn_north` 撞名）→ named 拒载或串数据。追加 FNV-1a 短哈希去重。
+
+**仍未修（下一轮，按严重度）**
+1. proxy 回源**全链路无超时**（connect / send / 读头 / 读体），静默上游可长期占住
+   连接与 64MiB 缓冲；`read_http_head` 无 deadline。
+2. `/__metrics` 仍在 `ip_access` + 限流**之前**返回（IP 白名单对监控口无效）。
+3. admin：`safe_join` 对不存在的路径只做词法包含检查（符号链接可逃逸）；
+   `/api/admin/save` 传空 `listeners_allow` 等于「全口可达」；
+   Basic Auth 无限流/锁定且每次尝试都跑 argon2id（CPU 放大）；
+   路由用 `ends_with` 匹配 → `/__adminfoo/...` 也能进管理面；
+   缺 `Origin` 头时 CSRF 检查直接跳过；admin body 在鉴权前就缓冲（32MiB/请求）。
+4. `connect_udp` 目标判定漏 NAT64 `64:ff9b::/96`、6to4、Teredo、CGNAT `100.64/10`。
+5. `ensure_sidecar` 无 per-key spawn 锁 + 超时路径丢下活着的子进程 → 进程泄漏。
+6. geoip：`lookup_merged` 每次请求对 `ipv4`/`anycast` **全表扫描**且扫两遍、跑在
+   async worker 上；`ops.rs` filter 先 `LIMIT 5000` 再过滤 → 结果被静默截断。
+
+**部署注意**：这台机器 `nohup ... &` 与 `&&` 串在一起时子进程会随 shell 退出而消失
+（已在生产重启时踩到两次，服务短暂中断后立即拉回）。可靠写法是
+`cd DIR && nohup BIN ... & echo launched; sleep N` 单独一条命令，随后另起一条验证。
