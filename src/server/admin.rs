@@ -101,6 +101,11 @@ pub async fn handle(req: Request<Full<Bytes>>, live: Arc<LiveConfig>) -> Respons
     // DNS 管理面板 API（bind9 控制面，含 JSP 编译按钮）——鉴权/CSRF 已在上方完成。
     // Routes are under [admin].path (default /__admin); bare starts_with("/api/dns/") never matches.
     let dns_rel = path.strip_prefix(&admin_path).unwrap_or(path.as_str());
+    // 分区导出必须走 text/plain + Content-Disposition 附件，而不是 admin_api 的
+    // JSON 通道 —— 否则浏览器只会显示一段 JSON，用户拿不到 .zone 文件。
+    if dns_rel.ends_with("/api/dns/zones/export") && method == Method::GET {
+        return crate::server::dns::admin_api::handle_zone_export(&req).await;
+    }
     if dns_rel.starts_with("/api/dns/")
         || dns_rel == "/api/apps/jsp/compile"
         || path.ends_with("/api/apps/jsp/compile")

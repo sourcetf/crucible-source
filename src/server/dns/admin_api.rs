@@ -508,3 +508,59 @@ fn acme_issue(c: &crate::server::dns::acme::AcmeCfg) -> Result<(), String> {
     }
     Err("no acme client (acme.sh/acme-client/certbot) — 请手动放置证书或安装工具".into())
 }
+
+/// `GET /api/dns/zones/export?name=<zone>` —— 按 RFC1035 导出单个分区（.zone 下载）。
+///
+/// 直接复用 `gen_zone_file`（与写入 named 用的 zone 文件同一套生成逻辑），
+/// 保证「导出的文本」和「服务实际加载的」一致，不会出现两套格式。
+pub async fn handle_zone_export(
+    req: &http::Request<http_body_util::Full<bytes::Bytes>>,
+) -> Response<BoxBody> {
+    let q = req.uri().query().unwrap_or("");
+    let zone = q
+        .split('&')
+        .find_map(|kv| kv.strip_prefix("name="))
+        .map(|v| {
+            percent_encoding::percent_decode_str(v)
+                .decode_utf8_lossy()
+                .into_owned()
+        })
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    let bad = |st: StatusCode, msg: String| -> Response<BoxBody> {
+        Response::builder()
+            .status(st)
+            .header(http::header::CONTENT_TYPE, "text/plain; charset=utf-8")
+            .body(full(msg))
+            .unwrap()
+    };
+    if zone.is_empty() {
+        return bad(StatusCode::BAD_REQUEST, "name= 必填".into());
+    }
+    let zones = match list_zones() {
+        Ok(z) => z,
+        Err(e) => return bad(StatusCode::INTERNAL_SERVER_ERROR, format!("zones: {e}")),
+    };
+    let Some(z) = zones.into_iter().find(|z| z.name == zone) else {
+        return bad(StatusCode::NOT_FOUND, format!("zone {zone} 不存在"));
+    };
+    let recs = match list_records(&zone) {
+        Ok(r) => r,
+        Err(e) => return bad(StatusCode::INTERNAL_SERVER_ERROR, format!("records: {e}")),
+    };
+    let text = gen_zone_file(&zone, &z.kind, &recs);
+    let fname = zone
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() || c == '.' || c == '-' { c } else { '_' })
+        .collect::<String>();
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(http::header::CONTENT_TYPE, "text/plain; charset=utf-8")
+        .header(
+            http::header::CONTENT_DISPOSITION,
+            format!("attachment; filename=\"{fname}.zone\""),
+        )
+        .body(full(text))
+        .unwrap()
+}

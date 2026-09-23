@@ -432,6 +432,17 @@ img.preview{max-width:100%;max-height:420px}
       <button id="btnDnsZoneAdd">添加/更新</button>
       <button id="btnDnsZoneDel">删除</button>
       <button id="btnDnsZoneList">列出</button>
+      <div style="margin-top:10px;border-top:1px solid #ddd;padding-top:10px">
+        <h3 style="margin:0 0 6px">分区与记录（表格编辑）</h3>
+        <div class="row">
+          <div><label>分区</label><select id="dnsZoneSel" style="min-width:220px"></select></div>
+          <div><label>&nbsp;</label><button class="act ghost" id="btnZoneRefresh">刷新列表</button></div>
+          <div><label>&nbsp;</label><button class="act ghost" id="btnZoneExport">导出 .zone</button></div>
+        </div>
+        <div id="dnsRecWrap"></div>
+        <button class="act ghost" id="btnRecRowAdd">+ 加一条记录</button>
+        <div id="dnsRecMsg" style="margin-top:6px"></div>
+      </div>
       <pre id="dnsZonesOut"></pre>
     </div>
     <div class="card">
@@ -1654,7 +1665,7 @@ async function dnsStatus(){
     $('dsOptout').checked=!!d.nsec3_optout;$('dsCds').checked=d.cds!==false;
   } else out('dnsStatusOut',r.text,false);
 }
-$('btnDnsStatus').onclick=dnsStatus;
+$('btnDnsStatus').onclick=async()=>{ await dnsStatus(); await dnsRefreshZones(); };
 $('btnDnsModes').onclick=async()=>{
   const r=await apiJson('/api/dns/modes',jpost({
     enabled:$('dnsEnabled').checked,root:$('dnsModeRoot').checked,
@@ -1670,6 +1681,122 @@ $('btnDnsZoneAdd').onclick=async()=>{
 $('btnDnsZoneDel').onclick=async()=>{
   const r=await apiJson('/api/dns/zones',jpost({action:'del',name:$('dnsZoneName').value}));
   out('dnsZonesOut',r.text,r.ok); if(r.ok)dnsStatus();
+};
+/* ================= DNS 分区与记录：表格编辑（替代原来的 JSON 文本框）=================
+   原来是「按钮 + 把原始 JSON 打印到 pre」，输入输出都是 JSON，对不熟悉 JSON 的用户
+   等于不可用。这里改成云解析厂商那种表格：分区下拉选择、一条记录一行、
+   主机记录/类型/TTL/记录值/线路 分列，行内保存与删除，另有导出 .zone。
+   注意：后端没有 update，改一条 = 先 del 旧 id 再 add（在行的保存按钮里做）。 */
+const DNS_RTYPES=['A','AAAA','CNAME','MX','TXT','NS','SRV','CAA','PTR'];
+let DNS_ZONES=[];
+
+async function dnsRefreshZones(keep){
+  const r=await apiJson('/api/dns/zones');
+  const sel=$('dnsZoneSel');
+  if(!sel) return;
+  if(!r.ok||!r.json){
+    sel.innerHTML='';
+    return out('dnsRecMsg','分区列表载入失败: '+r.text,false);
+  }
+  DNS_ZONES=(r.json.zones||[]);
+  const cur=keep!==undefined?keep:sel.value;
+  sel.innerHTML='';
+  DNS_ZONES.forEach(function(z){
+    sel.appendChild(new Option(z.name+'  ['+z.kind+']', z.name));
+  });
+  if(cur && DNS_ZONES.some(function(z){return z.name===cur;})) sel.value=cur;
+  await dnsLoadRecords();
+}
+
+async function dnsLoadRecords(){
+  const zone=$('dnsZoneSel').value;
+  const w=$('dnsRecWrap');
+  if(!zone){
+    w.innerHTML='<p class="hint">还没有分区，先用上面的「添加分区」建一个。</p>';
+    return;
+  }
+  const r=await apiJson('/api/dns/records?zone='+encodeURIComponent(zone));
+  if(!r.ok||!r.json){
+    w.innerHTML='';
+    return out('dnsRecMsg','记录载入失败: '+r.text,false);
+  }
+  renderDnsRecords(zone, r.json.records||[]);
+}
+
+function dnsRecRow(rec){
+  rec=rec||{};
+  const tr=document.createElement('tr');
+  tr.dataset.id=rec.id?String(rec.id):'';
+  const ph=(rec.rtype==='MX')?'10 mail.example.com.':'1.2.3.4';
+  tr.innerHTML='<td><input class="dr-name" size="14" placeholder="@" value="'+esc(rec.name||'')+'"/></td>'
+    +'<td><select class="dr-type">'+DNS_RTYPES.map(function(t){
+        return '<option'+(rec.rtype===t?' selected':'')+'>'+t+'</option>';}).join('')+'</select></td>'
+    +'<td><input class="dr-ttl" size="6" value="'+esc(String(rec.ttl||3600))+'"/></td>'
+    +'<td><input class="dr-data" style="width:99%" placeholder="'+esc(ph)+'" value="'+esc(rec.rdata||'')+'"/></td>'
+    +'<td><input class="dr-line" size="8" placeholder="(默认)" value="'+esc(rec.line||'')+'"/></td>'
+    +'<td><button class="act ghost dr-save" type="button">保存</button>'
+    +' <button class="act ghost dr-del" type="button">删除</button></td>';
+  tr.querySelector('.dr-save').onclick=async function(){
+    const body={action:'add',zone:$('dnsZoneSel').value,
+      name:(tr.querySelector('.dr-name').value||'').trim()||'@',
+      rtype:tr.querySelector('.dr-type').value,
+      ttl:parseInt(tr.querySelector('.dr-ttl').value,10)||3600,
+      rdata:(tr.querySelector('.dr-data').value||'').trim(),
+      line:(tr.querySelector('.dr-line').value||'').trim()};
+    if(!body.rdata) return out('dnsRecMsg','记录值不能为空',false);
+    const old=tr.dataset.id;
+    if(old){
+      const d=await apiJson('/api/dns/records',jpost({action:'del',id:parseInt(old,10)}));
+      if(!d.ok) return out('dnsRecMsg','删除旧记录失败: '+d.text,false);
+    }
+    const r=await apiJson('/api/dns/records',jpost(body));
+    out('dnsRecMsg', r.ok?'已保存':('保存失败: '+r.text), r.ok);
+    if(r.ok) await dnsLoadRecords();
+  };
+  tr.querySelector('.dr-del').onclick=async function(){
+    const id=tr.dataset.id;
+    if(!id){ tr.remove(); return; }
+    if(!confirm('删除这条记录？')) return;
+    const r=await apiJson('/api/dns/records',jpost({action:'del',id:parseInt(id,10)}));
+    out('dnsRecMsg', r.ok?'已删除':('删除失败: '+r.text), r.ok);
+    if(r.ok) await dnsLoadRecords();
+  };
+  return tr;
+}
+
+function renderDnsRecords(zone, recs){
+  const w=$('dnsRecWrap');
+  w.innerHTML='';
+  const t=document.createElement('table');
+  t.className='data';
+  t.innerHTML='<thead><tr><th>主机记录</th><th>类型</th><th>TTL</th><th>记录值</th>'
+    +'<th>线路</th><th></th></tr></thead>';
+  const tb=document.createElement('tbody');
+  recs.forEach(function(r){ tb.appendChild(dnsRecRow(r)); });
+  t.appendChild(tb);
+  w.appendChild(t);
+  out('dnsRecMsg', zone+' 共 '+recs.length+' 条记录', true);
+}
+
+$('btnZoneRefresh').onclick=function(){ dnsRefreshZones(); };
+$('dnsZoneSel').onchange=function(){ dnsLoadRecords(); };
+$('btnRecRowAdd').onclick=function(){
+  let tb=document.querySelector('#dnsRecWrap tbody');
+  if(!tb){
+    if(!$('dnsZoneSel').value) return out('dnsRecMsg','先选择一个分区',false);
+    renderDnsRecords($('dnsZoneSel').value,[]);
+    tb=document.querySelector('#dnsRecWrap tbody');
+  }
+  tb.appendChild(dnsRecRow({}));
+};
+$('btnZoneExport').onclick=function(){
+  const z=$('dnsZoneSel').value;
+  if(!z) return out('dnsRecMsg','先选择一个分区',false);
+  // 同源请求会自动带上浏览器缓存的 Basic 凭据，点一下即下载
+  const a=document.createElement('a');
+  a.href=base+'/api/dns/zones/export?name='+encodeURIComponent(z);
+  a.download=z+'.zone';
+  document.body.appendChild(a); a.click(); a.remove();
 };
 $('btnDnsZoneList').onclick=async()=>{
   const r=await apiJson('/api/dns/zones');
