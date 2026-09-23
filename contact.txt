@@ -210,3 +210,112 @@
   已改正测试并补上边界与「前缀不足返回 None」用例。
 - **未提交/未完成**：release 构建进行中（`config.mk` 要求
   `tls,tls_boring,go_shm_ipc,tls_nss,tls_tomcrypt`）；构建后做现场验证再推送。
+
+### Session 1008 (2026-09-23) — 进展 5（第三轮：跑通项目自带验收闸门）
+本轮全部围绕**让 `scripts/acceptance_test_ports.sh` 真正跑完**。此前它从未跑到底，
+所以下面这些问题一直被掩盖。逐项都是实测定位、实测修好的。
+
+**1) 验收闸门自身是坏的（假失败）**
+- `grep -q 'lua_pcall\|luaL_newstate'`：**BSD grep 不支持 GNU 的 BRE `\|` 交替**，
+  整串被当字面量，永不匹配 → Lua 引擎被误报成 stub 并 `exit 1`，闸门在第一步就死。
+  `libapp_lua.so` 其实是好的（`T luaL_newstate` / `T lua_pcallk` 都在）。
+  已改 `grep -qE`（`scripts/acceptance_test_ports.sh` + `scripts/build_app_engines.sh`）。
+- `config-test.toml` 绑**生产端口**：监听 8443（生产 TLS 口）、`[dns.dot] port = 853`、
+  `test_mode = false`（于是 DNS 走 53）。而所有测试脚本都写着「NEVER 8443/853/53」，
+  `test_sslv2_probe.py` 甚至硬编码 `FORBIDDEN_PORTS={8443,9445,9446,9081,9095}`。
+  与在跑的生产实例并存时必然 bind 失败。已改：8443→**18444**、dot→**11853**、
+   `test_mode=true`（端口派生 5353/1953/11853，DoT 只绑 127.0.0.1）。
+
+**2) 测试实例读的是生产 DNS 状态（隔离缺失）**
+- `dns::effective()` 只要发现 `state/dns/etc/panel.toml` 就**整体**返回它，
+  `config-test.toml` 的整个 `[dns]` 段形同不存在——所以上面改了端口也没用，
+  测试实例照样去绑 853。更糟的是 `db/dns.sqlite` 与 `zones/` 共用：
+  实测生产的 DNS 库里躺着 `verify.test`（`dns_verify.sh` 建的）。
+- 已加 `CRUCIBLE_DNS_STATE_ROOT` 环境变量覆盖 `dns::state_root()`，
+  并在 `acceptance_test_ports.sh` / `start_server_test.sh` 里指向
+  `/crucible/state/dns-test`。实测：`named reconciled (port 5353)`、
+  `DoT listening on 127.0.0.1:11853`，独立 named.conf/rndc.conf/zones。
+- **遗留数据**：生产库里的 `verify.test` zone 是历史污染，我没有删（生产数据不擅动），
+  如需清理请走 `POST /api/dns/zones {"action":"del","name":"verify.test"}`。
+
+**3) 明文口带 `port_reuse` → 所有请求变 301，测试全打在跳转上**
+- h1 对「`port_reuse` 且无 TLS」的 listener 一律 301 `moved to https`（早期规格 5）。
+  `config-test.toml` 给 8 个监听都开了 `port_reuse`，其中 19095/19081 是明文口且没有
+  TLS 兄弟 → 应用冒烟、wrk、bench、以及验收的 geoip 查询全部收到 301
+  （之前那次「geoip_lookup=moved to https」就是这么来的）。生产 config.toml 根本没有
+  `port_reuse`。已去掉这两个明文口的 `port_reuse`（TLS 口与 55555/55556 保留）。
+
+**4) `config-test.toml` 没有管理员账号**
+- 只有 `realm`、没有 `[[admin.users]]`，而 admin 面板在无用户时是**关闭**的
+  （`check_admin_headers` 返回 false + 告警），所有用 `-u admin:admin` 的检查全 401。
+  已补上与 config.toml 同口令的样例账号。
+
+**5) 【严重·可用性】一次 `/c/` 请求就把整个服务器打崩（SIGSEGV）**
+- `libs/app-engines/samples/c-plugin/plugin.c` **没有 include `<stdlib.h>`**，
+  `getenv` 按隐式 `int getenv()` 编译 → 64 位指针被截成 32 位再解引用：
+  ```
+  237d: movslq %eax,%rcx      ; getenv 的返回值被截断
+  2380: cmpb   $0x0,(%rcx)    ; SIGSEGV
+  ```
+  触发条件：`www-apps/c/.env` 里有 `APP_HELLO=c`，host 通过 extra JSON `setenv` 注入后
+  `getenv` 返回非 NULL → 必崩。32 位截断只是隐患，指针一非空就是确定性的崩溃。
+  **这是远程 DoS：任何能访问 /c/ 的人都能让整个 Web 服务器退出。**
+  之前没暴露是因为 `port_reuse` 让 /c/ 只返回 301，C 引擎从未被真正执行过
+  （上面第 3 条修好后第一次真跑就崩了）。
+  已加 `#include <stdlib.h>`；并在 `build_app_engines.sh` 的 CFLAGS 加
+  **`-Werror=implicit-function-declaration`**，让这类隐式声明在编译期就失败。
+  实测修复后：`/c/` 返回 200 且 body 为 `c path=/c/`（APP_HELLO 注入生效），
+  15 个引擎全部有响应、服务器存活、TLS/h3 正常。
+
+**6) GeoIP 写入路径整体是坏的（Python 侧）**
+- `geoip_common.py::upsert_range` 的 INSERT 列清单 34 列、绑定元组 36 个
+  （`si/ei` 数值列漏在列清单外）→ 每次调用都 `sqlite3.ProgrammingError`，
+  **所有走它的 enrich/seed 脚本全部静默失败**（脚本里是 `|| echo warn`）。
+  所以 `geoip` 表实际是空的，验收的 ASN 硬门必然失败。
+- 同文件 `load_covering` 用 **TEXT** 比较点分四段：
+  `'1.2.4.255' >= '1.2.4.8'` 为假（字典序 '2'<'8'），1.2.4.8 落在 1.2.4.0/24 里也查不出。
+  这正是代码注释里说的「TEXT BETWEEN 比较错误」——Rust 侧（`covering.rs`）早就改成
+  `start_i <= ?1 AND end_i >= ?1` 了，Python 侧没跟上。
+- 顺带修掉 `init_schema` 里错的回填：`CAST('1.2.4.0' AS INTEGER)` 在 SQLite 里只得到 1，
+  改成在 Python 里算真实整数（并补上 end_i）。
+- 实测：`geoip_seed_demo.py --force` 成功写入 8 条、`lookup_merged('1.2.4.8')` 返回
+  `asn=24151 CNNIC-DNS`，`/__admin/api/geoip/lookup?ip=1.2.4.8` 返回完整 JSON。
+
+**环境性缺口（如实记录，非 bug）**：`/go/` `/ruby/` `/psgi/` `/rack/` 返回 502 并给出
+明确原因——本机没有 go/ruby 工具链，perl 虽在但未以 `-DCRUCIBLE_HAVE_PERL` 嵌入。
+这些是「显式报错」的设计（popen 回退已被刻意移除），不是静默失败。
+
+### Session 1008 (2026-09-23) — 进展 6（验收闸门已跑通：0 FAIL）
+**`scripts/acceptance_test_ports.sh` 首次完整跑通，日志 0 个 FAIL：**
+```
+ACCEPTANCE DONE (non-std ports 19095/19081/19445/19446/18443/18444, dns 5353/dot 11853)
+```
+- `cargo test --bin webserver --features tls,tls_boring,go_shm_ipc,tls_nss,tls_tomcrypt`
+  → **86 passed / 0 failed**
+- SSLv2 探针 `sslv2_probe_ok` + `server_alive_ok`（服务器不再崩）
+- 应用冒烟是**真的在跑引擎**：`/rust/ -> rust path=/rust/`、`/c/ -> c path=/c/`
+  （`/c/` 的 body 证明 APP_HELLO 的 setenv 注入也恢复了）
+- TLS 1.2 / 1.3 握手 + H3(QUIC) 200；`geoip_asn_ok`
+- `tls route ... primary=boringssl legacy=nss,tomcrypt` —— 三套 TLS 栈都编进了二进制
+
+**随后又修掉两个 geoip enrich 脚本的启动期 bug（都是「静默 warn」掩盖的）**
+- `geoip_http.py` 从 `geoip_tor_pool` 导入 `tor_socks_endpoints_fallback`，但该名字
+  在 `geoip_tor_pool` 里不存在（它定义在 `geoip_http` 自己里）→ import 期 ImportError，
+  所有 `from geoip_http import ...` 的脚本（netorg / geofeed）全部起不来。
+- `geoip_enrich_netorg.py`：① `lacnic_rdap_pass` 的 SQL 是
+  `WHERE source LIKE %lacnic% AND net_org = `（`%lacnic%` 没加引号且 `net_org =` 无值）
+  每次 execute 必抛 OperationalError；② 调用 `fetch()` 却没导入它（只导入了 http_get）
+  → apnic/ripe 的 dump 每次 NameError 跳过。
+- 修后实测：`afrinic inetnums=178907`、`lacnic inetnums=419349` 正常解析入库。
+- **残留告警是外部的，不是代码问题**：APNIC dump URL 已 404；RIPE dump 因本机
+  磁盘/内存不足（磁盘长期 94%）分配失败；qqwry 三个镜像全部 404/SSL 失败，
+  脚本按设计 `no dat available; skip`。
+
+**仍遗留 / 建议**
+1. 生产 DNS 库里的 `verify.test` zone 是历史污染（`dns_verify.sh` 写的），
+   我没删生产数据。清理命令：
+   `curl -u admin:admin -H 'Content-Type: application/json' -d '{"action":"del","name":"verify.test"}' http://127.0.0.1:9081/__admin/api/dns/zones`
+2. `www-apps/*/deps/` 是 app 依赖功能的**运行期产物**（部分 .crucible_manifest 被
+   运行期改写/删除），本轮没有提交这些生成物，建议纳入 .gitignore。
+3. 未实现的仍如实保留：QMux（只有计数器）、H3 端到端 ECN、go/ruby/perl 嵌入
+   （本机缺工具链，502 且给出明确原因）。

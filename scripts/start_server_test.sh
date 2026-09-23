@@ -51,6 +51,11 @@ fi
 pkill -f 'webserver --config .*config-test.toml' 2>/dev/null || true
 sleep 1
 
+# 独立 DNS 状态根：共用生产 state/dns 会被生产 panel.toml 覆盖 [dns] 配置
+# （端口改不动、去绑生产 853/53），且测试 zone 会写进生产 DNS 库。
+export CRUCIBLE_DNS_STATE_ROOT="/crucible/state/dns-test"
+mkdir -p "$CRUCIBLE_DNS_STATE_ROOT"
+
 nohup ./target/release/webserver --config "$CFG" >>"$LOG" 2>&1 &
 WPID=$!
 echo "$WPID" >/tmp/crucible-test.pid

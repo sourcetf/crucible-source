@@ -111,6 +111,36 @@ def _create_range_table(conn: sqlite3.Connection, name: str) -> None:
     conn.execute(f"CREATE INDEX IF NOT EXISTS idx_{name}_range ON {name}(start, end)")
 
 
+def _clean_ip_text(v: object) -> str:
+    """去掉 NUL 填充与空白（历史写入用过定长 char 列）。"""
+    return str(v or "").strip().rstrip("\x00").strip()
+
+
+def _backfill_numeric(conn: sqlite3.Connection) -> int:
+    """把 start_i/end_i 空值补成真实整数，返回补的行数。
+
+    幂等：只处理空值，已填的（含 upsert_range 新写的）不动。
+    """
+    cur = conn.execute(
+        "SELECT rowid, ip_start, ip_end FROM geoip WHERE start_i IS NULL OR end_i IS NULL"
+    )
+    rows = cur.fetchall()
+    if not rows:
+        return 0
+    upd: list[tuple[int, int, int]] = []
+    for rowid, s, e in rows:
+        try:
+            si = int(ipaddress.ip_address(_clean_ip_text(s)))
+            ei = int(ipaddress.ip_address(_clean_ip_text(e)))
+        except ValueError:
+            continue
+        upd.append((si, ei, rowid))
+    if upd:
+        conn.executemany("UPDATE geoip SET start_i = ?, end_i = ? WHERE rowid = ?", upd)
+        conn.commit()
+    return len(upd)
+
+
 def init_schema(conn: sqlite3.Connection) -> None:
     conn.execute(
         """CREATE TABLE IF NOT EXISTS geoip (
@@ -182,11 +212,10 @@ def init_schema(conn: sqlite3.Connection) -> None:
         except sqlite3.OperationalError:
             pass
     conn.execute("CREATE INDEX IF NOT EXISTS idx_geoip_numeric ON geoip(start_i, end_i)")
-    # 存量回填（幂等：只填空值）
-    conn.execute(
-        """UPDATE geoip SET
-             start_i = CAST(rtrim(ip_start, char(0)) AS INTEGER) WHERE start_i IS NULL"""
-    )
+    # 存量回填（幂等：只填空值）。**必须在 Python 里算**：SQLite 的
+    # `CAST('1.2.4.0' AS INTEGER)` 只会取前导数字得到 1（不是 16909312），
+    # 用它回填等于把整库的数值范围列写成错的。
+    _backfill_numeric(conn)
     _create_range_table(conn, "ipv4")
     _create_range_table(conn, "ipv6")
     # §2.6：anycast 表——bgptools/anycast-prefixes 与 RIPE anycast 提取写入这里，
@@ -353,11 +382,20 @@ def ip_to_int(ip: str) -> int:
 
 def load_covering(conn: sqlite3.Connection, ip: str) -> list[sqlite3.Row]:
     conn.row_factory = sqlite3.Row
+    # §23.8：必须用数值范围列（start_i/end_i）。按 TEXT 比较点分四段是**错的**——
+    # 字符串字典序 ≠ 数值序，两个方向都会漏：
+    #   1.2.4.8 落在 1.2.4.0/24 内，但 '1.2.4.255' >= '1.2.4.8' 为假（'2' < '8'）；
+    #   9.0.0.1 与 10.0.0.0 之间同理（'9' > '1'）。
+    # 同一修复 Rust 侧早已做（covering.rs: load_from_geoip 用 start_i <= ?1 AND end_i >= ?1）。
+    try:
+        n = int(ipaddress.ip_address(ip))
+    except ValueError:
+        return []
     cur = conn.execute(
         """SELECT * FROM geoip
-           WHERE ip_start <= ? AND ip_end >= ?
+           WHERE start_i <= ? AND end_i >= ?
            ORDER BY COALESCE(commit_unix, 0) ASC, COALESCE(weight, 0) ASC, COALESCE(bits, 0) ASC""",
-        (ip, ip),
+        (n, n),
     )
     return list(cur.fetchall())
 
@@ -491,6 +529,9 @@ def upsert_range(
         epochs[f"e_{f}"] = cu if val else int(fields.get(f"e_{f}") or 0)
 
     conn.execute(
+        # 末尾的 start_i/end_i 是数值范围列（init_schema 的 ALTER + idx_geoip_numeric）。
+        # 绑定元组一直带着 si/ei，列清单却漏了它们 —— 34 个占位符对 36 个参数，
+        # upsert_range 每次都抛 ProgrammingError，所有走它的 enrich/seed 全部静默失败。
         """INSERT INTO geoip (
             ip_start, ip_end, bits, weight, prefix,
             country, province, region, city, district, isp, dc,
@@ -498,9 +539,10 @@ def upsert_range(
             hosting, division_code, source,
             e_country, e_province, e_city, e_district, e_isp,
             e_asn, e_as_org, e_net_org, e_cloud_provider, e_cloud_region,
-            e_cloud_service, e_hosting, commit_unix
+            e_cloud_service, e_hosting, commit_unix,
+            start_i, end_i
         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                  ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                  ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (
             start,
             end,

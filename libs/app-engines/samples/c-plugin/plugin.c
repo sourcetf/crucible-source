@@ -6,6 +6,7 @@
 #include "appengine_common.h"
 
 #include <stdio.h>
+#include <stdlib.h>   /* getenv/setenv：缺这个头会让 getenv 按隐式 int 声明编译 */
 #include <string.h>
 
 static int g_inited;

@@ -23,7 +23,10 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
 from geoip_common import DEFAULT_DB, init_schema, upsert_range  # noqa: E402
-from geoip_http import http_get, tor_socks_endpoints  # noqa: E402
+# fetch：geoip_http 的旧接口兼容名（get_dump 拉 RIR 全量 dump、rdap_ip 的非 Tor 分支
+# 都在调用它）。此前只导入了 http_get，两处调用直接 NameError:
+# "name 'fetch' is not defined" —— apnic/ripe 的 dump 每次都被跳过。
+from geoip_http import http_get, fetch, tor_socks_endpoints  # noqa: E402
 from geoip_tor_pool import ensure_tor_pool  # noqa: E402
 
 SOURCES = Path("data/geoip/sources")
@@ -252,9 +255,15 @@ def lacnic_rdap_pass(conn: sqlite3.Connection, cu: int) -> None:
     ports = ensure_tor_pool(workers + spare)
     n = len(ports)
     queue: list[tuple[str, str]] = []
+    # LACNIC 的 dump 只铺 CIDR、几乎不带 org，所以挑「还没有 net_org」的行去查 RDAP。
+    # 原查询是 `WHERE source LIKE %lacnic% AND net_org = `：两个错误叠在一起——
+    # `%lacnic%` 没加引号（SQL 语法错误），且 `net_org =` 后面根本没有值。
+    # 于是本函数每次都在 execute() 抛 OperationalError，整个 netorg 步骤从未真正跑过
+    # （调用处是 `|| echo warn`，失败被吞掉）。
     rows = conn.execute(
         """SELECT rowid, ip_start FROM geoip
-           WHERE source LIKE %lacnic% AND net_org = """
+           WHERE source LIKE '%lacnic%'
+             AND (net_org IS NULL OR net_org = '')"""
     ).fetchall()
     for rowid, start in rows:
         import ipaddress

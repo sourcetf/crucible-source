@@ -29,7 +29,10 @@ fi
 
 mkdir -p "${OUT}"
 
-CFLAGS="-O2 -fPIC -pthread -I${INC} -I${COMMON}"
+# -Werror=implicit-function-declaration：隐式声明会把返回值当 int，
+# 64 位指针被截成 32 位——c-plugin 的 getenv 就这么把返回值截断后解引用，
+# 一次 /c/ 请求直接把整个服务器打崩（SIGSEGV）。让它在编译期就失败。
+CFLAGS="-O2 -fPIC -pthread -Wall -Werror=implicit-function-declaration -I${INC} -I${COMMON}"
 LDFLAGS="-shared -fPIC -pthread"
 COMMON_SRC="${COMMON}/appengine_common.c ${COMMON}/appengine_util.c"
 
@@ -206,9 +209,12 @@ else
     ${LUA_LIBS} || { echo "FAIL: system lua compile"; exit 1; }
 fi
 # Sanity: real Lua symbols must exist (not a stub).
+# grep -E 而非 BRE `\|`：BSD grep 把 `\|` 当字面量，`grep -q 'a\|b'` 永不匹配，
+# 这道门会恒为假失败。PUC-Lua 5.4 导出的是 lua_pcallk（lua_pcall 是宏），
+# 用子串匹配即可同时覆盖 5.3/5.4。
 if command -v nm >/dev/null 2>&1; then
-  if ! nm -D "${OUT}/libapp_lua.so" 2>/dev/null | grep -q 'lua_pcall\|luaL_newstate'; then
-    if ! nm "${OUT}/libapp_lua.so" 2>/dev/null | grep -q 'lua_pcall\|luaL_newstate'; then
+  if ! nm -D "${OUT}/libapp_lua.so" 2>/dev/null | grep -qE 'lua_pcall|luaL_newstate'; then
+    if ! nm "${OUT}/libapp_lua.so" 2>/dev/null | grep -qE 'lua_pcall|luaL_newstate'; then
       echo "FAIL: libapp_lua.so missing lua_pcall — stub build detected" >&2
       exit 1
     fi

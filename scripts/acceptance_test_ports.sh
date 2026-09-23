@@ -1,7 +1,8 @@
 #!/bin/sh
 # Full acceptance on NON-STANDARD ports (config-test.toml).
-# Ports: 19095 apps, 19081 plain, 19445 tls12, 19446 tls13, 18443 prod-tls
-# NEVER use 9095/9081/9445/9446/8443.
+# Ports: 19095 apps, 19081 plain, 19445 tls12, 19446 tls13, 18443 prod-tls, 18444 doh/ech
+#        dns 5353, rndc 1953, dot 11853
+# NEVER use 9095/9081/9445/9446/8443/53/953/853.
 set -e
 cd /crucible
 
@@ -28,8 +29,11 @@ GO_ENGINE_MODE=shm bash scripts/build_app_engines.sh 2>&1 | tee /tmp/engines-acc
 # Require lua .so with real PUC-Lua symbols (hard gate — no stub)
 test -f target/app-engines/libapp_lua.so || { echo "FAIL: libapp_lua.so missing"; exit 1; }
 if command -v nm >/dev/null 2>&1; then
-  nm target/app-engines/libapp_lua.so 2>/dev/null | grep -q 'lua_pcall\|luaL_newstate' \
-    || nm -D target/app-engines/libapp_lua.so 2>/dev/null | grep -q 'lua_pcall\|luaL_newstate' \
+  # 必须用 grep -E：BSD grep 不支持 GNU 的 BRE `\|` 交替，`grep -q 'a\|b'`
+  # 会去找字面量 "a|b"，永远不匹配——这道门此前**恒为假失败**，
+  # 把一个本来正常的 Lua 引擎报成 stub。
+  nm target/app-engines/libapp_lua.so 2>/dev/null | grep -qE 'lua_pcall|luaL_newstate' \
+    || nm -D target/app-engines/libapp_lua.so 2>/dev/null | grep -qE 'lua_pcall|luaL_newstate' \
     || { echo "FAIL: libapp_lua.so is stub (no lua_pcall)"; exit 1; }
 fi
 
@@ -56,7 +60,7 @@ nohup sh /crucible/libs/jsp-sidecar/jsp_sidecar.sh /crucible/state/jsp/test.sock
 echo $! >/tmp/jsp-sidecar.pid
 sleep 1
 
-echo "==> start on test ports (NEVER 8443/9095/9081/9445/9446)"
+echo "==> start on test ports (NEVER 8443/9095/9081/9445/9446/53/853)"
 # Kill only prior test instance when possible
 if [ -f /tmp/crucible-test.pid ]; then
   OLD=$(cat /tmp/crucible-test.pid 2>/dev/null || true)
@@ -68,6 +72,11 @@ if [ -f /tmp/crucible-test.pid ]; then
 fi
 pkill -f 'webserver --config .*config-test.toml' 2>/dev/null || true
 sleep 1
+# 独立 DNS 状态根：否则测试实例会读到生产的 state/dns/etc/panel.toml
+# （它整体覆盖 config-test.toml 的 [dns]，端口改不动、仍去绑生产 853/53），
+# 并且 dns_smoke.sh/dns_verify.sh 建的测试 zone 会直接写进生产 DNS 库。
+export CRUCIBLE_DNS_STATE_ROOT="/crucible/state/dns-test"
+mkdir -p "$CRUCIBLE_DNS_STATE_ROOT"
 RUST_LOG=info "$BIN" --config "/crucible/$CFG" >"$LOG" 2>&1 &
 WPID=$!
 echo "$WPID" >/tmp/crucible-test.pid
@@ -161,13 +170,16 @@ python3 bench/matrix_http_tls.py --port-plain 19081 --port-tls12 19445 --port-tl
 echo "==> geoip"
 bash scripts/geoip_update.sh 2>&1 | tail -3 || true
 python3 scripts/geoip_seed_demo.py --force 2>&1 | tail -3 || true
-curl -sS "http://127.0.0.1:19095/__admin" >/dev/null && echo "admin ok" || true
-# Lookup must return ASN (non-null) for seeded 1.2.4.8
-# Lookup must return ASN (non-null) for seeded 1.2.4.8 — admin path under realm
-LOOK=$(curl -sS "http://127.0.0.1:19095/__admin/api/geoip/lookup?ip=1.2.4.8" 2>/dev/null || true)
-if [ -z "$LOOK" ]; then
-  LOOK=$(curl -sS "http://127.0.0.1:19095/api/geoip/lookup?ip=1.2.4.8" 2>/dev/null || true)
-fi
+curl -sS -u admin:admin "http://127.0.0.1:19095/__admin" >/dev/null && echo "admin ok" || true
+# Lookup must return ASN (non-null) for seeded 1.2.4.8 —— admin 路径在 realm 之下，
+# 必须带凭据：以前不带也能过，只因为那时 admin 鉴权是坏的（无凭据即放行）。
+# 同样，回退条件要看「有没有 asn」，不能只看「响应是否为空」——401 的
+# "unauthorized" 是非空正文，会把真正的公开回退路径挡掉。
+LOOK=$(curl -sS -u admin:admin "http://127.0.0.1:19095/__admin/api/geoip/lookup?ip=1.2.4.8" 2>/dev/null || true)
+case "$LOOK" in
+  *'"asn"'*) ;;
+  *) LOOK=$(curl -sS "http://127.0.0.1:19095/api/geoip/lookup?ip=1.2.4.8" 2>/dev/null || true) ;;
+esac
 echo "geoip_lookup=$LOOK" | head -n 1
 echo "$LOOK" | grep -Eq '"asn"[[:space:]]*:[[:space:]]*"?[0-9]+"?|"asn"[[:space:]]*:[[:space:]]*[0-9]+' && echo "geoip_asn_ok" || {
   echo "FAIL: geoip asn missing/null for 1.2.4.8"
@@ -177,4 +189,4 @@ echo "$LOOK" | grep -Eq '"asn"[[:space:]]*:[[:space:]]*"?[0-9]+"?|"asn"[[:space:
 echo "==> tls route log"
 grep 'tls route' "$LOG" | tail -5 || true
 
-echo "ACCEPTANCE DONE (non-std ports 19095/19081/19445/19446/18443)"
+echo "ACCEPTANCE DONE (non-std ports 19095/19081/19445/19446/18443/18444, dns 5353/dot 11853)"

@@ -5,13 +5,27 @@ realtime = false
 
 [admin]
 realm = "diff_merge_test"
+path = "/__admin"
+
+# 测试配置必须带管理员账号：所有测试脚本（dns_smoke.sh / dns_verify.sh /
+# acceptance_test_ports.sh 的 geoip 校验）都用 -u admin:admin 打
+# /__admin/api/*。此前这里只有 realm、没有 [[admin.users]]，而 admin 面板
+# 在「没有配置用户」时是**关闭**的（basic_auth::check_admin_headers 返回
+# false 并告警），于是这些检查全部 401。口令与 config.toml 的样例一致。
+[[admin.users]]
+username = "admin"
+password_hash = "$argon2id$v=19$m=19456,t=2,p=1$E/RLobwgix2BWMRMT++urA$yEympjJtiDh0ezwSQsnkbsfYAoSzeDAHYw3EsUMBsj4"  # sample password: admin
 
 [dns]
 axfr_out_acl = ["127.0.0.0/8"]
 enabled = true
 listen_addr = "any"
 recursion_acl = ["0.0.0.0/0"]
-test_mode = false
+# 测试配置必须开 test_mode：端口派生才落到 5353/1953/11853，
+# 而不是生产的 53/953/853。关掉的话这份「测试配置」会去绑生产端口，
+# 与 scripts/acceptance_test_ports.sh、dns_smoke.sh、dns_verify.sh
+# 全部「绝不碰 53/853」的前提矛盾（且与在跑的生产实例直接冲突）。
+test_mode = true
 
 [dns.dnssec]
 algorithm = "ECDSAP256SHA256"
@@ -31,7 +45,9 @@ path = "/dns-query"
 cert = "cert.pem"
 enabled = true
 key = "key.pem"
-port = 853
+# 写死 11853：显式端口会盖过 test_mode 的派生（0 → 853 / test_mode 11853），
+# 之前写 853 让这份测试配置去绑生产 DoT 口，和在生产实例并存时直接 bind 失败。
+port = 11853
 
 [dns.geo]
 enabled = true
@@ -73,7 +89,12 @@ deny = []
 [[listeners]]
 address = "0.0.0.0"
 address_v6 = "::"
-port_reuse = true
+# 不要在这里设 port_reuse：h1 对「port_reuse 且无 TLS」的 listener 一律
+# 301 到 https://{server_name}/（早期规格 5；明文口要有 TLS 兄弟才说得通）。
+# 19095 没有 TLS 兄弟，于是**所有明文请求都变成 301 "moved to https"**——
+# 应用冒烟、wrk/bench、dns_smoke.sh / dns_verify.sh 以及 acceptance 的 geoip
+# 查询全部打在跳转上，测到的不是应用响应。生产 config.toml 本就没有 port_reuse；
+# 真正需要复用的是 55555/55556（l4_forward 那对）。
 autoindex = true
 file_open = [
     "/php/demo.php=preview",
@@ -277,7 +298,7 @@ paths = ["/aspnet"]
 [[listeners]]
 address = "0.0.0.0"
 address_v6 = "::"
-port_reuse = true
+# 同 19095：明文静态口也不能带 port_reuse，否则每个请求都是 301。
 autoindex = true
 http_versions = [
     "h1",
@@ -369,7 +390,10 @@ http_versions = [
     "h2",
     "h3",
 ]
-port = 8443
+# DoH + ECH listener（www-doh）。端口原为 8443 —— 那是**生产** TLS 口：
+# 在跑着生产实例的机器上，这份测试配置必然 bind 失败，
+# 而所有测试脚本都写着「NEVER use 8443」。改到 18444。
+port = 18444
 root = "www-doh"
 server_name = "crucible.local"
 

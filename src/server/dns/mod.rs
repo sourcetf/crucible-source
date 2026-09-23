@@ -286,7 +286,20 @@ impl DnsConfig {
     }
 }
 
+/// DNS 状态根目录（默认 `state/dns`）：named.conf / rndc.conf / panel.toml /
+/// zones / keys / db 全在这里。
+///
+/// `CRUCIBLE_DNS_STATE_ROOT` 环境变量可整体改写它。**测试实例必须用独立目录**，
+/// 共用生产根目录会同时踩两个坑：
+///   1. [`effective`] 只要见到 `etc/panel.toml` 就把它**整体**当成 DNS 配置返回，
+///      `config-test.toml` 的整个 `[dns]` 段形同不存在——`[dns.dot] port` 改不动，
+///      测试实例照样去绑生产 DoT 853，和在生产实例并存时直接 bind 失败；
+///   2. `db/dns.sqlite` 与 `zones/` 共用——`dns_smoke.sh` / `dns_verify.sh` 通过
+///      `/api/dns/zones` 建的 `smoke.test`/`verify.test` 会**落进生产 DNS 库**。
 pub fn state_root() -> PathBuf {
+    if let Some(p) = env_state_root() {
+        return p;
+    }
     // 绝对化：named 由本进程 spawn（继承 cwd），但 key/zones 目录写入
     // 乃至外部工具（dnssec-keygen）都以绝对路径调用，避免 cwd 漂移踩坑。
     let rel = PathBuf::from("state/dns");
@@ -297,6 +310,20 @@ pub fn state_root() -> PathBuf {
         Ok(cwd) => cwd.join(rel),
         Err(_) => rel,
     }
+}
+
+/// 读取 `CRUCIBLE_DNS_STATE_ROOT`；空值视为未设置。相对路径按 cwd 绝对化。
+fn env_state_root() -> Option<PathBuf> {
+    let raw = std::env::var("CRUCIBLE_DNS_STATE_ROOT").ok()?;
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    let p = PathBuf::from(raw);
+    if p.is_absolute() {
+        return Some(p);
+    }
+    Some(std::env::current_dir().ok()?.join(p))
 }
 
 /// 生效配置：config.toml [dns] 为基底，panel.toml（面板编辑）存在则整体覆盖。

@@ -4,7 +4,8 @@
 # WARNING: This script uses PRODUCTION ports from config.toml / start_server.sh
 # (apps 9095, TLS 8443, …). For safe parallel testing that will not collide with
 # a live instance, use scripts/acceptance_test_ports.sh (or seed_and_accept.sh)
-# which bind NON-STANDARD ports 19095/19081/19445/19446/18443 only.
+# which bind NON-STANDARD ports 19095/19081/19445/19446/18443/18444 only
+# (dns 5353, rndc 1953, dot 11853).
 set -e
 cd "$(dirname "$0")/.."
 export PATH="/usr/local/bin:/usr/local/sbin:${HOME}/.cargo/bin:${PATH}"

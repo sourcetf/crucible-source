@@ -18,7 +18,11 @@ import urllib.request
 from typing import Iterable
 from urllib.parse import urlparse
 
-from geoip_tor_pool import tor_newnym_port, tor_socks_endpoints_fallback
+# tor_socks_endpoints_fallback 定义在**本文件**（见下方），不在 geoip_tor_pool 里。
+# 从 geoip_tor_pool 导入它会让本模块 import 期直接 ImportError —— 于是所有
+# `from geoip_http import ...` 的脚本（geoip_enrich_netorg / _geofeed）全部
+# 起不来，而调用处是 `|| echo warn`，失败被静默吞掉。
+from geoip_tor_pool import tor_newnym_port
 
 
 def _socks5_connect(host: str, port: int, proxy: tuple[str, int],
