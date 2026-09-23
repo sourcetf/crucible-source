@@ -1232,9 +1232,28 @@ pub fn write_all(cfg: &DnsConfig) -> Result<Vec<(String, PathBuf)>> {
             // 可能正好等于 named 已加载的值 → BIND 判定「serial 没变，不重载」，
             // 于是新记录写进了文件却**永远不出现在被服务的分区里**（实测遇到过）。
             // 叠加 DB 里的高水位（meta: serial:<zone>）保证跨文件生命周期的严格递增。
-            let file_serial = std::fs::read_to_string(&path)
+            // serial 还必须**压过 named 的 signed 版本**：开了 inline-signing 后
+            // BIND 每次签名都会把 serial 往上顶（实测文件 1790160412 / signed 1790160416）。
+            // 我们若按 now 生成一个更小的值，BIND 会以
+            //   ixfr-from-differences: new serial (…) out of range [前值+1 - …]
+            //   not loaded due to errors
+            // **拒载该 zone** —— 表现就是「面板加的记录写进了文件、服务里却查不到」，
+            // 并且从区来拉 SOA 时主区回 SERVFAIL，从区也永远起不来。
+            let path_signed = {
+                let mut q = path.clone().into_os_string();
+                q.push(".signed");
+                std::path::PathBuf::from(q)
+            };
+            let fs_serial = std::fs::read_to_string(&path)
                 .ok()
                 .and_then(|t| serial_from_zone_text(&t));
+            let ss_serial = std::fs::read_to_string(&path_signed)
+                .ok()
+                .and_then(|t| serial_from_zone_text(&t));
+            let file_serial = match (fs_serial, ss_serial) {
+                (Some(a), Some(b)) => Some(a.max(b)),
+                (a, b) => a.or(b),
+            };
             let hw = meta_get(&format!("serial:{}", z.name))
                 .ok()
                 .flatten()
