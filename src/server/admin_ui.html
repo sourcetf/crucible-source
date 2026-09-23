@@ -2096,6 +2096,15 @@ window.resolveConflict = async function(id, alsoWrite) {
   document.getElementById('btnGeoConflicts').click();
 };
 
+/* 首屏引导：此前**只在点击标签时**才调用 ensureTab（那是唯一调用点），
+   于是页面刚打开时，markup 里写死的「加载中…」永远不会被替换 ——
+   overview 要等用户去点一下任意标签才会加载，看起来就是「一直卡在加载中」。
+   这里在脚本末尾补一次引导：加载当前激活标签的内容（默认 overview）。 */
+(async () => {
+  const cur = document.querySelector('#tabs button.active');
+  await ensureTab(cur ? cur.getAttribute('data-tab') : 'overview');
+})();
+
 function showToast(msg, err) {
   const el = document.createElement('div');
   el.style = 'position:fixed;bottom:20px;right:20px;padding:10px 16px;border-radius:4px;z-index:9999;background:' + (err ? '#c0392b' : '#27ae60') + ';color:#fff;font-size:13px;max-width:400px';
