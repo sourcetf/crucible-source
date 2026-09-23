@@ -475,7 +475,9 @@ img.preview{max-width:100%;max-height:420px}
     <div class="card">
       <h3>分线路解析（GeoDNS，全默认线路时不启用）</h3>
       <label><input type="checkbox" id="geoDnsEnabled"> 启用分线路</label>
-      <label>线路 JSON（name+cidrs）<br><textarea id="geoDnsLines" rows="4" cols="60">[{"name":"cn-ct","cidrs":["202.96.0.0/16"]}]</textarea></label>
+      <label>分线路（每条线路一个名字 + 若干 CIDR，逗号或换行分隔）</label>
+      <div id="geoLinesWrap"></div>
+      <button class="act ghost" id="btnGeoLineAdd">+ 加一条线路</button>
       <label>MMDB city 库路径 <input id="geoCityDb" size="34" placeholder="留空=state/geo/GeoLite2-City.mmdb"></label>
       <label>MMDB ASN 库路径 <input id="geoAsnDb" size="34" placeholder="留空=state/geo/GeoLite2-ASN.mmdb"></label>
       <label>MMDB License Key <input id="geoMmdbLicense" size="30" placeholder="为空跳过自动同步"></label>
@@ -888,6 +890,39 @@ $('btnTlsSave').onclick=async()=>{
   if(r.ok){toast('TLS 已保存并热重载');await loadCfg();}
 };
 // 常用套件一键填入：省得用户去翻 BoringSSL 的套件名字符串
+/* ---- DNS 分线路：结构化编辑（替代原来的 JSON 文本框）---- */
+function geoLineRow(l){
+  const tr=document.createElement('tr');
+  tr.innerHTML='<td><input class="gl-name" size="12" placeholder="cn-ct" value="'+esc(l.name||'')+'"/></td>'
+    +'<td><input class="gl-cidrs" style="width:99%" placeholder="202.96.0.0/16, 1.2.3.0/24" value="'+esc((l.cidrs||[]).join(', '))+'"/></td>'
+    +'<td><button class="act ghost" type="button">删除</button></td>';
+  tr.querySelector('button').onclick=()=>tr.remove();
+  return tr;
+}
+function renderGeoLines(lines){
+  const w=$('geoLinesWrap'); if(!w) return;
+  w.innerHTML='';
+  const t=document.createElement('table'); t.className='data';
+  t.innerHTML='<thead><tr><th>线路名</th><th>CIDR（逗号或换行分隔）</th><th></th></tr></thead>';
+  const tb=document.createElement('tbody');
+  (lines||[]).forEach(l=>tb.appendChild(geoLineRow(l)));
+  t.appendChild(tb); w.appendChild(t);
+}
+function collectGeoLines(){
+  const out=[];
+  document.querySelectorAll('#geoLinesWrap tbody tr').forEach(tr=>{
+    const name=(tr.querySelector('.gl-name').value||'').trim();
+    const cidrs=(tr.querySelector('.gl-cidrs').value||'').split(/[,
+]/).map(x=>x.trim()).filter(Boolean);
+    if(name) out.push({name:name,cidrs:cidrs});
+  });
+  return out;
+}
+$('btnGeoLineAdd').onclick=()=>{
+  let tb=document.querySelector('#geoLinesWrap tbody');
+  if(!tb){ renderGeoLines([]); tb=document.querySelector('#geoLinesWrap tbody'); }
+  tb.appendChild(geoLineRow({}));
+};
 const COMMON_CIPHERS=['TLS_AES_128_GCM_SHA256','TLS_AES_256_GCM_SHA384','TLS_CHACHA20_POLY1305_SHA256',
   'ECDHE-ECDSA-AES128-GCM-SHA256','ECDHE-RSA-AES128-GCM-SHA256','ECDHE-ECDSA-AES256-GCM-SHA384',
   'ECDHE-RSA-AES256-GCM-SHA384','ECDHE-ECDSA-CHACHA20-POLY1305','ECDHE-RSA-CHACHA20-POLY1305'];
@@ -1556,7 +1591,7 @@ async function dnsStatus(){
     if(r.json.rootzone){$('rzHours').value=r.json.rootzone.refresh_hours||24;}
     // GeoDNS
     if(r.json.geo){$('geoDnsEnabled').checked=!!r.json.geo.enabled;
-      if(r.json.geo.lines&&r.json.geo.lines.length)$('geoDnsLines').value=JSON.stringify(r.json.geo.lines,null,1);
+      renderGeoLines((r.json.geo&&r.json.geo.lines)||[]);
       // MMDB 高级字段：缓存全量，保存时按字段合并回写（避免抹掉 toml 里的映射表）。
       const m=r.json.geo.mmdb;
       if(m){dnsGeoMmdb=m;
@@ -1640,7 +1675,9 @@ $('btnRpzDel').onclick=async()=>{
 };
 $('btnGeoDnsSave').onclick=async()=>{
   let lines;
-  try{lines=JSON.parse($('geoDnsLines').value)}catch(e){return out('geoDnsOut','JSON 无效: '+e,false)}
+  // 原先要从文本框里 JSON.parse，解析失败就「JSON 无效」——对小白等于不可用的功能。
+  // 现在从表格收集，结构由界面保证，不可能再出现 JSON 错误。
+  lines=collectGeoLines();
   // mmdb 为整体替换：以 status 缓存的完整对象为底，只覆盖面板上的三个字段，
   // 保留 asn_to_line/country_to_line/isp_contains/sync_days 等 toml 内配置。
   // 缓存为空（status 未成功加载）时不提交 mmdb，避免用残缺对象覆盖 toml 配置。
