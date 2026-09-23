@@ -848,7 +848,17 @@ pub fn gen_named_conf(cfg: &DnsConfig, zones: &[ZoneRow]) -> String {
     s.push_str(&format!(
         "key \"rndc-key\" {{ algorithm hmac-sha256; secret \"{secret}\"; }};\ncontrols {{ inet 127.0.0.1 port {rndc_port} allow {{ 127.0.0.1; }} keys {{ \"rndc-key\"; }}; }};\n"
     ));
-    s.push_str("logging { channel crucible { file \"../log/named.log\" versions 3 size 5m; severity info; print-time yes; print-severity yes; }; category default { crucible; }; };\n");
+    // 日志路径必须**绝对**：channel 里的相对路径是相对 named 的**工作目录**解析的，
+    // 而 named 由本进程以 cwd=/crucible 启动 —— `../log/named.log` 会落到 /log/ 下，
+    // 打不开就静默没有日志（实测 named.log 自 9/9 起再没被写过，
+    // 于是「从区没加载」「zone 不重载」这类问题全部无从排查）。
+    let log_dir = state_root().join("log");
+    let _ = std::fs::create_dir_all(&log_dir);
+    s.push_str(&format!(
+        "logging {{ channel crucible {{ file \"{}\" versions 3 size 5m; severity info; print-time yes; print-severity yes; }}; category default {{ crucible; }}; }};
+",
+        log_dir.join("named.log").display()
+    ));
 
     if cfg.dnssec.enabled {
         s.push_str(&gen_kasp_policy(&cfg.dnssec));
@@ -1218,15 +1228,36 @@ pub fn write_all(cfg: &DnsConfig) -> Result<Vec<(String, PathBuf)>> {
             let path = zones_dir.join(zone_file_name(z, view_tag));
             // serial 单调：读回本次覆盖前的 SOA serial，保证严格递增，
             // 否则同秒内的第二次编辑对任何 AXFR/IXFR 消费者都是「没变」。
-            let prev_serial = std::fs::read_to_string(&path)
+            // 只靠文件是不够的：文件被删/丢过时 prev 为 None → serial 直接取 now，
+            // 可能正好等于 named 已加载的值 → BIND 判定「serial 没变，不重载」，
+            // 于是新记录写进了文件却**永远不出现在被服务的分区里**（实测遇到过）。
+            // 叠加 DB 里的高水位（meta: serial:<zone>）保证跨文件生命周期的严格递增。
+            let file_serial = std::fs::read_to_string(&path)
                 .ok()
                 .and_then(|t| serial_from_zone_text(&t));
+            let hw = meta_get(&format!("serial:{}", z.name))
+                .ok()
+                .flatten()
+                .and_then(|v| v.parse::<u64>().ok())
+                .unwrap_or(0);
+            let prev_serial = match (file_serial, hw) {
+                (Some(a), b) => Some(a.max(b)),
+                (None, b) if b > 0 => Some(b),
+                _ => None,
+            };
             std::fs::write(
                 &path,
                 gen_zone_file_monotonic(&z.name, &z.kind, &recs, prev_serial),
             )?;
             // zone 文件是控制面的 source of truth：regen 后旧 journal/inline-signing
             // 产物必然失步（named 'journal out of sync' 拒载），一并清掉
+            // 把刚落盘的真实 serial 记为高水位（从写出的文本读回，保证与文件一致）
+            if let Some(ser) = std::fs::read_to_string(&path)
+                .ok()
+                .and_then(|t| serial_from_zone_text(&t))
+            {
+                let _ = meta_set(&format!("serial:{}", z.name), &ser.to_string());
+            }
             for ext in [".jnl", ".signed", ".signed.jnl"] {
                 let mut j = path.clone().into_os_string();
                 j.push(ext);
@@ -1381,16 +1412,42 @@ pub fn reconcile(cfg: &DnsConfig) -> Result<()> {
         }
         // named daemonize fork (OpenBSD) fails writing pidfile → use -g foreground
         // + detached stdio so named survives parent (webserver) exit (需求 12).
-        let st = std::process::Command::new(NAMED_BIN)
-            .arg("-u")
+        // named 必须用 -g 前台跑（OpenBSD 上 daemonize 写 pidfile 会失败），
+        // 但 BIND 的 -g 会**强制所有日志走 stderr、忽略 logging 配置里的 file channel**。
+        // 再把 stderr 丢给 /dev/null，就等于**整台 DNS 服务没有任何日志** ——
+        // 「从区没加载」「zone 不重载」这类问题完全无从排查（实测踩过：named.log
+        // 自 9/9 起再没被写过）。改为追加写到 state/dns/log/named.stderr.log。
+        let derr = state_root().join("log").join("named.stderr.log");
+        if let Some(d) = derr.parent() {
+            let _ = std::fs::create_dir_all(d);
+        }
+        let logf = std::fs::OpenOptions::new().create(true).append(true).open(&derr).ok();
+        let mut cmd = std::process::Command::new(NAMED_BIN);
+        cmd.arg("-u")
             .arg("_bind")
             .arg("-c")
             .arg(&conf)
             .arg("-g")
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn();
+            .stdin(std::process::Stdio::null());
+        match logf {
+            Some(f) => {
+                let f2 = f.try_clone().ok();
+                cmd.stdout(std::process::Stdio::from(f));
+                match f2 {
+                    Some(g) => {
+                        cmd.stderr(std::process::Stdio::from(g));
+                    }
+                    None => {
+                        cmd.stderr(std::process::Stdio::null());
+                    }
+                }
+            }
+            None => {
+                cmd.stdout(std::process::Stdio::null());
+                cmd.stderr(std::process::Stdio::null());
+            }
+        }
+        let st = cmd.spawn();
         match st {
             Ok(_) => std::thread::sleep(std::time::Duration::from_millis(800)),
             Err(e) => bail!("spawn named: {e}"),
