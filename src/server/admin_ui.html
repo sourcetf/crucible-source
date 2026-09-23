@@ -871,8 +871,7 @@ function fillTlsForm(){
   // versions/ciphers 覆盖成默认值（保存是整表替换）。
   $('tlsV10').checked=(s.versions||[]).includes('TLSv1.0');
   $('tlsV11').checked=(s.versions||[]).includes('TLSv1.1');
-  $('tlsCiphers').value=(s.ciphers||[]).join('
-');
+  $('tlsCiphers').value=(s.ciphers||[]).join('\n');
 }
 $('tlsEnabled').onchange=fillTlsFormReset;
 function fillTlsFormReset(){if($('tlsEnabled').value==='0'){['tlsV10','tlsV11','tlsV12','tlsV13','tlsPrefer13','tlsPqc','tlsEch','tlsPsk','tlsNss','tlsTc'].forEach(id=>$(id).checked=false);$('tlsCiphers').value='';}}
@@ -988,8 +987,7 @@ $('btnGeoLineAdd').onclick=()=>{
 const COMMON_CIPHERS=['TLS_AES_128_GCM_SHA256','TLS_AES_256_GCM_SHA384','TLS_CHACHA20_POLY1305_SHA256',
   'ECDHE-ECDSA-AES128-GCM-SHA256','ECDHE-RSA-AES128-GCM-SHA256','ECDHE-ECDSA-AES256-GCM-SHA384',
   'ECDHE-RSA-AES256-GCM-SHA384','ECDHE-ECDSA-CHACHA20-POLY1305','ECDHE-RSA-CHACHA20-POLY1305'];
-$('btnCiphersCommon').onclick=()=>{$('tlsCiphers').value=COMMON_CIPHERS.join('
-');};
+$('btnCiphersCommon').onclick=()=>{$('tlsCiphers').value=COMMON_CIPHERS.join('\n');};
 $('btnCiphersClear').onclick=()=>{$('tlsCiphers').value='';};
 $('btnTlsProbe').onclick=async()=>{
   const r=await api('/api/tls/probe',{method:'POST',body:$('tlsCert').value});
@@ -1566,8 +1564,7 @@ $('btnGeoUpdate').onclick=async()=>{
   if(!r.ok) return;
   const t0=Date.now();
   box.style.display='block';
-  box.textContent='已触发 geoip_update.sh，等待输出…
-';
+  box.textContent='已触发 geoip_update.sh，等待输出…\n';
   state.textContent='⏳ 进行中';
   const tick=async()=>{
     const res=await apiJson('/api/geoip/update/status?since='+since);
