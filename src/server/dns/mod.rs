@@ -420,6 +420,32 @@ fn valid_acl_item(s: &str) -> bool {
 }
 
 /// slave primaries：host 或 host:port / [ipv6]:port；拒绝 named.conf 元字符。
+/// 把配置里接受的 primaries 写法翻译成 **BIND 的 primaries 语法**。
+///
+/// [`valid_primary`] 允许 `host:port` 与 `[v6]:port`（对面板友好），但 BIND 的
+/// primaries 里**没有 `host:port` 这种写法** —— 端口要写成 `host port N`。
+/// 原样输出会让 named 以语法错误拒载**整份 named.conf**（与之前 primaries 里多一个
+/// 分号属于同一类：一处格式错、全份配置失效，所有 zone 一起不可用）。
+fn primary_for_named(p: &str) -> String {
+    let s = p.trim();
+    if let Some(rest) = s.strip_prefix('[') {
+        if let Some((ip, port)) = rest.split_once("]:") {
+            return format!("{ip} port {port}");
+        }
+        return s.to_string(); // [v6] 无端口
+    }
+    // 裸 IPv6 含多个冒号，不能按 host:port 切
+    if s.parse::<std::net::Ipv6Addr>().is_ok() {
+        return s.to_string();
+    }
+    if let Some((host, port)) = s.rsplit_once(':') {
+        if !host.is_empty() && port.parse::<u16>().is_ok() {
+            return format!("{host} port {port}");
+        }
+    }
+    s.to_string()
+}
+
 fn valid_primary(s: &str) -> bool {
     let s = s.trim();
     if s.is_empty() || s.len() > 253 {
@@ -922,7 +948,12 @@ pub fn gen_named_conf(cfg: &DnsConfig, zones: &[ZoneRow]) -> String {
                     }
                 ));
             } else {
-                let prim: Vec<String> = z.primaries.iter().filter(|p| valid_primary(p)).map(|p| format!("{p};")).collect();
+                let prim: Vec<String> = z
+                    .primaries
+                    .iter()
+                    .filter(|p| valid_primary(p))
+                    .map(|p| format!("{};", primary_for_named(p)))
+                    .collect();
                 if prim.is_empty() { continue; }
                 s.push_str(&format!(
                     "zone \"{}\" {{ type secondary; primaries {{ {} }}; file \"{f}\"; }};\n",
