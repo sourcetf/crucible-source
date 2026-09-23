@@ -173,10 +173,13 @@ pub async fn handle(req: Request<Full<Bytes>>, live: Arc<LiveConfig>) -> Respons
         return admin_geoip::handle_lookup_with_live(&req, &live).await;
     }
     if path.ends_with("/api/geoip/status") && method == Method::GET {
+        return admin_geoip::handle_status_with_live(&req, &live).await;
+    }
+    // 必须与上面那条**并列**：`/api/geoip/update/status` 并不以 `/api/geoip/status`
+    // 结尾，之前把它套在 status 分支内部，等于永远进不去（那条路径会一路落到
+    // 末尾的 "admin route not found"）。用 ends_with 做路由时，嵌套顺序就是语义。
     if path.ends_with("/api/geoip/update/status") && method == Method::GET {
         return admin_geoip::handle_update_status(&req).await;
-    }
-        return admin_geoip::handle_status_with_live(&req, &live).await;
     }
     if path.ends_with("/api/geoip/filter") && method == Method::GET {
         return admin_geoip::handle_filter_with_live(&req, &live).await;
