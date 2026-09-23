@@ -1259,11 +1259,22 @@ pub fn write_all(cfg: &DnsConfig) -> Result<Vec<(String, PathBuf)>> {
                 .flatten()
                 .and_then(|v| v.parse::<u64>().ok())
                 .unwrap_or(0);
-            let prev_serial = match (file_serial, hw) {
-                (Some(a), b) => Some(a.max(b)),
-                (None, b) if b > 0 => Some(b),
-                _ => None,
-            };
+            // 最关键的一块地板：**直接问 named 它现在认的 serial**。
+            //
+            // 只看文件不够 —— 开了 inline-signing 后 BIND 每次签名都会把 serial 往上顶，
+            // 它的 last-seen 是签名后的值；而我们每次写完就把 .signed 删掉，
+            // 等于把唯一能看出 BIND 串号的线索也断了。于是"文件 serial"可能仍低于它：
+            //   zone X/IN (unsigned): ixfr-from-differences: new serial (…) out of range [前值+1 - …]
+            //   zone X/IN (unsigned): not loaded due to errors
+            // BIND 直接拒载整个 zone → 面板加了记录、服务里查不到；从区来拉 SOA 得 SERVFAIL、
+            // 永远起不来。实测规律：同一秒内「建区 + 加记录」必现；隔一两秒则因时间戳型
+            // serial 自然追平而"自愈"，所以这类问题极难手工复现。问进程可彻底消除盲区。
+            let named_serial = named_zone_serial(cfg, &z.name);
+            let prev_serial = file_serial
+                .into_iter()
+                .chain(std::iter::once(hw).filter(|v| *v > 0))
+                .chain(std::iter::once(named_serial).filter(|v| *v > 0))
+                .max();
             std::fs::write(
                 &path,
                 gen_zone_file_monotonic(&z.name, &z.kind, &recs, prev_serial),
@@ -1275,7 +1286,11 @@ pub fn write_all(cfg: &DnsConfig) -> Result<Vec<(String, PathBuf)>> {
                 .ok()
                 .and_then(|t| serial_from_zone_text(&t))
             {
-                let _ = meta_set(&format!("serial:{}", z.name), &ser.to_string());
+                if let Err(e) = meta_set(&format!("serial:{}", z.name), &ser.to_string()) {
+                    // 不能吞：这块地板失效时的表象是「zone 被 BIND 拒载、面板加的记录不生效」，
+                    // 与项目里反复出现的 || echo warn / .ok()? / let _ = 属同一类静默失败。
+                    log::warn!("dns: 记录 serial 高水位失败 zone={} err={e:#}", z.name);
+                }
             }
             for ext in [".jnl", ".signed", ".signed.jnl"] {
                 let mut j = path.clone().into_os_string();
@@ -1378,6 +1393,33 @@ fn run(bin: &str, args: &[&str]) -> Result<String> {
 
 fn named_alive(cfg: &DnsConfig) -> bool {
     rndc(cfg, &["status"]).is_ok()
+}
+
+/// 问 named 该 zone 当前的 SOA serial（权威来源；取 `serial` 与 `signed serial` 的较大者）。
+///
+/// 用途见 [`write_all`] 里 prev_serial 处的注释：只按文件推算 serial 会低于 BIND 已知值
+/// （inline-signing 每次签名都往上顶，而我们会删掉 .signed），BIND 于是拒载整个 zone。
+/// named 没跑 / 该 zone 未加载 / rndc 不可用时返回 0，调用方按"未知"处理。
+fn named_zone_serial(cfg: &DnsConfig, zone: &str) -> u64 {
+    let text = match rndc(cfg, &["zonestatus", zone]) {
+        Ok(t) => t,
+        Err(e) => {
+            log::debug!("dns: zonestatus {zone} 取 serial 失败（按未知处理）: {e:#}");
+            return 0;
+        }
+    };
+    let mut best = 0u64;
+    for line in text.lines() {
+        if let Some((k, v)) = line.split_once(':') {
+            // 形如 "serial: 1790203401" 或 "signed serial: 1790203405"
+            if k.trim().ends_with("serial") {
+                if let Ok(n) = v.trim().parse::<u64>() {
+                    best = best.max(n);
+                }
+            }
+        }
+    }
+    best
 }
 
 fn rndc(cfg: &DnsConfig, args: &[&str]) -> Result<String> {
