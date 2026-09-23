@@ -51,7 +51,14 @@ cd /crucible && nohup cargo build --release \
 ```
 耗时 9–22 分钟（有同事的 remgr 构建抢 CPU；曾被外部 SIGTERM 打断过一次）。
 
-**部署**——停与起**必须分开**，且起要用子 shell 分离：
+**部署（重要修正）**——停与起**必须是两次独立的远程调用**：
+本轮实测 `sh -c 'nohup ... &'` 这种「同一条命令里停+起」的写法**也会失败**（生产因此中断约 2 分钟才手工拉回）。唯一可靠的是分两次：
+1) 先只发 `pkill -f '[/]target/release/webserver.*--config'`
+2) 再单独发启动命令（下面这条形式已成功过三次）：
+
+```bash
+cd /crucible && nohup /crucible/target/release/webserver --config /crucible/config.toml >> /tmp/webserver-restart.log 2>&1 & echo launched; sleep 14
+```
 
 ```bash
 pkill -f '[/]target/release/webserver.*--config'; sleep 2
