@@ -153,6 +153,8 @@ img.preview{max-width:100%;max-height:420px}
         <div><label>启用 SSL</label><select id="tlsEnabled"><option value="1">是</option><option value="0">否</option></select></div>
       </div>
       <div class="grid" style="margin-top:.6rem">
+        <div><label>版本 TLSv1.0（走遗留栈）</label><input type="checkbox" id="tlsV10"/></div>
+        <div><label>版本 TLSv1.1（走遗留栈）</label><input type="checkbox" id="tlsV11"/></div>
         <div><label>版本 TLSv1.2</label><input type="checkbox" id="tlsV12"/></div>
         <div><label>版本 TLSv1.3</label><input type="checkbox" id="tlsV13"/></div>
         <div><label>prefer_tls13</label><input type="checkbox" id="tlsPrefer13"/></div>
@@ -161,6 +163,13 @@ img.preview{max-width:100%;max-height:420px}
         <div><label>psk</label><input type="checkbox" id="tlsPsk"/></div>
         <div><label>enable_nss（遗留）</label><input type="checkbox" id="tlsNss"/></div>
         <div><label>enable_tomcrypt（遗留）</label><input type="checkbox" id="tlsTc"/></div>
+      </div>
+      <label>ciphers（密码套件：每行一个，或用 , : 分隔；留空 = 用库的默认套件）</label>
+      <textarea id="tlsCiphers" placeholder="TLS_AES_128_GCM_SHA256&#10;TLS_AES_256_GCM_SHA384&#10;ECDHE-RSA-AES128-GCM-SHA256"></textarea>
+      <div class="row">
+        <div><button class="act ghost" id="btnCiphersCommon">填入常用套件</button></div>
+        <div><button class="act ghost" id="btnCiphersClear">清空（改用库默认）</button></div>
+        <div style="flex:1"><label>TLS1.3 套件与 TLS1.2 套件在同一个列表里，由 BoringSSL 各取所需</label></div>
       </div>
       <label>cert（路径或 PEM 正文）</label>
       <textarea id="tlsCert" placeholder="cert.pem 或 -----BEGIN CERTIFICATE-----"></textarea>
@@ -824,14 +833,22 @@ function fillTlsForm(){
   $('tlsOcspDer').value=s.ocsp_der_path||'';
   $('tlsPskIdentity').value=s.psk_identity||'';
   $('tlsPskKey').value=s.psk_key||'';
+  // 版本与套件必须回填：否则面板显示为空，用户点一次保存就把配置里已有的
+  // versions/ciphers 覆盖成默认值（保存是整表替换）。
+  $('tlsV10').checked=(s.versions||[]).includes('TLSv1.0');
+  $('tlsV11').checked=(s.versions||[]).includes('TLSv1.1');
+  $('tlsCiphers').value=(s.ciphers||[]).join('
+');
 }
 $('tlsEnabled').onchange=fillTlsFormReset;
-function fillTlsFormReset(){if($('tlsEnabled').value==='0'){['tlsV12','tlsV13','tlsPrefer13','tlsPqc','tlsEch','tlsPsk','tlsNss','tlsTc'].forEach(id=>$(id).checked=false);}}
+function fillTlsFormReset(){if($('tlsEnabled').value==='0'){['tlsV10','tlsV11','tlsV12','tlsV13','tlsPrefer13','tlsPqc','tlsEch','tlsPsk','tlsNss','tlsTc'].forEach(id=>$(id).checked=false);$('tlsCiphers').value='';}}
 $('btnTlsSave').onclick=async()=>{
   const port=parseInt($('tlsPort').value,10);
   let ssl=null;
   if($('tlsEnabled').value==='1'){
     const versions=[];
+    if($('tlsV10').checked)versions.push('TLSv1.0');
+    if($('tlsV11').checked)versions.push('TLSv1.1');
     if($('tlsV12').checked)versions.push('TLSv1.2');
     if($('tlsV13').checked)versions.push('TLSv1.3');
     if(!versions.length){toast('至少选择一个 TLS 版本',true);return;}
@@ -841,7 +858,11 @@ $('btnTlsSave').onclick=async()=>{
       cert_ec:$('tlsCertEc').value||null,
       key_ec:$('tlsKeyEc').value||null,
       versions:versions,
-      ciphers:[],
+      // 曾经这里写死 ciphers:[]，而保存是整表替换 —— 面板每保存一次就把
+      // 配置里的密码套件清空（后端 apply_ciphers 明明在读它），且界面上
+      // 没有任何地方能填，等于「套件级管理」完全不可用。
+      ciphers:$('tlsCiphers').value.split(/[
+:,]+/).map(x=>x.trim()).filter(Boolean),
       prefer_tls13:$('tlsPrefer13').checked,
       ech:$('tlsEch').checked,
       ech_keys:$('tlsEchKeys').value||null,
@@ -866,6 +887,13 @@ $('btnTlsSave').onclick=async()=>{
   out('tlsOut',r.text,r.ok);
   if(r.ok){toast('TLS 已保存并热重载');await loadCfg();}
 };
+// 常用套件一键填入：省得用户去翻 BoringSSL 的套件名字符串
+const COMMON_CIPHERS=['TLS_AES_128_GCM_SHA256','TLS_AES_256_GCM_SHA384','TLS_CHACHA20_POLY1305_SHA256',
+  'ECDHE-ECDSA-AES128-GCM-SHA256','ECDHE-RSA-AES128-GCM-SHA256','ECDHE-ECDSA-AES256-GCM-SHA384',
+  'ECDHE-RSA-AES256-GCM-SHA384','ECDHE-ECDSA-CHACHA20-POLY1305','ECDHE-RSA-CHACHA20-POLY1305'];
+$('btnCiphersCommon').onclick=()=>{$('tlsCiphers').value=COMMON_CIPHERS.join('
+');};
+$('btnCiphersClear').onclick=()=>{$('tlsCiphers').value='';};
 $('btnTlsProbe').onclick=async()=>{
   const r=await api('/api/tls/probe',{method:'POST',body:$('tlsCert').value});
   out('tlsOut',r.text,r.ok);
