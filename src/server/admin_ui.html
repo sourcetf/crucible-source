@@ -894,8 +894,7 @@ $('btnTlsSave').onclick=async()=>{
       // 曾经这里写死 ciphers:[]，而保存是整表替换 —— 面板每保存一次就把
       // 配置里的密码套件清空（后端 apply_ciphers 明明在读它），且界面上
       // 没有任何地方能填，等于「套件级管理」完全不可用。
-      ciphers:$('tlsCiphers').value.split(/[
-:,]+/).map(x=>x.trim()).filter(Boolean),
+      ciphers:$('tlsCiphers').value.split(/[\n:,]+/).map(x=>x.trim()).filter(Boolean),
       prefer_tls13:$('tlsPrefer13').checked,
       ech:$('tlsEch').checked,
       ech_keys:$('tlsEchKeys').value||null,
@@ -973,8 +972,7 @@ function collectGeoLines(){
   const out=[];
   document.querySelectorAll('#geoLinesWrap tbody tr').forEach(tr=>{
     const name=(tr.querySelector('.gl-name').value||'').trim();
-    const cidrs=(tr.querySelector('.gl-cidrs').value||'').split(/[,
-]/).map(x=>x.trim()).filter(Boolean);
+    const cidrs=(tr.querySelector('.gl-cidrs').value||'').split(/[\n,]/).map(x=>x.trim()).filter(Boolean);
     if(name) out.push({name:name,cidrs:cidrs});
   });
   return out;
@@ -1569,8 +1567,7 @@ $('btnGeoUpdate').onclick=async()=>{
   const tick=async()=>{
     const res=await apiJson('/api/geoip/update/status?since='+since);
     const j=res.json;
-    if(!j){ box.textContent+='[状态查询失败: '+res.text+']
-'; return true; }
+    if(!j){ box.textContent+='[状态查询失败: '+res.text+']\n'; return true; }
     if(j.log) box.textContent+=j.log;
     since=j.to;
     const secs=Math.round((Date.now()-t0)/1000);
@@ -1578,9 +1575,7 @@ $('btnGeoUpdate').onclick=async()=>{
       +(j.done?'（脚本报告完成）':(j.running?'':'（未见到完成标记，请查看上面的输出）'));
     box.scrollTop=box.scrollHeight;
     if(!j.running) return true;
-    if(secs>1800){ box.textContent+='
-[超过 30 分钟，停止轮询]
-'; return true; }
+    if(secs>1800){ box.textContent+='\n[超过 30 分钟，停止轮询]\n'; return true; }
     return false;
   };
   await tick();
