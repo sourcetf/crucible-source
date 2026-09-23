@@ -1036,7 +1036,17 @@ fn save_page_rules(live: &Arc<LiveConfig>, v: &Json) -> Response<BoxBody> {
     finish_write(live, &tree, "page_rules saved")
 }
 
-const SSL_MODES: &[&str] = &["verify", "no_verify", "trust_self_signed", "off"];
+/// 回源 TLS 校验模式。**只能有一份**：这里原本还有一份函数内的副本，
+/// 两份取值不同（副本多一个 "tor"）——`save_proxy_rules` 用模块级这份校验，
+/// 于是面板下拉里能选到的 `tor` 永远存不进去，保存必报 "invalid ssl_mode: tor"，
+/// 而 proxy.rs 明明是支持的（ssl_mode=tor 要求 .onion 上游并强制走 Tor）。
+const SSL_MODES: &[&str] = &[
+    "verify",
+    "no_verify",
+    "trust_self_signed",
+    "off",
+    "tor",
+];
 
 /// body: {"port": 9081, "rules": [{"path": "/api", "upstream": "http://127.0.0.1:8080",
 ///   "ssl_mode": "verify", "modify_request_headers": {}, "modify_response_headers": {}}]}
@@ -1479,8 +1489,6 @@ async fn handle_rules_api(
                 t.insert("upstream".into(), toml::Value::String(up.to_string()));
                 if let Some(sm) = v.get("ssl_mode").and_then(|x| x.as_str()) {
                     if !sm.is_empty() {
-                        const SSL_MODES: &[&str] =
-                            &["verify", "no_verify", "trust_self_signed", "off", "tor"];
                         if !SSL_MODES.contains(&sm) {
                             return text_err(
                                 StatusCode::BAD_REQUEST,
