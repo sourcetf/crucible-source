@@ -915,7 +915,7 @@ pub fn gen_named_conf(cfg: &DnsConfig, zones: &[ZoneRow]) -> String {
                 let prim: Vec<String> = z.primaries.iter().filter(|p| valid_primary(p)).map(|p| format!("{p};")).collect();
                 if prim.is_empty() { continue; }
                 s.push_str(&format!(
-                    "zone \"{}\" {{ type secondary; primaries {{ {}; }}; file \"{f}\"; }};\n",
+                    "zone \"{}\" {{ type secondary; primaries {{ {} }}; file \"{f}\"; }};\n",
                     z.name,
                     prim.join(" ")
                 ));
