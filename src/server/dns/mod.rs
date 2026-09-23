@@ -76,9 +76,12 @@ pub struct DnsModes {
     /// public 递归模式
     #[serde(default)]
     pub recursive: bool,
-    /// 权威模式（服务用户 zones；始终可用，root/recursive 是叠加开关）
-    /// 兼容配置缩写 `auth`（config-test.toml 等曾写 auth = true）
-    #[serde(default, alias = "auth")]
+    /// 权威模式：是否服务用户 zones（规格 §16.1 要求面板可开关）。
+    ///
+    /// 默认 **true**：旧配置普遍没写这个字段，而「不写就停止服务所有 zone」会把
+    /// 已有部署打挂；默认开等于保持既有语义，显式 false 才是真的关掉。
+    /// 兼容配置缩写 `auth`。
+    #[serde(default = "default_true", alias = "auth")]
     pub authoritative: bool,
 }
 
@@ -585,11 +588,29 @@ pub fn list_records(zone: &str) -> Result<Vec<RecordRow>> {
 
 /// RFC1035 master 文件。SOA serial = unix 时间（面板每次改动 bump）。
 pub fn gen_zone_file(zone: &str, kind: &str, recs: &[RecordRow]) -> String {
+    gen_zone_file_monotonic(zone, kind, recs, None)
+}
+
+/// 带 serial 单调性的版本（推荐路径）。
+///
+/// SOA serial 必须**严格递增**：同秒内的两次面板编辑若产生同一个 unix 秒值，
+/// 从服务器 / 本模块自己的 IXFR 判定 / 任何 AXFR 消费者都会认为「无变化」而不更新。
+/// 传入上一次落盘的 serial，取 `max(now, prev + 1)`。
+pub fn gen_zone_file_monotonic(
+    zone: &str,
+    kind: &str,
+    recs: &[RecordRow],
+    prev_serial: Option<u64>,
+) -> String {
     // 统一去尾点再拼，修复 zone 名带尾点时的 "ns1.example.com.." 双点（named 拒载）
     let zone = zone.trim_end_matches('.');
     let mut s = String::new();
     s.push_str(&format!("$ORIGIN {zone}.\n$TTL 3600\n"));
-    let serial = chrono_now();
+    let now = chrono_now();
+    let serial = match prev_serial {
+        Some(p) => now.max(p.saturating_add(1)),
+        None => now,
+    };
     let ns1 = format!("ns1.{zone}.");
     if kind == "master" {
         // 面板可能自带 SOA 记录（RR_TYPES 里允许）——自带则不重复插入
@@ -831,7 +852,11 @@ pub fn gen_named_conf(cfg: &DnsConfig, zones: &[ZoneRow]) -> String {
             s.push_str(&format!("zone \"crucible.rpz\" {{ type primary; file \"{rf}\"; }};\n"));
             s.push_str(&format!("zone \"crucible.answers\" {{ type primary; file \"{af}\"; }};\n"));
         }
-        for z in zones {
+        // 权威开关：modes.authoritative=false 时不声明任何用户 zone。
+        // 此前这个字段从生成器里完全没被读过——面板上关掉它没有任何效果，
+        // 规格 §16.1 要求的「权威/递归/根 三档可开关」实际上是假的。
+        if cfg.modes.authoritative {
+            for z in zones {
             let f = zone_file_name(z, view_tag);
             if z.kind == "master" {
                 s.push_str(&format!(
@@ -860,6 +885,7 @@ pub fn gen_named_conf(cfg: &DnsConfig, zones: &[ZoneRow]) -> String {
                     z.name,
                     prim.join(" ")
                 ));
+            }
             }
         }
     };
@@ -1117,10 +1143,23 @@ pub fn write_all(cfg: &DnsConfig) -> Result<Vec<(String, PathBuf)>> {
     }
     let mut written: Vec<(String, PathBuf)> = Vec::new();
     for (view_tag, line_tag) in &views {
+        // 与 gen_named_conf 同步：权威关掉时不落用户 zone 文件
+        // （否则盘上留着 orphan zone，且 named.conf 里已无引用，排障时极易误判）。
+        if !cfg.modes.authoritative {
+            break;
+        }
         for z in &zones {
             let recs: Vec<RecordRow> = list_records(&z.name)?.into_iter().filter(|r| r.line == *line_tag).collect();
             let path = zones_dir.join(zone_file_name(z, view_tag));
-            std::fs::write(&path, gen_zone_file(&z.name, &z.kind, &recs))?;
+            // serial 单调：读回本次覆盖前的 SOA serial，保证严格递增，
+            // 否则同秒内的第二次编辑对任何 AXFR/IXFR 消费者都是「没变」。
+            let prev_serial = std::fs::read_to_string(&path)
+                .ok()
+                .and_then(|t| serial_from_zone_text(&t));
+            std::fs::write(
+                &path,
+                gen_zone_file_monotonic(&z.name, &z.kind, &recs, prev_serial),
+            )?;
             // zone 文件是控制面的 source of truth：regen 后旧 journal/inline-signing
             // 产物必然失步（named 'journal out of sync' 拒载），一并清掉
             for ext in [".jnl", ".signed", ".signed.jnl"] {
@@ -1666,8 +1705,16 @@ fn parse_dnssec_time(s: &str) -> u64 {
     let h: u64 = digits[8..10].parse().unwrap_or(0);
     let mi: u64 = digits[10..12].parse().unwrap_or(0);
     let se: u64 = digits[12..14].parse().unwrap_or(0);
-    // 简单计算（不考虑闰秒）
-    (y - 1970) * 365 * 86400 + mo * 30 * 86400 + d * 86400 + h * 3600 + mi * 60 + se
+    // 简单计算（不考虑闰秒）。
+    // 年份用 saturating_sub：`Activate: 00010101000000` 这类（管理员上传的 key 文件
+    // 里完全可能出现）会让 y < 1970，无符号减法在 debug/overflow-checks 下直接 panic，
+    // 而这条路径是从 status_json 与轮换循环可达的。
+    y.saturating_sub(1970) * 365 * 86400
+        + mo * 30 * 86400
+        + d * 86400
+        + h * 3600
+        + mi * 60
+        + se
 }
 
 /// Root zone AXFR 增量更新（需求 2）：比较 SOA serial → IXFR → 应用差异。

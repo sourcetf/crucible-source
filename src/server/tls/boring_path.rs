@@ -479,6 +479,21 @@ static ACCEPTOR_CACHE: Lazy<Mutex<HashMap<u64, Arc<SslAcceptor>>>> =
     Lazy::new(|| Mutex::new(HashMap::new()));
 const ACCEPTOR_CACHE_CAP: usize = 64;
 
+/// 清空 acceptor 缓存。
+///
+/// 指纹只覆盖配置字符串，缓存又永不失效，因此「同一路径上换证书」这类
+/// 内容变化（certbot 续期、面板覆盖 ssl.cert / ssl.ech_keys）不会命中新指纹，
+/// 进程会继续用旧证书直到重启。热路径（accept_and_serve 每连接查一次）不适合
+/// 加 stat，所以在配置重载这个低频点显式清空——由 `LiveConfig::reload` 调用。
+pub fn clear_acceptor_cache() {
+    let mut map = ACCEPTOR_CACHE.lock();
+    let n = map.len();
+    map.clear();
+    if n > 0 {
+        log::info!("tls: acceptor cache cleared ({n} entries) — certificates/config re-read on next handshake");
+    }
+}
+
 fn acceptor_fingerprint(ssl: &SslConfig, lc: &ListenerConfig) -> u64 {
     let mut h = DefaultHasher::new();
     ssl.cert.hash(&mut h);

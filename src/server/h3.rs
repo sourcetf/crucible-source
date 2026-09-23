@@ -16,7 +16,6 @@ mod imp {
     use super::*;
     use crate::server::apps;
     use crate::server::h1::{BoxBody, REQUEST_BODY_CAP};
-    #[allow(unused_imports)]
     use crate::server::connect_udp;
     use crate::server::static_files;
     use anyhow::Context;
@@ -46,6 +45,13 @@ mod imp {
         let server_config = build_server_config(&cert_pem, &key_pem)?;
         // Bind UDP then attach Boring-aware EndpointConfig (HMAC/versions).
         let socket = std::net::UdpSocket::bind(bind).context("h3 udp bind")?;
+        // TASK2：整个 QUIC 端点都跑在这一条 UDP socket 上，ECN 的 socket 级设置
+        // 与启动校验打在这里。默认关闭（`ListenerConfig::quic_ecn`）——
+        // 它不改变 ECN 是否生效（quinn 那边本来就开着），只把状态变成可观测，
+        // 详见 `server::ecn` 文件头。
+        if lc.quic_ecn {
+            apply_quic_ecn(&socket, bind);
+        }
         let endpoint = Endpoint::new(
             quinn_boring::helpers::default_endpoint_config(),
             Some(server_config),
@@ -80,6 +86,35 @@ mod imp {
             .map_err(|e| anyhow::anyhow!("h3 boring server_config: {e}"))
     }
 
+    /// QUIC socket 的 ECN 启动校验（由 `ListenerConfig::quic_ecn` 打开，默认关）。
+    ///
+    /// 这里**刻意只做入向 + 观测，不写出向码点**。原因是核对源码后的结论：
+    /// quinn 自己已经完整支持 ECN —— `quinn-proto` 的 `sending_ecn` 默认为 `true`，
+    /// 逐包标 `Ect0` 并做 ACK_ECN 校验与黑洞退避；`quinn-udp` 也已经设了
+    /// `IP_RECVTOS`/`IPV6_RECVTCLASS` 并用 per-packet cmsg 设置出向 `IP_TOS`/`IPV6_TCLASS`。
+    ///
+    /// quinn 想发 Not-ECT 时是「不加 cmsg」，此时 socket 级 `IP_TOS` 会生效——
+    /// 在 socket 上强写 ECT(0) 就等于覆盖它的黑洞退避。所以这里只重设入向选项
+    /// （对 macOS 双栈 socket 有益：quinn-udp 那边显式忽略了那里的 `IP_RECVTOS` 失败），
+    /// 再把 socket 的当前状态读出来记日志，作为「这台机器上 ECN 到底开没开」的运维证据。
+    fn apply_quic_ecn(socket: &std::net::UdpSocket, bind: SocketAddr) {
+        if !crate::server::ecn::platform_supported() {
+            log::warn!("h3 ECN bind={bind}: platform has no IP_RECVTOS/IPV6_RECVTCLASS, skipped");
+            return;
+        }
+        if let Err(e) = crate::server::ecn::enable_recv_ecn(socket) {
+            log::warn!("h3 ECN bind={bind}: recv options failed: {e}");
+        }
+        match crate::server::ecn::outgoing_ecn(socket) {
+            Ok(cp) => log::info!(
+                "h3 ECN bind={bind}: recv-ECN observable, socket TOS={} (outgoing marking is \
+                 per-packet in quinn-udp; transport-level ECN is on by default in quinn)",
+                cp.as_str()
+            ),
+            Err(e) => log::warn!("h3 ECN bind={bind}: socket TOS readback failed: {e}"),
+        }
+    }
+
     async fn handle_incoming(
         incoming: quinn::Incoming,
         live: Arc<LiveConfig>,
@@ -106,7 +141,12 @@ mod imp {
 
         // `::h3` / `::h3_quinn` — avoid clashing with this module name `server::h3`.
         let h3_conn = ::h3_quinn::Connection::new(connection);
-        let mut server = match ::h3::server::Connection::new(h3_conn).await {
+        // RFC 9298 的扩展 CONNECT 需要服务端声明 SETTINGS_ENABLE_CONNECT_PROTOCOL。
+        // h3 0.0.8 的默认值是 false（`h3::config::Settings::default`），不显式打开的话
+        // 守规矩的客户端根本不会发 `:protocol: connect-udp`。
+        let mut h3_builder = ::h3::server::builder();
+        h3_builder.enable_extended_connect(true);
+        let mut server = match h3_builder.build(h3_conn).await {
             Ok(s) => s,
             Err(e) => {
                 // Handshake / GOAWAY / reset during setup — log and drop connection.
@@ -115,6 +155,10 @@ mod imp {
             }
         };
 
+        // 每连接一份的 QMux 流预算（见 qmux.rs）：闸门是每连接的，
+        // 进程级的 QMUX_BUDGET 只做汇总。
+        let qmux = crate::server::qmux::QmuxBudget::per_connection();
+
         // Stream resets / CANCEL must not tear down the process or the accept loop
         // for the whole endpoint — only this QUIC connection's request loop.
         loop {
@@ -122,8 +166,11 @@ mod imp {
                 Ok(Some(resolver)) => {
                     let live_c = Arc::clone(&live);
                     let lc_c = lc.clone();
+                    let qmux_c = Arc::clone(&qmux);
                     tokio::spawn(async move {
-                        if let Err(e) = handle_resolver(resolver, live_c, lc_c, peer).await {
+                        if let Err(e) =
+                            handle_resolver(resolver, live_c, lc_c, peer, qmux_c).await
+                        {
                             // Client reset, idle timeout, or cancel — common; keep serving.
                             log::debug!("h3 request soft-fail peer={peer}: {e:#}");
                         }
@@ -184,17 +231,45 @@ mod imp {
         live: Arc<LiveConfig>,
         lc: ListenerConfig,
         peer: SocketAddr,
+        qmux: Arc<crate::server::qmux::QmuxBudget>,
     ) -> Result<()> {
-        crate::server::qmux::stream_opened();
+        let (req, mut stream) = match resolver.resolve_request().await {
+            Ok(pair) => pair,
+            Err(e) => {
+                log::debug!("h3 resolve_request reset/cancel peer={peer}: {e:#}");
+                return Ok(());
+            }
+        };
+        crate::server::telemetry::record_request();
+
+        // RFC 9298 CONNECT-UDP 必须在**收请求体之前**分流。
+        //
+        // 旧代码把 CONNECT 判断放在下面的 body 循环之后，而那个循环对
+        // 「发完 HEADERS 就等 200」的客户端会一直阻塞在 `recv_data()` 上：
+        // CONNECT-UDP 的负载本来就要等 200 之后才发，于是隧道还没建就先卡死。
+        if req.method() == http::Method::CONNECT {
+            return proxy_connect_udp(&req, stream, &live, peer).await;
+        }
+
+        // QMux 流预算：超限如实回 503，而不是把这次请求算成「已服务」。
+        // 守卫是 RAII 的 —— 下面所有 `return Ok(())` 的早退分支都不会漏账。
+        let permit = match crate::server::qmux::stream_opened(&qmux) {
+            Ok(p) => p,
+            Err(rej) => {
+                log::warn!(
+                    "h3 qmux budget peer={peer}: {rej} (process-wide {})",
+                    crate::server::qmux::QMUX_BUDGET.stats_line()
+                );
+                let resp = Response::builder()
+                    .status(StatusCode::SERVICE_UNAVAILABLE)
+                    .body(())
+                    .unwrap();
+                let _ = stream.send_response(resp).await;
+                return Ok(());
+            }
+        };
+
         let result = async {
-            let (req, mut stream) = match resolver.resolve_request().await {
-                Ok(pair) => pair,
-                Err(e) => {
-                    log::debug!("h3 resolve_request reset/cancel peer={peer}: {e:#}");
-                    return Ok(());
-                }
-            };
-            crate::server::telemetry::record_request();
             // P1-9：收齐 H3 请求体（上限 8MiB）——POST/PUT 才能把 body 交给引擎/admin；
             // 且不排空请求体会卡住 QUIC 流量控制。超限直接 413。
             let mut body: Vec<u8> = Vec::new();
@@ -227,35 +302,6 @@ mod imp {
 
             let method = req.method().as_str().to_string();
             let path = req.uri().path().to_string();
-
-            // RFC 9298 CONNECT-UDP（以及普通 CONNECT 隧道）。
-            //
-            // 之前这里无条件回 200 OK 就 return——客户端以为隧道已建立，
-            // 实际一个字节都没转发。这比直接报错更坏：把「没实现」伪装成成功。
-            // 现在如实回 501，并记录原因，等真正的 QUIC 流↔UDP 转发接上再放开。
-            if method == "CONNECT" {
-                let wants_udp = crate::server::connect_udp::is_connect_udp(
-                    req.headers()
-                        .get("connect-udp")
-                        .and_then(|v| v.to_str().ok()),
-                ) || req
-                    .headers()
-                    .get(":protocol")
-                    .and_then(|v| v.to_str().ok())
-                    .map(|p| p.eq_ignore_ascii_case("connect-udp"))
-                    .unwrap_or(false);
-                let target = parse_connect_target(&path);
-                log::warn!(
-                    "h3 CONNECT (udp={wants_udp}) path={path} peer={peer} target={target:?}: \
-                     tunnel forwarding not implemented, replying 501"
-                );
-                let resp = Response::builder()
-                    .status(StatusCode::NOT_IMPLEMENTED)
-                    .body(())
-                    .unwrap();
-                let _ = stream.send_response(resp).await;
-                return Ok(());
-            }
 
             let t0 = std::time::Instant::now();
             let req = req.map(|()| Bytes::from(body));
@@ -307,7 +353,7 @@ mod imp {
             Ok(())
         }
         .await;
-        crate::server::qmux::stream_closed();
+        crate::server::qmux::stream_closed(permit);
         result
     }
 
@@ -449,6 +495,8 @@ mod imp {
                 *req.uri_mut() = u;
             }
         }
+        // 改写后以新路径做后续判定与分发（与 h1/h2 的修正一致）。
+        let path = req.uri().path().to_string();
         // P1-5：h1 的 pass_upstream（page rule pass 动作）在 h3 同样生效。
         if let Some((murl, upstream)) = crate::server::page_rules::pass_upstream(&lc, &path) {
             let resp = crate::server::proxy::proxy_page_rule(
@@ -481,7 +529,15 @@ mod imp {
         peer: SocketAddr,
         path: &str,
     ) -> Response<Bytes> {
-        // P1-5：反代规则在 apps/static 之前（与 h1 dispatch_tail 对齐）。
+        // 分发顺序必须与 h1 一致（规格 §4：apps 优先于 proxy）。
+        // 此前这里是 proxy 在前、apps 在后，注释还写着「与 h1 dispatch_tail 对齐」——
+        // 恰好相反：同一条 URL 在 h1 交给应用引擎、在 h3 被反代走，行为随协议而变。
+        // Apps via try_handle_simple only when path/ext matches a listener app route.
+        if apps::would_handle(&lc, path) {
+            if let Some(resp) = apps::try_handle_simple(&req, &live, &lc, peer).await {
+                return tag(resp, "app");
+            }
+        }
         if would_proxy(&lc, path) {
             if let Some((_matched, resp)) =
                 crate::server::proxy::try_proxy(&lc, req.map(Full::new), peer.ip()).await
@@ -496,12 +552,6 @@ mod imp {
                 "proxy",
             );
         }
-        // Apps via try_handle_simple only when path/ext matches a listener app route.
-        if apps::would_handle(&lc, path) {
-            if let Some(resp) = apps::try_handle_simple(&req, &live, &lc, peer).await {
-                return tag(resp, "app");
-            }
-        }
         // Static files; metrics already handled above via telemetry::maybe_handle_simple.
         match static_files::serve_simple(&req, &lc).await {
             Ok(r) => tag(r, "static"),
@@ -515,25 +565,340 @@ mod imp {
         }
     }
 
-    /// Parse ":path" or authority as host:port for CONNECT target.
-    fn parse_connect_target(target: &str) -> Option<(std::net::IpAddr, u16)> {
-        let t = target.trim_start_matches('/');
-        let (h, p) = t.rsplit_once(':')?;
-        let ip: std::net::IpAddr = h.parse().ok()?;
-        let port = p.parse().ok()?;
-        Some((ip, port))
+    /// RFC 9298 CONNECT-UDP：真正的 QUIC 请求流 ↔ UDP 双向转发。
+    ///
+    /// 为什么这次能真做：服务端从 `resolve_request()` 拿到的是
+    /// `RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>`，而 `h3_quinn::BidiStream`
+    /// **实现了** `h3::quic::BidiStream`，所以 `RequestStream::split()` 可用 ——
+    /// 拿到彼此独立、可并发驱动的收发两半。
+    ///
+    /// 旧注释说「h3-quinn 的 OpenStreams/BidiStream 有 trait 限制」是认错了对象：
+    /// 没有 `split()` 的是 `OpenStreams`（只负责开流，服务端这条路径根本不用它），
+    /// 而服务端拿到的 `BidiStream` 一直有。所以转发不是"被 API 挡住"，是之前没接。
+    ///
+    /// 失败一律回真实状态码，不回 200：目标解析失败 400、地址不允许 403、
+    /// UDP 建不起来 502、非 CONNECT-UDP 或 capsule 形态 501。
+    async fn proxy_connect_udp(
+        req: &Request<()>,
+        mut stream: ::h3::server::RequestStream<::h3_quinn::BidiStream<Bytes>, Bytes>,
+        live: &Arc<LiveConfig>,
+        peer: SocketAddr,
+    ) -> Result<()> {
+        let t0 = std::time::Instant::now();
+        let path = req.uri().path().to_string();
+
+        // 1. 是不是 CONNECT-UDP。
+        //
+        // h3 0.0.8 把 `:protocol` 放在请求 extensions 的 `h3::ext::Protocol` 里，
+        // 不是请求头（见 h3 的 `proto/headers.rs::Pseudo::request` →
+        // `server/request.rs` 的 `extensions_mut().insert(protocol)`）。
+        // 旧代码读 `headers().get(":protocol")` 永远取不到值，这个判断从来没生效过。
+        let proto_ext = req
+            .extensions()
+            .get::<::h3::ext::Protocol>()
+            .map(|p| p.as_str().to_string());
+        let proto_hdr = req
+            .headers()
+            .get("connect-udp")
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.to_string());
+        let wants_udp = connect_udp::is_connect_udp(proto_ext.as_deref())
+            || connect_udp::is_connect_udp(proto_hdr.as_deref());
+
+        if !wants_udp {
+            // 普通 CONNECT（TCP 隧道）不在本次范围，如实回 501。
+            connect_reject(
+                &mut stream,
+                live,
+                peer,
+                &path,
+                StatusCode::NOT_IMPLEMENTED,
+                t0,
+                "only CONNECT-UDP (:protocol: connect-udp) is implemented",
+            )
+            .await;
+            return Ok(());
+        }
+
+        // 2. capsule 形态没实现。RFC 9297 §3 下 `Capsule-Protocol: ?1` 的流上是 capsule，
+        //    不是裸长度前缀报文；按错格式解析会解出垃圾，所以直接拒绝。
+        let capsule = req
+            .headers()
+            .get("capsule-protocol")
+            .and_then(|v| v.to_str().ok());
+        if connect_udp::wants_capsule_protocol(capsule) {
+            connect_reject(
+                &mut stream,
+                live,
+                peer,
+                &path,
+                StatusCode::NOT_IMPLEMENTED,
+                t0,
+                "capsule-protocol: ?1 未实现, 只支持长度前缀报文形态",
+            )
+            .await;
+            return Ok(());
+        }
+
+        // 3. 目标解析 + 准入。
+        let (host, port) = match connect_udp::parse_target_path(&path) {
+            Ok(v) => v,
+            Err(e) => {
+                connect_reject(
+                    &mut stream,
+                    live,
+                    peer,
+                    &path,
+                    StatusCode::BAD_REQUEST,
+                    t0,
+                    &e,
+                )
+                .await;
+                return Ok(());
+            }
+        };
+        let target = match connect_udp::resolve_target(&host, port) {
+            Ok(t) => t,
+            Err(e) => {
+                // 请求语法是对的，是代理策略不允许转发到那儿 → 403 而不是 400。
+                connect_reject(
+                    &mut stream,
+                    live,
+                    peer,
+                    &path,
+                    StatusCode::FORBIDDEN,
+                    t0,
+                    &e,
+                )
+                .await;
+                return Ok(());
+            }
+        };
+
+        // 4. 建 UDP socket 并 connect 到目标。
+        //    `connect()` 之后内核只收该对端的报文，省掉自己过滤源地址，
+        //    也避免把任意来源的 UDP 灌进隧道。本地地址/端口由内核分配。
+        let bind_any = if target.is_ipv4() {
+            SocketAddr::from(([0u8, 0, 0, 0], 0))
+        } else {
+            SocketAddr::from(([0u16; 8], 0))
+        };
+        let udp = match tokio::net::UdpSocket::bind(bind_any).await {
+            Ok(s) => s,
+            Err(e) => {
+                connect_reject(
+                    &mut stream,
+                    live,
+                    peer,
+                    &path,
+                    StatusCode::BAD_GATEWAY,
+                    t0,
+                    &format!("udp bind {bind_any} failed: {e}"),
+                )
+                .await;
+                return Ok(());
+            }
+        };
+        if let Err(e) = udp.connect(target).await {
+            connect_reject(
+                &mut stream,
+                live,
+                peer,
+                &path,
+                StatusCode::BAD_GATEWAY,
+                t0,
+                &format!("udp connect {target} failed: {e}"),
+            )
+            .await;
+            return Ok(());
+        }
+
+        // 5. 隧道成立，才回 200。客户端从这一刻起在请求流上发长度前缀的 UDP 负载。
+        let resp = match Response::builder().status(StatusCode::OK).body(()) {
+            Ok(r) => r,
+            Err(e) => {
+                log::warn!("h3 CONNECT-UDP build 200 peer={peer}: {e}");
+                return Ok(());
+            }
+        };
+        if let Err(e) = stream.send_response(resp).await {
+            log::debug!("h3 CONNECT-UDP send 200 peer={peer}: {e:#}");
+            return Ok(());
+        }
+        crate::server::access_log::log_response(
+            live,
+            peer,
+            "h3",
+            "CONNECT",
+            &path,
+            200,
+            None,
+            t0.elapsed(),
+            "connect-udp",
+        );
+        log::info!("h3 CONNECT-UDP established peer={peer} target={target} path={path}");
+
+        // 6. 拆成收发两半，跑双向转发；结束时正常收尾（FIN）而不是让 quinn reset。
+        let (mut send_half, mut recv_half) = stream.split();
+        let idle = std::time::Duration::from_secs(connect_udp::DEFAULT_IDLE_TIMEOUT_SECS);
+        run_udp_tunnel(&mut send_half, &mut recv_half, udp, idle, peer, target).await;
+        if let Err(e) = send_half.finish().await {
+            log::debug!("h3 CONNECT-UDP finish peer={peer}: {e:#}");
+        }
+        log::info!("h3 CONNECT-UDP closed peer={peer} target={target}");
+        Ok(())
     }
 
-    /// Bidirectional QUIC stream ↔ UDP proxy (RFC 9298 CONNECT-UDP).
-    // RFC 9298 CONNECT-UDP: HTTP/3 requests via QMUX stream → UDP proxy.
-    // NOTE: This is handled by the QMUX implementation (qmux.rs::try_open)
-    // which creates a QUIC stream and proxies to UDP. The h3-quinn
-    // OpenStreams/BidiStream API has trait limitations for direct use.
-    async fn proxy_connect_udp(
-        _stream: ::h3::server::RequestStream<::h3_quinn::OpenStreams, Bytes>,
-        _target: SocketAddr,
-    ) -> Result<()> {
-        Err(anyhow::anyhow!("CONNECT-UDP handled via QMUX"))
+    /// RFC 9298 §4.3 的双向转发循环。
+    ///
+    /// 上行：请求流 DATA 帧里的字节按 varint 长度前缀重组，逐个 `send()` 给目标；
+    /// 下行：`recv()` 到的报文加长度前缀，写回响应流。
+    /// 结束条件：请求流结束（FIN/trailers）、UDP 出错、空闲超时、分帧非法。
+    ///
+    /// 结构上刻意让每个 `select!` 分支的处理器都**不碰**其它分支 future 借用的变量：
+    /// 下行收包封在 [`recv_framed`] 里（它自己借 `buf`，只交出已分帧的 `Bytes`），
+    /// 处理器因此不需要再读 `buf`，借用关系一眼可读，也不必依赖 `select!` 内部
+    /// future 的存放与析构时机。
+    async fn run_udp_tunnel(
+        send: &mut ::h3::server::RequestStream<::h3_quinn::SendStream<Bytes>, Bytes>,
+        recv: &mut ::h3::server::RequestStream<::h3_quinn::RecvStream, Bytes>,
+        udp: tokio::net::UdpSocket,
+        idle_timeout: std::time::Duration,
+        peer: SocketAddr,
+        target: SocketAddr,
+    ) {
+        let mut asm = connect_udp::DatagramAssembler::default();
+        let mut udp_buf = vec![0u8; connect_udp::MAX_DATAGRAM];
+        let idle = tokio::time::sleep(idle_timeout);
+        tokio::pin!(idle);
+
+        loop {
+            tokio::select! {
+                // 上行：客户端 → 目标。
+                chunk = recv.recv_data() => {
+                    let mut buf = match chunk {
+                        Ok(Some(b)) => b,
+                        Ok(None) => {
+                            // 请求流 FIN 或 trailers：上行结束，隧道收摊。
+                            // 若还留着凑不齐的字节，说明客户端把报文截断了，记下来。
+                            let leftover = asm.pending();
+                            if leftover != 0 {
+                                log::warn!(
+                                    "h3 CONNECT-UDP peer={peer} target={target}: \
+                                     stream ended with {leftover} trailing byte(s)"
+                                );
+                            }
+                            log::debug!("h3 CONNECT-UDP peer={peer} target={target}: request stream ended");
+                            return;
+                        }
+                        Err(e) => {
+                            log::debug!("h3 CONNECT-UDP peer={peer} recv_data: {e:#}");
+                            return;
+                        }
+                    };
+                    let n = buf.remaining();
+                    if n == 0 {
+                        continue;
+                    }
+                    let bytes = buf.copy_to_bytes(n);
+                    asm.push(&bytes);
+                    // 一个 DATA 帧可能装多个报文、也可能只有半个前缀：
+                    // 把目前完整的全部送走，剩下留在 asm 里等下一帧。
+                    loop {
+                        match asm.next_datagram() {
+                            Ok(Some(dg)) => {
+                                if let Err(e) = udp.send(&dg).await {
+                                    log::debug!("h3 CONNECT-UDP peer={peer} udp send: {e}");
+                                    return;
+                                }
+                            }
+                            Ok(None) => break,
+                            Err(e) => {
+                                // 分帧非法：给一个明确的 stream error，
+                                // 而不是继续按错的偏移解析下一段。
+                                log::warn!("h3 CONNECT-UDP peer={peer} bad framing: {e}");
+                                send.stop_stream(::h3::error::Code::H3_MESSAGE_ERROR);
+                                return;
+                            }
+                        }
+                    }
+                }
+                // 下行：目标 → 客户端。
+                framed = recv_framed(&udp, &mut udp_buf) => {
+                    match framed {
+                        Ok(f) => {
+                            if let Err(e) = send.send_data(f).await {
+                                log::debug!("h3 CONNECT-UDP peer={peer} send_data: {e:#}");
+                                return;
+                            }
+                        }
+                        Err(e) => {
+                            log::debug!("h3 CONNECT-UDP peer={peer} udp recv: {e}");
+                            return;
+                        }
+                    }
+                }
+                _ = &mut idle => {
+                    log::debug!("h3 CONNECT-UDP peer={peer} target={target}: idle timeout");
+                    return;
+                }
+            }
+            // 有流量就把空闲时钟往后推。
+            idle.as_mut().reset(tokio::time::Instant::now() + idle_timeout);
+        }
+    }
+
+    /// 收一个 UDP 报文并加上 RFC 9298 的长度前缀，返回可写回流的 `Bytes`。
+    ///
+    /// 独立成函数是为了把 `&mut buf` 的借用关在 future 内部：
+    /// `select!` 的处理器拿到的只有返回值，不再需要读 `buf`。
+    async fn recv_framed(
+        udp: &tokio::net::UdpSocket,
+        buf: &mut [u8],
+    ) -> Result<Bytes, String> {
+        let n = udp.recv(buf).await.map_err(|e| e.to_string())?;
+        let framed = connect_udp::frame_datagram(&buf[..n])?;
+        Ok(Bytes::from(framed))
+    }
+
+    /// CONNECT 类请求的失败出口：回状态码 + 记一条访问日志。
+    ///
+    /// 访问日志是刻意的：否则隧道（成功的和失败的）在 access log 里完全不可见，
+    /// 只能靠 warn 级日志猜。
+    async fn connect_reject(
+        stream: &mut ::h3::server::RequestStream<::h3_quinn::BidiStream<Bytes>, Bytes>,
+        live: &Arc<LiveConfig>,
+        peer: SocketAddr,
+        path: &str,
+        status: StatusCode,
+        t0: std::time::Instant,
+        reason: &str,
+    ) {
+        log::warn!(
+            "h3 CONNECT-UDP peer={peer} path={path} -> {}: {reason}",
+            status.as_u16()
+        );
+        let resp = match Response::builder().status(status).body(()) {
+            Ok(r) => r,
+            Err(e) => {
+                log::debug!("h3 CONNECT-UDP build {status}: {e}");
+                return;
+            }
+        };
+        if let Err(e) = stream.send_response(resp).await {
+            log::debug!("h3 CONNECT-UDP reply {status} peer={peer}: {e:#}");
+        }
+        crate::server::access_log::log_response(
+            live,
+            peer,
+            "h3",
+            "CONNECT",
+            path,
+            status.as_u16(),
+            None,
+            t0.elapsed(),
+            "connect-udp",
+        );
     }
 
     fn would_proxy(lc: &ListenerConfig, path: &str) -> bool {

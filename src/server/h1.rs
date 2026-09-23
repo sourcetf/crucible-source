@@ -23,6 +23,23 @@ pub fn hsts_header() -> &'static str {
     "max-age=31536000; includeSubDomains; preload"
 }
 
+/// Host 头是否「像个主机名」——用于 port_reuse 明文口构造 301 Location。
+///
+/// 只需挡住明显不像主机名的输入（含空格、斜杠、`@`、`?`、`#`、控制字符），
+/// 避免把客户端可控的 Host 原样拼进 Location 造成开放重定向。
+/// 允许字母/数字/`.`/`-`/`_`，以及 IPv6 字面量的 `[` `]` `:`。
+fn is_plausible_hostname(h: &str) -> bool {
+    if h.is_empty() || h.len() > 253 {
+        return false;
+    }
+    let bracketed = h.starts_with('[') && h.ends_with(']');
+    h.bytes().all(|b| {
+        b.is_ascii_alphanumeric()
+            || matches!(b, b'.' | b'-' | b'_')
+            || (bracketed && matches!(b, b'[' | b']' | b':'))
+    })
+}
+
 pub type BoxBody = http_body_util::combinators::BoxBody<Bytes, std::convert::Infallible>;
 
 /// admin 请求体缓冲上限：admin::handle 侧本就全量缓冲 body（写文件/读 TOML），
@@ -155,14 +172,12 @@ async fn handle_request_inner(
         return tag(resp, "geoip");
     }
 
-    // DoH（RFC8484，需求 9）：按 Host/路径分流；未命中（非 DoH 域名）原样放行，
-    // 保证同一 443 上正常 HTTPS 站点不受影响。
-    let req = match crate::server::dns::dot_doh::h1_try_handle(req, &snap, peer).await {
-        Ok(r) => return tag(r, "dns-doh"),
-        Err(req) => req,
-    };
-
-    // 请求路径：IP access → rate limit → basic auth → page_rules → admin → apps → proxy → static
+    // 请求路径：IP access → rate limit → DoH → basic auth → page_rules → admin → apps → proxy → static
+    //
+    // DoH 必须排在 ACL/限速**之后**：此前它排在前面，等于任何能连上 TLS 口的人
+    // 都绕过监听器 IP 白名单与限速，白拿一个公共递归解析器（DoS/滥用放大器）。
+    // 同时它排在 basic_auth 之前——DoH 客户端（浏览器/系统解析器）无法交互式
+    // 提供 Basic 凭据，要求它会直接让 DoH 不可用。
     if !crate::server::access::is_allowed(&snap.ip_access, peer) {
         let (st, msg) = crate::server::access::deny_response();
         return tag(
@@ -192,6 +207,13 @@ async fn handle_request_inner(
             }
         }
     }
+
+    // DoH（RFC8484，需求 9）：按 Host/路径分流；未命中（非 DoH 域名）原样放行，
+    // 保证同一 443 上正常 HTTPS 站点不受影响。
+    let req = match crate::server::dns::dot_doh::h1_try_handle(req, &snap, peer).await {
+        Ok(r) => return tag(r, "dns-doh"),
+        Err(req) => req,
+    };
 
     if let Some(ba) = &lc.basic_auth {
         if !crate::server::basic_auth::check_listener(&req, ba) {
@@ -237,7 +259,7 @@ async fn handle_request_inner(
     // 早期规格 5：端口复用口（port_reuse 且非 TLS listener）上的明文 HTTP 请求
     // 统一返回 HSTS 头 + 301 到 https://{host}/，防不支持 HSTS 的客户端钉死明文。
     if lc.port_reuse && lc.ssl.is_none() {
-        let host = req
+        let raw_host = req
             .headers()
             .get(http::header::HOST)
             .and_then(|v| v.to_str().ok())
@@ -245,11 +267,30 @@ async fn handle_request_inner(
             .split(':')
             .next()
             .unwrap_or("")
+            .trim()
             .to_string();
-        let target = if host.is_empty() {
-            "/".to_string()
-        } else {
-            format!("https://{host}{}", req.uri().path_and_query().map(|p| p.as_str().to_string()).unwrap_or_default())
+        // 不做开放重定向：Host 是客户端可控的，直接拼进 Location 就等于
+        // 把 https://evil.example 回给用户（钓鱼/凭据窃取面）。
+        // 优先用本 listener 配置的 server_name；否则仅在 Host 看起来是合法主机名时
+        // 才采用，否则退化成纯相对路径跳转。
+        let host = match lc.server_name.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+            Some(sn) => Some(sn.to_string()),
+            None => {
+                if is_plausible_hostname(&raw_host) {
+                    Some(raw_host)
+                } else {
+                    None
+                }
+            }
+        };
+        let pq = req
+            .uri()
+            .path_and_query()
+            .map(|p| p.as_str().to_string())
+            .unwrap_or_else(|| "/".to_string());
+        let target = match host {
+            Some(h) => format!("https://{h}{pq}"),
+            None => pq,
         };
         let mut resp = Response::builder()
             .status(StatusCode::MOVED_PERMANENTLY)
@@ -302,6 +343,12 @@ async fn handle_request_inner(
             *req.uri_mut() = u;
         }
     }
+    // 改写之后必须以**新路径**做后续判定与分发。
+    // 此前把改写前的 path 传进 dispatch_tail，于是 `would_handle`/`would_proxy` 判断
+    // 的是一个路径、真正干活的 handler（apps::try_handle 内部自己重算 req.uri()）
+    // 用的是另一个：改写命中时会错发 502「app dispatch returned empty」，
+    // 或者把本该交给引擎的请求当静态文件发出去。
+    let path = req.uri().path().to_string();
     if let Some(resp) = crate::server::page_rules::apply(&lc, &req) {
         return tag(resp, "rule");
     }

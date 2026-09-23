@@ -343,12 +343,19 @@ pub fn parse_sni(buf: &[u8]) -> Option<String> {
     }
     let hs_len = u16::from_be_bytes([buf[3], buf[4]]) as usize;
     let end = (5 + hs_len).min(buf.len());
-    let mut p = 5 + 38; // hs type+len + version + random
-    if p + 2 > end || buf[p - 2] != 0x01 {
+    // 握手类型在 buf[5]（record 头 5 字节之后才是 handshake type/len）。
+    // 此前写成 `buf[p - 2]` 且 p=43，检查的其实是 random 的第 31 个字节——
+    // 等于「只有 1/256 的 ClientHello 能通过」：sni_only 会误杀几乎所有正常
+    // 客户端，port_reuse 的 TLS SNI 分流也永远匹配不到目标 listener。
+    let mut p = 5 + 38; // 握手头(4) + 版本(2) + random(32) = session_id_len 偏移
+    if p + 2 > end || buf[5] != 0x01 {
         return None;
     }
-    let sid_len = u16::from_be_bytes([buf[p], buf[p + 1]]) as usize;
-    p += 2 + sid_len;
+    // session_id 是 **1 字节长度** + N 字节（u8 session_id_len），不是 u16。
+    // 旧实现按 u16 读并 `p += 2 + sid_len`，从这一位起所有后续字段全部错位：
+    // cipher_suites_len 会被读成 0x0200 之类的值，扩展区永远走不到。
+    let sid_len = buf[p] as usize;
+    p += 1 + sid_len;
     if p + 2 > end {
         return None;
     }
@@ -357,7 +364,11 @@ pub fn parse_sni(buf: &[u8]) -> Option<String> {
     if p >= end {
         return None;
     }
-    p += 1; // compression
+    // compression_methods 同样是 **1 字节长度** + N 字节。旧实现只 `p += 1`
+    // 跳过长度字节，却把 `compression_methods[0]` 当成扩展区长度的高位来读，
+    // ext_len 得到一个荒唐的值，扩展循环一次都进不去。
+    let comp_len = buf[p] as usize;
+    p += 1 + comp_len;
     if p + 2 > end {
         return None;
     }
@@ -368,17 +379,97 @@ pub fn parse_sni(buf: &[u8]) -> Option<String> {
         let etype = u16::from_be_bytes([buf[p], buf[p + 1]]);
         let elen = u16::from_be_bytes([buf[p + 2], buf[p + 3]]) as usize;
         let (s, e) = (p + 4, (p + 4 + elen).min(ext_end));
-        if etype == 0x0000 && e > s + 5 {
-            // server_name_list: u16 list_len, entry: u8 type + u16 len + name
+        if etype == 0x0000 && e >= s + 5 {
+            // extension_data = ServerNameList:
+            //   u16 list_len | u8 name_type | u16 name_len | name
+            //
+            // 旧实现要求 `list[0]==0 && list[1]==0`（即 list_len 恰为 0）才算命中，
+            // 并用 `list[1..3]` 当 name_len——字段偏移整体错位。真实的 ClientHello
+            // list_len 是 0x000c 之类的非零值，于是**永远匹配不上**，
+            // SNI 解析对任何真实客户端都返回 None（与上面握手类型的偏移 bug 叠加，
+            // 使 sni_only 与 port_reuse 的 SNI 分流彻底失效）。
             let list = &buf[s..e];
-            if list[0..3] == [0x00, 0x00, 0x00] || (list[0] == 0 && list[1] == 0) {
-                let nlen = u16::from_be_bytes([list[1], list[2]]) as usize;
-                if nlen >= 1 && 3 + nlen <= list.len() {
-                    return Some(String::from_utf8_lossy(&list[3..3 + nlen]).into_owned());
+            if list[2] == 0x00 {
+                // name_type == 0 (host_name)
+                let nlen = u16::from_be_bytes([list[3], list[4]]) as usize;
+                if nlen >= 1 && 5 + nlen <= list.len() {
+                    return Some(String::from_utf8_lossy(&list[5..5 + nlen]).into_owned());
                 }
             }
         }
         p = e;
     }
     None
+}
+
+#[cfg(test)]
+mod sni_tests {
+    use super::parse_sni;
+
+    /// 构造一个**真实布局**的最小 TLS ClientHello（可选带 SNI 扩展）。
+    ///
+    /// `random_byte30` 刻意可控：旧实现检查的正是 random 的第 31 个字节
+    /// （`buf[p-2]` 且 p=43），只有它等于 0x01 才会继续，概率 1/256。
+    fn build_client_hello(sni: Option<&str>, random_byte30: u8) -> Vec<u8> {
+        let mut random = [0u8; 32];
+        random[30] = random_byte30;
+
+        let mut ext = Vec::new();
+        if let Some(name) = sni {
+            let nb = name.as_bytes();
+            // extension_data = ServerNameList: u16 list_len | u8 type | u16 len | name
+            let mut ed = Vec::new();
+            ed.extend_from_slice(&((1 + 2 + nb.len()) as u16).to_be_bytes());
+            ed.push(0x00); // host_name
+            ed.extend_from_slice(&(nb.len() as u16).to_be_bytes());
+            ed.extend_from_slice(nb);
+            ext.extend_from_slice(&0x0000u16.to_be_bytes()); // ext type = server_name
+            ext.extend_from_slice(&(ed.len() as u16).to_be_bytes());
+            ext.extend_from_slice(&ed);
+        }
+
+        let mut hs = Vec::new();
+        hs.extend_from_slice(&[0x03, 0x03]); // client_version
+        hs.extend_from_slice(&random);
+        hs.push(0x00); // session_id_len
+        hs.extend_from_slice(&2u16.to_be_bytes());
+        hs.extend_from_slice(&[0x00, 0x2f]); // cipher_suites
+        hs.push(1); // compression_methods_len
+        hs.push(0x00);
+        hs.extend_from_slice(&(ext.len() as u16).to_be_bytes());
+        hs.extend_from_slice(&ext);
+
+        let mut rec = Vec::new();
+        rec.push(0x16); // handshake record
+        rec.extend_from_slice(&[0x03, 0x01]); // record version
+        rec.extend_from_slice(&((4 + hs.len()) as u16).to_be_bytes());
+        rec.push(0x01); // handshake type = ClientHello
+        let hl = hs.len();
+        rec.extend_from_slice(&[(hl >> 16) as u8, (hl >> 8) as u8, hl as u8]);
+        rec.extend_from_slice(&hs);
+        rec
+    }
+
+    /// 回归：random[30] != 0x01 时必须仍能解析出 SNI。
+    /// 旧实现（检查 random 第 31 字节）在这里返回 None——sni_only 会误杀这些客户端。
+    #[test]
+    fn sni_parsed_regardless_of_random_byte() {
+        assert_eq!(
+            parse_sni(&build_client_hello(Some("localhost"), 0x00)).as_deref(),
+            Some("localhost")
+        );
+        assert_eq!(
+            parse_sni(&build_client_hello(Some("v.qq.com"), 0xff)).as_deref(),
+            Some("v.qq.com")
+        );
+        assert_eq!(
+            parse_sni(&build_client_hello(Some("crucible.local"), 0x01)).as_deref(),
+            Some("crucible.local")
+        );
+    }
+
+    #[test]
+    fn sni_absent_returns_none() {
+        assert_eq!(parse_sni(&build_client_hello(None, 0x01)), None);
+    }
 }

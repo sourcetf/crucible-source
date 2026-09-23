@@ -78,6 +78,15 @@ impl Drop for EngineLib {
 static LIBS: Lazy<Mutex<HashMap<String, Arc<EngineLib>>>> =
     Lazy::new(|| Mutex::new(HashMap::new()));
 
+/// 每个 .so 路径一把装载锁。
+///
+/// 原来的 check-then-insert 不是原子的：两个并发冷请求会各 dlopen 一次、
+/// 各跑一次 `appengine_init`，而 map 里只留后者——先到的那个 Arc 被 drop 时
+/// 会调用 `appengine_shutdown()`，把仍在被另一个请求执行中的实例状态拆掉。
+/// 分路径加锁既消除重复装载，又不让不同引擎互相阻塞。
+static LOAD_LOCKS: Lazy<Mutex<HashMap<String, Arc<Mutex<()>>>>> =
+    Lazy::new(|| Mutex::new(HashMap::new()));
+
 /// §7.2 引擎单次执行的结果（状态码 + 头块 + body）。
 pub struct ExecOutcome {
     pub status: i32,
@@ -398,6 +407,20 @@ fn serial_pool(engine: &str) -> Arc<EnginePool> {
 
 fn load_engine(engine: &str, lib_path: &PathBuf) -> Result<Arc<EngineLib>> {
     let key = lib_path.to_string_lossy().into_owned();
+    // 快路径：已装载
+    {
+        let map = LIBS.lock();
+        if let Some(l) = map.get(&key) {
+            return Ok(Arc::clone(l));
+        }
+    }
+    // 慢路径：按路径串行化，避免并发重复 dlopen + 重复 appengine_init。
+    let path_lock = {
+        let mut locks = LOAD_LOCKS.lock();
+        Arc::clone(locks.entry(key.clone()).or_default())
+    };
+    let _guard = path_lock.lock();
+    // 等到锁之后必须复查：这段时间里另一个线程可能已经装载完成。
     {
         let map = LIBS.lock();
         if let Some(l) = map.get(&key) {

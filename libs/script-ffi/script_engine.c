@@ -1,15 +1,22 @@
 /*
- * scriptffi app-engine — prefer in-process interpreters when headers available.
+ * scriptffi app-engine —— 进程内解释器（Python / Ruby / Perl），无 popen。
  *
- * Build with -DCRUCIBLE_HAVE_PYTHON / _RUBY / _PERL (see build_script_ffi.sh).
- * Popen is compiled ONLY in the per-language #else branch (headers missing).
+ * Build with -DCRUCIBLE_HAVE_PYTHON / _RUBY / _PERL (see build_script_ffi.sh)。
+ * 缺某个语言的嵌入头文件时：该语言**显式失败**（rc != 0 + error 文本），
+ * 不回退 popen、不返回假 hello（旧实现的 appengine_fill_hello 已删除）。
  *
  * Built as libapp_python.so / libapp_ruby.so / libapp_perl.so with
- * -DCRUCIBLE_SCRIPT_LANG.
+ * -DCRUCIBLE_SCRIPT_LANG。
+ *
+ * 跨 .so GIL 契约（详见 libs/app-engines/common/crucible_embed.h 文件头）：
+ * 谁调用 Py_Initialize 谁负责 PyEval_SaveThread 释放 GIL，且任何 .so 都不调用
+ * Py_FinalizeEx。否则同进程的 libapp_wsgi/asgi/uwsgi（另走 dlopen+dlsym 嵌入）
+ * 的请求线程会在 PyGILState_Ensure 上永久等待。
  */
 #include "../app-engines/include/appengine.h"
 #include "../app-engines/common/appengine_common.h"
 
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -22,38 +29,29 @@
 
 static int g_ready;
 
-static const char *default_lang(void)
+/* 语言判定：每个 .so 由 -DCRUCIBLE_SCRIPT_LANG 固定一种语言（libapp_python.so /
+ * libapp_ruby.so / libapp_perl.so），没有编译期语言时按脚本扩展名推断。
+ * 刻意不看 `extra`：Rust 侧现在把 .env 变量以 JSON 形式放在 extra 里（见
+ * app_ffi::call_exec），旧实现会把整段 JSON 当成语言名而失败。 */
+static const char *lang_name(const char *script)
 {
 #ifdef CRUCIBLE_SCRIPT_LANG
+    (void)script;
     return CRUCIBLE_SCRIPT_LANG;
 #else
-    return "python";
-#endif
-}
-
-static const char *lang_name(const char *extra, const char *script)
-{
-    if (extra && extra[0]) {
-        if (strcmp(extra, "python") == 0 || strcmp(extra, "py") == 0)
-            return "python";
-        if (strcmp(extra, "ruby") == 0 || strcmp(extra, "rb") == 0)
-            return "ruby";
-        if (strcmp(extra, "perl") == 0 || strcmp(extra, "pl") == 0)
-            return "perl";
-        return extra;
-    }
     if (script) {
         const char *dot = strrchr(script, '.');
         if (dot) {
-            if (strcmp(dot, ".py") == 0)
-                return "python";
             if (strcmp(dot, ".rb") == 0)
                 return "ruby";
             if (strcmp(dot, ".pl") == 0)
                 return "perl";
+            if (strcmp(dot, ".py") == 0)
+                return "python";
         }
     }
-    return default_lang();
+    return "python";
+#endif
 }
 
 static int resolve_script(const char *script, const char *docroot, const char *lang,
@@ -82,90 +80,161 @@ static int resolve_script(const char *script, const char *docroot, const char *l
     return 0;
 }
 
+/* 显式失败：填 out->error 并返回 -1（不再用 appengine_fill_hello 假装成功）。 */
+static int script_fail(AppEngineResult *out, const char *fmt, ...)
+{
+    char buf[1024];
+    va_list ap;
+
+    if (out == NULL)
+        return -1;
+    va_start(ap, fmt);
+    vsnprintf(buf, sizeof(buf), fmt, ap);
+    va_end(ap);
+    appengine_result_alloc(out);
+    appengine_result_set_error(out, buf);
+    return -1;
+}
+
 /* ---------- in-process Python ---------- */
 #if defined(CRUCIBLE_HAVE_PYTHON)
 #include <Python.h>
+
+#ifndef _WIN32
+#include <pthread.h>
+static pthread_once_t g_py_once = PTHREAD_ONCE_INIT;
+#define PY_BOOT_ONCE() pthread_once(&g_py_once, crucible_py_boot)
+#else
+#define PY_BOOT_ONCE() crucible_py_boot()
+#endif
+
+/* 解释器启动：一次。启动线程立刻 PyEval_SaveThread 释放 GIL（跨 .so 契约）。 */
+static void crucible_py_boot(void)
+{
+    if (!Py_IsInitialized()) {
+        Py_Initialize();
+        (void)PyEval_SaveThread();
+    }
+}
+
+/* 脚本所在目录（写进 out，返回 out 或 NULL）。 */
+static const char *script_dirname(const char *path, char *out, size_t outsz)
+{
+    const char *slash;
+    size_t n;
+
+    if (path == NULL || out == NULL || outsz == 0)
+        return NULL;
+    slash = strrchr(path, '/');
+    if (slash == NULL)
+        return ".";
+    n = (size_t)(slash - path);
+    if (n == 0)
+        return "/";
+    if (n >= outsz)
+        n = outsz - 1;
+    memcpy(out, path, n);
+    out[n] = '\0';
+    return out;
+}
 
 static int run_python_inprocess(const char *script, const char *method, const char *path,
                                 const char *query, const char *remote, char **out_body,
                                 size_t *out_len)
 {
-    FILE *fp;
-    PyObject *main_mod, *sys_mod, *stdout_obj, *io_mod, *buf, *getvalue, *result;
+    FILE *fp = NULL;
+    PyObject *sys_mod = NULL, *stdout_obj = NULL, *io_mod = NULL, *buf = NULL;
+    PyObject *getvalue = NULL, *result = NULL, *sys_path = NULL;
+    PyGILState_STATE gil;
     int rc = -1;
-    wchar_t *prog = NULL;
 
-    if (!Py_IsInitialized()) {
-        Py_Initialize();
-    }
+    PY_BOOT_ONCE();
+    gil = PyGILState_Ensure(); /* 每请求拿 GIL；与 wsgi/asgi/uwsgi 共用同一解释器 */
 
-    /* Capture stdout via io.StringIO */
     io_mod = PyImport_ImportModule("io");
-    if (!io_mod)
-        return -1;
+    if (io_mod == NULL)
+        goto done;
     buf = PyObject_CallMethod(io_mod, "StringIO", NULL);
     Py_DECREF(io_mod);
-    if (!buf)
-        return -1;
+    io_mod = NULL;
+    if (buf == NULL)
+        goto done;
 
     sys_mod = PyImport_ImportModule("sys");
-    if (!sys_mod) {
-        Py_DECREF(buf);
-        return -1;
-    }
+    if (sys_mod == NULL)
+        goto done;
     stdout_obj = PyObject_GetAttrString(sys_mod, "stdout");
-    PyObject_SetAttrString(sys_mod, "stdout", buf);
+    if (stdout_obj == NULL)
+        goto done;
+    if (PyObject_SetAttrString(sys_mod, "stdout", buf) != 0)
+        goto done;
 
+    /* 请求上下文 → os.environ（键值都不泄漏引用：用 PyDict_SetItemString） */
     {
         PyObject *os = PyImport_ImportModule("os");
-        if (os) {
+        if (os != NULL) {
             PyObject *environ = PyObject_GetAttrString(os, "environ");
-            if (environ) {
-                PyObject *v;
-                v = PyUnicode_FromString(method ? method : "GET");
-                PyObject_SetItem(environ, PyUnicode_FromString("REQUEST_METHOD"), v);
-                Py_XDECREF(v);
-                v = PyUnicode_FromString(path ? path : "/");
-                PyObject_SetItem(environ, PyUnicode_FromString("PATH_INFO"), v);
-                Py_XDECREF(v);
-                v = PyUnicode_FromString(query ? query : "");
-                PyObject_SetItem(environ, PyUnicode_FromString("QUERY_STRING"), v);
-                Py_XDECREF(v);
-                v = PyUnicode_FromString(remote ? remote : "");
-                PyObject_SetItem(environ, PyUnicode_FromString("REMOTE_ADDR"), v);
-                Py_XDECREF(v);
-                v = PyUnicode_FromString(script);
-                PyObject_SetItem(environ, PyUnicode_FromString("SCRIPT_FILENAME"), v);
-                Py_XDECREF(v);
+            if (environ != NULL) {
+                struct {
+                    const char *k;
+                    const char *v;
+                } kv[5];
+                int i;
+
+                kv[0].k = "REQUEST_METHOD";
+                kv[0].v = method ? method : "GET";
+                kv[1].k = "PATH_INFO";
+                kv[1].v = path ? path : "/";
+                kv[2].k = "QUERY_STRING";
+                kv[2].v = query ? query : "";
+                kv[3].k = "REMOTE_ADDR";
+                kv[3].v = remote ? remote : "";
+                kv[4].k = "SCRIPT_FILENAME";
+                kv[4].v = script;
+                for (i = 0; i < 5; i++) {
+                    PyObject *v = PyUnicode_FromString(kv[i].v);
+                    if (v == NULL)
+                        continue;
+                    (void)PyDict_SetItemString(environ, kv[i].k, v);
+                    Py_DECREF(v);
+                }
                 Py_DECREF(environ);
             }
             Py_DECREF(os);
         }
+        PyErr_Clear();
     }
+    /* sys.path 前置脚本目录：应用 import 同目录模块时必需。 */
+    sys_path = PyObject_GetAttrString(sys_mod, "path");
+    if (sys_path != NULL) {
+        char dirbuf[1024];
+        const char *dir = script_dirname(script, dirbuf, sizeof(dirbuf));
+        if (dir != NULL) {
+            PyObject *d = PyUnicode_FromString(dir);
+            if (d != NULL) {
+                (void)PyList_Insert(sys_path, 0, d);
+                Py_DECREF(d);
+            }
+        }
+        Py_DECREF(sys_path);
+        sys_path = NULL;
+    }
+    PyErr_Clear();
 
     fp = fopen(script, "r");
-    if (!fp) {
-        if (stdout_obj)
-            PyObject_SetAttrString(sys_mod, "stdout", stdout_obj);
-        Py_XDECREF(stdout_obj);
-        Py_DECREF(sys_mod);
-        Py_DECREF(buf);
-        return -1;
-    }
-    (void)prog;
-    if (PyRun_SimpleFileEx(fp, script, 1) != 0) {
-        /* fall through — still try to read any captured output */
-    }
+    if (fp == NULL)
+        goto done;
+    (void)PyRun_SimpleFileEx(fp, script, 1); /* fp 由 CPython 关闭 */
+    fp = NULL;
 
     getvalue = PyObject_GetAttrString(buf, "getvalue");
-    result = getvalue ? PyObject_CallObject(getvalue, NULL) : NULL;
-    Py_XDECREF(getvalue);
-    if (result && PyUnicode_Check(result)) {
+    result = getvalue != NULL ? PyObject_CallObject(getvalue, NULL) : NULL;
+    if (result != NULL && PyUnicode_Check(result)) {
         const char *s = PyUnicode_AsUTF8(result);
-        if (s) {
+        if (s != NULL) {
             size_t n = strlen(s);
             char *body = (char *)malloc(n + 1);
-            if (body) {
+            if (body != NULL) {
                 memcpy(body, s, n + 1);
                 *out_body = body;
                 *out_len = n;
@@ -173,14 +242,21 @@ static int run_python_inprocess(const char *script, const char *method, const ch
             }
         }
     }
-    Py_XDECREF(result);
 
-    if (stdout_obj)
-        PyObject_SetAttrString(sys_mod, "stdout", stdout_obj);
+done:
+    if (fp != NULL)
+        fclose(fp);
+    if (sys_mod != NULL && stdout_obj != NULL)
+        (void)PyObject_SetAttrString(sys_mod, "stdout", stdout_obj);
+    Py_XDECREF(sys_path);
+    Py_XDECREF(result);
+    Py_XDECREF(getvalue);
     Py_XDECREF(stdout_obj);
-    Py_DECREF(sys_mod);
-    Py_DECREF(buf);
-    (void)main_mod;
+    Py_XDECREF(sys_mod);
+    Py_XDECREF(buf);
+    Py_XDECREF(io_mod);
+    PyErr_Clear(); /* 不留悬挂异常给下一次调用 */
+    PyGILState_Release(gil);
     return rc;
 }
 #endif /* CRUCIBLE_HAVE_PYTHON */
@@ -304,44 +380,9 @@ static int run_perl_inprocess(const char *script, const char *method, const char
 #endif /* CRUCIBLE_HAVE_PERL */
 
 /*
- * POPEN FALLBACK — compiled only when at least one language lacks in-process
- * headers (used exclusively from that language's #else branch below).
+ * 执行分派。任何"嵌入不可用 / 语言未知"都返回 -1 + 调用方写错误文本，
+ * 不再有 popen 回退，也不再返回假 hello。
  */
-#if !defined(CRUCIBLE_HAVE_PYTHON) || !defined(CRUCIBLE_HAVE_RUBY) || \
-    !defined(CRUCIBLE_HAVE_PERL)
-
-static const char *interpreter_for(const char *lang)
-{
-    if (strcmp(lang, "ruby") == 0)
-        return "ruby";
-    if (strcmp(lang, "perl") == 0)
-        return "perl";
-    return "python3";
-}
-
-static int run_script_popen(const char *interp, const char *script, const char *method,
-                            const char *path, const char *query, const char *remote,
-                            char **out_body, size_t *out_len)
-{
-    /* Spec: Python/Ruby/Perl must not spawn. Fail closed when embed unavailable. */
-    (void)interp;
-    (void)script;
-    (void)method;
-    (void)path;
-    (void)query;
-    (void)remote;
-    if (out_body)
-        *out_body = NULL;
-    if (out_len)
-        *out_len = 0;
-    fprintf(stderr,
-            "scriptffi: in-process embed unavailable for this language; "
-            "rebuild with CRUCIBLE_HAVE_* (popen fallback disabled)\n");
-    return -1;
-}
-
-#endif /* popen available for languages without HAVE_* */
-
 static int run_lang(const char *lang, const char *script, const char *method, const char *path,
                     const char *query, const char *remote, char **out_body, size_t *out_len,
                     const char **mode_out)
@@ -353,9 +394,8 @@ static int run_lang(const char *lang, const char *script, const char *method, co
 #else
         *mode_out = "embed-missing";
         fprintf(stderr,
-                "scriptffi: %s embed not built; rebuild with CRUCIBLE_HAVE_* "
-                "(popen fallback disabled)\n",
-                lang);
+                "scriptffi: python embed not built; rebuild with -DCRUCIBLE_HAVE_PYTHON "
+                "(popen fallback removed)\n");
         return -1;
 #endif
     }
@@ -366,9 +406,8 @@ static int run_lang(const char *lang, const char *script, const char *method, co
 #else
         *mode_out = "embed-missing";
         fprintf(stderr,
-                "scriptffi: %s embed not built; rebuild with CRUCIBLE_HAVE_* "
-                "(popen fallback disabled)\n",
-                lang);
+                "scriptffi: ruby embed not built; rebuild with -DCRUCIBLE_HAVE_RUBY "
+                "(popen fallback removed)\n");
         return -1;
 #endif
     }
@@ -379,29 +418,14 @@ static int run_lang(const char *lang, const char *script, const char *method, co
 #else
         *mode_out = "embed-missing";
         fprintf(stderr,
-                "scriptffi: %s embed not built; rebuild with CRUCIBLE_HAVE_* "
-                "(popen fallback disabled)\n",
-                lang);
+                "scriptffi: perl embed not built; rebuild with -DCRUCIBLE_HAVE_PERL "
+                "(popen fallback removed)\n");
         return -1;
 #endif
     }
-
-#if !defined(CRUCIBLE_HAVE_PYTHON) || !defined(CRUCIBLE_HAVE_RUBY) || \
-    !defined(CRUCIBLE_HAVE_PERL)
-    *mode_out = "embed-missing";
-    fprintf(stderr, "scriptffi: language embed missing; popen fallback disabled\n");
-    return -1;
-#else
-    (void)script;
-    (void)method;
-    (void)path;
-    (void)query;
-    (void)remote;
-    (void)out_body;
-    (void)out_len;
     *mode_out = "unsupported";
+    fprintf(stderr, "scriptffi: unsupported language `%s`\n", lang != NULL ? lang : "(null)");
     return -1;
-#endif
 }
 
 int appengine_init(const char *engine, const char *lib_hint)
@@ -439,18 +463,35 @@ int appengine_execute(
     (void)body_len;
     (void)server_name;
     (void)server_port;
+    (void)extra; /* .env 变量：Rust 侧已注入进程环境；嵌入解释器共用进程环境 */
 
     if (!g_ready || !out)
         return -1;
 
-    lang = lang_name(extra, script);
+    lang = lang_name(script);
 
     if (resolve_script(script, docroot, lang, resolved, sizeof(resolved)) != 0) {
-        return appengine_fill_hello(out, lang, path);
+        /* 旧实现这里返回 appengine_fill_hello——坏引擎看起来像服务了页面。 */
+        return script_fail(out,
+                           "%s: 未找到脚本（script=%s docroot=%s；按语言回落到 index.%s）",
+                           lang, script != NULL ? script : "(null)",
+                           docroot != NULL ? docroot : "(null)",
+                           strcmp(lang, "ruby") == 0 ? "rb"
+                                                     : (strcmp(lang, "perl") == 0 ? "pl"
+                                                                                 : "py"));
     }
 
-    if (run_lang(lang, resolved, method, path, query, remote, &result, &result_len, &mode) != 0) {
-        return appengine_fill_hello(out, lang, path);
+    if (run_lang(lang, resolved, method, path, query, remote, &result, &result_len,
+                 &mode) != 0) {
+        free(result);
+        return script_fail(out,
+                           "%s: 进程内解释器不可用（mode=%s，script=%s）。"
+                           "本引擎不做 popen 回退，也不返回假响应；"
+                           "请用 CRUCIBLE_HAVE_%s 重建 libapp_%s.so",
+                           lang, mode, resolved, strcmp(lang, "ruby") == 0 ? "RUBY"
+                                                     : (strcmp(lang, "perl") == 0 ? "PERL"
+                                                                                 : "PYTHON"),
+                           lang);
     }
 
     appengine_result_alloc(out);

@@ -79,15 +79,59 @@ pub async fn serve_simple<T>(req: &Request<T>, lc: &ListenerConfig) -> Result<Re
         }
         bail!("directory");
     }
-    let data = read_cached(&fs_path, &meta)?;
-    let ct = mime_guess::from_path(&fs_path)
+    // h2/h3 必须与 h1 用同一套 file_open 语义。
+    // 此前 serve_simple 完全无视 file_open：管理员把 /uploads/x.html 配成
+    // preview/download（强制 text/plain + inline/attachment + nosniff，防上传文件被
+    // 当页面执行）时，h2/h3 上这条缓解被静默忽略——而浏览器默认就走 h2/h3。
+    let mode = lc.file_open_mode(path);
+    let mut ct = mime_guess::from_path(&fs_path)
         .first_or_octet_stream()
         .to_string();
-    Ok(Response::builder()
+    if mode == FileOpenMode::Preview && is_script_ext(&fs_path) {
+        ct = "text/plain; charset=utf-8".into();
+    }
+    let disposition = match mode {
+        FileOpenMode::Download => Some("attachment"),
+        FileOpenMode::Preview => Some("inline"),
+        _ => None,
+    };
+
+    // 超大文件：h2/h3 没有 Range/流式实现，不能整读进内存。
+    // 明确回 413（此前 read_file_capped 报错被上层统一映射成 404，
+    // 把「文件太大」误报成「文件不存在」）。
+    let len = meta.len();
+    if len > MAX_FULL_READ {
+        return Ok(Response::builder()
+            .status(StatusCode::PAYLOAD_TOO_LARGE)
+            .header(header::CONTENT_TYPE, "text/plain; charset=utf-8")
+            .body(Bytes::from(format!(
+                "file too large for this protocol ({len} bytes > {MAX_FULL_READ}); use HTTP/1.1 with Range\n"
+            )))
+            .unwrap());
+    }
+    // 只有小文件才进缓存，否则 256 条 × 16MiB 会把常驻内存撑到数 GiB。
+    let data = if len <= SMALL_FILE_MAX {
+        read_cached(&fs_path, &meta)?
+    } else {
+        Bytes::from(read_file_capped(&fs_path)?)
+    };
+    let mut b = Response::builder()
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, ct)
-        .body(data)
-        .unwrap())
+        .header(header::CONTENT_LENGTH, data.len());
+    if let Some(d) = disposition {
+        let name = fs_path.file_name().and_then(|n| n.to_str()).unwrap_or("file");
+        let safe_name: String = name
+            .chars()
+            .map(|c| if c.is_ascii_graphic() && c != '"' && c != '\\' { c } else { '_' })
+            .collect();
+        b = b.header(
+            header::CONTENT_DISPOSITION,
+            format!("{d}; filename=\"{safe_name}\""),
+        );
+        b = b.header("x-content-type-options", "nosniff");
+    }
+    Ok(b.body(data).unwrap())
 }
 
 fn resolve_path(root: &Path, url_path: &str) -> Result<PathBuf> {

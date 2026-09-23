@@ -1,133 +1,88 @@
 /*
- * uWSGI app-engine — prefer WSGI-compatible python app via uwsgi protocol
- * fallback: run app.py like a mini WSGI host (same as wsgi when uwsgi binary absent).
+ * uWSGI app-engine —— 进程内嵌入 CPython（静态嵌入，无每请求 spawn）。
+ *
+ * 本引擎按"crucible 内置的 mini uWSGI 主机"工作：不依赖 uwsgi 二进制（宿主上通常
+ * 没有），而是把 uwsgi 应用当作 WSGI 应用在进程内执行，environ 里额外带
+ * uwsgi.version。旧实现每请求 popen("python3 runner")（spec 禁止）且失败即
+ * appengine_fill_hello（假成功）。
  */
 #include "appengine.h"
 #include "appengine_common.h"
+#include "crucible_embed.h"
+#include "crucible_pyembed.h"
 
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <unistd.h>
+#include <sys/stat.h>
 
 static int g_inited;
 
-static int file_ok(const char *p)
+/* 引擎级失败：填 out->error 并返回 -1（app_ffi 会把它变成 502 文本）。
+ * 刻意放在 CRUCIBLE_HAVE_PYTHON 之外：关闭嵌入时同样需要显式失败。 */
+static int uwsgi_fail(AppEngineResult *out, const char *fmt, ...)
 {
-    FILE *f = fopen(p, "rb");
-    if (!f)
-        return 0;
-    fclose(f);
-    return 1;
+    char buf[1024];
+    va_list ap;
+
+    if (out == NULL)
+        return -1;
+    va_start(ap, fmt);
+    vsnprintf(buf, sizeof(buf), fmt, ap);
+    va_end(ap);
+    appengine_result_alloc(out);
+    appengine_result_set_error(out, buf);
+    return -1;
 }
 
-static int run_uwsgi_py(const char *script, const char *method, const char *path,
-                        const char *query, char **out, size_t *out_len)
+static int is_regular_file(const char *p)
 {
-    char tmp[] = "/tmp/crucible_uwsgi_XXXXXX";
-    char cmd[512];
-    FILE *fp, *tf;
-    int fd;
-    char buf[4096];
-    size_t cap = 4096, n = 0;
-    char *acc;
-    const char *py =
-        "import os, runpy, io, sys\n"
-        "ns = runpy.run_path(os.environ['CRUCIBLE_SCRIPT'])\n"
-        "app = ns.get('application') or ns.get('app')\n"
-        "if app is None:\n"
-        "    print('hello from uwsgi (no application)')\n"
-        "    raise SystemExit(0)\n"
-        "status_holder = ['200 OK']\n"
-        "headers_holder = []\n"
-        "def start_response(status, headers, exc_info=None):\n"
-        "    status_holder[0] = status\n"
-        "    headers_holder[:] = headers\n"
-        "    return lambda b: None\n"
-        "environ = {\n"
-        "  'REQUEST_METHOD': os.environ.get('REQUEST_METHOD', 'GET'),\n"
-        "  'PATH_INFO': os.environ.get('PATH_INFO', '/'),\n"
-        "  'QUERY_STRING': os.environ.get('QUERY_STRING', ''),\n"
-        "  'SERVER_NAME': 'crucible',\n"
-        "  'SERVER_PORT': '80',\n"
-        "  'uwsgi.version': b'crucible',\n"
-        "  'wsgi.version': (1, 0),\n"
-        "  'wsgi.url_scheme': 'http',\n"
-        "  'wsgi.input': io.BytesIO(b''),\n"
-        "  'wsgi.errors': sys.stderr,\n"
-        "  'wsgi.multithread': False,\n"
-        "  'wsgi.multiprocess': False,\n"
-        "  'wsgi.run_once': True,\n"
-        "}\n"
-        "for chunk in app(environ, start_response):\n"
-        "    if isinstance(chunk, bytes):\n"
-        "        sys.stdout.buffer.write(chunk)\n"
-        "    else:\n"
-        "        sys.stdout.write(str(chunk))\n";
+    struct stat st;
 
-    fd = mkstemp(tmp);
-    if (fd < 0)
-        return -1;
-    tf = fdopen(fd, "w");
-    if (!tf) {
-        close(fd);
-        unlink(tmp);
-        return -1;
-    }
-    fputs(py, tf);
-    fclose(tf);
+    return p != NULL && p[0] != '\0' && stat(p, &st) == 0 && S_ISREG(st.st_mode);
+}
 
-    setenv("CRUCIBLE_SCRIPT", script, 1);
-    setenv("REQUEST_METHOD", method ? method : "GET", 1);
-    setenv("PATH_INFO", path ? path : "/", 1);
-    setenv("QUERY_STRING", query ? query : "", 1);
-
-    snprintf(cmd, sizeof(cmd), "python3 \"%s\" 2>/dev/null", tmp);
-    fp = popen(cmd, "r");
-    if (!fp) {
-        unlink(tmp);
-        return -1;
+/* 脚本解析：显式 script → docroot/index.py → docroot/app.py → docroot/uwsgi.py。 */
+static const char *resolve_script(const char *script, const char *docroot, char *out,
+                                  size_t outsz)
+{
+    if (is_regular_file(script)) {
+        snprintf(out, outsz, "%s", script);
+        return out;
     }
-    acc = (char *)malloc(cap);
-    if (!acc) {
-        pclose(fp);
-        unlink(tmp);
-        return -1;
+    if (docroot != NULL && docroot[0] != '\0') {
+        snprintf(out, outsz, "%s/index.py", docroot);
+        if (is_regular_file(out))
+            return out;
+        snprintf(out, outsz, "%s/app.py", docroot);
+        if (is_regular_file(out))
+            return out;
+        snprintf(out, outsz, "%s/uwsgi.py", docroot);
+        if (is_regular_file(out))
+            return out;
     }
-    while (fgets(buf, sizeof(buf), fp)) {
-        size_t bl = strlen(buf);
-        if (n + bl + 1 >= cap) {
-            char *nb;
-            cap *= 2;
-            nb = (char *)realloc(acc, cap);
-            if (!nb) {
-                free(acc);
-                pclose(fp);
-                unlink(tmp);
-                return -1;
-            }
-            acc = nb;
-        }
-        memcpy(acc + n, buf, bl);
-        n += bl;
-    }
-    pclose(fp);
-    unlink(tmp);
-    acc[n] = '\0';
-    if (n == 0) {
-        free(acc);
-        return -1;
-    }
-    *out = acc;
-    *out_len = n;
-    return 0;
+    return NULL;
 }
 
 int appengine_init(const char *engine, const char *lib_hint)
 {
+#ifdef CRUCIBLE_HAVE_PYTHON
+    char err[256];
+#endif
+
+    (void)engine;
     (void)lib_hint;
     g_inited = 1;
-    (void)engine;
+#ifdef CRUCIBLE_HAVE_PYTHON
+    if (crucible_py_embed_ensure(err, sizeof(err)) == 0)
+        fprintf(stderr, "libapp_uwsgi: 进程内 CPython 就绪 (%s)\n", crucible_py_embed_version());
+    else
+        fprintf(stderr, "libapp_uwsgi: 嵌入式 CPython 不可用: %s\n", err);
+#else
+    fprintf(stderr,
+            "libapp_uwsgi: 构建时关闭了 Python 嵌入（-DCRUCIBLE_EMBED_PYTHON_OFF）\n");
+#endif
     return 0;
 }
 
@@ -146,48 +101,40 @@ int appengine_execute(
     const char *extra,
     AppEngineResult *out)
 {
-    char sp[1024];
-    char *result = NULL;
-    size_t rlen = 0;
-    const char *use = NULL;
-
-    (void)content_type;
-    (void)body;
-    (void)body_len;
-    (void)remote;
-    (void)server_name;
-    (void)server_port;
-    (void)extra;
+    char pathbuf[1024];
+    const char *use;
+    int env_dirty = extra != NULL && strchr(extra, '{') != NULL;
 
     if (!g_inited || out == NULL)
         return -1;
 
-    if (script && script[0] && file_ok(script))
-        use = script;
-    else {
-        snprintf(sp, sizeof(sp), "%s/app.py", docroot ? docroot : ".");
-        if (file_ok(sp))
-            use = sp;
-        else {
-            snprintf(sp, sizeof(sp), "%s/uwsgi.py", docroot ? docroot : ".");
-            if (file_ok(sp))
-                use = sp;
-        }
-    }
-
-    if (use && run_uwsgi_py(use, method, path, query, &result, &rlen) == 0) {
-        appengine_result_alloc(out);
-        out->status = 200;
-        appengine_result_set_headers(out, "Content-Type: text/plain; charset=utf-8\r\n"
-                                          "X-Crucible-Engine: uwsgi\r\n");
-        appengine_result_set_body(out, result, rlen);
-        free(result);
-        return 0;
-    }
-    return appengine_fill_hello(out, "uwsgi", path);
+#ifdef CRUCIBLE_HAVE_PYTHON
+    use = resolve_script(script, docroot, pathbuf, sizeof(pathbuf));
+    if (use == NULL)
+        return uwsgi_fail(out,
+                          "uwsgi: 未找到 WSGI 脚本（script=%s docroot=%s，"
+                          "尝试过 index.py / app.py / uwsgi.py）",
+                          script != NULL ? script : "(null)",
+                          docroot != NULL ? docroot : "(null)");
+    /* uwsgi 语义 = WSGI 主机；uwsgi.version 由 pyembed 侧统一注入 environ。 */
+    return crucible_py_wsgi_request("uwsgi", use, docroot, method, path, query,
+                                    content_type, body, body_len, remote, server_name,
+                                    server_port, env_dirty, out);
+#else
+    (void)script;
+    (void)docroot;
+    (void)pathbuf;
+    (void)env_dirty;
+    return uwsgi_fail(out,
+                      "uwsgi: 本引擎构建时未嵌入 CPython（-DCRUCIBLE_EMBED_PYTHON_OFF）。"
+                      "uwsgi 禁止每请求 spawn 解释器，故不提供 popen 回退");
+#endif
 }
 
 void appengine_shutdown(void)
 {
     g_inited = 0;
+#ifdef CRUCIBLE_HAVE_PYTHON
+    crucible_py_embed_shutdown();
+#endif
 }

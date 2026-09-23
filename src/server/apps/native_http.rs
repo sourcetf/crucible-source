@@ -215,17 +215,16 @@ async fn proxy_unix(
     };
 
     // P2-5：池化 checkout；坏连接重建后重试一次。
+    // 池化 checkout；**只**在发送前检查连接可用性，不对已发出的请求重试。
+    //
+    // hyper 在「请求已写入、上游随即关闭」时同样返回 Err——旧代码对任何 Err 都
+    // 无条件重建连接再发一次，非幂等请求（POST 等）会在上游被执行两次。
+    // 真需要上游重试应由调用方按方法幂等性显式决定，传输层不该擅自复制请求。
     let mut sender = checkout_unix(sock).await?;
-    let resp = match sender.send_request(build()?).await {
-        Ok(r) => r,
-        Err(_) => {
-            sender = checkout_unix(sock).await?;
-            sender
-                .send_request(build()?)
-                .await
-                .context("sidecar request")?
-        }
-    };
+    if !sender.is_ready() {
+        sender = checkout_unix(sock).await?;
+    }
+    let resp = sender.send_request(build()?).await.context("sidecar request")?;
     let (rparts, rbody) = resp.into_parts();
     // 任务 6（OOM 防护）：sidecar 响应体上限 64MiB。
     let rbytes = http_body_util::Limited::new(rbody, crate::server::h1::UPSTREAM_BODY_CAP)

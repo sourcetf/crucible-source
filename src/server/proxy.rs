@@ -84,18 +84,22 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send> AsyncReadWrite for T {}
 /// Type-erased upstream byte stream (plain TCP or TLS).
 struct UpstreamIo {
     inner: Pin<Box<dyn AsyncReadWrite>>,
+    /// 上游 TLS 协商出的 ALPN 是否为 h2（规格 11：`upstream_http_version`
+    /// 不配置时按 ALPN 自动选择回源 HTTP 版本）。
+    negotiated_h2: bool,
 }
 
 impl UpstreamIo {
     fn plain(tcp: TcpStream) -> Self {
         Self {
             inner: Box::pin(tcp),
+            negotiated_h2: false,
         }
     }
 
     /// 从任意读写流构造（tor_client 的 TorStream 等）。
     fn from_rw(inner: Pin<Box<dyn AsyncReadWrite>>) -> Self {
-        Self { inner }
+        Self { inner, negotiated_h2: false }
     }
 
     fn from_tls<S>(s: S) -> Self
@@ -104,6 +108,7 @@ impl UpstreamIo {
     {
         Self {
             inner: Box::pin(s),
+            negotiated_h2: false,
         }
     }
 }
@@ -213,6 +218,10 @@ fn join_upstream(upstream: &str, rest: &str) -> Result<String> {
 }
 
 /// §11 回源 HTTP 版本枚举：统一 h1/h2 SendRequest 的 send_request 调用。
+///
+/// 只保留这一份定义。此前 proxy_once 里还有一份同名的局部 enum，于是模块级的
+/// POOL/pool_give/pool_take（按它来声明类型）与真正创建连接的代码类型不同，
+/// 池化永远接不上——这正是那三个符号一直没有调用者的原因。
 enum UpSender {
     H1(hyper::client::conn::http1::SendRequest<Full<Bytes>>),
     H2(hyper::client::conn::http2::SendRequest<Full<Bytes>>),
@@ -225,6 +234,14 @@ impl UpSender {
         match self {
             UpSender::H1(s) => Ok(s.send_request(req).await?),
             UpSender::H2(s) => Ok(s.send_request(req).await?),
+        }
+    }
+
+    /// 连接是否仍可复用（从池中取出前后各查一次）。
+    fn is_ready(&self) -> bool {
+        match self {
+            UpSender::H1(s) => s.is_ready(),
+            UpSender::H2(s) => s.is_ready(),
         }
     }
 }
@@ -257,45 +274,47 @@ async fn proxy_once(
     let port = uri.port_u16().unwrap_or(if scheme == "https" { 443 } else { 80 });
 
     let stream = connect_upstream(&host, port, scheme, rule).await?;
+    // 规格 11：未配置 upstream_http_version 时按上游 ALPN 协商结果自动选 h2/h1。
+    let alpn_h2 = stream.negotiated_h2;
     let io = TokioIo::new(stream);
 
-    // 规格 11：回源 HTTP 版本可配（h2 显式启用；默认 h1 自动）。
-    // h1/h2 的 SendRequest 类型不同——用枚举统一 send 语义。
-    enum UpSender {
-        H1(hyper::client::conn::http1::SendRequest<Full<Bytes>>),
-        H2(hyper::client::conn::http2::SendRequest<Full<Bytes>>),
-    }
-    impl UpSender {
-        async fn send_request(
-            &mut self,
-            req: Request<Full<Bytes>>,
-        ) -> anyhow::Result<Response<hyper::body::Incoming>> {
-            match self {
-                UpSender::H1(s) => Ok(s.send_request(req).await?),
-                UpSender::H2(s) => Ok(s.send_request(req).await?),
+    // 规格 11：回源 HTTP 版本可配（h2 显式启用；不配置时按 ALPN 协商结果自动选）。
+    // UpSender 定义在模块级（连接池 POOL 按它声明类型，两处必须同一个类型）。
+
+    let want_h2 = rule.upstream_http_version.as_deref() == Some("h2")
+        || (rule.upstream_http_version.is_none() && alpn_h2);
+    let pool_key = PoolKey::new(&host, port, want_h2, scheme == "https");
+    // §3 连接池：仅当规则显式 `connection_pool = true` 时复用上游连接（默认关闭）。
+    // 此前 POOL / pool_give / pool_take 三个都是死代码（无任何调用者），
+    // 配置项开了也没有任何效果。
+    let pooled = if rule.connection_pool {
+        pool_take(pool_key).await
+    } else {
+        None
+    };
+    let mut sender = match pooled {
+        Some(s) if s.is_ready() => s,
+        _ => {
+            if want_h2 {
+                use hyper_util::rt::TokioExecutor;
+                let (sender, conn) =
+                    hyper::client::conn::http2::handshake(TokioExecutor::new(), io)
+                        .await
+                        .context("upstream h2 handshake")?;
+                tokio::spawn(async move {
+                    let _ = conn.await;
+                });
+                UpSender::H2(sender)
+            } else {
+                let (sender, conn) = hyper::client::conn::http1::handshake(io)
+                    .await
+                    .context("upstream handshake")?;
+                tokio::spawn(async move {
+                    let _ = conn.await;
+                });
+                UpSender::H1(sender)
             }
         }
-    }
-    let mut sender = if rule.upstream_http_version.as_deref() == Some("h2") {
-        use hyper_util::rt::TokioExecutor;
-        let (sender, conn) = hyper::client::conn::http2::handshake(
-            TokioExecutor::new(),
-            io,
-        )
-        .await
-        .context("upstream h2 handshake")?;
-        tokio::spawn(async move {
-            let _ = conn.await;
-        });
-        UpSender::H2(sender)
-    } else {
-        let (sender, conn) = hyper::client::conn::http1::handshake(io)
-            .await
-            .context("upstream handshake")?;
-        tokio::spawn(async move {
-            let _ = conn.await;
-        });
-        UpSender::H1(sender)
     };
 
     let (parts, body) = req.into_parts();
@@ -360,6 +379,10 @@ async fn proxy_once(
     }
     for (k, v) in &rule.modify_response_headers {
         out = out.header(k, v);
+    }
+    // 连接池：响应体已完整读完（H1 复用的前提），连接仍可用就放回池中。
+    if rule.connection_pool && sender.is_ready() {
+        pool_give(pool_key, sender);
     }
     Ok(out.body(full(rbytes)).unwrap())
 }
@@ -454,33 +477,28 @@ async fn connect_upstream(
     rule: &ProxyRuleConfig,
 ) -> Result<UpstreamIo> {
     let mode = OnionSslMode::parse(&rule.ssl_mode);
-    // `tor` only routes .onion (or explicit onion host); never force SOCKS for clearnet.
-    // 早期规格 A.1：needs_tor = via_tor || host.ends_with(".onion")（含 ssl_mode=tor）。
-    let onion = is_onion_host(host)
-        || (rule.ssl_mode.eq_ignore_ascii_case("tor") && is_onion_host(host));
-    if rule.ssl_mode.eq_ignore_ascii_case("tor") && !is_onion_host(host) {
+    // 早期规格 A.1：走 Tor 的三种情形——显式 via_tor、.onion 目标、ssl_mode=tor。
+    let is_onion = is_onion_host(host);
+    if rule.ssl_mode.eq_ignore_ascii_case("tor") && !is_onion {
         bail!("ssl_mode=tor requires a .onion upstream host");
     }
-    let needs_tor = rule.via_tor || host.ends_with(".onion")
-        || rule.ssl_mode.eq_ignore_ascii_case("tor");
+    let needs_tor = rule.via_tor || is_onion || rule.ssl_mode.eq_ignore_ascii_case("tor");
 
-    // Always validate onion host + ssl_mode (v3 pubkey required for verify).
-    if is_onion_host(host) || onion {
-        if !validate_onion_upstream(host, &rule.ssl_mode) {
-            bail!(
-                "invalid onion upstream host={host} ssl_mode={} (verify requires v3 .onion)",
-                rule.ssl_mode
-            );
-        }
+    // 校验 .onion 主机（verify 档要求 v3 pubkey）。
+    if is_onion && !validate_onion_upstream(host, &rule.ssl_mode) {
+        bail!(
+            "invalid onion upstream host={host} ssl_mode={} (verify requires v3 .onion)",
+            rule.ssl_mode
+        );
     }
 
-    if needs_tor {
-        // tor feature disabled
-        bail!("tor upstream not supported: tor_client module removed");
-    }
-
-    let tcp = if onion {
-        connect_tor_socks(host, port).await?
+    // 走 Tor：FFI → unix SOCKS → TCP SOCKS（优先 rule.tor_socks，其次环境变量）。
+    //
+    // 此前这里是无条件 bail!("tor upstream not supported")，而 needs_tor 对任何
+    // .onion 目标都为真——于是下面的 SOCKS 实现、以及 via_tor / ssl_mode=tor /
+    // rule.tor_socks 三个配置项全部成了死代码，Tor 反代从未真正可用过。
+    let tcp = if needs_tor {
+        connect_tor_socks(host, port, rule.tor_socks.as_deref()).await?
     } else {
         TcpStream::connect((host, port))
             .await
@@ -488,16 +506,24 @@ async fn connect_upstream(
     };
 
     let want_tls = scheme.eq_ignore_ascii_case("https")
-        || (is_onion_host(host) && mode != OnionSslMode::Off);
+        || (is_onion && mode != OnionSslMode::Off);
 
     if !want_tls {
-        if mode == OnionSslMode::Verify && is_onion_host(host) {
+        if mode == OnionSslMode::Verify && is_onion {
             bail!("onion ssl_mode=verify requires TLS; cannot verify without a cert path");
         }
         return Ok(UpstreamIo::plain(tcp));
     }
 
-    wrap_upstream_tls(tcp, host, mode, rule.upstream_tls_version.as_deref()).await
+    wrap_upstream_tls(
+        tcp,
+        host,
+        mode,
+        rule.upstream_tls_version.as_deref(),
+        // 未显式指定回源 HTTP 版本 → 让 ALPN 自动协商（规格 11）。
+        rule.upstream_http_version.is_none(),
+    )
+    .await
 }
 
 /// TLS wrap for HTTPS / onion upstreams. Onion `verify` checks leaf DER via
@@ -507,13 +533,15 @@ async fn wrap_upstream_tls(
     host: &str,
     mode: OnionSslMode,
     tls_version: Option<&str>,
+    alpn_auto: bool,
 ) -> Result<UpstreamIo> {
     #[cfg(feature = "tls_boring")]
     {
-        return wrap_upstream_tls_boring(tcp, host, mode, tls_version).await;
+        return wrap_upstream_tls_boring(tcp, host, mode, tls_version, alpn_auto).await;
     }
     #[cfg(all(feature = "tls_rustls", not(feature = "tls_boring")))]
     {
+        let _ = alpn_auto;
         return wrap_upstream_tls_rustls(tcp, host, mode, tls_version).await;
     }
     #[cfg(not(any(feature = "tls_boring", feature = "tls_rustls")))]
@@ -537,6 +565,7 @@ async fn wrap_upstream_tls_boring(
     host: &str,
     mode: OnionSslMode,
     tls_version: Option<&str>,
+    alpn_auto: bool,
 ) -> Result<UpstreamIo> {
     use boring::ssl::{SslConnector, SslMethod, SslVerifyMode, SslVersion};
 
@@ -565,7 +594,15 @@ async fn wrap_upstream_tls_boring(
         OnionSslMode::Off => {}
     }
     let connector = builder.build();
-    let config = connector.configure().context("ssl configure")?;
+    let mut config = connector.configure().context("ssl configure")?;
+    // 规格 11「不配置时自动处理」：未显式指定回源 HTTP 版本时，用 ALPN 让上游
+    // 自己选。ALPN 线格式是「1 字节长度 + 名字」序列。协商结果在握手后读回，
+    // 据此决定用 h2 还是 h1 的 client conn。
+    if alpn_auto {
+        config
+            .set_alpn_protos(&[2, b'h', b'2', 8, b'h', b't', b't', b'p', b'/', b'1', b'.', b'1'])
+            .context("upstream set_alpn_protos")?;
+    }
     // SNI: use host; for .onion Boring still accepts the name string.
     let mut tls = tokio_boring::connect(config, host, tcp)
         .await
@@ -589,8 +626,20 @@ async fn wrap_upstream_tls_boring(
         log::debug!("onion cert-as-pubkey verified for {host}");
     }
 
-    let _ = &mut tls;
-    Ok(UpstreamIo::from_tls(tls))
+    let negotiated_h2 = tls
+        .ssl()
+        .selected_alpn_protocol()
+        .map(|p| p == b"h2")
+        .unwrap_or(false);
+    if alpn_auto {
+        log::debug!(
+            "upstream {host}: ALPN auto → {}",
+            if negotiated_h2 { "h2" } else { "http/1.1" }
+        );
+    }
+    let mut io = UpstreamIo::from_tls(tls);
+    io.negotiated_h2 = negotiated_h2;
+    Ok(io)
 }
 
 /// rustls client path (feature `tls_rustls`, when Boring is not the primary stack).
@@ -798,9 +847,32 @@ fn parse_http_head(raw: &[u8]) -> Result<(StatusCode, HeaderMap)> {
 }
 
 /// Tor connect: optional FFI stub → unix SOCKS → TCP SOCKS.
-async fn connect_tor_socks(host: &str, port: u16) -> Result<TcpStream> {
+///
+/// `socks_override` 来自 `ProxyRuleConfig::tor_socks`（每条规则可指定不同 SOCKS），
+/// 支持 `unix:/path` / 绝对路径（UDS）与 `host:port`（TCP）。为空时回落到
+/// 环境变量 CRUCIBLE_TOR_SOCKS_UNIX / CRUCIBLE_TOR_SOCKS，最后是 127.0.0.1:9050。
+async fn connect_tor_socks(
+    host: &str,
+    port: u16,
+    socks_override: Option<&str>,
+) -> Result<TcpStream> {
     if let Some(stream) = try_tor_ffi_connect(host, port).await {
         return stream;
+    }
+    // 1) 规则级覆盖（面板可配）
+    if let Some(spec) = socks_override.map(str::trim).filter(|s| !s.is_empty()) {
+        if spec.starts_with("unix:") || spec.starts_with('/') {
+            let path = spec.strip_prefix("unix:").unwrap_or(spec);
+            let unix = UnixStream::connect(path)
+                .await
+                .with_context(|| format!("tor unix socks {path}"))?;
+            return socks5_unix_bridge(unix, host, port).await;
+        }
+        let addr: SocketAddr = spec.parse().with_context(|| format!("tor_socks {spec}"))?;
+        let tcp = TcpStream::connect(addr)
+            .await
+            .with_context(|| format!("tor socks connect {addr}"))?;
+        return socks5_connect(tcp, host, port).await;
     }
     if let Ok(unix_path) = std::env::var("CRUCIBLE_TOR_SOCKS_UNIX") {
         if !unix_path.is_empty() {

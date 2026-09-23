@@ -362,26 +362,7 @@ async fn handle_h2(
     if let Some(resp) = crate::server::telemetry::maybe_handle_simple(&req, &snap.telemetry) {
         return tag(resp, "telemetry");
     }
-    // DoH（RFC8484，需求 9）：h2 路径（body 已是 Bytes）；未命中原样放行正常站点
-    {
-        let dns_eff = crate::server::dns::effective(&snap);
-        if dns_eff.enabled && dns_eff.doh.enabled {
-            let (method, uri, headers) =
-                (req.method().clone(), req.uri().clone(), req.headers().clone());
-            if let Some(resp) = crate::server::dns::dot_doh::doh_prepared(
-                &dns_eff,
-                &method,
-                &uri,
-                &headers,
-                req.body().clone(),
-                peer,
-            )
-            .await
-            {
-                return tag(collect_to_bytes(resp).await, "dns-doh");
-            }
-        }
-    }
+    // DoH 分流已下移到 ACL/限速之后（见下方），此处不再提前返回。
     if !crate::server::access::is_allowed(&snap.ip_access, peer) {
         return tag(
             Response::builder()
@@ -412,6 +393,29 @@ async fn handle_h2(
                         .unwrap(),
                     "acl",
                 );
+            }
+        }
+    }
+
+    // DoH 挪到这里（ACL/限速之后、basic auth 之前）：
+    // 原先排在 is_allowed 之前，等于绕过监听器 IP 白名单与限速白拿一个递归解析器；
+    // 而排在 basic auth 之前是因为 DoH 客户端无法交互式提供 Basic 凭据。
+    {
+        let dns_eff = crate::server::dns::effective(&snap);
+        if dns_eff.enabled && dns_eff.doh.enabled {
+            let (method, uri, headers) =
+                (req.method().clone(), req.uri().clone(), req.headers().clone());
+            if let Some(resp) = crate::server::dns::dot_doh::doh_prepared(
+                &dns_eff,
+                &method,
+                &uri,
+                &headers,
+                req.body().clone(),
+                peer,
+            )
+            .await
+            {
+                return tag(collect_to_bytes(resp).await, "dns-doh");
             }
         }
     }
@@ -496,6 +500,9 @@ async fn handle_h2(
             *req.uri_mut() = u;
         }
     }
+    // 改写后必须以新路径做后续判定与分发（同 h1 的修正：此前 pre/post 路径混用，
+    // 会导致 would_handle/would_proxy 与真正 handler 看到的路径不一致）。
+    let path = req.uri().path().to_string();
     // P1-5：h1 的 pass_upstream（page rule pass 动作）在 h2 同样生效。
     if let Some((murl, upstream)) = crate::server::page_rules::pass_upstream(&lc, &path) {
         let resp = crate::server::proxy::proxy_page_rule(
@@ -528,7 +535,12 @@ async fn h2_tail(
     peer: SocketAddr,
     path: String,
 ) -> Response<Bytes> {
-    // P1-5：补齐 h1 分发顺序——反代规则在 apps/static 之前。
+    // 分发顺序必须与 h1 一致（规格 §4：apps 优先于 proxy）。
+    // 此前这里是 proxy 在前、apps 在后，还写着「补齐 h1 分发顺序」——恰好相反：
+    // 同一条 URL 在 h1 上交给应用引擎、在 h2/h3 上被反代走，行为随协议而变。
+    if let Some(resp) = crate::server::apps::try_handle_simple(&req, &live, &lc, peer).await {
+        return tag(resp, "app");
+    }
     if would_proxy(&lc, &path) {
         if let Some((_matched, resp)) =
             crate::server::proxy::try_proxy(&lc, req.map(Full::new), peer.ip()).await
@@ -542,9 +554,6 @@ async fn h2_tail(
                 .unwrap(),
             "proxy",
         );
-    }
-    if let Some(resp) = crate::server::apps::try_handle_simple(&req, &live, &lc, peer).await {
-        return tag(resp, "app");
     }
     match crate::server::static_files::serve_simple(&req, &lc).await {
         Ok(r) => tag(r, "static"),

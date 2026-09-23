@@ -1,84 +1,71 @@
 /*
- * TSX/TS app-engine — run index.tsx / index.ts via npx tsx or node when present.
+ * TSX/TS app-engine —— 不再每请求 spawn（node/tsx 侧车才是契约路径）。
+ *
+ * 旧实现：popen("(command -v tsx …) || (command -v npx … && npx --yes tsx …) ||
+ * node …")——每请求 spawn 解释器，且把**请求派生的脚本路径**插进 shell 字符串
+ * （命令注入面）；失败即 appengine_fill_hello（假成功）。
+ *
+ * 本项目的 tsx 契约不是"每请求跑解释器"，而是 options_catalog.rs 里写明的
+ * "One-click compile + watch deploy"（一键编译 + 监听部署）：TypeScript 由构建/
+ * 部署步骤编译一次，产物交给静态文件路径或**常驻 node 侧车**服务。
+ *   - Rust 侧入口：src/server/apps/tsx.rs → sidecar_engine::handle_with_fallback
+ *     （libapp_tsx.so → sidecar → UDS socket，三者皆无才 502）；
+ *   - 本机有 node，但没有 tsx，也没有常量侧车配置。
+ *
+ * 因此本引擎：不 spawn、不假 hello，返回显式错误并指出应当走哪条路（侧车/编译产物
+ * 静态服务）。这里不新增任何协议或产物约定。
  */
 #include "appengine.h"
 #include "appengine_common.h"
 
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <unistd.h>
+#include <sys/stat.h>
 
 static int g_inited;
 
-static int file_ok(const char *p)
+/* 引擎级失败：填 out->error 并返回 -1（app_ffi 会把它变成 502 文本）。 */
+static int tsx_fail(AppEngineResult *out, const char *fmt, ...)
 {
-    FILE *f = fopen(p, "rb");
-    if (!f)
-        return 0;
-    fclose(f);
-    return 1;
+    char buf[1024];
+    va_list ap;
+
+    if (out == NULL)
+        return -1;
+    va_start(ap, fmt);
+    vsnprintf(buf, sizeof(buf), fmt, ap);
+    va_end(ap);
+    appengine_result_alloc(out);
+    appengine_result_set_error(out, buf);
+    return -1;
 }
 
-static int run_tsx(const char *script, const char *method, const char *path,
-                   const char *query, char **out, size_t *out_len)
+static int is_regular_file(const char *p)
 {
-    char cmd[2048];
-    FILE *fp;
-    char buf[4096];
-    size_t cap = 4096, n = 0;
-    char *acc;
+    struct stat st;
 
-    setenv("REQUEST_METHOD", method ? method : "GET", 1);
-    setenv("PATH_INFO", path ? path : "/", 1);
-    setenv("QUERY_STRING", query ? query : "", 1);
-    setenv("SCRIPT_FILENAME", script, 1);
+    return p != NULL && p[0] != '\0' && stat(p, &st) == 0 && S_ISREG(st.st_mode);
+}
 
-    /* Prefer tsx, then npx tsx, then node (for plain .js/.mjs). */
-    if (access("/usr/local/bin/tsx", X_OK) == 0)
-        snprintf(cmd, sizeof(cmd), "tsx \"%s\" 2>/dev/null", script);
-    else if (access("/usr/bin/tsx", X_OK) == 0)
-        snprintf(cmd, sizeof(cmd), "tsx \"%s\" 2>/dev/null", script);
-    else
-        snprintf(cmd, sizeof(cmd),
-                 "(command -v tsx >/dev/null && tsx \"%s\") || "
-                 "(command -v npx >/dev/null && npx --yes tsx \"%s\") || "
-                 "node \"%s\" 2>/dev/null",
-                 script, script, script);
-
-    fp = popen(cmd, "r");
-    if (!fp)
-        return -1;
-    acc = (char *)malloc(cap);
-    if (!acc) {
-        pclose(fp);
-        return -1;
+/* 源文件定位（仅用于把状态报清楚）：显式 script → docroot/index.tsx → index.ts。 */
+static const char *resolve_script(const char *script, const char *docroot, char *out,
+                                  size_t outsz)
+{
+    if (is_regular_file(script)) {
+        snprintf(out, outsz, "%s", script);
+        return out;
     }
-    while (fgets(buf, sizeof(buf), fp)) {
-        size_t bl = strlen(buf);
-        if (n + bl + 1 >= cap) {
-            char *nb;
-            cap *= 2;
-            nb = (char *)realloc(acc, cap);
-            if (!nb) {
-                free(acc);
-                pclose(fp);
-                return -1;
-            }
-            acc = nb;
-        }
-        memcpy(acc + n, buf, bl);
-        n += bl;
+    if (docroot != NULL && docroot[0] != '\0') {
+        snprintf(out, outsz, "%s/index.tsx", docroot);
+        if (is_regular_file(out))
+            return out;
+        snprintf(out, outsz, "%s/index.ts", docroot);
+        if (is_regular_file(out))
+            return out;
     }
-    pclose(fp);
-    acc[n] = '\0';
-    if (n == 0) {
-        free(acc);
-        return -1;
-    }
-    *out = acc;
-    *out_len = n;
-    return 0;
+    return NULL;
 }
 
 int appengine_init(const char *engine, const char *lib_hint)
@@ -86,6 +73,9 @@ int appengine_init(const char *engine, const char *lib_hint)
     (void)engine;
     (void)lib_hint;
     g_inited = 1;
+    fprintf(stderr,
+            "libapp_tsx: 本引擎不执行 TypeScript（禁止每请求 spawn）；tsx 应为"
+            "『一键编译 + watch 部署』或 node 侧车，见 tsx_engine.c 文件头\n");
     return 0;
 }
 
@@ -104,11 +94,11 @@ int appengine_execute(
     const char *extra,
     AppEngineResult *out)
 {
-    char sp[1024];
-    char *result = NULL;
-    size_t rlen = 0;
-    const char *use = NULL;
+    char pathbuf[1024];
+    const char *use;
 
+    (void)method;
+    (void)query;
     (void)content_type;
     (void)body;
     (void)body_len;
@@ -117,32 +107,31 @@ int appengine_execute(
     (void)server_port;
     (void)extra;
 
-    if (!g_inited || !out)
+    if (!g_inited || out == NULL)
         return -1;
 
-    if (script && script[0] && file_ok(script))
-        use = script;
-    else {
-        snprintf(sp, sizeof(sp), "%s/index.tsx", docroot ? docroot : ".");
-        if (file_ok(sp))
-            use = sp;
-        else {
-            snprintf(sp, sizeof(sp), "%s/index.ts", docroot ? docroot : ".");
-            if (file_ok(sp))
-                use = sp;
-        }
-    }
-
-    if (use && run_tsx(use, method, path, query, &result, &rlen) == 0) {
-        appengine_result_alloc(out);
-        out->status = 200;
-        appengine_result_set_headers(out, "Content-Type: text/plain; charset=utf-8\r\n"
-                                          "X-Crucible-Engine: tsx\r\n");
-        appengine_result_set_body(out, result, rlen);
-        free(result);
-        return 0;
-    }
-    return appengine_fill_hello(out, "tsx", path);
+    use = resolve_script(script, docroot, pathbuf, sizeof(pathbuf));
+    if (use == NULL)
+        return tsx_fail(out,
+                        "tsx: 未找到 TypeScript 源（script=%s docroot=%s，尝试过 "
+                        "index.tsx / index.ts）",
+                        script != NULL ? script : "(null)",
+                        docroot != NULL ? docroot : "(null)");
+    /*
+     * 显式失败：每请求 spawn（node/tsx/npx）被 spec 禁止，且 shell 字符串里插请求
+     * 派生路径本身就是命令注入面——两条都已删除。正确路径是"编译一次 + 静态/侧车
+     * 常驻服务"。
+     */
+    return tsx_fail(out,
+                    "tsx: 本引擎不按请求执行 TypeScript（%s）。tsx 应用的契约是"
+                    "『一键编译 + watch 部署』：编译产物由静态文件路径或常驻 node 侧车"
+                    "服务（Rust 侧见 src/server/apps/tsx.rs → sidecar；配置 sidecar/"
+                    "socket 后本 .so 不再是唯一路径）。本机有 node 但没有 tsx，"
+                    "每请求 spawn tsx/npx/node 被 spec 禁止，故不提供回退",
+                    use);
 }
 
-void appengine_shutdown(void) { g_inited = 0; }
+void appengine_shutdown(void)
+{
+    g_inited = 0;
+}

@@ -1,127 +1,90 @@
 /*
- * Rack app-engine — run config.ru / app.rb via ruby when available.
+ * Rack app-engine —— 诚实失败（no embedded Ruby on this host）。
+ *
+ * 旧实现：写 Ruby runner 到 /tmp 再 popen("ruby runner")——每请求 spawn 解释器
+ * （spec 明令禁止：Ruby 必须静态嵌入），而且失败即 appengine_fill_hello（假成功）。
+ * 本机（OpenBSD）**没有安装 ruby，也没有 libruby**，MRI 嵌入在目标机上不可行：
+ *   - 没有 libruby 可 dlopen，也没有 ruby 头文件（ruby.h / ruby/Ruby.h）；
+ *   - Rack 还需要 rack gem + Rack::Builder 才能解释 config.ru 的 run/use DSL。
+ *
+ * 因此本引擎的做法：
+ *   1) 不再 spawn（popen 已删除），不假装成功；
+ *   2) 返回显式错误（rc != 0 + error 文本），说明需要什么才能启用；
+ *   3) 不写"看起来能跑"的 MRI 代码：在既无头文件、又无法编译/运行验证、且目标机
+ *      根本没有 libruby 的前提下，那只会制造误导。
+ *
+ * 未来在装有 ruby 的宿主上启用 MRI 嵌入的做法（需改 scripts/build_app_engines.sh，
+ * 属于本目录之外的改动）：
+ *      CFLAGS += $(pkg-config --cflags ruby) -DCRUCIBLE_HAVE_RUBY
+ *      LIBS   += $(pkg-config --libs ruby)              # 或 -lruby，使 .so 带 DT_NEEDED
+ *   嵌入 API：ruby_init / ruby_init_loadpath / rb_require("rack") /
+ *   rb_eval_string_protect（参见 libs/script-ffi/script_engine.c 的 Ruby 分支写法），
+ *   应用加载用 Rack::Builder.parse_file(script)。
  */
 #include "appengine.h"
 #include "appengine_common.h"
 
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <unistd.h>
+#include <sys/stat.h>
 
 static int g_inited;
 
-static int file_ok(const char *p)
+/* 引擎级失败：填 out->error 并返回 -1（app_ffi 会把它变成 502 文本）。 */
+static int rack_fail(AppEngineResult *out, const char *fmt, ...)
 {
-    FILE *f = fopen(p, "rb");
-    if (!f)
-        return 0;
-    fclose(f);
-    return 1;
+    char buf[1024];
+    va_list ap;
+
+    if (out == NULL)
+        return -1;
+    va_start(ap, fmt);
+    vsnprintf(buf, sizeof(buf), fmt, ap);
+    va_end(ap);
+    appengine_result_alloc(out);
+    appengine_result_set_error(out, buf);
+    return -1;
 }
 
-static int run_rack(const char *script, const char *method, const char *path,
-                    const char *query, char **out, size_t *out_len)
+static int is_regular_file(const char *p)
 {
-    char tmp[] = "/tmp/crucible_rack_XXXXXX";
-    char cmd[512];
-    FILE *fp, *tf;
-    int fd;
-    char buf[4096];
-    size_t cap = 4096, n = 0;
-    char *acc;
-    const char *rb =
-        "script = ENV['CRUCIBLE_SCRIPT']\n"
-        "code = File.read(script)\n"
-        "app = nil\n"
-        "begin\n"
-        "  app = eval(code, binding, script)\n"
-        "rescue => e\n"
-        "  print \"hello from rack error=#{e}\\n\"; exit 0\n"
-        "end\n"
-        "unless app.respond_to?(:call)\n"
-        "  # config.ru style: last expression may be a lambda\n"
-        "  print \"hello from rack (no app)\\n\"; exit 0\n"
-        "end\n"
-        "env = {\n"
-        "  'REQUEST_METHOD' => ENV['REQUEST_METHOD'] || 'GET',\n"
-        "  'PATH_INFO' => ENV['PATH_INFO'] || '/',\n"
-        "  'QUERY_STRING' => ENV['QUERY_STRING'] || '',\n"
-        "  'SERVER_NAME' => 'crucible',\n"
-        "  'SERVER_PORT' => '80',\n"
-        "  'rack.version' => [1, 3],\n"
-        "  'rack.url_scheme' => 'http',\n"
-        "  'rack.input' => StringIO.new(''),\n"
-        "  'rack.errors' => $stderr,\n"
-        "}\n"
-        "status, headers, body = app.call(env)\n"
-        "body.each { |c| print c }\n"
-        "body.close if body.respond_to?(:close)\n";
+    struct stat st;
 
-    fd = mkstemp(tmp);
-    if (fd < 0)
-        return -1;
-    tf = fdopen(fd, "w");
-    if (!tf) {
-        close(fd);
-        unlink(tmp);
-        return -1;
-    }
-    fputs("require 'stringio'\n", tf);
-    fputs(rb, tf);
-    fclose(tf);
+    return p != NULL && p[0] != '\0' && stat(p, &st) == 0 && S_ISREG(st.st_mode);
+}
 
-    setenv("CRUCIBLE_SCRIPT", script, 1);
-    setenv("REQUEST_METHOD", method ? method : "GET", 1);
-    setenv("PATH_INFO", path ? path : "/", 1);
-    setenv("QUERY_STRING", query ? query : "", 1);
-
-    snprintf(cmd, sizeof(cmd), "ruby \"%s\" 2>/dev/null", tmp);
-    fp = popen(cmd, "r");
-    if (!fp) {
-        unlink(tmp);
-        return -1;
+/* 脚本解析：显式 script → docroot/config.ru → docroot/index.ru → docroot/app.rb。 */
+static const char *resolve_script(const char *script, const char *docroot, char *out,
+                                  size_t outsz)
+{
+    if (is_regular_file(script)) {
+        snprintf(out, outsz, "%s", script);
+        return out;
     }
-    acc = (char *)malloc(cap);
-    if (!acc) {
-        pclose(fp);
-        unlink(tmp);
-        return -1;
+    if (docroot != NULL && docroot[0] != '\0') {
+        snprintf(out, outsz, "%s/config.ru", docroot);
+        if (is_regular_file(out))
+            return out;
+        snprintf(out, outsz, "%s/index.ru", docroot);
+        if (is_regular_file(out))
+            return out;
+        snprintf(out, outsz, "%s/app.rb", docroot);
+        if (is_regular_file(out))
+            return out;
     }
-    while (fgets(buf, sizeof(buf), fp)) {
-        size_t bl = strlen(buf);
-        if (n + bl + 1 >= cap) {
-            char *nb;
-            cap *= 2;
-            nb = (char *)realloc(acc, cap);
-            if (!nb) {
-                free(acc);
-                pclose(fp);
-                unlink(tmp);
-                return -1;
-            }
-            acc = nb;
-        }
-        memcpy(acc + n, buf, bl);
-        n += bl;
-    }
-    pclose(fp);
-    unlink(tmp);
-    acc[n] = '\0';
-    if (n == 0) {
-        free(acc);
-        return -1;
-    }
-    *out = acc;
-    *out_len = n;
-    return 0;
+    return NULL;
 }
 
 int appengine_init(const char *engine, const char *lib_hint)
 {
+    (void)engine;
     (void)lib_hint;
     g_inited = 1;
-    (void)engine;
+    fprintf(stderr,
+            "libapp_rack: 未嵌入 Ruby——本机没有 ruby/libruby（Rack 需要 MRI + rack "
+            "gem），见 rack_engine.c 文件头；请求将得到显式错误\n");
     return 0;
 }
 
@@ -140,11 +103,12 @@ int appengine_execute(
     const char *extra,
     AppEngineResult *out)
 {
-    char sp[1024];
-    char *result = NULL;
-    size_t rlen = 0;
-    const char *use = NULL;
+    char pathbuf[1024];
+    const char *use;
 
+    (void)method;
+    (void)path;
+    (void)query;
     (void)content_type;
     (void)body;
     (void)body_len;
@@ -156,29 +120,25 @@ int appengine_execute(
     if (!g_inited || out == NULL)
         return -1;
 
-    if (script && script[0] && file_ok(script))
-        use = script;
-    else {
-        snprintf(sp, sizeof(sp), "%s/config.ru", docroot ? docroot : ".");
-        if (file_ok(sp))
-            use = sp;
-        else {
-            snprintf(sp, sizeof(sp), "%s/app.rb", docroot ? docroot : ".");
-            if (file_ok(sp))
-                use = sp;
-        }
-    }
-
-    if (use && run_rack(use, method, path, query, &result, &rlen) == 0) {
-        appengine_result_alloc(out);
-        out->status = 200;
-        appengine_result_set_headers(out, "Content-Type: text/plain; charset=utf-8\r\n"
-                                          "X-Crucible-Engine: rack\r\n");
-        appengine_result_set_body(out, result, rlen);
-        free(result);
-        return 0;
-    }
-    return appengine_fill_hello(out, "rack", path);
+    use = resolve_script(script, docroot, pathbuf, sizeof(pathbuf));
+    if (use == NULL)
+        return rack_fail(out,
+                         "rack: 未找到 Rack 脚本（script=%s docroot=%s，尝试过 "
+                         "config.ru / index.ru / app.rb）",
+                         script != NULL ? script : "(null)",
+                         docroot != NULL ? docroot : "(null)");
+    /*
+     * 显式失败，不 spawn、不假 hello：
+     * spec 要求 Ruby 静态嵌入（禁止每请求 spawn 解释器），而本机没有 ruby/libruby，
+     * 无法嵌入；唯一正确的结果是把这个事实报给调用方（502 + 本消息）。
+     */
+    return rack_fail(out,
+                     "rack: 未嵌入 Ruby（not built with embedded MRI Ruby），且本机未安装 "
+                     "ruby/libruby，无法服务 %s。Rack 需要 MRI + rack gem；启用嵌入需 "
+                     "pkg-config --cflags/--libs ruby（-lruby 让 .so 带 DT_NEEDED）加 "
+                     "-DCRUCIBLE_HAVE_RUBY 重新构建 libapp_rack.so；每请求 spawn ruby 被 "
+                     "spec 禁止，故不再提供 popen 回退",
+                     use);
 }
 
 void appengine_shutdown(void)

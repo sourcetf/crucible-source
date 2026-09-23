@@ -246,6 +246,7 @@ mod tests {
             port_reuse: false,
             rate_limit: None,
             l4_forward: None,
+            quic_ecn: false,
         }
     }
 

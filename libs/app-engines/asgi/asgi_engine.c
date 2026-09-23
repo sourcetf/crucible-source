@@ -1,127 +1,91 @@
 /*
- * Minimal ASGI app-engine — spawn python3 with a tiny ASGI sync bridge when
- * app.py / asgi.py is present; otherwise hello fallback.
+ * ASGI app-engine —— 进程内嵌入 CPython（静态嵌入，无每请求 spawn）。
+ *
+ * 旧实现：写 runner 到 /tmp 后 popen("python3 runner")（每请求 spawn 解释器，
+ * spec 明令禁止），且失败即落 appengine_fill_hello（假成功）。宿主还根本没有 tsx/
+ * 第三方依赖可依赖，所以实际永远是 hello 页面。
+ *
+ * 现在：走 common/crucible_pyembed.h 的进程内 CPython；ASGI 需要事件循环，驱动
+ * 逻辑作为 Python 源码在**同进程**内 exec（不是 spawn），结果经 __cr_result 读回。
+ * 应用抛异常 → 500 + traceback；缺 libpython / 脚本缺失 → 显式错误。
  */
 #include "appengine.h"
 #include "appengine_common.h"
+#include "crucible_embed.h"
+#include "crucible_pyembed.h"
 
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <unistd.h>
+#include <sys/stat.h>
 
 static int g_inited;
 
-static int file_ok(const char *p)
+/* 引擎级失败：填 out->error 并返回 -1（app_ffi 会把它变成 502 文本）。
+ * 刻意放在 CRUCIBLE_HAVE_PYTHON 之外：关闭嵌入时同样需要显式失败。 */
+static int asgi_fail(AppEngineResult *out, const char *fmt, ...)
 {
-    FILE *f = fopen(p, "rb");
-    if (!f)
-        return 0;
-    fclose(f);
-    return 1;
+    char buf[1024];
+    va_list ap;
+
+    if (out == NULL)
+        return -1;
+    va_start(ap, fmt);
+    vsnprintf(buf, sizeof(buf), fmt, ap);
+    va_end(ap);
+    appengine_result_alloc(out);
+    appengine_result_set_error(out, buf);
+    return -1;
 }
 
-static int run_asgi(const char *script, const char *method, const char *path,
-                    const char *query, char **out, size_t *out_len)
+static int is_regular_file(const char *p)
 {
-    char tmp[] = "/tmp/crucible_asgi_XXXXXX";
-    char cmd[512];
-    FILE *fp, *tf;
-    int fd;
-    char buf[4096];
-    size_t cap = 4096, n = 0;
-    char *acc;
-    const char *py =
-        "import os, runpy, asyncio, sys\n"
-        "ns = runpy.run_path(os.environ['CRUCIBLE_SCRIPT'])\n"
-        "app = ns.get('app') or ns.get('application')\n"
-        "method = os.environ.get('REQUEST_METHOD', 'GET')\n"
-        "path = os.environ.get('PATH_INFO', '/')\n"
-        "query = os.environ.get('QUERY_STRING', '')\n"
-        "async def main():\n"
-        "    if app is None:\n"
-        "        print('hello from asgi (no app)')\n"
-        "        return\n"
-        "    body = []\n"
-        "    async def receive():\n"
-        "        return {'type': 'http.request', 'body': b'', 'more_body': False}\n"
-        "    async def send(msg):\n"
-        "        if msg['type'] == 'http.response.body':\n"
-        "            body.append(msg.get('body', b''))\n"
-        "    scope = {\n"
-        "        'type': 'http', 'asgi': {'version': '3.0'},\n"
-        "        'method': method, 'path': path,\n"
-        "        'query_string': query.encode(), 'headers': [],\n"
-        "        'scheme': 'http', 'server': ('crucible', 80),\n"
-        "    }\n"
-        "    await app(scope, receive, send)\n"
-        "    data = b''.join(body) if body else b'hello from asgi\\n'\n"
-        "    sys.stdout.buffer.write(data)\n"
-        "asyncio.run(main())\n";
+    struct stat st;
 
-    fd = mkstemp(tmp);
-    if (fd < 0)
-        return -1;
-    tf = fdopen(fd, "w");
-    if (!tf) {
-        close(fd);
-        unlink(tmp);
-        return -1;
-    }
-    fputs(py, tf);
-    fclose(tf);
+    return p != NULL && p[0] != '\0' && stat(p, &st) == 0 && S_ISREG(st.st_mode);
+}
 
-    setenv("CRUCIBLE_SCRIPT", script, 1);
-    setenv("REQUEST_METHOD", method ? method : "GET", 1);
-    setenv("PATH_INFO", path ? path : "/", 1);
-    setenv("QUERY_STRING", query ? query : "", 1);
-
-    snprintf(cmd, sizeof(cmd), "python3 \"%s\" 2>/dev/null", tmp);
-    fp = popen(cmd, "r");
-    if (!fp) {
-        unlink(tmp);
-        return -1;
+/* 脚本解析：显式 script → docroot/index.py → docroot/app.py → docroot/asgi.py。 */
+static const char *resolve_script(const char *script, const char *docroot, char *out,
+                                  size_t outsz)
+{
+    if (is_regular_file(script)) {
+        snprintf(out, outsz, "%s", script);
+        return out;
     }
-    acc = (char *)malloc(cap);
-    if (!acc) {
-        pclose(fp);
-        unlink(tmp);
-        return -1;
+    if (docroot != NULL && docroot[0] != '\0') {
+        snprintf(out, outsz, "%s/index.py", docroot);
+        if (is_regular_file(out))
+            return out;
+        snprintf(out, outsz, "%s/app.py", docroot);
+        if (is_regular_file(out))
+            return out;
+        snprintf(out, outsz, "%s/asgi.py", docroot);
+        if (is_regular_file(out))
+            return out;
     }
-    while (fgets(buf, sizeof(buf), fp)) {
-        size_t bl = strlen(buf);
-        if (n + bl + 1 >= cap) {
-            char *nb;
-            cap *= 2;
-            nb = (char *)realloc(acc, cap);
-            if (!nb) {
-                free(acc);
-                pclose(fp);
-                unlink(tmp);
-                return -1;
-            }
-            acc = nb;
-        }
-        memcpy(acc + n, buf, bl);
-        n += bl;
-    }
-    pclose(fp);
-    unlink(tmp);
-    acc[n] = '\0';
-    if (n == 0) {
-        free(acc);
-        return -1;
-    }
-    *out = acc;
-    *out_len = n;
-    return 0;
+    return NULL;
 }
 
 int appengine_init(const char *engine, const char *lib_hint)
 {
+#ifdef CRUCIBLE_HAVE_PYTHON
+    char err[256];
+#endif
+
+    (void)engine;
     (void)lib_hint;
     g_inited = 1;
-    (void)engine;
+#ifdef CRUCIBLE_HAVE_PYTHON
+    if (crucible_py_embed_ensure(err, sizeof(err)) == 0)
+        fprintf(stderr, "libapp_asgi: 进程内 CPython 就绪 (%s)\n", crucible_py_embed_version());
+    else
+        fprintf(stderr, "libapp_asgi: 嵌入式 CPython 不可用: %s\n", err);
+#else
+    fprintf(stderr,
+            "libapp_asgi: 构建时关闭了 Python 嵌入（-DCRUCIBLE_EMBED_PYTHON_OFF）\n");
+#endif
     return 0;
 }
 
@@ -140,48 +104,39 @@ int appengine_execute(
     const char *extra,
     AppEngineResult *out)
 {
-    char sp[1024];
-    char *result = NULL;
-    size_t rlen = 0;
-    const char *use = NULL;
-
-    (void)content_type;
-    (void)body;
-    (void)body_len;
-    (void)remote;
-    (void)server_name;
-    (void)server_port;
-    (void)extra;
+    char pathbuf[1024];
+    const char *use;
+    int env_dirty = extra != NULL && strchr(extra, '{') != NULL;
 
     if (!g_inited || out == NULL)
         return -1;
 
-    if (script && script[0] && file_ok(script))
-        use = script;
-    else {
-        snprintf(sp, sizeof(sp), "%s/asgi.py", docroot ? docroot : ".");
-        if (file_ok(sp))
-            use = sp;
-        else {
-            snprintf(sp, sizeof(sp), "%s/app.py", docroot ? docroot : ".");
-            if (file_ok(sp))
-                use = sp;
-        }
-    }
-
-    if (use && run_asgi(use, method, path, query, &result, &rlen) == 0) {
-        appengine_result_alloc(out);
-        out->status = 200;
-        appengine_result_set_headers(out, "Content-Type: text/plain; charset=utf-8\r\n"
-                                          "X-Crucible-Engine: asgi\r\n");
-        appengine_result_set_body(out, result, rlen);
-        free(result);
-        return 0;
-    }
-    return appengine_fill_hello(out, "asgi", path);
+#ifdef CRUCIBLE_HAVE_PYTHON
+    use = resolve_script(script, docroot, pathbuf, sizeof(pathbuf));
+    if (use == NULL)
+        return asgi_fail(out,
+                         "asgi: 未找到 ASGI 脚本（script=%s docroot=%s，"
+                         "尝试过 index.py / app.py / asgi.py）",
+                         script != NULL ? script : "(null)",
+                         docroot != NULL ? docroot : "(null)");
+    return crucible_py_asgi_request("asgi", use, docroot, method, path, query,
+                                    content_type, body, body_len, remote, server_name,
+                                    server_port, env_dirty, out);
+#else
+    (void)script;
+    (void)docroot;
+    (void)pathbuf;
+    (void)env_dirty;
+    return asgi_fail(out,
+                     "asgi: 本引擎构建时未嵌入 CPython（-DCRUCIBLE_EMBED_PYTHON_OFF）。"
+                     "asgi 禁止每请求 spawn 解释器，故不提供 popen 回退");
+#endif
 }
 
 void appengine_shutdown(void)
 {
     g_inited = 0;
+#ifdef CRUCIBLE_HAVE_PYTHON
+    crucible_py_embed_shutdown();
+#endif
 }

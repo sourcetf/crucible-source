@@ -509,6 +509,18 @@ pub struct ListenerConfig {
     /// §16.18 L4 不透明转发：配置后整条连接双向透传（不做 HTTP/TLS 解析）。
     #[serde(default)]
     pub l4_forward: Option<String>,
+    /// TASK2：该 listener 的 QUIC/UDP socket 是否做 ECN 的 socket 级设置与启动校验
+    /// （默认关）。
+    ///
+    /// 打开后：重设入向 `IP_RECVTOS` / `IPV6_RECVTCLASS`（让入向码点可观测，
+    /// 对 macOS 双栈 socket 有用），并把该 socket 的当前 ECN 状态写进启动日志。
+    ///
+    /// 注意：**它不改变 ECN 是否生效**——quinn 的传输层 ECN 本来就默认开着
+    /// （`sending_ecn = true`），出向标记是 quinn-udp 的 per-packet cmsg。
+    /// 本开关只是把「这台机器上到底开没开」变成可观测的，见 `server/ecn.rs` 文件头。
+    /// 默认关是因为它不带来行为变化，属于运维核查项而不是功能开关。
+    #[serde(default)]
+    pub quic_ecn: bool,
 }
 
 impl Default for ListenerConfig {
@@ -531,6 +543,7 @@ impl Default for ListenerConfig {
             port_reuse: false,
              rate_limit: None,
             l4_forward: None,
+            quic_ecn: false,
         }
     }
 }
