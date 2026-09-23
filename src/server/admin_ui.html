@@ -181,11 +181,15 @@ img.preview{max-width:100%;max-height:420px}
       </div>
       <div class="row">
         <div style="flex:1"><label>ech_keys（路径/PEM，可选）</label><input id="tlsEchKeys" style="width:100%"/></div>
-        <div><label>groups（冒号分隔，可选）</label><input id="tlsGroups" placeholder="X25519MLKEM768:X25519"/></div>
+        <div><label>groups（密钥交换组，可多选；不选=用库默认）</label>
+          <select id="tlsGroups" multiple size="5" style="min-width:210px"></select>
+        </div>
       </div>
       <div class="row">
         <div style="flex:1"><label>ech_public_name（对外身份，如 v.qq.com）</label><input id="tlsEchPublicName" style="width:100%"/></div>
-        <div style="flex:1"><label>ech_cipher_suite（HPKE 对称，可选）</label><input id="tlsEchSuite" placeholder="HKDF-SHA256/AES-128-GCM" style="width:100%"/></div>
+        <div style="flex:1"><label>ech_cipher_suite（HPKE 对称，可选）</label>
+          <select id="tlsEchSuite" style="width:100%"></select>
+        </div>
         <div><label>ech_max_name_length</label><input id="tlsEchMaxName" value="64" size="5"/></div>
       </div>
       <div class="grid" style="margin-top:.4rem">
@@ -380,7 +384,12 @@ img.preview{max-width:100%;max-height:420px}
       <h3 class="sub">定时任务</h3>
       <div class="row">
         <div><label>name</label><input id="cronName" size="12" placeholder="geoip_update"/></div>
-        <div><label>schedule</label><input id="cronSched" size="10" placeholder="daily"/></div>
+        <div><label>schedule</label><input id="cronSched" size="10" placeholder="daily" list="cronSchedList"/>
+          <datalist id="cronSchedList">
+            <option value="daily"></option><option value="hourly"></option>
+            <option value="weekly"></option><option value="monthly"></option>
+          </datalist>
+        </div>
         <div><label>enabled</label><select id="cronEnabled"><option value="1">true</option><option value="0">false</option></select></div>
         <div><button class="act" id="btnCronSave">保存任务</button></div>
         <div><button class="act ghost" id="btnCronLoad">刷新</button></div>
@@ -824,7 +833,9 @@ function fillTlsForm(){
   $('tlsCertEc').value=s.cert_ec||'';
   $('tlsKeyEc').value=s.key_ec||'';
   $('tlsEchKeys').value=s.ech_keys||'';
-  $('tlsGroups').value=(s.groups||[]).join(':');
+  fillTlsPickLists();
+  setMultiPick($('tlsGroups'), s.groups||[]);
+  setPickValue($('tlsEchSuite'), s.ech_cipher_suite||'');
   $('tlsEchPublicName').value=s.ech_public_name||'';
   $('tlsEchSuite').value=s.ech_cipher_suite||'';
   $('tlsEchMaxName').value=s.ech_max_name_length||64;
@@ -869,7 +880,7 @@ $('btnTlsSave').onclick=async()=>{
       ech:$('tlsEch').checked,
       ech_keys:$('tlsEchKeys').value||null,
       ech_public_name:$('tlsEchPublicName').value||null,
-      ech_cipher_suite:$('tlsEchSuite').value||null,
+      ech_cipher_suite:($('tlsEchSuite').value||null),
       ech_max_name_length:parseInt($('tlsEchMaxName').value,10)||64,
       ech_advertise:$('tlsEchAdv').checked,
       early_data:$('tlsEarlyData').checked,
@@ -880,7 +891,7 @@ $('btnTlsSave').onclick=async()=>{
       psk_key:$('tlsPskKey').value||null,
       psk:$('tlsPsk').checked,
       pqc:$('tlsPqc').checked,
-      groups:$('tlsGroups').value?$('tlsGroups').value.split(':').map(s=>s.trim()).filter(Boolean):[],
+      groups:Array.from($('tlsGroups').selectedOptions).map(o=>o.value),
       enable_nss:$('tlsNss').checked,
       enable_tomcrypt:$('tlsTc').checked
     };
@@ -890,6 +901,36 @@ $('btnTlsSave').onclick=async()=>{
   if(r.ok){toast('TLS 已保存并热重载');await loadCfg();}
 };
 // 常用套件一键填入：省得用户去翻 BoringSSL 的套件名字符串
+/* TLS 面板的候选值：BoringSSL 接受的组名 / HPKE 对称套件。
+   回填时若配置里的值不在候选内，会临时补一个 option —— 否则一保存就把它丢了。 */
+const TLS_GROUPS=['X25519MLKEM768','X25519','P-256','P-384','P-521'];
+const ECH_SUITES=['HKDF-SHA256/AES-128-GCM','HKDF-SHA384/AES-256-GCM',
+                  'HKDF-SHA256/ChaCha20Poly1305','HKDF-SHA384/ChaCha20Poly1305'];
+function fillTlsPickLists(){
+  const g=$('tlsGroups'), e=$('tlsEchSuite');
+  if(g&&!g.options.length){
+    TLS_GROUPS.forEach(n=>g.appendChild(new Option(n,n)));
+  }
+  if(e&&!e.options.length){
+    e.appendChild(new Option('（默认）',''));
+    ECH_SUITES.forEach(n=>e.appendChild(new Option(n,n)));
+  }
+}
+function setPickValue(sel,val){
+  if(!sel) return;
+  if(val&&!Array.from(sel.options).some(o=>o.value===val)){
+    sel.appendChild(new Option(val+'（配置中的值）',val));
+  }
+  sel.value=val||'';
+}
+function setMultiPick(sel,vals){
+  if(!sel) return;
+  (vals||[]).forEach(v=>{
+    if(!Array.from(sel.options).some(o=>o.value===v)) sel.appendChild(new Option(v+'（配置中的值）',v));
+    const o=Array.from(sel.options).find(x=>x.value===v); if(o) o.selected=true;
+  });
+}
+
 /* ---- DNS 分线路：结构化编辑（替代原来的 JSON 文本框）---- */
 function geoLineRow(l){
   const tr=document.createElement('tr');
