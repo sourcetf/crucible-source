@@ -330,3 +330,69 @@ ACCEPTANCE DONE (non-std ports 19095/19081/19445/19446/18443/18444, dns 5353/dot
   `/var/swap`、`/var/turnchroot`。
 - 若还要跑验收：每次 `gmake release` 会强制重建（脚本会 touch tls 源文件），
   约 20+ 分钟且吃磁盘；建议先确认 `df -h /` 有 ≥2G 空闲。
+
+### Session 1008 (2026-09-23) — 进展 7（第四轮：4 个审计 agent + 已修 6 类）
+本轮用 4 个**只读**审计 agent 分头扫描（C 引擎 / geoip+dns / admin+鉴权 / proxy+apps），
+每条发现都由我对照代码复核后才动手。已提交并推送 `c7db8d4`。
+
+**已修（都做了编译验证）**
+1. **从 `admin.rs.orig`/`.broken` 里恢复出被丢失的功能**（这两份不是垃圾，是残缺副本）：
+   - 3 条整段丢失的全局设置路由 `/api/syncookie/save`、`/api/telemetry/save`、
+     `/api/admin/save`（UI「全局」tab 三个保存按钮一直在调用，后端恒 404）。
+   - `/api/proxy_rules/save` 少写 5 个键 → 面板每保存一次就**静默抹掉**
+     `upstream_tls_version`/`upstream_http_version`/`connection_pool`/`via_tor`/`tor_socks`。
+   - `/api/autoindex/save` 少写 `enable_upload`/`upload_threads`。
+   - 顺带发现：`/api/admin/save` 若从空表重建会把 `[[admin.users]]` 删掉 →
+     管理面永久锁死（已改为基于现有表改，只覆盖 realm/path/listeners_allow）。
+2. **webshell 闸门（RCE）**：`/api/files/rename` 完全没有 `would_execute_on_get` 检查
+   → 先传 `php/shell.txt` 再改名 `php/shell.php` 即可执行。已补闸门。
+   同时闸门原先用**原始路径**做路由匹配（`safe_join` 却会归一化 `.`），
+   `/./php/x.php`、`//php/...`、`%2F.%2Fphp%2F` 都能绕过 → 新增 `web_path_of()` 归一化。
+3. **静态文件**：`SCRIPT_EXTS` 漏了 `html/htm/js/mjs/svg/xml` 等浏览器会主动渲染的类型，
+   于是「preview 强制 text/plain」对 `.html` 不生效（上传的页面照常在本站 origin 执行 =
+   存储型 XSS）。已补齐。另修 HEAD 在 Range/整读之前未短路（`HEAD` + 32MiB Range 会真的读满）。
+4. **C 侧 snprintf 截断当长度用（远程栈越界读）5 处**：`appengine_common.c`、
+   `c-plugin/plugin.c`、`axonasp_engine.c`、`aspnet_engine.c`、`lua_engine.c`。
+   全部夹到缓冲区真实容量。`aspnet_engine.c` 那处是本次全量扫 `= snprintf` 赋值点时
+   自己找出来的（审计未列出）。**已在生产实测**：`/c/<600 字符>` 现在稳定回 511 字节
+   （= 512-1，即截断后的真实长度），修复前会把栈上数据一起回给请求方。
+5. **h2/h3 引擎错误被吞导致源码泄露**：`apps::try_handle_simple` 用 `.ok()?` 把
+   「已命中路由但引擎失败」变成 None，h2/h3 于是落到静态服务。已改为与 h1 一致回 502。
+   生产实测 `/php/index.php` 在 h2 上不再回源码（现为 404；具体触发路径与审计描述
+   不完全一致，结论以实测为准）。
+6. **h3 CONNECT-UDP 绕过访问控制**：CONNECT 分流提前到收 body 之前（这个提前是对的），
+   但当时直接 return，`ip_access`/限流/listener Basic Auth 三项全被跳过 → 匿名 UDP 中继。
+   已按同一顺序补上三项检查。
+7. 仓库卫生：删掉 `admin.rs.orig`/`.broken`；`.gitignore` 补 `www-apps/*/deps/`、
+   `*.orig`、`*.broken`。
+
+**已复核为真、但本轮**未**改（留待下一轮，按严重度排序）**
+- proxy **WebSocket 升级**路径逐字转发客户端头且自行追加 `Content-Length`
+  → `Transfer-Encoding: chunked` + `Content-Length` 同时存在（TE.CL 走私），
+  且不剥离 hop-by-hop、不替换客户端自带的 `X-Forwarded-*`。
+- proxy 回源**全链路无超时**（connect/send/读头/读体），
+  `read_http_head` 无 deadline；静默上游可长期占住连接与 64MiB 缓冲。
+- `join_upstream` 拼接缺分隔符：`rule.path` 以 `/` 结尾时（如 UI 文档里的 `/api/*`）
+  会与 authority 粘连，`http://backend` + `.evil.tld/x` → 发给 `backend.evil.tld`。
+- `file_open` 的键用**原始**请求路径（解析文件时却已百分号解码/归一化），
+  `//uploads/x.html`、`/uploads/x%2Ehtml`、`/uploads/x.HTML` 都会落回 `Auto`。
+- `connect_udp.rs` 目标判定漏 NAT64 `64:ff9b::/96`、6to4、Teredo、CGNAT `100.64/10`。
+- `ensure_sidecar` 无 per-key spawn 锁 + 超时路径丢下活着的子进程 → 进程泄漏。
+- geoip：`lookup_merged` 每次请求对 `ipv4`/`anycast` **全表扫描**且扫两遍、
+  跑在 async worker 上；`ops.rs` filter 先 `LIMIT 5000` 再过滤 → 结果被静默截断；
+  面板编辑权重优先级反了（权重低的反而生效）；`dns/geoip.rs` 用 `or_else` 使
+  ASN/ISP 分线路永远不生效；`admin_geoip` 查了不存在的 `covering` 表并吞掉错误。
+- `dns/mod.rs` 的 `zone_file_name` 把 `-` 映射成 `_`，`a-b.com` 与 `a_b.com` 撞同一文件。
+- `/__metrics` 在 `ip_access`/Basic Auth **之前**返回（IP 白名单对它无效）。
+- admin：rename/mkdir 的 `safe_join` 非存在路径分支是词法包含检查（符号链接可逃逸）；
+  `/api/admin/save` 传空 `listeners_allow` 等于「全口可达」；Basic Auth 无限流/锁定，
+  且每次尝试都跑一遍 argon2id（可做 CPU 放大）；admin 路径前缀用 `ends_with` 匹配
+  → `/__adminfoo/...` 也能进管理面；`ORIGIN` 缺失时 CSRF 检查直接跳过。
+
+**运维**
+- 本轮验收跑到 unit tests 时我需要**重编 target/debug**（约 1.5G），
+  磁盘从 1.2G 掉到 424M（99%）——为保护正在跑的生产实例我中止了那次构建并清掉
+  `target/debug`，现为 1.4G 可用。**结论：这台机器磁盘不够跑 `cargo test`，
+  验收流程里的 unit tests 步骤目前跑不动**（release 构建与全部网络/协议检查都已通过）。
+- 期间发现 `/root/ReMgr` 的 `cargo check` 是**另一位同事**的进程，我没有动它。
+- 生产已用 round-4 二进制重启（PID 803），9095/8443/9081 + admin 全部 200。
