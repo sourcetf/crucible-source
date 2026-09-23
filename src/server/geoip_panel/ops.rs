@@ -226,13 +226,21 @@ pub fn spawn_geoip_update(root: &Path) -> Result<()> {
     if !script.is_file() {
         anyhow::bail!("missing {}", script.display());
     }
-    std::process::Command::new("bash")
+    let child = std::process::Command::new("bash")
         .arg(&script)
         .current_dir(root)
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .spawn()
         .context("spawn geoip_update.sh")?;
+    // 记 pid：脚本是全链最慢的一步（要下载 + 13 个 enrich），面板要能显示
+    // 「还在跑 / 跑完了」，而脚本自己的进度在 data/geoip/logs/update.log 里
+    // （它用 tee 全程落盘）。没有这个文件，后端只能干说一句「已启动」。
+    let pid_file = root.join("data/geoip/logs/update.pid");
+    if let Some(dir) = pid_file.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let _ = std::fs::write(&pid_file, child.id().to_string());
     Ok(())
 }
 

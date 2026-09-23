@@ -464,6 +464,67 @@ fn form_field(body: &str, key: &str) -> Option<String> {
     None
 }
 
+/// `GET /api/geoip/update/status?since=<bytes>` — 离线更新的进度。
+///
+/// 返回自 `since` 偏移之后的日志增量（脚本全程 tee 到 update.log），
+/// 以及进程是否还在跑（依据 spawn 时写下的 update.pid）。
+/// 前端据此轮询：触发 → 记下当前日志大小 → 每 1.5s 取增量增量显示。
+pub async fn handle_update_status(req: &Request<Full<Bytes>>) -> Response<BoxBody> {
+    use std::io::{Read, Seek, SeekFrom};
+    let q = req.uri().query().unwrap_or("");
+    let since: u64 = form_field(q, "since").and_then(|v| v.parse().ok()).unwrap_or(0);
+
+    let log_path = std::path::Path::new("data/geoip/logs/update.log");
+    let pid_path = std::path::Path::new("data/geoip/logs/update.pid");
+
+    let pid: Option<u32> = std::fs::read_to_string(pid_path)
+        .ok()
+        .and_then(|s| s.trim().parse().ok());
+    // kill(pid, 0)：只探测存在性，不发信号。进程没了就顺手清掉 pid 文件，
+    // 免得 pid 被复用后误报「还在跑」。
+    let running = match pid {
+        Some(p) => {
+            let alive = unsafe { libc::kill(p as i32, 0) } == 0;
+            if !alive {
+                let _ = std::fs::remove_file(pid_path);
+            }
+            alive
+        }
+        None => false,
+    };
+
+    let mut chunk = String::new();
+    let mut size: u64 = 0;
+    let mut truncated = false;
+    if let Ok(mut f) = std::fs::File::open(log_path) {
+        if let Ok(md) = f.metadata() {
+            size = md.len();
+        }
+        let from = since.min(size);
+        if f.seek(SeekFrom::Start(from)).is_ok() {
+            // 上限 256 KiB：一次轮询不该把整个日志灌给浏览器。
+            let mut buf = vec![0u8; 256 * 1024];
+            if let Ok(n) = f.read(&mut buf) {
+                if (size - from) > n as u64 {
+                    truncated = true;
+                }
+                chunk = String::from_utf8_lossy(&buf[..n]).into_owned();
+            }
+        }
+    }
+    let done = chunk.contains("geoip_update done");
+    let resp = serde_json::json!({
+        "running": running,
+        "pid": pid,
+        "from": since,
+        "to": size,
+        "done": done,
+        "truncated": truncated,
+        "log": chunk,
+    });
+    json_ok(resp.to_string())
+}
+
 /// `GET /api/geoip/status` — standalone env path.
 pub async fn handle_status(_req: &Request<Full<Bytes>>) -> Response<BoxBody> {
     let db_path = std::env::var("CRUCIBLE_GEOIP_DB")

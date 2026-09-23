@@ -56,24 +56,36 @@ img.preview{max-width:100%;max-height:420px}
 .kv{font-size:.85rem}
 .kv b{color:var(--muted);font-weight:600;margin-right:.3rem}
 </style>
+<style>
+/* 导航分组标签：把「全局配置」与「站点配置」在视觉上分开 */
+.navsep{display:inline-block;margin:0 6px 0 14px;padding:2px 8px;border-radius:10px;
+  background:#00000010;color:#666;font-size:12px;font-weight:600;vertical-align:middle}
+.navsep:first-of-type{margin-left:0}
+#geoUpdateLog{max-height:300px;overflow:auto;background:#0b1020;color:#cfe3ff;
+  padding:10px;border-radius:6px;font-size:12px;line-height:1.45;white-space:pre-wrap}
+</style>
 </head>
 <body>
 <header><h1>Crucible</h1><span class="hint">管理面板 · 配置几乎全部落 config.toml（热重载）</span></header>
 <nav id="tabs">
+  <!-- 全局配置：这些项在 config.toml 里是顶层表，对所有站点生效 -->
+  <span class="navsep">全局配置</span>
   <button data-tab="overview" class="active">概览</button>
+  <button data-tab="geoip">GeoIP</button>
+  <button data-tab="dns">DNS</button>
+  <button data-tab="access">访问控制</button>
+  <button data-tab="accesslog">访问日志</button>
+  <button data-tab="global">全局设置</button>
+  <button data-tab="accounts">账号</button>
+  <button data-tab="toml">配置源码</button>
+  <!-- 站点配置：per-listener，页面顶部都有「端口」选择器，改的是单个 [[listeners]] -->
+  <span class="navsep">站点配置</span>
   <button data-tab="listeners">站点/监听</button>
-  <button data-tab="tls">TLS</button>
+  <button data-tab="tls">TLS / 证书</button>
   <button data-tab="apps">应用引擎</button>
   <button data-tab="files">文件管理</button>
   <button data-tab="pagerules">页面规则</button>
   <button data-tab="proxy">反向代理</button>
-  <button data-tab="access">访问控制</button>
-  <button data-tab="accesslog">访问日志</button>
-  <button data-tab="geoip">GeoIP</button>
-  <button data-tab="dns">DNS</button>
-  <button data-tab="global">全局</button>
-  <button data-tab="toml">配置源码</button>
-  <button data-tab="accounts">账号</button>
 </nav>
 <main>
 <div id="toast" class="toast"></div>
@@ -294,6 +306,11 @@ img.preview{max-width:100%;max-height:420px}
         <div><button class="act" id="btnGeoSave">保存开关/路径</button></div>
       </div>
       <pre id="geoStatusOut">加载中…</pre>
+      <div style="margin-top:10px">
+        <button class="act" id="btnGeoUpdate">触发离线更新</button>
+        <span id="geoUpdateState" style="margin-left:8px;color:#666"></span>
+      </div>
+      <pre id="geoUpdateLog" style="display:none"></pre>
     </div>
 
     <div class="card">
@@ -1410,9 +1427,44 @@ $('btnCronSave').onclick=async()=>{
   toast(r.text,!r.ok);
   loadCron();
 };
+let geoPoll=null;
 $('btnGeoUpdate').onclick=async()=>{
+  if(geoPoll){toast('更新已在进行中',true);return;}
+  const box=$('geoUpdateLog'), state=$('geoUpdateState');
+  // 先记下当前日志大小：只显示「本次触发之后」产生的输出，
+  // 否则上一轮的输出会混进来，看起来像是这次的进度。
+  let since=0;
+  const st0=await apiJson('/api/geoip/update/status?since=0');
+  if(st0.json&&st0.json.to!==undefined) since=st0.json.to;
   const r=await api('/api/geoip/update',{method:'POST'});
   toast(r.text,!r.ok);
+  if(!r.ok) return;
+  const t0=Date.now();
+  box.style.display='block';
+  box.textContent='已触发 geoip_update.sh，等待输出…
+';
+  state.textContent='⏳ 进行中';
+  const tick=async()=>{
+    const res=await apiJson('/api/geoip/update/status?since='+since);
+    const j=res.json;
+    if(!j){ box.textContent+='[状态查询失败: '+res.text+']
+'; return true; }
+    if(j.log) box.textContent+=j.log;
+    since=j.to;
+    const secs=Math.round((Date.now()-t0)/1000);
+    state.textContent=(j.running?'⏳ 进行中':'✔ 已结束')+' '+secs+'s'
+      +(j.done?'（脚本报告完成）':(j.running?'':'（未见到完成标记，请查看上面的输出）'));
+    box.scrollTop=box.scrollHeight;
+    if(!j.running) return true;
+    if(secs>1800){ box.textContent+='
+[超过 30 分钟，停止轮询]
+'; return true; }
+    return false;
+  };
+  await tick();
+  geoPoll=setInterval(async()=>{
+    if(await tick()){ clearInterval(geoPoll); geoPoll=null; }
+  },1500);
 };
 $('btnGeoAudit').onclick=async()=>{
   const r=await api('/api/geoip/audit?limit=100');

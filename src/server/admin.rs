@@ -173,6 +173,9 @@ pub async fn handle(req: Request<Full<Bytes>>, live: Arc<LiveConfig>) -> Respons
         return admin_geoip::handle_lookup_with_live(&req, &live).await;
     }
     if path.ends_with("/api/geoip/status") && method == Method::GET {
+    if path.ends_with("/api/geoip/update/status") && method == Method::GET {
+        return admin_geoip::handle_update_status(&req).await;
+    }
         return admin_geoip::handle_status_with_live(&req, &live).await;
     }
     if path.ends_with("/api/geoip/filter") && method == Method::GET {
