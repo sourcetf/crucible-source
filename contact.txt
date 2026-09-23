@@ -319,3 +319,14 @@ ACCEPTANCE DONE (non-std ports 19095/19081/19445/19446/18443/18444, dns 5353/dot
    运行期改写/删除），本轮没有提交这些生成物，建议纳入 .gitignore。
 3. 未实现的仍如实保留：QMux（只有计数器）、H3 端到端 ECN、go/ruby/perl 嵌入
    （本机缺工具链，502 且给出明确原因）。
+
+**运维提醒（磁盘）**：本轮验收跑了两轮 `gmake release` 全量重建 + geoip 全链 enrich
+（afrinic 178907 / lacnic 419349 inetnums 入库），磁盘一度被打到 **103%（负可用空间）**，
+任何写入都会失败。已清理回收至 ~1.6G 可用：
+- 删除 `/crucible/target/debug`（1.5G，本地调试构建产物，`cargo build` 可重建；
+  `target/release/webserver` 完好未动）、`/crucible/webserver.core`（崩溃调试用的 core）、
+  `/tmp` 下的调试脚本。
+- **未动**：`/crucible/data/geoip`（2.0G，项目数据）、`/root/ReMgr`（3.1G，他人目录）、
+  `/var/swap`、`/var/turnchroot`。
+- 若还要跑验收：每次 `gmake release` 会强制重建（脚本会 touch tls 源文件），
+  约 20+ 分钟且吃磁盘；建议先确认 `df -h /` 有 ≥2G 空闲。
