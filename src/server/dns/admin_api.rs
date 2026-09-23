@@ -89,6 +89,29 @@ async fn handle_inner(
             p if p.ends_with("/api/dns/zones") => {
                 let action = v["action"].as_str().unwrap_or("add");
                 match action {
+                    // .zone 文本导入：mode=merge 追加、mode=replace 先清空本分区记录。
+                    // 解析阶段全量校验，任何一行不合法就整体失败（不落半截数据）。
+                    "import" => {
+                        let name = v["name"].as_str().ok_or("name?")?.to_string();
+                        let text = v["text"].as_str().ok_or("text?")?;
+                        let mode = v["mode"].as_str().unwrap_or("merge").to_string();
+                        if !valid_name(&name) {
+                            return Err(format!("bad zone name {name:?}"));
+                        }
+                        let recs = parse_zone_text(text, &name)?;
+                        if mode == "replace" {
+                            del_zone_records(&name).map_err(|e| e.to_string())?;
+                        }
+                        let mut n = 0usize;
+                        for r in &recs {
+                            add_record(&name, "", &r.name, &r.rtype, r.ttl, &r.rdata)
+                                .map_err(|e| e.to_string())?;
+                            n += 1;
+                        }
+                        // 本 match 各分支统一返回 ()（函数尾部回 {"ok":true}），
+                        // 条数记日志；前端刷新记录表即可看到「共 N 条」。
+                        log::info!("dns import: zone={name} mode={mode} imported={n}");
+                    }
                     "del" => {
                         let name = v["name"].as_str().ok_or("name?")?;
                         del_zone(name).map_err(|e| e.to_string())?;
@@ -563,4 +586,235 @@ pub async fn handle_zone_export(
         )
         .body(full(text))
         .unwrap()
+}
+
+// ---------------------------------------------------------------- .zone 导入
+
+/// 解析 RFC1035 主文件的务实子集，供面板导入 .zone 使用。
+///
+/// 支持：`;` 注释（引号内的 `;` 不算）、空行、括号续行、`$ORIGIN` / `$TTL`、
+/// 引号包裹的 rdata、省略 owner（沿用上一条）、可选 TTL 与 class、`1h/30m/2d` 式 TTL。
+/// **不支持** `$INCLUDE` / `$GENERATE` —— 遇到直接报错，不猜语义。
+///
+/// 先全量解析、再落库：任何一行不合法就整体失败并报出行号，不会写进半截数据。
+struct ZoneRec {
+    name: String,
+    rtype: String,
+    ttl: u32,
+    rdata: String,
+}
+
+fn strip_zone_comment(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut inq = false;
+    for ch in s.chars() {
+        match ch {
+            '"' => {
+                inq = !inq;
+                out.push(ch);
+            }
+            ';' if !inq => break,
+            _ => out.push(ch),
+        }
+    }
+    out
+}
+
+/// DNS 惯例的 TTL 写法：纯数字或 1s/30m/2h/3d/1w。
+fn parse_ttl(tok: &str) -> Option<u32> {
+    let t = tok.trim();
+    if t.is_empty() {
+        return None;
+    }
+    let (num, mult) = match t.chars().last()?.to_ascii_lowercase() {
+        's' => (&t[..t.len() - 1], 1u32),
+        'm' => (&t[..t.len() - 1], 60),
+        'h' => (&t[..t.len() - 1], 3600),
+        'd' => (&t[..t.len() - 1], 86400),
+        'w' => (&t[..t.len() - 1], 604800),
+        _ => (t, 1),
+    };
+    if num.is_empty() {
+        return None;
+    }
+    num.parse::<u32>().ok().map(|v| v.saturating_mul(mult))
+}
+
+/// 按空白切词，但引号内的空白算作同一个词；返回字节区间，便于原样取回 rdata。
+fn zone_tokens(s: &str) -> Vec<(usize, usize)> {
+    let b = s.as_bytes();
+    let mut out = Vec::new();
+    let mut i = 0usize;
+    while i < b.len() {
+        while i < b.len() && (b[i] as char).is_whitespace() {
+            i += 1;
+        }
+        if i >= b.len() {
+            break;
+        }
+        let start = i;
+        let mut inq = false;
+        while i < b.len() {
+            let c = b[i] as char;
+            if c == '"' {
+                inq = !inq;
+                i += 1;
+                continue;
+            }
+            if !inq && c.is_whitespace() {
+                break;
+            }
+            i += 1;
+        }
+        out.push((start, i));
+    }
+    out
+}
+
+fn parse_zone_text(text: &str, origin: &str) -> Result<Vec<ZoneRec>, String> {
+    let mut cur_origin = origin.trim_end_matches('.').to_ascii_lowercase();
+    let mut default_ttl: u32 = 3600;
+    let mut last_owner: Option<String> = None;
+    let mut out: Vec<ZoneRec> = Vec::new();
+
+    let mut buf = String::new();
+    let mut depth: i32 = 0;
+    let mut start_line = 0usize;
+
+    for (idx, raw) in text.lines().enumerate() {
+        let lineno = idx + 1;
+        let clean = strip_zone_comment(raw);
+        if clean.trim().is_empty() && depth == 0 {
+            continue;
+        }
+        if buf.is_empty() {
+            start_line = lineno;
+        }
+        // 行首有空白 = 沿用上一条 owner（RFC1035 的省略写法）
+        let omits_owner = buf.is_empty() && raw.starts_with([' ', '\t']);
+        for ch in clean.chars() {
+            if ch == '(' {
+                depth += 1;
+            } else if ch == ')' {
+                depth -= 1;
+            }
+        }
+        if depth < 0 {
+            return Err(format!("第 {lineno} 行: 多余的 )"));
+        }
+        buf.push_str(clean.trim());
+        buf.push(' ');
+        if depth > 0 {
+            continue;
+        }
+        let logical = std::mem::take(&mut buf);
+        let toks = zone_tokens(&logical);
+        if toks.is_empty() {
+            continue;
+        }
+        let first = &logical[toks[0].0..toks[0].1];
+        if first.starts_with('$') {
+            match first.to_ascii_uppercase().as_str() {
+                "$ORIGIN" => {
+                    if toks.len() < 2 {
+                        return Err(format!("第 {start_line} 行: $ORIGIN 缺少参数"));
+                    }
+                    cur_origin = logical[toks[1].0..toks[1].1]
+                        .trim_end_matches('.')
+                        .to_ascii_lowercase();
+                }
+                "$TTL" => {
+                    if toks.len() < 2 {
+                        return Err(format!("第 {start_line} 行: $TTL 缺少参数"));
+                    }
+                    let t = &logical[toks[1].0..toks[1].1];
+                    default_ttl = parse_ttl(t)
+                        .ok_or_else(|| format!("第 {start_line} 行: 无法解析 TTL {t:?}"))?;
+                }
+                other => {
+                    return Err(format!(
+                        "第 {start_line} 行: 不支持指令 {other}（导入只处理记录与 $ORIGIN/$TTL）"
+                    ))
+                }
+            }
+            continue;
+        }
+
+        let mut ti = 0usize;
+        let owner_raw = if omits_owner {
+            last_owner.clone().unwrap_or_else(|| "@".to_string())
+        } else {
+            ti = 1;
+            first.to_string()
+        };
+        // 可选 TTL / class（顺序任意，各最多一次）
+        let mut ttl: Option<u32> = None;
+        let mut class_seen = false;
+        while ti < toks.len() {
+            let t = &logical[toks[ti].0..toks[ti].1];
+            let up = t.to_ascii_uppercase();
+            if !class_seen && (up == "IN" || up == "CH" || up == "HS") {
+                class_seen = true;
+                ti += 1;
+                continue;
+            }
+            if ttl.is_none() {
+                if let Some(v) = parse_ttl(t) {
+                    ttl = Some(v);
+                    ti += 1;
+                    continue;
+                }
+            }
+            break;
+        }
+        if ti >= toks.len() {
+            return Err(format!("第 {start_line} 行: 缺少记录类型"));
+        }
+        let rtype = logical[toks[ti].0..toks[ti].1].to_ascii_uppercase();
+        let type_end = toks[ti].1;
+        if !RR_TYPES.contains(&rtype.as_str()) {
+            return Err(format!("第 {start_line} 行: 不支持的记录类型 {rtype}"));
+        }
+        // rdata 原样取回（保留引号，TXT 引号内的空格不会被切碎）
+        let rdata = logical[type_end..].trim().to_string();
+        if rdata.is_empty() {
+            return Err(format!("第 {start_line} 行: {rtype} 缺少记录值"));
+        }
+
+        // owner 归一成「分区内相对名」：@ 与顶点 -> "@"；绝对名去掉 zone 后缀
+        let mut name = owner_raw.trim().trim_end_matches('.').to_ascii_lowercase();
+        if name == "@" || name == cur_origin {
+            name = "@".to_string();
+        } else if name.len() > cur_origin.len()
+            && name.ends_with(cur_origin.as_str())
+            && name.as_bytes()[name.len() - cur_origin.len() - 1] == b'.'
+        {
+            name = name[..name.len() - cur_origin.len() - 1].to_string();
+        } else if owner_raw.trim().ends_with('.') {
+            // 绝对名却不在本分区内 —— 拒绝，否则会把外部名字塞进本区
+            return Err(format!(
+                "第 {start_line} 行: {owner_raw} 不在本分区 {cur_origin} 内"
+            ));
+        }
+        if name.is_empty() {
+            name = "@".to_string();
+        }
+        if !valid_name(&name) {
+            return Err(format!("第 {start_line} 行: 记录名 {name:?} 不合法"));
+        }
+        last_owner = Some(name.clone());
+        out.push(ZoneRec {
+            name,
+            rtype,
+            ttl: ttl.unwrap_or(default_ttl),
+            rdata,
+        });
+    }
+    if depth != 0 {
+        return Err(format!("第 {start_line} 行: 括号未闭合"));
+    }
+    if out.is_empty() {
+        return Err("没有解析到任何记录".to_string());
+    }
+    Ok(out)
 }

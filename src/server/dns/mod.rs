@@ -510,6 +510,13 @@ pub fn add_zone(kind: &str, name: &str, primaries: &[String], axfr_acl: &[String
     Ok(conn.last_insert_rowid())
 }
 
+/// 只清空某分区的记录、保留分区本身（导入时「全量替换」用）。
+pub fn del_zone_records(name: &str) -> Result<usize> {
+    let conn = store()?;
+    let n = conn.execute("DELETE FROM records WHERE zone=?1", [name])?;
+    Ok(n)
+}
+
 pub fn del_zone(name: &str) -> Result<()> {
     let conn = store()?;
     conn.execute("DELETE FROM zones WHERE name=?1", [name])?;

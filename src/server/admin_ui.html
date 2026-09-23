@@ -442,6 +442,16 @@ img.preview{max-width:100%;max-height:420px}
         <div id="dnsRecWrap"></div>
         <button class="act ghost" id="btnRecRowAdd">+ 加一条记录</button>
         <div id="dnsRecMsg" style="margin-top:6px"></div>
+        <div class="row" style="margin-top:8px;border-top:1px dashed #ddd;padding-top:8px">
+          <div><label>导入 .zone 文件</label><input type="file" id="dnsImportFile" accept=".zone,.txt"/></div>
+          <div><label>导入方式</label>
+            <select id="dnsImportMode">
+              <option value="merge">增量（追加到现有记录）</option>
+              <option value="replace">全量（先清空本分区记录）</option>
+            </select>
+          </div>
+          <div><label>&nbsp;</label><button class="act" id="btnZoneImport">导入到所选分区</button></div>
+        </div>
       </div>
       <pre id="dnsZonesOut"></pre>
     </div>
@@ -1788,6 +1798,23 @@ $('btnRecRowAdd').onclick=function(){
     tb=document.querySelector('#dnsRecWrap tbody');
   }
   tb.appendChild(dnsRecRow({}));
+};
+$('btnZoneImport').onclick=function(){
+  const zone=$('dnsZoneSel').value;
+  if(!zone) return out('dnsRecMsg','先选择一个分区',false);
+  const f=$('dnsImportFile').files[0];
+  if(!f) return out('dnsRecMsg','先选择 .zone 文件',false);
+  const mode=$('dnsImportMode').value;
+  if(mode==='replace' && !confirm('全量导入会先删除 '+zone+' 的现有全部记录，确定继续？')) return;
+  const fr=new FileReader();
+  fr.onload=async function(){
+    out('dnsRecMsg','正在导入…',true);
+    const r=await apiJson('/api/dns/zones',jpost({action:'import',name:zone,text:String(fr.result),mode:mode}));
+    out('dnsRecMsg', r.ok?('导入完成，记录表已刷新'):('导入失败: '+r.text), r.ok);
+    if(r.ok) await dnsLoadRecords();
+  };
+  fr.onerror=function(){ out('dnsRecMsg','读取文件失败',false); };
+  fr.readAsText(f);
 };
 $('btnZoneExport').onclick=function(){
   const z=$('dnsZoneSel').value;
