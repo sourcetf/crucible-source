@@ -255,6 +255,19 @@ pub struct FilterRow {
     pub weight: i64,
 }
 
+/// 转义 LIKE 元字符（`%` `_` `\`），避免面板输入的 `%` 被当成通配符。
+/// 配合 SQL 侧的 `ESCAPE '\'` 使用。
+fn like_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for ch in s.chars() {
+        if matches!(ch, '%' | '_' | '\\') {
+            out.push('\\');
+        }
+        out.push(ch);
+    }
+    out
+}
+
 /// Filter geoip rows by country/isp/cloud（Admin 面板筛选；结果携带字段供表格渲染）。
 pub fn filter_prefixes(
     conn: &Connection,
@@ -264,43 +277,49 @@ pub fn filter_prefixes(
     limit: usize,
 ) -> Result<Vec<FilterRow>> {
     let lim = limit.min(500);
+    let c = country.unwrap_or("").to_ascii_lowercase();
+    let i = isp.unwrap_or("").to_ascii_lowercase();
+    let cl = cloud.unwrap_or("").to_ascii_lowercase();
+    // 过滤下推到 SQL。原实现是 `ORDER BY weight DESC LIMIT 5000` 之后再在 Rust 里
+    // 按 country/isp/cloud 过滤 —— 命中的行只要排在权重前 5000 之外就被**静默截断**
+    // （面板显示「没有结果」，其实数据存在）。这里的 LIMIT 作用在过滤后的结果集上。
+    // 大小写：SQLite 的 LIKE 对 ASCII 不区分大小写（等价于原来的 to_ascii_lowercase
+    // 包含匹配）；lower() 只为把意图写死，非 ASCII 与原来一样不做大小写折叠。
     let mut stmt = conn.prepare(
         "SELECT COALESCE(prefix, ip_start || '-' || ip_end),
                 COALESCE(country, ''), COALESCE(province, ''), COALESCE(city, ''),
                 COALESCE(isp, ''), COALESCE(cloud_provider, ''), COALESCE(weight, 0)
-         FROM geoip ORDER BY weight DESC LIMIT 5000",
+         FROM geoip
+         WHERE (?1 = ''
+                 OR lower(COALESCE(country, '')) LIKE '%' || ?1 || '%' ESCAPE '\\'
+                 OR lower(COALESCE(province, '')) LIKE '%' || ?1 || '%' ESCAPE '\\'
+                 OR lower(COALESCE(city, '')) LIKE '%' || ?1 || '%' ESCAPE '\\')
+           AND (?2 = '' OR lower(COALESCE(isp, '')) LIKE '%' || ?2 || '%' ESCAPE '\\')
+           AND (?3 = '' OR lower(COALESCE(cloud_provider, '')) LIKE '%' || ?3 || '%' ESCAPE '\\')
+         ORDER BY COALESCE(weight, 0) DESC LIMIT ?4",
     )?;
-    let rows = stmt.query_map([], |row| {
-        Ok((
-            row.get::<_, String>(0)?,
-            row.get::<_, String>(1)?,
-            row.get::<_, String>(2)?,
-            row.get::<_, String>(3)?,
-            row.get::<_, String>(4)?,
-            row.get::<_, String>(5)?,
-            row.get::<_, i64>(6)?,
-        ))
-    })?;
-    let c = country.unwrap_or("").to_ascii_lowercase();
-    let i = isp.unwrap_or("").to_ascii_lowercase();
-    let cl = cloud.unwrap_or("").to_ascii_lowercase();
+    let rows = stmt.query_map(
+        rusqlite::params![
+            like_escape(&c),
+            like_escape(&i),
+            like_escape(&cl),
+            lim as i64
+        ],
+        |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, String>(5)?,
+                row.get::<_, i64>(6)?,
+            ))
+        },
+    )?;
     let mut out = Vec::new();
     for row in rows {
         let (prefix, country, province, city, isp, cloud_provider, weight) = row?;
-        if !c.is_empty() {
-            let hit = [&country, &province, &city]
-                .iter()
-                .any(|x| x.to_ascii_lowercase().contains(&c));
-            if !hit {
-                continue;
-            }
-        }
-        if !i.is_empty() && !isp.to_ascii_lowercase().contains(&i) {
-            continue;
-        }
-        if !cl.is_empty() && !cloud_provider.to_ascii_lowercase().contains(&cl) {
-            continue;
-        }
         out.push(FilterRow {
             prefix,
             country,
@@ -310,9 +329,6 @@ pub fn filter_prefixes(
             cloud_provider,
             weight,
         });
-        if out.len() >= lim {
-            break;
-        }
     }
     Ok(out)
 }
