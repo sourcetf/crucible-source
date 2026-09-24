@@ -252,11 +252,19 @@ mod tests {
     #[test]
     fn group_matches_has_no_separator_collision() {
         let g = Group::from_normalized("php", &[("A", "x"), ("B", "y")]);
-        assert!(g.matches("php", &[("B", "y"), ("A", "x")]), "键序不同但内容相同 → 同组");
+        // 键序不同但内容相同 → 同组。`matches` 的契约是「入参已归一化」（生产调用点传的
+        // 就是 `normalized(vars)`），所以这里同样先归一化再比 —— 键序无关性由归一化保证。
+        assert!(
+            g.matches("php", &normalized(&[("B", "y"), ("A", "x")])),
+            "键序不同但内容相同 → 同组"
+        );
         // 拼字符串实现会把这些误判成同一 key（分隔符/拼接碰撞）——结构化比较不会
-        assert!(!g.matches("php", &[("A", "x\u{1}B=y")]));
-        assert!(!g.matches("php", &[("A", "x"), ("B", "y"), ("C", "z")]));
-        assert!(!g.matches("lua", &[("A", "x"), ("B", "y")]), "引擎名在指纹里");
+        assert!(!g.matches("php", &normalized(&[("A", "x\u{1}B=y")])));
+        assert!(!g.matches("php", &normalized(&[("A", "x"), ("B", "y"), ("C", "z")])));
+        assert!(
+            !g.matches("lua", &normalized(&[("A", "x"), ("B", "y")])),
+            "引擎名在指纹里"
+        );
     }
 
     #[test]

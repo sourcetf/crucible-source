@@ -351,7 +351,12 @@ fn generic_pool_threads() -> usize {
     let cpu = std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(2);
-    cpu.clamp(2, 4)
+    // 池宽决定「同时能有多少个引擎请求在飞」。这些线程绝大部分时间阻塞在 I/O 上
+    // （等 sidecar 回包、等 fork 出来的 CGI 子进程），不是 CPU 密集，所以与核数脱钩、
+    // 给足冗余更划算：实测本机只有 1 核 → 旧下限 2 条线程，两个 `sleep 120` 的 CGI
+    // 就把池占满，**其它引擎的请求全部排队**（验收里 lua/asp/python 被饿到客户端超时）。
+    // 单个 CGI 最长可占 30s（CGI_TIMEOUT_MS），所以下限提到 4、上限 8。
+    cpu.clamp(4, 8)
 }
 
 fn serial_engine(engine: &str) -> bool {

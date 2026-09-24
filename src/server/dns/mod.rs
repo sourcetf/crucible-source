@@ -721,7 +721,12 @@ pub fn del_record(id: i64) -> Result<()> {
             bail!("zone {z:?} 是从区（{kind}），记录由 named 同步维护，不能直接删除");
         }
     }
-    conn.execute("DELETE FROM records WHERE id=?1", [id])?;
+    let n = conn.execute("DELETE FROM records WHERE id=?1", [id])?;
+    // 删不存在的 id 必须报错：静默成功会让「从区只读行的删除按钮」「已被删的记录再删一次」
+    // 看起来都成功了（面板又刷新不出变化），排查时全是假象。
+    if n == 0 {
+        bail!("记录不存在（id={id}）");
+    }
     Ok(())
 }
 
