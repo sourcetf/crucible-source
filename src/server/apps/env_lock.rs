@@ -24,6 +24,13 @@ pub fn with_temp_env_named<T, F>(engine: &str, vars: &[(&str, &str)], f: F) -> T
 where
     F: FnOnce() -> T,
 {
+    // 没有 .env 变量时**绝不能拿锁**：这把锁存在的唯一理由是「临时改进程环境」必须互斥，
+    // 而它是在整个引擎调用期间被持有的。空变量时白拿锁 = 把同一引擎的所有请求串行化。
+    // 实测（build31）：一个 sleep 120 的 CGI 会把整条 `/cgi/` 路径堵死——后续请求
+    // （包括另一个脚本）全部排队超时，而静态口完全正常。修复后同一实验应并发通过。
+    if vars.is_empty() {
+        return f();
+    }
     let lock = ENV_LOCKS
         .lock()
         .entry(engine.to_string())
