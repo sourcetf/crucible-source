@@ -12,6 +12,7 @@
 | 事项 | 位置/做法 |
 |---|---|
 | 本地工作副本 | `C:\Users\Administrator\Desktop\crucible`（**不是**权威仓库） |
+| ⚠️ 本地无法编译/检查 | 本机 rustc host 是 `x86_64-pc-windows-gnu`，但**缺 `dlltool.exe`**（无 MSYS2/LLVM）→ `getrandom`/`libloading` 等依赖编不过。**别在本地跑 `cargo check` 当作门槛**（会白等几分钟）；只能靠远程构建日志兜底。另：`cargo check … \| tail` 的退出码是 `tail` 的，恒为 0，**不能据此判断通过**（我踩过）。 |
 | 权威仓库 | 远程 `/crucible`，分支 `v1.0.0-final`，推送到 `origin main`（sourcetf/crucible-source） |
 | SSH 辅助脚本 | 仓库**外**：`C:\Users\Administrator\.crucible-remote\_rc.py`（执行命令）/ `_put.py`（上传）。凭据在其中 |
 | 服务器 | OpenBSD 7.9，`root@83.229.125.81:22` |
@@ -342,3 +343,44 @@ AXFR 自测通过）→ 生产实例把**同名** zone 建为 secondary，primar
 清了 `/tmp/xortest`、`/tmp/stuncheck`（我为探测 Tor/STUN 建的临时 crate，各带 260MB target）
 → 空闲由 603MB 回到 **1.1G**。
 **不要删**（不是我的）：`/root/legacy-backup`、`/root/ReMgr`、`/tmp/frp*`、`/tmp/rdcheck`、`/tmp/mkhash`。
+
+### 13.5 build29 部署与验证结果（2026-09-24，已上线）
+
+提交 `98ed9e1` → 构建 **21m25s** 成功（0 error，106 warning 全是既有的 unused）→ 部署。
+
+| 验证项 | 结果 |
+|---|---|
+| 二进制含新代码（`grep 'start_i IS NULL OR'`） | 1 ✓ |
+| 生产 9095 / 8443(TLS) / 9081(admin) / geoip status | 全 200 ✓ |
+| ipv4/ipv6 数值列 + 索引 + 回填（生产库） | 8 行 / 1 行，空值 0 ✓ |
+| `EXPLAIN QUERY PLAN` 走 `idx_ipv4_numeric` | ✓ |
+| **(b)** `filter?country=US&limit=20` 返回**整页 20 行** | ✓（修前被 CN 高权重行挤空） |
+| **(c)** `lookup?ip=0.1.2.3` 顶层 country **不是 ZZ** | ✓（ZZ 只出现在 covering 原始行里，合法） |
+| **(a)** range 表读路径在**活二进制**里生效 | ✓ 见下「判别探针」 |
+| **(1dff5e3)** `meta` 表出现 `serial:<zone>` 高水位 | ✓ 值 1790222009 / 1790222105（两次测试递减递增正常） |
+| **(1dff5e3)** 加记录后 dig 立刻查到 | ✓ 203.0.113.99 |
+| h2 协商 | HTTP/2 ✓ |
+| 引擎 | `/c/` `/rust/` 200；11 个引擎 200；`/jsp/` 502 = **本机没装 Java**（日志提示手工起 jsp_sidecar.sh），验收脚本同样视其为可选；`/go/` `/ruby/` `/psgi/` `/rack/` 是侧车引擎，同样 502 |
+
+**判别探针（证明线上跑的是新读路径，别删这段方法）**：往 `ipv4` 表插一行**数值列与文本故意不一致**的记录
+（文本 `203.0.113.0/24` 含目标 IP，但 `start_i=0,end_i=1` 不含）：
+- 新二进制：SQL 数值预过滤把它挡在 SQL 层 → `covering` 里**不出现** ✓（实测 0）
+- 旧二进制：无 WHERE 全表取回 → Rust 文本判定命中 → `covering` 里**会出现**
+实测 `covering` 无该行 → 线上确为新代码 ✓（探针行测完立即删除，ipv4 行数回到 8）
+
+**验证脚本**（仓库外 `C:\Users\Administrator\.crucible-remote\`，`.sh` 直接 `sh` 跑）：
+`_verify29_prod.sh`（17 项，0 FAIL）、`_verify29_test.sh`（12 项，0 FAIL，含 DNS meta 复验）。
+两个断言坑记下：①filter 也会匹配 province 等字段（DE 行带 `province=US-FL` 会命中 US），
+所以断言「返回整页 N 行」而不是数 country；②ZZ 允许出现在 `covering` 原始行列表，只看**顶层** country。
+
+**踩坑（运维）**：`pkill -f 'config-test.toml'` 会**杀掉我自己的 ssh 会话 shell** ——
+它的命令行里含这个字符串。要用括号技巧：`pkill -f 'config-tes[t].toml'`。
+同理 `while pgrep -f 'cargo build'` 会匹配到自己 → 死循环（我留过一个，已 kill）。
+
+### 13.6 本轮新发现并修掉的小 bug（build30）
+`POST /api/dns/geoip/sync` 返回的 `synced` 此前直接回 `run_sync`（= 是否到期/被强制），
+在**没配 MaxMind license_key** 或 mmdb 未启用时，明明是空操作却回 `synced:true`
+（与 07988d6 修的「面板说刚同步、数据却在老化」同类）。现在回 `synced` 真实语义
++ `reason` 说明跳过原因；无密钥时实测回 `{"ok":true,"synced":false,"reason":"未配置 MaxMind license_key"}`。
+**注意**：(d) 的「真下载」因此**无法在当前配置下验证** —— 没有 license_key，
+`ensure_synced` 按设计早退。要验证需要用户提供一个 MaxMind 授权密钥。

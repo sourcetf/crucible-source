@@ -333,7 +333,19 @@ async fn handle_inner(
                         );
                     if age_days < mmdb.sync_days { run_sync = false; }
                 }
-                let r = if mmdb.is_active() && !mmdb.license_key.is_empty() && run_sync {
+                // 空操作的原因（空串 = 本次真的会同步）。所有跳过路径都必须在这里说清楚，
+                // 否则响应会把「什么都没干」说成 synced。
+                let skip_reason = if !mmdb.is_active() {
+                    "mmdb 未启用（未配置 db 路径）"
+                } else if mmdb.license_key.is_empty() {
+                    "未配置 MaxMind license_key"
+                } else if !run_sync {
+                    "未到同步周期（可加 force=1 强制）"
+                } else {
+                    ""
+                };
+                let do_sync = skip_reason.is_empty();
+                let r = if do_sync {
                     tokio::task::spawn_blocking(move || super::geoip::ensure_synced(&mmdb, force))
                         .await
                         .map_err(|e| e.to_string())?
@@ -344,7 +356,10 @@ async fn handle_inner(
                     Ok(_) => {
                         // 清缓存 reader 让下次 lookup 读新 db
                         super::geoip::reset_cache();
-                        Ok(json!({"ok": true, "synced": run_sync}))
+                        // `synced` 只回答「这次真的同步了吗」。此前直接回 run_sync（= 是否
+                        // 到期/被强制），没密钥或未启用时明明是空操作，接口却回 true ——
+                        // 与 07988d6 修掉的「面板说刚同步、数据却在老化」是同一类假报告。
+                        Ok(json!({"ok": true, "synced": do_sync, "reason": skip_reason}))
                     }
                     Err(e) => Ok(json!({"ok": false, "error": e.to_string()})),
                 }
