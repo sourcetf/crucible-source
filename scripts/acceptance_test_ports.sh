@@ -16,9 +16,9 @@ BIN="./target/release/webserver"
 LOG="${CRUCIBLE_TEST_LOG:-/tmp/crucible-test.log}"
 
 echo "==> ensure certs"
-if [ ! -f cert_ec.pem ]; then
-  openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 \
-    -keyout key_ec.pem -out cert_ec.pem -days 3650 -nodes -subj /CN=crucible.local 2>/dev/null || true
+# 仓库自带测试证书。不再用 openssl 现场生成（用户要求项目不依赖 openssl）。
+if [ ! -f cert_ec.pem ] || [ ! -f key_ec.pem ]; then
+  echo "FAIL: 缺少测试证书 cert_ec.pem/key_ec.pem（仓库应自带）"
 fi
 if [ ! -f state/ech/ech_keys.pem ]; then
   sh scripts/generate_ech.sh crucible.local 2>/dev/null || true
@@ -106,11 +106,11 @@ curl -sS --max-time 5 -u admin:admin "http://127.0.0.1:19095/__metrics" 2>/dev/n
 echo
 
 echo "==> TLS 1.3 :18443"
-echo | openssl s_client -connect 127.0.0.1:18443 -tls1_3 2>/dev/null | grep Protocol || true
+python3 /tmp/_tlsprobe.py 18443 TLSv1_3 || true
 echo "==> TLS 1.2 :19445"
-echo | openssl s_client -connect 127.0.0.1:19445 -tls1_2 2>/dev/null | grep Protocol || true
+python3 /tmp/_tlsprobe.py 19445 TLSv1_2 || true
 echo "==> TLS 1.3 fair :19446"
-echo | openssl s_client -connect 127.0.0.1:19446 -tls1_3 2>/dev/null | grep Protocol || true
+python3 /tmp/_tlsprobe.py 19446 TLSv1_3 || true
 
 echo "==> H3 QUIC :18443 (optional — body OK even if stream reset)"
 if command -v curl >/dev/null 2>&1 && curl --version 2>/dev/null | grep -qi http3; then
@@ -126,11 +126,8 @@ else
 fi
 echo
 echo "==> TLS 1.0 NSS path :18443"
-if openssl s_client -help 2>&1 | grep -q -- '-tls1[^_]'; then
-  echo | openssl s_client -connect 127.0.0.1:18443 -tls1 2>/dev/null | grep -E 'Protocol|error|alert' | head -3 || true
-else
-  echo "openssl has no -tls1; skip"
-fi
+# TLS1.1 探针（python3 + 系统 LibreSSL；openssl 已从依赖中移除）
+python3 /tmp/_tlsprobe.py 18443 TLSv1_1 || true
 
 echo "==> SSLv2 ClientHello probe (no crash) :18443"
 CRUCIBLE_TEST_PID="$WPID" python3 scripts/test_sslv2_probe.py --host 127.0.0.1 --port 18443 --settle-ms 1500 || {
@@ -140,7 +137,7 @@ if kill -0 "$WPID" 2>/dev/null; then echo "server still alive after sslv2 probe"
 
 # Post-sslv2: verify TLS still works (server not wedged)
 echo "==> post-sslv2 TLS1.3 still works :18443"
-echo | openssl s_client -connect 127.0.0.1:18443 -tls1_3 2>/dev/null | grep Protocol || {
+python3 /tmp/_tlsprobe.py 18443 TLSv1_3 || {
   echo "FAIL: TLS broken after sslv2"; exit 1
 }
 

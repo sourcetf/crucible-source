@@ -147,20 +147,101 @@ fn load_identity(builder: &mut SslAcceptorBuilder, ssl: &SslConfig) -> Result<()
     Ok(())
 }
 
+/// BoringSSL 内置的 TLS1.3 套件名（`ssl_cipher.cc` 的 kCiphers 里 algorithm_mkey ==
+/// SSL_kGENERIC 的三条；除此之外没有任何 TLS1.3 套件）。
+const TLS13_SUITES: &[&str] = &[
+    "TLS_AES_128_GCM_SHA256",
+    "TLS_AES_256_GCM_SHA384",
+    "TLS_CHACHA20_POLY1305_SHA256",
+];
+
+/// psk=true 时追加的 PSK/ECDHE-PSK 套件族（早期规格 13）。
+///
+/// 名字必须是 BoringSSL **确实有**的那些：它没有 PSK-AES128-**GCM**-SHA256 之类的
+/// GCM 型 PSK 套件（那些是 OpenSSL 的名字），此前这里的 6 个名字里 5 个不存在 ——
+/// 非严格解析会静默忽略未知名字，于是「管理员显式配了套件列表」时 psk 实际一个都没加上。
+/// 待办的「全量套件目录」会把 PSK 也从目录里筛出来（见 WORKLOG §17），届时这段可去掉。
+const PSK_SUITE_TAIL: &str = ":PSK-AES128-CBC-SHA:PSK-AES256-CBC-SHA:ECDHE-PSK-AES128-CBC-SHA:ECDHE-PSK-AES256-CBC-SHA:ECDHE-PSK-CHACHA20-POLY1305";
+
 fn apply_ciphers(builder: &mut SslAcceptorBuilder, ssl: &SslConfig) -> Result<()> {
-    // 早期规格 13：psk=true 时追加 PSK/ECDHE-PSK 套件族（TLS1.3 PSK 走 callback）。
-    let mut list = if ssl.ciphers.is_empty() {
-        "ALL:!eNULL:!SSLv3".to_string()
+    let (mut list, dropped) = if ssl.ciphers.is_empty() {
+        ("ALL:!eNULL:!SSLv3".to_string(), Vec::new())
     } else {
-        ssl.ciphers.join(":")
+        split_tls13_suites(&ssl.ciphers.join(":"))
     };
-    if ssl.psk {
-        list = format!(
-            "{list}:PSK-AES128-GCM-SHA256:PSK-AES256-GCM-SHA384:PSK-CHACHA20-POLY1305:ECDHE-PSK-AES128-GCM-SHA256:ECDHE-PSK-AES256-GCM-SHA384:ECDHE-PSK-CHACHA20-POLY1305"
+    // TLS1.3 套件名**不能**经 SSL_CTX_set_cipher_list 生效：BoringSSL 的可配置套件表
+    // （ssl_cipher.cc 的 co_list）只含 TLS≤1.2 套件，TLS1.3 名字匹配不到条目 → 被
+    // 静默忽略；若列表里**只有** TLS1.3 名字，结果为空 → SSL_R_NO_CIPHER_MATCH →
+    // set_cipher_list 报错 → build_acceptor 失败 → 这个监听口的**每个**连接都软失败
+    //（客户端只看到连接被关闭）。boring 明确写着 BoringSSL 没有 set_ciphersuites，
+    // 所以 TLS1.3 套件集合在库内固定：要限制 TLS1.3 只能用 ssl.versions。
+    // 这里如实告警 + 剔除；剔除后没有 1.2 套件可配时回落默认列表，不把监听口配死。
+    if !dropped.is_empty() {
+        log::error!(
+            "ssl.ciphers 中的 TLS1.3 套件 {:?} 无法配置（BoringSSL 未实现 set_ciphersuites，\
+             TLS1.3 固定为 AES-128-GCM/AES-256-GCM/CHACHA20-POLY1305）；限制 TLS1.3 请用 \
+             ssl.versions。已从 TLS≤1.2 套件列表中剔除",
+            dropped
         );
+    }
+    if list.trim_matches(':').is_empty() {
+        log::error!("ssl.ciphers 剔除 TLS1.3 套件后无剩余套件，回落默认列表 ALL:!eNULL:!SSLv3");
+        list = "ALL:!eNULL:!SSLv3".to_string();
+    }
+    if ssl.psk {
+        list.push_str(PSK_SUITE_TAIL);
     }
     builder.set_cipher_list(&list)?;
     Ok(())
+}
+
+/// 把配置里的套件串拆开，返回 (TLS≤1.2 套件串, 被剔除的 TLS1.3 套件名)。
+///
+/// 分隔符按 BoringSSL 非严格模式接受的形式（`:`/`,`/空白/`;`）切开再统一用 `:` 拼回；
+/// 条目上的 `!`/`-`/`+`/`@` 修饰符不参与名字匹配（剔除整条：对固定套件做排除同样无效）。
+fn split_tls13_suites(spec: &str) -> (String, Vec<String>) {
+    let mut kept: Vec<&str> = Vec::new();
+    let mut dropped: Vec<String> = Vec::new();
+    for item in spec.split([':', ',', ';', ' ', '\t', '\n']).filter(|s| !s.is_empty()) {
+        let name = item.trim_start_matches(['!', '-', '+', '@']);
+        if TLS13_SUITES.iter().any(|s| s.eq_ignore_ascii_case(name)) {
+            dropped.push(item.to_string());
+        } else {
+            kept.push(item);
+        }
+    }
+    (kept.join(":"), dropped)
+}
+
+#[cfg(test)]
+mod ciphers_tests {
+    use super::split_tls13_suites;
+
+    /// TLS1.3 套件名不能进 set_cipher_list（BoringSSL 会忽略；只剩它们时整条列表报错
+    /// → 监听口每个连接都失败）。
+    #[test]
+    fn tls13_suite_names_are_stripped() {
+        let (kept, dropped) =
+            split_tls13_suites("TLS_AES_128_GCM_SHA256:ECDHE-RSA-AES128-GCM-SHA256");
+        assert_eq!(kept, "ECDHE-RSA-AES128-GCM-SHA256");
+        assert_eq!(dropped, vec!["TLS_AES_128_GCM_SHA256".to_string()]);
+
+        // 只有 TLS1.3 名字 → 剔除后为空（调用方回落默认列表，而不是把口配死）。
+        let (kept, dropped) =
+            split_tls13_suites("TLS_AES_256_GCM_SHA384, TLS_CHACHA20_POLY1305_SHA256");
+        assert!(kept.is_empty());
+        assert_eq!(dropped.len(), 2);
+
+        // 修饰符 + 大小写。
+        let (kept, dropped) = split_tls13_suites("!tls_aes_128_gcm_sha256");
+        assert!(kept.is_empty());
+        assert_eq!(dropped.len(), 1);
+
+        // 前缀相近的 TLS1.2 名字不受影响。
+        let (kept, dropped) = split_tls13_suites("TLS_RSA_WITH_AES_128_GCM_SHA256");
+        assert_eq!(kept, "TLS_RSA_WITH_AES_128_GCM_SHA256");
+        assert!(dropped.is_empty());
+    }
 }
 
 /// Post-quantum hybrid + explicit group list (BoringSSL `SSL_CTX_set1_groups_list`).

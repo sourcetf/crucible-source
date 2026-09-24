@@ -937,8 +937,11 @@ $('btnTlsSave').onclick=async()=>{
 /* TLS 面板的候选值：BoringSSL 接受的组名 / HPKE 对称套件。
    回填时若配置里的值不在候选内，会临时补一个 option —— 否则一保存就把它丢了。 */
 const TLS_GROUPS=['X25519MLKEM768','X25519','P-256','P-384','P-521'];
-const ECH_SUITES=['HKDF-SHA256/AES-128-GCM','HKDF-SHA384/AES-256-GCM',
-                  'HKDF-SHA256/ChaCha20Poly1305','HKDF-SHA384/ChaCha20Poly1305'];
+// 只列 BoringSSL 真正接受的组合：KDF 固定 HKDF-SHA256（其它 KDF 会让它拒绝整个
+// ECHConfig → ECH 静默失效），AEAD 三种全支持。以前这里有 2 个 HKDF-SHA384 的选项，
+// 选它们等于把 ECH 关掉。
+const ECH_SUITES=['HKDF-SHA256/AES-128-GCM','HKDF-SHA256/AES-256-GCM',
+                  'HKDF-SHA256/ChaCha20Poly1305'];
 function fillTlsPickLists(){
   const g=$('tlsGroups'), e=$('tlsEchSuite');
   if(g&&!g.options.length){

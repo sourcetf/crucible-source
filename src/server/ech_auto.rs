@@ -163,11 +163,15 @@ pub fn parse_suites(spec: &str) -> Result<Vec<(u16, u16)>> {
         let (kdf_s, aead_s) = item
             .split_once('/')
             .with_context(|| format!("套件 {item:?} 应为 KDF/AEAD 形式"))?;
+        // BoringSSL 只接受 HKDF-SHA256：其它 kdf_id 会让它**拒绝整个 ECHConfig**
+        // （ssl/encrypted_client_hello.cc 对 kdf_id != HKDF-SHA256 直接报
+        // SSL_R_UNSUPPORTED_ECH_SERVER_CONFIG）。以前这里放行 SHA384/512 → ECH 被静默关闭，
+        // 管理员以为开了。现在按「越界即拒绝」处理，错误里说清原因和可选项。
         let kdf = match kdf_s.trim().to_ascii_uppercase().as_str() {
             "HKDF-SHA256" | "SHA256" => KDF_HKDF_SHA256,
-            "HKDF-SHA384" | "SHA384" => KDF_HKDF_SHA384,
-            "HKDF-SHA512" | "SHA512" => KDF_HKDF_SHA512,
-            other => bail!("未知 KDF {other:?}"),
+            other => bail!(
+                "ECH 的 KDF 只能是 HKDF-SHA256（BoringSSL 的硬限制，其它值会被它拒绝整个 ECHConfig）；收到 {other:?}"
+            ),
         };
         let aead = match aead_s.trim().to_ascii_uppercase().as_str() {
             "AES-128-GCM" | "AES128-GCM" => AEAD_AES_128_GCM,
@@ -556,7 +560,9 @@ mod tests {
     #[test]
     fn suite_parsing() {
         assert_eq!(parse_suites("HKDF-SHA256/AES-128-GCM").unwrap(), vec![(1, 1)]);
-        assert_eq!(parse_suites("HKDF-SHA384/AES-256-GCM").unwrap(), vec![(2, 2)]);
+        // BoringSSL 不接受 HKDF-SHA384：必须报错，而不是放行后被静默关闭。
+        assert!(parse_suites("HKDF-SHA384/AES-256-GCM").is_err());
+        assert!(parse_suites("HKDF-SHA512/ChaCha20Poly1305").is_err());
         assert_eq!(
             parse_suites("HKDF-SHA256/AES-128-GCM CHACHA20POLY1305/HKDF-SHA256").is_err(),
             true
