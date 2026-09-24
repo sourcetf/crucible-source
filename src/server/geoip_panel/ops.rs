@@ -226,6 +226,19 @@ pub fn spawn_geoip_update(root: &Path) -> Result<()> {
     if !script.is_file() {
         anyhow::bail!("missing {}", script.display());
     }
+    let pid_file = root.join("data/geoip/logs/update.pid");
+    // 单实例保护：面板按钮点两次、两个人同时点、或按钮与 cron 撞上，都会拉起第二个 updater，
+    // 而 merge/enrich 不是为并发写的（两个进程同时改同一个 SQLite）—— 轻则互相覆盖、
+    // 重则把库写坏。实测一次误操作就出现了 4 个并发更新进程。已在跑就明确拒绝，
+    // 并把 pid 告诉调用方（面板能看到是谁在跑）。
+    if let Ok(s) = std::fs::read_to_string(&pid_file) {
+        if let Ok(pid) = s.trim().parse::<i32>() {
+            // kill(pid, 0) 只探测存在性；pid<=1 视为无效残留。
+            if pid > 1 && unsafe { libc::kill(pid, 0) } == 0 {
+                anyhow::bail!("geoip 更新已在进行中（pid={pid}），等它跑完再触发");
+            }
+        }
+    }
     let child = std::process::Command::new("bash")
         .arg(&script)
         .current_dir(root)
@@ -236,7 +249,6 @@ pub fn spawn_geoip_update(root: &Path) -> Result<()> {
     // 记 pid：脚本是全链最慢的一步（要下载 + 13 个 enrich），面板要能显示
     // 「还在跑 / 跑完了」，而脚本自己的进度在 data/geoip/logs/update.log 里
     // （它用 tee 全程落盘）。没有这个文件，后端只能干说一句「已启动」。
-    let pid_file = root.join("data/geoip/logs/update.pid");
     if let Some(dir) = pid_file.parent() {
         let _ = std::fs::create_dir_all(dir);
     }

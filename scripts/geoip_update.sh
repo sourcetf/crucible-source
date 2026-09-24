@@ -11,6 +11,26 @@ LOG="${ROOT}/data/geoip/logs/update.log"
 mkdir -p "${ROOT}/data/geoip/current" "${ROOT}/data/geoip/logs"
 ONLY="${2:-all}"
 
+# 单实例锁：面板按钮、cron、手工命令都可能同时触发。merge/enrich 不是为并发写的
+# （两个进程同时改同一个 SQLite），实测一次误操作就拉起了 4 个并发更新。
+# mkdir 是原子的：拿不到就是有人在跑。锁里记 pid，进程没了就清陈旧锁，避免永久卡死。
+LOCK="${ROOT}/data/geoip/logs/update.lock"
+if ! mkdir "$LOCK" 2>/dev/null; then
+  OLDPID="$(cat "$LOCK/pid" 2>/dev/null || echo 0)"
+  if [ "${OLDPID:-0}" -gt 1 ] && kill -0 "$OLDPID" 2>/dev/null; then
+    echo "[$(date '+%F %T')] geoip_update 已在运行（pid=${OLDPID}），本次跳过 (only=${ONLY})" >>"$LOG"
+    exit 0
+  fi
+  echo "[$(date '+%F %T')] geoip_update 清理陈旧锁（pid=${OLDPID:-?} 已不在）" >>"$LOG"
+  rm -rf "$LOCK"
+  if ! mkdir "$LOCK" 2>/dev/null; then
+    echo "[$(date '+%F %T')] geoip_update 抢锁失败，本次跳过 (only=${ONLY})" >>"$LOG"
+    exit 0
+  fi
+fi
+echo $$ >"$LOCK/pid"
+trap 'rm -rf "$LOCK" 2>/dev/null' EXIT INT TERM
+
 have_network() {
   command -v curl >/dev/null 2>&1 && curl -fsS --connect-timeout 3 -o /dev/null https://example.com 2>/dev/null
 }

@@ -1572,7 +1572,11 @@ $('btnGeoUpdate').onclick=async()=>{
   const st0=await apiJson('/api/geoip/update/status?since=0');
   if(st0.json&&st0.json.to!==undefined) since=st0.json.to;
   const r=await api('/api/geoip/update',{method:'POST'});
-  toast(r.text,!r.ok);
+  // 后端被并发保护挡下时也回 HTTP 200（body 里 ok:false + error）。这种情形下**不中断轮询**：
+  // 正在跑的可能是我们自己刚触发的那一轮，继续看进度比弹个错更有用。
+  let trigErr='';
+  try{ const j=JSON.parse(r.text); if(j&&j.ok===false) trigErr=j.error||''; }catch(e){}
+  if(trigErr){ toast(trigErr,false); } else { toast(r.text,!r.ok); }
   if(!r.ok) return;
   const t0=Date.now();
   box.style.display='block';

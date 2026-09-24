@@ -445,7 +445,12 @@ pub async fn handle_update_trigger(_req: Request<Full<Bytes>>) -> Response<BoxBo
     let root = std::path::Path::new(".");
     match crate::server::geoip_panel::ops::spawn_geoip_update(root) {
         Ok(()) => json_ok("{\"ok\":true,\"spawned\":\"geoip_update.sh\"}".into()),
-        Err(e) => json_ok(format!("{{\"error\":{}}}", json_str(&format!("{e:#}")))),
+        // 失败也带 `ok:false`：前端按 HTTP 状态判断成功与否，只回 {"error":...} 会被当成
+        // 「已触发」并显示成功提示（实际被并发保护挡下了）。
+        Err(e) => json_ok(format!(
+            "{{\"ok\":false,\"error\":{}}}",
+            json_str(&format!("{e:#}"))
+        )),
     }
 }
 
@@ -512,7 +517,23 @@ pub async fn handle_update_status(req: &Request<Full<Bytes>>) -> Response<BoxBod
             }
         }
     }
-    let done = chunk.contains("geoip_update done");
+    // `done` 必须看**日志尾部**，而不是从 `since` 开始的那段分片：分片可能落在好几轮之前的
+    // 旧 "done" 上（面板传 since=0、或缓存的偏移比日志短时都会），于是更新刚起步就报「已完成」。
+    // 尾部 4KiB 足以覆盖最后写入的那一行；再要求 `!running`，因为「跑完了」的语义是
+    // 「没有进程在跑 **且** 日志末尾写了 done」。
+    let tail_done = {
+        let mut s = String::new();
+        if let Ok(mut f) = std::fs::File::open(log_path) {
+            if f.seek(SeekFrom::Start(size.saturating_sub(4096))).is_ok() {
+                let mut buf = Vec::new();
+                if f.read_to_end(&mut buf).is_ok() {
+                    s = String::from_utf8_lossy(&buf).into_owned();
+                }
+            }
+        }
+        s.contains("geoip_update done")
+    };
+    let done = !running && tail_done;
     let resp = serde_json::json!({
         "running": running,
         "pid": pid,
