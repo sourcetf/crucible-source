@@ -220,6 +220,27 @@ pub fn set_source(
     Ok(())
 }
 
+/// 读脚本锁目录里的 pid（脚本自己在 mkdir 成功后写入）。
+fn read_lock_pid(lock_dir: &Path) -> Option<i32> {
+    std::fs::read_to_string(lock_dir.join("pid"))
+        .ok()
+        .and_then(|s| s.trim().parse::<i32>().ok())
+        .filter(|p| *p > 1)
+}
+
+/// 该 pid 是否真是我们的 geoip_update.sh —— 防 pid 复用把「已结束」误判成「在跑」。
+pub fn proc_is_geoip_update(pid: i32) -> bool {
+    if unsafe { libc::kill(pid, 0) } != 0 {
+        return false;
+    }
+    std::process::Command::new("ps")
+        .args(["-p", &pid.to_string(), "-o", "command="])
+        .output()
+        .ok()
+        .map(|o| String::from_utf8_lossy(&o.stdout).contains("geoip_update.sh"))
+        .unwrap_or(false)
+}
+
 /// Spawn offline geoip_update.sh (non-blocking).
 pub fn spawn_geoip_update(root: &Path) -> Result<()> {
     let script = root.join("scripts/geoip_update.sh");
@@ -227,16 +248,17 @@ pub fn spawn_geoip_update(root: &Path) -> Result<()> {
         anyhow::bail!("missing {}", script.display());
     }
     let pid_file = root.join("data/geoip/logs/update.pid");
+    let lock_dir = root.join("data/geoip/logs/update.lock");
     // 单实例保护：面板按钮点两次、两个人同时点、或按钮与 cron 撞上，都会拉起第二个 updater，
     // 而 merge/enrich 不是为并发写的（两个进程同时改同一个 SQLite）—— 轻则互相覆盖、
-    // 重则把库写坏。实测一次误操作就出现了 4 个并发更新进程。已在跑就明确拒绝，
-    // 并把 pid 告诉调用方（面板能看到是谁在跑）。
-    if let Ok(s) = std::fs::read_to_string(&pid_file) {
-        if let Ok(pid) = s.trim().parse::<i32>() {
-            // kill(pid, 0) 只探测存在性；pid<=1 视为无效残留。
-            if pid > 1 && unsafe { libc::kill(pid, 0) } == 0 {
-                anyhow::bail!("geoip 更新已在进行中（pid={pid}），等它跑完再触发");
-            }
+    // 重则把库写坏。实测一次误操作就出现了 4 个并发更新进程。
+    //
+    // 存活判定**不能只看 pid**：pid 会被复用（实测踩到 —— 脚本早已退出，pid 24327 被别的
+    // 进程接手，面板于是永远报「更新已在进行中」）。这里以脚本自己的锁目录为准，并要求那个
+    // pid 的命令行**确实是 geoip_update.sh**。
+    if let Some(p) = read_lock_pid(&lock_dir) {
+        if proc_is_geoip_update(p) {
+            anyhow::bail!("geoip 更新已在进行中（pid={p}），等它跑完再触发");
         }
     }
     let child = std::process::Command::new("bash")

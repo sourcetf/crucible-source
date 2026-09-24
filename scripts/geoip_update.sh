@@ -17,7 +17,8 @@ ONLY="${2:-all}"
 LOCK="${ROOT}/data/geoip/logs/update.lock"
 if ! mkdir "$LOCK" 2>/dev/null; then
   OLDPID="$(cat "$LOCK/pid" 2>/dev/null || echo 0)"
-  if [ "${OLDPID:-0}" -gt 1 ] && kill -0 "$OLDPID" 2>/dev/null; then
+  # 必须确认那个 pid 的命令行仍是本脚本：pid 会被复用，只看 kill -0 会让锁永远清不掉。
+  if [ "${OLDPID:-0}" -gt 1 ] && kill -0 "$OLDPID" 2>/dev/null      && ps -p "$OLDPID" -o command= 2>/dev/null | grep -q 'geoip_update.sh'; then
     echo "[$(date '+%F %T')] geoip_update 已在运行（pid=${OLDPID}），本次跳过 (only=${ONLY})" >>"$LOG"
     exit 0
   fi
@@ -46,9 +47,21 @@ have_network() {
     fi
   fi
 
+  # 磁盘预检：merge 是就地重写 geoip.sqlite（导入各层 + 建索引），需要相当于库大小
+  # 量级的临时空间（回滚日志/临时 B 树）。实测一次磁盘写满的后果：merge 默默死在
+  # 半路（dmesg 里刷 "file system full"），面板只看到「更新没了」，而库里还是旧数据。
+  # 空间不够就**跳过 merge 并说清楚**，保留上一份完整数据，比写坏库好得多。
   if [ "${ONLY}" = "all" ] || [ "${ONLY}" = "merge" ]; then
-    python3 "${ROOT}/scripts/geoip_merge.py" --db "$DB" --init-schema --import-layers \
-      || echo "warn: merge failed"
+    DBSZ=$( [ -f "$DB" ] && du -k "$DB" 2>/dev/null | awk '{print $1}' || echo 0 )
+    FREEK=$(df -k "$DB" 2>/dev/null | awk 'NR==2{print $4}')
+    NEEDK=$(( DBSZ + 262144 ))   # 库大小 + 256MiB 余量
+    if [ -n "$FREEK" ] && [ "$FREEK" -lt "$NEEDK" ]; then
+      echo "warn: 磁盘空间不足，跳过 merge（需 ≥$((NEEDK/1024))MiB 空闲，实际 $((FREEK/1024))MiB）。"
+      echo "warn: 建议先清理 ${ROOT}/data/geoip/sources 下的旧层文件（raw 抓取缓存），再重跑 --only merge。"
+    else
+      python3 "${ROOT}/scripts/geoip_merge.py" --db "$DB" --init-schema --import-layers \
+        || echo "warn: merge failed"
+    fi
   fi
 
   if [ "${ONLY}" = "all" ] || [ "${ONLY}" = "enrich" ]; then

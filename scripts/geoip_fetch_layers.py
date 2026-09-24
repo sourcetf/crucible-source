@@ -53,13 +53,37 @@ CHINA_OPERATOR_FILES = {
 CIDR_RE = re.compile(r"^(\d{1,3}(?:\.\d{1,3}){3}/\d{1,2})$")
 
 
-def fetch(url: str) -> bytes:
+def fetch(url: str, timeout: int = TIMEOUT, attempts: int = 3) -> bytes:
+    """带重试下载。
+
+    大文件（ARIN delegated 约 12MiB）在慢链路上会 IncompleteRead，偶发 DNS/5xx 同样
+    会整源失败，而它们下一轮才可能自愈 —— 实测一次运行里 ARIN 就这样丢了（最大的
+    国家基线层）。重试之间退避 2s/4s。
+    """
     for pat in BLACKLIST_URL_PATTERNS:
         if re.search(pat, url, re.I):
             raise RuntimeError(f"blacklisted source refused: {url}")
-    req = urllib.request.Request(url, headers=UA)
-    with urllib.request.urlopen(req, timeout=TIMEOUT) as resp:
-        return resp.read()
+    last: object = None
+    for i in range(max(1, attempts)):
+        try:
+            req = urllib.request.Request(url, headers=UA)
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                return resp.read()
+        except Exception as e:  # noqa: BLE001 —— 网络层什么都可能抛，都要能重试
+            last = e
+            if i + 1 < max(1, attempts):
+                time.sleep(2.0 * (i + 1))
+    raise RuntimeError(f"fetch failed after {attempts} attempts: {last}")
+
+
+def fetch_json(url: str) -> object:
+    """下载并解析 JSON；把「上游给了错误页/限流 JSON」变成可读原因。"""
+    raw = fetch(url)
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError as e:
+        head = raw[:160].decode("utf-8", errors="replace").replace("\n", " ")
+        raise RuntimeError(f"not JSON ({e.msg}): {head}") from e
 
 
 def write_layer(dirname: str, filename: str, rows) -> int:
@@ -68,17 +92,30 @@ def write_layer(dirname: str, filename: str, rows) -> int:
     final = os.path.join(out_dir, filename)
     tmp = final + ".tmp"
     n = 0
+    skipped = 0
     with open(tmp, "w", encoding="utf-8") as f:
         for row in rows:
+            # 形状漂移不该让整个源失败：非 dict 行跳过并计数（结尾有告警），
+            # 其余行照常落盘。
+            if not isinstance(row, dict):
+                skipped += 1
+                continue
             if not row.get("ip_start"):
                 continue
             f.write(json.dumps(row, ensure_ascii=False, separators=(",", ":")) + "\n")
             n += 1
     os.replace(tmp, final)
+    if skipped:
+        print(f"{dirname}/{filename}: skipped {skipped} malformed rows", file=sys.stderr)
     return n
 
 
 def cidr_row(cidr: str, fields: dict) -> dict | None:
+    # 上游常把字段写成 null（实测 GCP 的 v6-only 条目里 "ipv4Prefix": null，
+    # 且键是**存在**的 → `p.get(k, "")` 拿到 None）。此时 ipaddress.ip_network(None)
+    # 会抛 "'NoneType' object is not iterable"，整个源当场失败；类型检查放在这里最省事。
+    if not isinstance(cidr, str) or not cidr.strip():
+        return None
     try:
         net = ipaddress.ip_network(cidr.strip(), strict=False)
     except ValueError:
@@ -197,18 +234,29 @@ def do_aws() -> int:
 
 
 def do_gcp() -> int:
-    doc = json.loads(fetch("https://www.gstatic.com/ipranges/cloud.json"))
+    doc = fetch_json("https://www.gstatic.com/ipranges/cloud.json")
     rows = []
-    for p in doc.get("prefixes", []):
+    bad = 0
+    # 上游偶发返回 {"prefixes": null}（实测一次运行整源因此失败）：`or []` 兜住。
+    for p in (doc.get("prefixes") or []) if isinstance(doc, dict) else []:
         if not isinstance(p, dict):
             continue
-        rows.extend(
-            r for r in (
-                cidr_row(p.get("ipv4Prefix", ""),
+        # 逐个条目独立容错：上游的字段类型会漂移（v6-only 条目的 ipv4Prefix 是缺失或 null），
+        # 单条怪数据绝不能杀掉整个源 —— 记数、跳过、继续。
+        try:
+            r = cidr_row(p.get("ipv4Prefix", ""),
                          {"cloud_provider": "Google", "cloud_service": p.get("service", ""),
                           "cloud_region": p.get("scope", "")})
-            ) if r
-        )
+        except Exception as e:  # noqa: BLE001
+            bad += 1
+            if bad <= 3:
+                print(f"google: skip entry ({type(e).__name__}: {e}): "
+                      f"{json.dumps(p, ensure_ascii=False)[:160]}", file=sys.stderr)
+            continue
+        if r:
+            rows.append(r)
+    if bad:
+        print(f"google: skipped {bad} unparsable entries", file=sys.stderr)
     return write_layer("02-cloud-official", "google.jsonl", rows)
 
 
@@ -219,18 +267,32 @@ def do_cloudflare() -> int:
 
 
 def do_oci() -> int:
-    doc = json.loads(fetch("https://docs.oracle.com/en-us/iaas/tools/public_ip_ranges/public_ip_ranges.json"))
+    # 2026-09 实测：en-us 那条老路径已 404；新路径 302 后可用（urllib 自动跟随重定向）。
+    doc = fetch_json("https://docs.oracle.com/iaas/tools/public_ip_ranges.json")
     rows = []
-    for region in doc.get("regions", []):
+    bad = 0
+    for region in doc.get("regions", []) if isinstance(doc, dict) else []:
+        if not isinstance(region, dict):
+            continue
         rid = region.get("region", "")
-        for p in region.get("cidrs", []):
-            rows.extend(
-                r for r in (
-                    cidr_row(p.get("cidr", ""),
+        for p in region.get("cidrs", []) or []:
+            if not isinstance(p, dict):
+                bad += 1
+                continue
+            try:
+                r = cidr_row(p.get("cidr", ""),
                              {"cloud_provider": "Oracle", "cloud_region": rid,
                               "cloud_service": p.get("tags", "")})
-                ) if r
-            )
+            except Exception as e:  # noqa: BLE001 —— 单条怪数据不该杀整个源
+                bad += 1
+                if bad <= 3:
+                    print(f"oracle: skip entry ({type(e).__name__}: {e}): "
+                          f"{json.dumps(p, ensure_ascii=False)[:160]}", file=sys.stderr)
+                continue
+            if r:
+                rows.append(r)
+    if bad:
+        print(f"oracle: skipped {bad} entries", file=sys.stderr)
     return write_layer("02-cloud-official", "oracle.jsonl", rows)
 
 
@@ -249,15 +311,9 @@ def do_vultr() -> int:
     return write_layer("02-cloud-official", "vultr.jsonl", rows)
 
 
-def do_akamai() -> int:
-    doc = json.loads(fetch("https://ipranges.akamai.com/json"))
-    rows = []
-    for p in doc.get("cidrs", []):
-        r = cidr_row(p if isinstance(p, str) else p.get("cidr", ""),
-                     {"cloud_provider": "Akamai"})
-        if r:
-            rows.append(r)
-    return write_layer("02-cloud-official", "akamai.jsonl", rows)
+# do_akamai 已移除：官方 feed 主机 ipranges.akamai.com 于 2026-09 实测为 NXDOMAIN
+# （域名没了，重试也没用）。Akamai 段仍由 01-cloud 的 rezmoss 聚合覆盖（DEFAULT_CLOUD_PROVIDERS
+# 里含 akamai），所以不损失覆盖；留着只会每轮刷一条 FAIL 噪音。
 
 
 def do_linode() -> int:
@@ -277,19 +333,36 @@ def do_linode() -> int:
 # ---------------------------------------------------------- 05-hosting (300)
 
 def do_ipapi_hosting() -> int:
-    """ipapi.is Hosting 免费 Sample：GitHub 仓库探测 hosting 样例 CSV。"""
+    """ipapi.is Hosting 免费 Sample：GitHub 仓库探测 hosting 样例 CSV。
+
+    注意：GitHub API 对未认证请求按 IP 限流（60 次/小时），限流时返回的是
+    `{"message": "API rate limit exceeded ..."}` 而不是列表 —— 直接迭代会得到
+    「猜不出原因」的报错（实测就撞上了）。这里显式识别并把原因写清楚；
+    文件名匹配也放宽（hosting/idc/datacenter 任一），仓库改结构时不至于立刻失效。
+    """
     api = "https://api.github.com/repos/ipapi-is/ipapi/contents/"
-    listing = json.loads(fetch(api))
+    listing = fetch_json(api)
+    if isinstance(listing, dict):
+        msg = str(listing.get("message", listing))[:200]
+        raise RuntimeError(f"GitHub API 不可用（限流？）: {msg}")
     target = None
     for entry in listing:
-        n = entry.get("name", "").lower()
-        if entry.get("type") == "file" and ("hosting" in n) and (".csv" in n or ".txt" in n):
-            if "sample" in n or "free" in n:
-                target = entry["download_url"]
-                break
-            target = target or entry["download_url"]
+        if not isinstance(entry, dict) or entry.get("type") != "file":
+            continue
+        n = str(entry.get("name", "")).lower()
+        if not (n.endswith(".csv") or n.endswith(".txt")):
+            continue
+        if not any(k in n for k in ("hosting", "idc", "datacenter")):
+            continue
+        url = entry.get("download_url")
+        if not url:
+            continue
+        if "sample" in n or "free" in n:
+            target = url
+            break
+        target = target or url
     if not target:
-        raise RuntimeError("ipapi.is hosting sample not found in repo root")
+        raise RuntimeError("repo 根目录里没有 hosting/idc 样例 CSV（仓库结构变了？）")
     text = fetch(target).decode("utf-8", errors="replace")
     rows = []
     header: list[str] = []
@@ -390,7 +463,6 @@ def main() -> int:
         ("02-cloud-official/cloudflare", do_cloudflare),
         ("02-cloud-official/oracle", do_oci),
         ("02-cloud-official/vultr", do_vultr),
-        ("02-cloud-official/akamai", do_akamai),
         ("02-cloud-official/linode", do_linode),
         ("05-hosting/ipapi", do_ipapi_hosting),
         ("10-isp-cn/china-operator", do_china_operator),

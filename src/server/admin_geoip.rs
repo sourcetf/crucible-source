@@ -485,18 +485,18 @@ pub async fn handle_update_status(req: &Request<Full<Bytes>>) -> Response<BoxBod
     let pid: Option<u32> = std::fs::read_to_string(pid_path)
         .ok()
         .and_then(|s| s.trim().parse().ok());
-    // kill(pid, 0)：只探测存在性，不发信号。进程没了就顺手清掉 pid 文件，
-    // 免得 pid 被复用后误报「还在跑」。
-    let running = match pid {
-        Some(p) => {
-            let alive = unsafe { libc::kill(p as i32, 0) } == 0;
-            if !alive {
-                let _ = std::fs::remove_file(pid_path);
-            }
-            alive
-        }
-        None => false,
-    };
+    // 「在跑」的判定以**脚本自己的锁目录 + 命令行**为准：只看 pid 会被 pid 复用骗到
+    // （实测：脚本早退出了，pid 被别的进程接手，面板就一直显示「进行中」）。
+    let lock_dir = std::path::Path::new("data/geoip/logs/update.lock");
+    let lock_pid: Option<i32> = std::fs::read_to_string(lock_dir.join("pid"))
+        .ok()
+        .and_then(|s| s.trim().parse().ok());
+    let running = lock_pid
+        .map(crate::server::geoip_panel::ops::proc_is_geoip_update)
+        .unwrap_or(false);
+    if !running {
+        let _ = std::fs::remove_file(pid_path);
+    }
 
     let mut chunk = String::new();
     let mut size: u64 = 0;
