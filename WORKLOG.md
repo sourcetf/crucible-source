@@ -567,3 +567,14 @@ ASN/Tor pool，脚本还**硬拒绝** Ip2Region / DB-IP 系 URL（`BLACKLIST_URL
 3. **别在更新运行中替换 `geoip_update.sh`**：bash 按文件偏移递增读取，中途改文件可能让它在
    下一个命令边界读到错位内容（本轮踩到一次，侥幸没炸）。
 4. tor 池残留用 `python3 scripts/geoip_tor_pool.py stop` 收干净。
+
+### 15.5 再补一课：判活不能只看锁（`29f5607`）
+
+我在一轮更新**运行中**替换了 `geoip_update.sh`（见 15.4 第 3 条）→ 那轮脚本记完 `done`、
+自己的 trap 也把锁清掉了，**但主进程卡住没退**。于是我的单实例判据（只看锁）放行了第二轮 ✗
+→ 两轮同时写库 → 后一轮 merge 直接 `database is locked` 失败 ✗。
+现在：服务端判活 = **锁 + 进程表扫描**（`pgrep -f 'geoip_update\.sh'`）双保险；
+`geoip_merge.py` 的 sqlite 连接再加 `PRAGMA busy_timeout = 30000`（短暂抢锁自动等待）。
+
+**教训**：任何"单实例锁"的实现，都要考虑「持锁者异常退出但进程仍在」这一档 ——
+锁文件/锁目录只是**快路径**，最终判据要有进程层面的兜底。
