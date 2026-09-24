@@ -317,9 +317,6 @@ async fn handle_inner(
             }
             // GeoIP 管理（需求 9）：手动 sync / status / 查表
             p if p.ends_with("/api/dns/geoip/sync") => {
-                if !v["force"].as_bool().unwrap_or(false) && !v["domain"].is_null() {
-                    // no-op guard
-                }
                 let force = v["force"].as_bool().unwrap_or(false);
                 let mmdb = dc.geo.mmdb.clone();
                 let mut run_sync = true;
@@ -337,7 +334,7 @@ async fn handle_inner(
                     if age_days < mmdb.sync_days { run_sync = false; }
                 }
                 let r = if mmdb.is_active() && !mmdb.license_key.is_empty() && run_sync {
-                    tokio::task::spawn_blocking(move || super::geoip::ensure_synced(&mmdb))
+                    tokio::task::spawn_blocking(move || super::geoip::ensure_synced(&mmdb, force))
                         .await
                         .map_err(|e| e.to_string())?
                 } else {

@@ -1475,7 +1475,7 @@ pub fn reconcile(cfg: &DnsConfig) -> Result<()> {
     write_all(cfg)?;
     // 需求 9：MaxMind GeoLite2 数据库自同步 (cron 每日 + 启动时增量检查)
     if cfg.geo.enabled && cfg.geo.mmdb.is_active() && !cfg.geo.mmdb.license_key.is_empty() {
-        if let Err(e) = crate::server::dns::geoip::ensure_synced(&cfg.geo.mmdb) {
+        if let Err(e) = crate::server::dns::geoip::ensure_synced(&cfg.geo.mmdb, false) {
             log::warn!("dns: geoip auto-sync failed: {e:#}");
         }
     }

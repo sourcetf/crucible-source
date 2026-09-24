@@ -161,7 +161,7 @@ pub fn line_for(cfg: &GeoMmdbCfg, ip: IpAddr) -> Option<String> {
 }
 
 /// 下载 MaxMind GeoLite2-City + ASN tar.gz → 解 tar → 落盘
-pub fn ensure_synced(cfg: &GeoMmdbCfg) -> Result<()> {
+pub fn ensure_synced(cfg: &GeoMmdbCfg, force: bool) -> Result<()> {
     if cfg.license_key.is_empty() {
         log::debug!("geoip: no license_key, skip sync");
         return Ok(());
@@ -171,7 +171,7 @@ pub fn ensure_synced(cfg: &GeoMmdbCfg) -> Result<()> {
     let target_city = dir.join("GeoLite2-City.mmdb");
     let target_asn = dir.join("GeoLite2-ASN.mmdb");
     let stamp = dir.join("last_sync.txt");
-    if cfg.sync_days > 0 && stamp.exists() {
+    if !force && cfg.sync_days > 0 && stamp.exists() {
         let now_day = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs() / 86_400)
@@ -184,12 +184,13 @@ pub fn ensure_synced(cfg: &GeoMmdbCfg) -> Result<()> {
             return Ok(());
         }
     }
-    if !target_city.exists() {
-        fetch_edition(&cfg.license_key, "GeoLite2-City", &target_city)?;
-    }
-    if !target_asn.exists() {
-        fetch_edition(&cfg.license_key, "GeoLite2-ASN", &target_asn)?;
-    }
+    // **到这里就一定要真的下载**。
+    //
+    // 旧实现还有一层 `if !target.exists()` 的门槛：文件一旦存在就永不更新，而时间戳
+    // 照样被刷新、接口照样回 `synced:true` —— 面板显示「刚同步过」，数据却一直老化。
+    // 判断「该不该同步」是上面那段（以及调用方的 force）的职责，不该在这里再拦一次。
+    fetch_edition(&cfg.license_key, "GeoLite2-City", &target_city)?;
+    fetch_edition(&cfg.license_key, "GeoLite2-ASN", &target_asn)?;
     std::fs::write(&stamp, current_day_stamp()?.to_string())?;
     Ok(())
 }
@@ -247,8 +248,22 @@ fn fetch_edition(license: &str, edition: &str, dst: &Path) -> Result<()> {
             if !safe {
                 bail!("geoip: tar path traversal detected: {p_str}");
             }
-            let mut f = std::fs::File::create(dst)?;
-            std::io::copy(&mut e, &mut f)?;
+            // 先写临时文件、成功后再原子改名。
+            //
+            // 本函数现在**会在文件已存在时覆盖它**（ensure_synced 去掉了「文件存在就
+            // 跳过」的旧门槛），所以不能再直接写 dst —— 下载或解包中途失败会把还能用的
+            // 旧库毁掉，而它是地理分流与 GeoIP 查询的唯一数据源。
+            let mut tmp = dst.as_os_str().to_os_string();
+            tmp.push(".tmp");
+            let tmp_path = std::path::PathBuf::from(tmp);
+            let mut f = std::fs::File::create(&tmp_path)?;
+            if let Err(e) = std::io::copy(&mut e, &mut f) {
+                drop(f);
+                let _ = std::fs::remove_file(&tmp_path);
+                return Err(e).context("geoip: write temp mmdb");
+            }
+            drop(f);
+            std::fs::rename(&tmp_path, dst)?;
             log::info!("geoip: extracted {edition} → {}", dst.display());
             return Ok(());
         }
