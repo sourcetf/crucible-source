@@ -30,11 +30,11 @@ MSYS_NO_PATHCONV=1 python "C:/Users/Administrator/.crucible-remote/_put.py" "C:/
 
 ## 1. 版本状态（先看这里）
 
-- 远端 `HEAD` = **`3db7009`** = `origin/main`
-- **线上运行的二进制 = build30（09-24 12:25 构建，23m59s，0 error）**，包含到 `3db7009`：
-  build29 的全部内容（`1dff5e3` + GeoIP (a) 根治 + WebUI/AgentB/C/DNS 各轮）+ `/api/dns/geoip/sync`
-  的 `synced` 诚实化。部署后实测：9095/8443/9081 全 200、geoip lookup/filter/ZZ 回归正常、
-  `POST /api/dns/geoip/sync {"force":true}` 回 `{"ok":true,"synced":false,"reason":"mmdb 未启用（未配置 db 路径）"}`。
+- 远端 `HEAD` = **`df5c80f`** = `origin/main`
+- **线上运行的二进制 = build31（09-24 13:08 构建，23m54s，0 error）**，包含到 `df5c80f`：
+  build29/30 的全部内容 + **关停截止时间**（`src/main.rs`：`shutdown_timeout(3s)` + 8s 看门狗
+  `exit(exit_code)`）。部署后实测：9095/8443/9081 全 200、geoip lookup/filter 回归正常、
+  sync 接口回 `{"ok":true,"synced":false,"reason":"mmdb 未启用（未配置 db 路径）"}`、实例数恰 1。
 - ⚠️ **改 `admin_ui.html` 后必须先跑 `python scripts/check_ui_js.py`**（构建前闸门），
   它编进二进制、编译期不检查 JS。
 - ⚠️ **本地不能编译**（见 §0 表格）：本地 `cargo check` 无意义，只能靠远程构建日志。
@@ -408,3 +408,17 @@ pkill -9 -f '[/]target/release/webserver.*--config'; sleep 1
 for p in 9095 9081 8443 9445 9446; do printf '%s: ' $p; fstat -n | grep -c ":$p"; done
 ```
 （本轮第二次部署就是这样做，生产零中断，启动后进程数恰好 1。）
+
+**③ 已修（`df5c80f` / build31）：关停加截止时间**
+`src/main.rs` 退出路径改为 `rt.shutdown_timeout(3s)` + 8s 看门狗 `exit(exit_code)`
+（看门狗无条件退出，不管卡在哪）。**诚实说明：根因没能复现** —— 我构造了「CGI 现场有卡住的
+请求」这个场景，新旧二进制都是 0~1s 就退出（**证伪了**「CGI 的阻塞任务会阻塞 Runtime drop」
+这个猜测）。所以这条是**兜底加固**：把「可能永久不退出」变成「8s 内一定退出」，
+不依赖具体是哪种机制。另外还有一个候选解释：**早先某次 stop 的 `pkill` 把自己的 ssh 会话先杀了**
+（模式的字面量出现在自己的命令行里，见 §13.5 踩坑），于是那个进程根本没收到信号。
+
+**④ 本轮顺带发现（尚未处理，记下来）**
+- **CGI 引擎是串行的**：一个慢脚本（`/cgi/sleep.cgi` 睡 120s）会把整条 `/cgi/` 路径堵住，
+  后续请求全部排队超时。是否是设计如此需要确认；若否，一个慢 CGI 就能拖住整个引擎。
+- **CGI 子进程不在 `child_registry` 里**：关停后 `sleep 120` 那个子进程成了孤儿（自己 120s 后退出）。
+  引擎子进程（fpm/sidecar）有关停回收，CGI 子进程没有。
