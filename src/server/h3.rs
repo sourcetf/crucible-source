@@ -568,10 +568,15 @@ mod imp {
         }
 
         // /__metrics 排在 ip_access + 限流**之后**（此前是 handle_h3 的第一个分支，
-        // 用 IP 白名单当边界的部署等于把指标公开）。与 h1/h2 同位置：basic_auth 之前，
-        // 因为监控抓取通常不带凭据，「谁能抓」由 ip_access 白名单与限流决定。
-        if let Some(resp) = crate::server::telemetry::maybe_handle_simple(&req, &snap.telemetry)
-        {
+        // 用 IP 白名单当边界的部署等于把指标公开）。与 h1/h2 同位置：basic_auth 之前
+        // （listener 口令与「谁能抓指标」是两件事），指标的门在 telemetry 内部按
+        // [admin].metrics_public 判定（默认要求管理员凭据）。
+        if let Some(resp) = crate::server::telemetry::maybe_handle_simple(
+            &req,
+            &snap.telemetry,
+            &snap.admin,
+            peer.ip(),
+        ) {
             return tag(resp, "telemetry");
         }
 

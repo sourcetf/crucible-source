@@ -104,6 +104,13 @@ pub struct AdminConfig {
     /// （兼容旧行为）。建议生产配置只列 TLS 端口，避免 Basic 凭据在明文口暴露。
     #[serde(default)]
     pub listeners_allow: Vec<u16>,
+    /// 任务 3：`/__metrics`（Prometheus 指标）是否允许**匿名**抓取。
+    ///
+    /// 默认 false = 必须通过管理员 Basic 鉴权（复用 admin 那套口令校验与失败退避），
+    /// 否则只回 401 —— 指标里有请求总数/活跃流这类内部信息，不该默认公开。
+    /// true 时保持旧行为（公开，但仍排在 ip_access + 限流之后）。
+    #[serde(default)]
+    pub metrics_public: bool,
 }
 
 impl Default for AdminConfig {
@@ -116,6 +123,7 @@ impl Default for AdminConfig {
                 password_hash: String::new(),
             }],
             listeners_allow: Vec::new(),
+            metrics_public: false,
         }
     }
 }
@@ -872,6 +880,8 @@ struct AdminConfigRaw {
     password_hash: String,
     #[serde(default)]
     listeners_allow: Vec<u16>,
+    #[serde(default)]
+    metrics_public: bool,
 }
 
 impl Config {
@@ -897,6 +907,7 @@ impl Config {
             },
             users: raw_cfg.admin.users,
             listeners_allow: raw_cfg.admin.listeners_allow,
+            metrics_public: raw_cfg.admin.metrics_public,
         };
         admin.normalize_legacy(
             (!raw_cfg.admin.username.is_empty()).then_some(raw_cfg.admin.username),
@@ -1149,6 +1160,7 @@ mod tests {
             path: default_admin_path(),
             users: raw_cfg.admin.users,
             listeners_allow: Vec::new(),
+            metrics_public: false,
         };
         admin.normalize_legacy(
             Some(raw_cfg.admin.username),

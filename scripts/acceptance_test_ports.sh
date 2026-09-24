@@ -100,7 +100,9 @@ echo
 
 echo "==> geoip API :19095 (via admin path disabled; direct rust panel)"
 curl -sS --max-time 5 "http://127.0.0.1:19095/__admin" >/dev/null && echo "admin reachable" || true
-curl -sS --max-time 5 "http://127.0.0.1:19095/__metrics" 2>/dev/null | head -n 2 || true
+# /__metrics 默认要管理员凭据（[admin].metrics_public=false）；要把匿名抓取放开，
+# 在 config-test.toml 的 [admin] 里加 metrics_public = true。
+curl -sS --max-time 5 -u admin:admin "http://127.0.0.1:19095/__metrics" 2>/dev/null | head -n 2 || true
 echo
 
 echo "==> TLS 1.3 :18443"

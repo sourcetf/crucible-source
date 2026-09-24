@@ -19,7 +19,7 @@ use crate::server::h1::{full, BoxBody};
 use crate::server::live_config::LiveConfig;
 use crate::server::password;
 use bytes::Bytes;
-use http::{header, Method, Request, Response, StatusCode};
+use http::{header, HeaderMap, Method, Request, Response, StatusCode};
 use http_body_util::{BodyExt, Full};
 use serde_json::Value as Json;
 use std::sync::Arc;
@@ -28,10 +28,105 @@ pub const UI_HTML: &str = include_str!("admin_ui.html");
 /// 视频预览（HLS/mp4）辅助脚本，经 include_str! 编进二进制；改后需重链。
 pub const HLS_JS: &str = include_str!("admin_hls.light.min.js");
 
-/// CSRF helper（P0-2）：Origin 与 Host 是否同源（剥 scheme 后全等比较）。
-fn origin_matches_host(origin: &str, host: &str) -> bool {
-    let o = origin.split("://").nth(1).unwrap_or(origin);
-    o.eq_ignore_ascii_case(host.trim_end_matches('/'))
+/// 从 `Origin`/`Referer` 这类 URL 里取出 `host[:port]`（无尾斜杠、去尾点）。
+///
+/// 取不到就返回 None（`null`、相对路径、畸形）—— 上层按「不同源」处理，宁可拒绝。
+fn url_host(u: &str) -> Option<&str> {
+    let after_scheme = u.split("://").nth(1)?;
+    let host = after_scheme
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or("")
+        .trim()
+        .trim_end_matches('.');
+    // 沙箱 iframe / file:// 会把 Origin 写成字面量 `null`，它不是主机名。
+    (!host.is_empty() && !host.eq_ignore_ascii_case("null")).then_some(host)
+}
+
+/// 本请求的 `host[:port]`：优先 `Host` 头，h2 只有 `:authority` 时用 URI authority
+/// （hyper 的 h2 服务端把 `:authority` 放进 URI，不保证补 `Host` 头）。
+fn request_host<T>(req: &Request<T>) -> Option<&str> {
+    req.headers()
+        .get(header::HOST)
+        .and_then(|v| v.to_str().ok())
+        .map(str::trim)
+        .filter(|h| !h.is_empty())
+        .or_else(|| req.uri().authority().map(|a| a.as_str()))
+}
+
+/// `Content-Type` 是否为 JSON（允许 `; charset=` 之类的参数）。
+fn has_json_content_type(headers: &HeaderMap) -> bool {
+    headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| {
+            v.split(';')
+                .next()
+                .unwrap_or("")
+                .trim()
+                .eq_ignore_ascii_case("application/json")
+        })
+}
+
+/// 状态变更请求（POST/PUT/PATCH/DELETE）的跨站判定（P0-2 补强）。
+///
+/// 为什么不能只看 `Origin`：此前实现是「有 `Origin` 才比，没有就整段跳过」——
+/// 于是所有**不带 Origin** 的写请求（部分旧浏览器/表单场景、以及想绕检查的非浏览器
+/// 客户端）等于完全没有这道防线。而 `<form method=POST>` 恰恰是攻击者最容易构造的
+/// 跨站写请求。
+///
+/// 现在的判定分两层：
+/// 1. 带 `Origin` 或 `Referer`：其 `host[:port]` 必须与本请求的 `Host`（或 h2 的
+///    `:authority`）相同，否则 403。scheme 不参与比较（反代/回源常改 scheme）。
+/// 2. 两者都没有：要求请求具备「非简单请求」特征之一 ——
+///    `Content-Type: application/json`（含 `; charset=` 变体）、自定义头
+///    `X-Crucible-Admin: 1`、或浏览器自写的 `Sec-Fetch-Site: same-origin|none`。
+///    为什么这样就够：浏览器跨源发 JSON content-type 或自定义头**必然先发 CORS 预检**，
+///    而本服务不放行任何跨源请求（预检拿不到 Access-Control-Allow-* 就会失败），
+///    所以这两者跨源时根本发不出去；`<form>` 只能产出简单请求（简单 Content-Type +
+///    不能带自定义头），表单型 CSRF 因此被挡住。
+///
+/// GET/HEAD 不走这个门槛：它们是只读语义，浏览器也不会给它们带 `Origin`，套上反而
+/// 会误伤状态查询。跨站 GET 由三协议入口的 `access::cross_site_blocked` 负责。
+fn state_change_allowed<T>(req: &Request<T>) -> bool {
+    let headers = req.headers();
+    let origin = headers
+        .get(header::ORIGIN)
+        .and_then(|v| v.to_str().ok())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .or_else(|| {
+            headers
+                .get(header::REFERER)
+                .and_then(|v| v.to_str().ok())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+        });
+    if let Some(src) = origin {
+        return match (url_host(src), request_host(req)) {
+            (Some(a), Some(b)) => a.eq_ignore_ascii_case(b.trim_end_matches('/')),
+            // 有来源信息但比不出同源（畸形 URL、无边界的 `null`、无 Host/authority）
+            // → 一律拒绝，不做「拿不准就放行」。
+            _ => false,
+        };
+    }
+    if has_json_content_type(headers) {
+        return true;
+    }
+    if headers
+        .get("x-crucible-admin")
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v.trim() == "1")
+    {
+        return true;
+    }
+    headers
+        .get("sec-fetch-site")
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| {
+            let v = v.trim();
+            v.eq_ignore_ascii_case("same-origin") || v.eq_ignore_ascii_case("none")
+        })
 }
 
 /// P1-4：统一请求体类型为 Request<Full<Bytes>>——h1 在入口收齐（32MiB 上限），
@@ -57,19 +152,15 @@ pub async fn handle(req: Request<Full<Bytes>>, live: Arc<LiveConfig>) -> Respons
         }
     }
 
-    // CSRF 防护（P0-2）：浏览器写请求必须同源（Origin 与 Host 一致）；
-    // 非浏览器请求（curl/服务端脚本）不带 Origin，由 Basic 凭据本身鉴权，放行。
-    if matches!(method, Method::POST | Method::PUT | Method::DELETE | Method::PATCH) {
-        if let Some(origin) = req.headers().get(header::ORIGIN).and_then(|v| v.to_str().ok()) {
-            let host = req.headers().get(header::HOST).and_then(|v| v.to_str().ok());
-            let same = host.map(|h| origin_matches_host(origin, h)).unwrap_or(false);
-            if !same {
-                return Response::builder()
-                    .status(StatusCode::FORBIDDEN)
-                    .body(full("cross-origin request blocked"))
-                    .unwrap();
-            }
-        }
+    // CSRF 防护（P0-2）：状态变更请求必须同源或具备非简单请求特征，缺 `Origin` 不再
+    // 直接放行（判定细节见 `state_change_allowed`）。GET/HEAD 只读，不加这道门槛。
+    if matches!(method, Method::POST | Method::PUT | Method::DELETE | Method::PATCH)
+        && !state_change_allowed(&req)
+    {
+        return Response::builder()
+            .status(StatusCode::FORBIDDEN)
+            .body(full("cross-origin request blocked"))
+            .unwrap();
     }
 
     if path == admin_path || path == format!("{admin_path}/") || path.ends_with("/index.html") {
@@ -435,6 +526,12 @@ pub async fn handle(req: Request<Full<Bytes>>, live: Arc<LiveConfig>) -> Respons
                         .collect(),
                 ),
             );
+            // 任务 3：/__metrics 的公开开关。**只在请求带了该键时才写** ——
+            // 这个字段是安全开关，面板/脚本漏发它时不能被一次无关的保存动作悄悄
+            // 改回默认值（反之亦然：面板上关掉它必须立即生效）。
+            if let Some(mp) = v.get("metrics_public").and_then(|b| b.as_bool()) {
+                table.insert("metrics_public".into(), toml::Value::Boolean(mp));
+            }
             if let Err(e) =
                 cfg_edit::set_top_level_table(&mut tree, "admin", toml::Value::Table(table))
             {
@@ -1523,4 +1620,138 @@ async fn handle_rules_api(
         return text_err(StatusCode::BAD_REQUEST, format!("{e:#}"));
     }
     text_ok("ok")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 造请求：`uri_authority` 为真时用绝对 URI（模拟 h2 只有 `:authority` 的场景）。
+    fn mk(method: &str, headers: &[(&str, &str)], uri_authority: bool) -> Request<Full<Bytes>> {
+        let uri = if uri_authority {
+            "https://admin.example:18443/__admin/api/config/toml"
+        } else {
+            "/__admin/api/config/toml"
+        };
+        let mut b = Request::builder().method(method).uri(uri);
+        for (k, v) in headers {
+            b = b.header(*k, *v);
+        }
+        b.body(Full::new(Bytes::new())).unwrap()
+    }
+
+    fn allowed(headers: &[(&str, &str)]) -> bool {
+        state_change_allowed(&mk("POST", headers, false))
+    }
+
+    /// 核心修复：既无 Origin/Referer 也无「非简单请求」特征时**必须拒绝**
+    /// （旧实现是缺 Origin 就整段跳过 = 放行）。
+    #[test]
+    fn csrf_without_origin_or_marker_is_rejected() {
+        assert!(!allowed(&[("host", "admin.example:18443")]));
+        // 简单请求的典型形态：表单 POST（简单 Content-Type、无自定义头）。
+        assert!(!allowed(&[
+            ("host", "admin.example:18443"),
+            ("content-type", "application/x-www-form-urlencoded"),
+        ]));
+        assert!(!allowed(&[
+            ("host", "admin.example:18443"),
+            ("content-type", "text/plain;charset=UTF-8"),
+        ]));
+    }
+
+    /// 带来源信息：host[:port] 必须与本请求 Host 同源（scheme 不参与比较）。
+    #[test]
+    fn csrf_origin_and_referer_must_match_host() {
+        assert!(allowed(&[
+            ("host", "admin.example:18443"),
+            ("origin", "https://admin.example:18443"),
+        ]));
+        // scheme 变了（反代/回源改 scheme）仍算同源。
+        assert!(allowed(&[
+            ("host", "admin.example:18443"),
+            ("origin", "http://admin.example:18443"),
+        ]));
+        // 端口不同 → 不同源。
+        assert!(!allowed(&[
+            ("host", "admin.example:18443"),
+            ("origin", "https://admin.example:9081"),
+        ]));
+        assert!(!allowed(&[
+            ("host", "admin.example:18443"),
+            ("origin", "https://evil.example"),
+        ]));
+        // `Origin: null`（沙箱 iframe / file://）不是主机名 → 拒绝。
+        assert!(!allowed(&[
+            ("host", "admin.example:18443"),
+            ("origin", "null"),
+        ]));
+        // 没有 Origin 时看 Referer，同样必须同源。
+        assert!(allowed(&[
+            ("host", "admin.example"),
+            ("referer", "https://admin.example/__admin/"),
+        ]));
+        assert!(!allowed(&[
+            ("host", "admin.example"),
+            ("referer", "https://evil.example/x"),
+        ]));
+    }
+
+    /// 无来源信息时，「非简单请求」三选一放行：JSON content-type / 自定义头 /
+    /// Sec-Fetch-Site。
+    #[test]
+    fn csrf_non_simple_requests_pass_without_origin() {
+        assert!(allowed(&[
+            ("host", "admin.example"),
+            ("content-type", "application/json"),
+        ]));
+        assert!(allowed(&[
+            ("host", "admin.example"),
+            ("content-type", "application/json; charset=utf-8"),
+        ]));
+        assert!(allowed(&[
+            ("host", "admin.example"),
+            ("x-crucible-admin", "1"),
+        ]));
+        assert!(allowed(&[
+            ("host", "admin.example"),
+            ("sec-fetch-site", "same-origin"),
+        ]));
+        assert!(allowed(&[
+            ("host", "admin.example"),
+            ("sec-fetch-site", "None"),
+        ]));
+        // 反例：自定义头值不是 1、Sec-Fetch-Site 是跨站/同站、JSON 变体拼错。
+        assert!(!allowed(&[
+            ("host", "admin.example"),
+            ("x-crucible-admin", "0"),
+        ]));
+        assert!(!allowed(&[
+            ("host", "admin.example"),
+            ("sec-fetch-site", "cross-site"),
+        ]));
+        assert!(!allowed(&[
+            ("host", "admin.example"),
+            ("sec-fetch-site", "same-site"),
+        ]));
+        assert!(!allowed(&[
+            ("host", "admin.example"),
+            ("content-type", "application/jsonp"),
+        ]));
+    }
+
+    /// h2 场景：hyper 不保证补 `Host` 头时，同源比较用 URI 的 `:authority`。
+    #[test]
+    fn csrf_uses_uri_authority_when_host_header_is_absent() {
+        assert!(state_change_allowed(&mk(
+            "POST",
+            &[("origin", "https://admin.example:18443")],
+            true
+        )));
+        assert!(!state_change_allowed(&mk(
+            "POST",
+            &[("origin", "https://evil.example")],
+            true
+        )));
+    }
 }

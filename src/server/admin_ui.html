@@ -584,6 +584,7 @@ img.preview{max-width:100%;max-height:420px}
         <div style="flex:1"><label>realm</label><input id="adRealm" style="width:100%"/></div>
         <div style="flex:1"><label>path</label><input id="adPath" placeholder="/__admin"/></div>
         <div style="flex:1"><label>listeners_allow（端口逗号分隔，空=全口可达）</label><input id="adAllow" placeholder="18443,19446"/></div>
+        <div><label>metrics_public（/__metrics 免鉴权抓取，默认关）</label><input type="checkbox" id="adMetricsPublic"/></div>
       </div>
       <button class="act" id="btnAdminSave">保存 Admin 设置</button>
       <pre id="globalOut"></pre>
@@ -642,9 +643,22 @@ const base=(location.pathname.replace(/\/+$/,'')||'/__admin');
 // 没有提示文字、表格空白，看起来就像「这个按钮坏了」或「这页没实现」。
 // 这里统一兜住，把原因经由既有字段 r.text 回给调用方，
 // 所有 out(el,r.text,r.ok) / toast(r.text,!r.ok) 都能把它显示出来。
+// CSRF（服务端 admin.rs 的 state_change_allowed）：状态变更请求必须带「非简单请求」
+// 特征之一，否则缺 Origin 时会被 403 挡下。fetch 对没有 Content-Type 的 POST/PUT 会
+// 自动补 `text/plain;charset=UTF-8`，表单提交是 `x-www-form-urlencoded` —— 两者都是
+// **简单**请求，所以这里统一给写请求补一个自定义头（值必须是 1）。
+// 同源调用不受影响；跨源调用会因此触发 CORS 预检，而服务端不放行跨源，等于多一道保险。
+function adminHeaders(opts){
+  const o=opts||{};
+  const m=String(o.method||'GET').toUpperCase();
+  if(m==='GET'||m==='HEAD'||m==='OPTIONS')return o;
+  const h=new Headers(o.headers||{});
+  h.set('X-Crucible-Admin','1');
+  return Object.assign({},o,{headers:h});
+}
 async function api(path,opts){
   try{
-    const r=await fetch(base+path,opts||{});
+    const r=await fetch(base+path,adminHeaders(opts));
     const t=await r.text();
     return {ok:r.ok,status:r.status,text:t};
   }catch(e){
@@ -1691,6 +1705,8 @@ $('btnDnsZoneDel').onclick=async()=>{
    注意：后端没有 update，改一条 = 先 del 旧 id 再 add（在行的保存按钮里做）。 */
 const DNS_RTYPES=['A','AAAA','CNAME','MX','TXT','NS','SRV','CAA','PTR'];
 let DNS_ZONES=[];
+// 当前选中的分区是不是从区（只读）：由 /api/dns/records 的 readonly 字段决定。
+let DNS_READONLY=false;
 
 async function dnsRefreshZones(keep){
   const r=await apiJson('/api/dns/zones');
@@ -1714,30 +1730,36 @@ async function dnsLoadRecords(){
   const zone=$('dnsZoneSel').value;
   const w=$('dnsRecWrap');
   if(!zone){
+    DNS_READONLY=false;
     w.innerHTML='<p class="hint">还没有分区，先用上面的「添加分区」建一个。</p>';
     return;
   }
   const r=await apiJson('/api/dns/records?zone='+encodeURIComponent(zone));
   if(!r.ok||!r.json){
+    DNS_READONLY=false;
     w.innerHTML='';
     return out('dnsRecMsg','记录载入失败: '+r.text,false);
   }
-  renderDnsRecords(zone, r.json.records||[]);
+  // 从区（slave）的记录由 named 的 AXFR/IXFR 维护，后端从磁盘上的 zone 文件读给我们看，
+  // 并回 readonly=true —— 这里据此把编辑入口关掉（写了也会被下一次传输覆盖）。
+  DNS_READONLY=!!r.json.readonly;
+  renderDnsRecords(zone, r.json.records||[], DNS_READONLY, r.json.note);
 }
 
-function dnsRecRow(rec){
+function dnsRecRow(rec, readonly){
   rec=rec||{};
   const tr=document.createElement('tr');
   tr.dataset.id=rec.id?String(rec.id):'';
   const ph=(rec.rtype==='MX')?'10 mail.example.com.':'1.2.3.4';
-  tr.innerHTML='<td><input class="dr-name" size="14" placeholder="@" value="'+esc(rec.name||'')+'"/></td>'
-    +'<td><select class="dr-type">'+DNS_RTYPES.map(function(t){
+  tr.innerHTML='<td><input class="dr-name" size="14" placeholder="@" value="'+esc(rec.name||'')+'"'+(readonly?' readonly':'')+'/></td>'
+    +'<td><select class="dr-type"'+(readonly?' disabled':'')+'>'+DNS_RTYPES.map(function(t){
         return '<option'+(rec.rtype===t?' selected':'')+'>'+t+'</option>';}).join('')+'</select></td>'
-    +'<td><input class="dr-ttl" size="6" value="'+esc(String(rec.ttl||3600))+'"/></td>'
-    +'<td><input class="dr-data" style="width:99%" placeholder="'+esc(ph)+'" value="'+esc(rec.rdata||'')+'"/></td>'
-    +'<td><input class="dr-line" size="8" placeholder="(默认)" value="'+esc(rec.line||'')+'"/></td>'
-    +'<td><button class="act ghost dr-save" type="button">保存</button>'
-    +' <button class="act ghost dr-del" type="button">删除</button></td>';
+    +'<td><input class="dr-ttl" size="6" value="'+esc(String(rec.ttl||3600))+'"'+(readonly?' readonly':'')+'/></td>'
+    +'<td><input class="dr-data" style="width:99%" placeholder="'+esc(ph)+'" value="'+esc(rec.rdata||'')+'"'+(readonly?' readonly':'')+'/></td>'
+    +'<td><input class="dr-line" size="8" placeholder="(默认)" value="'+esc(rec.line||'')+'"'+(readonly?' readonly':'')+'/></td>'
+    +'<td>'+(readonly?'':('<button class="act ghost dr-save" type="button">保存</button>'
+    +' <button class="act ghost dr-del" type="button">删除</button>'))+'</td>';
+  if(readonly) return tr;
   tr.querySelector('.dr-save').onclick=async function(){
     const body={action:'add',zone:$('dnsZoneSel').value,
       name:(tr.querySelector('.dr-name').value||'').trim()||'@',
@@ -1766,23 +1788,31 @@ function dnsRecRow(rec){
   return tr;
 }
 
-function renderDnsRecords(zone, recs){
+function renderDnsRecords(zone, recs, readonly, note){
   const w=$('dnsRecWrap');
   w.innerHTML='';
+  if(readonly){
+    const h=document.createElement('p');
+    h.className='hint';
+    h.textContent='这是从区（secondary）：记录由 named 从主区同步维护，此处只读'
+      +(note?('。' + note):'（以上内容来自磁盘上的 zone 文件）。');
+    w.appendChild(h);
+  }
   const t=document.createElement('table');
   t.className='data';
   t.innerHTML='<thead><tr><th>主机记录</th><th>类型</th><th>TTL</th><th>记录值</th>'
     +'<th>线路</th><th></th></tr></thead>';
   const tb=document.createElement('tbody');
-  recs.forEach(function(r){ tb.appendChild(dnsRecRow(r)); });
+  recs.forEach(function(r){ tb.appendChild(dnsRecRow(r, readonly)); });
   t.appendChild(tb);
   w.appendChild(t);
-  out('dnsRecMsg', zone+' 共 '+recs.length+' 条记录', true);
+  out('dnsRecMsg', zone+(readonly?'（从区，只读）':'')+' 共 '+recs.length+' 条记录', true);
 }
 
 $('btnZoneRefresh').onclick=function(){ dnsRefreshZones(); };
 $('dnsZoneSel').onchange=function(){ dnsLoadRecords(); };
 $('btnRecRowAdd').onclick=function(){
+  if(DNS_READONLY) return out('dnsRecMsg','该分区是从区，记录由 named 同步维护，不能在这里添加',false);
   let tb=document.querySelector('#dnsRecWrap tbody');
   if(!tb){
     if(!$('dnsZoneSel').value) return out('dnsRecMsg','先选择一个分区',false);
@@ -1794,6 +1824,7 @@ $('btnRecRowAdd').onclick=function(){
 $('btnZoneImport').onclick=function(){
   const zone=$('dnsZoneSel').value;
   if(!zone) return out('dnsRecMsg','先选择一个分区',false);
+  if(DNS_READONLY) return out('dnsRecMsg','该分区是从区，记录由 named 同步维护，不能导入覆盖',false);
   const f=$('dnsImportFile').files[0];
   if(!f) return out('dnsRecMsg','先选择 .zone 文件',false);
   const mode=$('dnsImportMode').value;
@@ -1930,6 +1961,8 @@ $('btnJspCompile').onclick=async()=>{
 };
 async function initDnsTab(){
   await dnsStatus();
+  // 分区列表懒加载：切到本 tab 就刷新一次，否则要手动点「刷新状态」才看得到新建的分区。
+  await dnsRefreshZones();
   // ACME 字段已在 dnsStatus 中从 /api/dns/status 返回（status_json 现包含 acme）
   const c=await apiJson('/api/dns/config');
   if(c.json&&c.json.acme){
@@ -1961,6 +1994,7 @@ function gLoad(){
   $('adRealm').value=ad.realm||'';
   $('adPath').value=ad.path||'/__admin';
   $('adAllow').value=(ad.listeners_allow||[]).join(',');
+  $('adMetricsPublic').checked=!!ad.metrics_public;
 }
 document.querySelectorAll('[data-tab="global"]').forEach(b=>b.addEventListener('click',gLoad));
 $('btnSynSave').onclick=async()=>{
@@ -1984,7 +2018,9 @@ $('btnAdminSave').onclick=async()=>{
   const r=await api('/api/admin/save',jpost({
     realm:$('adRealm').value.trim(),
     path:$('adPath').value.trim()||'/__admin',
-    listeners_allow:allow
+    listeners_allow:allow,
+    // 字段名必须与后端 [admin] 表一致（admin.rs 的 /api/admin/save 读这个键）。
+    metrics_public:$('adMetricsPublic').checked
   }));
   out('globalOut',r.text,r.ok); if(r.ok){toast('Admin 设置已保存');await loadCfg();}
 };
@@ -2072,7 +2108,8 @@ window.resolveConflict = async function(id, alsoWrite) {
     const weight = document.getElementById('gepWeight').value.trim() || '200';
     const r = await fetch('/__admin/api/geoip/edit', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      // 服务端要求非简单请求特征（见 adminHeaders）：表单编码是简单请求，必须带上自定义头。
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded', 'X-Crucible-Admin': '1' },
       body: new URLSearchParams({ prefix, field, value, weight }),
     });
     const t = await r.text();
@@ -2080,7 +2117,8 @@ window.resolveConflict = async function(id, alsoWrite) {
   }
   const r = await fetch('/__admin/api/geoip/conflicts/resolve', {
     method: 'POST',
-    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    // 同上：这条不是走 api()，自定义头得自己带，否则缺 Origin 时会被 403。
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded', 'X-Crucible-Admin': '1' },
     body: new URLSearchParams({ id: String(id) }),
   });
   const t = await r.text();

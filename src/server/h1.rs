@@ -207,10 +207,11 @@ async fn handle_request_inner(
 
     // /__metrics 必须排在 ip_access + 限流**之后**：此前它是本函数的第一个分支，
     // 于是「用 IP 白名单当边界」的部署把指标（请求总数、活跃 H3 流）暴露给任何人。
-    // 位置与 DoH 对齐——排在 basic_auth **之前**：Prometheus/uptime 探针这类抓取端
-    // 通常不带凭据（虽然也支持 basic_auth，但不该强制），把「谁能抓」交给
-    // ip_access 白名单与限流来定；要口令的场景给 listener 配 ip_access 即可。
-    if let Some(resp) = crate::server::telemetry::maybe_handle(&req, &snap.telemetry) {
+    // 位置与 DoH 对齐——排在 basic_auth **之前**：listener 口令与「谁能抓指标」是两件事，
+    // 指标的门在 telemetry 内部按 [admin].metrics_public 判定（默认要求管理员凭据）。
+    if let Some(resp) =
+        crate::server::telemetry::maybe_handle(&req, &snap.telemetry, &snap.admin, peer.ip())
+    {
         return tag(resp, "telemetry");
     }
 
@@ -220,6 +221,25 @@ async fn handle_request_inner(
         Ok(r) => return tag(r, "dns-doh"),
         Err(req) => req,
     };
+
+    // P2-21（任务 4）：admin 暴露面——[admin].listeners_allow 非空时仅列出的端口可达
+    // （防止 Basic 凭据在明文 listener 上线传输；空 = 兼容旧行为全端口可达）。
+    //
+    // 位置必须与 h1/h2/h3 保持一致：**早于 listener 级 basic_auth**（h2/h3 的收 body
+    // 前置门里就是「ACL → listeners_allow → CSRF → admin 门」这个顺序）。此前 h1 把它
+    // 放在 listener basic_auth 之后，于是「端口不在白名单 + 该口又配了 listener 口令」
+    // 时会先回 401 —— 浏览器立刻弹出 Basic 口令框，等于把一个本该完全不可见的口
+    // 变成凭据输入面；h2/h3 在同一场景回的是 404。白名单的语义是「这个口根本没有
+    // 管理面」，所以 404 必须先生效。
+    if path.starts_with(&snap.admin.path) && !snap.admin.listener_allowed(lc.port) {
+        return tag(
+            Response::builder()
+                .status(StatusCode::NOT_FOUND)
+                .body(full("not found"))
+                .unwrap(),
+            "acl",
+        );
+    }
 
     if let Some(ba) = &lc.basic_auth {
         match crate::server::basic_auth::check_listener(&req, ba, peer.ip()) {
@@ -253,18 +273,6 @@ async fn handle_request_inner(
                 )
             }
         }
-    }
-
-    // P2-21（任务 4）：admin 暴露面——[admin].listeners_allow 非空时仅列出的端口可达
-    // （防止 Basic 凭据在明文 listener 上线传输；空 = 兼容旧行为全端口可达）。
-    if path.starts_with(&snap.admin.path) && !snap.admin.listener_allowed(lc.port) {
-        return tag(
-            Response::builder()
-                .status(StatusCode::NOT_FOUND)
-                .body(full("not found"))
-                .unwrap(),
-            "acl",
-        );
     }
 
     // P2-8（§16.18）：status_path 接线——此前只解析配置无服务逻辑（status_page.html 孤儿）。
@@ -343,9 +351,9 @@ async fn handle_request_inner(
         // 一旦先收满 body（上限 32MiB），一个不带凭据的并发 POST 就能让每个连接各占
         // 32MiB —— 不用通过鉴权（或随便带个垃圾凭据）就能放大内存占用。
         // 门内做的就是完整鉴权（含失败退避），因此未经校验的请求一个字节 body 都不收；
-        // 代价是合法管理请求会跑两次 argon2id（admin::handle 里还会再验一次，
-        // 见 basic_auth::admin_gate 的说明）—— 管理面请求量极小，换来的是
-        // 「任意垃圾凭据也能占住 32MiB/请求」这条放大路径被彻底掐掉。
+        // admin::handle 里那次同凭据的校验会命中 basic_auth 的成功备忘（见该处说明），
+        // 所以合法管理请求**只跑一次** argon2id，换来的是「任意垃圾凭据也能占住
+        // 32MiB/请求」这条放大路径被彻底掐掉。
         match crate::server::basic_auth::admin_gate(req.headers(), &snap.admin, peer.ip()) {
             crate::server::basic_auth::AdminGate::Proceed => {}
             crate::server::basic_auth::AdminGate::Unauthorized => {

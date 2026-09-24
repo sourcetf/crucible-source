@@ -50,9 +50,25 @@ async fn handle_inner(
                     .split('&')
                     .find_map(|kv| kv.strip_prefix("zone="))
                     .unwrap_or("");
-                list_records(zone)
-                    .map(|rs| json!({"records": rs}))
-                    .map_err(|e| e.to_string())
+                // 从区的记录不在 DB 里：named 传输后写进自己的 zone 文件。面板要显示就得读盘
+                // 上那份（readonly 告知前端不要给编辑/删除）。文件还没生成（传输未完成）时
+                // 返回空表 + note，而不是 500 —— 那只是「还没同步过来」。
+                let kind = super::zone_kind_of(zone).unwrap_or_default();
+                if !kind.is_empty() && kind != "master" {
+                    match super::list_secondary_records(zone) {
+                        Ok(rs) => Ok(json!({"records": rs, "readonly": true, "kind": kind})),
+                        Err(e) => Ok(json!({
+                            "records": [],
+                            "readonly": true,
+                            "kind": kind,
+                            "note": format!("{e:#}"),
+                        })),
+                    }
+                } else {
+                    list_records(zone)
+                        .map(|rs| json!({"records": rs}))
+                        .map_err(|e| e.to_string())
+                }
             }
             _ => Err("not found".into()),
         }
@@ -609,11 +625,12 @@ pub async fn handle_zone_export(
 /// **不支持** `$INCLUDE` / `$GENERATE` —— 遇到直接报错，不猜语义。
 ///
 /// 先全量解析、再落库：任何一行不合法就整体失败并报出行号，不会写进半截数据。
-struct ZoneRec {
-    name: String,
-    rtype: String,
-    ttl: u32,
-    rdata: String,
+/// zone 文件解析出的单条记录（导入口与「读从区落盘文件」共用）。
+pub(super) struct ZoneRec {
+    pub(super) name: String,
+    pub(super) rtype: String,
+    pub(super) ttl: u32,
+    pub(super) rdata: String,
 }
 
 fn strip_zone_comment(s: &str) -> String {
@@ -683,7 +700,8 @@ fn zone_tokens(s: &str) -> Vec<(usize, usize)> {
     out
 }
 
-fn parse_zone_text(text: &str, origin: &str) -> Result<Vec<ZoneRec>, String> {
+/// 解析 RFC1035 master 文件文本（导入口与「读从区落盘文件」共用）。
+pub(super) fn parse_zone_text(text: &str, origin: &str) -> Result<Vec<ZoneRec>, String> {
     let mut cur_origin = origin.trim_end_matches('.').to_ascii_lowercase();
     let mut default_ttl: u32 = 3600;
     let mut last_owner: Option<String> = None;

@@ -42,9 +42,82 @@ pub fn check_admin_headers(headers: &HeaderMap, admin: &AdminConfig) -> bool {
         // Users listed but none have passwords yet — deny (force set password first).
         return false;
     }
-    active
+    // 同一请求会走两次这里（入口门 + admin::handle），见 ADMIN_OK 的说明：
+    // 刚刚验过的那条凭据直接命中，第二次不再跑 argon2id。
+    let auth = headers.get(header::AUTHORIZATION);
+    let fp = admin_users_fp(admin);
+    if let Some(v) = auth {
+        if admin_ok_hit(fp, v.as_bytes()) {
+            return true;
+        }
+    }
+    let ok = active
         .iter()
-        .any(|u| check_user_pass_headers(headers, &u.username, &u.password_hash))
+        .any(|u| check_user_pass_headers(headers, &u.username, &u.password_hash));
+    if ok {
+        if let Some(v) = auth {
+            admin_ok_remember(fp, v.as_bytes());
+        }
+    }
+    ok
+}
+
+// ===== 「刚刚验过」的成功备忘（口令只验一次）=====
+
+/// 刚通过的 admin 凭据备忘。
+///
+/// 为什么需要：同一份 headers 目前会验**两次** —— 先是三协议入口的
+/// [`admin_gate`]（为了不通过鉴权就一个字节 body 都不收），再是 `admin::handle`
+/// 开头的那次鉴权。两次都跑 argon2id 等于把管理口令校验的 CPU 成本翻倍，而这
+/// 在管理面是纯浪费：headers 没变、用户表没变，结论必然一样。
+///
+/// 安全性要点：
+/// - 只记**成功**的凭据。失败路径（含「用户不存在」）照旧每次都真跑 argon2，
+///   对外仍与「口令错误」不可区分，恒定时间语义不变。
+/// - 键里带用户表指纹：改口令/加删用户/换 realm 立刻失效，不存在「改了口令还能
+///   凭旧结论进门」。
+/// - 命中的前提是本次请求带的 `Authorization` 与刚刚验过的那条**逐字节相同** ——
+///   也就是说对方已经持有有效凭据，备忘不会给任何人多一分权限。
+static ADMIN_OK: Lazy<Mutex<Option<AdminOkMemo>>> = Lazy::new(|| Mutex::new(None));
+
+/// 备忘有效期：覆盖「过门 → 收 body（上限 32MiB，慢链路要几秒）→ admin::handle」
+/// 这段窗口；再长没有必要（下一个请求重新验一次的成本本就该付）。
+const ADMIN_OK_TTL: Duration = Duration::from_secs(30);
+
+struct AdminOkMemo {
+    /// 用户表指纹，见 [`admin_users_fp`]。
+    fp: u64,
+    /// 通过校验的 `Authorization` 头原文。
+    auth: Vec<u8>,
+    at: Instant,
+}
+
+/// 用户表指纹（用户名 + 口令哈希 + realm）：任何一项变了指纹就变，备忘自动失效。
+fn admin_users_fp(admin: &AdminConfig) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    admin.realm.hash(&mut h);
+    for u in &admin.users {
+        u.username.hash(&mut h);
+        u.password_hash.hash(&mut h);
+    }
+    h.finish()
+}
+
+fn admin_ok_hit(fp: u64, auth: &[u8]) -> bool {
+    let g = ADMIN_OK.lock();
+    match &*g {
+        Some(m) => m.fp == fp && m.auth.as_slice() == auth && m.at.elapsed() <= ADMIN_OK_TTL,
+        None => false,
+    }
+}
+
+fn admin_ok_remember(fp: u64, auth: &[u8]) {
+    *ADMIN_OK.lock() = Some(AdminOkMemo {
+        fp,
+        auth: auth.to_vec(),
+        at: Instant::now(),
+    });
 }
 
 /// h1 入口：listener 级 Basic Auth（带来源 IP 的失败退避，见文末 FailTable）。
@@ -202,9 +275,10 @@ pub enum AdminGate {
 /// （h2/h3 各 8MiB），不需要通过鉴权即可放大内存。
 /// 判定顺序：退避 → 有没有携带 Basic 凭据（纯头部解析，零哈希成本）→ 完整校验。
 ///
-/// 注意这里会跑一次 argon2id，而 admin::handle 里还会再跑一次（同一份 headers、
-/// 同一份配置）—— 这次重复是**故意**的：宁可让合法的管理请求多花一次哈希
-///（管理面请求量极小），也不要让「带任意垃圾凭据」的请求拿到 32MiB/请求 的缓冲。
+/// 注意这里会跑一次 argon2id，而 admin::handle 里还会再「验」一次（同一份 headers、
+/// 同一份配置）—— 那一次由成功备忘 [`ADMIN_OK`] 直接命中，不会重复跑哈希，
+/// 因此合法管理请求的口令校验成本仍然是**一次** argon2id；代价为零而收益是
+/// 「带任意垃圾凭据的请求也拿不到 32MiB/请求 的缓冲」。
 /// 本函数的校验结果同时是失败计数/退避的唯一记账点。
 pub fn admin_gate(headers: &HeaderMap, admin: &AdminConfig, ip: IpAddr) -> AdminGate {
     if let Some(d) = ADMIN_FAILS.blocked(ip) {
@@ -352,6 +426,7 @@ mod tests {
                 password_hash: hash.into(),
             }],
             listeners_allow: vec![],
+            metrics_public: false,
         }
     }
 
@@ -440,10 +515,50 @@ mod tests {
             AdminGate::Unauthorized
         ));
         // 成功即清零（用 listener 表验证同一套清零语义）。
-        LISTENER_FAILS.note_failure(other);
+        // 退避是**累积**到 FAIL_THRESHOLD 次才生效的（首次失败不封锁），所以这里要凑满次数
+        // ——此前只记 1 次就断言「已封锁」，是个一直没被跑到的过期断言（cargo test 这一步
+        // 因磁盘/工具链原因长期没在验收里真正执行过）。
+        for _ in 0..FAIL_THRESHOLD {
+            LISTENER_FAILS.note_failure(other);
+        }
         assert!(LISTENER_FAILS.blocked(other).is_some());
         LISTENER_FAILS.note_success(other);
         assert!(LISTENER_FAILS.blocked(other).is_none());
+    }
+
+    /// 成功备忘只对「同一凭据 + 同一用户表」生效：换口令立刻失效，失败从不被记。
+    #[test]
+    fn admin_ok_memo_is_scoped_to_credentials_and_user_table() {
+        let hash = password::hash_password("pw").unwrap();
+        let cfg = admin_with_hash(&hash);
+        let h = headers_with_basic("u", "pw");
+        assert!(check_admin_headers(&h, &cfg));
+        // 第二次就是 admin::handle 里那次：结论必须仍为真（备忘命中只是省掉哈希）。
+        assert!(check_admin_headers(&h, &cfg));
+        let auth = h.get(header::AUTHORIZATION).unwrap().as_bytes().to_vec();
+        assert!(admin_ok_hit(admin_users_fp(&cfg), &auth));
+
+        // 换口令（同一用户名）→ 用户表指纹变，旧的成功结论不可复用。
+        let cfg2 = admin_with_hash(&password::hash_password("other").unwrap());
+        assert!(!check_admin_headers(&h, &cfg2));
+        assert_ne!(admin_users_fp(&cfg), admin_users_fp(&cfg2));
+
+        // 失败路径不写备忘：错口令即使此前有成功记录也不能凭它进门。
+        let wrong = headers_with_basic("u", "nope");
+        assert!(!check_admin_headers(&wrong, &cfg));
+        assert!(!admin_ok_hit(
+            admin_users_fp(&cfg),
+            wrong.get(header::AUTHORIZATION).unwrap().as_bytes()
+        ));
+    }
+
+    /// 无凭据 / 空凭据永远不命中备忘（备忘只在真验过之后才写）。
+    #[test]
+    fn admin_ok_memo_rejects_missing_credentials() {
+        let hash = password::hash_password("pw").unwrap();
+        let cfg = admin_with_hash(&hash);
+        assert!(!admin_ok_hit(admin_users_fp(&cfg), b""));
+        assert!(!check_admin_headers(&HeaderMap::new(), &cfg));
     }
 
     /// listener 校验在退避期内快速失败（不再进口令哈希路径）。

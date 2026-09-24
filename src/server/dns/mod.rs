@@ -11,7 +11,7 @@
 
 use crate::config::Config;
 use anyhow::{anyhow, bail, Context as _, Result};
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -580,6 +580,103 @@ fn split_semi(s: String) -> Vec<String> {
     s.split(';').filter(|x| !x.is_empty()).map(String::from).collect()
 }
 
+/// 分区类型（"master"/"slave"）；分区不存在时返回空串。
+///
+/// 调用方按「空串 = master」处理，保持旧行为（历史调用点会在建区之前就写记录）。
+pub fn zone_kind_of(zone: &str) -> Result<String> {
+    let conn = store()?;
+    let k = conn
+        .query_row("SELECT kind FROM zones WHERE name=?1", [zone], |r| {
+            r.get::<_, String>(0)
+        })
+        .optional()?;
+    Ok(k.unwrap_or_default())
+}
+
+fn zone_row_of(zone: &str) -> Result<Option<ZoneRow>> {
+    let conn = store()?;
+    let z = conn
+        .query_row(
+            "SELECT name,kind,primaries,axfr_acl,refresh_hours FROM zones WHERE name=?1",
+            [zone],
+            |r| {
+                Ok(ZoneRow {
+                    name: r.get(0)?,
+                    kind: r.get(1)?,
+                    primaries: split_semi(r.get::<_, String>(2)?),
+                    axfr_acl: split_semi(r.get::<_, String>(3)?),
+                    refresh_hours: r.get(4)?,
+                })
+            },
+        )
+        .optional()?;
+    Ok(z)
+}
+
+/// 从区（slave）的记录：named 把传输来的区写进**它自己**的 zone 文件，DB 里没有，
+/// 所以面板要显示只能读盘上那份（RFC1035 master file，复用导入用的解析器）。
+///
+/// 返回的行是**只读**的：id 用负数表示（DB 自增 id 恒 > 0），且 add_record/del_record
+/// 对非 master 分区直接拒绝 —— 写了也会被下一次 AXFR/IXFR 覆盖，那种「保存成功但
+/// 服务里查不到」的假成功比报错更糟。
+pub fn list_secondary_records(zone: &str) -> Result<Vec<RecordRow>> {
+    let z = zone_row_of(zone)?.with_context(|| format!("zone {zone} 不存在"))?;
+    let dir = state_root().join("zones");
+    // 默认 view 的文件名优先；配了 geo 多 view 时回退到前缀扫描（取第一个匹配）。
+    let primary = dir.join(zone_file_name(&z, ""));
+    let path = if primary.is_file() {
+        primary
+    } else {
+        // 开了 geo 时默认 view 的文件名是 `<safe>.<tag>.default.<hash>.zone`（view 名参与
+        // 文件名），同前缀可能有多份（每个 view 一份，内容相同）——优先 `.default.`，
+        // 否则按名字排序取第一份，保证同样的分区每次读到同一个文件。
+        let safe: String = z
+            .name
+            .chars()
+            .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+            .collect();
+        let prefix = format!("{safe}.{:08x}", fnv1a32(&z.name));
+        let mut cands: Vec<PathBuf> = std::fs::read_dir(&dir)
+            .with_context(|| format!("read dir {}", dir.display()))?
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .filter(|p| {
+                p.file_name()
+                    .and_then(|n| n.to_str())
+                    .map(|n| n.starts_with(&prefix) && n.ends_with(".zone"))
+                    .unwrap_or(false)
+            })
+            .collect();
+        cands.sort();
+        cands
+            .iter()
+            .find(|p| {
+                p.file_name()
+                    .and_then(|n| n.to_str())
+                    .map(|n| n.contains(".default."))
+                    .unwrap_or(false)
+            })
+            .or_else(|| cands.first())
+            .cloned()
+            .with_context(|| format!("从区 {zone} 的 zone 文件尚未生成（传输可能还没完成）"))?
+    };
+    let text = std::fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
+    let recs = admin_api::parse_zone_text(&text, &z.name).map_err(|e| anyhow::anyhow!("{e}"))?;
+    Ok(recs
+        .into_iter()
+        .enumerate()
+        .map(|(i, r)| RecordRow {
+            id: -(i as i64) - 1,
+            zone: z.name.clone(),
+            line: String::new(),
+            name: r.name,
+            rtype: r.rtype,
+            ttl: i64::from(r.ttl),
+            rdata: r.rdata,
+        })
+        .collect())
+}
+
 pub fn add_record(zone: &str, line: &str, name: &str, rtype: &str, ttl: u32, rdata: &str) -> Result<()> {
     if !valid_name(zone) {
         bail!("bad zone name {zone:?}");
@@ -590,6 +687,12 @@ pub fn add_record(zone: &str, line: &str, name: &str, rtype: &str, ttl: u32, rda
     let rtype_u = rtype.to_ascii_uppercase();
     if !RR_TYPES.contains(&rtype_u.as_str()) {
         bail!("unsupported record type {rtype_u}");
+    }
+    // 从区的记录由 named 的 AXFR/IXFR 维护，本地写入必被覆盖 —— 明确拒绝，
+    // 免得出现「保存成功、服务里却查不到」的假成功（面板对从区是只读的）。
+    let kind = zone_kind_of(zone)?;
+    if !kind.is_empty() && kind != "master" {
+        bail!("zone {zone:?} 是从区（{kind}），记录由 named 同步维护，不能直接编辑");
     }
     if rdata.is_empty() || rdata.len() > 4096 {
         bail!("bad rdata length");
@@ -608,6 +711,16 @@ pub fn add_record(zone: &str, line: &str, name: &str, rtype: &str, ttl: u32, rda
 
 pub fn del_record(id: i64) -> Result<()> {
     let conn = store()?;
+    // 从区记录只读（同 add_record 的守卫；负数 id 本来就查不到，这里给出明确原因）。
+    let zone: Option<String> = conn
+        .query_row("SELECT zone FROM records WHERE id=?1", [id], |r| r.get(0))
+        .optional()?;
+    if let Some(z) = zone {
+        let kind = zone_kind_of(&z)?;
+        if !kind.is_empty() && kind != "master" {
+            bail!("zone {z:?} 是从区（{kind}），记录由 named 同步维护，不能直接删除");
+        }
+    }
     conn.execute("DELETE FROM records WHERE id=?1", [id])?;
     Ok(())
 }

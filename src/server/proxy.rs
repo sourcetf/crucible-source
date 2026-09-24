@@ -11,8 +11,9 @@
 //! `crucible_tor_connect`. Until then, SOCKS remains the supported path.
 //!
 //! §3：连接池默认禁用；connection_pool=true 时按
-//! (host,port,h2?,use_tor?,ssl_mode?,upstream_tls_version?) 维度复用已建立的
-//! SendRequest，空闲上限 16，坏连接自动重建。
+//! (host,port,scheme,h2,use_tor,ssl_mode,upstream_tls_version,tor_socks) 维度复用
+//! 已建立的 SendRequest，各维度全量入键（不哈希截断，见 [`PoolKey`]），
+//! 空闲上限 16，坏连接自动重建。
 //!
 //! # Onion TLS (`ssl_mode`)
 //! For `.onion` hosts, [`onion_ca::validate_onion_upstream`] always runs.
@@ -28,10 +29,8 @@ use crate::server::h1::{empty, full, BoxBody};
 use once_cell::sync::Lazy;
 use parking_lot::Mutex as PLMutex;
 use std::collections::HashMap;
-use std::hash::{Hash, Hasher};
-use std::collections::hash_map::DefaultHasher;
 
-/// §3 连接池（每 upstream host:port:h2:出口:TLS 策略 维度，上限 16）。
+/// §3 连接池（每 upstream 目的地+scheme+h2+出口+TLS/HTTP 策略 维度，上限 16）。
 const POOL_CAP: usize = 16;
 
 /// 回源分阶段超时。此前整条链路一个 deadline 都没有：一个「接受连接但永不回包」
@@ -47,37 +46,64 @@ const UPSTREAM_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_
 const UPSTREAM_HEAD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 const UPSTREAM_BODY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
 
-#[derive(Clone, Copy)]
-struct PoolKey(u64);
-impl PartialEq for PoolKey { fn eq(&self, o: &Self) -> bool { self.0 == o.0 } }
-impl Eq for PoolKey {}
-impl Hash for PoolKey {
-    fn hash<H: Hasher>(&self, state: &mut H) { self.0.hash(state); }
-}
-impl PoolKey {
-    /// 池键维度：目的地 + h2 + 出口（是否经 Tor）+ TLS 策略。
-    ///
-    /// use_tor 必须进来：同一 host:port 经 Tor 与直连建立的是语义完全不同的两条
-    /// 连接（此前这里传的是 `scheme == "https"`，参数名却是 use_tor —— 于是
-    /// 「经 Tor 的规则」会复用「直连规则」留下的连接，本该经 Tor 的请求从本机直连
-    /// 发了出去，出口反了）。
-    ///
-    /// TLS 策略同理：两条规则可以指向同一 host:port 却要求不同校验档
+/// 连接池键：把每个决定「这条请求能复用到哪条连接」的维度**原样**放进结构体，
+/// 由字段比较/字段哈希定相等，**不做 64 位哈希截断**。
+///
+/// 此前是 `PoolKey(u64)`（DefaultHasher 各维度压成一个 u64）：池键决定复用到哪条
+/// 上游连接，哈希一旦碰撞，取出的就是发往**另一个上游**（或另一套 TLS 策略）的连接
+/// —— 与「复用」的语义完全不符，属安全问题而不只是命中率问题。字段集合没有变化，
+/// 所以相等性语义与原来一致（同规则 → 同键 → 可复用，不会退化成每条请求都新建连接）。
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct PoolKey {
+    /// 目的地（host + port）：同 host 不同端口是不同上游。
+    host: String,
+    port: u16,
+    /// `http` 与 `https` 决定是否起 TLS 握手，而同一 host:port 完全可能同时被
+    /// `http://` 与 `https://` 两条规则指向；共用连接会把「要求 TLS」的请求
+    /// 写进明文连接。
+    scheme: String,
+    /// 回源 HTTP 版本（显式配置或 ALPN 协商结果）：h2/h1 的 SendRequest 不可互换。
+    h2: bool,
+    /// 出口是否经 Tor。use_tor 必须进来：同一 host:port 经 Tor 与直连建立的是语义
+    /// 完全不同的两条连接（此前这里传的是 `scheme == "https"`，参数名却是 use_tor
+    /// —— 于是「经 Tor 的规则」会复用「直连规则」留下的连接，本该经 Tor 的请求从本机
+    /// 直连发了出去，出口反了）。
+    use_tor: bool,
+    /// TLS 策略：两条规则可以指向同一 host:port 却要求不同校验档
     /// （verify / no_verify），共用连接会让 no_verify 建立的连接被 verify 规则复用，
-    /// 把「要求校验」降级成「不校验」。这里哈希原始字符串，同义写法（大小写/空格）
+    /// 把「要求校验」降级成「不校验」。存原始字符串：同义写法（大小写/空格）
     /// 只会少复用、不会错复用。
+    ssl_mode: String,
+    /// 回源 TLS 版本（None = 自动协商）：同 host:port 上 tls1.2 与 tls1.3
+    /// 是两次不同的握手结果。
+    tls_version: Option<String>,
+    /// Tor SOCKS 端点：不同端点 = 不同电路/出口节点，出口 IP 不同，同样不能互相复用。
+    tor_socks: Option<String>,
+}
+
+impl PoolKey {
+    /// 池键维度：目的地 + scheme + HTTP 版本 + 出口（是否经 Tor、哪个 SOCKS）
+    /// + TLS 策略/版本。少任何一个维度都可能把请求复用到语义不同的连接上（见各字段）。
     fn new(
         host: &str,
         port: u16,
+        scheme: &str,
         h2: bool,
         use_tor: bool,
         ssl_mode: &str,
         tls_version: Option<&str>,
+        tor_socks: Option<&str>,
     ) -> Self {
-        let mut s = DefaultHasher::new();
-        host.hash(&mut s); port.hash(&mut s); h2.hash(&mut s); use_tor.hash(&mut s);
-        ssl_mode.hash(&mut s); tls_version.hash(&mut s);
-        PoolKey(s.finish())
+        Self {
+            host: host.to_string(),
+            port,
+            scheme: scheme.to_string(),
+            h2,
+            use_tor,
+            ssl_mode: ssl_mode.to_string(),
+            tls_version: tls_version.map(str::to_string),
+            tor_socks: tor_socks.map(str::to_string),
+        }
     }
 }
 
@@ -184,6 +210,59 @@ const HOP_BY_HOP: &[&str] = &[
     "transfer-encoding",
     "upgrade",
 ];
+
+/// `Connection:` 里点名的头也是逐跳头（RFC 9110 §7.6.1）。固定名单盖不住对端自定义的
+/// 逐跳头，所以剥除时要连这些 token 一起用。
+fn connection_tokens(headers: &HeaderMap) -> Vec<String> {
+    headers
+        .get(CONNECTION)
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v.split(',').map(|s| s.trim().to_ascii_lowercase()).collect())
+        .unwrap_or_default()
+}
+
+/// 规则（`modify_response_headers`）注入响应头时的禁用名单：HOP_BY_HOP 之外再加两个。
+///
+/// - `content-length`：报文定界头。规则写一个与真实 body 长度不符的值，客户端就会按
+///   错误长度截断/粘连后续报文 —— 与请求方向的 TE/CL 走私同源，不能让配置侧凭空造。
+/// - `host`：属请求方向，响应里出现只会误导客户端与中间缓存。
+///
+/// `Connection:` 点名的名字同样禁用（同一条逐跳语义）。其余 `set-cookie` /
+/// `cache-control` / `content-type` / CSP 等是正常业务头，必须照常注入。
+fn response_header_injectable(name: &HeaderName, conn_tokens: &[String]) -> bool {
+    let l = name.as_str();
+    !(HOP_BY_HOP.contains(&l)
+        || l == "content-length"
+        || l == "host"
+        || conn_tokens.iter().any(|t| t.as_str() == l))
+}
+
+/// 应用规则里的 `modify_response_headers`：**替换**语义（同名只留一份、规则值胜出）
+/// 且丢弃禁用头（见 [`response_header_injectable`]）。
+///
+/// 配置项名就是 “modify”（config.rs 亦写明 Inject/replace），语义应为覆盖：此前经由
+/// response builder 的 `header()` 落下去是**追加**，客户端会同时收到上游旧值与规则新值
+/// 两份同名头，而浏览器普遍取第一个 —— 管理员「改」了头却没生效。
+fn apply_response_header_rules(
+    headers: &mut HeaderMap,
+    rule: &ProxyRuleConfig,
+    conn_tokens: &[String],
+) {
+    for (k, v) in &rule.modify_response_headers {
+        // 名字/值先按 HTTP 规范校验：含 CR/LF 的值会把「注入一个头」变成「注入任意个头
+        // 或提前结束响应头」。非法项丢弃而不是让整条响应失败（响应体已经拿到了）。
+        let (Ok(name), Ok(value)) = (
+            HeaderName::from_bytes(k.as_bytes()),
+            HeaderValue::from_bytes(v.as_bytes()),
+        ) else {
+            continue;
+        };
+        if !response_header_injectable(&name, conn_tokens) {
+            continue;
+        }
+        headers.insert(name, value);
+    }
+}
 
 /// WebSocket 直写路径要跳过的头。与 HOP_BY_HOP 的区别：**保留** `upgrade`/`connection`
 /// （缺了握手不成立），但报文定界相关的头一律不转发 —— 否则客户端可以同时带上
@@ -339,16 +418,18 @@ async fn proxy_once(
     let pool_key = PoolKey::new(
         &host,
         port,
+        &scheme,
         want_h2,
         needs_tor(&host, rule),
         &rule.ssl_mode,
         rule.upstream_tls_version.as_deref(),
+        rule.tor_socks.as_deref(),
     );
     // §3 连接池：仅当规则显式 `connection_pool = true` 时复用上游连接（默认关闭）。
     // 此前 POOL / pool_give / pool_take 三个都是死代码（无任何调用者），
     // 配置项开了也没有任何效果。
     let pooled = if rule.connection_pool {
-        pool_take(pool_key).await
+        pool_take(pool_key.clone()).await
     } else {
         None
     };
@@ -461,23 +542,30 @@ async fn proxy_once(
     })?
     .map_err(|e| anyhow::anyhow!("read upstream response body: {e}"))?
     .to_bytes();
-    let mut out = Response::builder().status(rparts.status);
-    // 响应侧同样剥 hop-by-hop（上游的 Connection/TE/Upgrade 透传会污染客户端）。
-    for (k, v) in rparts.headers.iter() {
-        let kl = k.as_str().to_ascii_lowercase();
-        if HOP_BY_HOP.contains(&kl.as_str()) {
-            continue;
+    let mut out = Response::builder()
+        .status(rparts.status)
+        .body(full(rbytes))
+        .context("build upstream response")?;
+    {
+        // 响应侧同样剥 hop-by-hop（上游的 Connection/TE/Upgrade 透传会污染客户端）。
+        // 除固定名单外，`Connection:` 点名的头同样是逐跳头：只看名单的话，上游用一行
+        // Connection 就能让任意头（定界头也在内）原样透传到客户端。
+        let conn_tokens = connection_tokens(&rparts.headers);
+        let out_headers = out.headers_mut();
+        for (k, v) in rparts.headers.iter() {
+            let kl = k.as_str().to_ascii_lowercase();
+            if HOP_BY_HOP.contains(&kl.as_str()) || conn_tokens.iter().any(|t| *t == kl) {
+                continue;
+            }
+            out_headers.append(k.clone(), v.clone());
         }
-        out = out.header(k, v);
-    }
-    for (k, v) in &rule.modify_response_headers {
-        out = out.header(k, v);
+        apply_response_header_rules(out_headers, rule, &conn_tokens);
     }
     // 连接池：响应体已完整读完（H1 复用的前提），连接仍可用就放回池中。
     if rule.connection_pool && sender.is_ready() {
         pool_give(pool_key, sender);
     }
-    Ok(out.body(full(rbytes)).unwrap())
+    Ok(out)
 }
 
 async fn proxy_websocket(
@@ -508,15 +596,15 @@ async fn proxy_websocket(
         })??;
     if status != StatusCode::SWITCHING_PROTOCOLS {
         // Do not upgrade client unless upstream accepted the handshake.
-        let mut out = Response::builder().status(StatusCode::BAD_GATEWAY);
-        for (k, v) in &rule.modify_response_headers {
-            out = out.header(k, v);
-        }
-        return Ok(out
+        let mut out = Response::builder()
+            .status(StatusCode::BAD_GATEWAY)
             .body(full(format!(
                 "websocket upstream returned {status}, expected 101"
             )))
-            .unwrap());
+            .context("build websocket error response")?;
+        // 与正常回源路径同一套注入语义（替换 + 丢弃定界/逐跳头）。
+        apply_response_header_rules(out.headers_mut(), rule, &[]);
+        return Ok(out);
     }
 
     tokio::spawn(async move {
@@ -526,14 +614,21 @@ async fn proxy_websocket(
         }
     });
 
-    let mut out = Response::builder().status(status);
-    for (k, v) in headers.iter() {
-        out = out.header(k, v);
+    let mut out = Response::builder()
+        .status(status)
+        .body(empty())
+        .context("build websocket 101 response")?;
+    {
+        // 101 的 Connection/Upgrade 必须由上游那份原样透传（缺了握手不成立），
+        // 所以这里不做逐跳剥除；但规则注入的那一份仍按禁用名单过滤。
+        let conn_tokens = connection_tokens(&headers);
+        let out_headers = out.headers_mut();
+        for (k, v) in headers.iter() {
+            out_headers.append(k.clone(), v.clone());
+        }
+        apply_response_header_rules(out_headers, rule, &conn_tokens);
     }
-    for (k, v) in &rule.modify_response_headers {
-        out = out.header(k, v);
-    }
-    Ok(out.body(empty()).unwrap())
+    Ok(out)
 }
 
 fn is_websocket_upgrade(req: &Request<Full<Bytes>>) -> bool {
@@ -967,6 +1062,15 @@ async fn write_raw_request(
         }
     }
     for (k, v) in &rule.modify_request_headers {
+        // 这一路是**直接拼报文**（非 WS 的 h1/h2 路径会先经 HeaderName/HeaderValue 校验，
+        // 非法值让 builder 报错、整条请求 502）。不校验就等于让规则的名字/值里塞 CR/LF
+        // 而往上游请求注入任意个头、甚至提前结束请求头，所以这里照同样的失败语义拦下。
+        if HeaderName::from_bytes(k.as_bytes()).is_err() {
+            bail!("modify_request_headers has an invalid header name `{k}`");
+        }
+        if HeaderValue::from_bytes(v.as_bytes()).is_err() {
+            bail!("modify_request_headers value for `{k}` has invalid bytes (CR/LF?)");
+        }
         lines.push_str(&format!("{k}: {v}\r\n"));
     }
     lines.push_str(&format!("Content-Length: {}\r\n\r\n", body.len()));
