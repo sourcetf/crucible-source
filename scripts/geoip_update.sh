@@ -95,5 +95,9 @@ have_network() {
   if [ ! -f "$DB" ]; then
     python3 "${ROOT}/scripts/geoip_seed_demo.py" --db "$DB" --force
   fi
+  # tor 池是自我守护化的进程，采完必须显式收掉（否则会一直残留）。
+  if [ -d /tmp/geoip-tor-pool ]; then
+    python3 "${ROOT}/scripts/geoip_tor_pool.py" stop || echo "warn: tor pool stop failed"
+  fi
   echo "[$(date '+%F %T')] geoip_update done"
 } | tee -a "$LOG"

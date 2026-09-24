@@ -213,6 +213,15 @@ def stop_tor_pool() -> None:
 
 
 if __name__ == "__main__":
+    # `stop` 子命令：显式收掉池里所有 tor worker。
+    # 为什么需要：tor 是 `--RunAsDaemon 1` 自我守护化的，脚本退出后它们照跑 ——
+    # 实测一次采集后**25 个 tor 进程残留了一天**（连带几十 MB 数据目录），
+    # 因为没有任何人调用下面这个 stop_tor_pool()。更新链（geoip_update.sh）现在会在
+    # 结束时自动调用它；手工/独立运行时可以用这个子命令收尾。
+    if len(sys.argv) > 1 and sys.argv[1] in ("stop", "--stop"):
+        stop_tor_pool()
+        print("tor pool stopped")
+        sys.exit(0)
     n = int(sys.argv[1]) if len(sys.argv) > 1 else 5
     eps = ensure_tor_pool(n)
     print("pool:", eps)
