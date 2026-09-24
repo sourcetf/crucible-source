@@ -53,13 +53,9 @@ enum MetricsAccess {
 ///
 /// 401 与 admin 一致带 `WWW-Authenticate`（否则客户端不知道要发凭据）；退避期回 429
 /// 而不是 401 —— 与 admin 路径同一语义（401 会被反复重试，反而放大请求量）。
-fn metrics_access<T>(
-    req: &Request<T>,
-    cfg: &TelemetryConfig,
-    admin: &AdminConfig,
-    ip: IpAddr,
-) -> MetricsAccess {
-    if cfg.metrics_public {
+fn metrics_access<T>(req: &Request<T>, admin: &AdminConfig, ip: IpAddr) -> MetricsAccess {
+    // 开关在 `[admin]` 上（metrics_public）—— 与它复用的 admin 口令校验同属一处配置。
+    if admin.metrics_public {
         return MetricsAccess::Serve;
     }
     match admin_gate(req.headers(), admin, ip) {
@@ -108,7 +104,7 @@ pub fn maybe_handle(
                 .unwrap(),
         );
     }
-    match metrics_access(req, cfg, admin, ip) {
+    match metrics_access(req, admin, ip) {
         MetricsAccess::Serve => Some(metrics_response()),
         MetricsAccess::Reject(status, retry, msg) => Some(
             reject_parts(status, retry, &admin.realm)
@@ -140,7 +136,7 @@ pub fn maybe_handle_simple<T>(
                 .unwrap(),
         );
     }
-    match metrics_access(req, cfg, admin, ip) {
+    match metrics_access(req, admin, ip) {
         MetricsAccess::Serve => {
             let body = metrics_body();
             Some(
