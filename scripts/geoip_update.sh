@@ -47,6 +47,19 @@ have_network() {
     fi
   fi
 
+  # 前置检查：GeoCN.jsonl 是**国内主力源**（权重 820，实测 220 万行）的输入，由 Go 写的
+  # scripts/geoip-mmdb2jsonl 从同目录 GeoCN.mmdb 生成 —— 更新链不会自动生成它（本机也没装 Go）。
+  # 缺了它 enrich 只会打一行 "run mmdb2jsonl first"，然后静默丢掉最大的源，
+  # 所以在开工前就把话说重一点，并明确「不要为了腾空间删它」。
+  if [ ! -s "${ROOT}/data/geoip/sources/GeoCn.jsonl" ]; then
+    if [ -s "${ROOT}/data/geoip/sources/GeoCn.mmdb" ]; then
+      echo "warn: 缺少 sources/GeoCn.jsonl（GeoCN.mmdb 在，但需要 Go 工具生成）——"
+      echo "warn: 本次会跳过国内主力源（约 220 万行）。生成命令：cd ${ROOT} && go run scripts/geoip-mmdb2jsonl . > data/geoip/sources/GeoCn.jsonl"
+    else
+      echo "warn: 缺少 sources/GeoCn.mmdb 与 GeoCN.jsonl —— 国内主力源将被跳过。"
+    fi
+  fi
+
   # 磁盘预检：merge 是就地重写 geoip.sqlite（导入各层 + 建索引），需要相当于库大小
   # 量级的临时空间（回滚日志/临时 B 树）。实测一次磁盘写满的后果：merge 默默死在
   # 半路（dmesg 里刷 "file system full"），面板只看到「更新没了」，而库里还是旧数据。

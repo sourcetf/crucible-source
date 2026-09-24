@@ -231,6 +231,9 @@ async fn exec_dispatch(
         if serial {
             // rack/psgi：串行单线程池（解释器非线程安全）。
             Ok(serial_pool(&engine_for_pool).run(job).await?)
+        } else if let Some(n) = dedicated_pool_threads(&engine_for_pool) {
+            // cgi：独立窄池（见 dedicated_pool_threads），不占通用池、也不被通用池拖累。
+            Ok(named_pool(&engine_for_pool, n).run(job).await?)
         } else {
             Ok(GENERIC_POOL.run(job).await?)
         }
@@ -344,6 +347,7 @@ struct EnginePool {
 
 static GENERIC_POOL: Lazy<EnginePool> =
     Lazy::new(|| EnginePool::start(generic_pool_threads(), "appffi"));
+/// 命名池表：键是 `引擎#线程数`（既是 rack/psgi 的串行池，也是 cgi 那类独立窄池）。
 static SERIAL_POOLS: Lazy<Mutex<HashMap<String, Arc<EnginePool>>>> =
     Lazy::new(|| Mutex::new(HashMap::new()));
 
@@ -400,12 +404,31 @@ impl EnginePool {
     }
 }
 
-fn serial_pool(engine: &str) -> Arc<EnginePool> {
+/// 按名字取一个固定宽度的引擎池（同名同宽度复用）。
+fn named_pool(engine: &str, threads: usize) -> Arc<EnginePool> {
     SERIAL_POOLS
         .lock()
-        .entry(engine.to_string())
-        .or_insert_with(|| Arc::new(EnginePool::start(1, engine)))
+        .entry(format!("{engine}#{threads}"))
+        .or_insert_with(|| Arc::new(EnginePool::start(threads, engine)))
         .clone()
+}
+
+fn serial_pool(engine: &str) -> Arc<EnginePool> {
+    named_pool(engine, 1)
+}
+
+/// 需要**独立池**的引擎：`None` = 走通用池。
+///
+/// 为什么 cgi 要独立：CGI 引擎每个请求 fork 一个子进程、最长可占 30s（CGI_TIMEOUT_MS），
+/// 是所有引擎里唯一会长时间占住线程的。它跟通用池混在一起时，几个慢脚本就能把通用池
+/// 占满 —— 实测（本机 1 核 → 通用池只有 2 条线程）两个 `sleep 120` 的脚本就让
+/// lua/asp/python 的请求全部排队到客户端超时。独立池既隔离了这种阻塞，
+/// 也顺手把「同时 fork 多少个子进程」限住（内存可控）。
+fn dedicated_pool_threads(engine: &str) -> Option<usize> {
+    match engine {
+        "cgi" => Some(4),
+        _ => None,
+    }
 }
 
 // ---------------------------------------------------------------- dlopen / exec
