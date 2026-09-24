@@ -247,7 +247,10 @@ fn load_from_range_table(conn: &Connection, table: &str, ip: &str) -> Result<Vec
 type FieldScore = (i64, i64, i64);
 
 /// §3.3 查询期过滤：忽略特殊国家码（ZZ/XX/A1/A2）——不参与地理结论。
-fn country_vote_ok(cc: &str) -> bool {
+///
+/// `pub(crate)`：冲突投票（conflict.rs）必须用**同一判定**，否则它会用未过滤的票
+/// 选出 ZZ 之类的特殊码，再覆盖掉这里已过滤好的合并结果（等于整道滤白做）。
+pub(crate) fn country_vote_ok(cc: &str) -> bool {
     let c = cc.trim().to_ascii_uppercase();
     !matches!(c.as_str(), "ZZ" | "XX" | "A1" | "A2")
 }

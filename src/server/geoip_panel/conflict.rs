@@ -18,6 +18,13 @@ pub fn detect_country_conflict(rows: &[CoveringPrefix]) -> (String, bool) {
         if row.country.is_empty() {
             continue;
         }
+        // §3.3：特殊国家码（ZZ/XX/A1/A2）不参与地理结论 —— 这里必须与合并侧
+        // （covering.rs::sanitize 走的 country_vote_ok）用**同一判定**。否则一张权重很高的
+        // 特殊码行（geoip_enrich_iana_special.py 会以 weight 980 写入 ZZ）会在投票里胜出，
+        // 被调用方（merge_pipeline）拿去覆盖掉已经过滤好的合并结果，那道过滤就形同不存在。
+        if !super::covering::country_vote_ok(&row.country) {
+            continue;
+        }
         let entry = votes.entry(row.country.clone()).or_insert((0, 0));
         entry.0 += row.weight.max(1);
         entry.1 = entry.1.max(row.commit_unix);
