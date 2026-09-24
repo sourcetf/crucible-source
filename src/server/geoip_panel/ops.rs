@@ -220,6 +220,16 @@ pub fn set_source(
     Ok(())
 }
 
+/// 进程表里是否还有 `geoip_update.sh`（不依赖锁，兜住「锁已清但进程还在」）。
+fn any_geoip_update_running() -> bool {
+    std::process::Command::new("pgrep")
+        .args(["-f", "geoip_update\\.sh"])
+        .output()
+        .ok()
+        .map(|o| !String::from_utf8_lossy(&o.stdout).trim().is_empty())
+        .unwrap_or(false)
+}
+
 /// 读脚本锁目录里的 pid（脚本自己在 mkdir 成功后写入）。
 fn read_lock_pid(lock_dir: &Path) -> Option<i32> {
     std::fs::read_to_string(lock_dir.join("pid"))
@@ -260,6 +270,12 @@ pub fn spawn_geoip_update(root: &Path) -> Result<()> {
         if proc_is_geoip_update(p) {
             anyhow::bail!("geoip 更新已在进行中（pid={p}），等它跑完再触发");
         }
+    }
+    // 锁**不是**充分条件：脚本正常收尾会用自己的 trap 清掉锁，但主进程可能因为别的原因
+    // 还挂着（实测：脚本记完 done、锁也清了，进程却卡住没退，于是第二轮被放行、两轮同时
+    // 写库 → 后一轮的 merge 撞上 `database is locked` 直接失败）。所以再扫一遍进程表。
+    if any_geoip_update_running() {
+        anyhow::bail!("geoip 更新已有进程在运行（锁已过期但进程仍在），等它结束再触发");
     }
     let child = std::process::Command::new("bash")
         .arg(&script)

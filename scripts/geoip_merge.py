@@ -88,6 +88,9 @@ def main() -> int:
     commit_unix = args.commit_unix or int(time.time())
 
     conn = sqlite3.connect(path)
+    # SQLite 默认 busy_timeout=0：抓到锁就立刻报 "database is locked"。
+    # 更新与面板/其他进程并发时，等一会儿比直接失败强（真并发由单实例锁挡住）。
+    conn.execute("PRAGMA busy_timeout = 30000")
     try:
         if args.init_schema or fresh or args.seed or args.import_layers:
             init_schema(conn)
