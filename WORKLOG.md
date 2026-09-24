@@ -504,3 +504,66 @@ for p in 9095 9081 8443 9445 9446; do printf '%s: ' $p; fstat -n | grep -c ":$p"
 - **连接池条目永不淘汰**：键空间随规则数有界，不是无界增长。
 - **`connect_upstream` 在取池之前无条件拨号**：开 `connection_pool` 时每条请求白建一条上游连接（Tor 规则白开一条电路）。修它要重排「拨号 → ALPN 选 h2 → 取池」的顺序（want_h2 依赖协商结果），改动面超出最小修复，未做。
 - **admin 面板公网可达 + `config.toml` 里是示例口令 `admin`**：这是**投产前用户必须自己处理的一条** —— 改强口令 + 视情况设 `[admin].listeners_allow` 限定端口。
+
+
+---
+
+## 15. GeoIP 数据来源澄清 + 免费管线实测（用户提供原始设计文档后）
+
+### 15.1 澄清：数据本来就是免费来源，不需要任何密钥
+
+用户指出（并给出规格原文 §9）：GeoIP 数据来自**免费多源融合** ——
+rezmoss 云厂商聚合、各云官方 geofeed（AWS/GCP/Cloudflare/OCI/Vultr/Linode）、
+ipapi.is hosting 样例、gaoyifan/china-operator-ip、五大 RIR delegated、QQWry/CERNET/
+ASN/Tor pool，脚本还**硬拒绝** Ip2Region / DB-IP 系 URL（`BLACKLIST_URL_PATTERNS`）。
+`[dns.geo.mmdb] license_key` 那条 MaxMind 路径只是**可选补充**，不是核心数据来源 ——
+我此前把「(d) 真下载无法验证」归因于缺密钥是**搞错了重点**（见 §14.3 末）。
+
+### 15.2 面板「离线更新」真跑一遍：一次抓到 6 个失效源 + 3 个功能缺陷
+
+按真实路径（面板按钮 → `geoip_update.sh` → fetch/merge/enrich/finish）实测，全部修掉：
+
+**fetch 层（`scripts/geoip_fetch_layers.py`）**
+| 源 | 症状 | 修法 |
+|---|---|---|
+| ARIN delegated（12MiB） | 传输中断 `IncompleteRead` → **整源丢失**（最大的国家基线层） | `fetch()` 加 3 次重试 + 退避；实测恢复 **80807 行** |
+| GCP | v6-only 条目里 `ipv4Prefix` 缺失/null → `ipaddress` 迭代 None 抛错 | 逐条容错；实测 **1008 行**（1103 条里 95 条 v6-only 正常跳过） |
+| Oracle | 老 URL 404；新地址 302（urllib 自动跟随）| 换 URL；实测 **1107 行** |
+| Akamai | `ipranges.akamai.com` **已 NXDOMAIN**（域名没了） | 删除该死源（Akamai 段仍由 01-cloud 聚合覆盖，不损失覆盖） |
+| ipapi.is | GitHub API 未认证**按 IP 限流**（60/h），返回 message JSON | 显式识别并报出原因；文件名匹配放宽 |
+| 通用 | 上游形状漂移会让整源失败 | `write_layer` 跳过非 dict 行并计数；`cidr_row` 只接受非空字符串 |
+
+**功能缺陷（都在面板的更新链上）**
+1. **重复触发无保护** → 实测误操作拉起 **4 个并发 updater**（merge/enrich 不是为并发写的）
+   → 服务端以「脚本锁目录 + 校验该 pid 命令行确实是 geoip_update.sh」判活；
+   脚本侧再加 `mkdir` 原子锁（覆盖 cron/手工），锁里记 pid、进程没了自动清陈旧锁。
+2. **pid 复用导致假「进行中」** → 脚本早已退出、pid 被别的进程接手 → 面板永远报
+   「更新已在进行中」；同上改用「锁 + 命令行」判据（`ops::proc_is_geoip_update`）。
+3. **进度 `done` 误报** → 它在「从 `since` 开始的分片」里找 `done`，`since=0` 时会命中
+   好几轮之前的旧 done（更新刚起步就显示"已完成"）→ 改为读**日志尾部** 4KiB 且要求 `!running`。
+4. **磁盘写满导致 merge 默默死在半路** → dmesg 刷 `file system full`，面板只看到"更新没了"、
+   库里还是旧数据 → 脚本加**磁盘预检**（需 ≥ 库大小 + 256MiB，不足则跳过 merge 并给出清理建议）。
+
+**顺带**：`geoip_tor_pool.py` 的 tor worker 是 `--RunAsDaemon` 自我守护化的，脚本退出后照跑 ——
+实测一次采集后 **25 个 tor 进程残留一天**。加 `stop` 子命令，并让 `geoip_update.sh` 结束时自动停池。
+
+### 15.3 实测结果（免费来源，全程无密钥）
+
+| 项 | 结果 |
+|---|---|
+| fetch | **12/13 源成功**（唯一失败 ipapi = GitHub 按 IP 限流，报错已清晰、配额恢复即好） |
+| 全链 | `geoip_update done` 正常收尾，锁被脚本自动清理 ✓ |
+| 数据库 | 行数 **1,709,587 → 3,316,922**；`02-cloud-official` **5,870 → 11,740**（Google/Oracle 修复落库） |
+| 与既有修复的兼容 | `start_i`/`end_i` 数值列与三个 numeric 索引**在更新后依然存在**、0 空值 ✓（更新不会破坏 §13.3 的根治）|
+| 面板 | 更新期间 `running=true/done=false`；查表、filter 正常 |
+
+### 15.4 运维须知（更新链相关）
+
+1. **更新需要 ≈ 库大小 的空闲空间**（900MB 库 → 需 ≥1.2GB）。空间不足时脚本会**跳过 merge**
+   并在日志里说明 —— 这是有意的：宁可保留上一份完整数据，也不要写坏库。
+2. **可清理的缓存**（腾空间用）：`data/geoip/sources/GeoCn.jsonl`（**505MB**，由同目录
+   `GeoCn.mmdb` 经 `scripts/geoip-mmdb2jsonl` 再生 ✓）、`sources/ripe.db.gz`（351MB 下载缓存，
+   其对应的 `ripe.db` 本就是 0 字节 ✓）。
+3. **别在更新运行中替换 `geoip_update.sh`**：bash 按文件偏移递增读取，中途改文件可能让它在
+   下一个命令边界读到错位内容（本轮踩到一次，侥幸没炸）。
+4. tor 池残留用 `python3 scripts/geoip_tor_pool.py stop` 收干净。

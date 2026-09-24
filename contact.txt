@@ -549,3 +549,33 @@ dns/mod.rs+admin_api.rs+admin_ui.html（从区记录只读展示、切 tab 懒�
 5. 代理规则的 API 形状容易搞错：**读** `/api/proxyrules?port=`、**写** `/api/proxy_rules/save` 且 body 必须带 `port`
    （漏了会回 `missing port`）。
 6. 我建的测试文件要清干净：`www-apps/cgi/{.env,sleep.cgi}`；而 `www-apps/{c,go,php,rust}/.env` 是**项目自带**的，别删。
+
+---
+
+### Session 1008 (2026-09-24) — 进展 13（GeoIP 免费数据来源澄清 + 免费管线实测修 6 源 3 缺陷）
+
+**用户澄清**：GeoIP 数据本来就来自**免费多源**（rezmoss 云厂商聚合、各云官方 geofeed、
+ipapi.is hosting、gaoyifan/china-operator-ip、五大 RIR delegated、QQWry/CERNET/ASN/Tor pool，
+脚本硬拒 Ip2Region/DB-IP）；MaxMind license_key 只是**可选补充**。我此前把"真下载没法验证"
+归因于缺密钥是搞错了重点。
+
+**按真实路径（面板按钮）跑了一遍更新，一次抓到并修掉**（提交 `007a27c`/`29a0ffd`）：
+- fetch 层 6 个源失效：ARIN 传输中断丢整源（加 3 次重试，恢复 80807 行）、GCP 的 v6-only
+  条目让 `ipaddress` 迭代 None（逐条容错，1008 行）、Oracle 老 URL 404（换新地址，1107 行）、
+  Akamai 域名已 NXDOMAIN（删源，覆盖由 01-cloud 保留）、ipapi 撞 GitHub IP 限流（报错说清楚）、
+  通用形状漂移容错（write_layer 跳过非 dict 行、cidr_row 只收非空字符串）
+- 重复触发无保护（实测误操作拉起 **4 个并发 updater**）→ 服务端「锁目录 + 校验 pid 命令行」判活，
+  脚本侧加 mkdir 原子锁 + 陈旧锁自动清理
+- **pid 复用**导致假「进行中」（脚本早退出、pid 被别的进程接手）→ 同上判据（`ops::proc_is_geoip_update`）
+- 进度 `done` 在 `since=0` 时会命中旧 done 误报"已完成"→ 改读日志尾部 + 要求 !running
+- **磁盘写满让 merge 默默死在半路**（dmesg `file system full`）→ 脚本加磁盘预检，空间不足
+  跳过 merge 并给清理建议（宁可保留完整旧数据）
+- `geoip_tor_pool.py` 的 tor 是 `--RunAsDaemon`：实测 **25 个 tor 进程残留一天** →
+  加 `stop` 子命令 + 更新链结束时自动停池
+
+**实测**：12/13 源成功；全链 `geoip_update done` 正常收尾；行数 **1.71M → 3.32M**；
+`02-cloud-official` 5870→11740（Google/Oracle 修复落库 ✓）；**§13.3 的数值列与索引在更新后依然完好** ✓。
+
+**运维须知**：更新需 ≈ 库大小的空闲空间（不足会跳过 merge，这是有意的）；
+腾空间可删 `sources/GeoCn.jsonl`（505MB，可由同目录 mmdb 经 `geoip-mmdb2jsonl` 再生）与
+`sources/ripe.db.gz`（351MB 下载缓存）；**别在更新运行中替换 `geoip_update.sh`**（bash 按偏移读文件）。
