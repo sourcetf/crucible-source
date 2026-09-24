@@ -30,14 +30,14 @@ MSYS_NO_PATHCONV=1 python "C:/Users/Administrator/.crucible-remote/_put.py" "C:/
 
 ## 1. 版本状态（先看这里）
 
-- 远端 `HEAD` = **`df5c80f`** = `origin/main`
-- **线上运行的二进制 = build31（09-24 13:08 构建，23m54s，0 error）**，包含到 `df5c80f`：
-  build29/30 的全部内容 + **关停截止时间**（`src/main.rs`：`shutdown_timeout(3s)` + 8s 看门狗
-  `exit(exit_code)`）。部署后实测：9095/8443/9081 全 200、geoip lookup/filter 回归正常、
-  sync 接口回 `{"ok":true,"synced":false,"reason":"mmdb 未启用（未配置 db 路径）"}`、实例数恰 1。
+- 远端 `HEAD` = **`5bab654`** = `origin/main`
+- **线上运行的二进制 = build32（09-24 13:45 构建，7m34s 增量，0 error）**，包含到 `5bab654`：
+  build29/30/31 的全部内容 + **`env_lock` 空变量不再拿锁**（见 §13.8）。
+  部署后实测：9095/8443/9081 全 200、geoip lookup/filter 回归正常、named 正常。
 - ⚠️ **改 `admin_ui.html` 后必须先跑 `python scripts/check_ui_js.py`**（构建前闸门），
   它编进二进制、编译期不检查 JS。
 - ⚠️ **本地不能编译**（见 §0 表格）：本地 `cargo check` 无意义，只能靠远程构建日志。
+- 💡 只改本 crate 的代码时构建只要 **7~8 分钟**（依赖已缓存）；动到依赖才要 21~24 分钟。
 
 ---
 
@@ -418,7 +418,36 @@ for p in 9095 9081 8443 9445 9446; do printf '%s: ' $p; fstat -n | grep -c ":$p"
 （模式的字面量出现在自己的命令行里，见 §13.5 踩坑），于是那个进程根本没收到信号。
 
 **④ 本轮顺带发现（尚未处理，记下来）**
-- **CGI 引擎是串行的**：一个慢脚本（`/cgi/sleep.cgi` 睡 120s）会把整条 `/cgi/` 路径堵住，
-  后续请求全部排队超时。是否是设计如此需要确认；若否，一个慢 CGI 就能拖住整个引擎。
+- ~~**CGI 引擎是串行的**~~ → **已定位并修掉**，见 §13.8。
 - **CGI 子进程不在 `child_registry` 里**：关停后 `sleep 120` 那个子进程成了孤儿（自己 120s 后退出）。
-  引擎子进程（fpm/sidecar）有关停回收，CGI 子进程没有。
+  引擎子进程（fpm/sidecar）有关停回收，CGI 子进程没有。修它需要把 fork 出来的 pid 从 C 引擎
+  回传给 Rust（ABI 变更），影响也有限（脚本跑完即退出），暂不动。
+
+
+---
+
+## 13.8 env_lock：空 `.env` 时仍拿锁 → 同一引擎的请求被全部串行化（`5bab654` / build32）
+
+**怎么发现的**：验证关停修复时顺手做了个并发实验 —— 起一个 `sleep 120` 的 CGI，再请求
+`/cgi/`。结果**两个请求都排队到客户端超时**，而静态口 19081 毫秒级正常。
+
+**定位**：`app_ffi::exec_dispatch` 把非内联引擎的调用包在
+`env_lock::with_temp_env_named(engine, vars, …)` 里；该函数**无条件**取「按引擎」的全局锁，
+并在**整个引擎调用期间持有**（因为「临时改进程环境变量」必须互斥）。可是当 `.env` 变量为空
+——**默认情况**（cgi 的 docroot 里只有 deps/，没有 .env）—— 它什么都不用设却照样拿锁，
+于是同一引擎（php/lua/python/perl/ruby/cgi/uwsgi/wsgi/asgi/jsp…）的所有请求退化成串行执行。
+
+**修法**：`vars.is_empty()` → 直接 `return f()`，连锁都不碰；有变量时逻辑一字未改。
+
+**A/B 验证（同一个脚本 `/tmp/_verify_concurrency.sh`，修复前后各跑一次）**：
+
+| | 基线 `/cgi/` | 慢 CGI 在跑时的 `/cgi/` | 第二个慢 CGI | 静态口 |
+|---|---|---|---|---|
+| build31（修前） | 200 / 20ms | **超时（6s，000）** | 超时 | 200 / 1.5ms |
+| build32（修后） | 200 / 24ms | **200 / 7ms** ✓ | 超时（脚本自己睡 120s，预期） | 200 / 1.1ms |
+
+硬证据：修后 `pgrep -f 'sleep 120'` 同时有 **4 个**（多次实验并存在跑的子进程），
+`/cgi/` 与 `/lua/` 都毫秒级 200 → 引擎并发恢复 ✓
+
+**注意**：`.env` 变量**非空**时该引擎仍会被串行化（进程级 env 互斥是硬约束）。
+要彻底消除得让所有引擎都走 ABI 的 `extra` JSON 传环境（目前只有内联 c/go/rust 用），属后续工作。
