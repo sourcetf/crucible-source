@@ -53,6 +53,30 @@ fn main() -> Result<()> {
     });
     // 退出路径：终止注册的引擎子进程，防止孤儿 fpm / sidecar 堆积。
     server::apps::child_registry::kill_all();
+    // 关停必须有**截止时间**。
+    //
+    // `Runtime` 被 drop 时会等所有 `spawn_blocking` 任务收尾，而那些任务里是同步 IO
+    // （引擎 sidecar 的阻塞 UnixStream、CGI 子进程、各种 fs/DB 调用）——对端不响应就永久
+    // 卡住。实测：一个实例收到 SIGTERM 后**关掉了监听端口却带着一个连接残留 6 小时**没退出，
+    // 表现是 `pgrep` 里总有多余的 webserver 进程（它不监听、不服务任何请求），
+    // 部署后旧实例就这样赖着不走。所以：先是 shutdown_timeout 限时收尾，再留一个看门狗
+    // 兜底（万一连析构路径也在做同步 IO），保证进程一定会退出。
+    let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+    let exit_code = if result.is_ok() { 0 } else { 1 };
+    std::thread::spawn(move || {
+        if done_rx
+            .recv_timeout(std::time::Duration::from_secs(8))
+            .is_err()
+        {
+            log::warn!(
+                "shutdown: 8s 内未能正常退出 → 强制 exit({exit_code})（有阻塞任务未收尾）"
+            );
+            std::process::exit(exit_code);
+        }
+    });
+    rt.shutdown_timeout(std::time::Duration::from_secs(3));
+    // 正常路径：main 返回即进程退出，看门狗线程随之消失。
+    drop(done_tx);
     result
 }
 
