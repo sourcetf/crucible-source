@@ -583,10 +583,12 @@ fn lookup_json(ip_s: &str, db_path: Option<&std::path::Path>) -> Response<BoxBod
 
     match db::open(db_path) {
         Ok(conn) => {
-            let covering_rows = covering::load_covering_prefixes(&conn, &ip.to_string())
-                .unwrap_or_default();
-            match covering::lookup_merged(&conn, &ip.to_string()) {
-                Ok(m) => {
+            // 一次扫描同时拿到合并结果与命中的前缀行：原先这里先调一次
+            // load_covering_prefixes，lookup_merged 内部又调一次 —— 同一个请求把
+            // ipv4/ipv6 全表扫了两遍，而这是面板最热的路径（且两张表都没有可用的
+            // 数值范围索引，见 covering.rs::load_from_range_table 的说明）。
+            match covering::lookup_merged_with_rows(&conn, &ip.to_string()) {
+                Ok((m, covering_rows)) => {
                     let mut gr = lookup::GeoResult::from_merged(m);
                     if !gr.isp.is_empty() {
                         gr.isp = aliases::resolve_isp_alias(&gr.isp);

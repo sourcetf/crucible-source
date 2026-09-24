@@ -482,9 +482,30 @@ fn prefer_field(
 
 pub fn lookup_merged(conn: &Connection, ip: &str) -> Result<MergedFields> {
     let rows = load_covering_prefixes(conn, ip)?;
-    let mut merged = merge_covering(&rows);
+    Ok(merge_pipeline(conn, ip, &rows))
+}
+
+/// 与 [`lookup_merged`] 相同，但**把命中的 covering 行一并返回**。
+///
+/// 面板的 lookup 接口既要合并结果、又要展示命中的前缀列表；原先它自己再调一次
+/// [`load_covering_prefixes`] —— 同一个请求把 ipv4/ipv6 全表扫了两遍（这两张表
+/// 没有可用的数值范围索引，见 [`load_from_range_table`]）。这里让两条需求共用
+/// 同一次扫描。
+pub fn lookup_merged_with_rows(
+    conn: &Connection,
+    ip: &str,
+) -> Result<(MergedFields, Vec<CoveringPrefix>)> {
+    let rows = load_covering_prefixes(conn, ip)?;
+    let merged = merge_pipeline(conn, ip, &rows);
+    Ok((merged, rows))
+}
+
+/// 合并 + 冲突投票抑制 + 面板编辑覆盖。抽出来是为了让 [`lookup_merged`] 与
+/// [`lookup_merged_with_rows`] 共用同一套语义（唯一差别是后者把行也返回）。
+fn merge_pipeline(conn: &Connection, ip: &str, rows: &[CoveringPrefix]) -> MergedFields {
+    let mut merged = merge_covering(rows);
     if let Ok(ip_addr) = ip.parse::<std::net::IpAddr>() {
-        let (country, conflict) = super::conflict::detect_country_conflict(&rows);
+        let (country, conflict) = super::conflict::detect_country_conflict(rows);
         if !country.is_empty() {
             merged.country = country;
         }
@@ -497,7 +518,7 @@ pub fn lookup_merged(conn: &Connection, ip: &str) -> Result<MergedFields> {
     if let Ok(panel) = super::db::open_panel(std::path::Path::new("data/geoip/panel.sqlite")) {
         let _ = super::ops::apply_panel_edits(&panel, &mut merged);
     }
-    Ok(merged)
+    merged
 }
 
 #[cfg(test)]
