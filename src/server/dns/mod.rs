@@ -2104,16 +2104,49 @@ fn normalize_rr(line: &str) -> String {
 }
 
 /// 从 `... SOA mname rname SERIAL ...` 行里取 serial。
+///
+/// 必须同时认两种形态，因为我们**自己生成的就是后者**：
+///   单行：`@ IN SOA ns1 hostmaster 1790211513 …`
+///   多行括号：
+///     `@ IN SOA ns1 hostmaster (`
+///     `  1790211513 ; serial`
+/// 旧实现只做 `toks.get(soa + 3)?.parse()`，在多行形态下那个位置是 `(` —— 解析必然失败，
+/// 于是 serial_from_zone_text 对我们自己的 zone 文件永远返回 None：文件地板与 DB 高水位
+/// 都是死的，serial 退化成 now（同一秒内两次写入算出同一个值，BIND 判定分区未变、
+/// 继续服务旧内容）。这是"面板加了记录却查不到"最底层的成因。
 fn soa_serial_from_line(line: &str) -> Option<u64> {
     let toks: Vec<&str> = line.split_whitespace().collect();
     let soa = toks.iter().position(|t| t.eq_ignore_ascii_case("SOA"))?;
     // SOA 之后：mname rname serial …
-    toks.get(soa + 3)?.parse::<u64>().ok()
+    let t = toks.get(soa + 3)?;
+    if let Ok(v) = t.trim_matches(['(', ')']).parse::<u64>() {
+        return Some(v);
+    }
+    // 括号形态：剥掉括号后再看紧随其后的少数 token。**只看 3 个**，
+    // 免得越过 serial 误取 refresh/retry 之类的数字。
+    toks.iter()
+        .skip(soa + 4)
+        .take(3)
+        .find_map(|x| x.trim_matches(['(', ')']).parse::<u64>().ok())
 }
 
 /// 从完整 zone 文本里取 SOA serial。
+///
+/// **必须整段扫描，不能逐行找**：我们自己生成的 SOA 是括号多行形态，
+/// `mname`/`rname`/`serial` 被换行隔开，逐行解析永远取不到 serial
+/// （见 [`soa_serial_from_line`] 的说明）。做法与下面的 rootzone_current_serial 一致：
+/// 定位 SOA token，跳过 mname/rname，取其后第一个纯数字。
 fn serial_from_zone_text(text: &str) -> Option<u64> {
-    text.lines().find_map(soa_serial_from_line)
+    let toks: Vec<&str> = text.split_whitespace().collect();
+    let soa = toks.iter().position(|t| t.eq_ignore_ascii_case("SOA"))?;
+    let t = toks.get(soa + 3)?;
+    if let Ok(v) = t.trim_matches(['(', ')']).parse::<u64>() {
+        return Some(v);
+    }
+    toks.iter()
+        .skip(soa + 4)
+        .take(3)
+        .find_map(|x| x.trim_matches(['(', ')']).parse::<u64>().ok())
 }
 
 fn rootzone_current_serial(dst: &Path) -> Option<u64> {
