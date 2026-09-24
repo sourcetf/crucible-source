@@ -238,3 +238,52 @@ zone X/IN (unsigned): not loaded due to errors.
 `dig @127.0.0.1 <zone> AXFR` 看实际服务内容；以及**注意 dig 的位置参数顺序** ——
 `dig @server <zone> www A` 会把 `www` 当 type（我因此两次误判「查不到」，实际是查询语句写错了），
 正确写法是 `dig @127.0.0.1 www.<zone> A`。
+
+
+---
+
+## 12. 进度追加 5：DNS 主区/从区全部跑通（含两次我自己的测试设计错误）
+
+### 12.1 主区「加了记录却查不到」的根因与修法
+- 现象：同一秒内「建区 + 加记录」，dig 查不到新记录；named 日志给出
+  `zone X/IN (unsigned): ixfr-from-differences: new serial (…) out of range [前值+1 - …]` / `not loaded due to errors`。
+- 机制：开 inline-signing 后 BIND 每次签名都会把 serial 往上顶，它的 last-seen 是这个签名后的值；
+  而我们每次写完 zone 文件就把 .signed 删掉（为避免 journal out of sync），等于把唯一线索断了。
+  于是「文件 serial + 1」可能仍低于 BIND 已知值 → BIND 拒载整个 zone → 记录不生效、
+  从区来拉 SOA 得 SERVFAIL。隔一两秒再操作会因时间戳型 serial 自然追平而「自愈」，
+  所以极难手工复现 —— 这正是它长期潜伏的原因。
+- 修法（75c9e06）：write_all 里新增 named_zone_serial()，复用现成 rndc() 跑 zonestatus，
+  解析 serial 与 signed serial 取较大者，作为地板参与 max(文件, DB 高水位, named) + 1。
+- 验证（探针脚本，两种时序都跑）：同一秒内与隔 1.5 秒都 OK，日志无 out of range。
+
+### 12.2 primaries 的 host:port 必须翻译（1a9e0c5）
+valid_primary 允许 `192.0.2.1:53`（面板友好，还有单测断言它合法），但生成 named.conf 时是原样输出，
+而 BIND 的 primaries 没有 host:port 这种写法（端口要写 `host port N`）—— 会让 named 拒载整份
+named.conf，所有 zone 一起不可用（与之前 primaries 多一个分号同类的「一处格式错、全份失效」）。
+新增 primary_for_named() 做翻译。实测生成的声明已是 `primaries { 127.0.0.1 port 5353; }` 且被 named 接受。
+
+### 12.3 从区（secondary）已完整跑通
+拓扑：测试实例当**主区**（config-test.toml + CRUCIBLE_DNS_STATE_ROOT 隔离，named 听 127.0.0.1:5353，
+AXFR 自测通过）→ 生产实例把**同名** zone 建为 secondary，primaries 指向 127.0.0.1:5353 →
+**第 166 秒**传输完成，生产 :53 能查到主区记录（203.0.113.88）。
+
+**我在这上面错了两次，都是测试设计问题，不是产品缺陷**（记下来避免重犯）：
+1. 第一次把从区建成了 `zz6-slave.example`，却让它去主区拉同名分区 —— 从区必须与主区**同名**，
+   主区没有那个名字自然 SERVFAIL。
+2. 等待窗口给成了 30s/180s —— BIND 对新建从区首次失败后的重试是**分钟级**，实测 166 秒才完成。
+
+### 12.4 满盘事件（运维，重要）
+磁盘曾到 **101%（可用 -18MB）**，直接后果：named 写不了 journal（日志
+`managed-keys.bind.jnl: flush: disc full`）、测试实例启动卡在 half-way、从区行为异常 ——
+排查时容易被误当成产品 bug。已回收约 355MB：BoringSSL 的 .o 对象文件、target/release/deps 的
+*.rmeta（check 用元数据，可再生）、boringssl/bin、以及 /tmp 下我的日志。
+**规则：构建前先 `df -h /` 确认 ≥1GB**（release + thin LTO 很吃盘），否则会构建失败或把生产写崩。
+
+### 12.5 GeoIP 本轮已修 / 仍待
+- 已修（6a8a3d8）：面板 lookup 每请求把 ipv4/ipv6 全表扫两遍 → 抽出 lookup_merged_with_rows
+  合并为一次扫描，merge 步骤抽成 merge_pipeline 保证两个入口语义一致。
+- 仍待：(b) ops.rs filter 先 ORDER BY weight LIMIT 5000 再在 Rust 里过滤（结果静默截断）；
+  (c) ZZ/XX/A1/A2 被 detect_country_conflict 用未过滤值覆盖回；(d) dns/geoip.rs::ensure_synced
+  只在文件不存在时下载、force 也只更新时间戳；(a) 全表扫描的根治需给 ipv4/ipv6 加数值列 + 回填
+  + Python 侧同步写入（风险较高，别只改 Rust）。
+- 未解（非阻塞）：meta 表 serial:<zone> 高水位没落库，且把 let _ = 改成 log::warn 后也无告警。
