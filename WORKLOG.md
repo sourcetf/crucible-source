@@ -3,7 +3,7 @@
 > 这份文件的用途：**上下文压缩/换人之后仍能准确接着干**。
 > 只写事实与可复现的命令；**不写任何凭据**（SSH 口令、GitHub token 不在仓库内）。
 
-最后更新：2026-09-23
+最后更新：2026-09-24
 
 ---
 
@@ -29,15 +29,14 @@ MSYS_NO_PATHCONV=1 python "C:/Users/Administrator/.crucible-remote/_put.py" "C:/
 
 ## 1. 版本状态（先看这里）
 
-- 远端 `HEAD` = **`2164409`** = `origin/main`
-- **线上运行的二进制 = 15:32 那版**，包含：
-  - TLS 面板的版本（1.0/1.1/1.2/1.3）+ 密码套件（含"填入常用套件/清空"）
-  - 导航分「全局配置 / 站点配置」两组
-  - GeoIP 离线更新的进度界面（**但接口 404**，见下）
-- **已提交、尚未构建上线**：
-  - `e0bac78` 修 `/api/geoip/update/status` 路由嵌套（它被套进 `/api/geoip/status` 分支里，路径不以 `/api/geoip/status` 结尾 → 恒 404，落回 `admin route not found`）
-  - `2164409` DNS 分线路由 JSON 文本框改为**结构化表格**
-- ⚠️ 那次为 `e0bac78` 启动的构建**不含** `2164409`（改在后）。**需要再构建一次**才能三者一起上线。
+- 远端 `HEAD` = **`1dff5e3`** = `origin/main`
+- **线上运行的二进制 = build28（09-24 10:28 构建，PID 87352 于 10:33 启动）**，包含到 `07988d6`：
+  WebUI 换行修复 + `check_ui_js.py` 门禁、Agent B/C 的代理与管理面加固、GeoIP 的 (b)(c)(d)、
+  DNS 的 named serial 地板与 primaries 翻译。
+- **已提交、本轮回构建才会上线**：`1dff5e3`（`serial_from_zone_text` 多行 SOA 解析）
+  + GeoIP (a) 根治（ipv4/ipv6 数值范围列）。
+- ⚠️ **改 `admin_ui.html` 后必须先跑 `python scripts/check_ui_js.py`**（构建前闸门），
+  它编进二进制、编译期不检查 JS。
 
 ---
 
@@ -282,8 +281,64 @@ AXFR 自测通过）→ 生产实例把**同名** zone 建为 secondary，primar
 ### 12.5 GeoIP 本轮已修 / 仍待
 - 已修（6a8a3d8）：面板 lookup 每请求把 ipv4/ipv6 全表扫两遍 → 抽出 lookup_merged_with_rows
   合并为一次扫描，merge 步骤抽成 merge_pipeline 保证两个入口语义一致。
-- 仍待：(b) ops.rs filter 先 ORDER BY weight LIMIT 5000 再在 Rust 里过滤（结果静默截断）；
-  (c) ZZ/XX/A1/A2 被 detect_country_conflict 用未过滤值覆盖回；(d) dns/geoip.rs::ensure_synced
-  只在文件不存在时下载、force 也只更新时间戳；(a) 全表扫描的根治需给 ipv4/ipv6 加数值列 + 回填
-  + Python 侧同步写入（风险较高，别只改 Rust）。
-- 未解（非阻塞）：meta 表 serial:<zone> 高水位没落库，且把 let _ = 改成 log::warn 后也无告警。
+- 已修：(b) `984cdec` filter 先 ORDER BY weight LIMIT 5000 再过滤导致静默截断；
+  (c) `252e983` ZZ/XX/A1/A2 被 detect_country_conflict 用未过滤值覆盖回；
+  (d) `07988d6` ensure_synced 只在文件存在时跳过、force 只更新时间戳 → 现在真下载，
+  且 fetch_edition 先写 .tmp 再原子改名。
+- 已修（本轮，(a) 根治）：见 §13.3。ipv4/ipv6 现已带数值范围列 + 索引 + 回填 + 写入侧同步。
+- **未解→已定位**：meta 表 `serial:<zone>` 高水位没落库的**真正死因**是
+  `serial_from_zone_text` 只认单行 SOA，而我们自己生成的 zone 文件是**多行（括号续行）** SOA
+  → 该函数恒返回 None → 高水位从未写入，`prev_serial` 退化到 `now` → 同一秒两次写入得到
+  相同的 serial → BIND 认为 "zone unchanged"。`1dff5e3` 改成整段 token 扫描 + 括号容忍。
+  **待 build29 部署后复验**（复验点：加一条记录后 `meta` 表应出现 `serial:<zone>` 行）。
+
+
+---
+
+## 13. 进度追加 6：WebUI 全废根因 + 两个并行修复 agent + GeoIP (a) 根治
+
+### 13.1 WebUI「永远停在加载中」的根因（f6c3551 / ed046ee / 9753111）
+`admin_ui.html` 里有 **8 处**把真实换行写进了 JS 字符串或正则字面量（本意是 `\n`）→
+整个内联 `<script>` 语法错误 → 页面所有按钮失效、内容区停在加载中。
+`include_str!` 把 HTML 编进二进制，**Rust 编译期完全不校验 JS**，所以构建永远是绿的。
+防复发：新增 `scripts/check_ui_js.py`（纯 Python，esprima 4.0，ES2018 + 兼容 ES2019 `catch {`），
+**改 HTML 后必须跑**。注意两个坑：esprima 4.0 不认 ES2019 可选 catch 绑定（已做归一化）；
+无 esprima 时脚本只 WARN 不 FAIL（否则会因环境差异卡住构建）。
+
+### 13.2 两个并行 agent 的修复（aae843e）
+- **Agent B（代理/Tor）9 项**：上游三段超时（10s/30s/300s）、fail-open 的上游 URI 变成回环 SSRF、
+  池键把 scheme 当 `use_tor` 传 → 跨规则复用连接、Host 头丢非默认端口、tor_socks 回环约束、
+  CONNECT-UDP 漏 NAT64/6to4/Teredo/CGNAT、删掉撒谎的 `tor_client.rs`、tor_pool/NEWNYM。
+- **Agent C（管理面/服务）8 项**：`/__metrics` 移到 ACL 与限流之后、admin 先鉴权再缓冲 body、
+  跨站请求 403、`safe_join` 符号链接逃逸（含回归单测）、Basic Auth 按 IP 指数退避、
+  rate_limit 改淘汰而非整体清空、sidecar per-key 锁 + 子进程回收、read_file 先判上限再读。
+
+### 13.3 GeoIP (a) 根治：ipv4/ipv6 数值范围列（本轮）
+**问题**：`load_from_range_table` 是 `SELECT` 全表 + 在 Rust 里逐行判定；这两张表一旦被
+导入大量行，每次查询都全表扫描（而且跑在 async worker 上）。
+
+**改法（Rust 与 Python 必须成对改，只改一侧会让新写入的行查不到）**：
+| 侧 | 文件 | 改动 |
+|---|---|---|
+| Rust | `geoip_panel/iputil.rs` | 新增 `range_numeric_key()`：v4→u32；v6→**高 64 位**按 `hi ^ 2^63` 映射进 i64 |
+| Rust | `geoip_panel/db.rs` | `create_range_table` 建表带 `start_i`/`end_i` + 老库 `ALTER` + `idx_*_numeric` |
+| Rust | `geoip_panel/covering.rs` | 查询加 `WHERE start_i IS NULL OR (start_i <= ?1 AND end_i >= ?1)` |
+| Python | `geoip_common.py` | `range_numeric_key()`（**按地址族分支**，不是按数值大小）+ 建表补列 + `_backfill_range_numeric` + `init_schema` 调用 |
+| Python | `geoip_seed_demo.py` / `geoip_enrich_cloud_official.py` | 3 处裸 INSERT 补 `start_i`/`end_i` |
+
+**关键设计点（别改错）**：
+- IPv6 是 128 位、SQLite INTEGER 只有 64 位 → 取高 64 位并做**保序**折叠。因此
+  `start_i <= key <= end_i` 只是「落在区间内」的**必要条件**（能走索引、不漏行），
+  精确的 128 位判定仍由 `ipv4_in_range`/`ipv6_in_range` 在 Rust 侧兜底。
+- 查询里 `start_i IS NULL` **必须放行**：未回填的老行否则会静默消失。
+- Python 侧**必须按 `addr.version` 分支**。我先写成 `if v < 1<<32`（按数值大小）→
+  `::`、`::1` 这类小数值 IPv6 走了 v4 分支，与 Rust 不一致 —— 验证脚本抓到了这个 bug。
+- **跨语言互锁**：Rust 单测 `range_key_matches_python_literals` 里的字面量由 Python 算出，
+  改任一侧都必须同步改另一侧。
+- 仓库外验证脚本：`C:\Users\Administrator\.crucible-remote\_verify_range.py`
+  （不依赖被测实现的独立算法比对 + 边界字面量 + 新库/老库两条路径 + 查询命中），本轮 0 FAIL。
+
+### 13.4 磁盘（运维）
+清了 `/tmp/xortest`、`/tmp/stuncheck`（我为探测 Tor/STUN 建的临时 crate，各带 260MB target）
+→ 空闲由 603MB 回到 **1.1G**。
+**不要删**（不是我的）：`/root/legacy-backup`、`/root/ReMgr`、`/tmp/frp*`、`/tmp/rdcheck`、`/tmp/mkhash`。

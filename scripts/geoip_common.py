@@ -116,6 +116,99 @@ def _clean_ip_text(v: object) -> str:
     return str(v or "").strip().rstrip("\x00").strip()
 
 
+def range_numeric_key(ip_text: str) -> int | None:
+    """ipv4/ipv6 range 表 `start_i`/`end_i` 的数值键；解析失败返回 None。
+
+    必须与 Rust `iputil::range_numeric_key` **逐位一致**，否则新导入的行查不到。
+    IPv4：地址的 u32 值。IPv6：128 位装不进 SQLite 的 i64，取高 64 位并按
+    `hi ^ 2^63` 映射进有符号 i64 —— 该映射保序，故 `start_i <= key <= end_i`
+    是「落在区间内」的必要条件（能走索引），精确的 128 位判定在 Rust 侧完成。
+    """
+    try:
+        addr = ipaddress.ip_address(_clean_ip_text(ip_text))
+    except ValueError:
+        return None
+    # 必须按**地址族**分支，不能按数值大小（`::`、`::1` 数值很小但属于 IPv6）。
+    if addr.version == 4:
+        return int(addr)
+    x = (int(addr) >> 64) ^ (1 << 63)
+    return x - (1 << 64) if x >= (1 << 63) else x
+
+
+def _create_range_table(conn: sqlite3.Connection, name: str) -> None:
+    conn.execute(
+        f"""CREATE TABLE IF NOT EXISTS {name} (
+            start TEXT NOT NULL,
+            end TEXT NOT NULL,
+            bits INTEGER DEFAULT 0,
+            weight INTEGER DEFAULT 0,
+            country TEXT,
+            province TEXT,
+            region TEXT,
+            city TEXT,
+            district TEXT,
+            isp TEXT,
+            asn TEXT,
+            as_org TEXT,
+            net_org TEXT,
+            cloud_provider TEXT,
+            cloud_region TEXT,
+            cloud_service TEXT,
+            hosting TEXT,
+            division_code TEXT,
+            prefix TEXT,
+            source TEXT,
+            e_country INTEGER DEFAULT 0,
+            e_province INTEGER DEFAULT 0,
+            e_region INTEGER DEFAULT 0,
+            e_city INTEGER DEFAULT 0,
+            e_district INTEGER DEFAULT 0,
+            e_isp INTEGER DEFAULT 0,
+            e_asn INTEGER DEFAULT 0,
+            e_as_org INTEGER DEFAULT 0,
+            e_net_org INTEGER DEFAULT 0,
+            e_cloud_provider INTEGER DEFAULT 0,
+            e_cloud_region INTEGER DEFAULT 0,
+            e_cloud_service INTEGER DEFAULT 0,
+            e_hosting INTEGER DEFAULT 0,
+            e_dc INTEGER DEFAULT 0,
+            e_division_code INTEGER DEFAULT 0,
+            commit_unix INTEGER DEFAULT 0,
+            start_i INTEGER,
+            end_i INTEGER
+        )"""
+    )
+    conn.execute(f"CREATE INDEX IF NOT EXISTS idx_{name}_start ON {name}(start)")
+    conn.execute(f"CREATE INDEX IF NOT EXISTS idx_{name}_range ON {name}(start, end)")
+    # 老库建表时没有数值范围列；CREATE TABLE IF NOT EXISTS 不补列，需显式 ALTER。
+    for col in ("start_i", "end_i"):
+        try:
+            conn.execute(f"ALTER TABLE {name} ADD COLUMN {col} INTEGER")
+        except sqlite3.OperationalError:
+            pass
+    conn.execute(f"CREATE INDEX IF NOT EXISTS idx_{name}_numeric ON {name}(start_i, end_i)")
+
+
+def _backfill_range_numeric(conn: sqlite3.Connection, name: str) -> int:
+    """回填 range 表的 start_i/end_i（幂等：只填空值），返回行数。"""
+    try:
+        rows = conn.execute(
+            f"SELECT rowid, start, end FROM {name} WHERE start_i IS NULL OR end_i IS NULL"
+        ).fetchall()
+    except sqlite3.OperationalError:
+        return 0
+    upd = []
+    for rowid, s, e in rows:
+        si = range_numeric_key(s)
+        ei = range_numeric_key(e)
+        if si is None or ei is None:
+            continue
+        upd.append((si, ei, rowid))
+    if upd:
+        conn.executemany(f"UPDATE {name} SET start_i = ?, end_i = ? WHERE rowid = ?", upd)
+    return len(upd)
+
+
 def _backfill_numeric(conn: sqlite3.Connection) -> int:
     """把 start_i/end_i 空值补成真实整数，返回补的行数。
 
@@ -218,6 +311,8 @@ def init_schema(conn: sqlite3.Connection) -> None:
     _backfill_numeric(conn)
     _create_range_table(conn, "ipv4")
     _create_range_table(conn, "ipv6")
+    _backfill_range_numeric(conn, "ipv4")
+    _backfill_range_numeric(conn, "ipv6")
     # §2.6：anycast 表——bgptools/anycast-prefixes 与 RIPE anycast 提取写入这里，
     # 查询侧（Rust anycast.rs）读表判定 + 国家票 30% 共识抑制。
     conn.execute(

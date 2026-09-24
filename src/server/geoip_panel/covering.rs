@@ -184,7 +184,10 @@ fn load_from_geoip(conn: &Connection, ip: &str) -> Result<Vec<CoveringPrefix>> {
 fn load_from_range_table(conn: &Connection, table: &str, ip: &str) -> Result<Vec<CoveringPrefix>> {
     // table name is internal only (ipv4/ipv6). Column order MUST match map_covering_row
     // (index 10 = dc; ipv4/ipv6 schema has no dc column → empty string).
-    // Filter in Rust — SQLite TEXT compare breaks on "9." vs "10.".
+    // §23.8：数值范围列预过滤（idx_*_numeric）。`start_i IS NULL` 的老行必须放行——
+    // 否则未回填的行会静默消失（精确包含判定仍在 Rust 侧，放行多余行无害）。
+    // 列语义见 iputil::range_numeric_key；解析失败时 key=0，反正下面 Rust 判定必拒。
+    let key = crate::server::geoip_panel::iputil::range_numeric_key(ip).unwrap_or(0);
     let sql = format!(
         "SELECT COALESCE(prefix, start || '-' || end),
                 COALESCE(bits, 0),
@@ -219,10 +222,11 @@ fn load_from_range_table(conn: &Connection, table: &str, ip: &str) -> Result<Vec
                 COALESCE(e_hosting, 0),
                 start,
                 end
-         FROM {table}"
+         FROM {table}
+         WHERE start_i IS NULL OR (start_i <= ?1 AND end_i >= ?1)"
     );
     let mut stmt = conn.prepare(&sql)?;
-    let rows = stmt.query_map([], |row| {
+    let rows = stmt.query_map([key], |row| {
         let p = map_covering_row(row)?;
         let start: String = row.get(31)?;
         let end: String = row.get(32)?;

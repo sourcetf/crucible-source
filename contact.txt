@@ -436,6 +436,27 @@ file_open 的归一化改动会影响所有分发路径（`mode_for_path` 在 ap
 （已在生产重启时踩到两次，服务短暂中断后立即拉回）。可靠写法是
 `cd DIR && nohup BIN ... & echo launched; sleep N` 单独一条命令，随后另起一条验证。
 
-### 交接文件
-完整工作状态（环境/命令/坑/待办/未修项）已写入仓库根目录 **WORKLOG.md** —— 上下文压缩或换人后请先读它。
-本文件(contact.txt)继续用于多成员协作登记；WORKLOG.md 用于「接着干」的单一入口。
+---
+
+### Session 1008 (2026-09-24) — 进展 9（第六轮：WebUI 全废根因、并行 agent 加固、GeoIP 数值列根治）
+
+**我改动的文件（供其他成员避让；本轮只动这 6 个源码文件 + 2 个文档）**
+```
+src/server/geoip_panel/iputil.rs      新增 range_numeric_key() + 3 个单测（含跨语言互锁字面量）
+src/server/geoip_panel/db.rs          create_range_table 补 start_i/end_i + 老库 ALTER + idx_*_numeric
+src/server/geoip_panel/covering.rs    load_from_range_table 加数值预过滤（NULL 行放行）
+scripts/geoip_common.py               range_numeric_key（按地址族分支）+ 建表/回填 + init_schema 接线
+scripts/geoip_seed_demo.py            ipv4/ipv6 两处 INSERT 补数值列
+scripts/geoip_enrich_cloud_official.py ipv4 INSERT 补数值列（兜底建表同步）
+WORKLOG.md / contact.txt              文档
+```
+
+**要点**
+1. WebUI「卡加载中」= `admin_ui.html` 内联脚本里有 8 处真实换行写进了字符串/正则 → 整段
+   脚本解析失败。`include_str!` 编进二进制，**Rust 编译期不校验 JS**，所以构建恒绿。
+   防复发闸门：`python scripts/check_ui_js.py`（**改 HTML 后必跑**）。
+2. GeoIP ipv4/ipv6 数值范围列：**Rust 与 Python 必须成对改**，只改一侧会让新导入的行查不到。
+   IPv6 用「高 64 位保序折叠」当**必要条件**预过滤，精确 128 位判定仍在 Rust 侧；
+   查询必须放行 `start_i IS NULL` 的未回填行。
+3. 磁盘：清了我 `/tmp/{xortest,stuncheck}`（547MB）→ 空闲 1.1G。
+   **不是我的别删**：`/root/legacy-backup`、`/root/ReMgr`、`/tmp/frp*`、`/tmp/rdcheck`、`/tmp/mkhash`。

@@ -23,6 +23,7 @@ from geoip_common import (  # noqa: E402
     SOURCES_JSON,
     init_panel_schema,
     init_schema,
+    range_numeric_key,
     seed_panel_demo,
     upsert_range,
     write_sources_meta,
@@ -176,8 +177,8 @@ def seed_ipv4_row(conn: sqlite3.Connection, start: str, end: str, fields: dict, 
             division_code, prefix, source,
             e_country, e_province, e_city, e_district, e_isp,
             e_asn, e_as_org, e_cloud_provider, e_cloud_region, e_cloud_service, e_hosting,
-            commit_unix
-        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            commit_unix, start_i, end_i
+        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
         (
             start,
             end,
@@ -210,6 +211,8 @@ def seed_ipv4_row(conn: sqlite3.Connection, start: str, end: str, fields: dict, 
             cu if fields.get("cloud_service") else 0,
             cu if fields.get("hosting") else 0,
             cu,
+            range_numeric_key(start),
+            range_numeric_key(end),
         ),
     )
 
@@ -269,8 +272,9 @@ def main() -> int:
             asn, as_org, cloud_provider, cloud_region, cloud_service, hosting,
             division_code, prefix, source, commit_unix,
             e_country, e_province, e_city, e_district, e_isp,
-            e_asn, e_as_org, e_cloud_provider, e_cloud_region, e_cloud_service, e_hosting
-        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            e_asn, e_as_org, e_cloud_provider, e_cloud_region, e_cloud_service, e_hosting,
+            start_i, end_i
+        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
         (
             "2001:db8::",
             "2001:db8::ffff",
@@ -303,6 +307,8 @@ def main() -> int:
             0,
             0,
             cu,
+            range_numeric_key("2001:db8::"),
+            range_numeric_key("2001:db8::ffff"),
         ),
     )
 

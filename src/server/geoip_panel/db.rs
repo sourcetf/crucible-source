@@ -72,10 +72,20 @@ fn create_range_table(conn: &Connection, name: &str) -> Result<()> {
             e_cloud_region INTEGER DEFAULT 0,
             e_cloud_service INTEGER DEFAULT 0,
             e_hosting INTEGER DEFAULT 0,
-            commit_unix INTEGER DEFAULT 0
+            commit_unix INTEGER DEFAULT 0,
+            start_i INTEGER,
+            end_i INTEGER
         );
         CREATE INDEX IF NOT EXISTS idx_{name}_start ON {name}(start);
         CREATE INDEX IF NOT EXISTS idx_{name}_range ON {name}(start, end);"
+    ))?;
+    // 老库的 ipv4/ipv6 建表时还没有数值范围列，CREATE TABLE IF NOT EXISTS 不会补列。
+    // 列语义见 iputil::range_numeric_key（Python 侧 geoip_common.range_numeric_key 同义）。
+    for col in ["start_i", "end_i"] {
+        let _ = conn.execute(&format!("ALTER TABLE {name} ADD COLUMN {col} INTEGER"), []);
+    }
+    conn.execute_batch(&format!(
+        "CREATE INDEX IF NOT EXISTS idx_{name}_numeric ON {name}(start_i, end_i);"
     ))?;
     Ok(())
 }

@@ -11,6 +11,12 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 DB = ROOT / "data" / "geoip" / "current" / "geoip.sqlite"
 
+_SCRIPTS = Path(__file__).resolve().parent
+if str(_SCRIPTS) not in sys.path:
+    sys.path.insert(0, str(_SCRIPTS))
+
+from geoip_common import range_numeric_key  # noqa: E402
+
 # Minimal seed covering common test IPs + structure for §23 cloud fields.
 SEED = [
     # 1.1.1.0/24 Cloudflare
@@ -73,10 +79,12 @@ def seed(conn: sqlite3.Connection) -> int:
         try:
             conn.execute(
                 """INSERT INTO ipv4(start, end, bits, weight, cloud_provider, cloud_region,
-                   cloud_service, asn, as_org, country, source, e_cloud_provider, e_asn, commit_unix)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,strftime('%s','now'))""",
+                   cloud_service, asn, as_org, country, source, e_cloud_provider, e_asn, commit_unix,
+                   start_i, end_i)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,strftime('%s','now'),?,?)""",
                 (start, end, bits, weight, cloud, region, service, asn, as_org,
-                 "US" if cloud else "CN", "cloud_official", 100 if cloud else 0, 80),
+                 "US" if cloud else "CN", "cloud_official", 100 if cloud else 0, 80,
+                 range_numeric_key(start), range_numeric_key(end)),
             )
         except sqlite3.OperationalError:
             pass
@@ -86,14 +94,15 @@ def seed(conn: sqlite3.Connection) -> int:
 
 def main() -> int:
     conn = ensure_db(DB)
-    # Try create ipv4 for §23
+    # Try create ipv4 for §23（兜底：正式 schema 由 geoip_common._create_range_table 建）
     try:
         conn.execute(
             """CREATE TABLE IF NOT EXISTS ipv4 (
                 start TEXT, end TEXT, bits INTEGER, weight INTEGER,
                 country TEXT, province TEXT, city TEXT, isp TEXT, asn TEXT, as_org TEXT,
                 cloud_provider TEXT, cloud_region TEXT, cloud_service TEXT, hosting TEXT,
-                source TEXT, e_cloud_provider INTEGER, e_asn INTEGER, commit_unix INTEGER
+                source TEXT, e_cloud_provider INTEGER, e_asn INTEGER, commit_unix INTEGER,
+                start_i INTEGER, end_i INTEGER
             )"""
         )
     except sqlite3.Error:
