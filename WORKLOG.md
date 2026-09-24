@@ -30,14 +30,14 @@ MSYS_NO_PATHCONV=1 python "C:/Users/Administrator/.crucible-remote/_put.py" "C:/
 
 ## 1. 版本状态（先看这里）
 
-- 远端 `HEAD` = **`1dff5e3`** = `origin/main`
-- **线上运行的二进制 = build28（09-24 10:28 构建，PID 87352 于 10:33 启动）**，包含到 `07988d6`：
-  WebUI 换行修复 + `check_ui_js.py` 门禁、Agent B/C 的代理与管理面加固、GeoIP 的 (b)(c)(d)、
-  DNS 的 named serial 地板与 primaries 翻译。
-- **已提交、本轮回构建才会上线**：`1dff5e3`（`serial_from_zone_text` 多行 SOA 解析）
-  + GeoIP (a) 根治（ipv4/ipv6 数值范围列）。
+- 远端 `HEAD` = **`3db7009`** = `origin/main`
+- **线上运行的二进制 = build30（09-24 12:25 构建，23m59s，0 error）**，包含到 `3db7009`：
+  build29 的全部内容（`1dff5e3` + GeoIP (a) 根治 + WebUI/AgentB/C/DNS 各轮）+ `/api/dns/geoip/sync`
+  的 `synced` 诚实化。部署后实测：9095/8443/9081 全 200、geoip lookup/filter/ZZ 回归正常、
+  `POST /api/dns/geoip/sync {"force":true}` 回 `{"ok":true,"synced":false,"reason":"mmdb 未启用（未配置 db 路径）"}`。
 - ⚠️ **改 `admin_ui.html` 后必须先跑 `python scripts/check_ui_js.py`**（构建前闸门），
   它编进二进制、编译期不检查 JS。
+- ⚠️ **本地不能编译**（见 §0 表格）：本地 `cargo check` 无意义，只能靠远程构建日志。
 
 ---
 
@@ -384,3 +384,27 @@ AXFR 自测通过）→ 生产实例把**同名** zone 建为 secondary，primar
 + `reason` 说明跳过原因；无密钥时实测回 `{"ok":true,"synced":false,"reason":"未配置 MaxMind license_key"}`。
 **注意**：(d) 的「真下载」因此**无法在当前配置下验证** —— 没有 license_key，
 `ensure_synced` 按设计早退。要验证需要用户提供一个 MaxMind 授权密钥。
+
+### 13.7 两个运维级发现（重要，别再被绕进去）
+
+**① 优雅关闭没有截止时间 → 旧实例会永久残留**
+`pkill`（SIGTERM）之后，进程会先关监听端口、再等存量连接收尾。实测有一个实例
+（PID 71604，06:32 启动）**卡了 6 小时没退出**：fstat 显示它没有任何监听套接字，
+只握着一个外部客户端的长连接（83.229.125.81:8443 <-- 49.128.218.15:56866）。
+表现就是「`pgrep` 里总有 2~3 个 webserver」，但它其实**不在服务任何请求**（没有监听端口），
+所以我用 `ps -p` 一看就发现它不在 `sockets` 里 —— 判断某个实例是否在服务，**看它有没有监听端口，
+不要只看进程数**。
+**代码层面**：SIGTERM 后应加一个强制退出截止时间（例如 10~30s 后 `exit`），否则一次部署后
+旧进程可能永久残留。已记入待办，尚未修。
+
+**② 停止生产要「升级 + 校验」，不能只发一次 pkill**
+可靠序列（分两次独立调用，铁律不变）：
+```
+pkill -f '[/]target/release/webserver.*--config'; sleep 2; \
+pkill -9 -f '[/]target/release/webserver.*--config'; sleep 1
+```
+然后**校验端口真空了**再启动：
+```
+for p in 9095 9081 8443 9445 9446; do printf '%s: ' $p; fstat -n | grep -c ":$p"; done
+```
+（本轮第二次部署就是这样做，生产零中断，启动后进程数恰好 1。）

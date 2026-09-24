@@ -460,3 +460,35 @@ WORKLOG.md / contact.txt              文档
    查询必须放行 `start_i IS NULL` 的未回填行。
 3. 磁盘：清了我 `/tmp/{xortest,stuncheck}`（547MB）→ 空闲 1.1G。
    **不是我的别删**：`/root/legacy-backup`、`/root/ReMgr`、`/tmp/frp*`、`/tmp/rdcheck`、`/tmp/mkhash`。
+
+---
+
+### Session 1008 (2026-09-24) — 进展 10（build29 已上线并验证；build30 修 synced 假报告）
+
+**已上线（build29 = `98ed9e1`，构建 21m25s，0 error；生产 PID 51644 启动于 11:39:50）**
+
+验证结果：生产 **17 项 0 FAIL**、测试实例 **12 项 0 FAIL**。关键几条：
+- `meta` 表终于出现 `serial:<zone>` 高水位行（`1dff5e3` 生效），加记录后 `dig` 立刻查到
+- `filter?country=US&limit=20` 返回**整页 20 行**（修前被 CN 的 112 万高权重行挤空）
+- `lookup?ip=0.1.2.3` **顶层 country 为空**（不是 ZZ）——注意 ZZ 允许出现在 `covering` 原始行里
+- `EXPLAIN QUERY PLAN` 走 `idx_ipv4_numeric`；生产库 ipv4 8 行 / ipv6 1 行数值列已回填
+- **判别探针**（证明线上真跑新读路径）：插一行「文本范围含目标 IP 但 start_i/end_i 故意不含」，
+  新代码在 SQL 层就挡掉 → `covering` 不出现该行（实测 0）✓ 旧代码会全表取回并命中
+- 引擎：`/c/` `/rust/` 200，11 个引擎 200；`/jsp/` 502 是**本机没装 Java**（日志提示手工起
+  jsp_sidecar.sh），验收脚本同样视其为可选；`/go/ /ruby/ /psgi/ /rack/` 是侧车引擎
+- h2 协商 HTTP/2 ✓
+
+**build30（`3db7009`）**：修 `/api/dns/geoip/sync` 的 `synced` 假报告（无 license_key 时空操作
+却回 true）。**待验证**：无密钥时应回 `{"ok":true,"synced":false,"reason":"未配置 MaxMind license_key"}`。
+
+**仍未验证**：(d)「force 真下载」需要 MaxMind license_key，生产没配 → `ensure_synced` 按设计早退
+（我实测接口返回 `synced:false` + reason）。**要实测得等用户提供授权密钥。**
+
+**本轮踩的坑（记下来别再犯）**
+1. **本地无法编译**：本机 rustc host=`windows-gnu` 但缺 `dlltool.exe` → `getrandom`/`libloading`
+   编不过；且 `cargo check … | tail` 的退出码是 `tail` 的恒为 0，不能当门槛。
+2. `pkill -f 'config-test.toml'` **会杀掉我自己的 ssh 会话**（命令行里含该字符串）→ 用
+   `pkill -f 'config-tes[t].toml'`。同理 `while pgrep -f 'cargo build'` 会匹配自己 → 死循环。
+3. 验证断言别写成「数 `"country":"US"` 出现次数」：filter 也匹配 province（DE 行带 `province="US-FL"`），
+   会误判；应断言「返回整页 N 行」。
+4. 「停/起分两次独立调用」这条铁律依然有效，本轮 2 次重启都按它执行，生产零中断。
