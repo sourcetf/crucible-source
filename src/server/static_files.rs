@@ -599,10 +599,7 @@ fn autoindex_html(dir: &Path, url: &str, enable_upload: bool) -> Result<String> 
     // §44 上传 UI：只有开了 enable_upload 才渲染。分片 PUT + Content-Range，
     // 未收齐回 202/409 并带 x-upload-offset，据此续传（不重传已完成部分）。
     if enable_upload {
-        body.push_str(
-            "<hr><p><b>上传</b>（支持断点续传：中断后再选同一文件会从中断处继续）</p>"
-                .as_ref(),
-        );
+        body.push_str("<hr><p><b>上传</b>（支持断点续传：中断后再选同一文件会从中断处继续）</p>");
         body.push_str("<input type=\"file\" id=\"upf\"><button id=\"upb\">上传</button><span id=\"upm\"></span>");
         body.push_str(
             r#"<script>
