@@ -1137,5 +1137,47 @@ ech = true
 * `rdata` 含换行/名字非法 → 该条被丢弃并写日志（防 zone 注入）；TTL 固定 300。
 
 
+### 21.10 build50：h3/QUIC 传输层显式限额（quinn 的默认值里有一条是「无上限」）
+
+**问题**：`src/server/h3.rs` 之前直接用 `quinn::ServerConfig::new(...)`，一个传输参数都没设
+⇒ 全用 quinn 0.11 的库默认值。其中一条**危险**：
+`TransportConfig::default().receive_window = VarInt::MAX` —— 连接级接收窗口**无上限**。
+单连接内存上界于是变成 `max_streams × stream_receive_window`
+（默认 100 × 1.25MB ≈ **125MB/连接**）：攻击者开 N 条 QUIC 连接、每条开满 100 个流、
+持续发数据而我们故意不读，内存就按连接数线性放大。QUIC 跑在 UDP 上、源地址可伪造，
+这种放大比 TCP 侧更划算。
+
+**改动**（`src/server/h3.rs`）：新增 `quic_transport_config()` 挂到 ServerConfig，
+并打一行启动日志（限额可见、可审计）：
+
+| 参数 | 值 | 与 quinn 默认的差别 / 理由 |
+|---|---|---|
+| `max_concurrent_bidi_streams` | 256 | 默认 100；与 h2 的 `H2_MAX_CONCURRENT_STREAMS` 对齐 |
+| `max_concurrent_uni_streams` | 256 | 默认 100；单向流（WebTransport/QMux 方向）同样设界 |
+| `max_idle_timeout` | 60s | 默认 30s；RFC 9308 §3.2 要求 ≥30s，60s 兼顾移动端抖动 |
+| `keep_alive_interval` | **不设（None）** | 刻意：设了等于连接永不过期；空闲连接应被回收 |
+| `stream_receive_window` | 1MiB | 默认 1.25MB；与 h2 的 `H2_INITIAL_WINDOW_SIZE` 对齐 |
+| `receive_window` | **8MiB** | 默认 `VarInt::MAX`（无上限）—— **本次最关键的收紧**，单连接接收缓冲上界 |
+| `send_window` | 8MiB | 显式写死（默认 8×1.25MB ≈ 10MB） |
+| `datagram_receive_buffer_size` | 1MiB | 显式写死，避免由库默认决定 |
+| 0-RTT | 默认关 | 上一轮已在 `quinn-boring` 修好（只有 `ssl.early_data = true` 才接受） |
+
+**实测（build50）**
+* 启动日志（测试实例与生产各一行）：`h3 quic limits: bidi=256 uni=256 idle=60s
+  stream_window=1048576 conn_window=8388608 send_window=8388608 datagram_recv=1048576` ✓
+* h3 20MiB **下载** 200 / 0.37s / sha 一致 ✓（8MiB 连接窗口限制的是我们**收**多少，不影响发）
+* h3 串行 5 次请求 5/5 = 200 ✓；h3 分片上传 202 → 201、拼装 sha 一致 ✓
+* h1/h2 20MiB 回归 200 + sha 一致 ✓
+* 生产（已切 build50）：h1/h2/h3 全 200，DNS 正常 ✓
+
+**QUIC 侧边界小结**：单连接接收缓冲 ≤ 8MiB；单流接收 ≤ 1MiB；同时在飞双向/单向流各 ≤ 256；
+空闲 60s 回收（无 keep-alive）；0-RTT 默认不接受；datagram 接收 ≤ 1MiB。
+
+**仍未做**：QMux 协议本体（`src/server/qmux.rs` 目前是「真在生效的流预算 + 诚实说明」，
+协议本体需要一个新 QUIC 帧类型与 HTTP/3 上的协商，属独立一轮）；h2/h3 单请求 >8MiB 上传
+（设计见 §21.8；**分片上传在 h1/h2/h3 上均已实测可用**，面板 UI 就是分片发的）。
+
+
+
 
 
