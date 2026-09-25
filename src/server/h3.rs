@@ -42,7 +42,14 @@ mod imp {
 
         log::info!("{}", BoringQuicServerCrypto::status_line());
 
-        let server_config = build_server_config(&cert_pem, &key_pem)?;
+        // 规格：0-RTT 默认关。TCP 侧是 `ssl.early_data` 显式开关（boring_path.rs），
+        // QUIC 侧此前**无条件开启**（quinn-boring 的 server::Config::new 里
+        // `SSL_CTX_set_early_data_enabled(1)`），于是 H3 默认接受可重放的 0-RTT 请求。
+        // 现在把同一个开关透传下去：只有显式配置 early_data=true 才开放。
+        let server_config = build_server_config(&cert_pem, &key_pem, ssl.early_data)?;
+        if ssl.early_data {
+            log::info!("h3: early data (0-RTT) explicitly enabled by ssl.early_data");
+        }
         // Bind UDP then attach Boring-aware EndpointConfig (HMAC/versions).
         let socket = std::net::UdpSocket::bind(bind).context("h3 udp bind")?;
         // TASK2：整个 QUIC 端点都跑在这一条 UDP socket 上，ECN 的 socket 级设置
@@ -74,10 +81,15 @@ mod imp {
     }
 
     /// BoringSSL QUIC only — no silent rustls fallback (spec: H3 crypto = Boring).
-    fn build_server_config(cert_pem: &[u8], key_pem: &[u8]) -> Result<ServerConfig> {
-        let boring = BoringQuicServerCrypto::try_build(cert_pem, key_pem).ok_or_else(|| {
-            anyhow::anyhow!("h3: Boring QUIC try_build failed (invalid PEM or provider)")
-        })?;
+    fn build_server_config(
+        cert_pem: &[u8],
+        key_pem: &[u8],
+        early_data: bool,
+    ) -> Result<ServerConfig> {
+        let boring = BoringQuicServerCrypto::try_build_with_opts(cert_pem, key_pem, early_data)
+            .ok_or_else(|| {
+                anyhow::anyhow!("h3: Boring QUIC try_build failed (invalid PEM or provider)")
+            })?;
         log::info!("h3: {}", boring.status_line());
         let crypto = boring.as_quinn_crypto().ok_or_else(|| {
             anyhow::anyhow!("h3: BoringQuicConfig built but as_quinn_crypto=None")
@@ -580,6 +592,30 @@ mod imp {
             return tag(resp, "telemetry");
         }
 
+        // DoH：与 h1/h2 同一位置（ACL/限速之后、basic_auth 之前）与同一实现。
+        // h1 用 `h1_try_handle`、h2 用 `doh_prepared`，h3 此前**两处都没有**——
+        // 于是 HTTP/3 客户端请求 DoH 路径只会拿到 static 404（而 dot_doh::doh_prepared
+        // 的文档注释本身就写着「h2/h3 路径的入口」）。这里补上，语义与 h2 完全一致。
+        {
+            let dns_eff = crate::server::dns::effective(&snap);
+            if dns_eff.enabled && dns_eff.doh.enabled {
+                let (method, uri, headers) =
+                    (req.method().clone(), req.uri().clone(), req.headers().clone());
+                if let Some(resp) = crate::server::dns::dot_doh::doh_prepared(
+                    &dns_eff,
+                    &method,
+                    &uri,
+                    &headers,
+                    req.body().clone(),
+                    peer,
+                )
+                .await
+                {
+                    return tag(collect_to_bytes(resp).await, "dns-doh");
+                }
+            }
+        }
+
         // P0-1：listener 级 Basic Auth（§16.1）——与 h1/h2 对齐，堵住 h3 绕过。
         if let Some(ba) = &lc.basic_auth {
             match crate::server::basic_auth::check_listener_headers_at(
@@ -741,6 +777,15 @@ mod imp {
             );
         }
         // Static files; metrics already handled above via telemetry::maybe_handle_simple.
+        // §44 上传：与 h1 同一套语义（见 upload_api / WORKLOG §18）。
+        if matches!(*req.method(), http::Method::PUT | http::Method::PATCH | http::Method::POST)
+            && crate::server::upload_api::enabled_for(&lc, req.uri().path())
+        {
+            return tag(
+                crate::server::upload_api::handle_bytes(req, &lc, peer).await,
+                "upload",
+            );
+        }
         match static_files::serve_simple(&req, &lc).await {
             Ok(r) => tag(r, "static"),
             Err(_) => tag(

@@ -161,6 +161,27 @@ where
     resp(StatusCode::ACCEPTED, "partial; continue with X-Upload-Offset", Some(received))
 }
 
+/// h2/h3 用：这两个协议在协议层已把请求体收齐（`Request<Bytes>`），而返回体是 `Response<Bytes>`。
+///
+/// 这里不重构 `handle`，只做一层薄适配：把 `Bytes` 包成 `Full` 交给同一条 `handle` 路径
+/// （逻辑仍只有一份），再把响应体收集回 `Bytes`（响应都是很小的文案，收集无成本）。
+pub async fn handle_bytes(
+    req: Request<Bytes>,
+    lc: &ListenerConfig,
+    peer: std::net::SocketAddr,
+) -> Response<Bytes> {
+    let (parts, body) = req.into_parts();
+    let full_req = Request::from_parts(parts, Full::new(body));
+    let resp = handle(full_req, lc, peer).await;
+    let (parts, body) = resp.into_parts();
+    let bytes = BodyExt::collect(body)
+        .await
+        .ok()
+        .map(|c| c.to_bytes())
+        .unwrap_or_default();
+    Response::from_parts(parts, bytes)
+}
+
 /// 便于测试与静态检查：暴露扩展名闸门。
 pub fn exec_ext_rejected(path: &str) -> bool {
     has_exec_ext(path)
