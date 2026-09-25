@@ -73,7 +73,19 @@ where
             None,
         );
     }
-    // containment：safe_join 拒绝 `..`/绝对路径/反斜杠/Windows 盘符。
+    // 路径安全第一道：拒绝**编码过的分隔符**（`%2f`/`%5c`）与解码后含 `..` 段的路径。
+    // 没有这道时 `PUT /..%2f..%2fetc%2fpasswd` 会被当作**一个字面文件名**落在 docroot 里
+    //（实测返回 201 ✗）——虽然没逃逸出 root，但客户端意图是穿越、目录里也会留脏名字，
+    // 必须拒。判据与 static 层的 normalize_url_path 同一套。
+    let lower = path.to_ascii_lowercase();
+    if lower.contains("%2f") || lower.contains("%5c") {
+        return resp(StatusCode::BAD_REQUEST, "路径含编码分隔符(%2f/%5c)，拒绝", None);
+    }
+    let decoded = percent_encoding::percent_decode_str(&path).decode_utf8_lossy();
+    if decoded.split(['/', '\']).any(|seg| seg == "..") {
+        return resp(StatusCode::BAD_REQUEST, "路径含 .. 段，拒绝", None);
+    }
+    // containment 第二道：safe_join 拒绝 `..`/绝对路径/反斜杠/Windows 盘符。
     let rel = path.trim_start_matches('/');
     let target: PathBuf = match crate::server::admin_files::safe_join(&lc.root, rel) {
         Ok(p) => p,
@@ -92,7 +104,19 @@ where
                 )
             }
         },
-        None => (0, None),
+        None => {
+            // 没有 Content-Range 时，Content-Length **就是**总量（`curl -T` 的常见形态）。
+            // 之前这里给 None → `complete()` 恒假 → 客户端发完全部 body 也只拿到 202、
+            // 文件永远留在 .upload.part（build42 端到端实测踩到）。只有分块传输
+            // （既无 Content-Range 也无 Content-Length）才按“长度未知”处理，
+            // 那种情况在读不到更多帧之后视为完成（见下面的 finished 判断）。
+            let cl = req
+                .headers()
+                .get(header::CONTENT_LENGTH)
+                .and_then(|v| v.to_str().ok())
+                .and_then(|s| s.trim().parse::<u64>().ok());
+            (0, cl)
+        }
     };
     let sess = match upload_resume::session_for(&target, start, total) {
         Ok(s) => s,
@@ -109,12 +133,18 @@ where
         Err(UploadErr::TooManySessions) => {
             return resp(StatusCode::SERVICE_UNAVAILABLE, "上传会话过多，稍后再试", None)
         }
-        Err(UploadErr::TotalMismatch) => resp(
-            StatusCode::BAD_REQUEST,
-            "同名上传会话的 total 与本次不一致（请改名或先取消）",
-            None,
-        ),
-        Err(UploadErr::Io(e)) => resp(StatusCode::INTERNAL_SERVER_ERROR, &e, None),
+        Err(UploadErr::TotalMismatch) => {
+            return resp(
+                StatusCode::BAD_REQUEST,
+                "同名上传会话的 total 与本次不一致（请改名或先取消）",
+                None,
+            )
+        }
+        Err(UploadErr::Io(e)) => {
+            // 其他分支都是 return（类型 `!`），这一支也必须 return，否则 match 各臂类型不一致
+            //（build42 实测 E0308）。
+            return resp(StatusCode::INTERNAL_SERVER_ERROR, &e, None);
+        }
     };
 
     // 流式读 body：逐帧 append。offset 用会话当前值 —— 因此并发分片必须带 Content-Range
@@ -150,7 +180,8 @@ where
     if received > MAX_UPLOAD_BYTES {
         return resp(StatusCode::PAYLOAD_TOO_LARGE, "超过单文件上限", None);
     }
-    if sess.complete() {
+    // total 未知（分块传输）= 读不到更多帧就是完成；total 已知则要收够。
+    if sess.complete() || sess.total.is_none() {
         // 收齐 → 原子落盘（同目录 rename）
         return match upload_resume::commit(&sess) {
             Ok(()) => resp(StatusCode::CREATED, "uploaded", None),

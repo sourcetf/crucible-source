@@ -888,3 +888,33 @@ curl -k -H 'Expect:' -T /tmp/up.bin https://127.0.0.1:18443/up-test.bin
 sha256 -q /tmp/up.bin; sha256 -q /crucible/www-apps/up-test.bin
 # 2) .php → 403；3) ../ → 400；4) 生产口 9095 → 405
 ```
+
+
+### 21.4 build43 实测结果（h1 全通，h2 仍挂）——下一动作
+
+**h1（`curl -k --http1.1 -H 'Expect:' -T`）：全通 ✓**
+* 3MB 全量上传 → **201 / 36ms**，尺寸 3145728 精确、**sha256 与源文件完全一致** ✓
+* `.php` → **403** ✓（扩展名闸门）；生产口（未开 enable_upload）→ **405** ✓
+* 分片：先发 `Content-Range: bytes 0-999999/3145728` → **202** ✓；再发偏移不符 → **409** ✓
+  （断点续传的 202/409 语义正确 ✓）
+* `Content-Length` 当 total 的修复（§21.2）已生效 ✓（否则不可能 201）
+
+**`Expect: 100-continue` 不是问题** ✓：hyper 1.11.1 会自动回 100（`proto/h1/conn.rs:405-408`
+“automatically sending 100 Continue”），实测禁用 Expect 与不禁用都能 201 ✓。
+
+**新发现并已修：编码穿越被当字面文件名接受 ✗**
+`PUT /..%2f..%2fetc%2fpasswd` 曾返回 **201** —— 因为路径未解码，`safe_join` 的 `..` 检查没触发，
+于是 docroot 里多出一个叫 `..%2f..%2fetc%2fpasswd` 的文件（**没有逃逸**，但客户端意图是穿越、
+目录留脏名字）。已在 `upload_api` 加第一道判据：**拒绝含 `%2f`/`%5c`（编码分隔符）的路径**、
+以及**解码后含 `..` 段**的路径（与 static 层 `normalize_url_path` 同一套），400 拒绝。
+
+**仍未解决：h2 路径挂住 ✗（下一步）**
+`curl -k -T`（ALPN 选到 h2）**挂到客户端超时**，证据链：`/crucible/www/.up-test.bin.upload.part`
+**被创建了**（说明 `safe_join` + 建临时文件都成功了 ✓）→ 卡在**读 body 的循环**里，
+且 h2 流因此没有窗口推进 → 双方互等。h1 同一份代码全通 ✓，所以问题在 **h2 侧的 body 接线**：
+h2 的 `Request<Bytes>` 里拿到的 body 很可能不是本次请求的完整 body（dispatch 点之前/之后
+body 已被消费或仍由协议层持有）→ `handle_bytes` 把 `Bytes` 包成 `Full` 之后读到的是空流，
+于是 `received=0 < total` 永不完成、也永不返回。
+下一步：读 `h2.rs` 该分发点上游如何取 body（`serve_simple` 的 `Request<Bytes>` 从哪来），
+把上传 hook 移到**body 已经真正收齐**的那一步之后；在此之前，**不要**给 h2/h3 开 upload
+（生产本来就没开 ✓，测试配置也没在 h2/h3 上依赖它 ✓）。
