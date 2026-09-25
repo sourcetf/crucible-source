@@ -1091,4 +1091,51 @@ h3 **200 / 0.43s**，三个协议 sha256 全部一致 ✓ —— 生产此前「
 （ACL/限速/basic_auth/apps/proxy 必须先于 body 消费），属于结构性改动，单独一轮做。
 
 
+### 21.9 build49：ECH 配置进 DNS 应答（`[[dns.https_rr]]`）
+
+**问题**：ECH 的发现路径**只有 DNS** —— 客户端解析公开名时拿到 `ech=` SvcParam 才会启用 ECH。
+此前服务端 `ssl.ech = true` 已生成 ECHConfigList（`state/ech/ech_config_list.bin`），
+但 DNS 里没有任何地方发布它 ⇒ **ECH 对客户端等于不存在**（配置"生效"了，却没人知道）。
+
+**实现**（`src/server/dns/mod.rs`）
+* `DnsConfig` 新增 `[[dns.https_rr]]`：`name`（zone 内相对名或 FQDN）/`alpn`/`port`/`ech`/
+  `priority`（默认 1）/`target`（默认 `.`）。**默认空 = 零行为变化**（不写就不发布，现网应答不变）。
+* `auto_https_records()` 读 `state/ech/ech_config_list.bin` —— 服务端**实际在用**的那份，
+  保证「DNS 里发布的」与「TLS 上启用的」绝对是同一份（发布一份客户端解不开的配置比不发布更糟）。
+* 按 zone 归属过滤（`relative_owner`：`example.com`→`@`、`www.example.com`→`www`、根区不自动发布）；
+  **面板同名 HTTPS 记录优先**，自动生成只在缺失时补。
+* 缺 ECH 物料时**省略** `ech=` 参数（绝不写空值 —— 空值会让客户端以为 ECH 可用却解不开）并记 warn。
+* `gen_zone_file_monotonic_ext(..., extra)`：extra 行做单行/名字校验（防 zone 文件注入）。
+* 3 个单测：`https_rdata` 渲染与省略、`relative_owner` 归属映射（含大小写与根区边界）。
+
+**实测（build49 测试实例；测试态明文 DNS 口 = 5353）**
+
+| 检查 | 结果 |
+|---|---|
+| 建区 `echo.test` → 5 个 view 的 zone 文件 | 全部写入 `@ 300 IN HTTPS 1 . alpn="h2,h3" port=18443 ech="AEX+DQBBAQ..."` ✓ |
+| `dig @127.0.0.1 -p 5353 echo.test HTTPS` | **NOERROR / ANSWER: 1**，应答含 `ech=`（base64 内可见 public_name=crucible.local）✓ |
+| 面板加同名 HTTPS 记录后 | 自动记录被面板覆盖 ✓（面板优先，符合设计） |
+| 未在配置里的名字（echo2/echo3.test） | 不生成 ✓（只按配置的名字发布） |
+| 生产（build49 已部署） | prod 的 named.conf 里 0 个用户 zone ⇒ 这项在生产是 no-op；h2/h3/DoH/DNS 全部照常 ✓ |
+
+**踩坑记录**：`11853` 是 **DoT** 口，测试态明文 DNS 在 **5353**（`scripts/dns_verify.sh` 也这么取）。
+我第一次用 11853 查，得到「connection timed out」，误判成 DNS 没在跑 —— 是测试脚本写错，不是服务端问题。
+
+**要真在生产发布**：你的真实域名建好区之后，在 `[dns]` 里加（示例已放进 `config-test.toml`）：
+```toml
+[[dns.https_rr]]
+name = "你的公开名"     # 应与 ssl.ech_public_name 一致
+alpn = "h2,h3"
+port = 443
+ech = true
+```
+**边界**（与「每个值的边界写清楚」的要求对齐）：
+* `dns.https_rr` 为空 → 一个字节都不写进 zone（默认行为，现网零影响）；
+* `name` 不在任何已建区内 → 不发布（不报错，靠 `dig` 或 zone 文件核对）；
+* `ech = true` 但无 `state/ech/ech_config_list.bin` → 省略 `ech=` 并 warn（不会写出空值）；
+* 面板已有同名 `HTTPS` 记录 → 面板的赢，自动的不写（避免覆盖管理员意图）；
+* `rdata` 含换行/名字非法 → 该条被丢弃并写日志（防 zone 注入）；TTL 固定 300。
+
+
+
 
