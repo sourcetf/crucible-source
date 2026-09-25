@@ -791,9 +791,16 @@ ASN/Tor pool，脚本还**硬拒绝** Ip2Region / DB-IP 系 URL（`BLACKLIST_URL
    * `handle<B>(...) -> Response<BoxBody>`（h1，现有签名不变）与
      `handle_bytes(req: Request<Full<Bytes>>, ...) -> Response<Bytes>`（h2/h3）两个薄包装；
    * h2/h3 各插一次同款 hook（同 h1，注意用 if-分支 return 的写法避免 req 被 move 后仍被借用）。
-2. **autoindex 上传 UI**：`static_files.rs::autoindex_html` 在 `enable_upload` 为真时渲染上传按钮 +
+2. **autoindex 上传 UI**：注意 `autoindex_html(dir: &Path, url: &str)`（`static_files.rs:546`）**拿不到配置** ✗
+   —— 需要改签名传入 `&AutoindexConfig`（或 `enable_upload/upload_threads` 两个值），
+   并同步它的调用点（`serve`/`serve_simple` 各一处，`grep -n "autoindex_html(" static_files.rs`）。
+   渲染上传按钮 +
    `File.slice()` **4 片并发**（线程数取 `autoindex.upload_threads`）+ 每片带 `Content-Range` +
    按响应的 `x-upload-offset` 校正续传 + 失败重试 3 次 + 总进度条（§18.3）。
+2b. **关于"4 线程同时上传"的语义**：我们后端要求**顺序 append**（offset 必须等于已收字节数 ✓，
+   这是防空洞与防覆写的关键）。因此"4 线程"的落地方式是**同时上传 4 个文件**（各自顺序分片），
+   而不是同一文件的 4 片乱序并发 —— 后者需要随机写 + 已收区间位图，复杂度与出错面都大得多。
+   若一定要单文件多片并发，需要把 `upload_resume` 改成 pwrite + bitmap（记录在位图上，提交前校验无洞）。
 3. `ETag`/`Last-Modified` + `If-Range`/`If-None-Match`（`static_files.rs` 的 6 处头构造点统一：
    163/181/183/226/334/359/381 一带）。
 4. 流式 body（解除 >16MiB 单次 GET 只能 413）。
