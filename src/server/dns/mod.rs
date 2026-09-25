@@ -66,6 +66,111 @@ pub struct DnsConfig {
     /// EDNS Client Subnet 开关（需求 12）：递归时传递，权威时接收。默认打开。
     #[serde(default = "default_true")]
     pub ecs: bool,
+    /// 自动发布的 HTTPS(type65) 记录（`[[dns.https_rr]]`）。
+    ///
+    /// 为什么需要它：**ECH 的发现路径只有 DNS** —— 客户端解析公开名时拿到 `ech=`
+    /// SvcParam 才会启用 ECH。只在服务端 `ssl.ech = true` 而 DNS 里没有这条记录，
+    /// ECH 对客户端等于不存在。这里把 `state/ech/ech_config_list.bin`（服务端**实际在用**
+    /// 的那份，不是另生成一份）写进应答。面板里同名的 HTTPS 记录优先，本项只在缺失时补。
+    #[serde(default)]
+    pub https_rr: Vec<HttpsRrCfg>,
+}
+
+/// 一条自动发布的 HTTPS/SVCB 记录（`[[dns.https_rr]]`）。
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct HttpsRrCfg {
+    /// 要发布的名字：zone 内相对名（`@` / `www`）或 FQDN。
+    #[serde(default)]
+    pub name: String,
+    /// SvcParam `alpn`（如 `h2,h3`）；空则不写该参数。
+    #[serde(default)]
+    pub alpn: String,
+    /// SvcParam `port`；None 则不写。
+    #[serde(default)]
+    pub port: Option<u16>,
+    /// 是否带上 `ech=` 参数（取自 `state/ech/ech_config_list.bin`）。
+    #[serde(default)]
+    pub ech: bool,
+    /// SvcPriority，默认 1（AliasMode）。
+    #[serde(default = "default_https_priority")]
+    pub priority: u16,
+    /// TargetName，默认 `.`（AliasMode 用 `.`）。
+    #[serde(default = "default_https_target")]
+    pub target: String,
+}
+
+fn default_https_priority() -> u16 {
+    1
+}
+
+fn default_https_target() -> String {
+    ".".to_string()
+}
+
+/// 渲染一条 HTTPS 记录的 rdata（纯函数，便于单测）。
+///
+/// `ech_b64`：`None` = 当前没有可用 ECH 物料（此时**不写** `ech=` 参数，
+/// 而不是写一个空值 —— 空 `ech=` 会让客户端以为 ECH 可用却解不出配置）。
+pub fn https_rdata(item: &HttpsRrCfg, ech_b64: Option<&str>) -> String {
+    let mut params: Vec<String> = Vec::new();
+    if !item.alpn.trim().is_empty() {
+        params.push(format!("alpn=\"{}\"", item.alpn.trim()));
+    }
+    if let Some(p) = item.port {
+        params.push(format!("port={p}"));
+    }
+    if item.ech {
+        if let Some(b64) = ech_b64.filter(|s| !s.is_empty()) {
+            params.push(format!("ech=\"{b64}\""));
+        }
+    }
+    let target = if item.target.trim().is_empty() {
+        "."
+    } else {
+        item.target.trim()
+    };
+    if params.is_empty() {
+        format!("{} {}", item.priority, target)
+    } else {
+        format!("{} {} {}", item.priority, target, params.join(" "))
+    }
+}
+
+/// 名字是否落在该 zone 内；返回 zone 文件里的 owner（相对名）。
+/// `example.com` 在 `example.com` → `@`；`www.example.com` → `www`；不属于 → `None`。
+/// 根区（`.`）不自动发布（owner 要写完整 FQDN，与这里相对名的约定不同）。
+pub fn relative_owner(fqdn: &str, zone: &str) -> Option<String> {
+    let n = fqdn.trim().trim_end_matches('.').to_ascii_lowercase();
+    let z = zone.trim().trim_end_matches('.').to_ascii_lowercase();
+    if z.is_empty() {
+        return None;
+    }
+    if n == z || n == "@" {
+        return Some("@".to_string());
+    }
+    n.strip_suffix(&format!(".{z}")).map(|p| p.to_string())
+}
+
+/// 由配置构造「自动 HTTPS 记录」列表：`(名字, rdata)`；无 ECH 物料时 ech 参数会被省略。
+pub fn auto_https_records(cfg: &DnsConfig) -> Vec<(String, String)> {
+    if cfg.https_rr.is_empty() {
+        return Vec::new();
+    }
+    // 读服务端**实际在用**的 ECHConfigList（ech_auto 在 TLS 侧生成/复用的那份），
+    // 保证 DNS 里发布的和 TLS 上启用的绝对是同一份 —— 发布一份客户端解不开的配置
+    // 比不发布更糟（客户端会尝试 ECH 然后失败）。
+    let ech_b64 = crate::server::ech_auto::persisted_config_list_base64();
+    if cfg.https_rr.iter().any(|r| r.ech) && ech_b64.is_none() {
+        log::warn!(
+            "dns: dns.https_rr 里有 ech = true，但 state/ech/ech_config_list.bin 不存在\
+（服务端未启用 ECH 或尚未生成）→ 该条记录不带 ech 参数"
+        );
+    }
+    cfg.https_rr
+        .iter()
+        .filter(|r| !r.name.trim().is_empty())
+        .map(|r| (r.name.trim().to_string(), https_rdata(r, ech_b64.as_deref())))
+        .collect()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -347,6 +452,10 @@ pub fn store() -> Result<Connection> {
     let dir = state_root().join("db");
     std::fs::create_dir_all(&dir)?;
     let conn = Connection::open(dir.join("dns.sqlite"))?;
+    // 每次调用都开新连接（面板请求与 maintenance_loop 是并发的）。SQLite 默认
+    // busy timeout = 0，同进程两个连接撞车时后来的那个直接 SQLITE_BUSY —— 面板上
+    // 表现为随机的 "database is locked"。给一个短等待即可，不改 schema/WAL。
+    conn.busy_timeout(std::time::Duration::from_secs(5))?;
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS zones(
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -432,7 +541,10 @@ fn primary_for_named(p: &str) -> String {
         if let Some((ip, port)) = rest.split_once("]:") {
             return format!("{ip} port {port}");
         }
-        return s.to_string(); // [v6] 无端口
+        // `[v6]` 无端口：BIND 的 primaries/ACL 里地址**不带方括号**（方括号是 dig/URI
+        // 写法）。原样输出 `[::1];` 会让 named 拒载**整份** named.conf —— 与 host:port
+        // 那次修复同一类（一处格式错，所有分区一起失效）。
+        return rest.trim_end_matches(']').to_string();
     }
     // 裸 IPv6 含多个冒号，不能按 host:port 切
     if s.parse::<std::net::Ipv6Addr>().is_ok() {
@@ -505,6 +617,51 @@ pub fn valid_line_name(n: &str) -> bool {
         && !n.starts_with('-')
         && !n.ends_with('-')
         && n.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_'))
+}
+
+/// `listen-on { <value>; }` 的取值：named 关键字或 IP 字面量。
+///
+/// 这个字段没有被别处校验过，而面板 `POST /api/dns/config` 会把整个 `[dns]` 反序列化
+/// 进来 —— 不校验就等于把任意文本拼进 named.conf：`};` + 换行即可改写整份配置
+/// （与 valid_line_name 修掉的 `view "{name}"` 属同一类注入面）。
+fn valid_listen_addr(s: &str) -> bool {
+    let s = s.trim();
+    if matches!(s, "any" | "none" | "localhost" | "localnets") {
+        return true;
+    }
+    s.parse::<std::net::IpAddr>().is_ok()
+}
+
+/// dnssec-policy `keys { ... algorithm <x>; }` 与 dnssec-keygen `-a <x>` 的白名单
+/// （同一取值空间：配置文件里允许写助记名或算法号）。
+///
+/// 同样直接来自面板，且被拼进 named.conf —— 一份带 `}; zone ...` 的算法名会让
+/// named 拒载整份配置（所有分区一起失效）。
+fn valid_dnssec_alg(s: &str) -> bool {
+    // 取值 = BIND 认的全部算法助记名（含历史别名）+ 算法号，避免把老配置判死。
+    matches!(
+        s,
+        "RSAMD5"
+            | "DH"
+            | "DSA"
+            | "ECC"
+            | "RSASHA1"
+            | "DSA-NSEC3-SHA1"
+            | "NSEC3RSASHA1"
+            | "RSASHA1-NSEC3-SHA1"
+            | "RSASHA256"
+            | "RSASHA512"
+            | "ECC-GOST"
+            | "ECDSAP256SHA256"
+            | "ECDSAP384SHA384"
+            | "ED25519"
+            | "ED448"
+    ) || (!s.is_empty() && s.len() <= 3 && s.bytes().all(|b| b.is_ascii_digit()) && s != "0")
+}
+
+/// dnssec-policy `keys { <role> lifetime ... }` 的角色名（也用于 dnssec-keygen `-f`）。
+fn valid_key_role(s: &str) -> bool {
+    matches!(s.to_ascii_lowercase().as_str(), "ksk" | "zsk" | "csk")
 }
 
 pub fn add_zone(kind: &str, name: &str, primaries: &[String], axfr_acl: &[String], refresh_hours: u64) -> Result<i64> {
@@ -780,6 +937,20 @@ pub fn gen_zone_file_monotonic(
     recs: &[RecordRow],
     prev_serial: Option<u64>,
 ) -> String {
+    gen_zone_file_monotonic_ext(zone, kind, recs, prev_serial, &[])
+}
+
+/// 同 [`gen_zone_file_monotonic`]，外加模块自动生成的记录（目前是 ECH 用的 HTTPS 记录）。
+///
+/// `extra` 已经在调用侧按 zone 过滤好（owner 为相对名），并且已排除面板里同名的
+/// HTTPS 记录 —— **面板显式配置优先**，自动生成只在缺失时补，避免覆盖管理员的意图。
+pub fn gen_zone_file_monotonic_ext(
+    zone: &str,
+    kind: &str,
+    recs: &[RecordRow],
+    prev_serial: Option<u64>,
+    extra: &[(String, String)],
+) -> String {
     // 统一去尾点再拼，修复 zone 名带尾点时的 "ns1.example.com.." 双点（named 拒载）
     let zone = zone.trim_end_matches('.');
     let mut s = String::new();
@@ -806,6 +977,18 @@ pub fn gen_zone_file_monotonic(
         // 旧实现裸写 "hello world" 会被解析成多条 rdata → zone 文件非法。
         let rdata = quoted_txt_rdata(&r.rtype, &r.rdata);
         s.push_str(&format!("{} {} IN {} {}\n", name, r.ttl, r.rtype, rdata));
+    }
+    // 自动生成的记录（ECH 的 HTTPS 记录）：放在面板记录之后，同名同类型已被调用侧排除。
+    for (owner, rdata) in extra {
+        // rdata 里不能有换行：带换行即可往 named 加载的 zone 文件里塞任意记录
+        // （与 add_record 的同类校验一致）。这里是模块自产的字符串，仍然挡住。
+        if rdata.contains('\n') || rdata.contains('\r') {
+            continue;
+        }
+        if !valid_name(owner) && owner != "@" {
+            continue;
+        }
+        s.push_str(&format!("{owner} 300 IN HTTPS {rdata}\n"));
     }
     s
 }
@@ -881,7 +1064,12 @@ fn gen_answers_file(rules: &[RpzRule]) -> String {
             let name = fq_trim(&ensure_fq(&r.name));
             let rdata = if t == "txt" {
                 let d = r.value.trim();
-                if d.starts_with('"') { d.to_string() } else { format!("\"{}\"", d.replace('"', "\\\"")) }
+                if d.starts_with('"') { d.to_string() } else {
+                    // 反斜杠必须先转义：只转义引号时，值以 `\` 结尾会吃掉收尾引号，
+                    // answers 区变成非法 master file，named 拒载该区（override 全失效）。
+                    // 与 gen_zone_file 的 quoted_txt_rdata 同一处理顺序。
+                    format!("\"{}\"", d.replace('\\', "\\\\").replace('"', "\\\""))
+                }
             } else {
                 r.value.trim().to_string()
             };
@@ -966,10 +1154,15 @@ pub fn gen_named_conf(cfg: &DnsConfig, zones: &[ZoneRow]) -> String {
     ));
 
     if cfg.modes.recursive {
+        // 127.0.0.1 必须始终在递归白名单里：本进程的 DoT/DoH 转发（dot_doh::udp_query）
+        // 源地址就是 127.0.0.1，分线路转发目标更是 127.0.0.(2+i)。管理员一旦配了
+        // 自定义递归白名单（如 "10.0.0.0/8"），面板上 DoT/DoH 开关看着正常，
+        // 实际每个查询都被自己的 named 回 REFUSED。本机不在白名单之外。
+        let mut rec_acl = cfg.recursion_acl.clone();
+        rec_acl.push("127.0.0.1".to_string());
+        let rec_acl = acl_or(&rec_acl, "127.0.0.1");
         s.push_str(&format!(
-            "\n  allow-recursion {}; allow-query-cache {};",
-            acl_or(&cfg.recursion_acl, "127.0.0.1"),
-            acl_or(&cfg.recursion_acl, "127.0.0.1")
+            "\n  allow-recursion {rec_acl}; allow-query-cache {rec_acl};"
         ));
         // ECS 上游传递由本进程 DoT/DoH 层注入（ecs.rs，/24 硬约束）——
         // bind 9.20 options 无 ecs-prefix-* 语句，写了 named 会拒载。
@@ -1163,6 +1356,12 @@ pub fn cidr_contains(cidr: &str, ip: std::net::IpAddr) -> bool {
             if prefix > bits {
                 return false;
             }
+            // /0：移位量等于位宽，`>> 32` 在 debug/overflow-checks 下 panic、release
+            // 下按位宽取模（比较整个地址，永不相等）——「所有客户端」这条线路等于
+            // 静默失效。语义上 /0 匹配一切。
+            if prefix == 0 {
+                return true;
+            }
             let shift = bits - prefix;
             (n.to_bits() >> shift) == (h.to_bits() >> shift)
         }
@@ -1170,6 +1369,9 @@ pub fn cidr_contains(cidr: &str, ip: std::net::IpAddr) -> bool {
             let bits = 128u32;
             if prefix > bits {
                 return false;
+            }
+            if prefix == 0 {
+                return true;
             }
             let shift = bits - prefix;
             (n.to_bits() >> shift) == (h.to_bits() >> shift)
@@ -1298,14 +1500,51 @@ pub fn write_all(cfg: &DnsConfig) -> Result<Vec<(String, PathBuf)>> {
     // 先校验所有进入文件名 / named.conf 的用户可控字符串，再落盘。
     // validate() 会先调 write_all 再探活 named，所以检查必须放在这里，
     // 否则恶意 name 已经在盘上了（路径穿越的写入发生在探活之前）。
+    // listen_addr / dnssec.algorithm / dnssec.keys[].role 与被校验的 name 一样，
+    // 都来自面板（POST /api/dns/config 反序列化整个 [dns]）并被拼进 named.conf。
+    if !valid_listen_addr(&cfg.listen_addr) {
+        bail!(
+            "bad listen_addr {:?}（只接受 IP 字面量或 any/none/localhost/localnets）",
+            cfg.listen_addr
+        );
+    }
+    // dnssec 关掉时这两个字段不会被写进 named.conf（gen_kasp_policy 不调用），
+    // 只在真正启用时校验，免得把「没开 DNSSEC 的部署里一个不用的字段」判死。
+    if cfg.dnssec.enabled {
+        if !valid_dnssec_alg(&cfg.dnssec.algorithm) {
+            bail!("bad dnssec algorithm {:?}", cfg.dnssec.algorithm);
+        }
+        for k in &cfg.dnssec.keys {
+            if !valid_key_role(&k.role) {
+                bail!("bad dnssec key role {:?}（ksk|zsk|csk）", k.role);
+            }
+        }
+    }
+    let mut seen_lines: std::collections::HashSet<String> = std::collections::HashSet::new();
     for l in &cfg.geo.lines {
         if !valid_line_name(&l.name) {
             bail!("bad geo line name {:?}", l.name);
+        }
+        // 线路名同时是 named 的 view 名。模块自己还会生成兜底 view "default" 与
+        // 转发 view "fwd-<线路>"：线路直接叫 default / fwd-x，或两条线路重名，
+        // named 都会以「view already exists」拒载**整份** named.conf ——
+        // 所有分区一起失效（不只是这条线路不生效）。
+        let lname = l.name.to_ascii_lowercase();
+        if lname == "default" || lname.starts_with("fwd-") {
+            bail!("geo line name {:?} 是保留名（default 与 fwd- 前缀留给模块自建 view）", l.name);
+        }
+        if !seen_lines.insert(lname) {
+            bail!("geo line name {:?} 重复（view 名必须唯一）", l.name);
         }
     }
     for r in &cfg.rpz {
         if !valid_name(&r.name) {
             bail!("bad rpz name {:?}", r.name);
+        }
+        // value 会被原样拼进 rpz.zone / answers.zone 的文本行（CNAME/A/AAAA/TXT 的
+        // rdata），带换行即可往 named 加载的 zone 文件里塞任意记录。
+        if r.value.contains('\n') || r.value.contains('\r') {
+            bail!("bad rpz value（必须是单行）name={:?}", r.name);
         }
     }
     let etc = state_root().join("etc");
@@ -1321,6 +1560,14 @@ pub fn write_all(cfg: &DnsConfig) -> Result<Vec<(String, PathBuf)>> {
     chown_bind(&state_root().join("keys"));
 
     let zones = list_zones()?;
+    // 与模块自建分区重名时，同一个 view 里会出现两条同名 zone 声明（RPZ override /
+    // answers 是本模块自己声明的，`.` 是 root 模式声明的），named 直接拒载**整份**
+    // named.conf —— 表现是「加了一个分区，整个 DNS 全挂」。
+    for z in &zones {
+        if z.name == "." || z.name == "crucible.rpz" || z.name == "crucible.answers" {
+            bail!("zone {:?} 与 DNS 模块保留分区名（RPZ/answers/根区）冲突", z.name);
+        }
+    }
     let conf = gen_named_conf(cfg, &zones);
     let conf_path = etc.join("named.conf");
     std::fs::write(&conf_path, &conf)?;
@@ -1357,6 +1604,8 @@ pub fn write_all(cfg: &DnsConfig) -> Result<Vec<(String, PathBuf)>> {
         views.push(("default".into(), String::new()));
     }
     let mut written: Vec<(String, PathBuf)> = Vec::new();
+    // 自动发布的 HTTPS 记录（ECH 发现路径）算一次，各 zone/各 view 复用。
+    let auto_https = auto_https_records(cfg);
     for (view_tag, line_tag) in &views {
         // 与 gen_named_conf 同步：权威关掉时不落用户 zone 文件
         // （否则盘上留着 orphan zone，且 named.conf 里已无引用，排障时极易误判）。
@@ -1374,6 +1623,22 @@ pub fn write_all(cfg: &DnsConfig) -> Result<Vec<(String, PathBuf)>> {
                 continue;
             }
             let recs: Vec<RecordRow> = list_records(&z.name)?.into_iter().filter(|r| r.line == *line_tag).collect();
+            // 本 zone 该补的自动 HTTPS 记录：按 zone 归属过滤 + 面板同名记录优先。
+            let extra_https: Vec<(String, String)> = auto_https
+                .iter()
+                .filter_map(|(name, rdata)| {
+                    let owner = relative_owner(name, &z.name)?;
+                    let panel_has = recs.iter().any(|r| {
+                        r.rtype.eq_ignore_ascii_case("HTTPS")
+                            && (r.name.eq_ignore_ascii_case(&owner)
+                                || (owner == "@" && r.name.is_empty()))
+                    });
+                    if panel_has {
+                        return None;
+                    }
+                    Some((owner, rdata.clone()))
+                })
+                .collect();
             let path = zones_dir.join(zone_file_name(z, view_tag));
             // serial 单调：读回本次覆盖前的 SOA serial，保证严格递增，
             // 否则同秒内的第二次编辑对任何 AXFR/IXFR 消费者都是「没变」。
@@ -1426,7 +1691,7 @@ pub fn write_all(cfg: &DnsConfig) -> Result<Vec<(String, PathBuf)>> {
                 .max();
             std::fs::write(
                 &path,
-                gen_zone_file_monotonic(&z.name, &z.kind, &recs, prev_serial),
+                gen_zone_file_monotonic_ext(&z.name, &z.kind, &recs, prev_serial, &extra_https),
             )?;
             // zone 文件是控制面的 source of truth：regen 后旧 journal/inline-signing
             // 产物必然失步（named 'journal out of sync' 拒载），一并清掉
@@ -1585,11 +1850,23 @@ fn rndc(cfg: &DnsConfig, args: &[&str]) -> Result<String> {
     Ok(String::from_utf8_lossy(&out.stdout).into())
 }
 
+/// reconcile 串行化锁。
+///
+/// 「write_all 重写全部配置文件」+「named_alive 判定 → 探活 → spawn named」这段
+/// 不是原子的，而 reconcile 有多个并发调用方：面板每次保存（persist_and_reconcile）、
+/// 面板的 /api/dns/reload、以及 maintenance_loop 的 mtime 轮询。两个线程同时看到
+/// named_alive=false 就会各 spawn 一个 named（第二个抢不到端口即退出，但会和第一个
+/// 抢写同一个 named.stderr.log／同时改写同一份 named.conf）。整段串起来最省事：
+/// 单次 reconcile 只阻塞几秒，且本函数不会被自己递归调用。
+static RECONCILE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// reconcile：落盘 → 校验（探活法，named 已在跑则跳过）→ 确保进程 → reload。
 pub fn reconcile(cfg: &DnsConfig) -> Result<()> {
     if !cfg.enabled {
         return Ok(());
     }
+    // 锁被毒化（上一次 reconcile panic）时照样继续，避免之后每次保存都直接失败。
+    let _guard = RECONCILE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     write_all(cfg)?;
     // 需求 9：MaxMind GeoLite2 数据库自同步 (cron 每日 + 启动时增量检查)
     if cfg.geo.enabled && cfg.geo.mmdb.is_active() && !cfg.geo.mmdb.license_key.is_empty() {
@@ -1674,6 +1951,19 @@ pub fn reconcile(cfg: &DnsConfig) -> Result<()> {
 
 /// 一键生成 DNSSEC key（需求 4）。返回生成的 key 文件名。
 pub fn keygen(zone: &str, role: &str, alg: &str) -> Result<String> {
+    // zone/role/alg 全来自面板（action=keygen），会变成 dnssec-keygen 的 argv：
+    // 不校验时 `zone = "-K/tmp/x"` 之类会被 dnssec-keygen 当成选项解析（key 落到
+    // 指定目录），role 写错则静默生成成 ZSK。与 add_zone 用同一套名字规则。
+    if !valid_name(zone) || zone.starts_with('-') {
+        bail!("bad zone name {zone:?}");
+    }
+    if !valid_key_role(role) {
+        bail!("bad key role {role:?}（ksk|zsk|csk）");
+    }
+    if !valid_dnssec_alg(alg) {
+        bail!("bad dnssec algorithm {alg:?}");
+    }
+    let role = role.to_ascii_lowercase();
     let keys = state_root().join("keys");
     std::fs::create_dir_all(&keys)?;
     // ksk/csk 用 -f ROLE；zsk 默认
@@ -1755,6 +2045,12 @@ pub fn rootzone_refresh(cfg: &DnsConfig) -> Result<String> {
     let zones = state_root().join("zones");
     std::fs::create_dir_all(&zones)?;
     let tmp = zones.join("root.zone.tmp");
+    // url 来自配置/面板，是 curl 的**最后一个 argv**：以 '-' 开头的值会被 curl 当选项
+    // 解析（如 `-o/etc/cron.d/x`、`--config=...`），等于把外部工具的参数面交给配置。
+    // 这个字段本来就是 URL，限定 http(s) 即可，顺带挡掉 file:// 本地读取。
+    if !(cfg.rootzone.url.starts_with("http://") || cfg.rootzone.url.starts_with("https://")) {
+        bail!("rootzone.url 必须是 http(s):// URL（收到 {:?}）", cfg.rootzone.url);
+    }
     let out = std::process::Command::new("curl")
         .args(["-fsSL", "--max-time", "120", "-o"])
         .arg(&tmp)
@@ -1810,7 +2106,12 @@ fn dnssec_parse_key_filename(name: &str) -> Option<(String, String, String)> {
     let stem = stem.strip_suffix(".private").unwrap_or(stem);
     let stem = stem.strip_suffix(".state").unwrap_or(stem);
     let rest = stem.strip_prefix('K')?;
-    let dot_idx = rest.find('.')?;
+    // 文件名格式 `K<zone>.+<alg>+<tag>`：zone 自己就带点，只能用**最后一个**点
+    // 去切（find 会在第一个点上切，`Kexample.com.+013+12345` 解析出 zone="example"）。
+    // 这个 zone 会被 dnssec_check_and_rotate 直接交给 keygen —— 名字错位意味着
+    // 为一个不存在的分区生成密钥、面板里显示的分区也全错（若恰好存在同名小分区，
+    // KASP 还会把那把 key 认成该分区的 key）。
+    let dot_idx = rest.rfind('.')?;
     let zone = rest[..dot_idx].to_string();
     let suffix = &rest[dot_idx..];
     let plus1 = suffix.find('+')?;
@@ -1919,9 +2220,21 @@ pub fn dnssec_key_list() -> Vec<DnssecKeyInfo> {
                 for line in content.lines() {
                     if line.contains(" IN DNSKEY ") {
                         let parts: Vec<&str> = line.split_whitespace().collect();
-                        if parts.len() >= 7 {
-                            if let Ok(f) = parts[2].parse::<u16>() { info.flags = f; }
-                            info.algorithm = parts[4].to_string();
+                        // 按 token 定位，不写死下标：`.key` 里的 DNSKEY 行可能是
+                        // `name. TTL IN DNSKEY flags proto alg key`（keygen 传了 -L 就是
+                        // 这种），也可能没有 TTL 段。写死 parts[2]/parts[4] 在两种形态下
+                        // 分别取到 "IN"/"DNSKEY" 或 flags/proto，于是面板里 flags 恒为 0、
+                        // algorithm 变成数字（flags）。
+                        if let Some(i) = parts
+                            .iter()
+                            .position(|p| p.eq_ignore_ascii_case("DNSKEY"))
+                        {
+                            if let Some(f) = parts.get(i + 1).and_then(|x| x.parse::<u16>().ok()) {
+                                info.flags = f;
+                            }
+                            if let Some(a) = parts.get(i + 3) {
+                                info.algorithm = a.to_string();
+                            }
                         }
                         if let Some((zone, tag, alg)) = dnssec_parse_key_filename(&info.filename) {
                             info.zone = zone;
@@ -2008,6 +2321,20 @@ pub fn dnssec_check_and_rotate(cfg: &DnsConfig, dc: &DnsConfig) -> Result<Vec<Ds
         } else if role == "ZSK" || role == "CSK" {
             let zsk_threshold = lifetime_secs.saturating_sub(7 * 86400);
             if age_secs > zsk_threshold {
+                // 节流（必须有）：maintenance_loop 每 30s 调一次本函数，而「临近过期」
+                // 这个条件在新 key 被 BIND 真正接管、旧 key 被删掉之前**每一轮都成立**。
+                // 旧实现于是每 30s 又生成一把新 key（≈2880 把/天，可持续数周），
+                // keys/ 目录与面板 key 列表无限膨胀。用 meta 记最近一次生成时间：
+                // 同一 (zone, role) 最快一天生成一把。
+                let throttle_key = format!("dnssec_rotate:{}:{}", key.zone, role);
+                let last = meta_get(&throttle_key)
+                    .ok()
+                    .flatten()
+                    .and_then(|v| v.parse::<u64>().ok())
+                    .unwrap_or(0);
+                if now.saturating_sub(last) < 86_400 {
+                    continue;
+                }
                 log::info!(
                     "dnssec: {} tag={} nearing end of life, generating replacement",
                     role, key.tag
@@ -2015,8 +2342,16 @@ pub fn dnssec_check_and_rotate(cfg: &DnsConfig, dc: &DnsConfig) -> Result<Vec<Ds
                 match keygen(&key.zone, "zsk", &dc.dnssec.algorithm) {
                     Ok(new_name) => {
                         log::info!("dnssec: generated new ZSK for {}: {}", key.zone, new_name);
+                        if let Err(e) = meta_set(&throttle_key, &now.to_string()) {
+                            log::warn!("dnssec: 记录轮换节流失败 {e:#}");
+                        }
                     }
-                    Err(e) => log::warn!("dnssec: keygen failed for {}: {e}", key.zone),
+                    Err(e) => {
+                        log::warn!("dnssec: keygen failed for {}: {e}", key.zone);
+                        // 生成失败也记时间，否则失败会变成每 30s 一条日志 + 一次进程
+                        // 派生（dnssec-keygen 不可用的部署上会一直空转）。
+                        let _ = meta_set(&throttle_key, &now.to_string());
+                    }
                 }
             }
         }
@@ -2385,6 +2720,49 @@ pub async fn maintenance_loop(live: Arc<crate::server::live_config::LiveConfig>,
 #[cfg(test)]
 mod acl_primary_tests {
     use super::*;
+
+    /// ECH 的发现路径只有 DNS：`[[dns.https_rr]]` 渲染出来的 HTTPS 记录必须
+    /// 带上与服务端**同一份** ech 参数，且缺物料时宁可省略也不能写空值。
+    #[test]
+    fn https_rdata_renders_ech_and_omits_when_missing() {
+        let item = HttpsRrCfg {
+            name: "example.com".into(),
+            alpn: "h2,h3".into(),
+            port: Some(443),
+            ech: true,
+            priority: 1,
+            target: ".".into(),
+        };
+        assert_eq!(
+            https_rdata(&item, Some("AEX+DQBB")),
+            "1 . alpn=\"h2,h3\" port=443 ech=\"AEX+DQBB\""
+        );
+        // 没有 ECH 物料 → 不写 ech=（写空值会让客户端以为 ECH 可用）
+        assert_eq!(
+            https_rdata(&item, None),
+            "1 . alpn=\"h2,h3\" port=443"
+        );
+        // 只要最简形式
+        let bare = HttpsRrCfg {
+            priority: 1,
+            target: ".".into(),
+            ..Default::default()
+        };
+        assert_eq!(https_rdata(&bare, Some("X")), "1 .");
+    }
+
+    /// 自动记录只补本 zone 的名字，且**面板同名 HTTPS 记录优先**。
+    #[test]
+    fn relative_owner_maps_names_into_zone() {
+        assert_eq!(relative_owner("example.com", "example.com").as_deref(), Some("@"));
+        assert_eq!(relative_owner("example.com.", "example.com").as_deref(), Some("@"));
+        assert_eq!(relative_owner("www.example.com", "example.com").as_deref(), Some("www"));
+        assert_eq!(relative_owner("@", "example.com").as_deref(), Some("@"));
+        assert_eq!(relative_owner("other.test", "example.com"), None);
+        assert_eq!(relative_owner("www.example.com", "."), None);
+        // 大小写不敏感（DNS 名字本就大小写无关）
+        assert_eq!(relative_owner("WWW.Example.COM", "example.com").as_deref(), Some("www"));
+    }
 
     #[test]
     fn valid_acl_item_accepts_safe() {

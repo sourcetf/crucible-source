@@ -27,6 +27,13 @@ recursion_acl = ["0.0.0.0/0"]
 # 全部「绝不碰 53/853」的前提矛盾（且与在跑的生产实例直接冲突）。
 test_mode = true
 
+# ECH 的发现路径只有 DNS：这条记录让客户端解析 echo.test 时拿到 ech= 参数。
+[[dns.https_rr]]
+name = "echo.test"
+alpn = "h2,h3"
+port = 18443
+ech = true
+
 [dns.dnssec]
 algorithm = "ECDSAP256SHA256"
 enabled = true
