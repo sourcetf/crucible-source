@@ -61,6 +61,13 @@ pub async fn serve(
     serve_io(TokioIo::new(stream), live, lc, peer).await
 }
 
+/// 请求头读取超时：客户端连上后「挤牙膏」式发头部会把连接长期占住任务与 socket
+/// （slowloris）。hyper 的 header_read_timeout 只覆盖「读完整请求头」这段，
+/// 之后的请求体读取与 keep-alive 长连接不受影响（不改 keep-alive 语义）。
+const HEADER_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+/// 单个请求的头部条数上限：几十万行头部是廉价的内存/CPU 放大面。
+const MAX_HEADERS: usize = 100;
+
 pub async fn serve_with_prefix(
     stream: TcpStream,
     live: Arc<LiveConfig>,
@@ -110,6 +117,8 @@ where
         async move { Ok::<_, std::convert::Infallible>(handle_request(req, live, lc, peer).await) }
     });
     hyper::server::conn::http1::Builder::new()
+        .header_read_timeout(HEADER_READ_TIMEOUT)
+        .max_headers(MAX_HEADERS)
         .serve_connection(io, svc)
         .await?;
     Ok(())
