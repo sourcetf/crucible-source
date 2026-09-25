@@ -767,3 +767,42 @@ ASN/Tor pool，脚本还**硬拒绝** Ip2Region / DB-IP 系 URL（`BLACKLIST_URL
    回来先 `_cmp.py` 逐文件比对再决定接受或回滚。
 4. OpenBSD 没有 `base64`（用 `python3 -m base64`）；`head -c` 不存在（用 `cut -c`）；
    `pkill` 的模式若出现在自己的命令行里会**杀掉自己的会话** ✗。
+
+
+---
+
+## 19. 上传功能进度快照（接续用，2026-09-25）
+
+### 19.1 已完成（提交 `b931567` / `38719bf`）
+
+| 层 | 状态 |
+|---|---|
+| `src/server/upload_resume.rs` | ✅ 安全会话层（同目录临时文件+原子 rename / offset 语义 → `OffsetMismatch(cur)` / 每目标会话锁支撑 4 片并发 / TTL+sweep / 2GiB、256 会话上限 / `parse_content_range`），3 个单测 |
+| `src/server/upload_api.rs` | ✅ 端点逻辑（`enabled_for` 只认 `autoindex.enabled && enable_upload` + 路径前缀 / 泛型 body 流式 append / 扩展名闸门 / `safe_join` containment / 201-202-409-413-503 语义 / `x-upload-offset`），3 个单测 |
+| `src/server/mod.rs` | ✅ 声明 `pub mod upload_api; pub mod upload_resume;`（**此前两者都不在模块树里** —— 所以老 `upload_resume.rs` 是游离文件、才表现为"零引用"） |
+| `src/server/h1.rs` | ✅ 在 `static_files::serve` 之前 hook PUT/PATCH/POST（ACL/限速/鉴权之后） |
+
+### 19.2 下一步（机械可执行）
+
+1. **h2/h3 接线**：两处静态分发点是 `src/server/h2.rs:672` 与 `src/server/h3.rs:780`
+   （`match static_files::serve_simple(&req, &lc).await {`）。它们返回 `Response<Bytes>`，
+   而现在的 `upload_api::handle` 返回 `Response<BoxBody>` —— 所以先做**小重构**：
+   * 把核心抽成 `async fn run<B>(req, lc, peer) -> (StatusCode, String, Option<u64>)`（不改逻辑）；
+   * `handle<B>(...) -> Response<BoxBody>`（h1，现有签名不变）与
+     `handle_bytes(req: Request<Full<Bytes>>, ...) -> Response<Bytes>`（h2/h3）两个薄包装；
+   * h2/h3 各插一次同款 hook（同 h1，注意用 if-分支 return 的写法避免 req 被 move 后仍被借用）。
+2. **autoindex 上传 UI**：`static_files.rs::autoindex_html` 在 `enable_upload` 为真时渲染上传按钮 +
+   `File.slice()` **4 片并发**（线程数取 `autoindex.upload_threads`）+ 每片带 `Content-Range` +
+   按响应的 `x-upload-offset` 校正续传 + 失败重试 3 次 + 总进度条（§18.3）。
+3. `ETag`/`Last-Modified` + `If-Range`/`If-None-Match`（`static_files.rs` 的 6 处头构造点统一：
+   163/181/183/226/334/359/381 一带）。
+4. 流式 body（解除 >16MiB 单次 GET 只能 413）。
+5. ECH 配置进 DNS 应答；QMux（先取 draft 正文）；h3/QUIC 限额（vendored quinn-boring）。
+
+### 19.3 未验证风险（build42 编译时优先看）
+
+`upload_api.rs` 里三处 API 假设需要编译器确认：
+① `admin_files::safe_join(&Path, &str) -> Result<PathBuf, E>` 的**确切签名**；
+② `ListenerConfig.autoindex` 字段名与其 `enabled/enable_upload/paths` 成员；
+③ `Full<Bytes>`/`Incoming` 是否满足 `Body<Data = Bytes> + Unpin + Send + 'static` 与
+   `B::Error: Display`。若报错，按实际签名调整（逻辑不需要改）。
