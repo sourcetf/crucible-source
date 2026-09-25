@@ -847,3 +847,44 @@ ASN/Tor pool，脚本还**硬拒绝** Ip2Region / DB-IP 系 URL（`BLACKLIST_URL
 → ECH 配置进 DNS 应答（`type65_api` 目前只有面板读写，`dns/**` 无消费者）
 → QMux（draft-ietf-quic-qmux-01：先取草案正文，不发明 wire format）
 → h3/QUIC 限额（vendored `libs/quinn-boring` 里设 idle/流上限）。
+
+
+---
+
+## 21. 上传功能端到端实测：发现的两个真实缺陷（下一动作，都在这两处）
+
+build42 部署后实测上传（测试配置 18443 已开 `enable_upload`，见 `config-test.toml` 的
+`autoindex = {enabled, enable_upload, paths:["/"]}`）：`curl -k -T file https://127.0.0.1:18443/x.bin`
+**挂住直到超时** ✗，且未见落盘文件。定位到两个缺陷（都不是测试问题）：
+
+### 21.1 `Expect: 100-continue` 没有回应 → 双方互等（挂住）
+curl 对较大 body 会先发 `Expect: 100-continue` 并**等服务端回 `100 Continue` 才发 body**；
+`upload_api::handle` 直接 `body.frame().await` 等 body → 客户端在等 100、服务端在等 body → 卡死。
+修法（二选一，推荐前者）：
+* 在 `handle` 开头，若 `req.headers()` 含 `Expect: 100-continue`，**先**把 `100 Continue` 写回连接再读 body；
+  hyper 1.x 的 h1 服务端需要走它暴露的接口（`hyper::server::conn::http1` 无直接 API ✗）→ 另一条更稳的路：
+  在 **h1 的 `service_fn` 里**（有 `Request<Incoming>` 与连接上下文）用
+  `let _ = req.extensions()` ✗ 不可行 → 实际可行方案：**用 `hyper::body::Incoming` 的
+  `poll_frame` 之前先设置响应**不行（HTTP/1 的 100 必须先于最终响应发出）——
+  结论：在 h1 侧用 `hyper` 的低层 `http1::Builder::serve_connection` 配合
+  `http1::Connection::without_shutdown`/`into_parts` 手工发 `100 Continue`，或把上传端点
+  改为**在 h2/h3 上验证**（h2/h3 无 100-continue 语义 ✗ 但 curl 在 h2 上不发 Expect ✗）。
+  **先做最小验证**：`curl -H 'Expect:'`（禁用）+/或 `--http2` 走 h2 → 确认其余逻辑正确，再决定 100-continue 的实现位置。
+* 同时在文档/UI 上注明：本上传端点建议客户端禁用 `Expect`（面板 JS 用 `fetch` 本就不发 ✗ 所以 UI 不受影响 ✓）。
+
+### 21.2 无 `Content-Range` 时从不 commit（把 Content-Length 当 total）
+`handle` 里 `(start, total)`：无 `Content-Range` → `(0, None)` → `Session::complete()` 恒假
+→ 客户端即使发完全部 body 也只会拿到 **202**、文件永远留在 `.upload.part` ✗。
+修法：无 `Content-Range` 时用 `Content-Length` 作 total（`(0, content_length)`）；
+只有在**既无 Content-Range 又无 Content-Length**（分块传输）时才按"长度未知"处理（此时
+收完 body 即视为完成 → 直接 commit）。
+注意：`curl -T` + `-C -`（续传）会发 `Content-Range` ✓ 这条路是好的 ✓（§18.4 第 2 条要靠它）。
+
+### 21.3 实测命令（修完照此跑）
+
+```sh
+# 1) 全量（禁用 Expect 或走 h2）→ 期望 201 且 sha256 一致
+curl -k -H 'Expect:' -T /tmp/up.bin https://127.0.0.1:18443/up-test.bin
+sha256 -q /tmp/up.bin; sha256 -q /crucible/www-apps/up-test.bin
+# 2) .php → 403；3) ../ → 400；4) 生产口 9095 → 405
+```

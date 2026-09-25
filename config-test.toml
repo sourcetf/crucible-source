@@ -110,6 +110,7 @@ port = 19095
 root = "www-apps"
 server_name = "apps-test.crucible.local"
 
+
 [[listeners.apps]]
 docroot = "www-apps/php"
 enabled = true
@@ -367,6 +368,7 @@ server_name = "prod-test.crucible.local"
 
 [listeners.autoindex]
 enabled = true
+enable_upload = true
 paths = ["/"]
 
 [listeners.ssl]
