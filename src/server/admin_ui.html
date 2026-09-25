@@ -167,7 +167,11 @@ img.preview{max-width:100%;max-height:420px}
       <label>ciphers（密码套件：每行一个，或用 , : 分隔；留空 = 用库的默认套件）</label>
       <textarea id="tlsCiphers" placeholder="TLS_AES_128_GCM_SHA256&#10;TLS_AES_256_GCM_SHA384&#10;ECDHE-RSA-AES128-GCM-SHA256"></textarea>
       <div class="row">
-        <div><button class="act ghost" id="btnCiphersCommon">填入常用套件</button></div>
+        <div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap">
+          <select id="tlsCipherPick" style="min-width:280px"><option value="">（套件全集加载中…）</option></select>
+          <button class="act ghost" id="btnCipherAdd">加入所选</button>
+          <button class="act ghost" id="btnCiphersCommon">填入全部可用</button>
+        </div>
         <div><button class="act ghost" id="btnCiphersClear">清空（改用库默认）</button></div>
         <div style="flex:1"><label>TLS1.3 套件与 TLS1.2 套件在同一个列表里，由 BoringSSL 各取所需</label></div>
       </div>
@@ -1002,7 +1006,29 @@ $('btnGeoLineAdd').onclick=()=>{
 const COMMON_CIPHERS=['TLS_AES_128_GCM_SHA256','TLS_AES_256_GCM_SHA384','TLS_CHACHA20_POLY1305_SHA256',
   'ECDHE-ECDSA-AES128-GCM-SHA256','ECDHE-RSA-AES128-GCM-SHA256','ECDHE-ECDSA-AES256-GCM-SHA384',
   'ECDHE-RSA-AES256-GCM-SHA384','ECDHE-ECDSA-CHACHA20-POLY1305','ECDHE-RSA-CHACHA20-POLY1305'];
-$('btnCiphersCommon').onclick=()=>{$('tlsCiphers').value=COMMON_CIPHERS.join('\n');};
+// 套件全集来自后端**探测**（/api/tls/ciphers）——不手抄名字，保证与链接进来的 BoringSSL
+// 实际支持的一致；配置校验用的是同一份，所以面板能选的都能保存成功。
+let TLS_CIPHERS_FULL=null;
+async function loadTlsCipherCatalog(){
+  const sel=$('tlsCipherPick'); if(!sel) return;
+  const r=await apiJson('/api/tls/ciphers');
+  const j=r.json||{};
+  const all=[].concat(j.suites||[], j.tls13||[]);
+  TLS_CIPHERS_FULL=all.length?all:COMMON_CIPHERS;
+  sel.innerHTML='<option value="">（选择套件…）</option>'
+    +TLS_CIPHERS_FULL.map(function(n){return '<option>'+esc(n)+'</option>';}).join('');
+}
+$('btnCipherAdd').onclick=function(){
+  const v=$('tlsCipherPick').value; if(!v) return;
+  const cur=$('tlsCiphers').value.trim();
+  if(cur.split(/[\n:,]+/).map(function(x){return x.trim();}).indexOf(v)>=0) return;
+  $('tlsCiphers').value=(cur?cur+'\n':'')+v;
+};
+$('btnCiphersCommon').onclick=async()=>{
+  if(!TLS_CIPHERS_FULL) await loadTlsCipherCatalog();
+  $('tlsCiphers').value=(TLS_CIPHERS_FULL||COMMON_CIPHERS).join('\n');
+};
+loadTlsCipherCatalog();
 $('btnCiphersClear').onclick=()=>{$('tlsCiphers').value='';};
 $('btnTlsProbe').onclick=async()=>{
   const r=await api('/api/tls/probe',{method:'POST',body:$('tlsCert').value});
