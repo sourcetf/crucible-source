@@ -777,15 +777,6 @@ mod imp {
             );
         }
         // Static files; metrics already handled above via telemetry::maybe_handle_simple.
-        // §44 上传：与 h1 同一套语义（见 upload_api / WORKLOG §18）。
-        if matches!(*req.method(), http::Method::PUT | http::Method::PATCH | http::Method::POST)
-            && crate::server::upload_api::enabled_for(&lc, req.uri().path())
-        {
-            return tag(
-                crate::server::upload_api::handle_bytes(req, &lc, peer).await,
-                "upload",
-            );
-        }
         match static_files::serve_simple(&req, &lc).await {
             Ok(r) => tag(r, "static"),
             Err(_) => tag(
