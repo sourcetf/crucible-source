@@ -46,6 +46,11 @@ pub const H2_COALESCE_WRITES: bool = COALESCE_WRITES_DEFAULT;
 pub const H2_MAX_CONCURRENT_STREAMS: u32 = 256;
 pub const H2_INITIAL_WINDOW_SIZE: u32 = 1024 * 1024;
 
+/// 单个请求的头部列表总字节上限（HPACK 解出来之后的量）：无界头列表是内存/CPU 放大面
+/// （一个连接反复发巨大头部即可），64KiB 对正常请求足够宽裕，超限 h2 会以
+/// ENHANCE_YOUR_CALM/压缩错误终止该流而不是吃掉内存。
+pub const H2_MAX_HEADER_LIST_SIZE: u32 = 64 * 1024;
+
 pub async fn serve(
     stream: TcpStream,
     live: Arc<LiveConfig>,
@@ -110,6 +115,7 @@ where
     builder.initial_window_size(H2_INITIAL_WINDOW_SIZE);
     builder.initial_connection_window_size(H2_INITIAL_WINDOW_SIZE);
     builder.max_concurrent_streams(H2_MAX_CONCURRENT_STREAMS);
+    builder.max_header_list_size(H2_MAX_HEADER_LIST_SIZE);
     // Note: h2 0.4 Builder has no enable_push / coalesce setter — coalesce is
     // applied via CoalescingIo + BatchWriter above; logged so knobs are visible.
 
@@ -223,7 +229,10 @@ where
                     .status(StatusCode::PAYLOAD_TOO_LARGE)
                     .body(())
                     .unwrap();
-                if let Ok(mut send) = respond.send_response(resp, true) {
+                // end_of_stream=false：紧随其后的 send_data 才是这一响应的结束。
+                // 旧代码传 true（先结束流），send_data 必然报错被 `let _` 吞掉——
+                // 客户端只收到一个空 body 的 413。
+                if let Ok(mut send) = respond.send_response(resp, false) {
                     let _ = send.send_data(Bytes::from_static(b"request body too large"), true);
                 }
                 return;
