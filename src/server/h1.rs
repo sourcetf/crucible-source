@@ -539,6 +539,18 @@ async fn dispatch_tail(
         );
     }
 
+    // §44 上传：仅当该路径开了 autoindex + enable_upload 时接管写方法。
+    // 放在这里 = ACL / 限速 / basic_auth 都已完成，上传与静态下载享受同一套防护。
+    if matches!(
+        *req.method(),
+        http::Method::PUT | http::Method::PATCH | http::Method::POST
+    ) && crate::server::upload_api::enabled_for(&lc, &path)
+    {
+        return tag(
+            crate::server::upload_api::handle(req, &lc, peer).await,
+            "upload",
+        );
+    }
     match static_files::serve(&req, &lc).await {
         Ok(r) => tag(r, "static"),
         Err(_) => tag(

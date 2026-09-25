@@ -38,6 +38,8 @@ pub mod rate_limit;
 pub mod ssl_material;
 pub mod tor_hs;
 pub mod static_files;
+pub mod upload_api;
+pub mod upload_resume;
 pub mod qmux;
 pub mod syncookie;
 pub mod telemetry;
