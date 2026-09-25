@@ -611,3 +611,28 @@ h2 3MB 上传 201 + sha 一致；h2 PUT/POST 3MB 不再挂住（405/56ms）。
 * ECH 配置未进 DNS 应答：`ech_auto` 已产出 `ECHConfigList`（`ech_config_list_b64()`），
   只需在 `dns::gen_zone_file` 里为 ECH 的 public name 生成 `HTTPS` 记录（`ech="<b64>"` + `alpn`）。
 * QMux 协议本体未实现；h3/QUIC 限额在 `libs/quinn-boring`。
+
+[工号 1008 / 2026-09-26 08:0x] 续：ECH 进 DNS 应答 + h3/QUIC 显式限额（build49 → build50）
+
+**本轮改动的文件**：`src/server/dns/mod.rs`、`src/server/h3.rs`、`config-test.toml`、`WORKLOG.md`
+
+**1. ECH 配置进 DNS 应答（build49，已提交 2757251）**
+`DnsConfig` 新增 `[[dns.https_rr]]`（name/alpn/port/ech/priority/target，**默认空 = 现网零影响**）；
+按 zone 归属自动生成 `HTTPS(type65)` 记录，`ech=` 取自 `state/ech/ech_config_list.bin`
+（服务端实际在用的那份）；面板同名记录优先。实测 `dig echo.test HTTPS` → NOERROR + ANSWER: 1
+且带 ech 参数。**要真在生产发布**：在 `[dns]` 里加 `[[dns.https_rr]] name = "<你的公开名>" alpn = "h2,h3" port = 443 ech = true`
+（我**没有**动生产 DNS 配置——发布记录会改变对外的 DNS 应答，需要你确认域名后再开）。
+**坑**：测试态明文 DNS 在 **5353**，11853 是 DoT 口（我一开始查错了，不是服务端问题）。
+
+**2. h3/QUIC 显式限额（build50）**
+`src/server/h3.rs` 里新增 `quic_transport_config()`：quinn 的默认值有一条是危险的 ——
+`receive_window = VarInt::MAX`（连接级接收窗口无上限），单连接内存上界 ≈ 流数 × 单流窗口
+（默认 100 × 1.25MB ≈ 125MB），攻击者开多连接即可按连接数放大内存。
+现在显式写死：bidi/uni 流各 256、空闲 60s、单流窗口 1MiB、**连接窗口 8MiB（单连接接收缓冲上界）**、
+发送窗口 8MiB、datagram 接收 1MiB；**不设 keep-alive**（空闲连接 60s 回收）。
+
+**其余遗留（我没有动，线索见 WORKLOG §21.8/§21.9）**
+* h2/h3 上传的单请求 8MiB 上限：分片上传（Content-Range）在 h1/h2/h3 上**都已实测可用**，
+  我们的面板 UI 就是分片发的，所以正常路径不受影响；只有「单请求 >8MiB 的裸 PUT」会被 413
+  （文案已说明出路）。要彻底解掉需要把 `handle_h2` 的闸门/分发拆开（设计写在 WORKLOG §21.8）。
+* QMux 协议本体：`src/server/qmux.rs` 目前是「真在生效的流预算 + 诚实说明」，协议本体未实现。

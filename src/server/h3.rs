@@ -80,6 +80,45 @@ mod imp {
         Ok(())
     }
 
+    /// QUIC 传输层显式限额（**不依赖 quinn 的库默认值**）。
+    ///
+    /// 为什么必须显式写：quinn 0.11 的 `TransportConfig::default()` 里
+    /// **`receive_window = VarInt::MAX`** —— 连接级接收窗口无上限。于是单连接的内存上界
+    /// 变成 `max_streams × stream_receive_window`（默认 100 × 1.25MB ≈ 125MB）；
+    /// 攻击者开 N 条连接、每条开满流并持续发数据（我们故意不读），内存就按连接数线性放大。
+    /// 这里把连接级窗口压到 [`QUIC_CONN_WINDOW`]，其余值也写死以便审计。
+    pub const QUIC_MAX_BIDI_STREAMS: u32 = 256;
+    pub const QUIC_MAX_UNI_STREAMS: u32 = 256;
+    /// 空闲超时秒数。RFC 9308 §3.2 要求不低于 30s；60s 兼顾移动端抖动与资源回收。
+    pub const QUIC_MAX_IDLE_SECS: u64 = 60;
+    /// 单流接收窗口（1MiB）：与 h2 的 `H2_INITIAL_WINDOW_SIZE` 对齐。
+    pub const QUIC_STREAM_WINDOW: u32 = 1024 * 1024;
+    /// 连接级接收窗口（8MiB）：**这一条是单连接的接收缓冲上界**，也是与 quinn 默认值
+    /// 差别最大的一条（默认无上限）。
+    pub const QUIC_CONN_WINDOW: u32 = 8 * 1024 * 1024;
+    pub const QUIC_SEND_WINDOW: u64 = 8 * 1024 * 1024;
+    /// WebTransport/QMux 方向的 datagram 接收缓冲（显式给值，否则由 quinn 默认决定）。
+    pub const QUIC_DATAGRAM_RECV: usize = 1024 * 1024;
+
+    /// 见上方常量的说明。
+    /// **不设 keep-alive**：空闲连接按 [`QUIC_MAX_IDLE_SECS`] 回收（要长连的客户端
+    /// 自己发 PING/请求），避免连接被永久钉住。
+    fn quic_transport_config() -> Result<quinn::TransportConfig> {
+        let mut t = quinn::TransportConfig::default();
+        t.max_concurrent_bidi_streams(quinn::VarInt::from_u32(QUIC_MAX_BIDI_STREAMS));
+        t.max_concurrent_uni_streams(quinn::VarInt::from_u32(QUIC_MAX_UNI_STREAMS));
+        t.max_idle_timeout(Some(
+            std::time::Duration::from_secs(QUIC_MAX_IDLE_SECS)
+                .try_into()
+                .map_err(|_| anyhow::anyhow!("h3: idle timeout 超出 quinn 允许范围"))?,
+        ));
+        t.stream_receive_window(quinn::VarInt::from_u32(QUIC_STREAM_WINDOW));
+        t.receive_window(quinn::VarInt::from_u32(QUIC_CONN_WINDOW));
+        t.send_window(QUIC_SEND_WINDOW);
+        t.datagram_receive_buffer_size(Some(QUIC_DATAGRAM_RECV));
+        Ok(t)
+    }
+
     /// BoringSSL QUIC only — no silent rustls fallback (spec: H3 crypto = Boring).
     fn build_server_config(
         cert_pem: &[u8],
@@ -94,8 +133,17 @@ mod imp {
         let crypto = boring.as_quinn_crypto().ok_or_else(|| {
             anyhow::anyhow!("h3: BoringQuicConfig built but as_quinn_crypto=None")
         })?;
-        quinn_boring::helpers::server_config(crypto)
-            .map_err(|e| anyhow::anyhow!("h3 boring server_config: {e}"))
+        let mut cfg = quinn_boring::helpers::server_config(crypto)
+            .map_err(|e| anyhow::anyhow!("h3 boring server_config: {e}"))?;
+        // 显式 QUIC 限额（quinn 默认值是库的约定，不是我们的边界）。
+        cfg.transport_config(std::sync::Arc::new(quic_transport_config()?));
+        log::info!(
+            "h3 quic limits: bidi={QUIC_MAX_BIDI_STREAMS} uni={QUIC_MAX_UNI_STREAMS} \
+             idle={QUIC_MAX_IDLE_SECS}s stream_window={QUIC_STREAM_WINDOW} \
+             conn_window={QUIC_CONN_WINDOW} send_window={QUIC_SEND_WINDOW} \
+             datagram_recv={QUIC_DATAGRAM_RECV}"
+        );
+        Ok(cfg)
     }
 
     /// QUIC socket 的 ECN 启动校验（由 `ListenerConfig::quic_ecn` 打开，默认关）。
