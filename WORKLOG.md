@@ -687,3 +687,83 @@ ASN/Tor pool，脚本还**硬拒绝** Ip2Region / DB-IP 系 URL（`BLACKLIST_URL
 | GeoIP 导入 | 单行 rdata、解析阶段**全量校验**后才落库 | 任一行不合法 → 整体失败并报行号（不落半截 ✗） |
 | 配置文件 | `cert`/`key` 必须成对；`sni_only` 需有名字；TLS 版本串白名单；root 唯一；端口非 0 且不重复 | **加载期报错**（fail-fast，不静默降级 ✗） |
 | TLS 套件名 | 必须 ∈ 运行时探测出的 BoringSSL 目录（`/api/tls/ciphers` 同源） | 加载期报错并指名（此前静默剔除 ✗） |
+
+
+---
+
+## 18. 上传 + 断点续传（规格 §44）实施方案 + 剩余待办
+
+用户指令：**做完之前不要编译**（本轮先把改动/方案攒齐）。以下为可机械执行的方案。
+
+### 18.1 现状（已核对）
+
+| §44 要求 | 现状 |
+|---|---|
+| autoindex 开关 | ✅ `autoindex.enabled/paths`（`config.rs`），目录链接按段编码 |
+| `enable_upload` 开关 | ❌ 只有配置字段（`config.rs:247/296`）与面板表单回显 ✓，**无任何运行时消费者** ✗ |
+| 上传端点 | ❌ 不存在（静态分支非 GET/HEAD 一律 405） |
+| 断点续传（上传） | ❌ `upload_resume.rs` 74 行**零引用死代码** ✗：`resolve_dest` 把根写死 `/crucible/uploads` ✗、只查 `contains("..")` ✗、无 containment、`append()` 无并发/原子性、无临时文件与清理、未接鉴权 |
+| 断点续传（下载） | ✅ h1 + h2/h3 均已支持 Range/206/416（本轮审计补齐 h2/h3 ✓）；>32MiB 单段收窄为 206 子段 ✓ |
+| 4 线程并发上传 | ❌ 只有 `upload_threads` 默认 4 的配置项，无执行代码 |
+| 无穿越 / 无 webshell | 读路径 ✅（`resolve_path`+containment）；写路径需按下方案实现 |
+
+### 18.2 后端设计（`upload_resume.rs` 重写 + 端点接线）
+
+1. **端点**：`PUT /<autoindex 路径>/<文件名>`，仅当该路径 `autoindex.enabled && enable_upload` 为真；
+   同一 URL 的 `POST`/`PATCH` 亦支持（表单兼容）。非 GET/HEAD 的其它方法保持 405。
+2. **鉴权**：写操作必须过 `access`（同站点的 ip_access/rate_limit）+ `file_open` 的 webshell 闸门
+   （`would_execute_on_get` 为真的扩展名**拒绝上传**，除非管理员在配置里显式允许；这是 §44
+   「不得有 webshell」的落地方式）。
+3. **落盘**：`safe_join` 解析目标（禁 `..`/反斜杠/绝对路径/盘符，Windows 另禁 `:`）→ 临时文件
+   `<name>.upload.<session>.part` 与目标**同目录**（保证 rename 原子）→ 完成后 `rename` 覆盖。
+4. **断点续传语义**（`Content-Range: bytes <start>-<end>/<total|*>`）：
+   - 缺 `Content-Range` → 全量写（`start=0`，先截断临时文件）；
+   - 有 `Content-Range` → 校验 `start` 必须等于临时文件当前长度（否则 **409** 并回
+     `X-Upload-Offset: <当前长度>`，客户端据此续传）；
+   - 全部收齐（临时文件长度 == total）→ 原子 rename；否则 **202** + 当前 offset；
+   - `DELETE` 同一 URL → 放弃会话并删临时文件。
+5. **并发（4 线程上传）**：每目标一把 `Mutex`（`HashMap<PathBuf, Arc<Mutex<()>>>`，随会话清理），
+   分片写入串行化；不同文件互不阻塞。会话 TTL（默认 1h）由维护任务清理临时文件。
+6. **限额**（写进 §17 的表）：单文件 ≤ `MAX_UPLOAD_BYTES`（默认 2GiB）、单次请求体 ≤
+   `APP_BODY_CAP`(32MiB)、每会话临时文件数 ≤ `MAX_UPLOAD_SESSIONS`（默认 256）。
+7. **C/Go/Rust 禁用 CGI 之类的规矩不涉及此处**；不引入新依赖。
+
+### 18.3 前端（autoindex 页面 + 面板）
+
+- `autoindex_html`：`enable_upload` 为真时渲染「上传」按钮 + 拖放区；
+- 上传器：`File.slice()` 分 4 片并发（`upload_threads` 来自配置），每片带
+  `Content-Range`，逐片读回 `X-Upload-Offset` 校正；失败重试 3 次；显示总进度；
+- 断点续传：刷新后按服务端回的 offset 继续（不重传已完成部分）。
+
+### 18.4 验收标准（实现后照此实测）
+
+1. `curl -T file http://…/up/` 全量上传成功，落盘内容与原文件 `sha256` 一致；
+2. 中断后 `curl -C - -T file` 续传成功且不产生重复字节；
+3. 并发 4 片上传同一文件 → 结果一致、无临时文件残留；
+4. 越界：`../`、`%2e%2e%2f`、绝对路径、Windows `:`、超限文件 → 400/409/413，且**目录外无文件产生**；
+5. uploads 目录里放一个 `x.php` → 请求它**不被引擎执行**（返回静态文本或 404，取决于配置）；
+6. 未开 `enable_upload` 的路径 → PUT 仍 405。
+
+### 18.5 本轮剩余待办（下一步按序，全部做完再一次性编译）
+
+1. **上传 + 断点续传**（§18 方案）—— 最大的功能缺口；
+2. `ETag`/`Last-Modified` + `If-Range`/`If-None-Match`（`static_files.rs` 6 处头构造点统一；
+   解决「续传期间文件变化 → 客户端静默拼出坏文件」）;
+3. 流式 body（当前 `BoxBody<Bytes, Infallible>` 只能整读缓冲 → >16MiB 单次 GET 只能 413；
+   需改成可失败的流式 body）；
+4. ECH 生成的配置自动进 DNS 应答（`type65_api` 目前只有面板读写，`dns/**` 无消费者）；
+5. QMux（draft-ietf-quic-qmux-01）：需先取草案正文再实现，**不发明 wire format**；
+6. h3/QUIC 侧限额（在 vendored `libs/quinn-boring` 里设 idle/流上限，改动面在 vendored 库）；
+7. `scripts/debug_tls.sh` 仍在用 openssl CLI（辅助脚本）。
+
+### 18.6 过程教训（血泪，务必照做）
+
+1. **加固类改动必须用真实连接验证**：build39 里给 h1 加 `header_read_timeout` 却忘了
+   `.timer()` → 每个 h1 连接 panic → 9095/9081（含管理面板）停摆约 45 分钟；**编译期毫无提示** ✗。
+2. **不编译就攒代码时要格外克制**：无编译反馈时，只做小而确定的改动；中等以上改动等
+   下一次编译窗口一起做。
+3. **agent 会静默死亡**：本轮 2/3 个审计 agent 没交报告 ✗，其中一个在**旧文件快照**上编辑
+   （本地比远端多 351 行）✗，已回滚。派 agent 时：范围要小、必须要求交清单表、
+   回来先 `_cmp.py` 逐文件比对再决定接受或回滚。
+4. OpenBSD 没有 `base64`（用 `python3 -m base64`）；`head -c` 不存在（用 `cut -c`）；
+   `pkill` 的模式若出现在自己的命令行里会**杀掉自己的会话** ✗。
