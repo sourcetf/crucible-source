@@ -994,6 +994,50 @@ impl Config {
             }
         }
 
+        // TLS 相关的 fail-fast：这几条错了不会「报错」，而是**静默降级或整站不可用**，
+        // 必须在加载期拦住（用户明确要求：拒绝异常配置，而不是运行期悄悄跳过）。
+        for l in &self.listeners {
+            let Some(ssl) = &l.ssl else { continue };
+            let has_cert = ssl.cert.as_deref().map_or(false, |s| !s.trim().is_empty());
+            let has_key = ssl.key.as_deref().map_or(false, |s| !s.trim().is_empty());
+            // ① 证书与私钥必须成对。只写 cert 不写 key 时，TLS 建不起来，而 accept 侧会把
+            //    「未配置证书」当作「按明文 HTTP 服务」（规格要求 cert 未配置前一律走 HTTP）
+            //    —— 于是少写一行 key = 该口静默变明文。这比启动失败危险得多。
+            if has_cert != has_key {
+                anyhow::bail!(
+                    "listener {}:{} 的 TLS 证书与私钥必须成对配置（cert/key 只给了一个；                     缺 key 会让该口静默退化成明文 HTTP）",
+                    l.address, l.port
+                );
+            }
+            // ② sni_only 必须在名字可比对：只开 sni_only 而不给 sni_name / server_name 时，
+            //    每个连接都会因「SNI 不匹配」被丢弃（fail-closed，但整个站点不可用），
+            //    运维在日志里只看到一句「无可用 SNI」。
+            if ssl.sni_only
+                && ssl.sni_name.as_deref().unwrap_or("").trim().is_empty()
+                && l.server_name.as_deref().unwrap_or("").trim().is_empty()
+            {
+                anyhow::bail!(
+                    "listener {}:{} 开了 sni_only 但既没有 sni_name 也没有 server_name ——                      这样所有连接都会被丢弃",
+                    l.address, l.port
+                );
+            }
+            // ③ TLS 版本串写错只会被静默忽略（与预期不符，甚至以为关掉了 TLS1.0）。只认这几种写法。
+            for v in &ssl.versions {
+                let n = v.trim().to_ascii_lowercase();
+                if !matches!(
+                    n.as_str(),
+                    "tls1" | "tls1.0" | "tls1.1" | "tls1.2" | "tls1.3"
+                        | "tlsv1" | "tlsv1.0" | "tlsv1.1" | "tlsv1.2" | "tlsv1.3"
+                ) {
+                    anyhow::bail!(
+                        "listener {}:{} 的 TLS 版本 {v:?} 无法识别（支持 tls1.0/tls1.1/tls1.2/tls1.3）",
+                        l.address,
+                        l.port
+                    );
+                }
+            }
+        }
+
         // deps_dir 必须位于该应用 docroot 之内。
         //
         // 依据：deps::ensure_app_deps 在 init.sh 存在时会 **递归删除 deps_dir 再重建**，
@@ -1060,6 +1104,56 @@ fn resolve_ssl_material(field: &mut Option<String>, base: &Path) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// cert 不给 key：必须加载失败（否则该 TLS 口会静默退化成明文 HTTP）。
+    #[test]
+    fn tls_cert_without_key_is_rejected() {
+        let toml = r#"
+[[listeners]]
+address = "127.0.0.1"
+port = 14443
+root = "/tmp/x1"
+[listeners.ssl]
+cert = "cert.pem"
+"#;
+        let cfg: Config = toml::from_str(toml).expect("parse");
+        let err = cfg.validate().expect_err("cert 无 key 必须报错");
+        assert!(format!("{err}").contains("成对"), "错误信息应说明成对: {err}");
+    }
+
+    /// sni_only 但没有可比对的名字：必须加载失败（否则所有连接被丢弃）。
+    #[test]
+    fn sni_only_without_name_is_rejected() {
+        let toml = r#"
+[[listeners]]
+address = "127.0.0.1"
+port = 14443
+root = "/tmp/x2"
+[listeners.ssl]
+sni_only = true
+"#;
+        let cfg: Config = toml::from_str(toml).expect("parse");
+        let err = cfg.validate().expect_err("sni_only 无名字必须报错");
+        assert!(format!("{err}").contains("sni_only"), "错误信息应提到 sni_only: {err}");
+    }
+
+    /// 版本串写错：必须加载失败，而不是被静默忽略。
+    #[test]
+    fn unknown_tls_version_is_rejected() {
+        let toml = r#"
+[[listeners]]
+address = "127.0.0.1"
+port = 14443
+root = "/tmp/x3"
+[listeners.ssl]
+cert = "cert.pem"
+key = "key.pem"
+versions = ["tls9.9"]
+"#;
+        let cfg: Config = toml::from_str(toml).expect("parse");
+        let err = cfg.validate().expect_err("非法 TLS 版本必须报错");
+        assert!(format!("{err}").contains("TLS 版本"), "错误信息应提到版本: {err}");
+    }
 
     #[test]
     fn file_open_inline_array_roundtrip() {
