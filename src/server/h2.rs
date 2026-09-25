@@ -313,7 +313,15 @@ where
                 // 旧代码传 true（先结束流），send_data 必然报错被 `let _` 吞掉——
                 // 客户端只收到一个空 body 的 413。
                 if let Ok(mut send) = respond.send_response(resp, false) {
-                    let _ = send.send_data(Bytes::from_static(b"request body too large"), true);
+                    // 单请求上限就是 REQUEST_BODY_CAP（h2/h3 先收齐再处理）；
+                    // 大文件必须走分片（Content-Range，§44）或 HTTP/1.1（h1 是流式，上限 2GiB）。
+                    let _ = send.send_data(
+                        Bytes::from_static(
+                            b"request body too large: h2/h3 single-request limit is 8MiB; \
+use chunked uploads (Content-Range) or HTTP/1.1 for larger bodies\n",
+                        ),
+                        true,
+                    );
                 }
                 return;
             }
@@ -335,7 +343,11 @@ where
                         http::HeaderValue::from_static(crate::server::h1::hsts_header())
                     });
             }
-            let (parts, data) = response.into_parts();
+            let (mut parts, data) = response.into_parts();
+            // 大文件（static 层 FileSource 标记）：用 DATA 帧分块从磁盘读，避免整读进内存。
+            let file_src = parts
+                .extensions
+                .remove::<crate::server::static_files::FileSource>();
             let engine = parts
                 .extensions
                 .get::<crate::server::access_log::EngineTag>()
@@ -349,13 +361,61 @@ where
                 &method,
                 &path,
                 parts.status.as_u16(),
-                Some(data.len() as u64),
+                // 流式响应（FileSource）日志记真实长度，而不是空 body 的 0
+                Some(file_src.as_ref().map(|s| s.len).unwrap_or(data.len() as u64)),
                 t0.elapsed(),
                 engine,
             );
-            let end = data.is_empty();
+            let end = file_src.is_none() && data.is_empty();
             if let Ok(mut send) = respond.send_response(Response::from_parts(parts, ()), end) {
-                if !data.is_empty() {
+                if let Some(src) = file_src {
+                    // 大文件：按 64KiB 分块读盘、逐帧发送。`send_data` 自带 h2 流控背压
+                    //（窗口满时 Pending），所以读盘被发送速率拉住，文件不会进内存。
+                    // 循环体里不用 `?`（外层是 spawn 的 `async move` 块，返回 ()）。
+                    use tokio::io::{AsyncReadExt, AsyncSeekExt};
+                    match tokio::fs::File::open(&src.path).await {
+                        Ok(mut f) => {
+                            let mut left = src.len;
+                            if src.start > 0
+                                && f.seek(std::io::SeekFrom::Start(src.start)).await.is_err()
+                            {
+                                log::warn!("h2 stream_file seek {} peer={peer}", src.path.display());
+                                left = 0;
+                            }
+                            let mut buf =
+                                vec![0u8; crate::server::static_files::STREAM_CHUNK];
+                            while left > 0 {
+                                let want = left.min(buf.len() as u64) as usize;
+                                match f.read(&mut buf[..want]).await {
+                                    Ok(0) => {
+                                        log::warn!("h2 stream_file 提前 EOF peer={peer}");
+                                        break;
+                                    }
+                                    Ok(n) => {
+                                        left -= n as u64;
+                                        if let Err(e) =
+                                            send.send_data(Bytes::copy_from_slice(&buf[..n]), false)
+                                        {
+                                            log::debug!("h2 stream_file send_data peer={peer}: {e}");
+                                            return;
+                                        }
+                                    }
+                                    Err(e) => {
+                                        log::warn!("h2 stream_file read peer={peer}: {e}");
+                                        break;
+                                    }
+                                }
+                            }
+                            if let Err(e) = send.send_data(Bytes::new(), true) {
+                                log::debug!("h2 stream_file end peer={peer}: {e}");
+                            }
+                        }
+                        Err(e) => log::warn!(
+                            "h2 stream_file open {} peer={peer}: {e}",
+                            src.path.display()
+                        ),
+                    }
+                } else if !data.is_empty() {
                     let _ = send.send_data(data, true);
                 }
             }

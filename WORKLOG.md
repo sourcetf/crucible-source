@@ -1011,3 +1011,84 @@ data frames"*。必须 `RecvStream::flow_control().release_capacity(n)`（recv.r
 `upload_api::handle` 流式写盘（h1 已是流式，上限 `MAX_UPLOAD_BYTES`=2GiB）。
 
 
+### 21.7 build46：条件请求（ETag / Last-Modified / If-* / If-Range）
+
+**问题**：静态层完全没有验证器 —— 响应不带 `ETag`/`Last-Modified`，因此不可能有 304；
+浏览器/CDN 每次都整份重传（大文件尤其贵）。`If-Range` 语义缺失更危险：续传客户端拿着
+**旧验证器**请求，服务端照样给**新文件**的那一段，客户端把新旧内容拼在一起 ⇒ 静默的文件损坏。
+
+**改动**（`src/server/static_files.rs`；h1 的 `serve_file` 与 h2/h3 的 `serve_simple` 共用同一套）
+* `validators()`：`ETag = "{len:x}-{mtime_secs:x}"`（nginx 同款），`mtime` **截断到秒**
+  —— HTTP 日期只有秒精度，不截断会让 `If-Modified-Since` 永远判「已修改」、304 永不出现。
+* `eval_conditions()`：按 RFC 9110 §13.2.2 顺序求值 If-Match → If-Unmodified-Since →
+  If-None-Match → If-Modified-Since；304 不带 body/Content-Length，412 带文案。
+* `if_range_allows()`：验证器不符 / 弱标记（`W/`，强比较不成立）/ 无法解析 → **忽略 Range 回 200 全量**。
+* 200 / HEAD / 206 全部带 `ETag` + `Last-Modified`。
+* 依赖新增 `httpdate = "1"`（纯 Rust、无传递依赖；registry 里已有 1.0.3，不需新下载）。
+* 4 个新单测：ETag 列表/弱比较/`*`、条件求值顺序与 304/412、If-Range 闸门、mtime 秒截断。
+
+**实测（build46，测试实例）**
+
+| 检查 | h1（18443 TLS） | h2（18443 TLS） |
+|---|---|---|
+| ETag / Last-Modified 存在，且两协议**完全一致** | ✓ `"1b-5e0d5da5"` | ✓ 同值 |
+| `If-None-Match` 命中 → 304（body 0 字节） | ✓ | ✓ |
+| `If-None-Match: *` → 304 | ✓ | — |
+| `If-None-Match` 不命中 → 200 | ✓ | — |
+| `If-Modified-Since` 同秒 → 304；更早 → 200 | ✓ / ✓ | ✓ |
+| `If-Match` 不符 → 412；相符 → 200 | ✓ / ✓ | ✓（412） |
+| `If-Unmodified-Since` 更早 → 412 | ✓ | — |
+| `Range`+`If-Range` 相符 → 206(size=5)；不符 → **200 全量**；弱标记 → 200 全量；日期形式 → 206 | ✓✓✓✓ | ✓（不符→200） |
+| HEAD → 200 且 body 0 字节 | ✓ | ✓ |
+| 明文 h2c（19081）同样具备验证器 + 304 | ✓（ETag `"16-5e0ced25"`，304，If-Range 不符→200） | |
+
+**诚实边界**：该 ETag 是*弱*语义（同一秒内等长改写识别不出），但按业界惯例不加 `W/` 前缀，
+所以客户端会当强验证器用（也才能配合 `If-Range`）。要真正强验证器必须改成内容哈希，
+意味着每个请求都要全量读文件 —— 代价与收益不成比例，故不做。
+
+
+### 21.8 build47/48：>16MiB 大文件改为**流式**（此前一律 413）
+
+**问题**：`Response<BoxBody>`（h1）与 `Response<Bytes>`（h2/h3）都把 body 放在内存里，于是
+`len > MAX_FULL_READ`(16MiB) 的静态文件只能回 **413**：浏览器点一个 20MB 的文件不带 Range，
+就是这条路径（等于大文件在浏览器里根本下不动）；Range 只能拿 ≤`MAX_RANGE_BYTES`(32MiB) 的分段。
+
+**做法**：静态层改为返回「**空 body + `FileSource` 标记**（放在 response extensions）」，
+由各协议的发送路径分块（64KiB）读盘：
+
+| 协议 | 位置 | 实现 |
+|---|---|---|
+| h1 | `h1::stream_file()` + `handle_request` 收口点 | 后台任务读盘 → mpsc（容量 2 帧，天然背压）→ 自定义 `hyper::body::Body`；`BoxBody` 的错误类型是 `Infallible`，读失败只能结束流 + 记日志 |
+| h2 | `serve_io` 发送分支 | 逐块 `send_data`（h2 流控自带背压），最后一帧 END_STREAM |
+| h3 | `handle_incoming` 发送分支 | 逐块 `send_data` + `finish()`（QUIC 流控背压） |
+
+* 用 extensions 传来源而不是改 body 类型：**不动** 30 多处 `Response<BoxBody>` 构造点。
+* 访问日志在流式响应下记真实长度（否则会记 0）。
+* Range 仍优先（206，≤32MiB 内存）；HEAD 仍短路（200 + Content-Length，无 body）。
+
+**实测（build47，测试实例；20MiB 随机文件，比对 sha256）**
+
+| 检查 | 结果 |
+|---|---|
+| h2 TLS 全量下载 | **200 / 20971520 字节 / 0.22s**，sha 一致 ✓ |
+| h3（`curl --http3`）全量下载 | **200 / 20971520 字节 / 0.43s**，sha 一致 ✓ |
+| h2c 明文全量下载 | **200 / 20971520 字节 / 0.18s**，sha 一致 ✓ |
+| h2 / h3 `Range` | 206 / 1024 字节、206 / 100 字节 ✓ |
+| h2 `HEAD` | 200、body 0 字节、`content-length: 20971520` ✓ |
+| h2 `Range` + `If-Range` 不符 | 200 全量（20971520）✓ |
+| **h1 全量下载** | build47 实测 **413**（漏改 `serve_file` 里那条 413 分支）✗ → build48 修复后 **200 / 20971520 字节 / 0.14s，sha 一致 ✓** |
+| h3 条件请求 | ETag 存在、`If-None-Match` 命中 → 304 ✓ |
+| h3 上传 20MB | **413**（h2/h3 单请求 8MiB 上限，见下） |
+
+**生产（build48，8443 TLS 口，临时文件 20MiB 用完即删）**：h1 **200 / 0.16s**、h2 **200 / 0.18s**、
+h3 **200 / 0.43s**，三个协议 sha256 全部一致 ✓ —— 生产此前「≥16MiB 文件一律 413、
+浏览器下不动」的缺陷消失。
+
+**已知限制（未变）**：h2/h3 的请求体仍是「先收齐再处理」⇒ 单请求 ≤ `REQUEST_BODY_CAP`(8MiB)，
+超出回 413（提示改写：分片 Content-Range 或走 h1/h1 上限 2GiB）。
+解掉它需要把 h2 的 `RecvStream` 包成 `http_body::Body`（每帧 `release_capacity`）并让
+`upload_api::handle` 直接流式写盘 —— 那要求把 `handle_h2` 的「闸门」与「分发」拆开
+（ACL/限速/basic_auth/apps/proxy 必须先于 body 消费），属于结构性改动，单独一轮做。
+
+
+

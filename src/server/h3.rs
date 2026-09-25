@@ -465,6 +465,13 @@ mod imp {
                     .body(())
                     .unwrap();
                 let _ = stream.send_response(resp).await;
+                // 如实说明上限与出路（h1 是流式，上限 2GiB；分片上传见 §44）。
+                let _ = stream
+                    .send_data(Bytes::from_static(
+                        b"request body too large: h2/h3 single-request limit is 8MiB; \
+use chunked uploads (Content-Range) or HTTP/1.1 for larger bodies\n",
+                    ))
+                    .await;
                 return Ok(());
             }
 
@@ -485,7 +492,11 @@ mod imp {
                         http::HeaderValue::from_static(crate::server::h1::hsts_header())
                     });
             }
-            let (parts, body_out) = response.into_parts();
+            let (mut parts, body_out) = response.into_parts();
+            // 大文件（static 层 FileSource 标记）：分块读盘逐帧发送，避免整读进内存。
+            let file_src = parts
+                .extensions
+                .remove::<crate::server::static_files::FileSource>();
             let engine = parts
                 .extensions
                 .get::<crate::server::access_log::EngineTag>()
@@ -499,7 +510,8 @@ mod imp {
                 &method,
                 &path,
                 parts.status.as_u16(),
-                Some(body_out.len() as u64),
+                // 流式响应（FileSource）日志记真实长度，而不是空 body 的 0
+                Some(file_src.as_ref().map(|s| s.len).unwrap_or(body_out.len() as u64)),
                 t0.elapsed(),
                 engine,
             );
@@ -508,7 +520,51 @@ mod imp {
                 log::debug!("h3 send_response peer={peer}: {e:#}");
                 return Ok(());
             }
-            if !body_out.is_empty() {
+            if let Some(src) = file_src {
+                // 大文件：分块读盘逐帧发送（`send_data` 自带 QUIC 流控背压）。
+                // 这里不调用带类型标注的辅助函数：stream 的类型由调用点决定，
+                // 内联可以完全避开三处 SendStream 泛型不匹配的风险。
+                use tokio::io::{AsyncReadExt, AsyncSeekExt};
+                match tokio::fs::File::open(&src.path).await {
+                    Ok(mut f) => {
+                        let mut left = src.len;
+                        if src.start > 0
+                            && f.seek(std::io::SeekFrom::Start(src.start)).await.is_err()
+                        {
+                            log::warn!("h3 stream_file seek {} peer={peer}", src.path.display());
+                            left = 0;
+                        }
+                        let mut buf = vec![0u8; crate::server::static_files::STREAM_CHUNK];
+                        while left > 0 {
+                            let want = left.min(buf.len() as u64) as usize;
+                            match f.read(&mut buf[..want]).await {
+                                Ok(0) => {
+                                    log::warn!("h3 stream_file 提前 EOF peer={peer}");
+                                    break;
+                                }
+                                Ok(n) => {
+                                    left -= n as u64;
+                                    if let Err(e) = stream
+                                        .send_data(Bytes::copy_from_slice(&buf[..n]))
+                                        .await
+                                    {
+                                        log::debug!("h3 stream_file send_data peer={peer}: {e:#}");
+                                        break;
+                                    }
+                                }
+                                Err(e) => {
+                                    log::warn!("h3 stream_file read peer={peer}: {e:#}");
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    Err(e) => log::warn!(
+                        "h3 stream_file open {} peer={peer}: {e:#}",
+                        src.path.display()
+                    ),
+                }
+            } else if !body_out.is_empty() {
                 if let Err(e) = stream.send_data(body_out).await {
                     log::debug!("h3 send_data peer={peer}: {e:#}");
                     return Ok(());

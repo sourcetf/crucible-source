@@ -43,6 +43,9 @@ hyper = { version = "1", features = [
 hyper-util = { version = "0.1", features = [
     "full"] }
 http = "1"
+# HTTP 日期（Last-Modified / If-Modified-Since / If-Range）的格式化与解析：
+# 纯 Rust、无传递依赖，registry 里已有 1.0.3（供其它 crate 用），不新增下载。
+httpdate = "1"
 http-body-util = "0.1"
 bytes = "1"
 tokio = { version = "1", features = [
@@ -91,3 +94,6 @@ cc = "1"
 [profile.release]
 lto = "thin"
 codegen-units = 1
+
+
+# Patch: OpenBSD has no libclang.so → skip bindgen in boring-sys, use prebuilt bindings

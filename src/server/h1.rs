@@ -141,6 +141,16 @@ pub async fn handle_request(
     let path0 = req.uri().path().to_string();
     let is_https = lc.ssl.is_some();
     let mut resp = handle_request_inner(req, Arc::clone(&live), lc, peer).await;
+    // 大文件（static 层的 FileSource 标记）在这里换成真正的流式 body：这是所有
+    // 分支（acl/admin/apps/proxy/static/upload…）回包的**唯一**收口点。
+    // 用 extensions 传来源而不是改 body 类型，是为了不动其它 ~30 处 `Response<BoxBody>`
+    // 构造点；代价只是每个协议要在自己的发送路径上认这个标记。
+    if let Some(src) = resp
+        .extensions_mut()
+        .remove::<crate::server::static_files::FileSource>()
+    {
+        *resp.body_mut() = stream_file(src);
+    }
     // P1-7：所有 HTTPS 响应统一补 HSTS。此前只在 dispatch_tail 之后加，telemetry/
     // geoip/DoH/acl 拒绝/限速/basic_auth/admin/status/rule/proxy 等提前返回分支全部漏掉。
     // entry().or_insert 不覆盖分支已显式设置的值。
@@ -573,4 +583,95 @@ pub fn full(s: impl Into<Bytes>) -> BoxBody {
 
 pub fn empty() -> BoxBody {
     Full::new(Bytes::new()).boxed()
+}
+
+/// 大文件流式 body（>16MiB 的静态响应）：按 64KiB 分块从磁盘读，经 mpsc 交给 hyper。
+///
+/// 为什么用 mpsc：`tokio::fs::File::read` 的 future 借用 `&mut File`，直接塞进
+/// `poll_frame` 会变成自引用结构；让后台任务读、body 只 poll 通道最省事，
+/// 顺带得到背压（通道容量 2 帧 ⇒ 读盘不会跑到发送前面去）。
+///
+/// 错误处理：`BoxBody` 的 error 类型是 `Infallible`，而响应头此刻**已经发出**，
+/// 读失败只能结束流 + 记日志（Content-Length 与实际不符时 hyper 会关闭连接，
+/// 客户端据此判定传输失败 —— 唯一诚实的处理，不能改状态码了）。
+pub fn stream_file(src: crate::server::static_files::FileSource) -> BoxBody {
+    use crate::server::static_files::STREAM_CHUNK;
+    let (tx, rx) = tokio::sync::mpsc::channel::<Bytes>(2);
+    tokio::spawn(async move {
+        use tokio::io::{AsyncReadExt, AsyncSeekExt};
+        let mut f = match tokio::fs::File::open(&src.path).await {
+            Ok(f) => f,
+            Err(e) => {
+                log::warn!("stream_file open {}: {e}", src.path.display());
+                return;
+            }
+        };
+        if src.start > 0 {
+            if let Err(e) = f.seek(std::io::SeekFrom::Start(src.start)).await {
+                log::warn!("stream_file seek {}: {e}", src.path.display());
+                return;
+            }
+        }
+        let mut left = src.len;
+        let mut buf = vec![0u8; STREAM_CHUNK];
+        while left > 0 {
+            let want = left.min(buf.len() as u64) as usize;
+            match f.read(&mut buf[..want]).await {
+                Ok(0) => {
+                    // 文件在传输中被截断：如实记日志并结束（不要死循环）
+                    log::warn!("stream_file 提前 EOF（文件被截断？）{}", src.path.display());
+                    break;
+                }
+                Ok(n) => {
+                    left -= n as u64;
+                    if tx.send(Bytes::copy_from_slice(&buf[..n])).await.is_err() {
+                        return; // 接收端（body）已丢弃：客户端断开
+                    }
+                }
+                Err(e) => {
+                    log::warn!("stream_file read {}: {e}", src.path.display());
+                    return;
+                }
+            }
+        }
+    });
+    BoxBody::new(FileStreamBody {
+        rx: parking_lot::Mutex::new(rx),
+        len: src.len,
+    })
+}
+
+/// [`stream_file`] 的 body 适配：把通道里的块当 DATA 帧发出去。
+///
+/// 接收端放在 `parking_lot::Mutex` 里是必须的：`tokio::sync::mpsc::Receiver` 是
+/// `Send` 但**不是** `Sync`，而本 crate 的 [`BoxBody`] 别名是
+/// `BoxBody<Bytes, Infallible>`（=`Send + Sync` 的 trait object）。
+/// 锁只在 `poll_frame` 里短暂持有，且临界区内不 await，不会引入阻塞。
+struct FileStreamBody {
+    rx: parking_lot::Mutex<tokio::sync::mpsc::Receiver<Bytes>>,
+    len: u64,
+}
+
+impl hyper::body::Body for FileStreamBody {
+    type Data = Bytes;
+    type Error = std::convert::Infallible;
+
+    fn poll_frame(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Result<hyper::body::Frame<Bytes>, Self::Error>>> {
+        let this = self.get_mut();
+        match this.rx.lock().poll_recv(cx) {
+            std::task::Poll::Ready(Some(b)) => {
+                std::task::Poll::Ready(Some(Ok(hyper::body::Frame::data(b))))
+            }
+            std::task::Poll::Ready(None) => std::task::Poll::Ready(None),
+            std::task::Poll::Pending => std::task::Poll::Pending,
+        }
+    }
+
+    /// 精确长度：hyper 需要它来确认与 Content-Length 一致（否则可能改用 chunked）。
+    fn size_hint(&self) -> hyper::body::SizeHint {
+        hyper::body::SizeHint::with_exact(self.len)
+    }
 }
