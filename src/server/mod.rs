@@ -23,7 +23,7 @@ pub mod basic_auth;
 pub mod dns;
 pub mod geoip_panel;
 pub mod h1;
-# 已删除：h1_static.rs 是死代码（无调用者），且一旦接线会绕过 static_files 的全部加固
+// 已删除：h1_static.rs 是死代码（无调用者），且一旦接线会绕过 static_files 的全部加固
 pub mod h2;
 pub mod h3;
 pub mod l4;

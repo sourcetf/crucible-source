@@ -373,7 +373,7 @@ pub async fn handle(req: Request<Full<Bytes>>, live: Arc<LiveConfig>) -> Respons
         return with_json(req, |v| {
             // 端口范围校验：`as u16` 会把 131165 截断成 9095，于是
             // 「删除 131165」实际删掉的是 9095 那个站点。
-            let port = match json_port(v, "port") {
+            let port = match json_port(&v, "port") {
                 Ok(p) => p,
                 Err(resp) => return resp,
             };
@@ -1094,7 +1094,7 @@ fn save_listener(live: &Arc<LiveConfig>, v: &Json) -> Response<BoxBody> {
 
 /// body: {"port": 9095, "apps": [AppRouteConfig...]}
 fn save_apps(live: &Arc<LiveConfig>, v: &Json) -> Response<BoxBody> {
-    let port = match json_port(v, "port") {
+    let port = match json_port(&v, "port") {
         Ok(p) => p,
         Err(resp) => return resp,
     };
@@ -1139,7 +1139,7 @@ fn save_apps(live: &Arc<LiveConfig>, v: &Json) -> Response<BoxBody> {
 
 /// body: {"port": 9446, "ssl": {...} | null}；null 表示去掉该站点的 TLS。
 fn save_ssl(live: &Arc<LiveConfig>, v: &Json) -> Response<BoxBody> {
-    let port = match json_port(v, "port") {
+    let port = match json_port(&v, "port") {
         Ok(p) => p,
         Err(resp) => return resp,
     };
@@ -1186,7 +1186,7 @@ fn save_ssl(live: &Arc<LiveConfig>, v: &Json) -> Response<BoxBody> {
 /// body: {"port": 9095, "entries": [{"path": "/x", "mode": "preview|download|execute|auto"}]}
 /// 键可为 URL 路径（/a/b）或扩展名（pdf）或 *；file_open 优先级高于应用引擎（§3.2）。
 fn save_file_open(live: &Arc<LiveConfig>, v: &Json) -> Response<BoxBody> {
-    let port = match json_port(v, "port") {
+    let port = match json_port(&v, "port") {
         Ok(p) => p,
         Err(resp) => return resp,
     };
@@ -1244,7 +1244,7 @@ fn save_file_open(live: &Arc<LiveConfig>, v: &Json) -> Response<BoxBody> {
 
 /// body: {"port": 9081, "enabled": true, "paths": ["/"]}
 fn save_autoindex(live: &Arc<LiveConfig>, v: &Json) -> Response<BoxBody> {
-    let port = match json_port(v, "port") {
+    let port = match json_port(&v, "port") {
         Ok(p) => p,
         Err(resp) => return resp,
     };
@@ -1334,7 +1334,7 @@ const PAGE_RULE_ACTIONS: &[&str] = &["redirect", "block", "rewrite", "pass", "ca
 
 /// body: {"port": 9081, "rules": [{"match_url": "/old/*", "action": "redirect", "target": "/new"}]}
 fn save_page_rules(live: &Arc<LiveConfig>, v: &Json) -> Response<BoxBody> {
-    let port = match json_port(v, "port") {
+    let port = match json_port(&v, "port") {
         Ok(p) => p,
         Err(resp) => return resp,
     };
@@ -1421,7 +1421,7 @@ const SSL_MODES: &[&str] = &[
 /// body: {"port": 9081, "rules": [{"path": "/api", "upstream": "http://127.0.0.1:8080",
 ///   "ssl_mode": "verify", "modify_request_headers": {}, "modify_response_headers": {}}]}
 fn save_proxy_rules(live: &Arc<LiveConfig>, v: &Json) -> Response<BoxBody> {
-    let port = match json_port(v, "port") {
+    let port = match json_port(&v, "port") {
         Ok(p) => p,
         Err(resp) => return resp,
     };
