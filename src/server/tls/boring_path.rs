@@ -155,15 +155,31 @@ const TLS13_SUITES: &[&str] = &[
     "TLS_CHACHA20_POLY1305_SHA256",
 ];
 
+
 /// psk=true 时追加的 PSK/ECDHE-PSK 套件族（早期规格 13）。
 ///
-/// 名字必须是 BoringSSL **确实有**的那些：它没有 PSK-AES128-**GCM**-SHA256 之类的
-/// GCM 型 PSK 套件（那些是 OpenSSL 的名字），此前这里的 6 个名字里 5 个不存在 ——
-/// 非严格解析会静默忽略未知名字，于是「管理员显式配了套件列表」时 psk 实际一个都没加上。
-/// 待办的「全量套件目录」会把 PSK 也从目录里筛出来（见 WORKLOG §17），届时这段可去掉。
-const PSK_SUITE_TAIL: &str = ":PSK-AES128-CBC-SHA:PSK-AES256-CBC-SHA:ECDHE-PSK-AES128-CBC-SHA:ECDHE-PSK-AES256-CBC-SHA:ECDHE-PSK-CHACHA20-POLY1305";
+/// 从 [`cipher_catalog`] 里筛出来 —— 不再手工维护名字：以前那份常量里 6 个名字有 5 个
+/// 是 OpenSSL 的、BoringSSL 没有，而解析失败是静默忽略的，于是"显式配套件列表"时 psk 一个都没生效。
+fn psk_tail() -> String {
+    let mut s = String::new();
+    for n in crate::server::tls::cipher_catalog::psk_suites() {
+        s.push(':');
+        s.push_str(&n);
+    }
+    s
+}
 
 fn apply_ciphers(builder: &mut SslAcceptorBuilder, ssl: &SslConfig) -> Result<()> {
+    // 配置里写了 BoringSSL 不认的套件名：不再静默剔除 —— 那会让"我配了它"变成
+    // "它其实没生效"（psk 族就栽在这上面）。加载期就报错并指名，让运维改对。
+    for raw in &ssl.ciphers {
+        let name = raw.trim();
+        if !name.is_empty() && !crate::server::tls::cipher_catalog::is_acceptable(name) {
+            anyhow::bail!(
+                "ssl.ciphers 里的 {name:?} 不是 BoringSSL 支持的套件名（可用目录见 /api/tls/ciphers 或面板）"
+            );
+        }
+    }
     let (mut list, dropped) = if ssl.ciphers.is_empty() {
         ("ALL:!eNULL:!SSLv3".to_string(), Vec::new())
     } else {
@@ -189,7 +205,7 @@ fn apply_ciphers(builder: &mut SslAcceptorBuilder, ssl: &SslConfig) -> Result<()
         list = "ALL:!eNULL:!SSLv3".to_string();
     }
     if ssl.psk {
-        list.push_str(PSK_SUITE_TAIL);
+        list.push_str(&psk_tail());
     }
     builder.set_cipher_list(&list)?;
     Ok(())

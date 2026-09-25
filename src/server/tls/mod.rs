@@ -11,6 +11,7 @@ use crate::config::SslConfig;
 
 pub mod accept;
 pub mod boring_path;
+pub mod cipher_catalog;
 pub mod client_hello;
 #[cfg(feature = "tls_boring")]
 pub mod ech_pem;
