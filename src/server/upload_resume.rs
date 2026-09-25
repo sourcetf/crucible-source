@@ -108,11 +108,14 @@ pub fn session_for(
         }
         if start == 0 {
             // 全量重传：截断临时文件（复用会话，锁不变）。
-            let _g = s.lock.lock();
-            if let Err(e) = std::fs::File::create(&s.tmp) {
-                return Err(UploadErr::Io(e.to_string()));
+            // 守卫必须限定在作用域内：否则 `return Ok(s)` 会在守卫析构前 move `s`（E0505）。
+            {
+                let _g = s.lock.lock();
+                if let Err(e) = std::fs::File::create(&s.tmp) {
+                    return Err(UploadErr::Io(e.to_string()));
+                }
+                s.received.store(0, Ordering::Relaxed);
             }
-            s.received.store(0, Ordering::Relaxed);
             return Ok(s);
         }
         if start != s.received() {

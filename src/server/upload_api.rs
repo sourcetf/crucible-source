@@ -82,7 +82,7 @@ where
         return resp(StatusCode::BAD_REQUEST, "路径含编码分隔符(%2f/%5c)，拒绝", None);
     }
     let decoded = percent_encoding::percent_decode_str(&path).decode_utf8_lossy();
-    if decoded.split(['/', '\']).any(|seg| seg == "..") {
+    if decoded.split(['/', '\\']).any(|seg| seg == "..") {
         return resp(StatusCode::BAD_REQUEST, "路径含 .. 段，拒绝", None);
     }
     // containment 第二道：safe_join 拒绝 `..`/绝对路径/反斜杠/Windows 盘符。

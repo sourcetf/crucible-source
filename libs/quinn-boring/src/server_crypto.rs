@@ -36,8 +36,21 @@ impl BoringQuicConfig {
 pub struct BoringQuicServerCrypto;
 
 impl BoringQuicServerCrypto {
+    /// 默认构建：**不开启 0-RTT**（规格：0-RTT 默认关）。
     pub fn try_build(cert_pem: &[u8], key_pem: &[u8]) -> Option<BoringQuicConfig> {
         try_build(cert_pem, key_pem)
+    }
+
+    /// 显式指定 0-RTT（QUIC early data）的构建入口。
+    ///
+    /// 调用方应当只在配置里真的开启了 early data 时传 `true`
+    /// （TCP 侧同样语义：`ssl.early_data`，见 boring_path.rs）。
+    pub fn try_build_with_opts(
+        cert_pem: &[u8],
+        key_pem: &[u8],
+        early_data: bool,
+    ) -> Option<BoringQuicConfig> {
+        try_build_with_opts(cert_pem, key_pem, early_data)
     }
 
     pub fn status_line() -> &'static str {
@@ -46,10 +59,18 @@ impl BoringQuicServerCrypto {
 }
 
 pub fn try_build(cert_pem: &[u8], key_pem: &[u8]) -> Option<BoringQuicConfig> {
+    try_build_with_opts(cert_pem, key_pem, false)
+}
+
+pub fn try_build_with_opts(
+    cert_pem: &[u8],
+    key_pem: &[u8],
+    early_data: bool,
+) -> Option<BoringQuicConfig> {
     if cert_pem.is_empty() || key_pem.is_empty() {
         return None;
     }
-    match build_server_crypto(cert_pem, key_pem) {
+    match build_server_crypto(cert_pem, key_pem, early_data) {
         Ok(crypto) => Some(BoringQuicConfig {
             cert_pem: cert_pem.to_vec(),
             key_pem: key_pem.to_vec(),
@@ -63,7 +84,11 @@ pub fn try_build(cert_pem: &[u8], key_pem: &[u8]) -> Option<BoringQuicConfig> {
     }
 }
 
-fn build_server_crypto(cert_pem: &[u8], key_pem: &[u8]) -> Result<BoringServerConfig, String> {
+fn build_server_crypto(
+    cert_pem: &[u8],
+    key_pem: &[u8],
+    early_data: bool,
+) -> Result<BoringServerConfig, String> {
     let certs = X509::stack_from_pem(cert_pem).map_err(|e| format!("cert: {e}"))?;
     if certs.is_empty() {
         return Err("empty cert chain".into());
@@ -82,6 +107,10 @@ fn build_server_crypto(cert_pem: &[u8], key_pem: &[u8]) -> Result<BoringServerCo
         .set_private_key(key)
         .map_err(|e| format!("set_private_key: {e}"))?;
     let _ = cfg.ctx_mut().check_private_key();
+    // 规格：0-RTT 默认关，只有显式开启时才对客户端开放 early data。
+    if early_data {
+        cfg.enable_early_data(true);
+    }
     let _ = cfg.set_alpn(&[b"h3".to_vec()]);
     Ok(cfg)
 }

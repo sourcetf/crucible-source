@@ -22,6 +22,7 @@ use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
+use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::TcpStream;
 
@@ -36,10 +37,19 @@ pub fn h2_batch_cap() -> usize {
 }
 
 pub const H2_BATCH_CAP: usize = BATCH_CAP;
-/// Cap concurrent in-flight H2 stream tasks（与 H2_MAX_CONCURRENT_STREAMS 对齐；
-/// 注意 BATCH_CAP 是写合并的帧批量，两者语义不同，勿混用调参）。
-static H2_INFLIGHT: once_cell::sync::Lazy<tokio::sync::Semaphore> =
-    once_cell::sync::Lazy::new(|| tokio::sync::Semaphore::new(256));
+/// 全局同时在飞 h2 流上限（含排队等配额的阶段）。见 [`H2_INFLIGHT_WAIT`] 与
+/// [`serve_io`] 里的说明：配额**只能**在 spawn 出来的任务里获取。
+pub const H2_MAX_INFLIGHT: usize = 256;
+/// 拿不到在飞配额时的最长等待：超时回 503 而不是无限排队。等待期间连接仍在被驱动
+/// （accept 循环不阻塞），所以是「快速失败」而不是「整条连接停摆」。
+pub const H2_INFLIGHT_WAIT: Duration = Duration::from_secs(5);
+/// 请求体读取的**空闲**超时：两次 `data()` 之间超过该时长即判定为慢速攻击
+/// （与 nginx 的 client_body_timeout 同语义），回 408 并结束该流。
+/// 注意这是「读不到新字节」的上限，不是整个请求体的总时长上限；分片/断点续传的
+/// 停顿发生在两次请求**之间**，不受影响。
+pub const H2_BODY_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+static H2_INFLIGHT: once_cell::sync::Lazy<Arc<tokio::sync::Semaphore>> =
+    once_cell::sync::Lazy::new(|| Arc::new(tokio::sync::Semaphore::new(H2_MAX_INFLIGHT)));
 pub const H2_MAX_SEND_BUFFER: usize = 128 * 1024;
 pub const H2_COALESCE_WRITES: bool = COALESCE_WRITES_DEFAULT;
 /// Soft concurrent-stream hint applied when Builder supports it.
@@ -124,12 +134,45 @@ where
         let (request, mut respond) = result?;
         let live = Arc::clone(&live);
         let lc = lc.clone();
-        let permit = match H2_INFLIGHT.acquire().await {
-                        Ok(p) => p,
-                        Err(_) => continue,
-                    };
-                    tokio::spawn(async move {
-                        let _permit = permit;
+        let sem = H2_INFLIGHT.clone();
+        tokio::spawn(async move {
+            // P0（DoS）：配额**绝不能**在 accept 循环里 await —— await 期间 `conn` 不被
+            // poll，连接驱动停摆（回应写不出、WINDOW_UPDATE 发不出、其他流全部卡住），
+            // 一条恶意连接持满 256 个慢速流即可让**所有** h2 连接失去响应。
+            // 改成任务内获取 + 限时等待：拿不到配额就快速回 503，连接继续被驱动，
+            // 正常突发（短暂排队）仍按原语义处理。
+            let _permit = match tokio::time::timeout(
+                H2_INFLIGHT_WAIT,
+                sem.acquire_owned(),
+            )
+            .await
+            {
+                Ok(Ok(p)) => p,
+                _ => {
+                    let t0 = std::time::Instant::now();
+                    let mut b = Response::builder()
+                        .status(StatusCode::SERVICE_UNAVAILABLE)
+                        .header(http::header::RETRY_AFTER, "1");
+                    b = b.header(http::header::CONTENT_TYPE, "text/plain; charset=utf-8");
+                    crate::server::access_log::log_response(
+                        &live,
+                        peer,
+                        "h2",
+                        request.method().as_str(),
+                        request.uri().path(),
+                        StatusCode::SERVICE_UNAVAILABLE.as_u16(),
+                        None,
+                        t0.elapsed(),
+                        "busy",
+                    );
+                    // 不读 body 直接回包：流关闭时 h2 会自动归还连接级窗口
+                    // （recv.rs release_closed_capacity），不会占住连接窗口。
+                    if let Ok(mut send) = respond.send_response(b.body(()).unwrap(), false) {
+                        let _ = send.send_data(Bytes::from_static(b"server busy"), true);
+                    }
+                    return;
+                }
+            };
             let (parts, mut body) = request.into_parts();
             // 与 h1 同序的 admin 前置门（见 basic_auth::admin_gate）：**先判鉴权/CSRF、
             // 再收 body**。否则不带凭据的并发 POST 每个都能占住 REQUEST_BODY_CAP（8MiB）
@@ -196,8 +239,11 @@ where
                         if let Some(secs) = retry {
                             b = b.header(http::header::RETRY_AFTER, secs.to_string());
                         }
-                        // 不收 body 直接回包：未读的请求体由 h2 丢弃并释放流控额度
-                        //（与上面 413 分支同一做法），连接不受影响。
+                        // 不收 body 直接回包：未读的 DATA 留在该流接收缓冲里，任务结束、
+                        // 流被释放时 h2 会归还**连接级**窗口并清空缓冲
+                        // （recv.rs::release_closed_capacity：「Normal drop without
+                        // reading: buf=in_flight -> full release」），所以不会占住连接窗口。
+                        // 该流的流级窗口不再归还——但那条流已经从我们这边结束了。
                         match respond.send_response(b.body(()).unwrap(), false) {
                             Ok(mut send) => {
                                 let _ = send.send_data(Bytes::from_static(msg.as_bytes()), true);
@@ -210,19 +256,53 @@ where
             }
             // P1-9/P1-4：收齐请求体（上限 8MiB）——POST/PUT 才能把 body 交给引擎/admin；
             // 且不排空 H2 请求体会卡住流量控制窗口。超限直接 413。
+            //
+            // P0（真 bug，实测 >1MiB 必卡死）：h2 0.4 的契约是**调用方**在消费掉每个
+            // DATA 之后显式 `release_capacity(n)`（share.rs 的 FlowControl 文档：
+            // "the caller is expected to call release_capacity after dropping data
+            // frames"），recv.rs::release_capacity 才会把额度还给流级+连接级窗口并排
+            // WINDOW_UPDATE。少这一步 → 收到初始窗口（1MiB）后窗口停在 0，对端再也发不出
+            // DATA，我们这边 `data()` 永远 Pending → 双方互等到客户端超时。
             let mut buf: Vec<u8> = Vec::new();
             let mut overflow = false;
-            while let Some(chunk) = body.data().await {
+            let mut idle_timeout = false;
+            loop {
+                let next = match tokio::time::timeout(H2_BODY_IDLE_TIMEOUT, body.data()).await {
+                    Ok(n) => n,
+                    Err(_) => {
+                        idle_timeout = true;
+                        break;
+                    }
+                };
+                let Some(chunk) = next else { break };
                 match chunk {
                     Ok(c) => {
-                        if buf.len() + c.len() > REQUEST_BODY_CAP {
+                        let n = c.len();
+                        if buf.len() + n > REQUEST_BODY_CAP {
                             overflow = true;
                             break;
                         }
                         buf.extend_from_slice(&c);
+                        drop(c);
+                        // h2 的 API：`RecvStream::flow_control()` 拿到该流的 FlowControl，
+                        // 再 `release_capacity(n)`（share.rs 里 release_capacity 定义在
+                        // FlowControl 上，不在 RecvStream 上）。
+                        if body.flow_control().release_capacity(n).is_err() {
+                            break;
+                        }
                     }
                     Err(_) => break,
                 }
+            }
+            if idle_timeout {
+                let resp = Response::builder()
+                    .status(StatusCode::REQUEST_TIMEOUT)
+                    .body(())
+                    .unwrap();
+                if let Ok(mut send) = respond.send_response(resp, false) {
+                    let _ = send.send_data(Bytes::from_static(b"request body read timeout"), true);
+                }
+                return;
             }
             if overflow {
                 let resp = Response::builder()
@@ -669,6 +749,20 @@ async fn h2_tail(
             "proxy",
         );
     }
+    // §44 上传：仅当该路径开了 autoindex + enable_upload 时接管写方法。
+    // 位置与 h1 一致（ACL/限速/basic_auth/apps/proxy 之后、静态之前）；
+    // 请求体已在 serve_io 里收齐为 Bytes，走 upload_api::handle_bytes 薄适配。
+    // 此前 h2 缺这条 hook → 同一条 URL 在 h1 上能上传、在 h2 上必然 405。
+    if matches!(
+        *req.method(),
+        http::Method::PUT | http::Method::PATCH | http::Method::POST
+    ) && crate::server::upload_api::enabled_for(&lc, &path)
+    {
+        return tag(
+            crate::server::upload_api::handle_bytes(req, &lc, peer).await,
+            "upload",
+        );
+    }
     match crate::server::static_files::serve_simple(&req, &lc).await {
         Ok(r) => tag(r, "static"),
         Err(_) => tag(
@@ -711,5 +805,34 @@ mod tests {
         let admin = tail.find("admin::handle").expect("admin call");
         let ip = tail.find("is_allowed").expect("ip_access");
         assert!(ip < ba && ba < admin, "order must be ip_access → basic_auth → admin");
+    }
+
+    /// P0 回归：请求体收取循环必须显式归还 h2 接收窗口（release_capacity）。
+    /// h2 0.4 不会在 Bytes 丢弃时归还（契约要求调用方显式归还）；少这一步
+    /// → body > 初始窗口（1MiB）时对端发不出、我们等不到，双向卡死。
+    #[test]
+    fn h2_body_loop_releases_recv_capacity() {
+        let src = include_str!("h2.rs");
+        let pos = src.find("body.data()").expect("body read loop");
+        let tail = &src[pos..];
+        let rel = tail.find("release_capacity").expect("release_capacity missing");
+        let cap = tail.find("REQUEST_BODY_CAP").expect("cap");
+        assert!(rel < cap, "release_capacity must be inside the body read loop");
+    }
+
+    /// P0 回归：在飞配额不得在 accept 循环里 await（await 期间 conn 不被 poll，
+    /// 连接驱动停摆 → 一条恶意连接即可让所有 h2 连接失去响应）。
+    #[test]
+    fn h2_inflight_permit_not_awaited_in_accept_loop() {
+        let src = include_str!("h2.rs");
+        let loop_pos = src
+            .find("while let Some(result) = conn.accept().await")
+            .expect("accept loop");
+        let tail = &src[loop_pos..];
+        let spawn_pos = tail.find("tokio::spawn").expect("spawn");
+        assert!(
+            !tail[..spawn_pos].contains("acquire"),
+            "permit acquisition must happen inside the spawned task, not in the accept loop"
+        );
     }
 }

@@ -776,6 +776,18 @@ mod imp {
                 "proxy",
             );
         }
+        // §44 上传：与 h1/h2 同一位置（ACL/限速/basic_auth/apps/proxy 之后、静态之前）。
+        // 请求体已在 handle_incoming 里收齐为 Bytes，走 upload_api::handle_bytes 薄适配。
+        if matches!(
+            *req.method(),
+            http::Method::PUT | http::Method::PATCH | http::Method::POST
+        ) && crate::server::upload_api::enabled_for(&lc, path)
+        {
+            return tag(
+                crate::server::upload_api::handle_bytes(req, &lc, peer).await,
+                "upload",
+            );
+        }
         // Static files; metrics already handled above via telemetry::maybe_handle_simple.
         match static_files::serve_simple(&req, &lc).await {
             Ok(r) => tag(r, "static"),

@@ -42,8 +42,16 @@ impl Config {
         // Disable verification of the client by default.
         ctx.verify_peer(false);
 
-        // By default, enable early data (used for 0-RTT).
-        ctx.enable_early_data(true);
+        // 规格：**0-RTT 默认关闭**，显式开启才接受（见 [`Config::enable_early_data`]）。
+        //
+        // 这里此前是无条件 `ctx.enable_early_data(true)`（上游 quinn-btls 的默认值），
+        // 而本仓库在 TCP 侧是 `ssl.early_data` 显式开关（boring_path.rs）。QUIC 侧没有
+        // 任何开关，于是 H3 **默认就接受 0-RTT**：配合下面 Session 里设置的
+        // `set_quic_early_data_context`，BoringSSL 会把 NewSessionTicket 标成
+        // max_early_data_size=0xffffffff，客户端可凭票据在握手完成前发送 0-RTT 请求，
+        // 而 h3 会把它们当普通请求处理（可重放、无应用层去重）。
+        // BoringSSL 自身默认即 false（ssl_lib.cc: `enable_early_data(false)`），
+        // 所以这里不再调用开关；需要时由持有 Config 的调用方显式打开。
 
         // Configure default ALPN protocols accepted by the server.QUIC requires ALPN be
         // configured (see https://www.rfc-editor.org/rfc/rfc9001.html#section-8.1).
@@ -84,6 +92,15 @@ impl Config {
     /// disabled by default.
     pub fn verify_peer(&mut self, verify: bool) {
         self.ctx.verify_peer(verify)
+    }
+
+    /// 规格：0-RTT（QUIC early data）显式开关，默认关。
+    ///
+    /// 打开后 BoringSSL 才会把 NewSessionTicket 标成可接受 early data
+    /// （`max_early_data_size = 0xffffffff`），并在后续握手中接受 0-RTT。
+    /// 必须在任何连接建立之前调用（`Session` 在 `SSL_new` 时从 ctx 复制该标志）。
+    pub fn enable_early_data(&mut self, enable: bool) {
+        self.ctx.enable_early_data(enable)
     }
 
     /// Sets the ALPN protocols that will be accepted by the server. QUIC requires that

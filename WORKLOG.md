@@ -920,7 +920,7 @@ body 已被消费或仍由协议层持有）→ `handle_bytes` 把 `Bytes` 包�
 （生产本来就没开 ✓，测试配置也没在 h2/h3 上依赖它 ✓）。
 
 
-### 21.5 build44 复验：h2 的 PUT 挂住**与上传无关**（预先存在的 h2 缺陷）
+### 21.5 build44 复验：h2 的 PUT 挂住**与上传无关**（预先存在的 h2 缺陷）【结论已作废 → §21.6】
 
 移除 h2/h3 的上传 hook 之后复验（测试实例 build44b、18443 已开 enable_upload）：
 
@@ -938,4 +938,76 @@ body 已被消费或仍由协议层持有）→ `handle_bytes` 把 `Bytes` 包�
 且这类连接会一直占着任务与 socket）。
 **下一步**：查 `src/server/h2.rs` 里 body 的收取条件（找 `request_has_body` 之类的判定，
 看是否漏了 PUT/PATCH），修好后**再**恢复上传 hook（那时 h2 才会真正可用）。
+
+
+### 21.6 build45：h2 请求体窗口死锁的**真根因** + 全局 DoS 修复（§21.5 的猜测作废）
+
+**先更正 §21.5**：那里写的「body 没人读 / 非 POST 方法漏了判定」**是错的**。真根因在
+上游 h2 0.4.19 的**流控契约**上（读源码确证），共两条，第 2 条比第 1 条更严重。
+
+**① `release_capacity` 是调用方的义务 —— 这是「>1MiB 必挂死」的原因**
+`RecvStream::data()` 交出的 `Bytes` 被丢弃时 h2 **不会**自动归还接收窗口；share.rs 的
+`FlowControl` 文档原文：*"the caller is expected to call `release_capacity` after dropping
+data frames"*。必须 `RecvStream::flow_control().release_capacity(n)`（recv.rs:464）才把额度
+还给**流级 + 连接级**窗口并（按阈值批量）排 `WINDOW_UPDATE`。
+我们只读 body、从不归还 ⇒ 服务端窗口收满**初始窗口 1MiB** 后停在 0 ⇒ 对端再也发不出 DATA、
+`data()` 永远 Pending ⇒ **双向互等**。阈值实测**精确落在窗口大小**上：
+
+| body 大小 | 修复前 |
+|---|---|
+| 1048576 B（= 1MiB 窗口） | 立刻 405 ✓ |
+| 1049600 B | 挂到客户端超时 ✗ |
+| 3145728 B | 挂到客户端超时 ✗（h2/TLS 与 h2c 明文都复现） |
+
+**② 在飞配额在 accept 循环里 await ⇒ 一条连接即可让所有 h2 连接停摆（远程可触发的 DoS）**
+旧代码 `H2_INFLIGHT.acquire().await` 位于 `while let Some(..) = conn.accept().await` 循环体内、
+`tokio::spawn` **之前**：await 期间 `conn` 不被 poll ⇒ **连接驱动停摆**（回应写不出、
+`WINDOW_UPDATE` 发不出、该连接所有流一起卡住）。而配额是**全局** 256 ⇒ 一条恶意连接开 256 个
+慢速流就能让**所有** h2 连接失去响应。改成任务内 `timeout(5s, sem.acquire_owned())`：
+正常突发照旧排队（配额拿不到才 503），连接驱动永不停摆。
+
+**顺带补的边界**（用户要求「每个功能每个值的边界写清楚」）：
+
+| 常量 | 值 | 越界行为 |
+|---|---|---|
+| `H2_BODY_IDLE_TIMEOUT` | 60s（两次 `data()` 之间的空闲上限，nginx `client_body_timeout` 同语义） | **408** + 结束该流 |
+| `H2_MAX_INFLIGHT` | 256（全局在飞流） | 超出 → 等待 `H2_INFLIGHT_WAIT` |
+| `H2_INFLIGHT_WAIT` | 5s | 仍拿不到 → **503**（`Retry-After: 1`） |
+| `REQUEST_BODY_CAP` | 8MiB（h2/h3 先收齐再处理） | **413** |
+| `H2_MAX_HEADER_LIST_SIZE` | 64KiB | h2 层终止该流（ENHANCE_YOUR_CALM） |
+| `H2_MAX_CONCURRENT_STREAMS` | 256（每连接） | 对端不得再开流 |
+
+分片上传的「两次请求之间长停顿」不受 408 影响（那是空闲**请求内**读不到字节的判据）。
+
+**改动**（`src/server/h2.rs`、`src/server/h3.rs`）
+* body 循环里 `body.flow_control().release_capacity(n)` —— 真正的修复；
+* 配额获取移入 spawn 的任务 + 限时 + 503（accept 循环只做 `conn.accept()`）；
+* 新增 408 分支；
+* **恢复 h2/h3 上传 hook**（`h2_tail`/`h3_tail` 里 `upload_api::handle_bytes`，位置与 h1 一致：
+  ACL/限速/basic_auth/apps/proxy 之后、静态之前）；
+* 两条源码级回归测试：body 循环必须含 `release_capacity`；accept 循环到 `tokio::spawn`
+  之间不得出现 `acquire`。
+
+**build45 实测（测试实例 18443 已开 `enable_upload`，全通）**
+
+| 检查 | 结果 |
+|---|---|
+| h2 TLS+ALPN 3MB 上传 | **201 / 51ms**，sha256 与源一致 ✓（修复前 000/15s 挂死） |
+| h2 1MiB+1024（窗口边界） | **201 / 25ms** ✓ |
+| h2c 明文 3MB（19081 未开 upload） | **405 / 54ms** ✓（不再挂） |
+| h1 3MB 回归 | 201 / 33ms，sha 一致 ✓ |
+| h2 GET | 200 ✓ |
+| h2 上传闸门：`..%2f..%2fetc%2fpasswd` / `x.php` | **400** / **403** ✓ |
+| 同一条连接：大 body 之后再来一个请求 | 201 → **200** ✓（窗口确实归还了） |
+| h2 9MB（超 8MiB 收集上限） | **413 / 105ms** ✓ |
+
+**生产（已切 build45）实测**：9095/9081（明文 h1+h2）200 ✓；**h2 PUT 3MB → 405 / 56ms** ✓；
+**h2 POST 3MB → 405 / 36ms** ✓；8443（www）、9445、9446（TLS）均 200 ✓。
+生产此前同样带「h2 上任意 >1MiB body 请求挂死 + 256 慢流可致全站 h2 停摆」的活缺陷，
+本轮一并修掉（这也说明之前的构建/部署没有覆盖到 h2 大 body 这条路径）。
+
+**下一步**：h2/h3 上传仍是「先收齐再处理」⇒ 单请求上限 `REQUEST_BODY_CAP`(8MiB)；
+要支持大文件得把 h2 的 `RecvStream` 包成 `http_body::Body`（每帧归还额度）直接交给
+`upload_api::handle` 流式写盘（h1 已是流式，上限 `MAX_UPLOAD_BYTES`=2GiB）。
+
 
