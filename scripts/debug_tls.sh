@@ -45,21 +45,18 @@ sleep 2
 echo "server pid=$WPID config=$CFG ports=$PORT_PROD/$PORT_TLS12/$PORT_TLS13 primary=$(strings ./target/release/webserver 2>/dev/null | grep -m1 boringssl || echo boringssl)"
 
 echo "=== TLS 1.3 (BoringSSL + ECH/PQC path) :$PORT_PROD ==="
-echo | openssl s_client -connect 127.0.0.1:$PORT_PROD -tls1_3 2>&1 | grep -E 'Protocol|Cipher|Verify' | head -4 || true
+python3 /tmp/_tlsprobe.py $PORT_PROD TLSv1_3 || true
 
 echo "=== TLS 1.2 (BoringSSL) :$PORT_PROD ==="
-echo | openssl s_client -connect 127.0.0.1:$PORT_PROD -tls1_2 2>&1 | grep -E 'Protocol|Cipher' | head -2 || true
+python3 /tmp/_tlsprobe.py $PORT_PROD TLSv1_2 || true
 
 echo "=== Fair TLS1.2 :$PORT_TLS12 / TLS1.3 :$PORT_TLS13 ==="
-echo | openssl s_client -connect 127.0.0.1:$PORT_TLS12 -tls1_2 2>&1 | grep -E 'Protocol|Cipher' | head -2 || true
-echo | openssl s_client -connect 127.0.0.1:$PORT_TLS13 -tls1_3 2>&1 | grep -E 'Protocol|Cipher' | head -2 || true
+python3 /tmp/_tlsprobe.py $PORT_TLS12 TLSv1_2 || true
+python3 /tmp/_tlsprobe.py $PORT_TLS13 TLSv1_3 || true
 
 echo "=== TLS 1.0 (NSS legacy when enabled) :$PORT_PROD ==="
-if openssl s_client -help 2>&1 | grep -q -- '-tls1[^_]'; then
-  echo | openssl s_client -connect 127.0.0.1:$PORT_PROD -tls1 2>&1 | grep -E 'Protocol|Cipher|error|alert' | head -4 || true
-else
-  echo "openssl has no -tls1; skip"
-fi
+# TLS1.0 探针（python3 + 系统 LibreSSL；已不依赖 openssl）
+python3 /tmp/_tlsprobe.py $PORT_PROD TLSv1 || true
 
 echo "=== SSLv2 ClientHello probe (no crash) :$PORT_PROD ==="
 python3 scripts/test_sslv2_probe.py --host 127.0.0.1 --port "$PORT_PROD" || true
