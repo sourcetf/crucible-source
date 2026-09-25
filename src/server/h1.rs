@@ -117,6 +117,10 @@ where
         async move { Ok::<_, std::convert::Infallible>(handle_request(req, live, lc, peer).await) }
     });
     hyper::server::conn::http1::Builder::new()
+        // 设了 header_read_timeout 就**必须**给 Timer：否则 hyper 在每个连接上
+        // panic（common/time.rs: "timeout set, but no timer set"）—— 实测那样会让
+        // 整个 h1 监听口失效（accept 任务被杀，9095/9081 全停）。
+        .timer(hyper_util::rt::TokioTimer::new())
         .header_read_timeout(HEADER_READ_TIMEOUT)
         .max_headers(MAX_HEADERS)
         .serve_connection(io, svc)
