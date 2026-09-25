@@ -813,3 +813,37 @@ ASN/Tor pool，脚本还**硬拒绝** Ip2Region / DB-IP 系 URL（`BLACKLIST_URL
 ② `ListenerConfig.autoindex` 字段名与其 `enabled/enable_upload/paths` 成员；
 ③ `Full<Bytes>`/`Incoming` 是否满足 `Body<Data = Bytes> + Unpin + Send + 'static` 与
    `B::Error: Display`。若报错，按实际签名调整（逻辑不需要改）。
+
+
+---
+
+## 20. build42 接续手册（上传功能已写完，下一步先编译一次）
+
+### 20.1 待编译的改动清单（都已提交、**都没进二进制**）
+
+| 文件 | 改动 | 风险点（编译时优先看） |
+|---|---|---|
+| `src/server/upload_resume.rs` | 全量重写（会话层 + 3 单测） | 低；`AtomicU64` + `parking_lot::Mutex` 用法 |
+| `src/server/upload_api.rs` | 新增（端点 + 3 单测） | **中**：`admin_files::safe_join(&Path,&str)` 签名、`lc.autoindex{enabled,enable_upload,paths}` 字段名、`B: Body<Data=Bytes>+Unpin+Send+'static` 与 `B::Error: Display` 是否满足（`Incoming` / `Full<Bytes>`） |
+| `src/server/mod.rs` | 声明 `upload_api` / `upload_resume` | — |
+| `src/server/h1.rs` | 上传 hook（静态分发前） | `req` 在 if 分支被 move、else 分支仍借用 —— 已用"分支内 return"写法 |
+| `src/server/h2.rs` / `h3.rs` | 同款 hook（走 `handle_bytes`） | 同上；`req.uri().path()` 借用时机 |
+| `src/server/static_files.rs` | autoindex 上传 UI（签名加 `enable_upload` + 2 调用点 + JS） | 中：`autoindex()`/`autoindex_html()` 的**所有**调用点都要带新实参（本轮改了 2 处，若有第三处会报错） |
+
+已验证的部分（无需编译即可确认）：autoindex 里的 JS 过了 `check_ui_js.py` ✓；`r#"`/`"#` 定界符 1:1 配平 ✓；三处 hook 形态正确 ✓。
+
+### 20.2 推荐协议（重要）
+
+1. **先编译一次**（`cargo build --release --features 'tls,tls_boring,go_shm_ipc,tls_nss,tls_tomcrypt'`），修掉 §20.1 的"中风险"三处；
+2. 然后**每条改动都走「改 → 编译 → 部署 → 真实连接验证」**（h1+h2+admin 三连 + 新端点），
+   不再攒批 —— build39 的教训就是"编译过 ≠ 端口活着"（h1 Timer 事故）；
+3. 上传功能的验收照 §18.4 六条（`curl -T` 全量、`curl -C -` 不重复字节、4 文件并发、
+   越界 400/409/413 且目录外无文件、uploads 里的 `x.php` 不被引擎执行、未开 enable_upload 仍 405）。
+
+### 20.3 仍未做（每条都比上传小，逐条做）
+
+`ETag`/`Last-Modified` + `If-Range`/`If-None-Match`（`static_files.rs` 6 处头构造点：163/181/183/226/334/359/381 一带）
+→ 流式 body（解除 >16MiB 单次 GET 只能 413；需把 `BoxBody<Bytes, Infallible>` 换成可失败的流式 body，牵连 h1/h2/h3 的响应类型）
+→ ECH 配置进 DNS 应答（`type65_api` 目前只有面板读写，`dns/**` 无消费者）
+→ QMux（draft-ietf-quic-qmux-01：先取草案正文，不发明 wire format）
+→ h3/QUIC 限额（vendored `libs/quinn-boring` 里设 idle/流上限）。
