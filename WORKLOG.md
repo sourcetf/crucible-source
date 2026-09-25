@@ -620,3 +620,70 @@ ASN/Tor pool，脚本还**硬拒绝** Ip2Region / DB-IP 系 URL（`BLACKLIST_URL
 一轮完整更新（fetch 13/14 → merge → enrich → finish）后：库从 **943MB/443万行** 涨到
 **1.27GB/574万行**；`sources/` 会重新攒下 `ripe.db.gz`（351MB，其 `ripe.db` 是 0 字节的死缓存，
 可随时删）。**建议更新前留 ≥1.5GB，更新后清理 `sources/*.gz` 等死缓存**。
+
+
+---
+
+## 17. 边界清单（用户要求：每个功能、每个值的边界写清楚，用来拒绝异常请求/攻击）
+
+以下常量与行为**都来自代码**（`grep` 可见），越界行为一栏是实际实现，不是设计意图。
+改动时请同步改这张表。
+
+### 17.1 管理面 API（`src/server/admin.rs`）——越界一律 **400 + 可读原因**
+
+| 常量 | 值 | 约束对象 | 越界行为 |
+|---|---|---|---|
+| `MAX_LIST_ITEMS` | 512 | listeners/apps/rules/users/白名单等**列表条数** | 400，指出是哪一项超限 |
+| `MAX_APPS_PER_LISTENER` | 64 | 单个 listener 的 `apps` 条数 | 400 |
+| `MAX_APP_PATHS` | 32 | 单个 app 的 `paths` 条数 | 400 |
+| `MAX_ENGINE_LEN` | 32 | `engine` 名长度 | 400 |
+| `MAX_APP_WORKERS` | 128 | `workers`（应用进程/线程数） | 400（防一个配置项把机器打满） |
+| `MAX_SHORT_STR` | 128 | 短字符串（用户名、枚举值、线路名等） | 400 |
+| `MAX_PATH_STR` | 512 | 路径类字段（docroot/out_dir/entry 等） | 400 |
+| `MAX_URL_STR` | 2048 | URL 类字段（match_url/upstream 等） | 400 |
+| `MAX_HEADER_NAME_LEN` / `MAX_HEADER_VALUE_LEN` | 128 / 4096 | 规则注入的头名/头值 | 400（另：CR/LF 在构造 `HeaderName`/`HeaderValue` 时就被拒 ✓） |
+| `MAX_HEADER_ITEMS` | 64 | 单条规则的注入头条数 | 400 |
+| `MAX_IP_ACCESS_ITEMS` | 1024 | `ip_access.allow/deny` 条数 | 400 |
+| `MAX_PASSWORD_BYTES` | 1024 | 面板设置口令的字节数 | 400（argon2id 哈希，每哈希独立盐） |
+| `MAX_DNS_NAME_LEN` / `MAX_DNS_LABEL_LEN` | 253 / 63 | DNS 域名 / 单标签（按 RFC 1035） | 400 |
+| 集合外的键 | — | 未知字段 | 拒（`serde` 严格解析） |
+
+### 17.2 请求面（协议层）
+
+| 常量/来源 | 值 | 约束 | 越界行为 |
+|---|---|---|---|
+| `MAX_HEADERS`（h1） | 100 | 单请求头部**条数** | 连接错误（hyper 关连接 ✗ 客户端见 400/断开） |
+| `HEADER_READ_TIMEOUT`（h1） | 30s | 读完请求头的时间（slowloris ✗） | 连接超时关闭；**不影响**请求体与 keep-alive |
+| hyper h1 头部总大小 | 上游默认（16KiB 量级） | 头部字节总量 | 连接错误 |
+| `APP_BODY_CAP` | 32MiB | 引擎请求体 | **413** |
+| `UPSTREAM_BODY_CAP` | 64MiB | 转发给上游的请求体 / admin body | **413** |
+| `MAX_FULL_READ` | 16MiB | 静态文件**一次性整读**上限（200 路径） | **413 + `Accept-Ranges`**（提示改用 Range 续传） |
+| `MAX_RANGE_BYTES` | 32MiB | 单个 Range 段一次返回的上限 | 收窄为 206 子段（RFC 7233 §4.1 允许），**不回 416**（否则大文件续传不可用 ✗） |
+| `SMALL_FILE_MAX` / `CACHE_CAP` | 256KiB / 256 项 | 小文件内存缓存 | 超出不缓存（只影响性能） |
+| 方法白名单 | — | 静态/自动索引：仅 GET/HEAD（h1/h2/h3 一致） | **405** |
+| `Origin`/`Referer` 与 Host | — | 状态变更方法（POST/PUT/PATCH/DELETE） | 不同源 **403**；无来源信息时要求 JSON content-type 或 `X-Crucible-Admin: 1` 或 `Sec-Fetch-Site: same-origin\|none`，否则 **403** |
+
+### 17.3 限流 / 认证退避 / 资源
+
+| 常量 | 值 | 约束 | 行为 |
+|---|---|---|---|
+| `FAIL_THRESHOLD` / `FAIL_WINDOW` | 8 次 / 900s | 同一 IP 的 Basic Auth 失败累积 | 达阈值后**退避**（401 → 429 + `Retry-After`） |
+| `MAX_BLOCK` | 300s | 退避上限 | 指数退避封顶 |
+| `FAIL_TABLE_CAP` | 4096 | 退避表条目 | 满时淘汰最旧（**不整表清空** ✗ 否则攻击者刷表即可自我解封） |
+| `BUCKET_CAP` / `BUCKET_EVICT_DIV` | 100000 / 64 | 限流桶 | 满时按比例淘汰最旧 |
+| `POOL_CAP` | 16 | 上游连接池每键条目 | 超出不入池 |
+| 引擎池宽 | `cpu.clamp(4,8)`（CGI 独立 4） | 并发引擎请求 | 队列等待；CGI 独立池使其**不再饿死**其它引擎 ✓ |
+| `SYN_RATE_THRESHOLD` | 2000 | Linux syncookie 动态开关阈值 | 仅 Linux 生效（OpenBSD 走降级分支 ✓） |
+| `PENDING_OPENS`（每连接） | 见 `h1.rs` | 同一连接的未完成请求 | 超出拒绝 |
+
+### 17.4 DNS / GeoIP / 配置文件
+
+| 项 | 边界 | 行为 |
+|---|---|---|
+| DNS 记录 rdata | ≤4096 字节、单行（含 CR/LF 即拒） | 400（rdata 会进 zone 文件文本 ✗ 换行=注入） |
+| 分区/记录名 | RFC 1035（`valid_name`）、标签 ≤63、总长 ≤253 | 400 |
+| primaries | `host` 或 `host:port` 或 `[v6]:port`，无 named.conf 元字符 | 400（生成时翻译成 BIND 的 `host port N`） |
+| named.conf 面 | `listen_addr` 仅 IP/`any`/`none`/`localhost`/`localnets`；DNSSEC 算法与 key role 白名单；线路名禁保留名与重名 | 400（此前这些字段能改写整份 named.conf ✗） |
+| GeoIP 导入 | 单行 rdata、解析阶段**全量校验**后才落库 | 任一行不合法 → 整体失败并报行号（不落半截 ✗） |
+| 配置文件 | `cert`/`key` 必须成对；`sni_only` 需有名字；TLS 版本串白名单；root 唯一；端口非 0 且不重复 | **加载期报错**（fail-fast，不静默降级 ✗） |
+| TLS 套件名 | 必须 ∈ 运行时探测出的 BoringSSL 目录（`/api/tls/ciphers` 同源） | 加载期报错并指名（此前静默剔除 ✗） |
