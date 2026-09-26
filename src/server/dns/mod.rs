@@ -1033,7 +1033,26 @@ fn chrono_now() -> u64 {
         .unwrap_or(0)
 }
 
-fn gen_rpz_file(rules: &[RpzRule]) -> String {
+/// 严格递增的 serial：`max(now, prev + 1)`。
+///
+/// 为什么不能直接用 `now`：HTTP/面板的两次编辑常常落在同一秒，而 BIND 只在 serial
+/// **更大**时才重载 zone —— 同值会被判成「没变化」，表现为「面板 ok、服务里还是旧内容」。
+fn next_serial(prev: Option<u64>) -> u64 {
+    let now = chrono_now();
+    match prev {
+        Some(p) => now.max(p.saturating_add(1)),
+        None => now,
+    }
+}
+
+/// 从已落盘的 zone 文件里读回 SOA serial（读不到 → None，下一个 serial 直接取 now）。
+fn read_zone_serial(path: &std::path::Path) -> Option<u64> {
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|t| serial_from_zone_text(&t))
+}
+
+fn gen_rpz_file(rules: &[RpzRule], prev_serial: Option<u64>) -> String {
     // RPZ 语义（v3 实测修正）：
     // 1) 触发 owner 必须是**相对名**——挂在 $ORIGIN crucible.rpz. 之下才是合法触发
     //    （blocked.crucible.test → blocked.crucible.test.crucible.rpz.）；
@@ -1042,7 +1061,7 @@ fn gen_rpz_file(rules: &[RpzRule]) -> String {
     let mut s = String::from("$ORIGIN crucible.rpz.\n$TTL 300\n");
     s.push_str(&format!(
         "@ IN SOA localhost. root.localhost. ( {} 3600 900 86400 300 )\n@ IN NS localhost.\n",
-        chrono_now()
+        next_serial(prev_serial)
     ));
     for r in rules {
         let rel = r.name.trim_end_matches('.').to_string();
@@ -1071,11 +1090,11 @@ fn fq_trim(fq: &str) -> String {
 }
 
 /// answers 区（承载 override 的自定义响应，需求 7）。
-fn gen_answers_file(rules: &[RpzRule]) -> String {
+fn gen_answers_file(rules: &[RpzRule], prev_serial: Option<u64>) -> String {
     let mut s = String::from("$ORIGIN crucible.answers.\n$TTL 300\n");
     s.push_str(&format!(
         "@ IN SOA localhost. root.localhost. ( {} 3600 900 86400 300 )\n@ IN NS localhost.\n",
-        chrono_now()
+        next_serial(prev_serial)
     ));
     for r in rules {
         let t = r.rtype.to_ascii_lowercase();
@@ -1565,6 +1584,46 @@ pub fn write_all(cfg: &DnsConfig) -> Result<Vec<(String, PathBuf)>> {
         if r.value.contains('\n') || r.value.contains('\r') {
             bail!("bad rpz value（必须是单行）name={:?}", r.name);
         }
+        // **按类型校验 value**：answers 区是**一个文件**，里面任何一行非法都会让 named
+        // 拒载整个区；而 RPZ 的所有 a/aaaa/txt 规则都 CNAME 指向该区 ⇒ 一条空值/坏 IP
+        // 就让**全部 override 静默失效**（面板仍显示 ok）。
+        // 此前只挡了换行，A/AAAA 连「是不是 IP」都没校验，缺省还是空串。
+        match r.rtype.to_ascii_lowercase().as_str() {
+            "a" => {
+                if r.value.trim().parse::<std::net::Ipv4Addr>().is_err() {
+                    bail!(
+                        "rpz A 记录的 value 必须是 IPv4 地址: name={:?} value={:?}",
+                        r.name,
+                        r.value
+                    );
+                }
+            }
+            "aaaa" => {
+                if r.value.trim().parse::<std::net::Ipv6Addr>().is_err() {
+                    bail!(
+                        "rpz AAAA 记录的 value 必须是 IPv6 地址: name={:?} value={:?}",
+                        r.name,
+                        r.value
+                    );
+                }
+            }
+            "txt" => {
+                if r.value.trim().is_empty() {
+                    bail!("rpz TXT 记录的 value 不能为空: name={:?}", r.name);
+                }
+            }
+            "cname" => {
+                if !valid_name(r.value.trim().trim_end_matches('.')) {
+                    bail!(
+                        "rpz CNAME 记录的 value 不是合法域名: name={:?} value={:?}",
+                        r.name,
+                        r.value
+                    );
+                }
+            }
+            // nxdomain / nodata / passthru 不需要 value
+            _ => {}
+        }
     }
     let etc = state_root().join("etc");
     let zones_dir = state_root().join("zones");
@@ -1745,7 +1804,12 @@ pub fn write_all(cfg: &DnsConfig) -> Result<Vec<(String, PathBuf)>> {
         for (view_tag, _) in &views {
             let rf = if view_tag.is_empty() { "rpz.zone".to_string() } else { format!("rpz.{view_tag}.zone") };
             let path = zones_dir.join(&rf);
-            std::fs::write(&path, gen_rpz_file(&cfg.rpz))?;
+            // SOA serial 必须**严格递增**（同用户 zone 的处理）：RPZ/answers 此前用的是裸
+            // `chrono_now()`，于是「改一条 override → 面板 ok → BIND 仍服务旧内容」——
+            // rndc reload 只在 serial 更大时才加载新内容，同秒内的两次编辑会撞成同一个值。
+            // 这里从**已落盘的旧文件**里读回上一个 serial 取 max(now, prev+1)。
+            let prev_rpz = read_zone_serial(&path);
+            std::fs::write(&path, gen_rpz_file(&cfg.rpz, prev_rpz))?;
             let mut j = path.clone().into_os_string();
             j.push(".jnl");
             let _ = std::fs::remove_file(&j);
@@ -1753,7 +1817,8 @@ pub fn write_all(cfg: &DnsConfig) -> Result<Vec<(String, PathBuf)>> {
             // answers 区：override 自定义响应（A/AAAA/TXT）的真实记录（需求 7）
             let af = if view_tag.is_empty() { "answers.zone".to_string() } else { format!("answers.{view_tag}.zone") };
             let apath = zones_dir.join(&af);
-            std::fs::write(&apath, gen_answers_file(&cfg.rpz))?;
+            let prev_ans = read_zone_serial(&apath);
+            std::fs::write(&apath, gen_answers_file(&cfg.rpz, prev_ans))?;
             let mut j2 = apath.clone().into_os_string();
             j2.push(".jnl");
             let _ = std::fs::remove_file(&j2);
