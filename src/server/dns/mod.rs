@@ -319,6 +319,25 @@ pub struct DotCfg {
     pub cert: Option<String>,
     #[serde(default)]
     pub key: Option<String>,
+    /// DoT 客户端白名单（IP/CIDR）。**空 = 沿用 `[dns] recursion_acl`；那个也空则仅回环。**
+    ///
+    /// 为什么必须有这道门：DoT 查询会被转发给 named，而 named 的 allow-recursion 里
+    /// 硬编码了 127.0.0.1（转发源），所以「谁能连上 853，谁就拿到一个无限制递归解析器」
+    /// —— 与 `[dns] recursion_acl`（文档写的是「空 = 仅本机」）的语义直接矛盾，
+    /// 而且可被用来打上游 / 刷缓存 / 当放大器。DoH 侧本来就排在 ip_access + 限速之后，
+    /// 这里补齐同一个威胁模型。要对外提供 DoT（公开解析器）就显式写
+    /// `allow = ["0.0.0.0/0", "::/0"]`（或把 `recursion_acl` 设成同样的值）。
+    #[serde(default)]
+    pub allow: Vec<String>,
+    /// 单 IP 每秒查询上限（0 = 用默认 20）
+    #[serde(default)]
+    pub rate_per_sec: u32,
+    /// 令牌桶突发（0 = 用默认 40）
+    #[serde(default)]
+    pub burst: u32,
+    /// 并发连接上限（0 = 用默认 128）
+    #[serde(default)]
+    pub max_conns: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]

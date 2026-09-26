@@ -1217,6 +1217,42 @@ h3-quinn 自己会归还流控，主要工作是把响应发送改走 split 出�
 在此之前 h3 单请求上限仍是 8MiB（h2 已无此限，h1 一直是 2GiB）。
 
 
+### 21.12 build52：DoT 准入（ACL / 限速 / 并发上限）—— 之前是「谁能连 853 就白拿递归」
+
+**问题**（审计 agent 报的第一条，我核实属实）：`run_dot` 的 accept 循环**没有任何准入** ——
+无 ACL、无限速、无并发上限，accept 一次就 spawn。而 DoT 查询会被转发给 named，named 的
+allow-recursion 里硬编码了 127.0.0.1（转发源）⇒ **谁能连上 853，谁就得到一个无限制的递归
+解析器**：可打上游、刷缓存、当放大器（DNS 反射），且 TLS 握手成本由我们承担。
+更要命的是这与 `[dns] recursion_acl`（文档写「空 = 仅本机」）的语义直接矛盾：
+DoH 侧本来就排在 ip_access + 限速之后，DoT 侧却完全没有这道门。
+
+**改动**（`src/server/dns/dot_doh.rs`、`DotCfg`）
+* `[dns.dot]` 新增 `allow`（IP/CIDR 白名单）、`rate_per_sec`、`burst`、`max_conns`。
+* **白名单解析**：`dot.allow` 非空用它；否则沿用 `[dns] recursion_acl`；两者都空 ⇒ **仅回环**。
+  这样「公开解析器」与「仅本机」两种意图都由既有配置决定，不再出现「配置说仅本机、实际全网可用」。
+* 三道准入（**判定失败直接丢连接，不做 TLS 握手**，避免白耗握手 CPU）：
+  ① ACL（复用 `access::is_allowed`，含 v4-mapped v6 归一化）→ ② 单 IP 限速（复用 `rate_limit::allow`）
+  → ③ 进程级并发连接上限（`Semaphore`）。
+* 默认值：rate 20/s、burst 40、max_conns 128；**0 视为「用默认」**（整段 `[dns.dot]` 缺失时
+  serde 会走 `DotCfg::default()` 全 0，若把 0 当「不限」就会静默变成无限制）。
+* 启动日志打印生效策略，便于审计。
+
+**实测（build52）**
+
+| 检查 | 结果 |
+|---|---|
+| 启动日志（测试/生产） | `dns: DoT listening on … (allow=0.0.0.0/0, rate=20/s burst=40, max_conns=128)` ✓ |
+| 测试实例 DoT 查询（源=回环，白名单命中） | 有应答 ✓（113/110 字节） |
+| 生产 DoT 查询（源=回环） | **有应答**（83 字节、rcode 0、ancount 2）✓ |
+| 生产 DoT 查询（源=公网 IP，非回环） | 有应答 ✓ —— 因为生产**显式**配了 `recursion_acl = 0.0.0.0/0`（公开解析器意图），
+现在 DoT 与之一致（此前是"配置说仅本机、实际全网可用"的矛盾态） |
+| 生产 DNS 53 / HTTP h2 | 正常 ✓ |
+
+**运维含义**：要限制 DoT 来源就写 `[dns.dot] allow = ["10.0.0.0/8"]`（或收紧 `[dns] recursion_acl`）；
+两者都不写即「仅本机」。公开提供 DoT 时，限速与并发上限现在默认生效（20/s/IP、128 连接）。
+
+
+
 
 
 

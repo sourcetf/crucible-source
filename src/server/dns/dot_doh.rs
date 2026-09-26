@@ -334,6 +334,70 @@ fn build_tls_acceptor(
 }
 
 #[cfg(feature = "tls_boring")]
+/// DoT 客户端白名单的解析：`[dns.dot] allow` 非空用它；否则沿用 `[dns] recursion_acl`；
+/// 两者都空 ⇒ **仅回环**（与 `[dns] recursion_acl`「空 = 仅本机」的文档语义一致）。
+fn dot_effective_allow(cfg: &crate::server::dns::DnsConfig) -> Vec<String> {
+    if !cfg.dot.allow.is_empty() {
+        return cfg.dot.allow.clone();
+    }
+    cfg.recursion_acl.clone()
+}
+
+/// 准入判定：白名单为空 ⇒ 仅回环（安全默认）。IP/CIDR 解析复用 HTTP 侧那一套
+/// （`access::is_allowed`，含 v4-mapped v6 归一化）。
+fn dot_peer_allowed(cfg: &crate::server::dns::DnsConfig, peer: std::net::SocketAddr) -> bool {
+    let allow = dot_effective_allow(cfg);
+    if allow.is_empty() {
+        return peer.ip().is_loopback();
+    }
+    crate::server::access::is_allowed(
+        &crate::config::IpAccessConfig {
+            allow,
+            deny: Vec::new(),
+        },
+        peer,
+    )
+}
+
+fn dot_allow_desc(cfg: &crate::server::dns::DnsConfig) -> String {
+    let a = dot_effective_allow(cfg);
+    if a.is_empty() {
+        "loopback-only".to_string()
+    } else {
+        a.join(",")
+    }
+}
+
+const DOT_DEFAULT_RATE: f64 = 20.0;
+const DOT_DEFAULT_BURST: f64 = 40.0;
+const DOT_DEFAULT_MAX_CONNS: usize = 128;
+
+/// 0 视为「用默认值」——因为整段 `[dns.dot]` 缺失时 serde 走 `DotCfg::default()`（全 0），
+/// 若把 0 当「不限」就会在「只想开 DoT、没写限速」时静默变成无限制。
+fn dot_rate(cfg: &crate::server::dns::DnsConfig) -> f64 {
+    if cfg.dot.rate_per_sec == 0 {
+        DOT_DEFAULT_RATE
+    } else {
+        cfg.dot.rate_per_sec as f64
+    }
+}
+
+fn dot_burst(cfg: &crate::server::dns::DnsConfig) -> f64 {
+    if cfg.dot.burst == 0 {
+        DOT_DEFAULT_BURST
+    } else {
+        cfg.dot.burst as f64
+    }
+}
+
+fn dot_max_conns(cfg: &crate::server::dns::DnsConfig) -> usize {
+    if cfg.dot.max_conns == 0 {
+        DOT_DEFAULT_MAX_CONNS
+    } else {
+        cfg.dot.max_conns
+    }
+}
+
 async fn run_dot(
     cfg: crate::server::dns::DnsConfig,
     listen: u16,
@@ -349,18 +413,46 @@ async fn run_dot(
         }
     };
     log::info!(
-        "dns: DoT listening on {bind_ip}:{listen} → named@{}:{}",
+        "dns: DoT listening on {bind_ip}:{listen} → named@{}:{} (allow={}, rate={}/s burst={}, max_conns={})",
         cfg.listen_addr,
-        cfg.port_or_default()
+        cfg.port_or_default(),
+        dot_allow_desc(&cfg),
+        dot_rate(&cfg),
+        dot_burst(&cfg),
+        dot_max_conns(&cfg)
     );
+    // 并发连接上限：进程级信号量。旧实现每 accept 一次就 spawn 一个任务且**没有任何上限**，
+    // 单个来源开几千条 TLS 连接即可把 fd/任务吃光（OpenBSD 的 fd 是系统级共享的）。
+    let conns = std::sync::Arc::new(tokio::sync::Semaphore::new(dot_max_conns(&cfg)));
     loop {
         let (sock, peer) = match listener.accept().await {
             Ok(x) => x,
             Err(_) => continue,
         };
+        // 三道准入（与 HTTP/DoH 侧同一套判定的思路）：ACL → 单 IP 限速 → 并发上限。
+        // 都只做**无状态/轻量**判定，判定失败直接丢弃连接（不握手，避免白耗 TLS 握手 CPU）。
+        if !dot_peer_allowed(&cfg, peer) {
+            log::warn!("dot: reject {peer}: 不在 DoT 白名单（见 [dns.dot] allow / [dns] recursion_acl）");
+            continue;
+        }
+        if !crate::server::rate_limit::allow(peer.ip(), dot_rate(&cfg), dot_burst(&cfg)) {
+            log::warn!("dot: rate limit exceeded from {}", peer.ip());
+            continue;
+        }
+        let permit = match conns.clone().try_acquire_owned() {
+            Ok(p) => p,
+            Err(_) => {
+                log::warn!(
+                    "dot: 并发连接已达上限 {}，拒绝 {peer}",
+                    dot_max_conns(&cfg)
+                );
+                continue;
+            }
+        };
         let acc = acceptor.clone();
         let cfg_i = cfg.clone();
         tokio::spawn(async move {
+            let _permit = permit;
             let cfg = cfg_i;
             let mut tls = match tokio_boring::accept(&acc, sock).await {
                 Ok(s) => s,
