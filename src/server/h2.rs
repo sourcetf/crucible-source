@@ -18,6 +18,7 @@ use h2::{
 use http::{Request, Response, StatusCode};
 use http_body_util::{BodyExt, Full};
 use std::io::{self, Write};
+use std::future::Future;
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -173,7 +174,7 @@ where
                     return;
                 }
             };
-            let (parts, mut body) = request.into_parts();
+            let (parts, body) = request.into_parts();
             // 与 h1 同序的 admin 前置门（见 basic_auth::admin_gate）：**先判鉴权/CSRF、
             // 再收 body**。否则不带凭据的并发 POST 每个都能占住 REQUEST_BODY_CAP（8MiB）
             // 的缓冲，等于不用通过鉴权就能放大内存。
@@ -254,84 +255,61 @@ where
                     }
                 }
             }
-            // P1-9/P1-4：收齐请求体（上限 8MiB）——POST/PUT 才能把 body 交给引擎/admin；
-            // 且不排空 H2 请求体会卡住流量控制窗口。超限直接 413。
+            // P1-9/P1-4：请求体的取舍。
             //
-            // P0（真 bug，实测 >1MiB 必卡死）：h2 0.4 的契约是**调用方**在消费掉每个
-            // DATA 之后显式 `release_capacity(n)`（share.rs 的 FlowControl 文档：
-            // "the caller is expected to call release_capacity after dropping data
-            // frames"），recv.rs::release_capacity 才会把额度还给流级+连接级窗口并排
-            // WINDOW_UPDATE。少这一步 → 收到初始窗口（1MiB）后窗口停在 0，对端再也发不出
-            // DATA，我们这边 `data()` 永远 Pending → 双方互等到客户端超时。
-            let mut buf: Vec<u8> = Vec::new();
-            let mut overflow = false;
-            let mut idle_timeout = false;
-            loop {
-                let next = match tokio::time::timeout(H2_BODY_IDLE_TIMEOUT, body.data()).await {
-                    Ok(n) => n,
-                    Err(_) => {
-                        idle_timeout = true;
-                        break;
-                    }
-                };
-                let Some(chunk) = next else { break };
-                match chunk {
-                    Ok(c) => {
-                        let n = c.len();
-                        if buf.len() + n > REQUEST_BODY_CAP {
-                            overflow = true;
-                            break;
-                        }
-                        buf.extend_from_slice(&c);
-                        drop(c);
-                        // h2 的 API：`RecvStream::flow_control()` 拿到该流的 FlowControl，
-                        // 再 `release_capacity(n)`（share.rs 里 release_capacity 定义在
-                        // FlowControl 上，不在 RecvStream 上）。
-                        if body.flow_control().release_capacity(n).is_err() {
-                            break;
-                        }
-                    }
-                    Err(_) => break,
-                }
-            }
-            if idle_timeout {
-                let resp = Response::builder()
-                    .status(StatusCode::REQUEST_TIMEOUT)
-                    .body(())
-                    .unwrap();
-                if let Ok(mut send) = respond.send_response(resp, false) {
-                    let _ = send.send_data(Bytes::from_static(b"request body read timeout"), true);
-                }
-                return;
-            }
-            if overflow {
-                let resp = Response::builder()
-                    .status(StatusCode::PAYLOAD_TOO_LARGE)
-                    .body(())
-                    .unwrap();
-                // end_of_stream=false：紧随其后的 send_data 才是这一响应的结束。
-                // 旧代码传 true（先结束流），send_data 必然报错被 `let _` 吞掉——
-                // 客户端只收到一个空 body 的 413。
-                if let Ok(mut send) = respond.send_response(resp, false) {
-                    // 单请求上限就是 REQUEST_BODY_CAP（h2/h3 先收齐再处理）；
-                    // 大文件必须走分片（Content-Range，§44）或 HTTP/1.1（h1 是流式，上限 2GiB）。
-                    let _ = send.send_data(
-                        Bytes::from_static(
-                            b"request body too large: h2/h3 single-request limit is 8MiB; \
-use chunked uploads (Content-Range) or HTTP/1.1 for larger bodies\n",
-                        ),
-                        true,
-                    );
-                }
-                return;
-            }
+            // 只有**上传**分支需要流式 body（大文件直接写盘，不受 8MiB 单请求上限约束）；
+            // 其余分支（admin/apps/proxy/DoH/static）都要 `Bytes` 形态，统一走 [`collect_bytes`]。
+            // 这里只是**预判像不像上传**，各分支还会按需自行收齐 —— 因此 page_rules 改写路径、
+            // 或 app/proxy 抢走 URL 时，最坏只是少一次流式机会，不会出现语义分叉。
+            //
+            // P0（真 bug，实测 >1MiB 必卡死）已修：归还接收窗口的责任在**调用方**
+            // （h2 0.4 契约），流式路径由 [`H2RecvBody`] 逐帧归还，收齐路径由它内部同样归还。
             let method = parts.method.as_str().to_string();
-            let fake = Request::from_parts(parts, Bytes::from(buf));
-            let path = fake.uri().path().to_string();
+            let pre_path = parts.uri.path().to_string();
+            let is_upload_like = matches!(
+                parts.method,
+                http::Method::PUT | http::Method::PATCH | http::Method::POST
+            ) && !crate::server::apps::would_handle(&lc, &pre_path)
+                && !would_proxy(&lc, &pre_path)
+                && crate::server::upload_api::enabled_for(&lc, &pre_path);
+            let req: Request<H2Body> = if is_upload_like {
+                // 注意：这里必须用**泛型**的 `combinators::BoxBody::new`（错误类型擦除成
+                // Box<dyn Error>），不能用 h1 的 `BoxBody` 别名（那个的 Error 是 Infallible）。
+                Request::from_parts(
+                    parts,
+                    http_body_util::combinators::BoxBody::new(H2RecvBody::new(body)),
+                )
+            } else {
+                let boxed = Request::from_parts(
+                    parts,
+                    http_body_util::combinators::BoxBody::new(H2RecvBody::new(body)),
+                );
+                match collect_bytes(boxed, REQUEST_BODY_CAP).await {
+                    Ok(r) => {
+                        let (p, b) = r.into_parts();
+                        Request::from_parts(p, bytes_body(b))
+                    }
+                    Err(resp) => {
+                        // 与旧行为一致：超限 413 / 空闲超时 408 / 读错 400，直接回包。
+                        let (rp, data) = resp.into_parts();
+                        if let Ok(mut send) =
+                            respond.send_response(Response::from_parts(rp, ()), false)
+                        {
+                            if !data.is_empty() {
+                                let _ = send.send_data(data, true);
+                            }
+                        }
+                        return;
+                    }
+                }
+            };
             let t0 = std::time::Instant::now();
             // HSTS 判定要在 handle_h2 之前取：lc 会被 move 进去。
             let is_https = lc.ssl.is_some();
-            let mut response = handle_h2(fake, live.clone(), lc, peer).await;
+            let mut response = handle_h2(req, live.clone(), lc, peer).await;
+            // 访问日志用的路径：与旧实现一致，记**改写前**的请求路径（改写发生在
+            // handle_h2 内部的副本上，这里拿不到也不需要）。
+            let path = pre_path;
             // HTTPS 响应统一补 HSTS。此前只有 h1.rs 做了这件事，h2/h3 完全没有——
             // 而 h2/h3 才是主用协议，等于「开了 TLS 却不发 HSTS」。
             // entry().or_insert 不覆盖分支已显式设置的值，与 h1 语义一致。
@@ -432,6 +410,132 @@ async fn collect_to_bytes(resp: Response<BoxBody>) -> Response<Bytes> {
         .map(|c| c.to_bytes())
         .unwrap_or_default();
     Response::from_parts(parts, data)
+}
+
+/// h2 请求体的「装箱」类型：既能装已收齐的 `Bytes`，也能装**流式**的 h2 `RecvStream`。
+/// 错误类型擦除成 `Box<dyn Error + Send + Sync>`，两种形态才能共用同一个请求类型
+/// （否则每个分发分支都要泛型化，改动面大得多）。
+pub type H2Body =
+    http_body_util::combinators::BoxBody<Bytes, Box<dyn std::error::Error + Send + Sync>>;
+
+/// 把已收齐的 `Bytes` 装成 [`H2Body`]。
+fn bytes_body(b: Bytes) -> H2Body {
+    Full::new(b)
+        .map_err(|e: std::convert::Infallible| -> Box<dyn std::error::Error + Send + Sync> {
+            match e {}
+        })
+        .boxed()
+}
+
+/// 统一的纯文本响应（h2 的响应体类型是 `Bytes`）。
+fn plain(status: StatusCode, msg: &str) -> Response<Bytes> {
+    Response::builder()
+        .status(status)
+        .header(http::header::CONTENT_TYPE, "text/plain; charset=utf-8")
+        .body(Bytes::from(msg.to_string()))
+        .unwrap()
+}
+
+/// 收齐请求体（≤ `cap`）→ `Request<Bytes>`；超限/**空闲超时**/读错的响应直接返回。
+///
+/// 只有上传分支**不**走这里（那里的 body 要流式写盘，见 [`H2RecvBody`]）；
+/// 其余分支（admin/apps/proxy/DoH）的引擎与接口本来就是 `Bytes` 形态。
+async fn collect_bytes(
+    req: Request<H2Body>,
+    cap: usize,
+) -> Result<Request<Bytes>, Response<Bytes>> {
+    let (parts, mut body) = req.into_parts();
+    let mut buf: Vec<u8> = Vec::new();
+    loop {
+        let frame = match tokio::time::timeout(H2_BODY_IDLE_TIMEOUT, body.frame()).await {
+            Ok(Some(Ok(f))) => f,
+            Ok(Some(Err(e))) => {
+                log::debug!("h2 body read: {e}");
+                return Err(plain(StatusCode::BAD_REQUEST, "request body read failed"));
+            }
+            Ok(None) => break,
+            Err(_) => {
+                return Err(plain(
+                    StatusCode::REQUEST_TIMEOUT,
+                    "request body read timeout",
+                ))
+            }
+        };
+        let Some(data) = frame.data_ref() else { continue };
+        if buf.len() + data.len() > cap {
+            return Err(plain(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "request body too large for this protocol (single-request limit 8MiB); \
+use chunked uploads (Content-Range) or HTTP/1.1 for larger bodies",
+            ));
+        }
+        buf.extend_from_slice(data);
+    }
+    Ok(Request::from_parts(parts, Bytes::from(buf)))
+}
+
+/// h2 请求体的**流式**适配：直接驱动 `RecvStream`，每帧归还接收窗口，带空闲超时。
+///
+/// 为什么必须显式归还窗口：h2 0.4 不在 `Bytes` 被丢弃时自动归还，契约写明由调用方
+/// `flow_control().release_capacity(n)`（见 recv.rs）；少了它 ⇒ 收满初始窗口（1MiB）
+/// 后窗口停在 0，对端发不出、我们等不到，**双向互等**（已实测挂死）。
+/// 归还推迟到**下一次** poll：消费方拿到帧就立刻处理，推迟一轮不影响吞吐，
+/// 却避免了「还没交付就先归还」的语义问题。
+struct H2RecvBody {
+    inner: h2::RecvStream,
+    pending_release: usize,
+    idle: std::pin::Pin<Box<tokio::time::Sleep>>,
+    timed_out: bool,
+}
+
+impl H2RecvBody {
+    fn new(inner: h2::RecvStream) -> Self {
+        Self {
+            inner,
+            pending_release: 0,
+            idle: Box::pin(tokio::time::sleep(H2_BODY_IDLE_TIMEOUT)),
+            timed_out: false,
+        }
+    }
+}
+
+impl hyper::body::Body for H2RecvBody {
+    type Data = Bytes;
+    type Error = Box<dyn std::error::Error + Send + Sync>;
+
+    fn poll_frame(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<hyper::body::Frame<Bytes>, Self::Error>>> {
+        let this = self.get_mut();
+        if this.pending_release > 0 {
+            let n = std::mem::take(&mut this.pending_release);
+            if this.inner.flow_control().release_capacity(n).is_err() {
+                return Poll::Ready(None);
+            }
+        }
+        if this.idle.as_mut().poll(cx).is_ready() {
+            this.timed_out = true;
+            return Poll::Ready(Some(Err("h2 request body idle timeout".into())));
+        }
+        match this.inner.poll_data(cx) {
+            Poll::Ready(Some(Ok(b))) => {
+                this.idle
+                    .as_mut()
+                    .reset(tokio::time::Instant::now() + H2_BODY_IDLE_TIMEOUT);
+                this.pending_release = b.len();
+                Poll::Ready(Some(Ok(hyper::body::Frame::data(b))))
+            }
+            Poll::Ready(Some(Err(e))) => Poll::Ready(Some(Err(Box::new(e)))),
+            Poll::Ready(None) => Poll::Ready(None),
+            Poll::Pending => Poll::Pending,
+        }
+    }
+
+    fn size_hint(&self) -> hyper::body::SizeHint {
+        // 长度由请求头给出（Content-Length）；这里不谎报，让下游按帧读。
+        hyper::body::SizeHint::new()
+    }
 }
 
 /// AsyncWrite wrapper that coalesces small writes using the same semantics as
@@ -573,7 +677,7 @@ fn batch_write_demo(frames: &[&[u8]], coalesce: bool, cap: usize) -> io::Result<
 }
 
 async fn handle_h2(
-    req: Request<Bytes>,
+    req: Request<H2Body>,
     live: Arc<LiveConfig>,
     lc: ListenerConfig,
     peer: SocketAddr,
@@ -636,19 +740,35 @@ async fn handle_h2(
     {
         let dns_eff = crate::server::dns::effective(&snap);
         if dns_eff.enabled && dns_eff.doh.enabled {
-            let (method, uri, headers) =
-                (req.method().clone(), req.uri().clone(), req.headers().clone());
-            if let Some(resp) = crate::server::dns::dot_doh::doh_prepared(
-                &dns_eff,
-                &method,
-                &uri,
-                &headers,
-                req.body().clone(),
-                peer,
-            )
-            .await
+            // 只有「确实是 DoH 请求」才收 body —— 否则会给普通上传白白套上 8MiB 上限。
+            // 判定条件与 doh_prepared 的前几个早退分支保持一致（path + host）。
+            let host = req.headers().get(http::header::HOST).cloned();
+            if crate::server::dns::dot_doh::is_doh_request(&dns_eff, req.uri().path(), host.as_ref())
             {
-                return tag(collect_to_bytes(resp).await, "dns-doh");
+                let collected = match collect_bytes(req, REQUEST_BODY_CAP).await {
+                    Ok(r) => r,
+                    Err(resp) => return tag(resp, "dns-doh"),
+                };
+                let (parts, body) = collected.into_parts();
+                let (method, uri, headers) = (
+                    parts.method.clone(),
+                    parts.uri.clone(),
+                    parts.headers.clone(),
+                );
+                let body_for_rest = body.clone();
+                if let Some(resp) = crate::server::dns::dot_doh::doh_prepared(
+                    &dns_eff,
+                    &method,
+                    &uri,
+                    &headers,
+                    body,
+                    peer,
+                )
+                .await
+                {
+                    return tag(collect_to_bytes(resp).await, "dns-doh");
+                }
+                req = Request::from_parts(parts, bytes_body(body_for_rest));
             }
         }
     }
@@ -715,6 +835,11 @@ async fn handle_h2(
     // admin：P1-4——走与 h1 完全一致的 admin::handle（UI + 全部 API + CSRF/Basic 鉴权）。
     // 旧实现对 /__admin/api/* 只回 UI shell，新二进制一旦链接 12 个 tab 的 API 在 h2 全失效。
     if path.starts_with(&snap.admin.path) {
+        // admin::handle 是 h1 体类型（Bytes）的接口：先收齐（≤8MiB）。
+        let req = match collect_bytes(req, REQUEST_BODY_CAP).await {
+            Ok(r) => r,
+            Err(resp) => return tag(resp, "admin"),
+        };
         let resp = crate::server::admin::handle(req.map(Full::new), live).await;
         // 兜底记账（与 h1 同语义）：鉴权与失败退避已在 admin_gate 里完成，这里只在
         // 「过了门却仍回 401」（两次校验之间配置被热重载）时补记一次。
@@ -759,6 +884,11 @@ async fn handle_h2(
     let path = req.uri().path().to_string();
     // P1-5：h1 的 pass_upstream（page rule pass 动作）在 h2 同样生效。
     if let Some((murl, upstream)) = crate::server::page_rules::pass_upstream(&lc, &path) {
+        // proxy_page_rule 需要 h1 体类型（Bytes）：先收齐（≤8MiB）。
+        let req = match collect_bytes(req, REQUEST_BODY_CAP).await {
+            Ok(r) => r,
+            Err(resp) => return tag(resp, "proxy"),
+        };
         let resp = crate::server::proxy::proxy_page_rule(
             req.map(Full::new),
             &murl,
@@ -783,15 +913,34 @@ async fn handle_h2(
 }
 
 async fn h2_tail(
-    req: Request<Bytes>,
+    req: Request<H2Body>,
     live: Arc<LiveConfig>,
     lc: ListenerConfig,
     peer: SocketAddr,
     path: String,
 ) -> Response<Bytes> {
-    // 分发顺序必须与 h1 一致（规格 §4：apps 优先于 proxy）。
-    // 此前这里是 proxy 在前、apps 在后，还写着「补齐 h1 分发顺序」——恰好相反：
-    // 同一条 URL 在 h1 上交给应用引擎、在 h2/h3 上被反代走，行为随协议而变。
+    // 分发顺序必须与 h1 一致（规格 §4：apps 优先于 proxy），上传排在 apps/proxy **之后**、
+    // 静态**之前**（与 h1 相同）。这里的 `upload_like` 只是「apps/proxy 都不会接管这条 URL」
+    // 的等价判定（`would_handle`/`would_proxy` 与两个执行分支用的是同一组谓词），
+    // 用来决定**要不要把 body 保持流式**——顺序本身仍由下面各分支的先后保证。
+    let upload_like = matches!(
+        *req.method(),
+        http::Method::PUT | http::Method::PATCH | http::Method::POST
+    ) && !crate::server::apps::would_handle(&lc, &path)
+        && !would_proxy(&lc, &path)
+        && crate::server::upload_api::enabled_for(&lc, &path);
+    if upload_like {
+        // 流式上传：body 不进内存，逐帧落盘（上限 2GiB，见 upload_resume::MAX_UPLOAD_BYTES）。
+        return tag(
+            crate::server::upload_api::handle_stream(req, &lc, peer).await,
+            "upload",
+        );
+    }
+    // 其余分支都要 Bytes 形态（引擎 FFI、代理上游、静态层都按 Bytes 传参）。
+    let req = match collect_bytes(req, REQUEST_BODY_CAP).await {
+        Ok(r) => r,
+        Err(resp) => return tag(resp, "static"),
+    };
     if let Some(resp) = crate::server::apps::try_handle_simple(&req, &live, &lc, peer).await {
         return tag(resp, "app");
     }
@@ -810,9 +959,7 @@ async fn h2_tail(
         );
     }
     // §44 上传：仅当该路径开了 autoindex + enable_upload 时接管写方法。
-    // 位置与 h1 一致（ACL/限速/basic_auth/apps/proxy 之后、静态之前）；
-    // 请求体已在 serve_io 里收齐为 Bytes，走 upload_api::handle_bytes 薄适配。
-    // 此前 h2 缺这条 hook → 同一条 URL 在 h1 上能上传、在 h2 上必然 405。
+    // 走到这里说明 body 已被收齐（上面 apps/proxy 需要 Bytes），用 `handle_bytes` 适配。
     if matches!(
         *req.method(),
         http::Method::PUT | http::Method::PATCH | http::Method::POST
@@ -867,17 +1014,36 @@ mod tests {
         assert!(ip < ba && ba < admin, "order must be ip_access → basic_auth → admin");
     }
 
-    /// P0 回归：请求体收取循环必须显式归还 h2 接收窗口（release_capacity）。
+    /// P0 回归：请求体适配器必须显式归还 h2 接收窗口（release_capacity）。
     /// h2 0.4 不会在 Bytes 丢弃时归还（契约要求调用方显式归还）；少这一步
     /// → body > 初始窗口（1MiB）时对端发不出、我们等不到，双向卡死。
     #[test]
     fn h2_body_loop_releases_recv_capacity() {
         let src = include_str!("h2.rs");
-        let pos = src.find("body.data()").expect("body read loop");
+        let pos = src
+            .find("impl hyper::body::Body for H2RecvBody")
+            .expect("H2RecvBody impl");
         let tail = &src[pos..];
         let rel = tail.find("release_capacity").expect("release_capacity missing");
-        let cap = tail.find("REQUEST_BODY_CAP").expect("cap");
-        assert!(rel < cap, "release_capacity must be inside the body read loop");
+        let poll = tail.find("poll_data").expect("poll_data missing");
+        assert!(
+            rel < poll,
+            "release_capacity 必须在 H2RecvBody 里、poll_data 之前（先归还上一帧再取下一帧）"
+        );
+    }
+
+    /// 上传走流式、其余分支走收齐：两条路径都必须存在，且上传不再先收齐。
+    #[test]
+    fn h2_upload_uses_streaming_body() {
+        let src = include_str!("h2.rs");
+        let pos = src.find("async fn h2_tail").expect("h2_tail");
+        let tail = &src[pos..];
+        let stream = tail.find("handle_stream").expect("handle_stream call");
+        let collect = tail.find("collect_bytes").expect("collect_bytes call");
+        assert!(
+            stream < collect,
+            "上传分支必须在收齐之前用流式 body（否则又是 8MiB 上限）"
+        );
     }
 
     /// P0 回归：在飞配额不得在 accept 循环里 await（await 期间 conn 不被 poll，

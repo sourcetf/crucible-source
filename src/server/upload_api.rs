@@ -213,6 +213,29 @@ pub async fn handle_bytes(
     Response::from_parts(parts, bytes)
 }
 
+/// h2/h3 的**流式**入口：body 直接透传给 [`handle`]（不先收齐进内存），响应仍收成 `Bytes`。
+///
+/// 与 `handle_bytes` 的唯一区别就是不把 body 变成 `Full<Bytes>` —— 这样 h2/h3 上的
+/// 大文件上传可以逐帧落盘（上限 `MAX_UPLOAD_BYTES`=2GiB），而不是先撞 `REQUEST_BODY_CAP`(8MiB)。
+pub async fn handle_stream<B>(
+    req: Request<B>,
+    lc: &ListenerConfig,
+    peer: std::net::SocketAddr,
+) -> Response<Bytes>
+where
+    B: Body<Data = Bytes> + Unpin + Send + 'static,
+    B::Error: std::fmt::Display,
+{
+    let resp = handle(req, lc, peer).await;
+    let (parts, body) = resp.into_parts();
+    let bytes = BodyExt::collect(body)
+        .await
+        .ok()
+        .map(|c| c.to_bytes())
+        .unwrap_or_default();
+    Response::from_parts(parts, bytes)
+}
+
 /// 便于测试与静态检查：暴露扩展名闸门。
 pub fn exec_ext_rejected(path: &str) -> bool {
     has_exec_ext(path)

@@ -106,6 +106,23 @@ pub async fn h1_try_handle(
     }
 }
 
+/// DoH 是否**可能**处理该请求（只看 path/Host，不看 body）。
+///
+/// 供 h2/h3 在**收请求体之前**判定：DoH 请求体很小，而普通上传可能很大 ——
+/// 若不分青红皂白先收齐，等于给普通上传套上 `REQUEST_BODY_CAP`(8MiB) 上限。
+/// 判定条件必须与 [`doh_prepared`] 的前几个早退分支完全一致，否则会出现
+/// 「预判说不处理、实际处理（或反之）」的错位。
+pub fn is_doh_request(
+    dns_cfg: &crate::server::dns::DnsConfig,
+    path: &str,
+    host: Option<&http::HeaderValue>,
+) -> bool {
+    dns_cfg.enabled
+        && dns_cfg.doh.enabled
+        && path == dns_cfg.doh.path
+        && doh_host_allowed(&dns_cfg.doh.hostnames, host)
+}
+
 /// h2/h3 路径的 DoH 入口（body 已由协议层收集为 Bytes）。
 /// 返回 Some(resp) = 已按 DoH 应答；None = 非 DoH 请求（路径/Host 不匹配）。
 pub async fn doh_prepared(
