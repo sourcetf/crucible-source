@@ -519,67 +519,87 @@ mod imp {
         }
 
         let result = async {
-            // P1-9：收齐 H3 请求体（上限 8MiB）——POST/PUT 才能把 body 交给引擎/admin；
-            // 且不排空请求体会卡住 QUIC 流量控制。超限直接 413。
-            let mut body: Vec<u8> = Vec::new();
-            let mut overflow = false;
-            loop {
-                // 空闲超时（与 h2 同语义）：**必须**有——否则「发完 HEADERS 就不发 FIN、
-                // 也不再发数据」的客户端会让这个任务永远挂在 recv_data 上，
-                // 约 50 字节流量换 1 个任务 + 1 个流 + 1 个 QMux 名额，零成本。
-                let next = match tokio::time::timeout(
-                    std::time::Duration::from_secs(H3_BODY_IDLE_TIMEOUT_SECS),
-                    stream.recv_data(),
-                )
-                .await
-                {
-                    Ok(n) => n,
-                    Err(_) => {
-                        log::warn!("h3 body idle timeout peer={peer}");
-                        // 直接结束：流被 drop 时会向对端发 STOP_SENDING/RESET
-                        return Ok(());
-                    }
-                };
-                match next {
-                    Ok(Some(mut buf)) => {
-                        if body.len() + buf.remaining() > REQUEST_BODY_CAP {
-                            overflow = true;
-                            break;
-                        }
-                        let chunk = buf.copy_to_bytes(buf.remaining());
-                        body.extend_from_slice(&chunk);
-                    }
-                    Ok(None) => break,
-                    Err(e) => {
-                        log::debug!("h3 recv_data peer={peer}: {e}");
-                        return Ok(());
-                    }
-                }
-            }
-            if overflow {
-                let resp = Response::builder()
-                    .status(StatusCode::PAYLOAD_TOO_LARGE)
-                    .body(())
-                    .unwrap();
-                let _ = stream.send_response(resp).await;
-                // 如实说明上限与出路（h1 是流式，上限 2GiB；分片上传见 §44）。
-                let _ = stream
-                    .send_data(Bytes::from_static(
-                        b"request body too large: h2/h3 single-request limit is 8MiB; \
-use chunked uploads (Content-Range) or HTTP/1.1 for larger bodies\n",
-                    ))
-                    .await;
-                return Ok(());
-            }
+            // 请求体两种取法（与 h2 同构）：
+            //  ① 普通请求 → 收齐（≤8MiB，超限 413）：admin/apps/proxy/DoH 的接口都是 Bytes 形态；
+            //  ② **上传目标** → 不读 body，把 recv 半边装箱交给 upload_api 流式写盘
+            //     ⇒ 单请求上限从 8MiB 抬到 MAX_UPLOAD_BYTES(2GiB)，与 h1/h2 一致。
+            // 预判只看「像不像上传」，各分支仍按需自行收齐 —— 所以 page_rules 改写路径 /
+            // app / proxy 抢走 URL 时最坏只是少一次流式机会，语义不分叉。
+            let (mut send_half, mut recv_half) = stream.split();
+            let pre_path = req.uri().path().to_string();
+            let upload_like = matches!(
+                *req.method(),
+                http::Method::PUT | http::Method::PATCH | http::Method::POST
+            ) && !apps::would_handle(&lc, &pre_path)
+                && !would_proxy(&lc, &pre_path)
+                && crate::server::upload_api::enabled_for(&lc, &pre_path);
 
             let method = req.method().as_str().to_string();
-            let path = req.uri().path().to_string();
-
             let t0 = std::time::Instant::now();
-            let req = req.map(|()| Bytes::from(body));
             // HSTS 判定要在 handle_h3 之前取：lc 会被 move 进去。
             let is_https = lc.ssl.is_some();
-            let mut response = handle_h3(req, live.clone(), lc, peer).await;
+
+            let req: Request<H3Body> = if upload_like {
+                req.map(|()| h3_body_from_recv(recv_half))
+            } else {
+                match h3_collect_stream(&mut recv_half, peer).await {
+                    Ok(b) => req.map(|()| h3_bytes_body(b)),
+                    Err(H3BodyErr::Overflow) => {
+                        let resp = Response::builder()
+                            .status(StatusCode::PAYLOAD_TOO_LARGE)
+                            .body(())
+                            .unwrap();
+                        let _ = send_half.send_response(resp).await;
+                        // 如实说明上限与出路（h1 是流式，上限 2GiB；分片上传见 §44）。
+                        let _ = send_half
+                            .send_data(Bytes::from_static(
+                                b"request body too large: h2/h3 single-request limit is 8MiB; \
+use chunked uploads (Content-Range) or HTTP/1.1 for larger bodies\n",
+                            ))
+                            .await;
+                        let _ = send_half.finish().await;
+                        return Ok(());
+                    }
+                    // 空闲超时/读错：直接结束（drop 会向对端发 STOP_SENDING/RESET）
+                    Err(H3BodyErr::Other) => return Ok(()),
+                }
+            };
+            let path = req.uri().path().to_string();
+            let response = handle_h3(req, live.clone(), lc, peer).await;
+            h3_send_response(
+                &mut send_half,
+                peer,
+                response,
+                &live,
+                &method,
+                &path,
+                t0,
+                is_https,
+            )
+            .await;
+            Ok(())
+        }
+        .await;
+        crate::server::qmux::stream_closed(permit);
+        result
+    }
+
+    /// 统一的 h3 响应发送路径（普通请求与流式上传**共用一条**，避免两处实现漂移）。
+    ///
+    /// 早退只记日志、不改状态码：响应头可能已经发出去了。参数里带 `method`/`path`/`t0`
+    /// 是为了完成侧那条全字段访问日志。
+    async fn h3_send_response<S>(
+        send: &mut ::h3::server::RequestStream<S, Bytes>,
+        peer: SocketAddr,
+        mut response: Response<Bytes>,
+        live: &Arc<LiveConfig>,
+        method: &str,
+        path: &str,
+        t0: std::time::Instant,
+        is_https: bool,
+    ) where
+        S: ::h3::quic::SendStream<Bytes>,
+    {
             // HTTPS(H3) 响应统一补 HSTS——与 h1/h2 同一语义，见 h2.rs 处的说明。
             if is_https {
                 response
@@ -601,11 +621,11 @@ use chunked uploads (Content-Range) or HTTP/1.1 for larger bodies\n",
                 .unwrap_or("http");
             // P1-11：完成侧全字段访问日志；h3 侧拿得到精确响应字节数。
             crate::server::access_log::log_response(
-                &live,
+                live,
                 peer,
                 "h3",
-                &method,
-                &path,
+                method,
+                path,
                 parts.status.as_u16(),
                 // 流式响应（FileSource）日志记真实长度，而不是空 body 的 0
                 Some(file_src.as_ref().map(|s| s.len).unwrap_or(body_out.len() as u64)),
@@ -613,14 +633,14 @@ use chunked uploads (Content-Range) or HTTP/1.1 for larger bodies\n",
                 engine,
             );
             let resp = Response::from_parts(parts, ());
-            if let Err(e) = stream.send_response(resp).await {
+            if let Err(e) = send.send_response(resp).await {
                 log::debug!("h3 send_response peer={peer}: {e:#}");
-                return Ok(());
+                return;
             }
             if let Some(src) = file_src {
                 // 大文件：分块读盘逐帧发送（`send_data` 自带 QUIC 流控背压）。
-                // 这里不调用带类型标注的辅助函数：stream 的类型由调用点决定，
-                // 内联可以完全避开三处 SendStream 泛型不匹配的风险。
+                // 这里不调用带类型标注的辅助函数：类型由调用点决定，
+                // 内联可以完全避开 SendStream 泛型不匹配的风险。
                 use tokio::io::{AsyncReadExt, AsyncSeekExt};
                 match tokio::fs::File::open(&src.path).await {
                     Ok(mut f) => {
@@ -641,7 +661,7 @@ use chunked uploads (Content-Range) or HTTP/1.1 for larger bodies\n",
                                 }
                                 Ok(n) => {
                                     left -= n as u64;
-                                    if let Err(e) = stream
+                                    if let Err(e) = send
                                         .send_data(Bytes::copy_from_slice(&buf[..n]))
                                         .await
                                     {
@@ -662,21 +682,15 @@ use chunked uploads (Content-Range) or HTTP/1.1 for larger bodies\n",
                     ),
                 }
             } else if !body_out.is_empty() {
-                if let Err(e) = stream.send_data(body_out).await {
+                if let Err(e) = send.send_data(body_out).await {
                     log::debug!("h3 send_data peer={peer}: {e:#}");
-                    return Ok(());
+                    return;
                 }
             }
-            if let Err(e) = stream.finish().await {
+            if let Err(e) = send.finish().await {
                 log::debug!("h3 finish peer={peer}: {e:#}");
-                return Ok(());
             }
-            Ok(())
         }
-        .await;
-        crate::server::qmux::stream_closed(permit);
-        result
-    }
 
     /// admin::handle 返回 `Response<BoxBody>`（h1 体类型）；h3 分支收齐为 `Response<Bytes>`。
     async fn collect_to_bytes(resp: Response<BoxBody>) -> Response<Bytes> {
@@ -688,8 +702,187 @@ use chunked uploads (Content-Range) or HTTP/1.1 for larger bodies\n",
         Response::from_parts(parts, data)
     }
 
+    /// h3 请求体的「装箱」类型：既能装已收齐的 `Bytes`，也能装**流式**的 QUIC recv 半边。
+    /// 错误类型擦除成 `Box<dyn Error + Send + Sync>`，两种形态共用同一个请求类型
+    ///（与 h2 的 `H2Body` 同构，见 h2.rs）。
+    pub type H3Body =
+        http_body_util::combinators::BoxBody<Bytes, Box<dyn std::error::Error + Send + Sync>>;
+
+    /// 把已收齐的 `Bytes` 装成 [`H3Body`]。
+    fn h3_bytes_body(b: Bytes) -> H3Body {
+        Full::new(b)
+            .map_err(|e: std::convert::Infallible| -> Box<dyn std::error::Error + Send + Sync> {
+                match e {}
+            })
+            .boxed()
+    }
+
+    /// h3 的纯文本响应（响应体类型是 `Bytes`）。
+    fn h3_plain(status: StatusCode, msg: &str) -> Response<Bytes> {
+        Response::builder()
+            .status(status)
+            .header(http::header::CONTENT_TYPE, "text/plain; charset=utf-8")
+            .body(Bytes::from(msg.to_string()))
+            .unwrap()
+    }
+
+    /// 收齐请求体（≤ `cap`）→ `Request<Bytes>`；超限/读错直接给出响应。
+    ///
+    /// 只有上传分支**不**走这里（那里的 body 要流式写盘，见 [`h3_body_from_recv`]）；
+    /// 其余分支（admin / apps / proxy / DoH）的接口都是 `Bytes` 形态。
+    async fn h3_collect_bytes(
+        req: Request<H3Body>,
+        cap: usize,
+    ) -> Result<Request<Bytes>, Response<Bytes>> {
+        let (parts, mut body) = req.into_parts();
+        let mut buf: Vec<u8> = Vec::new();
+        loop {
+            let frame = match body.frame().await {
+                Some(Ok(f)) => f,
+                Some(Err(e)) => {
+                    log::debug!("h3 body read: {e}");
+                    return Err(h3_plain(StatusCode::BAD_REQUEST, "request body read failed"));
+                }
+                None => break,
+            };
+            let Some(data) = frame.data_ref() else { continue };
+            if buf.len() + data.len() > cap {
+                return Err(h3_plain(
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                    "request body too large: h2/h3 single-request limit is 8MiB; \
+use chunked uploads (Content-Range) or HTTP/1.1 for larger bodies",
+                ));
+            }
+            buf.extend_from_slice(data);
+        }
+        Ok(Request::from_parts(parts, Bytes::from(buf)))
+    }
+
+    /// 流式请求体的 body 适配：后台任务循环 `recv_data()` → mpsc（容量 2 帧，天然背压）
+    /// → body 侧 poll 通道。
+    ///
+    /// 与 h2 的 `H2RecvBody` 有两点不同，都是有意的：
+    /// * **不需要手工归还流控**：h3-quinn 在 `recv_data()` 消费时自己归还，手工再调会 double-release；
+    /// * h3 的 `RecvStream` 只有 async API（没有 poll 版），所以用后台任务 + 通道，
+    ///   而不是像 h2 那样直接实现 `poll_data`。
+    /// 任务结束（EOF/出错/超时/接收端丢弃）会 drop recv 半边 ⇒ quinn 发 STOP_SENDING，
+    /// 不会把流吊住。
+    fn h3_body_from_recv<R>(mut recv: ::h3::server::RequestStream<R, Bytes>) -> H3Body
+    where
+        // `Send + 'static` 是 tokio::spawn 的要求（泵任务要能在别的线程上跑、且不借用外部）：
+        // h3-quinn 的 RecvStream 持有连接的 Arc，因此满足 ✓
+        R: ::h3::quic::RecvStream + Send + 'static,
+    {
+        let (tx, rx) = tokio::sync::mpsc::channel::<Bytes>(2);
+        tokio::spawn(async move {
+            loop {
+                match tokio::time::timeout(
+                    std::time::Duration::from_secs(H3_BODY_IDLE_TIMEOUT_SECS),
+                    recv.recv_data(),
+                )
+                .await
+                {
+                    Ok(Ok(Some(mut buf))) => {
+                        let b = buf.copy_to_bytes(buf.remaining());
+                        if b.is_empty() {
+                            continue;
+                        }
+                        if tx.send(b).await.is_err() {
+                            return; // 接收端已丢弃（客户端断开或分支提前返回）
+                        }
+                    }
+                    Ok(Ok(None)) => return,
+                    Ok(Err(e)) => {
+                        log::debug!("h3 body task recv_data: {e:#}");
+                        return;
+                    }
+                    Err(_) => {
+                        log::warn!("h3 body task idle timeout");
+                        return;
+                    }
+                }
+            }
+        });
+        // `Receiver` 是 Send 但**不是** Sync，而 BoxBody 要求 Send + Sync ⇒ 包一把锁
+        //（临界区里不 await，只是 poll 通道，不会阻塞）。
+        H3Body::new(H3RecvChan {
+            rx: parking_lot::Mutex::new(rx),
+        })
+    }
+
+    /// [`h3_body_from_recv`] 的 body 侧：把通道里的块当 DATA 帧交给消费方。
+    struct H3RecvChan {
+        rx: parking_lot::Mutex<tokio::sync::mpsc::Receiver<Bytes>>,
+    }
+
+    impl hyper::body::Body for H3RecvChan {
+        type Data = Bytes;
+        type Error = Box<dyn std::error::Error + Send + Sync>;
+
+        fn poll_frame(
+            self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Option<Result<hyper::body::Frame<Bytes>, Self::Error>>> {
+            match self.get_mut().rx.lock().poll_recv(cx) {
+                std::task::Poll::Ready(Some(b)) => {
+                    std::task::Poll::Ready(Some(Ok(hyper::body::Frame::data(b))))
+                }
+                std::task::Poll::Ready(None) => std::task::Poll::Ready(None),
+                std::task::Poll::Pending => std::task::Poll::Pending,
+            }
+        }
+    }
+
+    /// [`h3_collect_stream`] 的失败原因：`Overflow` 需要**调用方**回 413
+    ///（recv 半边发不了响应），其余情况直接断开即可（drop 会发 STOP_SENDING/RESET）。
+    enum H3BodyErr {
+        Overflow,
+        Other,
+    }
+
+    /// 收齐 h3 请求体（≤ `REQUEST_BODY_CAP`）。
+    /// 空闲超时与 h2 同语义：只卡「读不到新字节」，不限制整个请求的总时长。
+    async fn h3_collect_stream<R>(
+        recv: &mut ::h3::server::RequestStream<R, Bytes>,
+        peer: SocketAddr,
+    ) -> Result<Bytes, H3BodyErr>
+    where
+        R: ::h3::quic::RecvStream,
+    {
+        let mut body: Vec<u8> = Vec::new();
+        loop {
+            let next = match tokio::time::timeout(
+                std::time::Duration::from_secs(H3_BODY_IDLE_TIMEOUT_SECS),
+                recv.recv_data(),
+            )
+            .await
+            {
+                Ok(n) => n,
+                Err(_) => {
+                    log::warn!("h3 body idle timeout peer={peer}");
+                    return Err(H3BodyErr::Other);
+                }
+            };
+            match next {
+                Ok(Some(mut buf)) => {
+                    if body.len() + buf.remaining() > REQUEST_BODY_CAP {
+                        return Err(H3BodyErr::Overflow);
+                    }
+                    let chunk = buf.copy_to_bytes(buf.remaining());
+                    body.extend_from_slice(&chunk);
+                }
+                Ok(None) => break,
+                Err(e) => {
+                    log::debug!("h3 recv_data peer={peer}: {e}");
+                    return Err(H3BodyErr::Other);
+                }
+            }
+        }
+        Ok(Bytes::from(body))
+    }
+
     async fn handle_h3(
-        req: Request<Bytes>,
+        req: Request<H3Body>,
         live: Arc<LiveConfig>,
         lc: ListenerConfig,
         peer: SocketAddr,
@@ -752,19 +945,38 @@ use chunked uploads (Content-Range) or HTTP/1.1 for larger bodies\n",
         {
             let dns_eff = crate::server::dns::effective(&snap);
             if dns_eff.enabled && dns_eff.doh.enabled {
-                let (method, uri, headers) =
-                    (req.method().clone(), req.uri().clone(), req.headers().clone());
-                if let Some(resp) = crate::server::dns::dot_doh::doh_prepared(
+                // 只有「确实是 DoH 请求」才收 body —— 否则会给普通上传白白套上 8MiB 上限
+                //（判定条件与 doh_prepared 的前几个早退分支一致）。
+                let host = req.headers().get(http::header::HOST).cloned();
+                if crate::server::dns::dot_doh::is_doh_request(
                     &dns_eff,
-                    &method,
-                    &uri,
-                    &headers,
-                    req.body().clone(),
-                    peer,
-                )
-                .await
-                {
-                    return tag(collect_to_bytes(resp).await, "dns-doh");
+                    req.uri().path(),
+                    host.as_ref(),
+                ) {
+                    let collected = match h3_collect_bytes(req, REQUEST_BODY_CAP).await {
+                        Ok(r) => r,
+                        Err(resp) => return tag(resp, "dns-doh"),
+                    };
+                    let (parts, body) = collected.into_parts();
+                    let (method, uri, headers) = (
+                        parts.method.clone(),
+                        parts.uri.clone(),
+                        parts.headers.clone(),
+                    );
+                    let body_for_rest = body.clone();
+                    if let Some(resp) = crate::server::dns::dot_doh::doh_prepared(
+                        &dns_eff,
+                        &method,
+                        &uri,
+                        &headers,
+                        body,
+                        peer,
+                    )
+                    .await
+                    {
+                        return tag(collect_to_bytes(resp).await, "dns-doh");
+                    }
+                    req = Request::from_parts(parts, h3_bytes_body(body_for_rest));
                 }
             }
         }
@@ -833,6 +1045,11 @@ use chunked uploads (Content-Range) or HTTP/1.1 for larger bodies\n",
     // P1-4：admin 走与 h1/h2 一致的完整 handle（旧实现只回 UI shell）。
         // 注：旧实现把 admin 放在 ip_access 之前，这里一并修正为规格顺序。
         if path.starts_with(&snap.admin.path) {
+            // admin::handle 是 h1 体类型（Bytes）的接口：先收齐（≤8MiB）。
+            let req = match h3_collect_bytes(req, REQUEST_BODY_CAP).await {
+                Ok(r) => r,
+                Err(resp) => return tag(resp, "admin"),
+            };
             let resp = crate::server::admin::handle(req.map(Full::new), live).await;
             // 兜底记账（与 h1/h2 同语义）：鉴权与失败退避已在 admin_gate 里完成，
             // 这里只在「过了门却仍回 401」（两次校验之间配置被热重载）时补记一次。
@@ -876,6 +1093,11 @@ use chunked uploads (Content-Range) or HTTP/1.1 for larger bodies\n",
         let path = req.uri().path().to_string();
         // P1-5：h1 的 pass_upstream（page rule pass 动作）在 h3 同样生效。
         if let Some((murl, upstream)) = crate::server::page_rules::pass_upstream(&lc, &path) {
+            // proxy_page_rule 需要 h1 体类型（Bytes）：先收齐（≤8MiB）。
+            let req = match h3_collect_bytes(req, REQUEST_BODY_CAP).await {
+                Ok(r) => r,
+                Err(resp) => return tag(resp, "proxy"),
+            };
             let resp = crate::server::proxy::proxy_page_rule(
                 req.map(Full::new),
                 &murl,
@@ -900,16 +1122,34 @@ use chunked uploads (Content-Range) or HTTP/1.1 for larger bodies\n",
     }
 
     async fn h3_tail(
-        req: Request<Bytes>,
+        req: Request<H3Body>,
         live: Arc<LiveConfig>,
         lc: ListenerConfig,
         peer: SocketAddr,
         path: &str,
     ) -> Response<Bytes> {
-        // 分发顺序必须与 h1 一致（规格 §4：apps 优先于 proxy）。
-        // 此前这里是 proxy 在前、apps 在后，注释还写着「与 h1 dispatch_tail 对齐」——
-        // 恰好相反：同一条 URL 在 h1 交给应用引擎、在 h3 被反代走，行为随协议而变。
-        // Apps via try_handle_simple only when path/ext matches a listener app route.
+        // 分发顺序必须与 h1 一致（规格 §4：apps 优先于 proxy），上传排在 apps/proxy **之后**、
+        // 静态**之前**（与 h1/h2 相同）。这里的 `upload_like` 只是「apps/proxy 都不会接管这条 URL」
+        // 的等价判定（与两个执行分支用的是同一组谓词），用来决定**要不要把 body 保持流式** ——
+        // 顺序本身仍由下面各分支的先后保证。
+        let upload_like = matches!(
+            *req.method(),
+            http::Method::PUT | http::Method::PATCH | http::Method::POST
+        ) && !apps::would_handle(&lc, path)
+            && !would_proxy(&lc, path)
+            && crate::server::upload_api::enabled_for(&lc, path);
+        if upload_like {
+            // 流式上传：body 不进内存，逐帧落盘（上限 2GiB，见 upload_resume::MAX_UPLOAD_BYTES）。
+            return tag(
+                crate::server::upload_api::handle_stream(req, &lc, peer).await,
+                "upload",
+            );
+        }
+        // 其余分支都要 Bytes 形态（引擎 FFI、代理上游、静态层都按 Bytes 传参）。
+        let req = match h3_collect_bytes(req, REQUEST_BODY_CAP).await {
+            Ok(r) => r,
+            Err(resp) => return tag(resp, "static"),
+        };
         if apps::would_handle(&lc, path) {
             if let Some(resp) = apps::try_handle_simple(&req, &live, &lc, peer).await {
                 return tag(resp, "app");
@@ -929,8 +1169,8 @@ use chunked uploads (Content-Range) or HTTP/1.1 for larger bodies\n",
                 "proxy",
             );
         }
-        // §44 上传：与 h1/h2 同一位置（ACL/限速/basic_auth/apps/proxy 之后、静态之前）。
-        // 请求体已在 handle_incoming 里收齐为 Bytes，走 upload_api::handle_bytes 薄适配。
+        // §44 上传：走到这里说明 body 已被收齐（上面 apps/proxy 需要 Bytes），
+        // 用 `handle_bytes` 适配（`*/` 或改写路径导致预判没命中时也会落到这里）。
         if matches!(
             *req.method(),
             http::Method::PUT | http::Method::PATCH | http::Method::POST

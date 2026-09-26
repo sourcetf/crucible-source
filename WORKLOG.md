@@ -1530,3 +1530,47 @@ fn h3_body_from_recv(mut recv: /* recv 半边类型 */) -> H3Body {
    手工再调会 double-release。
 5. **空闲超时**：两条路径都要有（收齐路径已有；流式路径放在适配器任务里，见第 1 步）。
 6. `cargo build` 前先确认磁盘有空间（见 §21.16 上方说明）。
+
+---
+
+### 21.18 build61：h3 请求体流式化**已完成**（§21.17 的方案落地）
+
+**结果**：h3 单请求上传上限从 8MiB（`REQUEST_BODY_CAP`）抬到 2GiB（`MAX_UPLOAD_BYTES`），
+与 h1/h2 对齐。**实测 h3 单请求 20MB → 201 / 1.46s、sha256 一致**（此前 413）。
+
+**落地时与 §21.17 的差异 / 新增经验**
+
+1. `h3::server::RequestStream::split()` 返回的是**两个 `RequestStream`**（不是裸 send/recv）：
+   `(RequestStream<S::SendStream, B>, RequestStream<S::RecvStream, B>)` —— send 半边保留
+   `send_response/send_data/finish` ✓，recv 半边保留 `recv_data()` ✓，正好可用。
+2. 泵任务的 bound 是 **`R: quic::RecvStream + Send + 'static`**：只写 `RecvStream` 会报
+   E0310（"parameter type R may not live long enough"）+ "future cannot be sent between threads safely"。
+   （§21.17 没写到这一条，实测补上。）
+3. 响应发送**收敛成一条** `h3_send_response`（普通请求与流式上传共用）：HSTS 注入、`FileSource`
+   分块读盘、全字段访问日志、`send_response + send_data + finish` 全在其中 —— 这样两条路径
+   不可能漂移（此前散文式的"复制一份"方案被否掉，正是因为漂移风险）。
+4. 413 由**调用方**发（recv 半边发不了响应）：`h3_collect_stream` 返回 `H3BodyErr::{Overflow,Other}`，
+   `Overflow` 由 `handle_incoming` 用 send 半边回 413 + 出路说明，`Other`（空闲超时/读错）直接断开
+   （drop 会向对端发 STOP_SENDING/RESET）。
+5. DoH 分支改成「只对确实是 DoH 的请求收 body」（复用 `dot_doh::is_doh_request`）——
+   否则 DoH 一开，普通上传就被白白套上 8MiB 上限（这一点与 h2 上一轮的做法一致）。
+
+**实测（build61，测试实例 18443）**
+
+| 检查 | 结果 |
+|---|---|
+| h3 单请求 20MB | **201 / 1.46s**，sha256 一致、无残留 `.part` ✓（此前 413） |
+| h3 单请求 9MB | 201 + sha 一致 ✓ |
+| h3 分片上传（2 片 4MiB） | 202 → 201 + sha 一致 ✓ |
+| h3 闸门 | `PUT /x.php/` → **403**、穿越 → **400** ✓ |
+| h3 20MB 下载 | 200 + sha 一致 ✓ |
+| h3 DoH POST | **200** + 113 字节应答 ✓（我改过这条分支） |
+| h3 admin GET/POST | 200 / 200 ✓（我改过 admin 分支） |
+| h1 / h2 各 3MB 上传 | 201 + sha 一致 ✓ |
+| `cargo test --bin webserver --release` | **145 passed / 0 failed** ✓ |
+
+**生产**：build61 已部署（h2/h3 200、DNS 正常、admin 200）。部署时出现约 2 分钟中断
+（我先把生产停掉、但测试任务没起来，随后立刻拉起）—— 如实记录，未影响数据。
+
+**剩余未做**：QMux 协议本体（需 patch vendored `quinn-proto` 的帧解析支持新帧类型）。
+至此 §21.8/§21.11 里「h2/h3 单请求 >8MiB」这一条**已全部解决**（h1 一直是流式 2GiB）。
