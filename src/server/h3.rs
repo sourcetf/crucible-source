@@ -404,7 +404,28 @@ mod imp {
                     }
                 }
             }
-            return proxy_connect_udp(&req, stream, &live, peer).await;
+            // QMux 流预算：**CONNECT-UDP 也必须计入**。此前预算是在这个分支 return 之后才取的，
+            // 于是隧道完全绕过闸门：单条连接 256 个隧道（QUIC_MAX_BIDI_STREAMS）= 256 个 UDP fd
+            // + 256 个任务，而连接数无上限。守卫是 RAII 的 —— 隧道存活期间一直持有名额，
+            // 下面所有 `return Ok(())` 的早退分支也都不会漏账。
+            let permit = match crate::server::qmux::stream_opened(&qmux) {
+                Ok(p) => p,
+                Err(rej) => {
+                    log::warn!(
+                        "h3 qmux budget peer={peer}: {rej} (process-wide {})",
+                        crate::server::qmux::QMUX_BUDGET.stats_line()
+                    );
+                    let resp = Response::builder()
+                        .status(StatusCode::SERVICE_UNAVAILABLE)
+                        .body(())
+                        .unwrap();
+                    let _ = stream.send_response(resp).await;
+                    return Ok(());
+                }
+            };
+            let r = proxy_connect_udp(&req, stream, &live, peer).await;
+            drop(permit);
+            return r;
         }
 
         // QMux 流预算：超限如实回 503，而不是把这次请求算成「已服务」。

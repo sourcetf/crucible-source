@@ -454,6 +454,14 @@ fn resolve_path(root: &Path, url_path: &str) -> Result<PathBuf> {
     if decoded.split(['/','\\']).any(|seg| seg == "..") {
         bail!("path escape");
     }
+    // 上传临时文件**不得下载**：`.{目标名}.upload.part` 与目标名一一对应且可猜，
+    // 否则任何客户端都能轮询 `GET /.secret.pdf.upload.part` 读走别人正在上传
+    //（或已中断）的内容 —— 而那正是最可能含敏感数据的一份。
+    if let Some(name) = decoded.rsplit('/').next() {
+        if name.starts_with('.') && name.ends_with(".upload.part") {
+            bail!("upload temp file is not served");
+        }
+    }
     let joined = root.join(&decoded);
     let canon_root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
     // P2-1：symlink 经 canonicalize 解析后强制 containment——指向 root 外的符号链接

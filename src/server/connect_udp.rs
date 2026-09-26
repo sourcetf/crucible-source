@@ -168,9 +168,21 @@ pub fn is_disallowed_ip(ip: &IpAddr) -> bool {
                 || v.is_multicast()
                 || v.is_unique_local()
                 || v.is_unicast_link_local()
+                || is_site_local(*v)
                 || is_teredo_or_nat64_local(*v)
         }
     }
+}
+
+/// `fec0::/10`（RFC 3879 已弃用的 site-local）。
+///
+/// 为什么必须单独判：`is_unique_local()` 只覆盖 `fc00::/7`、`is_unicast_link_local()`
+/// 只覆盖 `fe80::/10`，于是 `fec0::/10` 既不算 loopback/ULA/link-local，会被当成
+/// 「公网单播」放行 —— 与 v4 侧拒绝 `10/8`、`192.168/16` 的口径不一致，
+/// 等于给「用 CONNECT-UDP 打内网」留了一条 v6 通道（部分环境仍按 site-local 路由）。
+fn is_site_local(v: std::net::Ipv6Addr) -> bool {
+    let o = v.octets();
+    o[0] == 0xfe && (o[1] & 0xc0) == 0xc0
 }
 
 /// 过渡前缀里嵌的 IPv4。折回后就能套用全部 v4 规则（含 `|| is_cgnat(...)`）。

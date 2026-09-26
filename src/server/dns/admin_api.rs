@@ -115,6 +115,18 @@ async fn handle_inner(
                             return Err(format!("bad zone name {name:?}"));
                         }
                         let recs = parse_zone_text(text, &name)?;
+                        // 落库前把 add_record 的守卫（rdata 单行/长度上限）在**解析阶段**
+                        // 全量跑一遍：mode=replace 会先清空本分区，若写到一半才失败，
+                        // 旧记录已经没了、新记录只落一半 —— 与「不落半截数据」的承诺相悖。
+                        for r in &recs {
+                            if r.rdata.is_empty()
+                                || r.rdata.len() > 4096
+                                || r.rdata.contains('\n')
+                                || r.rdata.contains('\r')
+                            {
+                                return Err(format!("记录 {} {} 的值不合法（单行且 ≤4096 字节）", r.name, r.rtype));
+                            }
+                        }
                         if mode == "replace" {
                             del_zone_records(&name).map_err(|e| e.to_string())?;
                         }
@@ -159,6 +171,15 @@ async fn handle_inner(
                         let ttl = v["ttl"].as_u64().unwrap_or(3600) as u32;
                         let rdata = v["rdata"].as_str().ok_or("rdata?")?;
                         let line = v["line"].as_str().unwrap_or("");
+                        // 线路名的记录只会落进 `line == 线路名` 的那个 view 的 zone 文件
+                        // （write_all 按 line 过滤）。线路名写错/线路被删/geo 关掉时，
+                        // 记录照样入库、面板照样显示「成功」，但没有任何 view 加载它
+                        // —— 与从区只读守卫同一类假成功，这里直接拒绝。
+                        if !line.is_empty() && !dc.geo.lines.iter().any(|l| l.name == line) {
+                            return Err(format!(
+                                "线路 {line:?} 不存在（geo.lines），该记录不会被任何 view 加载"
+                            ));
+                        }
                         add_record(zone, line, name, rtype, ttl, rdata)
                             .map_err(|e| e.to_string())?;
                     }
@@ -670,32 +691,37 @@ fn parse_ttl(tok: &str) -> Option<u32> {
 }
 
 /// 按空白切词，但引号内的空白算作同一个词；返回字节区间，便于原样取回 rdata。
+/// 把一行 zone 文本切成 token 的**字节区间**。
+///
+/// 必须按 `char_indices` 走：旧实现用 `b[i] as char` 把 UTF-8 字节当 Latin-1 码位，
+/// 而 `U+0085`(NEL)/`U+00A0`(NBSP) 这类多字节字符的 `.is_whitespace()` 为真 ——
+/// 于是 token 的 end 可能落在多字节字符**中间**，调用方 `&logical[start..end]`
+/// 立刻 panic（"byte index N is not a char boundary"）。
+/// 触发条件只需要文本里有一个 NBSP（从浏览器/Word 复制 zone 文件极常见），
+/// 或者从区（AXFR）内容里含这种字节 —— 面板导入与「读从区文件」走的是同一个解析器。
 fn zone_tokens(s: &str) -> Vec<(usize, usize)> {
-    let b = s.as_bytes();
     let mut out = Vec::new();
-    let mut i = 0usize;
-    while i < b.len() {
-        while i < b.len() && (b[i] as char).is_whitespace() {
-            i += 1;
-        }
-        if i >= b.len() {
-            break;
-        }
-        let start = i;
-        let mut inq = false;
-        while i < b.len() {
-            let c = b[i] as char;
-            if c == '"' {
-                inq = !inq;
-                i += 1;
+    let mut start: Option<usize> = None;
+    let mut inq = false;
+    for (i, c) in s.char_indices() {
+        if start.is_none() {
+            if c.is_whitespace() {
                 continue;
             }
-            if !inq && c.is_whitespace() {
-                break;
-            }
-            i += 1;
+            start = Some(i);
         }
-        out.push((start, i));
+        if c == '"' {
+            inq = !inq;
+            continue;
+        }
+        if !inq && c.is_whitespace() {
+            if let Some(st) = start.take() {
+                out.push((st, i));
+            }
+        }
+    }
+    if let Some(st) = start {
+        out.push((st, s.len()));
     }
     out
 }
