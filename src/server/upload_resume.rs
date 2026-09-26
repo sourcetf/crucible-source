@@ -281,14 +281,17 @@ mod tests {
     #[test]
     fn oversize_and_missing_session_rejected() {
         let target = std::path::PathBuf::from("/nonexistent/x.bin");
-        assert_eq!(
-            session_for(&target, 0, Some(MAX_UPLOAD_BYTES + 1)),
-            Err(UploadErr::TooLarge)
-        );
-        assert_eq!(
-            session_for(&target, 10, None),
-            Err(UploadErr::OffsetMismatch(0)),
-            "没有会话却要从中间续 → 应告诉它从 0 开始"
-        );
+        // 不要在 `Result<Arc<Session>, _>` 上做 == ：Session 含 Mutex/Atomic 字段，
+        // 既不可能（也不该）为它实现 PartialEq —— 断言错误**变体**即可
+        //（此前这两条 assert_eq! 让整个测试目标编译不过，cargo test 形同虚设）。
+        match session_for(&target, 0, Some(MAX_UPLOAD_BYTES + 1)) {
+            Err(UploadErr::TooLarge) => {}
+            other => panic!("超限应回 TooLarge，实际 {:?}", other.err()),
+        }
+        match session_for(&target, 10, None) {
+            // 没有会话却要从中间续 → 应告诉它从 0 开始
+            Err(UploadErr::OffsetMismatch(0)) => {}
+            other => panic!("应从 0 重来，实际 {:?}", other.err()),
+        }
     }
 }

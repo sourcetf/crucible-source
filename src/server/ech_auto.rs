@@ -520,9 +520,13 @@ mod tests {
 
     #[test]
     fn roundtrip_parse() {
+        // 只用 BoringSSL 真正接受的组合（HKDF-SHA256）：其它 KDF 会让它**拒绝整个
+        // ECHConfig**，因此 from_config/parse_suites 会直接报错。这条用例此前写的是
+        // HKDF-SHA384/AES-256-GCM —— 属「测试写早了、代码后来收紧」的陈旧用例；
+        // 在修好之前，整个测试目标连编译都过不去（cargo test 形同虚设）。
         let spec = EchSpec::from_config(
             Some("v.example.com"),
-            Some("HKDF-SHA384/AES-256-GCM"),
+            Some("HKDF-SHA256/AES-128-GCM"),
             Some(64),
         )
         .unwrap();
@@ -530,7 +534,7 @@ mod tests {
         let (name, mlen, suites) = parse_config(&mat.config).unwrap();
         assert_eq!(name, "v.example.com");
         assert_eq!(mlen, 64);
-        assert_eq!(suites, vec![(KDF_HKDF_SHA384, AEAD_AES_256_GCM)]);
+        assert_eq!(suites, vec![(KDF_HKDF_SHA256, AEAD_AES_128_GCM)]);
         assert_eq!(mat.key.len(), 32);
         // config_list = 2 字节长度 + config
         assert_eq!(mat.config_list.len(), mat.config.len() + 2);
