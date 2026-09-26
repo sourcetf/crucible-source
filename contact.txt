@@ -636,3 +636,31 @@ h2 3MB 上传 201 + sha 一致；h2 PUT/POST 3MB 不再挂住（405/56ms）。
   我们的面板 UI 就是分片发的，所以正常路径不受影响；只有「单请求 >8MiB 的裸 PUT」会被 413
   （文案已说明出路）。要彻底解掉需要把 `handle_h2` 的闸门/分发拆开（设计写在 WORKLOG §21.8）。
 * QMux 协议本体：`src/server/qmux.rs` 目前是「真在生效的流预算 + 诚实说明」，协议本体未实现。
+
+[工号 1008 / 2026-09-26 收尾] 审计全部落地（build45→build59，生产已切 build59）
+
+**本轮+上轮改动的文件（请勿与我并行编辑）**
+`src/server/h2.rs`、`h3.rs`、`h1.rs`、`static_files.rs`、`upload_api.rs`、`upload_resume.rs`、
+`dns/mod.rs`、`dns/dot_doh.rs`、`dns/admin_api.rs`、`connect_udp.rs`、`server/mod.rs`、
+`Cargo.toml`(+lock)、`config-test.toml`、`WORKLOG.md`
+
+**审计 12 条已全部落地并实测**（详见 WORKLOG §21.12–§21.15）
+DoT 准入（ACL/限速/并发上限）、上传 P0 闸门绕过、上传会话回收、完成判定三态、`enabled_for` 边界、
+h3 头部上限与请求体空闲超时、CONNECT-UDP 计入 QMux 预算、`fec0::/10` 准入、
+zone 导入 NBSP panic、RPZ/answers SOA serial 单调性、RPZ value 类型校验、`.part` 不可下载且不进列表。
+
+**功能补齐**：h2 上传流式（单请求 20MB 从 413 变 201）、条件请求、>16MiB 大文件流式（三协议）、
+ECH 进 DNS 应答、h3/QUIC 显式限额。
+
+**未做（方法与改动点见 WORKLOG §21.11 / §21.8）**
+1. h3 请求体流式化：`RequestStream::split()` + recv 半边包成 `http_body::Body`。当前 h3 单请求 8MiB
+   （h2 无此限、h1 是 2GiB），**分片上传在三个协议上都实测可用**，面板 UI 走分片。
+2. QMux 协议本体：需 patch vendored `quinn-proto` 的帧解析以支持新帧类型。
+
+**运维须知（我改过的默认语义）**
+* DoT：白名单解析顺序 `[dns.dot] allow` → `[dns] recursion_acl` → 都空则仅回环；
+  默认 20/s/IP 限速 + 128 并发连接。生产目前是显式 `recursion_acl = 0.0.0.0/0`（公开递归），
+  要收紧就写 `[dns.dot] allow`。
+* 上传：同名并发从 0 重传需静默 30s（`RESET_IDLE_GRACE`），否则 409 + X-Upload-Offset。
+* ECH：DNS 侧发布需在 `[dns]` 加 `[[dns.https_rr]]`（示例只在 config-test.toml）。
+* 生产验证用的一次性文件都已清理；测试实例跑在 18443 / DNS 5353（明文）/DoT 11853。
