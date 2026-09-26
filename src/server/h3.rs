@@ -91,6 +91,12 @@ mod imp {
     pub const QUIC_MAX_UNI_STREAMS: u32 = 256;
     /// 空闲超时秒数。RFC 9308 §3.2 要求不低于 30s；60s 兼顾移动端抖动与资源回收。
     pub const QUIC_MAX_IDLE_SECS: u64 = 60;
+    /// 头部区（HPACK/QPACK 解码之后）字节上限：与 h2 的 `H2_MAX_HEADER_LIST_SIZE` 对齐。
+    /// 必须显式设 —— h3 默认无上限，且校验发生在「收齐整个帧之后」。
+    pub const H3_MAX_FIELD_SECTION: usize = 64 * 1024;
+    /// 请求体读取的**空闲**超时（两次 `recv_data` 之间）；语义与 h2 的
+    /// `H2_BODY_IDLE_TIMEOUT` 一致：只卡「读不到新字节」，不限制整个请求的总时长。
+    pub const H3_BODY_IDLE_TIMEOUT_SECS: u64 = 60;
     /// 单流接收窗口（1MiB）：与 h2 的 `H2_INITIAL_WINDOW_SIZE` 对齐。
     pub const QUIC_STREAM_WINDOW: u32 = 1024 * 1024;
     /// 连接级接收窗口（8MiB）：**这一条是单连接的接收缓冲上界**，也是与 quinn 默认值
@@ -206,6 +212,12 @@ mod imp {
         // 守规矩的客户端根本不会发 `:protocol: connect-udp`。
         let mut h3_builder = ::h3::server::builder();
         h3_builder.enable_extended_connect(true);
+        // 头部区上限：**必须显式设**。h3 0.0.8 的默认是 `VarInt::MAX`（≈2^62），
+        // 而它是在**收齐整个帧之后**才做 QPACK 解码与长度校验的 —— 也就是说
+        // 一个声明「HEADERS 帧长 4GiB」再慢慢发的客户端，能让我们按发送速率 1:1 吃内存，
+        // 直到分配失败（Rust 分配失败是 abort 进程，不是可恢复错误）。
+        // 64KiB 与 h2 的 `H2_MAX_HEADER_LIST_SIZE` 对齐，正常请求足够宽裕。
+        h3_builder.max_field_section_size(H3_MAX_FIELD_SECTION as u64);
         let mut server = match h3_builder.build(h3_conn).await {
             Ok(s) => s,
             Err(e) => {
@@ -491,7 +503,23 @@ mod imp {
             let mut body: Vec<u8> = Vec::new();
             let mut overflow = false;
             loop {
-                match stream.recv_data().await {
+                // 空闲超时（与 h2 同语义）：**必须**有——否则「发完 HEADERS 就不发 FIN、
+                // 也不再发数据」的客户端会让这个任务永远挂在 recv_data 上，
+                // 约 50 字节流量换 1 个任务 + 1 个流 + 1 个 QMux 名额，零成本。
+                let next = match tokio::time::timeout(
+                    std::time::Duration::from_secs(H3_BODY_IDLE_TIMEOUT_SECS),
+                    stream.recv_data(),
+                )
+                .await
+                {
+                    Ok(n) => n,
+                    Err(_) => {
+                        log::warn!("h3 body idle timeout peer={peer}");
+                        // 直接结束：流被 drop 时会向对端发 STOP_SENDING/RESET
+                        return Ok(());
+                    }
+                };
+                match next {
                     Ok(Some(mut buf)) => {
                         if body.len() + buf.remaining() > REQUEST_BODY_CAP {
                             overflow = true;

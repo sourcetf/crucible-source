@@ -69,6 +69,14 @@ pub async fn run(live: Arc<LiveConfig>) -> Result<()> {
         loop {
             tokio::time::sleep(std::time::Duration::from_secs(300)).await;
             crate::server::rate_limit::cleanup(std::time::Duration::from_secs(600));
+            // 上传会话回收：**这个调用此前从没被任何地方调用过** ——
+            // 会话只能在 commit/abort 里被删，而客户端断连/读 body 出错/超限这些路径
+            // 既不 commit 也不 abort，于是 256 个被弃会话之后所有「新文件名」上传恒回 503，
+            // 且每个会话都在 docroot 里留下永久的 `.part` 文件（磁盘无界增长）。
+            let swept = crate::server::upload_resume::sweep_expired();
+            if swept > 0 {
+                log::info!("upload: swept {swept} 个过期上传会话（连同 .part 文件）");
+            }
         }
     });
 

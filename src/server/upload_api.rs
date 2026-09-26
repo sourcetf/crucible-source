@@ -26,8 +26,18 @@ const EXEC_EXTS: &[&str] = &[
     "mjs", "cjs", "html", "htm", "xhtml", "svg", "xml", "xsl", "xslt",
 ];
 
+/// 扩展名闸门。
+///
+/// **必须取「最后一个非空、且不是 `.` 的段」**：落盘路径会经过 `safe_join` 的 Path 归一化，
+/// 而旧实现只看原始路径的最后一个段 —— 于是
+/// `PUT /up/shell.php/`、`/up/shell.php/.`、`/up/shell.php//` 都让 name 变成空串，
+/// 扩展名判成「没有」，闸门放行，而文件实际写到 `<root>/up/shell.php` ⇒ **webshell 落盘**
+/// （同一条路径随后由引擎执行）。这是审计报的 P0，实测可复现。
 fn has_exec_ext(path: &str) -> bool {
-    let name = path.rsplit('/').next().unwrap_or(path);
+    let name = path
+        .rsplit('/')
+        .find(|s| !s.is_empty() && *s != ".")
+        .unwrap_or("");
     match name.rsplit_once('.') {
         Some((_, ext)) => EXEC_EXTS.iter().any(|e| e.eq_ignore_ascii_case(ext)),
         None => false,
@@ -40,8 +50,14 @@ pub fn enabled_for(lc: &ListenerConfig, path: &str) -> bool {
     if !a.enabled || !a.enable_upload {
         return false;
     }
-    // paths 为空视为整站；否则任一路径前缀匹配即可（与 autoindex 的语义一致）。
-    a.paths.is_empty() || a.paths.iter().any(|p| path.starts_with(p.as_str()))
+    // paths 为空视为整站；否则必须**按路径边界**匹配 —— 与 `AutoindexConfig::allows` 同一套：
+    // 旧实现用裸 `starts_with`，配置 `paths = ["/up"]` 会把 `/uploads/...`、`/upfoo/...`
+    // 也算成上传目录，上传面比运营方以为的更宽。
+    a.paths.is_empty()
+        || a.paths.iter().any(|p| {
+            let p = p.trim_end_matches('/');
+            path == p || path.starts_with(&format!("{p}/"))
+        })
 }
 
 fn resp(status: StatusCode, msg: &str, offset: Option<u64>) -> Response<BoxBody> {
@@ -93,9 +109,17 @@ where
     };
 
     // Content-Range（可选）：`bytes <start>-<end>/<total|*>`；缺省 = 全量、start=0。
+    let mut wildcard_total = false;
     let (start, total) = match req.headers().get(header::CONTENT_RANGE) {
         Some(v) => match v.to_str().ok().and_then(upload_resume::parse_content_range) {
-            Some((s, _e, t)) => (s, t),
+            Some((s, _e, t)) => {
+                // `bytes N-M/*` = 总长未知：**不能**把首片当完整文件
+                wildcard_total = v
+                    .to_str()
+                    .map(|s| s.trim().ends_with("/*"))
+                    .unwrap_or(false);
+                (s, t)
+            }
             None => {
                 return resp(
                     StatusCode::BAD_REQUEST,
@@ -180,9 +204,32 @@ where
     if received > MAX_UPLOAD_BYTES {
         return resp(StatusCode::PAYLOAD_TOO_LARGE, "超过单文件上限", None);
     }
-    // total 未知（分块传输）= 读不到更多帧就是完成；total 已知则要收够。
-    if sess.complete() || sess.total.is_none() {
-        // 收齐 → 原子落盘（同目录 rename）
+    // 完成判定要分三种情况，别把「未知长度」压成一个：
+    //  ① `total = Some(n)` → 收够 n 才算完成（分片上传走 202 + X-Upload-Offset）；
+    //  ② 完全没有 Content-Range/Length（total=None 且非 `*/`）→ 读到 EOF 就是完整文件
+    //     （`curl -T` 的分块传输形态）；
+    //  ③ `Content-Range: bytes N-M/*` → 总长**未知**：服务端无法判断何时算完，
+    //     因此**永不在本请求里判完成**，一律 202 + X-Upload-Offset，客户端必须用
+    //     带具体 total 的请求（`bytes N-M/T` 或 Content-Length）收尾。
+    //     旧实现把 ③ 并进 ② → 首片就 201（静默截断 + 会话被 commit，后续分片 409，永远拼不回）。
+    // 用**本次请求**声明的 total 判定（不是会话里的那个：会话的 total 是首次创建时定的，
+    // 用 `*/` 开的会话 total 恒为 None，于是收尾片即使给了具体 total 也会被判成未完成 → 永久 202）。
+    let wildcard = wildcard_total || sess.is_wildcard_total();
+    if let Some(t) = total {
+        // 客户端一旦给出具体 total，就不再是「未知长度」会话了
+        sess.clear_wildcard_total();
+        if received >= t {
+            return match upload_resume::commit(&sess) {
+                Ok(()) => resp(StatusCode::CREATED, "uploaded", None),
+                Err(e) => {
+                    resp(StatusCode::INTERNAL_SERVER_ERROR, &format!("落盘失败: {e:?}"), None)
+                }
+            };
+        }
+    } else if wildcard {
+        sess.mark_wildcard_total();
+    } else {
+        // 没有 Content-Range/Length：读到 EOF 就是完整文件（`curl -T` 的分块传输形态）
         return match upload_resume::commit(&sess) {
             Ok(()) => resp(StatusCode::CREATED, "uploaded", None),
             Err(e) => resp(StatusCode::INTERNAL_SERVER_ERROR, &format!("落盘失败: {e:?}"), None),

@@ -48,6 +48,12 @@ pub struct Session {
     received: AtomicU64,
     /// 客户端声明的总长度（`Content-Range` 的 `*` → None）。
     pub total: Option<u64>,
+    /// 本次是否用了 `Content-Range: bytes N-M/*`（RFC 合法的「总长未知」写法）。
+    ///
+    /// 必须与「压根没有 Content-Range」区分开：后者读到 EOF 就是完整文件；
+    /// 而 `*/` 形式的第一片**不是**完整文件，当成完成会 ① 201 让客户端以为传完（文件被静默截断）
+    /// ② 会话被 commit 掉，后续分片只会收到 409 OffsetMismatch(0)，永远拼不回来。
+    pub wildcard_total: std::sync::atomic::AtomicBool,
     touched: Mutex<Instant>,
     /// 片写入串行化（4 片并发写同一文件时不能交错）。
     lock: Mutex<()>,
@@ -58,9 +64,23 @@ impl Session {
         self.received.load(Ordering::Relaxed)
     }
 
-    /// 是否已收齐（客户端没给 total 时无法判定）。
+    pub fn is_wildcard_total(&self) -> bool {
+        self.wildcard_total.load(Ordering::Relaxed)
+    }
+
+    pub fn mark_wildcard_total(&self) {
+        self.wildcard_total.store(true, Ordering::Relaxed);
+    }
+
+    /// 客户端给出具体 total 之后就不该再按「未知长度」对待（否则收尾片永远 202）。
+    pub fn clear_wildcard_total(&self) {
+        self.wildcard_total.store(false, Ordering::Relaxed);
+    }
+
+    /// 是否已收齐。`total = Some(0)`（空文件）也算完成 —— 旧实现带 `t > 0` 条件，
+    /// 于是 `Content-Length: 0` / `bytes 0-0/0` 永远回 202、目标文件永不生成。
     pub fn complete(&self) -> bool {
-        matches!(self.total, Some(t) if t > 0 && self.received() >= t)
+        matches!(self.total, Some(t) if self.received() >= t)
     }
 }
 
@@ -143,6 +163,7 @@ pub fn session_for(
         tmp,
         received: AtomicU64::new(0),
         total,
+        wildcard_total: std::sync::atomic::AtomicBool::new(false),
         touched: Mutex::new(Instant::now()),
         lock: Mutex::new(()),
     });

@@ -1252,6 +1252,70 @@ DoH 侧本来就排在 ip_access + 限速之后，DoT 侧却完全没有这道�
 两者都不写即「仅本机」。公开提供 DoT 时，限速与并发上限现在默认生效（20/s/IP、128 连接）。
 
 
+### 21.13 build53：审计报告落地（第 1 批）—— 上传闸门绕过(P0) + h3 头部/空闲 + 会话回收 + 完成判定
+
+三个只读审计 agent 的报告已到（h3/QUIC+QMux、DNS、请求体与流控）。本批修 4 条最要命的：
+
+**① [P0] 上传扩展名闸门可被「尾斜杠 / `/.` / 重复斜杠」绕过**（`upload_api::has_exec_ext`）
+旧实现只看原始路径的**最后一个段**：`PUT /up/shell.php/`（或 `/up/shell.php/.`、`/up/shell.php//`）
+让 name 变成空串 → 扩展名判成「没有」→ 闸门放行，而 `safe_join` 归一化后文件**真的写到**
+`<root>/up/shell.php` ⇒ **webshell 落盘**，随后由 PHP 引擎执行。
+修法：取「最后一个非空且不是 `.` 的段」再判扩展名。实测 `PUT /x.php/` → **403** ✓。
+
+**② [P1] h3 头部区无上限 + 请求体无空闲超时**（`h3.rs`）
+* `max_field_section_size` 从未设置 → h3 默认 `VarInt::MAX`(≈2^62)，而校验发生在**收齐整帧之后**：
+  声明「HEADERS 帧长 4GiB」再慢慢发就能按速率 1:1 吃内存，直到分配失败（Rust 分配失败 = abort）。
+  现在显式设 **64KiB**（与 h2 的 `H2_MAX_HEADER_LIST_SIZE` 对齐）。
+* 请求体读取无空闲超时 → 「发完 HEADERS 不发 FIN 也不再发数据」的客户端用约 50 字节流量
+  就能永久钉住一个任务 + 一个流 + 一个 QMux 名额。现在加 **60s 空闲超时**（与 h2 同语义）。
+
+**③ [P1] `sweep_expired()` 从未被调用 → 256 个被弃会话后所有新上传恒 503**（`server/mod.rs`）
+会话只能在 commit/abort 里被删，而客户端断连 / 读 body 出错 / 超限这些路径既不 commit 也不 abort
+⇒ 会话与 docroot 里的 `.part` 文件都**永久残留**（磁盘无界增长；256 之后新文件名一律 503）。
+现在 300s 维护循环里调用 `upload_resume::sweep_expired()` 并记日志。
+
+**④ [P1] 完成判定把「总长未知」压成一个**（`upload_api` + `upload_resume`）
+`Content-Range: bytes N-M/*`（RFC 合法写法）此前与「压根没有 Content-Range」共用 `total=None`
+⇒ 首片就被判完成：**201 告知客户端传完（文件被静默截断）**，且会话被 commit，
+后续分片只会收到 409 OffsetMismatch(0) —— 永远拼不回来。
+现在三态分明：① `Some(n)` → 收够才完成；② 无 Content-Range → EOF 即完整；
+③ `*/` → **永不在本请求里判完成**（一律 202 + X-Upload-Offset，客户端须用带具体 total 的请求收尾，
+这是 RFC 语义下唯一正确的读法）。
+顺带修掉 `complete()` 里的 `t > 0`：空文件（`Content-Length: 0` / `bytes 0-0/0`）此前永远 202、
+目标文件永不生成。
+
+**⑤（顺带）`enabled_for` 的前缀匹配补上路径边界**：配置 `paths = ["/up"]` 不再把
+`/uploads/...`、`/upfoo/...` 当成上传目录（与 `AutoindexConfig::allows` 同一套判定）。
+
+**实测**：见本节末（build53 部署后补）。
+
+**实测（build54，测试实例 18443 已开 enable_upload）**
+
+| 检查 | 结果 |
+|---|---|
+| P0 闸门：`PUT /x.php/`、`/x.php/.`、`/x.php//`、`/x.php` | **全部 403**，docroot 里**没有**落盘 ✓（修前 3 种绕过写法都会 201 并写出 webshell） |
+| `Content-Range: bytes 0-1023/*` 首片 | **202** ✓（不再 201 静默截断） |
+| 收尾片（`bytes 1024-2047/2048`） | **201**，拼装 sha256 一致 ✓ |
+| 空文件（`--data-binary ''`） | **201** + 0 字节落盘 ✓（修前永远 202） |
+| 常规 3MB 上传 h1 / h2 / h3 | **201 / 201 / 201**，三个协议 sha256 全一致 ✓ |
+| h3 100KB 头部 | **431**（被拒），随后正常请求仍 200 ✓ —— 服务器不崩、不无界吃内存 |
+| h2 100KB 头部 | 连接被 h2 层终止（000），随后正常请求仍 200 ✓ |
+
+**交付过程中自己踩到并修掉的 bug（诚实记录）**：build53 里我的完成判定用了**会话**的 total
+（会话的 total 是首次创建时定的，用 `*/` 开的会话恒为 None），于是「首片 `*/` → 收尾片给具体 total」
+仍然回 202 ✗。build54 改为用**本次请求**声明的 total，并在客户端给出具体 total 时清除
+`wildcard_total` 标记 —— 复验 202 → 201 + sha 一致 ✓。
+（教训：状态放在会话里、判定却要看请求，是这类「看起来差不多」的 bug 的常见来源。）
+
+**生产（build54 已部署）**：h1/h2/h3 全 200、DNS 正常；生产未开 enable_upload，
+`PUT /x.php/` → 405（闸门不参与，符合预期）。
+
+**下一批（报告里还没落地的）**：DNS 侧 3 条 P1（RPZ/answers 的 SOA serial 单调性、
+zone 导入按字节切下标的 panic、RPZ value 按类型校验）、h3 侧 2 条 P2（CONNECT-UDP 绕过预算、
+`fec0::/10` 准入）、上传侧 2 条 P2（并发同名会话互写、在途 `.part` 可被下载）。
+
+
+
 
 
 
