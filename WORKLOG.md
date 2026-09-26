@@ -1369,3 +1369,47 @@ A 下一帧用 `sess.received()` 取 offset 继续追加 ⇒ 两段数据混在�
 
 
 
+
+---
+
+### 21.16 验收清单（给运维/用户复验本轮 13 条修复用）
+
+前置：测试实例跑在 build60（`config-test.toml`；18443 = TLS+h2+h3 且已开 `enable_upload`，
+19081 = 明文 h2c，DNS 明文 5353 / DoT 11853）；生产 = 9095（明文 h1/h2）、8443（TLS h1/h2/h3）、9081（明文）。
+
+| # | 症状（修之前） | 复现命令 | 期望结果 |
+|---|---|---|---|
+| 1 | h2 上请求体 >1MiB 的 PUT/POST **挂死** | `curl -sk --http2 -X PUT --data-binary @20MB https://127.0.0.1:18443/t.bin` | **201**（<1s）；不再挂到客户端超时 |
+| 2 | 一条 h2 连接开 256 个慢速流可让**所有** h2 连接停摆 | 256 个 `curl --http2` 只发 HEADERS 不发完 body | 其它连接的请求照常 200；慢速流 60s 空闲后被 **408** 收掉 |
+| 3 | `PUT /x.php/`（尾斜杠/`/.`/`//`）绕过扩展名闸门 → **webshell 落盘** | `for p in '/x.php/' '/x.php/.' '/x.php//'; do curl -sk --http2 -X PUT --data-binary x -o /dev/null -w "$p %{http_code}\n" "https://127.0.0.1:18443$p"; done` | 全部 **403**，且 `ls /crucible/www/x.php` 不存在 |
+| 4 | 256 个被弃上传会话后，新文件名上传**永久 503** | 见 §21.13（并发/断连制造会话），或直接看维护循环日志 | 300s 内出现 `upload: swept N 个过期上传会话`；不再 503 |
+| 5 | `Content-Range: N-M/*` 首片被判完成 → **201 静默截断** | `curl -sk --http2 -X PUT --data-binary @1MB -H 'Content-Range: bytes 0-1048575/*' https://127.0.0.1:18443/w.bin` | **202** + `x-upload-offset: 1048576`；随后用带具体 total 的请求收尾才 **201** |
+| 6 | 空文件上传永远 202、文件不生成 | `curl -sk --http2 -X PUT --data-binary '' https://127.0.0.1:18443/e.bin` | **201**，且文件 0 字节存在 |
+| 7 | 同名并发上传互相截断/混写（双方都可能 201） | 先发一片（start=0），立刻再发一片 start=0 | 第二次 **409** + `x-upload-offset`；静默 30s 后允许重传（**202**） |
+| 8 | h3 声明「HEADERS 帧长 4GiB」可无界吃内存 | `curl -sk --http3 -H "X-Big: $(python3 -c 'print("A"*100000)')" https://127.0.0.1:18443/` | **431**（被拒），服务不崩、随后请求仍 200 |
+| 9 | 在途 `.part` 可被下载 / 被列入目录 | `curl -sk --http2 https://127.0.0.1:18443/.secret.bin.upload.part`（先造一个该名字的文件） | **404**；目录列表里也**不出现**该名字 |
+| 10 | CONNECT-UDP 不受 QMux 预算约束（单连接 256 隧道） | 需要 h3 CONNECT-UDP 客户端；无客户端时看启动日志与代码路径 | 预算在 CONNECT 前获取（`qmux budget` 日志可见）；超限 503 |
+| 11 | zone 导入含 NBSP → **panic**（按字节切下标） | 面板 `POST /__admin/api/dns/zones`，`{"action":"import","name":"t.test","text":"www\u00a0 300 IN A 192.0.2.1\n"}` | **200**（或结构化报错），服务存活 |
+| 12 | RPZ/answers 同秒两次编辑 → 面板 ok 但 **BIND 仍服务旧内容** | 连续两次 `POST /api/dns/override`，每次读 `state/dns-test/zones/answers.zone` 的 SOA serial | serial **严格递增**（实测 1790391945 → 946 → 947） |
+| 13 | 一条坏 RPZ value 让**整个 answers 区**加载失败（override 全失效） | `{"action":"add","name":"b.test","rtype":"a","value":""}` | **400** + 明确文案；answers 区里零坏记录 |
+| 14 | CGI 引擎请求体无上限 | `curl --http1.1 -X POST --data-binary @40MB <CGI 路由>` | 超 32MiB 被拒（带说明），不再无界吃内存 |
+
+**回归基线（每次改动后都该跑）**
+
+```sh
+# 上传：三个协议都要 201 + sha 一致（分片路径走 202 → 201）
+cd /crucible && curl -sk --http1.1 -X PUT --data-binary @3MB https://127.0.0.1:18443/a.bin
+curl -sk --http2  -X PUT --data-binary @3MB https://127.0.0.1:18443/b.bin
+curl -sk --http3  -X PUT --data-binary @3MB https://127.0.0.1:18443/c.bin
+sha256 -q a.bin b.bin c.bin 3MB        # 四者一致
+# 大文件流式（>16MiB 不再 413）
+curl -sk --http2 -o /tmp/d.bin -w '%{http_code} %{size_download}\n' https://127.0.0.1:18443/20MB.bin
+# 条件请求
+E=$(curl -sk --http2 -D - -o /dev/null https://127.0.0.1:18443/index.html | tr -d '\r' | grep -i ^etag | cut -d' ' -f2)
+curl -sk --http2 -o /dev/null -w '%{http_code}\n' -H "If-None-Match: $E" https://127.0.0.1:18443/index.html   # 期望 304
+# 单元测试（此前整个目标编译不过，现在应 145 passed）
+cd /crucible && cargo test --bin webserver --release --features 'tls,tls_boring,go_shm_ipc,tls_nss,tls_tomcrypt'
+```
+
+**注意**：清单里的复现命令都按测试实例的端口/路径写；在生产上跑请把 18443 换成 8443 并注意**生产未开 `enable_upload`**
+（上传类用例在生产会得到 405，这是预期）。
