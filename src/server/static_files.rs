@@ -844,7 +844,15 @@ fn autoindex_html(dir: &Path, url: &str, enable_upload: bool) -> Result<String> 
             .replace('>', "&gt;")
             .replace('"', "&quot;")
     };
-    let mut entries: Vec<_> = fs::read_dir(dir)?.filter_map(|e| e.ok()).collect();
+    let mut entries: Vec<_> = fs::read_dir(dir)?
+        .filter_map(|e| e.ok())
+        // 上传临时文件（`.{目标名}.upload.part`）不进目录列表：它们不可下载（见 resolve_path），
+        // 但把名字列出来等于告诉所有人「谁正在往这里传什么文件、传到一半」。
+        .filter(|e| {
+            let n = e.file_name().to_string_lossy().to_string();
+            !(n.starts_with('.') && n.ends_with(".upload.part"))
+        })
+        .collect();
     entries.sort_by_key(|e| e.file_name());
     let base = if url.ends_with('/') {
         url.to_string()
