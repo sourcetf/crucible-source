@@ -1413,3 +1413,120 @@ cd /crucible && cargo test --bin webserver --release --features 'tls,tls_boring,
 
 **注意**：清单里的复现命令都按测试实例的端口/路径写；在生产上跑请把 18443 换成 8443 并注意**生产未开 `enable_upload`**
 （上传类用例在生产会得到 405，这是预期）。
+
+---
+
+### 21.17 h3 请求体流式化：施工细则（照此实现即可，蓝本是 h2 已做好的那套）
+
+**目标**：h3 上的**裸单请求**上传不再受 `REQUEST_BODY_CAP`(8MiB) 限制（改成流式写盘，上限 `MAX_UPLOAD_BYTES`=2GiB），
+与 h1/h2 行为一致。**注意**：分片上传（Content-Range）在 h1/h2/h3 上现在就已可用，面板 UI 走的就是分片；
+本项只影响「一条请求传完一个大文件」这种用法。
+
+**验收**（做完必须全过）
+```sh
+# 1) 单请求 20MB（当前 413 → 期望 201 + sha 一致）
+dd if=/dev/urandom of=/tmp/u20.bin bs=1M count=20
+curl -sk --http3 -T /tmp/u20.bin https://127.0.0.1:18443/h3big.bin -o /dev/null -w '%{http_code}\n'
+sha256 -q /tmp/u20.bin; sha256 -q /crucible/www/h3big.bin
+# 2) 回归：h3 常规下载/上传、h1/h2 不变、cargo test 仍 145 passed
+# 3) 不再有 >8MiB 的 413（对照：修复前 20MB 单请求返回 413）
+```
+
+#### 第 1 步：加「装箱」请求体类型与流式适配器（`src/server/h3.rs`，放在 `imp` 模块内）
+
+仿 `h2.rs` 的 `H2Body` / `H2RecvBody`，但 h3 两个关键差异：
+* h3-quinn **自己归还流控**（`recv_data()` 消费即归还），所以适配器**不需要** `release_capacity`；
+* h3 的 `RecvStream` 只有 async 的 `recv_data()`，没有 poll 版 ⇒ 用 **mpsc 后台任务**做适配
+  （与 h1 的 `h1::stream_file` 同一手法，方向相反），通道容量取 2 帧以获得背压：
+
+```rust
+/// h3 请求体的装箱类型（错误类型擦除，和 h2 的 H2Body 同构）。
+pub type H3Body = http_body_util::combinators::BoxBody<Bytes, Box<dyn std::error::Error + Send + Sync>>;
+
+/// 把 h3 的 recv 半边适配成 `http_body::Body`：
+/// 后台任务循环 `recv_data()` → 送进 mpsc（容量 2）→ body 侧 poll 通道。
+/// 客户端断开/任务结束时会 drop recv 半边 ⇒ quinn 发 STOP_SENDING，不会吊住流。
+struct H3RecvBody { rx: parking_lot::Mutex<tokio::sync::mpsc::Receiver<Bytes>> }
+impl hyper::body::Body for H3RecvBody {
+    type Data = Bytes;
+    type Error = Box<dyn std::error::Error + Send + Sync>;
+    fn poll_frame(self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>)
+        -> std::task::Poll<Option<Result<hyper::body::Frame<Bytes>, Self::Error>>> {
+        match self.get_mut().rx.lock().poll_recv(cx) {
+            std::task::Poll::Ready(Some(b)) => std::task::Poll::Ready(Some(Ok(hyper::body::Frame::data(b)))),
+            std::task::Poll::Ready(None) => std::task::Poll::Ready(None),
+            std::task::Poll::Pending => std::task::Poll::Pending,
+        }
+    }
+}
+fn h3_body_from_recv(mut recv: /* recv 半边类型 */) -> H3Body {
+    let (tx, rx) = tokio::sync::mpsc::channel::<Bytes>(2);
+    tokio::spawn(async move {
+        loop {
+            // 沿用 H3_BODY_IDLE_TIMEOUT_SECS 的空闲超时：读不到新数据就收摊
+            match tokio::time::timeout(std::time::Duration::from_secs(H3_BODY_IDLE_TIMEOUT_SECS), recv.recv_data()).await {
+                Ok(Ok(Some(mut buf))) => {
+                    let b = buf.copy_to_bytes(buf.remaining());
+                    if tx.send(b).await.is_err() { return; } // 接收端已丢弃
+                }
+                Ok(Ok(None)) => return,
+                Ok(Err(e)) => { log::debug!("h3 body task: {e:#}"); return; }
+                Err(_) => { log::warn!("h3 body idle timeout"); return; }
+            }
+        }
+    });
+    H3Body::new(H3RecvBody { rx: parking_lot::Mutex::new(rx) })
+}
+```
+> `parking_lot::Mutex` 是必需的：`tokio::sync::mpsc::Receiver` 是 `Send` 但**不是 `Sync`**，
+> 而 `BoxBody`（= `Send + Sync` 的 trait object）要求 `Sync`（h1 的 `stream_file` 已踩过同一坑）。
+
+#### 第 2 步：`handle_incoming` 里分两种取 body 的方式
+
+现状（`handle_incoming` 的 `let result = async { ... }` 块内）：无条件 `stream.recv_data()` 循环
+收齐 body（8MiB → 413，带 60s 空闲超时）→ `req.map(|()| Bytes::from(body))` → `handle_h3(...)`。
+
+改为：
+1. 在收 body **之前**算出预判（与 h2 完全同构，谓词要保持一致）：
+   ```rust
+   let pre_path = req.uri().path().to_string();
+   let is_upload_like = matches!(*req.method(), http::Method::PUT | http::Method::PATCH | http::Method::POST)
+       && !crate::server::apps::would_handle(&lc, &pre_path)
+       && !crate::server::proxy::would_proxy(&lc, &pre_path)   // h3 的 would_proxy 是文件内私有 fn，同文件直接用
+       && crate::server::upload_api::enabled_for(&lc, &pre_path);
+   ```
+   （**只做预判**：各分支仍按需自行收齐 ⇒ page_rules 改写路径 / app / proxy 抢走 URL 时最坏少一次流式机会，语义不分叉。）
+2. `is_upload_like == false`：**保持现有收齐逻辑不动**（含 8MiB→413、空闲超时、DoH/admin/apps/proxy 都要 Bytes）。
+3. `is_upload_like == true`：**不读 body**，改为
+   ```rust
+   let (mut send, recv) = stream.split();      // ← 先核对 h3 0.0.8 的 split 返回类型
+   let body = h3_body_from_recv(recv);
+   let req = req.map(|()| body);               // Request<H3Body>
+   let response = handle_h3(req, live.clone(), lc, peer).await;
+   // 用 split 出来的 send 半边发响应（原来是 stream.send_response/send_data/finish）
+   ```
+4. 响应发送与收尾：`send.send_response(resp)` → 若 `body_out` 非空 `send.send_data(body_out)` →
+   `send.finish()`。**大文件响应**（static 层的 `FileSource` 标记）那段分块发送也要改走 `send`（同 h3.rs 现有 `FileSource` 分支）。
+
+#### 第 3 步：`handle_h3` / `h3_tail` 的签名
+
+* `handle_h3` 与 `h3_tail` 目前收 `Request<Bytes>`。**最小改动**：让它们在*上传分支*上能接受流式 body ⇒
+  两种做法，选一种并保持只有一份分发逻辑：
+  - **(推荐) 装箱统一**：把两者的参数改成 `Request<H3Body>`；非上传分支在需要 Bytes 时收齐
+    （加一个 `collect_bytes(req, REQUEST_BODY_CAP)` 辅助，与 h2 同名同语义），
+    apps/proxy/admin/DoH 分支各调一次。上传分支直接把 `req` 交给 `upload_api::handle_stream`。
+  - 或保持 `Request<Bytes>`，只在 `is_upload_like` 时**在 `handle_incoming` 里直接调**
+    `upload_api::handle_stream` 并返回 —— **不推荐**：那会绕过 `handle_h3` 里的
+    ACL/限速/basic_auth/status_path/page_rules 闸门顺序（h1/h2 都是闸门之后才进上传）。
+* **分发顺序不许变**：apps → proxy → 上传 → 静态（与 h1/h2 一致）。
+
+#### 风险点（做完逐条自查）
+1. **CONNECT-UDP 分支**在 `handle_resolver` 里 `return proxy_connect_udp(...)`，**不读 body**：
+   改成 split 后不要影响它（它不经过 `is_upload_like` 路径）。
+2. **必须仍然 `send.finish()`**：漏了会让响应不结束（客户端一直等）。
+3. **访问日志**的字节数：流式响应记得用真实长度（h3.rs 现在已按 `FileSource` 长度记），
+   请求侧字节数无法预知，保持不记即可。
+4. **do not 手工 release 流控**：h3-quinn 会在 `recv_data()` 消费时自动归还；
+   手工再调会 double-release。
+5. **空闲超时**：两条路径都要有（收齐路径已有；流式路径放在适配器任务里，见第 1 步）。
+6. `cargo build` 前先确认磁盘有空间（见 §21.16 上方说明）。
