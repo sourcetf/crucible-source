@@ -76,7 +76,14 @@ pub async fn handle(
     peer: SocketAddr,
 ) -> Result<Response<BoxBody>> {
     let (parts, body) = req.into_parts();
-    let body_bytes = body.collect().await?.to_bytes();
+    // 与其它引擎一致：请求体必须**限量**收集（其余引擎都走 Limited::new(body, APP_BODY_CAP)）。
+    // 这里是唯一的例外 —— 无上限 collect 意味着 h1 上任何 chunked/超大 POST 到 CGI 路由
+    // 都能把请求体全量读进内存（同一个威胁模型下的漏网点）。
+    let body_bytes = http_body_util::Limited::new(body, crate::server::h1::APP_BODY_CAP)
+        .collect()
+        .await
+        .map_err(|e| anyhow::anyhow!("cgi_script: 请求体超出 {} 字节上限: {e}", crate::server::h1::APP_BODY_CAP))?
+        .to_bytes();
     let docroot = app.docroot.clone().unwrap_or_else(|| lc.root.clone());
     let script = script_rel(&docroot, parts.uri.path().trim_start_matches('/'))
         .context("cgi_script script path")?;
