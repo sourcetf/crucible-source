@@ -26,6 +26,9 @@ pub const SESSION_TTL: Duration = Duration::from_secs(3600);
 pub const MAX_UPLOAD_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 /// 同时在飞的会话上限（防「只开会话不写完」占满 inode）。
 pub const MAX_SESSIONS: usize = 256;
+/// 「从 0 全量重传」允许截断旧会话前，旧会话必须静默多久。
+/// 30s 足以区分「客户端断线后重试」与「另一个客户端在并发上传同名文件」。
+pub const RESET_IDLE_GRACE: Duration = Duration::from_secs(30);
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum UploadErr {
@@ -120,7 +123,10 @@ pub fn session_for(
     }
     let mut map = SESSIONS.lock();
     if let Some(s) = map.get(target).cloned() {
-        *s.touched.lock() = Instant::now();
+        // **先算空闲时长**，再决定放行/拒绝 —— 只有**放行**才刷新 touched。
+        // 否则被拒的并发请求会把会话一直"焐热"，`RESET_IDLE_GRACE` 永远走不完，
+        // 该目标名的全量重传会被卡到 1h 的 sweep 为止（第一版就踩了这个坑）。
+        let idle = s.touched.lock().elapsed();
         if let (Some(have), Some(want)) = (s.total, total) {
             if have != want {
                 return Err(UploadErr::TotalMismatch);
@@ -128,6 +134,15 @@ pub fn session_for(
         }
         if start == 0 {
             // 全量重传：截断临时文件（复用会话，锁不变）。
+            //
+            // 但这**只在旧会话已经静默下来**时才允许：否则两个客户端同时上传同名文件时，
+            // 后者的「从 0 重传」会截断前者正在写的文件、并把 received 归零，
+            // 而前者下一帧用 `sess.received()` 取 offset 继续追加 ⇒
+            // 两份数据混在一个文件里、received 是两者之和、**双方都可能收到 201**（损坏文件）。
+            // 静默判定给「断线后重试」留了活路，同时把并发写挡在 409（客户端据此续传或稍后重试）。
+            if s.received() > 0 && idle < RESET_IDLE_GRACE {
+                return Err(UploadErr::OffsetMismatch(s.received()));
+            }
             // 守卫必须限定在作用域内：否则 `return Ok(s)` 会在守卫析构前 move `s`（E0505）。
             {
                 let _g = s.lock.lock();
@@ -136,11 +151,13 @@ pub fn session_for(
                 }
                 s.received.store(0, Ordering::Relaxed);
             }
+            *s.touched.lock() = Instant::now();
             return Ok(s);
         }
         if start != s.received() {
             return Err(UploadErr::OffsetMismatch(s.received()));
         }
+        *s.touched.lock() = Instant::now();
         return Ok(s);
     }
     if start != 0 {

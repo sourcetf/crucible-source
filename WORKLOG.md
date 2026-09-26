@@ -1315,6 +1315,54 @@ zone 导入按字节切下标的 panic、RPZ value 按类型校验）、h3 侧 2
 `fec0::/10` 准入）、上传侧 2 条 P2（并发同名会话互写、在途 `.part` 可被下载）。
 
 
+### 21.14 审计第 2/3 批：h3 预算与 v6 准入、zone 导入 panic、`.part` 泄露、DNS serial 与值校验
+
+**① [P2] CONNECT-UDP 完全绕过 QMux 预算**（`h3.rs`）：预算是在 CONNECT 分支 `return`
+**之后**才取的 ⇒ 隧道不受闸门约束：单连接可开 256 个隧道 = 256 个 UDP fd + 256 个任务，
+连接数无上限。现在预算在 CONNECT 之前获取（RAII 守卫持有到隧道结束）。
+
+**② [P2] CONNECT-UDP 目标准入漏 `fec0::/10`**（`connect_udp.rs`）：`is_unique_local()` 只覆盖
+`fc00::/7`、`is_unicast_link_local()` 只覆盖 `fe80::/10`，于是 RFC 3879 的 site-local
+（部分环境仍按此路由）被当「公网单播」放行 —— 与 v4 侧拒绝 `10/8`、`192.168/16` 的口径不一致。
+已加位判定（`o[0]==0xfe && (o[1]&0xc0)==0xc0`）。
+
+**③ [P1] zone 导入按字节切下标 → NBSP 必 panic**（`dns/admin_api.rs::zone_tokens`）：
+旧实现 `b[i] as char` 把 UTF-8 字节当 Latin-1 码位，而 `U+00A0`(NBSP)/`U+0085`(NEL) 的
+`is_whitespace()` 为真 ⇒ token 的 end 落在多字节字符**中间**，调用方 `&logical[a..b]` 立刻
+panic（"byte index N is not a char boundary"）。触发只需一个 NBSP（浏览器/Word 粘贴 zone
+文件极常见），**从区（AXFR）内容也走同一解析器**。改为 `char_indices` 迭代。
+实测：含 NBSP 的 zone 导入 → 200，服务存活 ✓。
+
+**④ [P2] 在途 `.part` 可被下载**（`static_files.rs::resolve_path`）：
+`.{目标名}.upload.part` 与目标名一一对应且可猜 ⇒ 任何客户端可 `GET /.secret.pdf.upload.part`
+读走别人正在上传（或已中断）的内容 —— 正是最可能含敏感数据的那份。现在直接拒绝该模式。
+实测：直接 GET 与 `%2e` 编码形式都是 **404**，普通文件仍 200 ✓。
+
+**⑤ [P1] RPZ/answers 的 SOA serial 无单调性兜底**（`dns/mod.rs`）：用户 zone 早就做了四层地板，
+RPZ/answers 却是裸 `chrono_now()` ⇒ 同秒两次编辑产生同一个 serial，而 BIND 只在 serial
+**更大**时重载 ⇒「加一条 override → 面板 ok → 服务里还是旧规则」。现在两个生成器都从
+**已落盘旧文件**读回上一个 serial 取 `max(now, prev+1)`（新增 `next_serial`/`read_zone_serial`）。
+实测：同秒内三次 override → answers 区 serial **1790391945 → 946 → 947 严格递增** ✓。
+
+**⑥ [P1] RPZ value 未按类型校验**（`dns/mod.rs`）：answers 区是**一个文件**，任何一行非法都会让
+named 拒载整个区；而 RPZ 的 a/aaaa/txt 规则全部 CNAME 指向该区 ⇒ 一条空值/坏 IP 让
+**全部 override 静默失效**（面板仍 ok）。现在 A/AAAA 必须是合法 IP、TXT 非空、CNAME 必须是
+合法域名，且**在写盘前** 400 拒绝。实测：空 A / 坏 AAAA / 空 TXT 全部 400 且 answers 区零坏记录，
+合法 override 仍生效（`dig s1.test A` → NOERROR + `192.0.2.11`）✓。
+
+### 21.15 上传：同名并发会话不再互相截断/混写
+
+**问题**（审计 P2）：会话按**目标路径**共享，而「从 0 全量重传」会截断临时文件并把 `received`
+归零。两个客户端同时上传同名文件时：A 正在逐帧写 → B 从 0 重传截断了文件并归零 →
+A 下一帧用 `sess.received()` 取 offset 继续追加 ⇒ 两段数据混在一个文件里、`received` 是两者之和、
+`complete()` 可能提前成立 ⇒ **双方都可能拿到 201，文件是损坏的**（浏览器超时重传、或任何并发写同名文件的客户端都会触发）。
+
+**做法**：`session_for` 里「start == 0 且旧会话 `received > 0`」时，只有当旧会话**已静默**
+（`RESET_IDLE_GRACE` = 30s 无触碰）才允许截断重来；否则回 **409 + X-Upload-Offset: 当前值**。
+这样既挡住并发混写，又给「断线后重试」留了活路（客户端可据 409 里的偏移续传，或 30s 后重来）。
+
+
+
 
 
 
