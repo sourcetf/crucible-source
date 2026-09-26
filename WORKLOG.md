@@ -1178,6 +1178,46 @@ ech = true
 （设计见 §21.8；**分片上传在 h1/h2/h3 上均已实测可用**，面板 UI 就是分片发的）。
 
 
+### 21.11 build51：h2 请求体按需收齐 + 上传走流式（单请求 20MB 从 413 变 201）
+
+**问题**：h2 此前把**每个**请求体先收齐进内存（`REQUEST_BODY_CAP` = 8MiB），
+于是 >8MiB 的单请求上传一律 413；而 h1 是流式（上限 2GiB）—— 同一操作在两个协议上行为不同。
+
+**做法**（`src/server/h2.rs`、`src/server/upload_api.rs`、`src/server/dns/dot_doh.rs`）
+* 新增 `H2RecvBody`：把 h2 的 `RecvStream` 包成 `hyper::body::Body`，**逐帧归还接收窗口**
+  （h2 0.4 的契约），并带 60s 空闲超时（超时即 body 读错误）。归还推迟到下一次 `poll_frame`。
+* 请求体统一装箱成 `H2Body`（错误类型擦除）。`serve_io` 只做**预判**「像不像上传」：
+  上传 → 保持流式；其余 → `collect_bytes(cap=8MiB)`。各分支仍按需自行收齐 ——
+  所以 page_rules 改写路径 / app / proxy 抢走 URL 时最坏只是少一次流式机会，**语义不分叉**。
+* `h2_tail` 分发顺序不变（apps → proxy → 上传 → 静态）；只有 apps/proxy 不接管时，
+  才把流式 body 交给新的 `upload_api::handle_stream`（body 直接透传，不先收齐）。
+* DoH 分支改为**只对确实是 DoH 的请求**收 body（新增 `dot_doh::is_doh_request`，
+  判定条件与 `doh_prepared` 的早退分支一致）—— 否则普通上传会被白白套上 8MiB 上限。
+* `collect_bytes` 的错误语义与旧行为**逐条对齐**：超限 413 / 空闲超时 408 / 读错 400。
+* 回归测试：`release_capacity` 必须在 `H2RecvBody` 内且在 `poll_data` 之前；
+  `h2_tail` 里 `handle_stream` 必须早于 `collect_bytes`（防止退回「先收齐」）。
+
+**实测（build51，测试实例）**
+
+| 检查 | 结果 |
+|---|---|
+| h2 单请求 **20MB** 上传 | **201 / 0.28s**，sha256 一致、无残留 `.part` ✓（此前 413） |
+| h2 单请求 9MB（刚越旧上限） | **201** + sha 一致 ✓ |
+| 分片上传（h2，2 片 4MiB） | 202 → 201 + sha 一致 ✓ |
+| 上传闸门 | 穿越 **400** / `.php` **403** ✓ |
+| DoH（h2 POST `/dns-query`） | **200** + 113 字节应答 ✓（我改过这条分支，重点回归） |
+| admin API（GET/POST） | 200 / 200 / 200 ✓（admin 分支改为先收齐） |
+| h2 20MB 下载 + 条件请求 | 200 + sha 一致、`If-None-Match` → **304** ✓ |
+| 非上传路径的 9MB POST | **413 / 0.09s**（快速失败）+ 同连接后续 GET **200** ✓（边界不变） |
+
+**生产（build51 已部署）**：h1/h2/h3 全 200、admin API 200 ✓。
+
+**仍未做**：h3 侧同样的流式化（`RequestStream::split()` + 把 recv 半边包成 `http_body::Body`；
+h3-quinn 自己会归还流控，主要工作是把响应发送改走 split 出来的 send 半边）。
+在此之前 h3 单请求上限仍是 8MiB（h2 已无此限，h1 一直是 2GiB）。
+
+
+
 
 
 
