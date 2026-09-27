@@ -313,6 +313,7 @@ http_versions = [
     "h2",
 ]
 port = 19081
+qmux = true          # QMux v1（draft-ietf-quic-qmux-02）
 root = "www-static-fair"
 server_name = "fair-plain-test.crucible.local"
 status_path = "/__status"
@@ -327,6 +328,7 @@ http_versions = [
     "h2",
 ]
 port = 19445
+qmux = true          # QMux v1（draft-ietf-quic-qmux-02）
 root = "www-static-fair-tls12"
 server_name = "fair-tls12-test.crucible.local"
 

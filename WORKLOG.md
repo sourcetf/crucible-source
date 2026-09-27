@@ -1574,3 +1574,59 @@ fn h3_body_from_recv(mut recv: /* recv 半边类型 */) -> H3Body {
 
 **剩余未做**：QMux 协议本体（需 patch vendored `quinn-proto` 的帧解析支持新帧类型）。
 至此 §21.8/§21.11 里「h2/h3 单请求 >8MiB」这一条**已全部解决**（h1 一直是流式 2GiB）。
+---
+
+### 21.19 QMux v1 协议本体：已实现 + 19 条一致性测试；HTTP-over-QMux 端到端**未跑通**
+
+**背景**：`src/server/qmux.rs` 此前是「真在生效的流预算 + 诚实说明」，协议本体未实现，
+理由是「仓库里拿不到草案正文，不发明 wire format」（这个克制是对的）。本轮取到正文并实现。
+
+**取到的材料**：`draft-ietf-quic-qmux-02`（2026-07-06，WG draft；-01 也取来对比）。
+它是在**双向字节流（TLS over TCP 等）上提供 QUIC v1 那套流/数据报操作**的复用协议 ——
+不是 QUIC 扩展、不需要 patch quinn，因此**可以在应用层完整实现**。
+
+**实现**（`src/server/qmux/{proto.rs,conn.rs}`，约 1400 行 + 19 条测试）
+* §3.2 记录：`Size(i)+Frames` 自定界；帧不跨记录；末尾对不齐帧边界 → FRAME_ENCODING_ERROR；
+* §4 帧集合：QUIC v1 的 PADDING/RESET_STREAM/STOP_SENDING/STREAM/MAX_DATA/MAX_STREAM_DATA/
+  MAX_STREAMS/DATA_BLOCKED/STREAM_DATA_BLOCKED/STREAMS_BLOCKED/CONNECTION_CLOSE，
+  其余（PING/ACK/CRYPTO/NEW_TOKEN/…/HANDSHAKE_DONE）收到即 FRAME_ENCODING_ERROR；
+* §4.1 同一流的 STREAM 必须连续（offset 紧接上一字节）→ 否则 PROTOCOL_VIOLATION（因此无需重组缓冲）；
+* §4.2 第一个帧必须是 QX_TRANSPORT_PARAMETERS；我方参数**立刻发**，不等对端；
+* §4.3 QX_PING 请求序号严格递增、响应原样回显；
+* §5 传输参数：允许 7 个 QUIC 参数 + `max_record_size`；被禁的 → TRANSPORT_PARAMETER_ERROR；
+  未知的忽略；§5.2 默认 16382 且不得小于默认；记录不得超对端声明；
+* §6 读侧**永不**因应用不读而阻塞（缓冲上限=声明的额度，消费即回补 MAX_*）；
+* §7.1 空闲超时按「记录」计（收满/发完都重置）；§7.2/§7.3 CONNECTION_CLOSE 与优雅关闭；
+* §9.1 DATAGRAM（不可交付时可丢）、§9.2 RESET_STREAM_AT（按 RESET_STREAM 语义）；
+* `QmuxStream: AsyncRead+AsyncWrite` ⇒ 直接喂现有 h1（**HTTP/1.1 over QMux**）。
+
+**集成**：`ListenerConfig.qmux`（**默认 false**）；ALPN 加 `h1-02qx`（§8.1：QMux 自己没有 ALPN，
+由上层协议指定，命名沿用草案示例 `<协议>-<草案号>qx`）；服务端偏好 h2 > http/1.1 > qmux
+⇒ **开 qmux 不改变老客户端行为**；明文监听器按 §10.1 用首 8 字节魔数识别；配置校验要求 h1 开着。
+
+**实测**
+
+| 检查 | 结果 |
+|---|---|
+| 19 条 QMux 单测/一致性测试 | **全过**（握手、回显、主动发参数、读后续记录、首帧规则、禁止帧、偏移连续性、PING 语义、被禁参数、魔数、varint 边界、记录增量解析…） |
+| 全套测试 | **161 passed / 0 failed** |
+| TLS ALPN 协商 | 客户端拿到 **`h1-02qx`** ✓ |
+| 服务端主动发传输参数（§4.2，不等对端） | ✓（客户端读到 `\xffQMX…` 记录的 74 字节） |
+| 服务端读后续记录并发 QX_PING 响应（§4.3） | ✓（客户端发 PING(1) → 收到 `...be 01` 回显） |
+| **HTTP-over-QMux 端到端** | **✗ 未跑通**：STREAM 帧里的 HTTP 请求没有产生正确响应（日志显示 h1 会话有被拉起，但没拿到正确请求字节） |
+
+**过程中修掉的两个真 bug**（都由测试暴露）
+1. 协议错误时 `writer.abort()` 抢在队列落盘前 → 刚入队的 CONNECTION_CLOSE **从未写出**，
+   对端只看到连接被断、看不到原因。改成「发停止信号 → 冲刷队列 → 收摊」，2s 上限兜底。
+2. 单测客户端每条记录都新建解析器，丢掉一次 read 里多带的记录（6 个用例因此假失败）。
+
+**草案自身的一处不一致**（-01/-02 都有，已核对两版）：类型写成十六进制 `0x3f5153300d0a0d0a`，
+同句又说 wire 是 `"\xffQMX\r\n\r\n"`，二者不可能同时成立（varint(0x3f515330…) 是 `\xffQS0\r\n\r\n`）。
+本实现**以 ASCII 形式为准**（正文明确标注 on wire，且该魔数的全部意义就是认出 "QMX"），
+同时**接收**两种都认。
+
+**下一步（交接）**：排障入口已经很少了 —— 协议层与 ALPN 都验证过，问题在
+「STREAM 载荷 → h1 会话」这一小段。建议：① 在 `handle_frame` 的 Stream 分支与
+`QmuxStream::poll_read` 各加一行 debug 日志，确认 h1 到底收到了什么字节；
+② 用单测直接驱动 `qmux::serve_h1`（内存 duplex）跑一个真实 HTTP 请求，把范围压到
+「handler 装配」或「流 I/O」二者之一。`qmux` 默认关，生产未启用，不影响现网。

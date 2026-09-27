@@ -556,6 +556,20 @@ pub struct ListenerConfig {
     /// 默认关是因为它不带来行为变化，属于运维核查项而不是功能开关。
     #[serde(default)]
     pub quic_ecn: bool,
+    /// 是否在该监听器上提供 **QMux v1**（`draft-ietf-quic-qmux-02`）。
+    ///
+    /// QMux 在一条双向字节流（本实现：TLS over TCP）上复用出多条逻辑流。本实现服务的是
+    /// **HTTP/1.1 over QMux**，因此要求 `http_versions` 含 `h1`（配置校验会拦）。
+    ///
+    /// * TLS 监听器：ALPN 里加入 `h1-02qx`（见 `qmux::conn::QMUX_ALPN`）。服务端偏好仍是
+    ///   h2 > http/1.1 > h1-02qx ⇒ **只提供旧协议的客户端行为不变**；想要 QMux 的客户端
+    ///   在 ALPN 里只给 `h1-02qx`。
+    /// * 明文监听器：按草案 §10.1，用首 8 字节的协议魔数（`\xffQMX\r\n\r\n`）识别 ——
+    ///   与既有的 h2 prior-knowledge 嗅探同一条路径。
+    ///
+    /// 默认 **false**：不开就没有这个协议面（零行为变化）。
+    #[serde(default)]
+    pub qmux: bool,
 }
 
 impl Default for ListenerConfig {
@@ -579,6 +593,7 @@ impl Default for ListenerConfig {
              rate_limit: None,
             l4_forward: None,
             quic_ecn: false,
+            qmux: false,
         }
     }
 }
@@ -987,6 +1002,15 @@ impl Config {
                 if !seen.insert(key) {
                     anyhow::bail!(
                         "duplicate listener address:port {}:{}",
+                        l.address,
+                        l.port
+                    );
+                }
+                // QMux 上跑的是 HTTP/1.1：h1 关掉时 qmux 无法工作，配置期就拦住
+                //（否则表现是「ALPN 协商到 h1-02qx 却立刻失败」，很难查）。
+                if l.qmux && !l.allows_h1() {
+                    anyhow::bail!(
+                        "listener {}:{} 开了 qmux 但 http_versions 不含 h1（QMux 上跑的是 HTTP/1.1）",
                         l.address,
                         l.port
                     );

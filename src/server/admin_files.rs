@@ -345,6 +345,7 @@ mod tests {
             rate_limit: None,
             l4_forward: None,
             quic_ecn: false,
+            qmux: false,
         }
     }
 

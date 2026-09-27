@@ -60,7 +60,8 @@ async fn dispatch_plain(
     if lc.port_reuse && lc.ssl.is_none() {
         stream.readable().await.ok();
         let mut peek = vec![0u8; 4096];
-        let n = match stream.try_read(&mut peek) {
+        // `mut`：下面补齐半个 ClientHello 时会继续往 peek 里写（并把 n 加上读到的字节数）
+        let mut n = match stream.try_read(&mut peek) {
             Ok(m) => m,
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => 0,
             Err(_) => 0,
@@ -68,6 +69,30 @@ async fn dispatch_plain(
         if n > 0 {
             // 仅 TLS record header (0x16) 才走 SNI 分流；明文 HTTP 方法名留给下面。
             if peek[0] == 0x16 && n >= 5 {
+                // 单次 try_read 可能只拿到半个 ClientHello（TCP 分段）——直接按「无 SNI」
+                // 丢弃会把**正常客户端**误杀。先按 record 头声明的长度补齐：
+                // TLS record = type(1)+version(2)+length(2)+payload ⇒ 需要 `5 + length` 字节。
+                // 最多 8 轮、每轮 300ms，且不超过缓冲区容量。
+                {
+                    let mut rounds = 0;
+                    while rounds < 8 {
+                        if port_reuse::peek_sni(&peek[..n]).is_some() {
+                            break;
+                        }
+                        let need = 5 + u16::from_be_bytes([peek[3], peek[4]]) as usize;
+                        // 已收齐仍解析不出 SNI → 确实没有；或已超缓冲区 → 放弃（同旧行为）
+                        if need <= n || need > peek.len() {
+                            break;
+                        }
+                        stream.readable().await.ok();
+                        match stream.try_read(&mut peek[n..need]) {
+                            Ok(k) if k > 0 => n += k,
+                            _ => break,
+                        }
+                        rounds += 1;
+                        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+                    }
+                }
                 let sni = match port_reuse::peek_sni(&peek[..n]) {
                     Some(s) => s,
                     None => {
@@ -136,7 +161,13 @@ async fn dispatch_plain(
         plain_prefix = buf[..n].to_vec();
     }
     let prefix: &[u8] = plain_prefix.as_slice();
-    if prefix.len() >= 24 && &prefix[..24] == b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n" {
+    // 草案 §10.1：非 TLS 时用首 8 字节的协议魔数识别 QMux（QX_TRANSPORT_PARAMETERS 的帧类型
+    // 字段，wire 上是 `\xffQMX\r\n\r\n`）。与 h2 prior-knowledge 是同一条嗅探路径。
+    if lc.qmux && prefix.starts_with(crate::server::qmux::proto::QX_TP_TYPE_WIRE) {
+        // 已 try_read 走的字节必须交回协议层，否则首帧被吞
+        let io = crate::server::prefixed_stream::PrefixedStream::new(stream, prefix.to_vec());
+        crate::server::qmux::serve_h1(io, live, lc, peer).await
+    } else if prefix.len() >= 24 && &prefix[..24] == b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n" {
         if !lc.allows_h2() {
             anyhow::bail!("h2 prior-knowledge but http_versions disables h2");
         }

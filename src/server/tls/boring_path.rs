@@ -544,10 +544,13 @@ fn apply_alpn(builder: &mut SslAcceptorBuilder, lc: &ListenerConfig) -> Result<(
     // select 回调，并从客户端列表内回显所选协议（RFC 7301 要求回显原字节）。
     let offer_h2 = lc.allows_h2();
     let offer_h1 = lc.allows_h1();
+    // QMux（`qmux = true`）走 h1-over-QMux，所以必须 h1 开着（配置校验已拦）。
+    let offer_qmux = lc.qmux && offer_h1;
     builder.set_alpn_select_callback(move |_ssl, client_protos: &[u8]| {
-        // wire 格式：u8 len + name，逐段扫描；记录 h2 / http/1.1 的命中区间。
+        // wire 格式：u8 len + name，逐段扫描；记录 h2 / http/1.1 / qmux 的命中区间。
         let mut h2_span: Option<&[u8]> = None;
         let mut h1_span: Option<&[u8]> = None;
+        let mut qmux_span: Option<&[u8]> = None;
         let mut i = 0usize;
         while i < client_protos.len() {
             let l = client_protos[i] as usize;
@@ -559,12 +562,19 @@ fn apply_alpn(builder: &mut SslAcceptorBuilder, lc: &ListenerConfig) -> Result<(
             match name {
                 b"h2" if offer_h2 => h2_span = Some(name),
                 b"http/1.1" if offer_h1 => h1_span = Some(name),
+                n if offer_qmux && n == crate::server::qmux::conn::QMUX_ALPN => {
+                    qmux_span = Some(name)
+                }
                 _ => {}
             }
             i = end;
         }
-        // 服务端固定偏好 h2（有则选 h2，否则 http/1.1；都没提供 → NOACK 不带 ALPN）。
-        h2_span.or(h1_span).ok_or(boring::ssl::AlpnError::NOACK)
+        // 服务端偏好 h2 > http/1.1 > QMux：**开启 qmux 不改变老客户端的行为**，
+        // 想要 QMux 的客户端在 ALPN 里只给 `h1-02qx` 即可。
+        h2_span
+            .or(h1_span)
+            .or(qmux_span)
+            .ok_or(boring::ssl::AlpnError::NOACK)
     });
     Ok(())
 }
@@ -661,7 +671,10 @@ async fn dispatch_alpn(
     peer: SocketAddr,
 ) -> Result<()> {
     let alpn = tls.ssl().selected_alpn_protocol().map(|p| p.to_vec());
-    if alpn.as_deref() == Some(b"h2") && lc.allows_h2() {
+    if alpn.as_deref() == Some(crate::server::qmux::conn::QMUX_ALPN) && lc.qmux {
+        // QMux v1：在其逻辑流上跑 HTTP/1.1（每条流一个 h1 会话）
+        crate::server::qmux::serve_h1(tls, live, lc, peer).await
+    } else if alpn.as_deref() == Some(b"h2") && lc.allows_h2() {
         h2::serve_tls(tls, live, lc, peer).await
     } else {
         h1::serve_tls(tls, live, lc, peer).await

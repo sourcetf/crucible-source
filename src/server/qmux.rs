@@ -1,61 +1,71 @@
-//! QMux —— **协议本体未实现**。这里是一个真的在生效的流预算，加上一份诚实的现状说明。
+//! QMux v1 —— **协议本体已实现**（`draft-ietf-quic-qmux-02`），外加一份真在生效的流预算。
 //!
-//! # 已实现（真的生效，不是摆着）
+//! # 实现范围（对着草案逐条）
 //!
-//! 每连接一份的**并发请求流预算**：`h3.rs` 开流时取名额（[`stream_opened`]）、
-//! 结束时释放（[`stream_closed`]，或守卫 Drop），超限时如实回 503 并记日志。
-//! 各连接的计数汇总到进程级 [`QMUX_BUDGET`]，供日志观察。
+//! | 草案条款 | 实现位置 |
+//! |---|---|
+//! | §3.2 记录（`Size(i) + Frames`，自定界、帧不跨记录、末尾对不齐即错） | [`proto::RecordReader`] / [`proto::encode_record`] |
+//! | §4 允许/禁止的帧集合（沿用 QUIC v1 帧格式） | [`proto::FrameKind::from_type`] / [`proto::parse_frames`] |
+//! | §4.1 STREAM 必须按序（同流 offset 连续） | [`conn`] 的 `handle_frame` |
+//! | §4.2 首个帧必须是 `QX_TRANSPORT_PARAMETERS`（wire 上是 `\xffQMX\r\n\r\n`） | [`conn::serve`] / [`proto::QX_TP_TYPE`] |
+//! | §4.3 `QX_PING` 请求/响应与序号单调性 | [`conn`] 的 `handle_frame` |
+//! | §5 传输参数（允许 7 个 QUIC 参数 + `max_record_size`；被禁的报错、未知的忽略） | [`proto::TransportParams::decode`] |
+//! | §5.2 `max_record_size`（默认 16382，不得小于默认；记录不得超限） | [`proto::DEFAULT_MAX_RECORD_SIZE`] / [`conn::Conn::push_frames`] |
+//! | §6 读侧永不因应用不读而阻塞（缓冲上限 = 声明的流控额度，消费即回补） | [`conn::QmuxStream`] |
+//! | §7.1 空闲超时（收满/发完一条记录都重置） | [`conn::serve`] |
+//! | §7.2/§7.3 CONNECTION_CLOSE 的收发与优雅关闭 | [`conn::serve`] |
+//! | §9.1 DATAGRAM 扩展（按 §6 允许丢弃） | [`conn`] 的 `handle_frame` |
+//! | §9.2 RESET_STREAM_AT 扩展（按 RESET_STREAM 语义） | [`conn`] 的 `handle_frame` |
 //!
-//! 这道闸门的上限（[`DEFAULT_MAX_ACTIVE`] = 100）刻意与 quinn 的默认
-//! `max_concurrent_bidi_streams` 对齐，所以它**不会比传输层本身更严**，
-//! 正常客户端碰不到；它真正拦的是「账目错了」——漏释放导致的计数泄漏。
+//! 单测见 [`proto::tests`]（编解码与边界）与 [`conn::tests`]（用内存 duplex 跑的
+//! 一致性用例：握手、回显、首个帧校验、禁止帧、偏移连续性、PING 语义、被禁参数）。
 //!
-//! # 未实现（说清楚，别让桩代码看起来像做完了）
+//! # 怎么用
 //!
-//! `draft-ietf-quic-qmux-01` 的**协议本体一行都没实现**：
+//! QMux 自己**没有 ALPN**（§8.1），由上层协议指定。本实现服务 **HTTP/1.1 over QMux**，
+//! ALPN 标识 [`conn::QMUX_ALPN`] = `h1-02qx`（`02` = 草案版本）。启用方式：监听器加
+//! `qmux = true`，且 `http_versions` 里含 `h1`（HTTP/1.1 跑在 QMux 流上）。
+//! 客户端在 ALPN 里只提供 `h1-02qx` 即可走 QMux；同时提供 `h2`/`http/1.1` 的老客户端
+//! 行为不变（服务端偏好 h2 > h1 > qmux，见 `tls::boring_path::apply_alpn`）。
 //!
-//! - 没有 QMUX 帧类型 / 流类型，没有对应的 wire 编码；
-//! - 没有连接 ID 映射、没有多路复用调度、没有协商参数；
-//! - 没有和 quinn 连接层挂钩（quinn 0.11 也没有暴露所需的连接事件）。
+//! # 与「流预算」的关系
 //!
-//! 原因是：**在本仓库能拿到的材料里无法确定该草案的确切 wire format**。
-//! 已全树检索过 `qmux`（源码、`*.md`/`*.toml`/`*.txt`/`*.json`/`*.h`、构建日志、
-//! 以及 `www-doh/`、`bench/`、`scripts/`、`www/`、`www-apps/` 与快照目录
-//! `orig/`、`base_src/`、`_rhead/`、`_ridx/`），命中的只有：
-//!
-//! - 本文件（及其两份副本）自己的注释；
-//! - 若干构建/对比日志里「`qmux.rs` 是个 stub」「`QmuxBudget`/`QMUX_BUDGET` 从未被使用」的记录。
-//!
-//! **没有草案正文、没有抓包样本、没有一致性测试向量。**
-//!
-//! 另需指出两处容易误判为「有实现」的线索：`api_cmp.txt` 里出现过
-//! `UNIQUE: struct QmuxManager`、`uniq1.txt` 里出现过 `qmux.rs  QmuxManager`，
-//! 但那是**另一份代码快照的符号清单**，本仓库树里并不存在 `QmuxManager` 的实现
-//! （全树 grep 只命中这两个文本文件），不能据此反推协议。
-//!
-//! 顺带更正原注释的一处混淆：它自称「RFC 9000 §5.1.2 流预算 — draft-ietf-quic-qmux-01
-//! 最小实现」。RFC 9000 §5.1.2 讲的是 QUIC 自己的流 ID 与并发流计数规则，
-//! 那是传输层的事（quinn 已经实现）；把它和另一份草案绑在一起当成本模块的实现，
-//! 是名不副实的。
-//!
-//! 取舍：**编一个能编译但语义错的协议，比留一个诚实的桩更糟**——前者看起来是完成了，
-//! 会让后续的人按错的格式去对接。所以这里不发明 wire format。
-//!
-//! # 要补齐需要什么
-//!
-//! 下列任意一份材料就够开工：
-//!
-//! 1. `draft-ietf-quic-qmux-01` 正文（确定帧类型取值、流建立/关闭语义）；
-//! 2. 一份该草案的真实抓包或互操作记录；
-//! 3. 上游参考实现（或某个实现了它的 `quinn` 分支 / PR），据此判断是否需要
-//!    给 quinn 加连接事件钩子；
-//! 4. 一致性测试向量。
-//!
-//! 拿到 1 或 2 之后，本文件应从「流预算」升级为真正的 QMux 状态机，
-//! 并且预算要从 `h3.rs` 的每请求粒度下沉到 QMUX 自己的流粒度。
+//! [`QmuxBudget`] 是另一件事：h3（QUIC）**每连接每请求**的并发流闸门（闸门上限刻意与
+//! quinn 默认对齐，真正拦的是「漏释放导致的计数泄漏」）。它与本文件的协议实现相互独立：
+//! 协议实现有自己的流状态机与流控（[`conn`]），预算只管并发计数。
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+
+pub mod conn;
+pub mod proto;
+
+/// 用 **HTTP/1.1** 服务一条 QMux 连接：每条 QMux 逻辑流跑一个独立的 h1 会话。
+///
+/// 这样 QMux 复用的就是现成的 HTTP/1.1 实现（报文解析、路由、应用引擎、上传……），
+/// 与 h1/h2/h3 共享同一套分发与安全闸门 —— 不会出现「新协议上少一道检查」的漂移。
+pub async fn serve_h1<IO>(
+    io: IO,
+    live: Arc<crate::server::live_config::LiveConfig>,
+    lc: crate::config::ListenerConfig,
+    peer: std::net::SocketAddr,
+) -> anyhow::Result<()>
+where
+    IO: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
+    conn::serve(io, move |stream| {
+        let live = Arc::clone(&live);
+        let lc = lc.clone();
+        async move {
+            // h1::serve_tls 接受任意 AsyncRead+AsyncWrite（内部包 TokioIo），
+            // 所以一条 QMux 流可以直接当「连接」用。
+            if let Err(e) = crate::server::h1::serve_tls(stream, live, lc, peer).await {
+                log::debug!("qmux: h1 会话结束 peer={peer}: {e:#}");
+            }
+        }
+    })
+    .await
+}
 
 /// 单连接默认并发请求流上限。
 ///
