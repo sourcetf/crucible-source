@@ -146,6 +146,13 @@ struct UpstreamIo {
     /// 上游 TLS 协商出的 ALPN 是否为 h2（规格 11：`upstream_http_version`
     /// 不配置时按 ALPN 自动选择回源 HTTP 版本）。
     negotiated_h2: bool,
+    /// 「已经读进来但还没被消费」的字节 —— poll_read 时优先吐出。
+    ///
+    /// 为什么必须留着：读响应头（[`read_http_head`]）按 `\r\n\r\n` 切分，而一次 `read`
+    /// 往往**同时带回响应头与正文起始字节**；升级 WebSocket（101）时那些字节就是上游的
+    /// 首批 WS 帧。旧实现只解析 `..pos+4`、剩下的直接丢：隧道开头缺数据、WS 帧错位
+    /// （客户端与上游都会解析失败），现象是「WS 连上但立刻报协议错」。
+    leftover: Vec<u8>,
 }
 
 impl UpstreamIo {
@@ -153,6 +160,7 @@ impl UpstreamIo {
         Self {
             inner: Box::pin(tcp),
             negotiated_h2: false,
+            leftover: Vec::new(),
         }
     }
 
@@ -163,6 +171,7 @@ impl UpstreamIo {
         Self {
             inner: Box::pin(s),
             negotiated_h2: false,
+            leftover: Vec::new(),
         }
     }
 }
@@ -173,6 +182,14 @@ impl AsyncRead for UpstreamIo {
         cx: &mut TaskContext<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<std::io::Result<()>> {
+        // 先把上次多读出来的字节交出去，再读 socket。
+        if !self.leftover.is_empty() {
+            let n = self.leftover.len().min(buf.remaining());
+            let rest = self.leftover.split_off(n);
+            buf.put_slice(&self.leftover);
+            self.leftover = rest;
+            return Poll::Ready(Ok(()));
+        }
         Pin::new(&mut self.inner).poll_read(cx, buf)
     }
 }
@@ -1085,22 +1102,32 @@ async fn write_raw_request(
 ///
 /// **自身没有 deadline**：上游可以「收下连接后一个字节都不发」，那时这里永远不返回。
 /// 调用方必须把它套在 [`UPSTREAM_HEAD_TIMEOUT`] 里（见 [`proxy_websocket`]）。
+///
+/// 头部之后**多读进来的字节会写回 `stream.leftover`**（不是丢掉）：一次 read 常常
+/// 同时带回头部与正文起始，升级场景下那些就是上游的首批 WS 帧。
 async fn read_http_head(stream: &mut UpstreamIo) -> Result<(StatusCode, HeaderMap)> {
     let mut buf = Vec::with_capacity(4096);
     let mut tmp = [0u8; 1024];
     loop {
+        // 先把 leftover（上次多读的）纳入本次解析，避免「上一轮剩的字节被跳过」
+        if !stream.leftover.is_empty() && buf.is_empty() {
+            buf.extend_from_slice(&stream.leftover);
+            stream.leftover.clear();
+        }
+        if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+            let head = buf[..pos + 4].to_vec();
+            // 头部之后剩下的字节**回注**，交给后续隧道/正文读取
+            stream.leftover = buf[pos + 4..].to_vec();
+            return parse_http_head(&head);
+        }
+        if buf.len() > 65536 {
+            bail!("upstream headers too large");
+        }
         let n = stream.read(&mut tmp).await?;
         if n == 0 {
             bail!("upstream closed before headers");
         }
         buf.extend_from_slice(&tmp[..n]);
-        if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
-            let head = &buf[..pos + 4];
-            return parse_http_head(head);
-        }
-        if buf.len() > 65536 {
-            bail!("upstream headers too large");
-        }
     }
 }
 
@@ -1160,7 +1187,8 @@ async fn connect_tor_socks(
             .with_context(|| format!("tor socks connect {addr}"))?;
         return socks5_connect(tcp, host, port).await;
     }
-    if let Ok(unix_path) = std::env::var("CRUCIBLE_TOR_SOCKS_UNIX") {
+    // 用缓存的读取器：env_lock 会在引擎请求期间写进程环境，直接 var() 有数据竞争（见其说明）
+    if let Some(unix_path) = crate::server::apps::env_lock::read_static_env("CRUCIBLE_TOR_SOCKS_UNIX") {
         if !unix_path.is_empty() {
             let unix = UnixStream::connect(&unix_path)
                 .await
@@ -1168,8 +1196,8 @@ async fn connect_tor_socks(
             return socks5_unix_bridge(unix, host, port).await;
         }
     }
-    let socks = std::env::var("CRUCIBLE_TOR_SOCKS")
-        .unwrap_or_else(|_| "127.0.0.1:9050".into());
+    let socks = crate::server::apps::env_lock::read_static_env("CRUCIBLE_TOR_SOCKS")
+        .unwrap_or_else(|| "127.0.0.1:9050".to_string());
     let addr: SocketAddr = socks.parse().context("CRUCIBLE_TOR_SOCKS parse")?;
     ensure_loopback_socks(addr, "CRUCIBLE_TOR_SOCKS")?;
     let tcp = TcpStream::connect(addr)
@@ -1204,7 +1232,7 @@ fn ensure_loopback_socks(addr: SocketAddr, source: &str) -> Result<()> {
 /// On missing lib / missing symbol / probe failure, returns `None` so callers
 /// fall back to unix/TCP SOCKS (documented supported path).
 async fn try_tor_ffi_connect(host: &str, port: u16) -> Option<Result<TcpStream>> {
-    let path = std::env::var("CRUCIBLE_TOR_FFI_LIB").ok()?;
+    let path = crate::server::apps::env_lock::read_static_env("CRUCIBLE_TOR_FFI_LIB")?;
     if path.is_empty() {
         return None;
     }

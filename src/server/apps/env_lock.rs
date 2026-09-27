@@ -220,6 +220,35 @@ fn restore(prev: &[(OsString, Option<OsString>)]) {
     }
 }
 
+/// 读取「启动期只读」环境变量，**结果只取一次并缓存**。
+///
+/// # 为什么不能直接用 `std::env::var`
+///
+/// 本模块会在**引擎请求期间**调用 `set_var`/`remove_var`（把 `.env` 里的变量装进进程环境）。
+/// 而 glibc 的 `setenv` 可能 **realloc `environ` 数组** —— 此刻任何其它线程的
+/// `getenv`/`std::env::var`（**哪怕读的是另一个键**）都可能走到已释放的内存上，
+/// 表现是间歇性崩溃或读到垃圾值。Rust 标准库明确把「多线程下修改进程环境」列为不应发生的场景
+/// （相关 API 在 2024 edition 下已改为 unsafe），所以「写者之间互斥」并不够，读者也必须避开。
+///
+/// 这里走的路子最省事也最稳：`CRUCIBLE_*` / `APPENGINE_*_LIB` 这类都是**运维在启动前
+/// 设好的只读配置**，缓存一次即可彻底消除竞争 —— 不必让读者也去抢同一把锁
+/// （那会把应用层锁塞进热路径，还要改好几个模块）。
+///
+/// **诚实边界**：缓存后，进程运行期间再改这些环境变量**不会**被读到。对「启动期配置」
+/// 这正是期望行为；要支持热改就该用配置文件而不是环境变量。
+pub fn read_static_env(key: &str) -> Option<String> {
+    static CACHE: Lazy<Mutex<BTreeMap<String, Option<String>>>> =
+        Lazy::new(|| Mutex::new(BTreeMap::new()));
+    let mut cache = CACHE.lock();
+    if let Some(v) = cache.get(key) {
+        return v.clone();
+    }
+    let v = std::env::var(key).ok();
+    cache.insert(key.to_string(), v.clone());
+    log::debug!("env: 缓存启动期环境变量 {key}（存在={}）", v.is_some());
+    v
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

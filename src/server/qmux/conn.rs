@@ -671,7 +671,7 @@ where
                     });
                     map.insert(stream_id, Arc::clone(&s));
                     drop(map);
-                    log::info!("qmux: 对端发起新流 {stream_id}");
+                    log::debug!("qmux: 对端发起新流 {stream_id}");
                     let app = QmuxStream {
                         id: stream_id,
                         conn: Arc::clone(conn),
@@ -713,14 +713,9 @@ where
                 }
                 c.received += data.len() as u64;
                 if !data.is_empty() {
-                    // 排障期保留一行 info：QMux 流上「字节到底有没有交给上层」是这套实现
-                    // 最需要可观测的一步（只记首帧，避免刷屏）。
+                    // 首帧记 debug（排障时用过；info 级会变成每请求一行日志噪声）
                     if c.received == data.len() as u64 {
-                        log::info!(
-                            "qmux: 流 {stream_id} 首个数据帧 {} 字节，前 24 字节 {:02x?}",
-                            data.len(),
-                            &data[..data.len().min(24)]
-                        );
+                        log::debug!("qmux: 流 {stream_id} 首个数据帧 {} 字节", data.len());
                     }
                     if let Some(tx) = c.events.as_ref() {
                         let _ = tx.send(StreamEvent::Data(Bytes::from(data)));

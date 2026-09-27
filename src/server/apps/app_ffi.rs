@@ -329,7 +329,7 @@ pub fn resolve_lib(app: &AppRouteConfig, engine: &str) -> Result<PathBuf> {
         return Ok(p.clone());
     }
     let env_key = format!("APPENGINE_{}_LIB", engine.to_ascii_uppercase());
-    if let Ok(p) = std::env::var(&env_key) {
+    if let Some(p) = env_lock::read_static_env(&env_key) {
         return Ok(PathBuf::from(p));
     }
     Ok(PathBuf::from(format!(

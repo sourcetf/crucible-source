@@ -30,8 +30,7 @@ use tokio::net::TcpStream;
 /// Fair-gate knobs retained from overnight tuning.
 /// Override at runtime with `CRUCIBLE_BATCH_CAP` (sweep_batch_cap.sh).
 pub fn h2_batch_cap() -> usize {
-    std::env::var("CRUCIBLE_BATCH_CAP")
-        .ok()
+    crate::server::apps::env_lock::read_static_env("CRUCIBLE_BATCH_CAP")
         .and_then(|s| s.parse().ok())
         .filter(|n| *n > 0 && *n <= 256)
         .unwrap_or(BATCH_CAP)
