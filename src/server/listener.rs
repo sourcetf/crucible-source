@@ -163,7 +163,8 @@ async fn dispatch_plain(
     let prefix: &[u8] = plain_prefix.as_slice();
     // 草案 §10.1：非 TLS 时用首 8 字节的协议魔数识别 QMux（QX_TRANSPORT_PARAMETERS 的帧类型
     // 字段，wire 上是 `\xffQMX\r\n\r\n`）。与 h2 prior-knowledge 是同一条嗅探路径。
-    if lc.qmux && prefix.starts_with(crate::server::qmux::proto::QX_TP_TYPE_WIRE) {
+    // 注意：规范编码下首字节是**记录 Size**，魔数在其后（见 proto::plaintext_is_qmux 的说明）。
+    if lc.qmux && crate::server::qmux::proto::plaintext_is_qmux(prefix) {
         // 已 try_read 走的字节必须交回协议层，否则首帧被吞
         let io = crate::server::prefixed_stream::PrefixedStream::new(stream, prefix.to_vec());
         crate::server::qmux::serve_h1(io, live, lc, peer).await

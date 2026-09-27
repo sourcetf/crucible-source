@@ -68,6 +68,26 @@ const HEADER_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(
 /// 单个请求的头部条数上限：几十万行头部是廉价的内存/CPU 放大面。
 const MAX_HEADERS: usize = 100;
 
+/// 同 [`serve_tls`]，但**允许半关闭**（对端发完请求就 FIN）。
+///
+/// 为什么需要单独一个入口：hyper 的 `allow_half_close` 默认为 **false**，
+/// 此时「消息在途中读到 EOF」会直接报 `IncompleteMessage`（
+/// `proto/h1/conn.rs::mid_message_detect_eof`）—— 哪怕请求头已经收全。
+/// **QMux 上这是常态**：客户端把 FIN 与请求数据放在同一条记录里一起发出，
+/// 于是 hyper 在派发响应之前就看到了 EOF，连接被判失败（表现为「连上了但什么都不发生」）。
+/// TCP 侧保持原行为不变（现网客户端不会在同一时刻半关闭），需要时再单独评估。
+pub async fn serve_tls_half_close<IO>(
+    stream: IO,
+    live: Arc<LiveConfig>,
+    lc: ListenerConfig,
+    peer: SocketAddr,
+) -> Result<()>
+where
+    IO: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    serve_io_opts(TokioIo::new(stream), live, lc, peer, true).await
+}
+
 pub async fn serve_with_prefix(
     stream: TcpStream,
     live: Arc<LiveConfig>,
@@ -111,20 +131,37 @@ async fn serve_io<IO>(
 where
     IO: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
+    serve_io_opts(io, live, lc, peer, false).await
+}
+
+/// `serve_io` 的真正实现；`half_close` 见 [`serve_tls_half_close`] 的说明。
+async fn serve_io_opts<IO>(
+    io: TokioIo<IO>,
+    live: Arc<LiveConfig>,
+    lc: ListenerConfig,
+    peer: SocketAddr,
+    half_close: bool,
+) -> Result<()>
+where
+    IO: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
     let svc = service_fn(move |req: Request<Incoming>| {
         let live = Arc::clone(&live);
         let lc = lc.clone();
         async move { Ok::<_, std::convert::Infallible>(handle_request(req, live, lc, peer).await) }
     });
-    hyper::server::conn::http1::Builder::new()
-        // 设了 header_read_timeout 就**必须**给 Timer：否则 hyper 在每个连接上
-        // panic（common/time.rs: "timeout set, but no timer set"）—— 实测那样会让
-        // 整个 h1 监听口失效（accept 任务被杀，9095/9081 全停）。
+    let mut builder = hyper::server::conn::http1::Builder::new();
+    // 设了 header_read_timeout 就**必须**给 Timer：否则 hyper 在每个连接上
+    // panic（common/time.rs: "timeout set, but no timer set"）—— 实测那样会让
+    // 整个 h1 监听口失效（accept 任务被杀，9095/9081 全停）。
+    builder
         .timer(hyper_util::rt::TokioTimer::new())
         .header_read_timeout(HEADER_READ_TIMEOUT)
-        .max_headers(MAX_HEADERS)
-        .serve_connection(io, svc)
-        .await?;
+        .max_headers(MAX_HEADERS);
+    if half_close {
+        builder.half_close(true);
+    }
+    builder.serve_connection(io, svc).await?;
     Ok(())
 }
 

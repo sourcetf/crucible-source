@@ -1630,3 +1630,33 @@ fn h3_body_from_recv(mut recv: /* recv 半边类型 */) -> H3Body {
 `QmuxStream::poll_read` 各加一行 debug 日志，确认 h1 到底收到了什么字节；
 ② 用单测直接驱动 `qmux::serve_h1`（内存 duplex）跑一个真实 HTTP 请求，把范围压到
 「handler 装配」或「流 I/O」二者之一。`qmux` 默认关，生产未启用，不影响现网。
+
+### 21.20 QMux 端到端打通（build67）—— 两个真 bug 的根因与修法
+
+**① hyper 把「响应派发前的 EOF」判成 IncompleteMessage（半关闭默认关）**
+QMux 客户端把 FIN 与请求数据放在**同一条记录**里发出（实测如此），服务端在同一次交付里既给
+请求字节又给 EOF。hyper 的 `allow_half_close` 默认 **false**，`proto/h1/conn.rs::mid_message_detect_eof`
+直接报 `IncompleteMessage` —— 哪怕请求头已收全。现象：ALPN 成功、服务端发了参数、流上字节正确
+（日志确认 `GET /probe2 HTTP/1.` 已交付 h1），但**永远没有响应**，且 h1 的错误此前只在 debug 级。
+修法：h1 新增 `serve_tls_half_close()`（`http1::Builder::half_close(true)`），**只给 QMux 用**；
+TCP 侧不变（现网客户端不会同时半关闭；要不要一起改属单独评估项）。
+排障手法记录：先用「只读服务端参数」和「发 QX_PING 看是否回声」把范围压到「协议层没问题」，
+再写一个**内存 duplex 的端到端单测**（`h1_over_qmux_end_to_end`）把 HTTP 跑起来，
+一次构建就能复现，比反复重启线上实例快得多 —— 这条单测现在留在仓库里防回归。
+
+**② 明文识别的魔数位置偏一**（草案自身的表述与 §3.2 冲突）
+§10.1 说用「first 8 bytes exchanged on the transport (i.e., the type field …)」识别，但 §3.2
+规定字节流上**每条记录以 Size 变长整数开头** ⇒ 真实首字节是 Size，魔数在其后。
+原 `prefix.starts_with(MAGIC)` 因此永不成立（明文口把二进制当 h1 直接断开）。
+修法：`proto::plaintext_is_qmux()` —— 魔数在偏移 0 **或**「记录 Size 之后」都认。
+
+**实测（build67）**：端到端单测 ok；全套 **162 passed / 0 failed**；
+TLS（ALPN `h1-02qx`）与明文（魔数）两条路径用 Python QMux 客户端各自拿到 **HTTP/1.1 200 OK**；
+链路日志 `对端发起新流 0` → `首个数据帧 N 字节` → h1 访问日志齐全 ✓。
+
+**顺带**：`serve_h1` 里 h1 会话失败由 debug 提到 **warn**（「协议面不可用」级别事件不该静默 ——
+本轮排障就是被它卡的）。
+
+**未做（交接）**：① 生产尚未部署 build67（生产配置没开 `qmux`，不受影响；要上线就停/起两次调用）；
+② TCP 侧是否也该允许半关闭（RFC 上更宽容，现有实现会把「发完就 FIN」的客户端判失败）——
+建议单独评估，不要与其它改动混在一起。

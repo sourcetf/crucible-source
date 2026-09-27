@@ -159,6 +159,24 @@ pub const QX_TP_TYPE: u64 = 0x3f51_4d58_0d0a_0d0a;
 pub const QX_TP_TYPE_DOC_HEX: u64 = 0x3f51_5330_0d0a_0d0a;
 /// `QX_TRANSPORT_PARAMETERS` 在 wire 上的 8 个字节（§4.2 的魔数，§10.1 的协议识别字节）。
 pub const QX_TP_TYPE_WIRE: &[u8] = b"\xffQMX\r\n\r\n";
+
+/// 明文传输上「这一串字节是不是 QMux」的判定（草案 §10.1）。
+///
+/// §10.1 说用「first 8 bytes exchanged on the transport (i.e., the type field of the
+/// QX_TRANSPORT_PARAMETERS frame in its encoded form)」识别 —— 但 §3.2 规定字节流上
+/// **每条记录都以 Size 变长整数开头**，所以真实首字节是 Size，魔数在其后。
+/// 因此这里两种都认：魔数在偏移 0（对端若按 §10.1 的字面意思直接发帧类型），
+/// 以及魔数紧跟在**记录 Size** 之后（按 §3.2 的规范编码，也就是本实现的发送方式）。
+pub fn plaintext_is_qmux(buf: &[u8]) -> bool {
+    if buf.len() >= 8 && &buf[..8] == QX_TP_TYPE_WIRE {
+        return true;
+    }
+    let mut pos = 0usize;
+    if get_varint(buf, &mut pos).is_ok() && buf.len() >= pos + 8 {
+        return &buf[pos..pos + 8] == QX_TP_TYPE_WIRE;
+    }
+    false
+}
 pub const QX_PING_REQ: u64 = 0x348c_6752_9ef8_c7bd;
 pub const QX_PING_RESP: u64 = 0x348c_6752_9ef8_c7be;
 pub const FRAME_PADDING: u64 = 0x00;

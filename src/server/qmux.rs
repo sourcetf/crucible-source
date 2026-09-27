@@ -57,14 +57,136 @@ where
         let live = Arc::clone(&live);
         let lc = lc.clone();
         async move {
-            // h1::serve_tls 接受任意 AsyncRead+AsyncWrite（内部包 TokioIo），
-            // 所以一条 QMux 流可以直接当「连接」用。
-            if let Err(e) = crate::server::h1::serve_tls(stream, live, lc, peer).await {
-                log::debug!("qmux: h1 会话结束 peer={peer}: {e:#}");
+            // **必须用 half_close 版本**：QMux 客户端会把 FIN 与请求数据放在同一条记录里，
+            // hyper 默认（allow_half_close=false）会把「响应派发前的 EOF」判成
+            // `IncompleteMessage`，现象是「连上了但什么都不发生」。详见 h1::serve_tls_half_close。
+            if let Err(e) = crate::server::h1::serve_tls_half_close(stream, live, lc, peer).await {
+                // warn 而不是 debug：QMux 流上的 h1 会话失败是「协议面不可用」级别的
+                // 事件，静默掉就等于什么都看不到，无从排障。
+                log::warn!("qmux: h1 会话结束 peer={peer}: {e:#}");
             }
         }
     })
     .await
+}
+
+#[cfg(test)]
+mod compose_tests {
+    use super::*;
+    use crate::server::qmux::proto::{self, put_varint, Frame, RecordReader};
+
+    /// 端到端：QMux 上跑一个**真实 HTTP/1.1 请求**，必须拿到 HTTP 响应。
+    ///
+    /// 这条测试专门覆盖「QMux 流 ↔ hyper」的接缝（协议层已有 19 条测试、ALPN 与
+    /// 明文魔数也实测过，问题只可能出在这一段）。
+    #[tokio::test]
+    async fn h1_over_qmux_end_to_end() {
+        let (a, b) = tokio::io::duplex(64 * 1024);
+        let mut lc = crate::config::ListenerConfig::default();
+        lc.root = std::env::temp_dir();
+        lc.http_versions = vec!["h1".to_string()];
+        lc.qmux = true;
+        // 注意：**不设 lc.ssl** —— 这里只要 HTTP/1.1 能正常处理，避免 301 跳转干扰
+        let live = std::sync::Arc::new(crate::server::live_config::LiveConfig::new(
+            crate::config::Config::default(),
+            std::path::PathBuf::from("/tmp/qmux-test.toml"),
+        ));
+        let srv = tokio::spawn(serve_h1(b, live, lc, "127.0.0.1:1".parse().unwrap()));
+
+        let mut io = a;
+        let mut rd = RecordReader::new();
+        // 1) 读服务端传输参数（§4.2：它不等我们）
+        let mut buf = [0u8; 4096];
+        let n = tokio::io::AsyncReadExt::read(&mut io, &mut buf).await.unwrap();
+        eprintln!("[test] 读到服务端首记录 {n} 字节");
+        rd.push(&buf[..n]);
+        let body = rd.next_record().unwrap().expect("服务端参数记录");
+        let frames = proto::parse_frames(&body).unwrap();
+        eprintln!("[test] 服务端首记录帧: {frames:?}");
+        assert!(matches!(
+            frames.first(),
+            Some(Frame::QxTransportParameters(_))
+        ));
+
+        // 2) 发我方传输参数 + 一个带 FIN 的 STREAM（HTTP/1.1 GET）
+        //
+        // 注意编码：传输参数的值是「变长整数，前面再带自己的长度」。最初这里把长度硬写成 1
+        // 而值实际占 4 字节 —— 服务端解析立刻失步并回 `varint: 截断`（error_code=7），
+        // 现象与「QMux 用不了」一模一样。长度必须**算出来**。
+        fn tp_item(id: u64, val: u64) -> Vec<u8> {
+            let mut out = Vec::new();
+            put_varint(&mut out, id);
+            let mut tmp = Vec::new();
+            put_varint(&mut tmp, val);
+            put_varint(&mut out, tmp.len() as u64);
+            out.extend_from_slice(&tmp);
+            out
+        }
+        let mut tp = tp_item(0x05, 1 << 20); // initial_max_stream_data_bidi_local
+        tp.extend(tp_item(0x04, 1 << 20)); // initial_max_data
+        let req = b"GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n".to_vec();
+        let mut out = Vec::new();
+        proto::encode_record(
+            &[
+                Frame::QxTransportParameters(tp),
+                Frame::Stream {
+                    stream_id: 0,
+                    offset: 0,
+                    fin: true,
+                    data: req,
+                },
+            ],
+            &mut out,
+        );
+        tokio::io::AsyncWriteExt::write_all(&mut io, &out).await.unwrap();
+        eprintln!("[test] 已发请求（{} 字节记录）", out.len());
+
+        // 3) 读响应：拼 STREAM 载荷直到 FIN
+        let mut got = Vec::new();
+        let deadline = tokio::time::timeout(std::time::Duration::from_secs(8), async {
+            loop {
+                loop {
+                    if let Some(body) = rd.next_record().unwrap() {
+                        for f in proto::parse_frames(&body).unwrap() {
+                            match f {
+                                Frame::Stream { offset, data, fin, .. } => {
+                                    assert_eq!(offset, got.len() as u64, "偏移必须连续");
+                                    got.extend_from_slice(&data);
+                                    if fin {
+                                        return;
+                                    }
+                                }
+                                other => eprintln!("[test] 其他帧: {other:?}"),
+                            }
+                        }
+                    } else {
+                        break;
+                    }
+                }
+                let n = tokio::io::AsyncReadExt::read(&mut io, &mut buf)
+                    .await
+                    .unwrap();
+                if n == 0 {
+                    eprintln!("[test] 对端关闭（EOF）");
+                    return;
+                }
+                rd.push(&buf[..n]);
+            }
+        })
+        .await;
+        eprintln!(
+            "[test] 结果 deadline={:?} 收到 {} 字节: {}",
+            deadline.is_err(),
+            got.len(),
+            String::from_utf8_lossy(&got[..got.len().min(200)])
+        );
+        assert!(
+            got.starts_with(b"HTTP/1.1 "),
+            "期望 HTTP 响应，实际 {:?}",
+            String::from_utf8_lossy(&got[..got.len().min(200)])
+        );
+        srv.abort();
+    }
 }
 
 /// 单连接默认并发请求流上限。
