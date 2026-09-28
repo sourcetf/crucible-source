@@ -200,6 +200,15 @@ fn self_signed(cn: &str) -> (X509, PKey<boring::pkey::Private>) {
     b.set_pubkey(&pkey).expect("pubkey");
     b.set_not_before(&Asn1Time::days_from_now(0).expect("nb")).expect("set nb");
     b.set_not_after(&Asn1Time::days_from_now(30).expect("na")).expect("set na");
+    // SAN：现代 CA 一律走 SAN，`cert_covers` 也优先看它（只给 CN 的证书现实中已罕见）
+    {
+        use boring::x509::extension::SubjectAlternativeName;
+        let san = SubjectAlternativeName::new()
+            .dns(cn)
+            .build(&b.x509v3_context(None, None))
+            .expect("build san");
+        b.append_extension(&san).expect("append san");
+    }
     b.sign(&pkey, MessageDigest::sha256()).expect("sign");
     (b.build(), pkey)
 }
@@ -276,5 +285,181 @@ fn ech_cover_certificate_selection() {
         "非 ECH 客户端必须拿到 **cover 证书**"
     );
 
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// **探测防护**（关键安全验收）：客户端**不带 ECH**、却把 SNI 写成**内层真实名**时，
+/// 必须只拿到 **cover 证书** —— 否则任何主动探测者都能用「猜 SNI」确认本机持有该域名的
+/// 证书，cover 也就形同虚设。判据必须是 `ech_accepted()`，不能按域名。
+#[test]
+fn probe_with_real_name_without_ech_gets_cover() {
+    use crate::config::{ListenerConfig, SslConfig};
+    use crate::server::ech_auto::{generate, EchSpec};
+
+    let dir = std::env::temp_dir().join(format!("crucible-ech-probe-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("mkdir");
+    let (real_cert, real_key) = self_signed("real.example.com");
+    let (cover_cert, cover_key) = self_signed("cover.example.com");
+    let (rc, rk) = write_pair(&dir, "real", &real_cert, &real_key);
+    let (cc, ck) = write_pair(&dir, "cover", &cover_cert, &cover_key);
+
+    let spec = EchSpec::from_config(Some("cover.example.com"), None, None).expect("spec");
+    let mat = generate(&spec).expect("generate");
+    let ek = dir.join("ech.pem");
+    std::fs::write(&ek, mat.to_pem()).expect("write ech pem");
+
+    let ssl_cfg = SslConfig {
+        cert: Some(rc),
+        key: Some(rk),
+        ech: true,
+        ech_keys: Some(ek.to_string_lossy().to_string()),
+        ech_public_name: Some("cover.example.com".into()),
+        ech_cover_cert: Some(cc),
+        ech_cover_key: Some(ck),
+        ..Default::default()
+    };
+    let acceptor = crate::server::tls::boring_path::build_acceptor(&ssl_cfg, &ListenerConfig::default())
+        .expect("acceptor");
+
+    // 探测：SNI=真实名，**不发 ECH**
+    let client = client_ctx();
+    let (accepted, sni, cn) = handshake(acceptor.context(), &client, "real.example.com", None);
+    eprintln!("[ech-probe] 探测(SNI=真实名,无 ECH): accepted={accepted} SNI={sni:?} 证书 CN={cn:?}");
+    assert!(!accepted, "不该达成 ECH");
+    assert_eq!(
+        cn.as_deref(),
+        Some("cover.example.com"),
+        "不带 ECH 的探测连接**必须**只拿到 cover 证书（否则 ECH 失去意义）"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// **ECH 被拒**路径（RFC 9849：客户端持过期/不匹配的 ECHConfig）：服务端解不开 ⇒
+/// 退回外层参数 ⇒ 必须发 **cover 证书**（客户端按 public_name 校验），且 `ech_accepted=false`。
+#[test]
+fn rejected_ech_falls_back_to_cover() {
+    use crate::config::{ListenerConfig, SslConfig};
+    use crate::server::ech_auto::{generate, EchSpec};
+
+    let dir = std::env::temp_dir().join(format!("crucible-ech-rej-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("mkdir");
+    let (real_cert, real_key) = self_signed("real.example.com");
+    let (cover_cert, cover_key) = self_signed("cover.example.com");
+    let (rc, rk) = write_pair(&dir, "real", &real_cert, &real_key);
+    let (cc, ck) = write_pair(&dir, "cover", &cover_cert, &cover_key);
+
+    // 服务端装 B 的密钥；客户端拿 A 的 ECHConfig（密钥不匹配 ⇒ 服务端解不开）
+    let spec_a = EchSpec::from_config(Some("cover.example.com"), None, None).expect("spec a");
+    let spec_b = EchSpec::from_config(Some("cover.example.com"), None, None).expect("spec b");
+    let mat_a = generate(&spec_a).expect("gen a");
+    let mat_b = generate(&spec_b).expect("gen b");
+    let ek = dir.join("ech-b.pem");
+    std::fs::write(&ek, mat_b.to_pem()).expect("write b");
+
+    let ssl_cfg = SslConfig {
+        cert: Some(rc),
+        key: Some(rk),
+        ech: true,
+        ech_keys: Some(ek.to_string_lossy().to_string()),
+        ech_public_name: Some("cover.example.com".into()),
+        ech_cover_cert: Some(cc),
+        ech_cover_key: Some(ck),
+        ..Default::default()
+    };
+    let acceptor = crate::server::tls::boring_path::build_acceptor(&ssl_cfg, &ListenerConfig::default())
+        .expect("acceptor");
+
+    // 客户端用 A 的 config_list（服务端没有对应私钥）
+    let client = client_ctx();
+    let (accepted, sni, cn) =
+        handshake(acceptor.context(), &client, "real.example.com", Some(&mat_a.config_list));
+    eprintln!("[ech-rej] ECH 被拒: accepted={accepted} 服务端 SNI={sni:?} 证书 CN={cn:?}");
+    assert!(!accepted, "密钥不匹配时不应达成 ECH");
+    assert_eq!(
+        cn.as_deref(),
+        Some("cover.example.com"),
+        "ECH 被拒后必须回退到 cover 证书"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// **证书不得混用**（RFC 9849 的部署要求）：把同一张证书同时配成真实与 cover
+/// 必须在**配置期**被拒 —— 否则任何连接看到的证书都一样，ECH 失去意义。
+#[test]
+fn same_cert_for_inner_and_outer_is_rejected() {
+    use crate::config::{ListenerConfig, SslConfig};
+    use crate::server::ech_auto::{generate, EchSpec};
+
+    let dir = std::env::temp_dir().join(format!("crucible-ech-same-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("mkdir");
+    let (only_cert, only_key) = self_signed("cover.example.com");
+    let (pc, pk) = write_pair(&dir, "only", &only_cert, &only_key);
+
+    let spec = EchSpec::from_config(Some("cover.example.com"), None, None).expect("spec");
+    let mat = generate(&spec).expect("generate");
+    let ek = dir.join("ech.pem");
+    std::fs::write(&ek, mat.to_pem()).expect("write ech pem");
+
+    let ssl_cfg = SslConfig {
+        cert: Some(pc.clone()),
+        key: Some(pk.clone()),
+        ech: true,
+        ech_keys: Some(ek.to_string_lossy().to_string()),
+        ech_public_name: Some("cover.example.com".into()),
+        // 同一张证书充当 cover ⇒ 必须被拒
+        ech_cover_cert: Some(pc),
+        ech_cover_key: Some(pk),
+        ..Default::default()
+    };
+    let err = match crate::server::tls::boring_path::build_acceptor(&ssl_cfg, &ListenerConfig::default()) {
+        Ok(_) => panic!("同一张证书必须被拒绝，但构建成功了"),
+        Err(e) => e,
+    };
+    let msg = format!("{err:#}");
+    eprintln!("[ech-same] 预期报错: {msg}");
+    assert!(
+        msg.contains("同一张"),
+        "报错信息应明确说明内外层不能用同一张证书，实际: {msg}"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// cover 证书不覆盖 `ech_public_name` ⇒ 配置期报错（否则回退路径客户端校验必然失败）。
+#[test]
+fn cover_not_covering_public_name_is_rejected() {
+    use crate::config::{ListenerConfig, SslConfig};
+    use crate::server::ech_auto::{generate, EchSpec};
+
+    let dir = std::env::temp_dir().join(format!("crucible-ech-cov-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("mkdir");
+    let (real_cert, real_key) = self_signed("real.example.com");
+    let (wrong_cert, wrong_key) = self_signed("other.example.net"); // 不覆盖 public_name
+    let (rc, rk) = write_pair(&dir, "real", &real_cert, &real_key);
+    let (wc, wk) = write_pair(&dir, "wrong", &wrong_cert, &wrong_key);
+
+    let spec = EchSpec::from_config(Some("cover.example.com"), None, None).expect("spec");
+    let mat = generate(&spec).expect("generate");
+    let ek = dir.join("ech.pem");
+    std::fs::write(&ek, mat.to_pem()).expect("write ech pem");
+
+    let ssl_cfg = SslConfig {
+        cert: Some(rc),
+        key: Some(rk),
+        ech: true,
+        ech_keys: Some(ek.to_string_lossy().to_string()),
+        ech_public_name: Some("cover.example.com".into()),
+        ech_cover_cert: Some(wc),
+        ech_cover_key: Some(wk),
+        ..Default::default()
+    };
+    let err = match crate::server::tls::boring_path::build_acceptor(&ssl_cfg, &ListenerConfig::default()) {
+        Ok(_) => panic!("cover 未覆盖 public_name 必须被拒绝，但构建成功了"),
+        Err(e) => e,
+    };
+    eprintln!("[ech-cov] 预期报错: {err:#}");
+    assert!(format!("{err:#}").contains("不覆盖"));
     let _ = std::fs::remove_dir_all(&dir);
 }

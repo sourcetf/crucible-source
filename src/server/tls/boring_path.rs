@@ -11,7 +11,7 @@ use crate::server::{h1, h2};
 use anyhow::{Context, Result};
 use boring::pkey::PKey;
 use boring::ssl::{SslAcceptor, SslAcceptorBuilder, SslMethod, SslVersion, NameType};
-use boring::x509::X509;
+use boring::x509::{X509, X509Ref};
 use once_cell::sync::Lazy;
 use parking_lot::Mutex;
 use std::collections::HashMap;
@@ -150,6 +150,44 @@ fn load_identity(builder: &mut SslAcceptorBuilder, ssl: &SslConfig) -> Result<()
         _ => None,
     };
 
+    // ECH（RFC 9849）部署约束 —— 全部**配置期 fail-fast**，不做静默降级：
+    //
+    // ① 外层（cover）与内层（真实）必须是**两张不同的证书**。若用同一张，任何连接
+    //    （含不做 ECH 的探测者）看到的证书都一样，ECH 就失去意义 —— 中间人凭证书即可
+    //    关联出「这台主机在服务哪个真实域名」。
+    // ② cover 证书必须**覆盖 `ech_public_name`**：客户端未用 ECH、或 ECH 被拒时看到的是
+    //    外层名，它按 public_name 校验证书；cover 不覆盖它 ⇒ 回退路径直接校验失败。
+    // ③ cover 与 OCSP 装订**同时开启**时直接报错：staple 是**逐证书的单份 DER**
+    //    （`set_ocsp_status` 只装一份），而我们会在两套证书之间切换 ⇒ 必然有一边拿到
+    //    不匹配的 staple：严格客户端校验失败、宽松客户端**撤回检查静默失效**（比不装订更糟）。
+    //    与其错配，不如明确要求二选一。
+    if let Some((cc, _ck)) = &cover {
+        let public_name = ssl
+            .ech_public_name
+            .as_deref()
+            .context("ECH cover 需要 ssl.ech_public_name（RFC 9849 的 public_name）")?
+            .trim()
+            .to_string();
+        if cert.to_der()? == cc.to_der()? {
+            anyhow::bail!(
+                "ECH: cover 证书与真实证书是**同一张**（DER 完全相同）—— RFC 9849 要求内外层分离；\
+同一张证书会让 ECH 失去意义（中间人凭证书即可关联真实域名）"
+            );
+        }
+        if !cert_covers(cc, &public_name) {
+            anyhow::bail!(
+                "ECH: cover 证书不覆盖 ech_public_name={public_name} —— 未使用 ECH / ECH 被拒的\
+客户端会按 public_name 校验证书，必然失败"
+            );
+        }
+        if ssl.ocsp_der_path.is_some() {
+            anyhow::bail!(
+                "ECH cover 证书与 ssl.ocsp_der_path 不能同时配置：OCSP staple 是逐证书的单份 DER，\
+两套证书间切换必然有一边错配（严格客户端校验失败、宽松客户端撤回检查静默失效）。请二选一"
+            );
+        }
+    }
+
     match &cover {
         Some((cc, ck)) => {
             builder.set_certificate(cc)?;
@@ -171,44 +209,84 @@ fn load_identity(builder: &mut SslAcceptorBuilder, ssl: &SslConfig) -> Result<()
     }
 
     if cover.is_some() {
-        // servername 回调在 **ECH 处理之后**调用：ECH 被接受时服务端看到的是**解密后的
-        // 内层真实名**，否则看到的是明文外层名（= ech_public_name）。
-        // 于是「看到的名字 != 公开名」⇒ 这是 ECH 客户端 ⇒ 换成真实证书；
-        // 等于公开名（或客户端没发 SNI）⇒ 保持 cover。
-        let public_name = ssl
-            .ech_public_name
-            .as_deref()
-            .map(|n| n.trim().trim_end_matches('.').to_ascii_lowercase());
+        // RFC 9849：证书选择判据是 **ECH 是否被接受**（`SSL_ech_accepted`），
+        // **不能用域名比较** —— 按名字判等于「谁把 SNI 写成真实名，谁就拿到真实证书」，
+        // 那既让 cover 形同虚设，又向主动探测者确认了「本机持有该域名的证书」。
+        //
+        // * `ech_accepted() == true`：客户端用了 ECH 且解密成功，服务端看到的是**内层真实名**
+        //   ⇒ 用真实证书（TLS1.3 下证书对被动观察者加密，MITM 看不到）。
+        // * `false`（客户端没发 ECH，或发了但被拒后回退）：一律用 **cover**。
+        //   —— 包括「SNI 恰好是真实名」的探测连接：它们只配看到外层证书。
+        // 注：本回调在 **ECH 处理之后**运行（实测：ECH 客户端在此处已能看到内层名）。
         let real_cert = cert.clone();
         let real_key = key.clone();
         let real_ec = ec_pair.as_ref().map(|(c, k)| (c.clone(), k.clone()));
         builder.set_servername_callback(move |s, _alert| {
-            let seen = s
-                .servername(NameType::HOST_NAME)
-                .map(|n| n.trim_end_matches('.').to_ascii_lowercase());
-            // 判定：看到了公开名（外层）⇒ 用 cover；否则（含无 SNI / 内层真实名）⇒ 用真实证书。
-            // 无 SNI 时保守用 cover：那种客户端本来也拿不到 ECH（ECH 必须有名字），
-            // 而 cover 才是它按 public_name 期望的那张。
-            let use_cover = match (&seen, &public_name) {
-                (Some(s), Some(p)) => s == p,
-                _ => true,
-            };
-            if !use_cover {
-                if s.set_certificate(&real_cert).is_err() || s.set_private_key(&real_key).is_err() {
-                    log::warn!("ech: 切换到真实证书失败（保持 cover）");
-                    return Err(boring::ssl::SniError::ALERT_FATAL);
-                }
-                if let Some((ec_c, ec_k)) = &real_ec {
-                    // 备用 EC 链同样切成真实的（失败不回退，但记日志）
-                    let _ = s.set_certificate(ec_c);
-                    let _ = s.set_private_key(ec_k);
-                }
-                log::debug!("ech: 服务端看到内层名 {seen:?} ⇒ 使用真实证书");
+            if !s.ech_accepted() {
+                // 未接受 ECH：保持容器默认（cover）证书，不加任何额外动作
+                return Ok(());
             }
+            if s.set_certificate(&real_cert).is_err() || s.set_private_key(&real_key).is_err() {
+                log::warn!("ech: ECH 已接受但切换真实证书失败（保持 cover）");
+                return Err(boring::ssl::SniError::ALERT_FATAL);
+            }
+            if let Some((ec_c, ec_k)) = &real_ec {
+                // 备用 EC 链同样切成真实的，否则 ECDSA 客户端拿到不匹配的链
+                let _ = s.set_certificate(ec_c);
+                let _ = s.set_private_key(ec_k);
+            }
+            // 日志不脱敏（本地存储安全，用户明确要求）：内层名便于排障。
+            log::debug!(
+                "ech: accepted ⇒ 真实证书（服务端看到内层名 {:?}）",
+                s.servername(NameType::HOST_NAME)
+            );
             Ok(())
         });
     }
     Ok(())
+}
+
+/// 名字匹配（通配符感知，RFC 6125 §6.4.3 的简化：只支持最左 `*.`）。
+fn dns_name_matches(pattern: &str, name: &str) -> bool {
+    let p = pattern.trim().trim_end_matches('.').to_ascii_lowercase();
+    let n = name.trim().trim_end_matches('.').to_ascii_lowercase();
+    if p == n {
+        return true;
+    }
+    if let Some(rest) = p.strip_prefix("*.") {
+        // 通配符只匹配**一个**标签：`*.example.com` 匹配 `a.example.com`，不匹配
+        // `a.b.example.com`、也不匹配 `example.com` 本身。
+        return match n.split_once('.') {
+            Some((_, tail)) => tail == rest,
+            None => false,
+        };
+    }
+    false
+}
+
+/// 证书是否覆盖该名字：**SAN 优先**，CN 仅作兼容回退（现代 CA 一律走 SAN）。
+fn cert_covers(cert: &X509Ref, name: &str) -> bool {
+    if let Some(sans) = cert.subject_alt_names() {
+        for gn in sans.iter() {
+            if let Some(dns) = gn.dnsname() {
+                if dns_name_matches(dns, name) {
+                    return true;
+                }
+            }
+        }
+    }
+    if let Some(cn) = cert
+        .subject_name()
+        .entries_by_nid(boring::nid::Nid::COMMONNAME)
+        .next()
+    {
+        if let Ok(s) = std::str::from_utf8(cn.data().as_slice()) {
+            if dns_name_matches(s, name) {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 /// BoringSSL 内置的 TLS1.3 套件名（`ssl_cipher.cc` 的 kCiphers 里 algorithm_mkey ==

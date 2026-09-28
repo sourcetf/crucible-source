@@ -1761,4 +1761,50 @@ QMux v1 协议本体与端到端打通。仍然留在用户手上的只有投产
 而不是静默回落到静态）；TLS1.3/1.2 真实套件探针通过；**h3 200**；**SSLv2 探针通过**
 （`sslv2_probe_ok` + 服务存活 + 之后 TLS1.3 仍可用）；geoip ASN 查询返回真实 ASN；
 **无凭据访问 admin → 401** ✓。
-**注**：本轮只改脚本，生产 build68 不受影响。
+**注**：本轮只改脚本，生产 build68 不受影响。### 21.24 ECH 按 RFC 9849 严格部署（build70）：判据、证书分离、MITM 不可区分
+
+**起因**：用户先问「ECH 需要外层 cover 证书吧」，我实现后他追问
+「看看是否符合安全和隐私的最佳实践」。复查发现**我自己的实现有两处真缺陷**，且其中一条
+是安全相关的：
+
+* **[安全] 证书选择用「域名比较」判据**（`seen != ech_public_name` ⇒ 换真实证书）——
+  等价于「**谁把 SNI 猜成真实名，谁就拿到真实证书**」。这既让 cover 形同虚设，
+  又向主动探测者**确认**「本机持有该域名证书」。RFC 9849 的判据是 **`SSL_ech_accepted()`**。
+* **[正确性] 两张证书只有一份 OCSP staple**：`set_ocsp_status` 是**逐证书的单份 DER**，
+  而我们在两套证书间切换 ⇒ 必然一边错配（严格客户端校验失败；宽松客户端**撤回检查静默失效**，
+  比不装订更糟）。这是我引入的且无测试覆盖。
+
+**按用户明确要求实施（RFC 标准 + 不混用证书 + 日志不脱敏）**
+
+1. **判据改为 `SslRef::ech_accepted()`**（`boring_path.rs` servername 回调）：
+   * `true`（客户端用了 ECH 且服务端解密成功）⇒ 用**真实（内层）证书**；
+   * `false`（没发 ECH，或发了被拒后回退）⇒ 一律 **cover** —— **包括 SNI 恰好写成真实名的
+     探测连接**，它们只配看到外层证书。
+2. **证书严格分离，配置期 fail-fast**（三条，均 bail 不静默降级）：
+   * cover 与真实证书 **DER 相同 ⇒ 拒绝**（同一张证书让 ECH 无意义：中间人凭证书即可关联）；
+   * cover 必须**覆盖 `ech_public_name`**（SAN 优先、CN 回退、通配符只匹配一个标签）——
+     否则未用 ECH/被拒的客户端按 public_name 校验必然失败；
+   * cover 与 `ssl.ocsp_der_path` **同时配置 ⇒ 拒绝**（staple 逐证书单份，必然错配）。
+3. **日志不脱敏**（本地存储安全）：保留内层名便于排障。我上一轮建议的"脱敏"作废。
+
+**新增 4 条真机验收用例**（`ech_handshake_test.rs`，用 boring 当 ECH 客户端；
+自签证书带 SAN，不依赖 openssl）
+
+| 用例 | 断言 |
+|---|---|
+| `ech_handshake_accepted_and_inner_name_visible_to_server` | `ech_accepted=true` **且服务端看到内层真实名**（只断前者会被"标称成功"骗过） |
+| `probe_with_real_name_without_ech_gets_cover` | **探测防护**：不带 ECH、SNI=真实名 ⇒ 只拿到 **cover** |
+| `rejected_ech_falls_back_to_cover` | **ECH 被拒**（客户端用不匹配的 ECHConfig）⇒ 回退到 **cover**，`ech_accepted=false` |
+| `same_cert_for_inner_and_outer_is_rejected` / `cover_not_covering_public_name_is_rejected` | 配置期必须报错 |
+
+**MITM 不可区分**如何保证（链路逐段）：
+* 被动观察者只能看到**外层名**（= public_name）与 TLS1.3 加密后的内容；
+* ECH 被接受时证书是**真实证书但经 TLS1.3 加密**传输，MIDM 看不到真实域名；
+* 客户端 **ECH 被拒/未支持**时看到的是 **cover** ⇒ 与普通站点无区别；
+* 内外层证书**必须不同**（配置期强制）⇒ 不存在"同一张证书把两边关联起来"的通路；
+* 探测者用真实名 SNI 也**只**拿到 cover（判据是 `ech_accepted` 而非域名）。
+
+**诚实边界（不遮掩）**：① **TLS1.2 无法承载 ECH** ⇒ 那条路径真实名明文可见、证书明文可见；
+若真实名需要保密，必须同时确保客户端走 TLS1.3+ECH（本报文不解决这一点）。
+② 自动 OCSP（`ocsp_fetcher`）按 `ssl.cert` 取 staple，配了 cover 时同样会错配 ——
+本次只对**显式** `ocsp_der_path` 做了 fail-fast；自动路径的组合限制记在待办。
