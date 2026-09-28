@@ -1711,4 +1711,54 @@ h3 8443 / h1 9081 全 **200**、DNS 解析正常、admin **200**。
 
 **至此三份审计报告的条目已全部处理完**（累计 16 条：1 P0 + 7 P1 + 8 P2），加上本轮新增的
 QMux v1 协议本体与端到端打通。仍然留在用户手上的只有投产前四项决定（admin 强口令、
-`[admin].listeners_allow`、metrics 凭据、是否公开发布 ECH）——那些是只有用户能拍板的。
+`[admin].listeners_allow`、metrics 凭据、是否公开发布 ECH）——那些是只有用户能拍板的。### 21.23 项目自带验收脚本：DNS 两个脚本恒红（6 个真 bug）+ openssl 依赖收尾
+
+**起因**：在 build68 上跑 `scripts/acceptance_test_ports.sh` 的**检查部分**（省略了它会强制重编
+7+ 分钟、以及需要联网下载的步骤），发现项目自己的两个 DNS 验收脚本恒失败
+（`dns_verify.sh` 7/15、`dns_smoke.sh` 18/5）。逐条排查后确认**全是脚本自身的 bug**，
+服务端功能正常（生产递归、DoT、DoH 均实测可用）。这类「验收脚本永远红」等于**DNS 这条线
+从未被真正验过**，属于最该修的一类问题。
+
+**`dns_verify.sh` 的 3 个 bug**
+1. **端口取错**：`grep -oE '"port":[0-9]+' | head -1` —— status JSON 里 `dot` 是嵌套对象且
+   序列化在前，第一个 `"port"` 是 **DoT 口 11853**（测试态）。于是明文 DNS 查询全打到 DoT 口上，
+   A/AAAA/SOA/NS/AXFR/RPZ **全部误报 FAIL**。改为用 python3 解析顶层字段。
+2. **`q2.bin` 从未生成**：DoH POST 与 DoT 都用 `--data-binary @/tmp/q2.bin`，但没有任何地方写过
+   它（原本靠另一个脚本残留）⇒ 两项恒失败。改为脚本内从 base64 生成。
+3. **依赖 openssl**（DoT 用 `openssl s_client … | strings`）：用户明确要求项目不依赖 openssl。
+   改用 python3 + ssl 实现 RFC7858 探测。
+
+**`dns_smoke.sh` 的 3 个 bug**
+4. **`api()` 不带 `$BASE`**：调用点写的是 `api /api/dns/status`，相对路径被 curl 当 URL ⇒
+   **所有 GET 检查恒失败**（POST 因 `post()` 自己拼了 `$BASE` 反而正常）。新增 `get()` 并替换。
+5. **`$WIRE_B64` 先用后定义**（第 77 行用、第 88 行才赋值）且把 `/tmp/dns_smoke_q.bin` 当**命令**
+   执行 ⇒ DoT/DoH 恒失败。
+6. 同上的 openssl 依赖。
+
+**两个脚本的共性问题（也修了）**：递归检查在 `modes.root = true` 时会得到**权威 NXDOMAIN** ——
+那是**正确行为**不是故障（`dns_smoke.sh` 第 0 步自己就把 root 打开了）。改为读 status 判断 root
+模式并如实 **SKIP**，不报假 FAIL。
+
+**openssl 依赖收尾**：`generate_test_certs.sh` 会在第 5 行 `openssl version` 失败即 `exit 1`
+（且带 `set -e`）—— **即使四张证书全都存在、什么都没必要做，脚本仍然报错退出**，让调用方
+（`acceptance.sh`）在「已卸载 openssl 的正常机器」上直接失败。改为：证书齐全 → 直接成功退出
+（部署路径本就不需要生成工具）；只有证书缺失时才找生成器（先 `bssl`，再 `openssl`），
+都没有则给出明确指引。**实测**：`sh scripts/generate_test_certs.sh` → 打印
+「test certs ready（仓库自带，无需生成）」、`exit=0`。
+（仍以 openssl 为**最后**回退的还有 `start_server*.sh` / `nightly_complete.sh` 的证书生成块，
+它们本就 `if [ ! -f ]` 守卫，证书在时不会调用 openssl；要彻底去掉得先有 bssl 可用的生成路径。）
+
+**实测**
+
+| 脚本 | 修复前 | 修复后 |
+|---|---|---|
+| `scripts/dns_verify.sh` | `PASS=7 FAIL=15` | **`PASS=21 FAIL=0`** |
+| `scripts/dns_smoke.sh` | `PASS=18 FAIL=5` | **`PASS=22 FAIL=0`** |
+| `scripts/generate_test_certs.sh` | 缺 openssl 即失败（哪怕证书齐全） | **退出 0** |
+
+**同轮 acceptance 检查（build68，省略强制重编/联网步骤）**：引擎 smoke 大多 200
+（`ruby`/`psgi`/`rack`/`jsp` → 502，是本机**未装 ruby**、JSP sidecar 未起，且它们是**诚实的 502**
+而不是静默回落到静态）；TLS1.3/1.2 真实套件探针通过；**h3 200**；**SSLv2 探针通过**
+（`sslv2_probe_ok` + 服务存活 + 之后 TLS1.3 仍可用）；geoip ASN 查询返回真实 ASN；
+**无凭据访问 admin → 401** ✓。
+**注**：本轮只改脚本，生产 build68 不受影响。
