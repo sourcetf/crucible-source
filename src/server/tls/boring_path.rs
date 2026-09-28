@@ -10,7 +10,7 @@ use crate::server::ssl_material;
 use crate::server::{h1, h2};
 use anyhow::{Context, Result};
 use boring::pkey::PKey;
-use boring::ssl::{SslAcceptor, SslAcceptorBuilder, SslMethod, SslVersion};
+use boring::ssl::{SslAcceptor, SslAcceptorBuilder, SslMethod, SslVersion, NameType};
 use boring::x509::X509;
 use once_cell::sync::Lazy;
 use parking_lot::Mutex;
@@ -127,22 +127,86 @@ fn load_identity(builder: &mut SslAcceptorBuilder, ssl: &SslConfig) -> Result<()
     let key_pem = ssl_material::load_bytes(ssl.key.as_deref().context("ssl.key")?)?;
     let cert = X509::from_pem(&cert_pem)?;
     let key = PKey::private_key_from_pem(&key_pem)?;
-    builder.set_certificate(&cert)?;
-    builder.set_private_key(&key)?;
-    builder.check_private_key()?;
 
-    // RSA + ECDSA dual certificate (BoringSSL selects by client sigalgs).
-    // Calling set_certificate/set_private_key again for a different key type
-    // registers an alternate chain — do NOT use add_extra_chain_cert (that is
-    // intermediate-only and breaks EC leaf selection).
-    if let (Some(ec_cert), Some(ec_key)) = (&ssl.cert_ec, &ssl.key_ec) {
-        let ec_cert_pem = ssl_material::load_bytes(ec_cert)?;
-        let ec_key_pem = ssl_material::load_bytes(ec_key)?;
-        let ec_x509 = X509::from_pem(&ec_cert_pem)?;
-        let ec_pkey = PKey::private_key_from_pem(&ec_key_pem)?;
-        builder.set_certificate(&ec_x509)?;
-        builder.set_private_key(&ec_pkey)?;
+    // 备用 EC 证书（BoringSSL 按客户端 sigalgs 选）。**先加载好**，因为 cover 与真实
+    // 两套证书在切换时都要成对提供，否则 ECDSA 客户端会拿不到匹配的链。
+    let ec_pair = match (&ssl.cert_ec, &ssl.key_ec) {
+        (Some(c), Some(k)) => {
+            let ec_x509 = X509::from_pem(&ssl_material::load_bytes(c)?)?;
+            let ec_pkey = PKey::private_key_from_pem(&ssl_material::load_bytes(k)?)?;
+            Some((ec_x509, ec_pkey))
+        }
+        _ => None,
+    };
+
+    // ECH 外层（cover）证书：容器默认证书设为 cover —— **不带 ECH 的客户端**（以及
+    // ECH 被拒后回退的客户端）按 `ech_public_name` 校验证书，走的就是这一张。
+    let cover = match (&ssl.ech_cover_cert, &ssl.ech_cover_key) {
+        (Some(c), Some(k)) => {
+            let cc = X509::from_pem(&ssl_material::load_bytes(c)?)?;
+            let ck = PKey::private_key_from_pem(&ssl_material::load_bytes(k)?)?;
+            Some((cc, ck))
+        }
+        _ => None,
+    };
+
+    match &cover {
+        Some((cc, ck)) => {
+            builder.set_certificate(cc)?;
+            builder.set_private_key(ck)?;
+            builder.check_private_key()?;
+        }
+        None => {
+            builder.set_certificate(&cert)?;
+            builder.set_private_key(&key)?;
+            builder.check_private_key()?;
+        }
+    }
+    if let Some((ec_x509, ec_pkey)) = &ec_pair {
+        // 同一密钥类型重复 set_certificate 会注册**备用链**（不能用 add_extra_chain_cert，
+        // 那只是中间证书，会破坏 EC 叶证书选择）。
+        builder.set_certificate(ec_x509)?;
+        builder.set_private_key(ec_pkey)?;
         builder.check_private_key()?;
+    }
+
+    if cover.is_some() {
+        // servername 回调在 **ECH 处理之后**调用：ECH 被接受时服务端看到的是**解密后的
+        // 内层真实名**，否则看到的是明文外层名（= ech_public_name）。
+        // 于是「看到的名字 != 公开名」⇒ 这是 ECH 客户端 ⇒ 换成真实证书；
+        // 等于公开名（或客户端没发 SNI）⇒ 保持 cover。
+        let public_name = ssl
+            .ech_public_name
+            .as_deref()
+            .map(|n| n.trim().trim_end_matches('.').to_ascii_lowercase());
+        let real_cert = cert.clone();
+        let real_key = key.clone();
+        let real_ec = ec_pair.as_ref().map(|(c, k)| (c.clone(), k.clone()));
+        builder.set_servername_callback(move |s, _alert| {
+            let seen = s
+                .servername(NameType::HOST_NAME)
+                .map(|n| n.trim_end_matches('.').to_ascii_lowercase());
+            // 判定：看到了公开名（外层）⇒ 用 cover；否则（含无 SNI / 内层真实名）⇒ 用真实证书。
+            // 无 SNI 时保守用 cover：那种客户端本来也拿不到 ECH（ECH 必须有名字），
+            // 而 cover 才是它按 public_name 期望的那张。
+            let use_cover = match (&seen, &public_name) {
+                (Some(s), Some(p)) => s == p,
+                _ => true,
+            };
+            if !use_cover {
+                if s.set_certificate(&real_cert).is_err() || s.set_private_key(&real_key).is_err() {
+                    log::warn!("ech: 切换到真实证书失败（保持 cover）");
+                    return Err(boring::ssl::SniError::ALERT_FATAL);
+                }
+                if let Some((ec_c, ec_k)) = &real_ec {
+                    // 备用 EC 链同样切成真实的（失败不回退，但记日志）
+                    let _ = s.set_certificate(ec_c);
+                    let _ = s.set_private_key(ec_k);
+                }
+                log::debug!("ech: 服务端看到内层名 {seen:?} ⇒ 使用真实证书");
+            }
+            Ok(())
+        });
     }
     Ok(())
 }

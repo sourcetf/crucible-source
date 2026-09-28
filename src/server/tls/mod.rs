@@ -15,6 +15,9 @@ pub mod cipher_catalog;
 pub mod client_hello;
 #[cfg(feature = "tls_boring")]
 pub mod ech_pem;
+/// ECH 真机握手测试：用本仓库依赖的 `boring` 当 ECH 客户端（见文件头说明）。
+#[cfg(all(test, feature = "tls_boring"))]
+mod ech_handshake_test;
 pub mod legacy_io;
 #[cfg(all(feature = "tls_rustls", not(feature = "tls_boring")))]
 pub mod rustls_path;

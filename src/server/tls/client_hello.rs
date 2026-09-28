@@ -169,8 +169,14 @@ fn has_tls13_supported_versions(buf: &[u8]) -> bool {
             // supported_versions: length(1) versions...
             let vlen = buf[off] as usize;
             let mut vo = off + 1;
-            let vend = vo + vlen;
-            while vo + 1 < vend && vo < ext_end {
+            // 版本列表的两个字节都必须落在 **扩展数据内**。vlen 是 1 字节长度，
+            // 与 elen 无一致性约束（攻击者可控）。旧条件 `vo < ext_end` 只约束了
+            // 第一个字节：当该扩展正好结束在 record/peek 末尾、且 vlen > 剩余字节数
+            // 时，`vo` 会落在 ext_end-1 上，于是 `buf[vo + 1]` 读到缓冲区外一字节
+            // → 索引越界 panic（route() 在 sni_only/证书检查之前就被调用，任何能连上
+            // TLS 监听口的客户端都能触发）。把 vlen 也夹进扩展长度即可。
+            let vend = (vo + vlen).min(ext_end);
+            while vo + 2 <= vend {
                 let ver = u16::from_be_bytes([buf[vo], buf[vo + 1]]);
                 if ver == 0x0304 {
                     return true;
@@ -253,6 +259,31 @@ mod tests {
         assert_eq!(route(&hello), HelloRoute::Boring);
     }
 
+    /// 回归：supported_versions 扩展的 1 字节 vlen 与 2 字节 elen 不一致、
+    /// 且扩展正好结束在缓冲区末尾时，旧实现会读越界一字节（`buf[vo + 1]`）panic。
+    /// 这个 hello 的布局刻意构造成：ext_len 使 ext_end == buf.len()，elen = 8（偶数）
+    /// 让 vo 落到 ext_end-1，vlen = 8 让循环条件 `vo + 1 < vend` 继续成立。
+    #[test]
+    fn malformed_supported_versions_does_not_panic() {
+        let mut hello = vec![
+            0x16, 0x03, 0x01, 0x00, 0x38, // record
+            0x01, 0x00, 0x00, 0x36, // handshake header
+            0x03, 0x03, // client_version（非 0x0300 → 走到 supported_versions 扫描）
+        ];
+        hello.extend_from_slice(&[0u8; 32]); // random
+        hello.push(0x00); // session_id_len
+        hello.extend_from_slice(&[0x00, 0x00]); // cipher_suites_len = 0
+        hello.push(0x00); // compression_methods_len = 0
+        hello.extend_from_slice(&[0x00, 0x0c]); // extensions_len = 12 → ext_end == 61 == len
+        hello.extend_from_slice(&[0x00, 0x2b]); // supported_versions
+        hello.extend_from_slice(&[0x00, 0x08]); // elen = 8（其后只有 7 字节！）
+        hello.push(0x08); // vlen = 8，与 elen 不一致
+        hello.extend_from_slice(&[0u8; 7]); // 剩余版本字节
+        assert_eq!(hello.len(), 61);
+        // 不 panic 且按默认路径回 Boring（GREASE 版本 0x0000，不是 0x0304）。
+        assert_eq!(route(&hello), HelloRoute::Boring);
+    }
+
     #[test]
     fn tls10_client_hello_routes_nss() {
         // TLS1.0 client hello in TLS record (no TLS1.3 ext).
@@ -267,62 +298,18 @@ mod tests {
 
     #[test]
     fn resolve_respects_enable_flags() {
-        let ssl = SslConfig {
-            cert: None,
-            key: None,
-            sni_name: None,
-            sni_only: false,
-            cert_ec: None,
-            key_ec: None,
-            versions: vec![],
-            ciphers: vec![],
-            prefer_tls13: false,
-            ech: false,
-            ech_keys: None,
-            psk: false,
-            psk_identity: None,
-            psk_key: None,
-            ocsp_der_path: None,
-            pqc: false,
-            groups: vec![],
-            ech_public_name: None,
-            ech_cipher_suite: None,
-            ech_max_name_length: None,
-            ech_advertise: true,
-            early_data: false,
-            enable_nss: false,
-            enable_tomcrypt: false,
-        };
+        // 用 ..Default::default()：字段多，逐个列举会在每次新增字段时断掉（SslConfig 的
+        // Default 与 serde 默认值严格一致，见其文档）。
+        let ssl = SslConfig::default();
         assert_eq!(resolve(HelloRoute::Nss, &ssl), HelloRoute::Boring);
     }
 
     #[test]
     fn resolve_tls10_to_nss_when_enabled() {
         let ssl = SslConfig {
-            cert: None,
-            key: None,
-            sni_name: None,
-            sni_only: false,
-            cert_ec: None,
-            key_ec: None,
-            versions: vec![],
-            ciphers: vec![],
-            prefer_tls13: false,
-            ech: false,
-            ech_keys: None,
-            psk: false,
-            psk_identity: None,
-            psk_key: None,
-            ocsp_der_path: None,
-            pqc: false,
-            groups: vec![],
-            ech_public_name: None,
-            ech_cipher_suite: None,
-            ech_max_name_length: None,
-            ech_advertise: true,
-            early_data: false,
             enable_nss: true,
             enable_tomcrypt: true,
+            ..SslConfig::default()
         };
         // NSS only when the tls_nss feature (and linked shim) is present.
         let expect = if cfg!(all(feature = "tls_nss", tls_nss_enabled)) {

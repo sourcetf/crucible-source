@@ -674,9 +674,21 @@ pub struct SslConfig {
     /// §1a：指定 SNI 名称（精确字符串），用于 sni_only 模式。
     #[serde(default)]
     pub sni_name: Option<String>,
-    /// 早期规格 1a：ECH 自动配置——public-name（对外身份，如 v.qq.com）。
+    /// Early 规格 1a：ECH 自动配置——public-name（对外身份，如 v.qq.com）。
     #[serde(default)]
     pub ech_public_name: Option<String>,
+    /// ECH **外层（cover）证书**：客户端不发送 / 未接受 ECH 时，握手退回外层参数，
+    /// 客户端按 `ech_public_name` 校验证书 —— 因此需要一张**覆盖 public_name** 的证书。
+    ///
+    /// 配置后：listener 的**默认证书 = cover**（不带 ECH 的客户端走这条），
+    /// 当服务端在 servername 回调里看到的名字**不是** `ech_public_name` 时
+    /// （即 ECH 被接受、看到的是解密后的**内层真实名**），切换到 `ssl.cert`/`key` 的真实证书。
+    /// 未配置时行为与之前完全一致（只有一张证书）。
+    #[serde(default)]
+    pub ech_cover_cert: Option<String>,
+    /// 配合 [`Self::ech_cover_cert`] 的私钥（两者必须成对，缺失一个即配置错误）。
+    #[serde(default)]
+    pub ech_cover_key: Option<String>,
     /// ECH HPKE 对称套件（如 HKDF-SHA384/AES-256-GCM）。
     #[serde(default)]
     pub ech_cipher_suite: Option<String>,
@@ -689,6 +701,45 @@ pub struct SslConfig {
     /// 早期规格 3：0-RTT 默认关闭；显式开启才接受 early data。
     #[serde(default)]
     pub early_data: bool,
+}
+
+/// 与 serde 默认值**严格对齐**的 `Default`（唯一非平凡项是 `ech_advertise = true`）。
+///
+/// 存在的意义：`SslConfig` 字段多，测试里逐个列举字段会导致「每加一个字段就断三处」。
+/// 有了它，测试可以用 `..Default::default()`，新增字段不再破坏它们。
+impl Default for SslConfig {
+    fn default() -> Self {
+        Self {
+            cert: None,
+            key: None,
+            cert_ec: None,
+            key_ec: None,
+            versions: Vec::new(),
+            ciphers: Vec::new(),
+            prefer_tls13: false,
+            ech: false,
+            ech_keys: None,
+            psk: false,
+            psk_identity: None,
+            psk_key: None,
+            ocsp_der_path: None,
+            pqc: false,
+            groups: Vec::new(),
+            enable_nss: false,
+            enable_tomcrypt: false,
+            sni_only: false,
+            sni_name: None,
+            ech_public_name: None,
+            ech_cover_cert: None,
+            ech_cover_key: None,
+            ech_cipher_suite: None,
+            ech_max_name_length: None,
+            // serde 侧是 `default_true`，这里必须一致，否则用 Default 构造的配置
+            // 会与「不写该字段的 TOML」语义不同。
+            ech_advertise: true,
+            early_data: false,
+        }
+    }
 }
 
 impl SslConfig {
@@ -1015,6 +1066,29 @@ impl Config {
                         l.port
                     );
                 }
+            }
+        }
+
+        for l in &self.listeners {
+            let Some(ssl) = &l.ssl else { continue };
+            // ECH cover 证书必须成对：只给一半会在握手时静默回落到「不能用于 public_name
+            // 的真实证书」，客户端报证书不匹配 —— 与「只写 cert 不写 key」同类，配置期拦。
+            let cover_cert = ssl.ech_cover_cert.as_deref().map_or(false, |s| !s.trim().is_empty());
+            let cover_key = ssl.ech_cover_key.as_deref().map_or(false, |s| !s.trim().is_empty());
+            if cover_cert != cover_key {
+                anyhow::bail!(
+                    "listener {}:{}: ssl.ech_cover_cert 与 ssl.ech_cover_key 必须成对配置",
+                    l.address,
+                    l.port
+                );
+            }
+            if cover_cert && ssl.ech_public_name.is_none() {
+                anyhow::bail!(
+                    "listener {}:{}: 配了 ECH cover 证书但没有 ssl.ech_public_name —— \
+证书选择靠它区分「外层名」与「ECH 解密后的内层真实名」，缺了它必然选错证书",
+                    l.address,
+                    l.port
+                );
             }
         }
 
