@@ -1807,4 +1807,47 @@ QMux v1 协议本体与端到端打通。仍然留在用户手上的只有投产
 **诚实边界（不遮掩）**：① **TLS1.2 无法承载 ECH** ⇒ 那条路径真实名明文可见、证书明文可见；
 若真实名需要保密，必须同时确保客户端走 TLS1.3+ECH（本报文不解决这一点）。
 ② 自动 OCSP（`ocsp_fetcher`）按 `ssl.cert` 取 staple，配了 cover 时同样会错配 ——
-本次只对**显式** `ocsp_der_path` 做了 fail-fast；自动路径的组合限制记在待办。
+本次只对**显式** `ocsp_der_path` 做了 fail-fast；自动路径的组合限制记在待办。### 21.25 清尾：CONNECT-UDP capsule 协议、ech_advertise 假开关、GeoIP 周期同步（+ 更正两条陈旧待办）
+
+把 WORKLOG 里剩余的「未做/待办」逐条查证后处理，结果如下。
+
+**① [功能缺口] CONNECT-UDP 的 `?1`（RFC 9297 capsule 协议）此前直接回 501**
+RFC 9298 §3.2 规定客户端**应当**带 `?1`，真实 MASQUE 客户端（Chrome 等）就是这么发的 ——
+所以「只支持裸长度前缀（早期草稿形态）」等于**对标准客户端不可用**。
+* 新增 `Framing { LengthPrefixed, Capsules }` 与 `TunnelEvent { Datagram, Close }`；
+* `?1` ⇒ capsule 形态：`varint(type)+varint(len)+payload`（`0x00`=DATAGRAM，`0x01`=CLOSE），
+  且**响应**必须回 `Capsule-Protocol: ?1`（RFC 9297 §3），否则客户端仍按裸形态发；
+* 不带 `?1` ⇒ 保持原样（裸长度前缀），**老客户端行为不变**；
+* **未知 capsule 一律跳过负载并继续解析下一条**（RFC 9297 §3.2 要求忽略）。
+  这里踩到一个真坑：第一版跳过未知 capsule 后返回 `Ok(None)`，而调用方的
+  `Ok(None) => break` 会退出循环 —— 缓冲里紧随其后的 DATAGRAM 在**没有新数据到达**时
+  永远取不到（隧道静默卡死）。改为在解析器内部 `continue` 循环。这正是新加的
+  `unknown_capsule_is_skipped` 用例逼出来的。
+* 新增 6 条单测：往返、**两种形态不可混**（同一串字节在两种 Framing 下含义不同）、
+  未知 capsule 跳过、CLOSE、增量分片解析、伪造超长 capsule 必须报错。
+
+**② [假开关] `ssl.ech_advertise`（默认 true）声称「发布到 HTTPS(type65) DNS 记录」，但从未接线**
+`SslConfig::ech_advertise_enabled()` 是**死代码**（全树无调用者），真正的发布动作在
+`[dns] [[dns.https_rr]]`。于是「ECH 已启用」与「客户端拿不到 ECHConfig」可以同时成立而无人察觉
+—— 正是本项目反复出现的「开关是假的」那一类。
+* 新增启动期自检 `warn_unpublished_ech`：开了 `ech_advertise` 且有 `ech_public_name`、
+  但 `[dns].https_rr` 里没有对应的 `ech=true` 条目时，**明确告警**并给出两条出路
+  （补配置，或关掉 `ech_advertise` 以免误解）。
+
+**③ [未实现] GeoIP 定时同步（原注：`ops::spawn_cron_scheduler` 未实现）**
+`geoip::ensure_synced` 原本只在**启动**与**面板保存**时被调用，靠 `sync_days` +
+磁盘时间戳判断过期 ⇒ **长期运行且从不改配置的服务器永远不会再同步**，而
+`geo.mmdb.sync_days` 的文案是「cron 每日」。已补周期任务：每 6 小时检查一次
+（是否真的下载仍由 `ensure_synced` 按 `sync_days` 判定；重复调用只 stat 时间戳，很廉价），
+并在 `dns.enabled && geo.enabled && mmdb.is_active()` 时才动作。
+
+**两条陈旧待办——查证后确认「早已实现」，本次更正 WORKLOG，不写代码**
+* **从区记录在面板显示为空**：`admin_api` 对非 master 区已走 `list_secondary_records`
+  （读盘解析 named 自己维护的 zone 文件），返回 `{records, readonly: true, kind}`，
+  文件未生成时给 `note` 说明「传输可能还没完成」而不是 500；`admin_ui.html` 里
+  `readonly` 有 17 处引用、据此关闭编辑入口。实测 `?zone=slave1.test` 返回
+  `{"kind":"slave","note":"……尚未生成（传输可能还没完成）","readonly":true,"records":[]}` ✓
+* **优雅关闭无截止时间（旧实例永久残留）**：`src/main.rs` 已有
+  `rt.shutdown_timeout(3s)` + 8s 看门狗（`std::process::exit`），注释里写明正是为这个场景加的。
+
+**测试**：全套 `cargo test --bin webserver --release` 结果见下方提交（capsule 6 条新用例在内）。

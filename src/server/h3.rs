@@ -1255,19 +1255,15 @@ use chunked uploads (Content-Range) or HTTP/1.1 for larger bodies",
             .headers()
             .get("capsule-protocol")
             .and_then(|v| v.to_str().ok());
-        if connect_udp::wants_capsule_protocol(capsule) {
-            connect_reject(
-                &mut stream,
-                live,
-                peer,
-                &path,
-                StatusCode::NOT_IMPLEMENTED,
-                t0,
-                "capsule-protocol: ?1 未实现, 只支持长度前缀报文形态",
-            )
-            .await;
-            return Ok(());
-        }
+        // RFC 9298 §3.2：客户端**应当**带 `?1`（capsule 协议），真实 MASQUE 客户端就是这么发的。
+        // 之前这里直接回 501，等于对标准客户端不可用。现在两种形态都支持：
+        //   `?1` → RFC 9297 capsule（type+len+payload，DATAGRAM=0x00）
+        //   不带 → RFC 9298 §4.3 的裸长度前缀（早期草稿形态）
+        let framing = if connect_udp::wants_capsule_protocol(capsule) {
+            connect_udp::Framing::Capsules
+        } else {
+            connect_udp::Framing::LengthPrefixed
+        };
 
         // 3. 目标解析 + 准入。
         let (host, port) = match connect_udp::parse_target_path(&path) {
@@ -1342,8 +1338,14 @@ use chunked uploads (Content-Range) or HTTP/1.1 for larger bodies",
             return Ok(());
         }
 
-        // 5. 隧道成立，才回 200。客户端从这一刻起在请求流上发长度前缀的 UDP 负载。
-        let resp = match Response::builder().status(StatusCode::OK).body(()) {
+        // 5. 隧道成立，才回 200。客户端从这一刻起按协商到的封装形态发 UDP 负载。
+        //    capsule 模式必须在**响应**里回 `Capsule-Protocol: ?1`（RFC 9297 §3），
+        //    否则客户端不知道能否用 capsule —— 它只会按裸长度前缀发。
+        let mut rb = Response::builder().status(StatusCode::OK);
+        if framing == connect_udp::Framing::Capsules {
+            rb = rb.header("capsule-protocol", "?1");
+        }
+        let resp = match rb.body(()) {
             Ok(r) => r,
             Err(e) => {
                 log::warn!("h3 CONNECT-UDP build 200 peer={peer}: {e}");
@@ -1370,7 +1372,7 @@ use chunked uploads (Content-Range) or HTTP/1.1 for larger bodies",
         // 6. 拆成收发两半，跑双向转发；结束时正常收尾（FIN）而不是让 quinn reset。
         let (mut send_half, mut recv_half) = stream.split();
         let idle = std::time::Duration::from_secs(connect_udp::DEFAULT_IDLE_TIMEOUT_SECS);
-        run_udp_tunnel(&mut send_half, &mut recv_half, udp, idle, peer, target).await;
+        run_udp_tunnel(&mut send_half, &mut recv_half, udp, idle, peer, target, framing).await;
         if let Err(e) = send_half.finish().await {
             log::debug!("h3 CONNECT-UDP finish peer={peer}: {e:#}");
         }
@@ -1395,8 +1397,9 @@ use chunked uploads (Content-Range) or HTTP/1.1 for larger bodies",
         idle_timeout: std::time::Duration,
         peer: SocketAddr,
         target: SocketAddr,
+        framing: connect_udp::Framing,
     ) {
-        let mut asm = connect_udp::DatagramAssembler::default();
+        let mut asm = connect_udp::DatagramAssembler::new(framing);
         let mut udp_buf = vec![0u8; connect_udp::MAX_DATAGRAM];
         let idle = tokio::time::sleep(idle_timeout);
         tokio::pin!(idle);
@@ -1434,12 +1437,17 @@ use chunked uploads (Content-Range) or HTTP/1.1 for larger bodies",
                     // 一个 DATA 帧可能装多个报文、也可能只有半个前缀：
                     // 把目前完整的全部送走，剩下留在 asm 里等下一帧。
                     loop {
-                        match asm.next_datagram() {
-                            Ok(Some(dg)) => {
+                        match asm.next_event() {
+                            Ok(Some(connect_udp::TunnelEvent::Datagram(dg))) => {
                                 if let Err(e) = udp.send(&dg).await {
                                     log::debug!("h3 CONNECT-UDP peer={peer} udp send: {e}");
                                     return;
                                 }
+                            }
+                            // RFC 9297 §3.3：CLOSE capsule = 对端正常收尾（不是错误）
+                            Ok(Some(connect_udp::TunnelEvent::Close)) => {
+                                log::debug!("h3 CONNECT-UDP peer={peer} target={target}: 收到 CLOSE capsule");
+                                return;
                             }
                             Ok(None) => break,
                             Err(e) => {
@@ -1453,7 +1461,7 @@ use chunked uploads (Content-Range) or HTTP/1.1 for larger bodies",
                     }
                 }
                 // 下行：目标 → 客户端。
-                framed = recv_framed(&udp, &mut udp_buf) => {
+                framed = recv_framed(&udp, &mut udp_buf, framing) => {
                     match framed {
                         Ok(f) => {
                             if let Err(e) = send.send_data(f).await {
@@ -1484,9 +1492,13 @@ use chunked uploads (Content-Range) or HTTP/1.1 for larger bodies",
     async fn recv_framed(
         udp: &tokio::net::UdpSocket,
         buf: &mut [u8],
+        framing: connect_udp::Framing,
     ) -> Result<Bytes, String> {
         let n = udp.recv(buf).await.map_err(|e| e.to_string())?;
-        let framed = connect_udp::frame_datagram(&buf[..n])?;
+        let framed = match framing {
+            connect_udp::Framing::Capsules => connect_udp::frame_datagram_capsule(&buf[..n])?,
+            connect_udp::Framing::LengthPrefixed => connect_udp::frame_datagram(&buf[..n])?,
+        };
         Ok(Bytes::from(framed))
     }
 

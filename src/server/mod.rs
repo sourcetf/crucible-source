@@ -80,13 +80,41 @@ pub async fn run(live: Arc<LiveConfig>) -> Result<()> {
         }
     });
 
-    // P1-6: GeoIP cron scheduler deferred (ops::spawn_cron_scheduler not yet implemented).
+    // GeoIP 定时同步（此前是「P1-6 deferred：ops::spawn_cron_scheduler 未实现」）。
+    //
+    // 落点说明：`geoip::ensure_synced` 原本只在**启动**与**面板保存（reconcile）**时被调用，
+    // 并靠 `sync_days` 与磁盘上的时间戳做「多久算过期」的判定。于是一台**长期运行且从不改
+    // 配置**的服务器永远不会再同步 —— 而 geo.mmdb.sync_days 的文案恰恰是「cron 每日」。
+    // 这里补上周期性触发：每 6 小时查一次，是否真的下载由 ensure_synced 自己按
+    // sync_days 判断（重复调用是廉价的：只 stat 时间戳）。
+    {
+        let live_geo = Arc::clone(&live);
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(6 * 3600)).await;
+                let snap = live_geo.snapshot();
+                let mmdb = &snap.dns.geo.mmdb;
+                if !snap.dns.enabled || !snap.dns.geo.enabled || !mmdb.is_active() {
+                    continue;
+                }
+                match crate::server::dns::geoip::ensure_synced(mmdb, false) {
+                    Ok(()) => log::debug!("geoip: 周期同步检查完成（未过期则不下载）"),
+                    Err(e) => log::warn!("geoip: 周期同步失败: {e:#}"),
+                }
+            }
+        });
+    }
 
     let active: Arc<tokio::sync::Mutex<std::collections::HashSet<u16>>> =
         Arc::new(tokio::sync::Mutex::new(std::collections::HashSet::new()));
 
     // Initial listeners.
     let cfg = live.snapshot();
+    // ECH 广告自检：`ssl.ech_advertise`（默认 true）声称「生成/加载配置并发布 HTTPS(type65)
+    // 记录」，而**发布**这件事实际由 `[dns] [[dns.https_rr]]` 完成 —— 两者没接上时，
+    // 客户端解析不出 ech= 参数，ECH 等于对客户端不存在（面板与日志都看不出来）。
+    // 这里在启动期把这种「开了广告却没人发布」的组合显式指出来。
+    warn_unpublished_ech(&cfg);
     for (idx, lc) in cfg.listeners.iter().enumerate() {
         if let Err(e) = spawn_listener_port(
             Arc::clone(&live),
@@ -301,3 +329,38 @@ fn maybe_set_busy_poll_stream(stream: &tokio::net::TcpStream) {
 
 #[cfg(not(all(target_os = "linux", feature = "linux_busy_poll")))]
 fn maybe_set_busy_poll_stream(_stream: &tokio::net::TcpStream) {}
+
+/// 启动期自检：开了 ECH 广告、却没有对应的 `[[dns.https_rr]]` 发布条目时给出明确告警。
+///
+/// 为什么需要：`ech_advertise` 的字面含义是「发布到 DNS」，但真正的发布动作在
+/// `[dns] [[dns.https_rr]]`（见 `dns::auto_https_records`）。少了这层检查，
+/// 「ECH 已启用」与「客户端拿不到 ECHConfig」可以同时成立而无人察觉 ——
+/// 属于本项目一直避免的「开关是假的」那一类。
+fn warn_unpublished_ech(cfg: &crate::config::Config) {
+    let published: Vec<String> = cfg
+        .dns
+        .https_rr
+        .iter()
+        .filter(|r| r.ech)
+        .map(|r| r.name.trim().trim_end_matches('.').to_ascii_lowercase())
+        .collect();
+    for lc in &cfg.listeners {
+        let Some(ssl) = lc.ssl.as_ref() else { continue };
+        if !ssl.ech_advertise_enabled() {
+            continue;
+        }
+        let Some(name) = ssl.ech_public_name.as_deref() else {
+            // 没有 public_name 时 ECHConfig 无法生成（ech_auto 需要它），
+            // 广告同样落空；ech_advertise_enabled() 已把这个情况排除，这里不重复报。
+            continue;
+        };
+        let want = name.trim().trim_end_matches('.').to_ascii_lowercase();
+        if !published.contains(&want) {
+            log::warn!(
+                "ECH: listener {}:{} 开了 ech_advertise（public_name={name}），但 [dns] 里没有对应的 [[dns.https_rr]]（name=\"{name}\"、ech=true）—— **ECH 不会被发布**，客户端解析不到 ech= 参数就等同于没有 ECH。补上该配置，或把 ech_advertise 关掉以免误解",
+                lc.address,
+                lc.port
+            );
+        }
+    }
+}

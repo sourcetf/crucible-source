@@ -15,6 +15,11 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 /// RFC 9298 §4.3：单个 UDP 负载上限（UDP 报文长度字段本身最大 65535）。
 pub const MAX_DATAGRAM: usize = 65535;
 
+/// RFC 9297 §3.2 的 capsule 类型：`0x00` = DATAGRAM（负载即一个 UDP 报文）。
+pub const CAPSULE_DATAGRAM: u64 = 0x00;
+/// RFC 9297 §3.3：`0x01` = CLOSE —— 对端宣告隧道正常结束。
+pub const CAPSULE_CLOSE: u64 = 0x01;
+
 /// 隧道空闲上限（秒）：两个方向都没有流量时拆除。
 pub const DEFAULT_IDLE_TIMEOUT_SECS: u64 = 30;
 
@@ -278,16 +283,66 @@ pub fn frame_datagram(payload: &[u8]) -> Result<Vec<u8>, String> {
     Ok(out)
 }
 
-/// RFC 9298 §4.3：把 QUIC 流上的字节按长度前缀重组成一个个 UDP 报文。
+/// RFC 9297：把一个 UDP 报文封成 DATAGRAM capsule（`type=0x00, len, payload`）。
+pub fn frame_datagram_capsule(payload: &[u8]) -> Result<Vec<u8>, String> {
+    if payload.len() > MAX_DATAGRAM {
+        return Err(format!("datagram length {} exceeds {MAX_DATAGRAM}", payload.len()));
+    }
+    let mut out = Vec::with_capacity(payload.len() + 6);
+    encode_varint(CAPSULE_DATAGRAM, &mut out)?;
+    encode_varint(payload.len() as u64, &mut out)?;
+    out.extend_from_slice(payload);
+    Ok(out)
+}
+
+/// 隧道内的报文封装形态。
 ///
-/// 一个 H3 DATA 帧里可能有多个报文、也可能只有半个前缀，所以必须缓冲——
+/// RFC 9298 §3.2 规定客户端**应当**带 `?1`（capsule 协议）—— 真实 MASQUE 客户端
+/// （Chrome 等）就是这么发的；不带 `?1` 的裸长度前缀形态是早期草稿的写法。
+/// 两种形态必须各自解析，不能混：capsule 每帧多一个**类型**字段。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Framing {
+    /// RFC 9298 §4.3：`varint(len) + payload`。
+    LengthPrefixed,
+    /// RFC 9297：`varint(type) + varint(len) + payload`（type 0x00 = DATAGRAM）。
+    Capsules,
+}
+
+/// 从隧道字节流里解析出来的事件。
+#[derive(Debug, PartialEq, Eq)]
+pub enum TunnelEvent {
+    /// 一个完整的 UDP 报文负载。
+    Datagram(Vec<u8>),
+    /// 对端发了 CLOSE capsule：隧道应**正常收尾**（不是错误）。
+    Close,
+}
+
+/// RFC 9298 §4.3：把隧道字节流重组回一个个 UDP 报文。
+///
+/// 一个 H3 DATA 帧里可能有多个报文、也可能只有半个长度前缀/capsule，所以必须缓冲 ——
 /// 不能假设「一次 recv_data = 一个报文」（旧实现正是栽在假设上）。
-#[derive(Default)]
 pub struct DatagramAssembler {
     buf: Vec<u8>,
+    framing: Framing,
+}
+
+impl Default for DatagramAssembler {
+    fn default() -> Self {
+        Self {
+            buf: Vec::new(),
+            framing: Framing::LengthPrefixed,
+        }
+    }
 }
 
 impl DatagramAssembler {
+    pub fn new(framing: Framing) -> Self {
+        Self {
+            buf: Vec::new(),
+            framing,
+        }
+    }
+
     /// 追加流上收到的字节。
     pub fn push(&mut self, chunk: &[u8]) {
         self.buf.extend_from_slice(chunk);
@@ -314,6 +369,56 @@ impl DatagramAssembler {
         let dg = self.buf[used..total].to_vec();
         self.buf.drain(..total);
         Ok(Some(dg))
+    }
+
+    /// 解析下一个事件。两种封装形态都从这里出：
+    ///
+    /// * [`Framing::LengthPrefixed`]：一个长度前缀 + 负载；
+    /// * [`Framing::Capsules`]：`type + len + payload`；`0x00` → 报文，`0x01` → [`TunnelEvent::Close`]，
+    ///   **其它类型按 RFC 9297 §3.2 跳过**（前向兼容：不认识的 capsule 必须忽略而不是报错）。
+    pub fn next_event(&mut self) -> Result<Option<TunnelEvent>, String> {
+        match self.framing {
+            Framing::LengthPrefixed => Ok(self.next_datagram()?.map(TunnelEvent::Datagram)),
+            Framing::Capsules => {
+                // **必须在自己内部循环**：未知 capsule 要「跳过并继续解析下一条」，
+                // 不能返回 `Ok(None)`（那是「字节不够」的语义）——否则调用方的
+                // `Ok(None) => break` 会退出，而缓冲里紧随其后的 DATAGRAM 在**没有新数据
+                // 到达**时永远取不到（隧道静默卡死）。RFC 9297 §3.2 要求忽略未知 capsule，
+                // 这里把「忽略」实现为「跳过并接着取」。
+                loop {
+                    let (ty, used) = match decode_varint(&self.buf) {
+                        Some(v) => v,
+                        None => return Ok(None),
+                    };
+                    let (len, used2) = match decode_varint(&self.buf[used..]) {
+                        Some(v) => v,
+                        None => return Ok(None),
+                    };
+                    // capsule 负载上限：DATAGRAM 受 UDP 限制；其它类型（含未知）我们只跳过，
+                    // 但也必须有界，否则一个伪造的大长度就能让我们无限等/无界缓存。
+                    if len > MAX_DATAGRAM as u64 {
+                        return Err(format!("capsule payload {len} exceeds {MAX_DATAGRAM}"));
+                    }
+                    let total = used + used2 + len as usize;
+                    if self.buf.len() < total {
+                        return Ok(None);
+                    }
+                    let payload = self.buf[used + used2..total].to_vec();
+                    self.buf.drain(..total);
+                    match ty {
+                        CAPSULE_DATAGRAM => return Ok(Some(TunnelEvent::Datagram(payload))),
+                        CAPSULE_CLOSE => return Ok(Some(TunnelEvent::Close)),
+                        other => {
+                            // 未知 capsule：跳过负载并**继续**解析下一条
+                            log::debug!(
+                                "connect-udp: 跳过未知 capsule type=0x{other:x}（{len} 字节）"
+                            );
+                            continue;
+                        }
+                    }
+                }
+            }
+        }
     }
 
     /// 还有多少未消费的字节（收尾/诊断用）。
@@ -463,5 +568,95 @@ mod tests {
         encode_varint(1_000_000, &mut huge).unwrap();
         c.push(&huge);
         assert!(c.next_datagram().is_err());
+    }
+
+    /// capsule 形态（RFC 9297）：封装/解析往返一致。
+    #[test]
+    fn capsule_roundtrip() {
+        let payload = b"hello udp";
+        let framed = frame_datagram_capsule(payload).unwrap();
+        // wire = varint(0x00) + varint(len) + payload
+        assert_eq!(framed[0], 0x00);
+        assert_eq!(framed[1], payload.len() as u8);
+        let mut asm = DatagramAssembler::new(Framing::Capsules);
+        asm.push(&framed);
+        assert_eq!(
+            asm.next_event().unwrap(),
+            Some(TunnelEvent::Datagram(payload.to_vec()))
+        );
+        assert_eq!(asm.next_event().unwrap(), None);
+    }
+
+    /// **两种形态不可混**：同样的字节按不同 Framing 解析出的含义不同。
+    /// 裸长度前缀形态下 `0x00` 是「长度 0」（空报文）；capsule 形态下它才是类型 DATAGRAM。
+    #[test]
+    fn framing_modes_differ() {
+        // 裸形态：长度 3 + "abc"
+        let lp = frame_datagram(b"abc").unwrap();
+        let mut a = DatagramAssembler::new(Framing::LengthPrefixed);
+        a.push(&lp);
+        assert_eq!(a.next_event().unwrap(), Some(TunnelEvent::Datagram(b"abc".to_vec())));
+
+        // 同样字节喂给 capsule 解析器：头字节 0x03 变成「类型 3」、下一字节 0x61 变成
+        // 「长度 97」⇒ 字节不足，取不到事件。重点是**不会**把它误判成报文 "abc"。
+        let mut b = DatagramAssembler::new(Framing::Capsules);
+        b.push(&lp);
+        assert_eq!(b.next_event().unwrap(), None, "同一串字节在 capsule 形态下不是报文");
+    }
+
+    /// RFC 9297 §3.2：**未知 capsule 类型必须跳过负载**（前向兼容），而不是报错。
+    #[test]
+    fn unknown_capsule_is_skipped() {
+        let mut buf = Vec::new();
+        encode_varint(0x1234, &mut buf).unwrap(); // 未知类型
+        encode_varint(2, &mut buf).unwrap();
+        buf.extend_from_slice(b"xx");
+        // 后面跟一个正常 DATAGRAM，必须能接着取到
+        buf.extend_from_slice(&frame_datagram_capsule(b"real").unwrap());
+
+        let mut asm = DatagramAssembler::new(Framing::Capsules);
+        asm.push(&buf);
+        // 第一个事件 = 跳过未知后取到的 DATAGRAM
+        assert_eq!(
+            asm.next_event().unwrap(),
+            Some(TunnelEvent::Datagram(b"real".to_vec()))
+        );
+    }
+
+    /// RFC 9297 §3.3：CLOSE capsule ⇒ `TunnelEvent::Close`（隧道**正常**收尾，不是错误）。
+    #[test]
+    fn close_capsule_signals_close() {
+        let mut buf = Vec::new();
+        encode_varint(CAPSULE_CLOSE, &mut buf).unwrap();
+        encode_varint(0, &mut buf).unwrap();
+        let mut asm = DatagramAssembler::new(Framing::Capsules);
+        asm.push(&buf);
+        assert_eq!(asm.next_event().unwrap(), Some(TunnelEvent::Close));
+    }
+
+    /// 增量到达（TCP/QUIC 式分片）也要能拼出来：逐字节喂。
+    #[test]
+    fn capsule_incremental_parse() {
+        let framed = frame_datagram_capsule(b"abcd").unwrap();
+        let mut asm = DatagramAssembler::new(Framing::Capsules);
+        let mut got = None;
+        for b in &framed {
+            asm.push(&[*b]);
+            if let Some(ev) = asm.next_event().unwrap() {
+                got = Some(ev);
+            }
+        }
+        assert_eq!(got, Some(TunnelEvent::Datagram(b"abcd".to_vec())));
+    }
+
+    /// 伪造的超大 capsule 长度必须报错（否则无界等待/缓存）。
+    #[test]
+    fn oversized_capsule_rejected() {
+        let mut buf = Vec::new();
+        encode_varint(CAPSULE_DATAGRAM, &mut buf).unwrap();
+        encode_varint(MAX_DATAGRAM as u64 + 1, &mut buf).unwrap();
+        let mut asm = DatagramAssembler::new(Framing::Capsules);
+        asm.push(&buf);
+        assert!(asm.next_event().is_err());
     }
 }
