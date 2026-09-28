@@ -689,6 +689,12 @@ pub struct SslConfig {
     /// 配合 [`Self::ech_cover_cert`] 的私钥（两者必须成对，缺失一个即配置错误）。
     #[serde(default)]
     pub ech_cover_key: Option<String>,
+    /// **cover 证书**的 OCSP staple（DER/PEM 路径）。OCSP 响应是**逐证书**的，而 ECH 会在
+    /// 内外层证书间切换 ⇒ 两份 staple 必须分开给：`ssl.ocsp_der_path` 属于真实证书
+    /// （`ssl.cert`），本项属于 cover。未配置时：cover 路径**不装订**
+    /// （不装订是安全的——客户端会自行查询 OCSP；装了**错配**的那份才是有害的）。
+    #[serde(default)]
+    pub ech_cover_ocsp_der_path: Option<String>,
     /// ECH HPKE 对称套件（如 HKDF-SHA384/AES-256-GCM）。
     #[serde(default)]
     pub ech_cipher_suite: Option<String>,
@@ -732,6 +738,7 @@ impl Default for SslConfig {
             ech_public_name: None,
             ech_cover_cert: None,
             ech_cover_key: None,
+            ech_cover_ocsp_der_path: None,
             ech_cipher_suite: None,
             ech_max_name_length: None,
             // serde 侧是 `default_true`，这里必须一致，否则用 Default 构造的配置

@@ -58,7 +58,10 @@ pub fn build_acceptor(ssl: &SslConfig, lc: &ListenerConfig) -> Result<SslAccepto
     // set_min/max_proto_version 不会复位该 option 位)。§6 主路径要求 1.2/1.3 全开。
     builder.clear_options(boring::ssl::SslOptions::NO_TLSV1_3);
     apply_versions(&mut builder, ssl)?;
-    load_identity(&mut builder, ssl)?;
+    // OCSP 是**逐证书**一份：先规划（真实/cover 各一份），再让 load_identity 在
+    // 「ECH 接受与否」的决策点装对应那份（见 OcspPlan 的说明）。
+    let ocsp = plan_ocsp(ssl);
+    load_identity(&mut builder, ssl, &ocsp)?;
     // 早期规格 3：0-RTT 默认关闭；early_data=true 才显式开启（boring 无安全封装，
     // 直调 BoringSSL C API SSL_CTX_set_early_data_enabled）。
     if ssl.early_data {
@@ -70,7 +73,7 @@ pub fn build_acceptor(ssl: &SslConfig, lc: &ListenerConfig) -> Result<SslAccepto
     apply_ciphers(&mut builder, ssl)?;
     apply_groups(&mut builder, ssl)?;
     apply_ech(&mut builder, ssl)?;
-    apply_ocsp(&mut builder, ssl)?;
+    apply_ocsp(&mut builder, ssl, &ocsp)?;
     apply_psk(&mut builder, ssl)?;
     apply_alpn(&mut builder, lc)?;
     Ok(builder.build())
@@ -122,7 +125,7 @@ fn parse_version(s: &str) -> Result<SslVersion> {
     }
 }
 
-fn load_identity(builder: &mut SslAcceptorBuilder, ssl: &SslConfig) -> Result<()> {
+fn load_identity(builder: &mut SslAcceptorBuilder, ssl: &SslConfig, ocsp: &OcspPlan) -> Result<()> {
     let cert_pem = ssl_material::load_bytes(ssl.cert.as_deref().context("ssl.cert")?)?;
     let key_pem = ssl_material::load_bytes(ssl.key.as_deref().context("ssl.key")?)?;
     let cert = X509::from_pem(&cert_pem)?;
@@ -221,10 +224,28 @@ fn load_identity(builder: &mut SslAcceptorBuilder, ssl: &SslConfig) -> Result<()
         let real_cert = cert.clone();
         let real_key = key.clone();
         let real_ec = ec_pair.as_ref().map(|(c, k)| (c.clone(), k.clone()));
+        // OCSP 是逐证书一份：把两份材料（可能为空=不装订）一起搬进回调
+        let ocsp_real = ocsp.real.as_ref().map(|s| s.bytes()).flatten();
+        let ocsp_cover = ocsp.cover.as_ref().map(|s| s.bytes()).flatten();
         builder.set_servername_callback(move |s, _alert| {
             if !s.ech_accepted() {
-                // 未接受 ECH：保持容器默认（cover）证书，不加任何额外动作
+                // 未接受 ECH：保持容器默认（cover）证书 —— 但 **staple 必须换成 cover 的**：
+                // 容器上装的是真实证书那份（apply_ocsp 的默认动作），装在 cover 上就是错配。
+                match &ocsp_cover {
+                    Some(der) => {
+                        let _ = s.set_ocsp_status(der);
+                    }
+                    // cover 没有自己的 staple ⇒ **清空**：不装订是安全的（客户端自行查询），
+                    // 留着真实证书那份才是错的。
+                    None => {
+                        let _ = s.set_ocsp_status(&[]);
+                    }
+                }
                 return Ok(());
+            }
+            // ECH 被接受：换成真实证书，并把 staple 换成真实证书那份
+            if let Some(der) = &ocsp_real {
+                let _ = s.set_ocsp_status(der);
             }
             if s.set_certificate(&real_cert).is_err() || s.set_private_key(&real_key).is_err() {
                 log::warn!("ech: ECH 已接受但切换真实证书失败（保持 cover）");
@@ -485,7 +506,113 @@ fn apply_ech_keys(builder: &mut SslAcceptorBuilder, pem: &[u8]) -> Result<()> {
 ///    真正的网络抓取由 `ocsp_fetcher` 的后台续期线程完成，取回后回调自动装订。
 ///
 /// 两条路径都失败时仅 warn，绝不阻断 TLS。
-fn apply_ocsp(builder: &mut SslAcceptorBuilder, ssl: &SslConfig) -> Result<()> {
+/// 一份 OCSP staple 的来源：静态文件内容，或后台自动续期的槽。
+enum StapleSource {
+    Static(Vec<u8>),
+    Auto(std::sync::Arc<crate::server::ocsp_fetcher::StapleSlot>),
+}
+
+impl StapleSource {
+    fn bytes(&self) -> Option<Vec<u8>> {
+        match self {
+            StapleSource::Static(b) => Some(b.clone()),
+            StapleSource::Auto(s) => s.current(),
+        }
+    }
+}
+
+/// **逐证书**的 OCSP 装订规划。
+///
+/// ECH 会在 **cover** 与 **真实** 证书之间切换，而 OCSP 响应是与证书**一一对应**的
+/// （`SSL_set_ocsp_status` 装的是单份 DER）⇒ 必须各准备一份：
+/// * `real`  —— 配给 `ssl.cert`（ECH 被接受、使用内层真实证书时用）；
+/// * `cover` —— 配给 `ssl.ech_cover_cert`（未用 ECH / ECH 被拒时用）。
+///
+/// 某一侧没有材料时**不装订那一侧**：**不装订是安全的**（客户端会自行查询 OCSP），
+/// 而装了**不匹配**的那份才是有害的（严格客户端校验失败；宽松客户端撤回检查静默失效）。
+struct OcspPlan {
+    real: Option<StapleSource>,
+    cover: Option<StapleSource>,
+}
+
+fn ocsp_static_from(path: &str) -> Option<StapleSource> {
+    match ssl_material::load_bytes(path) {
+        Ok(d) if !d.is_empty() => {
+            let der = pem_to_der(&d).unwrap_or(d);
+            log::info!("ocsp stapling: {} bytes from {path}", der.len());
+            Some(StapleSource::Static(der))
+        }
+        Ok(_) => {
+            log::warn!("ssl.ocsp 材料 {path} 为空；该证书不装订");
+            None
+        }
+        Err(e) => {
+            log::warn!("ssl.ocsp 材料 {path} 不可读: {e:#}；该证书不装订");
+            None
+        }
+    }
+}
+
+/// 自动获取路径：`(host, 证书路径)` → 后台续期槽。
+fn ocsp_auto_slot(host: &str, cert_path: &str) -> Option<StapleSource> {
+    let cert_pem = ssl_material::load_bytes(cert_path).ok()?;
+    let leaf = X509::from_pem(&cert_pem).ok()?;
+    crate::server::ocsp_fetcher::prepare_stapling(host, &leaf, &cert_pem)
+        .map(StapleSource::Auto)
+}
+
+/// 为真实证书与 cover 证书各规划一份 staple（见 [`OcspPlan`] 的说明）。
+fn plan_ocsp(ssl: &SslConfig) -> OcspPlan {
+    // 真实证书：显式路径优先，否则自动获取（沿用既有语义：host 取 ssl.ocsp_host()）。
+    let real = if let Some(p) = ssl.ocsp_der_path.as_deref() {
+        ocsp_static_from(p)
+    } else {
+        match (ssl.cert.as_deref(), ssl.ocsp_host()) {
+            (Some(c), Some(h)) => ocsp_auto_slot(&h, c),
+            _ => None,
+        }
+    };
+
+    // cover 证书：只在配了 cover 时规划。
+    let cover = if let (Some(cover_cert), Some(public_name)) = (
+        ssl.ech_cover_cert.as_deref(),
+        ssl.ech_public_name.as_deref(),
+    ) {
+        if let Some(p) = ssl.ech_cover_ocsp_der_path.as_deref() {
+            ocsp_static_from(p)
+        } else {
+            // 自动探测用 **public_name**（cover 证书服务的就是这个名字）
+            let slot = ocsp_auto_slot(public_name.trim(), cover_cert);
+            if slot.is_none() {
+                log::info!(
+                    "ocsp: cover 证书未配置且无法自动获取 staple ⇒ cover 路径不装订（不装订是安全的：客户端会自行查询 OCSP）"
+                );
+            }
+            slot
+        }
+    } else {
+        None
+    };
+
+    OcspPlan { real, cover }
+}
+
+fn apply_ocsp(builder: &mut SslAcceptorBuilder, ssl: &SslConfig, ocsp: &OcspPlan) -> Result<()> {
+    // 配了 cover 时：装订在 **servername 回调**里按 ech_accepted 分派（见 load_identity）；
+    // 这里只开启装订能力，**不**注册 select_certificate 装订（否则会先装上真实证书那份，
+    // 而 cover 路径无从纠正 —— select_certificate 早于 servername 且只能注册一次）。
+    if ssl.ech_cover_cert.is_some() {
+        if ocsp.real.is_none() && ocsp.cover.is_none() {
+            return Ok(());
+        }
+        builder.enable_ocsp_stapling();
+        log::info!(
+            "ocsp stapling: 按证书分派（real={} cover={}）",
+            ocsp.real.is_some(),
+            ocsp.cover.is_some()
+        );
+        return Ok(());
+    }
     if let Some(path) = ssl.ocsp_der_path.as_deref() {
         return apply_ocsp_static(builder, path);
     }
