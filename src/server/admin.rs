@@ -329,6 +329,37 @@ pub async fn handle(req: Request<Full<Bytes>>, live: Arc<LiveConfig>) -> Respons
         );
     }
 
+    // Tor 状态：Hidden Service 的 .onion 名（面板显示用）。
+    //
+    // 为什么需要这个端点：`tor_hs::ensure_hs` 一直把 onion 名写进
+    // `state/tor-hs/hostname.log`，注释写着"供面板显示"——**但全树没有任何读方**，
+    // 于是运维在面板上永远看不到自己的 .onion 地址（只能去服务器上 cat 文件）。
+    if path.ends_with("/api/tor/status") && method == Method::GET {
+        let hs = cfg.tor_hs.clone();
+        let onion = crate::server::tor_hs::current_onion_name(&hs);
+        // outbound 只报告**配置了什么**，不报告探测结果（探测要走网络/stat，不该在 HTTP 请求里做）
+        let env_unix = std::env::var("CRUCIBLE_TOR_SOCKS_UNIX").unwrap_or_default();
+        let env_tcp = std::env::var("CRUCIBLE_TOR_SOCKS").unwrap_or_default();
+        return json_ok(
+            serde_json::json!({
+                "enabled": hs.enabled,
+                "onion": onion,
+                "ports": hs.ports,
+                "outbound": {
+                    "env_unix": env_unix,
+                    "env_tcp": env_tcp,
+                    "rule_overrides": cfg
+                        .listeners
+                        .iter()
+                        .flat_map(|l| l.proxy_rules.iter())
+                        .filter_map(|r| r.tor_socks.clone())
+                        .collect::<Vec<_>>(),
+                },
+            })
+            .to_string(),
+        );
+    }
+
     // ---------- 配置读取 ----------
     if path.ends_with("/api/config/json") && method == Method::GET {
         return match serde_json::to_string_pretty(&*cfg) {

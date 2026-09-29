@@ -3,9 +3,15 @@
 const ONION_ALPHABET: &[u8; 32] = b"abcdefghijklmnopqrstuvwxyz234567";
 
 /// Returns true when host looks like a v2/v3 onion address.
+///
+/// **必须容忍尾点**：`abc.onion.`（FQDN 写法）此前会被判成**非** onion —— 后果不是
+/// 「少一次校验」，而是 `needs_tor()` 也返回 false ⇒ **直连 + 把 onion 名泄露给 DNS**。
+/// DNS 完全解析不了 `.onion`（那是 Tor 内部的虚拟域），所以这条路径既泄露名字又必然失败。
+/// 尾点在 DNS 语义上等同于根，任何比较主机名的地方都得先归一化。
 pub fn is_onion_host(host: &str) -> bool {
-    let h = host.trim().to_ascii_lowercase();
-    h.ends_with(".onion")
+    let h = host.trim().trim_end_matches('.').to_ascii_lowercase();
+    // 必须是 `<非空 label>.onion`
+    h.len() > ".onion".len() && h.ends_with(".onion")
 }
 
 /// Map proxy ssl_mode strings to verification behaviour for onion upstreams.
@@ -43,7 +49,10 @@ impl OnionSslMode {
 
 /// Decode Tor v3 `.onion` hostname → 32-byte ed25519 service public key.
 pub fn decode_v3_onion_pubkey(host: &str) -> Option<[u8; 32]> {
-    let label = host.trim().trim_end_matches(".onion").to_ascii_lowercase();
+    // 用 `strip_suffix` 而不是 `trim_end_matches`：后者会**反复**剥掉匹配后缀，
+    // 于是 `xx.onion.onion` 这种输入会被多剥一次；同时先去掉尾点（FQDN 写法）。
+    let normalized = host.trim().trim_end_matches('.').to_ascii_lowercase();
+    let label = normalized.strip_suffix(".onion")?;
     if label.len() != 56 {
         return None;
     }
@@ -320,5 +329,30 @@ mod tests {
         raw2[0] = 0x22;
         let host2 = format!("{}.onion", base32_encode(&raw2));
         assert!(!onion_cert_matches_host(&cert, &host2));
+    }
+    /// 尾点（FQDN 写法）必须仍判为 onion —— 否则会绕过 Tor 路由并把 onion 名交给 DNS。
+    #[test]
+    fn trailing_dot_still_onion() {
+        let v3 = "duckduckgogg42xjoc72x3sjasowoarfbgcmvfimaftt6twagswzczad.onion";
+        let with_dot = format!("{v3}.");
+        assert!(is_onion_host(v3));
+        assert!(is_onion_host(&with_dot), "带尾点的 .onion 必须仍是 onion");
+        assert!(is_onion_host(&v3.to_ascii_uppercase()));
+        // 公钥解码也要容忍尾点
+        assert_eq!(decode_v3_onion_pubkey(v3), decode_v3_onion_pubkey(&with_dot));
+        assert!(decode_v3_onion_pubkey(&with_dot).is_some());
+        // 边界：裸 ".onion"、空 label 不算
+        assert!(!is_onion_host(".onion"));
+        assert!(!is_onion_host(".onion."));
+        assert!(!is_onion_host("onion"));
+        assert!(!is_onion_host("abc.onion.evil.com"));
+    }
+
+    /// `strip_suffix` 只剥一次：`xx.onion.onion` 不应被当成合法 v3。
+    #[test]
+    fn suffix_stripped_once() {
+        // 56 字符 label + ".onion.onion" → 剥一次后剩 "….onion"，长度 62 ≠ 56 ⇒ None
+        let label = "a".repeat(56);
+        assert!(decode_v3_onion_pubkey(&format!("{label}.onion.onion")).is_none());
     }
 }

@@ -60,11 +60,15 @@ pub async fn run(live: Arc<LiveConfig>) -> Result<()> {
 
     crate::server::syncookie::spawn_evaluator(Arc::clone(&live));
     // 早期规格 A.3：Hidden Service（独立 tor 进程，SocksPort 0）——enabled 时拉起。
-    // ensure_hs 幂等（hostname 存在即复用），mtime 热重载后再次调用也安全。
-    {
-        let cfg0 = live.snapshot();
-        // tor_hs::spawn_from_config: deferred (tor_hs removed)
-    }
+    // ensure_hs 幂等（hostname 存在即复用，不重启 tor），所以启动与热重载都调它。
+    //
+    // 这一行此前**不存在**（只有一句 "tor_hs::spawn_from_config: deferred
+    // (tor_hs removed)" 的注释，而模块明明在），于是配 `[tor_hs] enabled = true`
+    // 什么都不会发生、也不报错 —— 一个彻底静默的假开关。
+    crate::server::tor_hs::spawn_from_config(live.snapshot().tor_hs.clone());
+
+    // 热重载路径的调用挂在 `LiveConfig::reload()` 里（与 reconcile_apps_runtime 同一位置），
+    // 那里本来就是「重载后动作」的落点。
     tokio::spawn(async {
         loop {
             tokio::time::sleep(std::time::Duration::from_secs(300)).await;

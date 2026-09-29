@@ -874,6 +874,26 @@ pub struct TorHsConfig {
     pub tor_bin: Option<String>,
 }
 
+/// 与 serde 默认值**严格对齐**的 `Default`（`ssl_mode` 默认 `verify` —— 最严格档）。
+///
+/// 存在的意义同 `SslConfig::default`：字段多，测试/面板逐字段列举会在每次新增字段时断掉。
+impl Default for ProxyRuleConfig {
+    fn default() -> Self {
+        Self {
+            path: String::new(),
+            upstream: String::new(),
+            ssl_mode: default_proxy_ssl_mode(),
+            modify_request_headers: std::collections::HashMap::new(),
+            modify_response_headers: std::collections::HashMap::new(),
+            via_tor: false,
+            tor_socks: None,
+            connection_pool: false,
+            upstream_http_version: None,
+            upstream_tls_version: None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProxyRuleConfig {
     pub path: String,
@@ -901,8 +921,20 @@ pub struct ProxyRuleConfig {
     /// 早期规格 A.1：强制走 Tor（needs_tor）。
     #[serde(default)]
     pub via_tor: bool,
-    /// 覆盖 SOCKS 端点：unix:/path 或 127.0.0.1:9050（仅 loopback TCP）；
-    /// 空 = 内置优先链（arti → UDS → loopback）。
+    /// 覆盖 SOCKS 端点：`unix:/path`（或裸路径）→ SOCKS5 over UDS；
+    /// `host:port` → SOCKS5 over TCP，**仅允许 loopback**（非回环一律拒绝：
+    /// 那等于把 tor 出口做成开放代理，也绕过了 .onion 的证书即公钥校验）。
+    ///
+    /// 空 = 按以下优先链自动选择（`proxy.rs::connect_tor_socks`）：
+    /// 1. `CRUCIBLE_TOR_FFI_LIB`（可选 dlopen 直连，需库导出 `crucible_tor_connect`）；
+    /// 2. 默认 UDS 探测链：`state/tor-client/socks.sock`、`/run/tor/socks`、
+    ///    `/var/run/tor/socks`、`/run/tor/socks.sock`；
+    /// 3. 环境变量 `CRUCIBLE_TOR_SOCKS_UNIX` / `CRUCIBLE_TOR_SOCKS`；
+    /// 4. 兜底 TCP `127.0.0.1:9050`（仅 loopback）。
+    ///
+    /// **不含 in-process arti**：早先这里写着「arti」，但实现里从来没有过 —— 引入
+    /// `arti-client` 会带进一整套 rustls/static-sqlite 依赖，与本项目「BoringSSL 为主、
+    /// 不引入第二套 TLS 栈」的取向相冲。需要内置 tor 就用 1/2/3 之一，或跑系统 tor。
     #[serde(default)]
     pub tor_socks: Option<String>,
 }
@@ -1098,6 +1130,10 @@ impl Config {
                 );
             }
         }
+
+        // QMux/Hidden Service 之类的「开了但配不全」在运行期只会静默不生效，
+        // 配置期一律拦住（见各自 validate 的注释）。
+        crate::server::tor_hs::validate(&self.tor_hs)?;
 
         // TLS 相关的 fail-fast：这几条错了不会「报错」，而是**静默降级或整站不可用**，
         // 必须在加载期拦住（用户明确要求：拒绝异常配置，而不是运行期悄悄跳过）。

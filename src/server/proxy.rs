@@ -123,6 +123,7 @@ use crate::server::onion_ca::{
     is_onion_host, onion_cert_matches_host, validate_onion_upstream, OnionSslMode,
 };
 use anyhow::{bail, Context, Result};
+use std::path::PathBuf;
 use bytes::Bytes;
 use http::header::{CONNECTION, HOST, UPGRADE};
 use http::{HeaderMap, HeaderName, HeaderValue, Request, Response, StatusCode, Uri};
@@ -1196,6 +1197,33 @@ async fn connect_tor_socks(
             return socks5_unix_bridge(unix, host, port).await;
         }
     }
+    // 2) 未显式配置时的默认 UDS 探测链。
+    //
+    // 早先只有「环境变量 → 直落 TCP 9050」，而 config.rs 的文档写着
+    // 「空 = 内置优先链（arti → UDS → loopback）」—— 那条链**当时并不存在**。
+    // 这里补齐其中真正有用的一段：系统 tor 的 SOCKS 口在多数发行版/OpenBSD 上都以
+    // unix socket 形式落在下面这些路径（一次性 stat，成本可忽略），找到就用它，
+    // 走 UDS 不经过 TCP 栈、也不需要监听回环端口。
+    //
+    // （arti 是**有意不做**的：引入 arti-client 会带进一整套 rustls/sqlite 依赖，
+    //   与本项目「BoringSSL 为主、不引入第二套 TLS 栈」的取向相冲。config 的文档已同步改成
+    //   与实现一致，不再留下不存在的承诺。）
+    for cand in default_tor_uds_candidates() {
+        if cand.is_socket() {
+            match UnixStream::connect(&cand).await {
+                Ok(unix) => {
+                    log::debug!(
+                        "tor: 使用默认 UDS {}（未配置 CRUCIBLE_TOR_SOCKS[_UNIX]）",
+                        cand.display()
+                    );
+                    return socks5_unix_bridge(unix, host, port).await;
+                }
+                Err(e) => log::debug!("tor: UDS {} 打不开（{e}），继续下一个候选", cand.display()),
+            }
+        }
+    }
+
+    // 3) 最后兜底：系统 tor 的默认 TCP SOCKS 口（仅 loopback）。
     let socks = crate::server::apps::env_lock::read_static_env("CRUCIBLE_TOR_SOCKS")
         .unwrap_or_else(|| "127.0.0.1:9050".to_string());
     let addr: SocketAddr = socks.parse().context("CRUCIBLE_TOR_SOCKS parse")?;
@@ -1204,6 +1232,39 @@ async fn connect_tor_socks(
         .await
         .with_context(|| format!("tor socks connect {addr}"))?;
     socks5_connect(tcp, host, port).await
+}
+
+
+/// `Path::is_socket()` 需要 `std::os::unix::fs::FileTypeExt`（仅 unix）。
+trait SocketPath {
+    fn is_socket(&self) -> bool;
+}
+impl SocketPath for PathBuf {
+    fn is_socket(&self) -> bool {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::FileTypeExt;
+            return std::fs::metadata(self)
+                .map(|m| m.file_type().is_socket())
+                .unwrap_or(false);
+        }
+        #[cfg(not(unix))]
+        {
+            false
+        }
+    }
+}
+
+/// 默认 UDS 探测候选（按优先级）。顺序与 orig 规格 A 一致，另加本项目 `state/tor-client`。
+pub(crate) fn default_tor_uds_candidates() -> Vec<PathBuf> {
+    let mut v: Vec<PathBuf> = Vec::new();
+    if let Ok(cwd) = std::env::current_dir() {
+        v.push(cwd.join("state/tor-client/socks.sock"));
+    }
+    v.push(PathBuf::from("/run/tor/socks"));
+    v.push(PathBuf::from("/var/run/tor/socks"));
+    v.push(PathBuf::from("/run/tor/socks.sock"));
+    v
 }
 
 /// SOCKS5 端点若走 TCP，必须是 loopback。
@@ -1308,6 +1369,14 @@ async fn socks5_connect(mut tcp: TcpStream, host: &str, port: u16) -> Result<Tcp
 }
 
 /// After SOCKS5 on a Unix socket, bridge bytes to a local TcpStream for Hyper.
+/// 把一条 **Unix socket**（tor 的 SOCKS 口）桥接成 `TcpStream`：上游连接的类型在
+/// `connect_upstream` 里固定是 `TcpStream`，而 `TcpStream::from_std` 无法从 `UnixStream`
+/// 造出来，所以在本机回环上开一个临时端口做中转。
+///
+/// **必须校验 accept 到的对端就是自己**：临时端口虽是内核分配的，但同机进程可以先连上
+/// 抢到隧道（于是它经我们这条已验证的 `.onion` 隧道出网）。这里比对「我们 client 侧的
+/// 本地端口」与「accept 到的 peer 端口」，不一致就丢弃该连接再等下一个 —— 抢占者拿不到
+/// 隧道，我们自己在同一循环里继续 accept。
 async fn socks5_unix_bridge(mut unix: UnixStream, host: &str, port: u16) -> Result<TcpStream> {
     do_socks5(&mut unix, host, port).await?;
     let listener = TcpListener::bind("127.0.0.1:0")
@@ -1317,7 +1386,21 @@ async fn socks5_unix_bridge(mut unix: UnixStream, host: &str, port: u16) -> Resu
     let client = TcpStream::connect(addr)
         .await
         .context("tor bridge client")?;
-    let mut server = listener.accept().await.context("tor bridge accept")?.0;
+    let mine = client
+        .local_addr()
+        .context("tor bridge client local_addr")?
+        .port();
+    // 只接受端口号等于本连接的那个；别的（同机抢占/扫描）一律立刻关闭
+    let mut server = loop {
+        let (sock, peer) = listener.accept().await.context("tor bridge accept")?;
+        if peer.port() == mine {
+            break sock;
+        }
+        log::warn!(
+            "tor bridge: 丢弃非预期连接 peer={peer}（期望端口 {mine}）—— 疑似同机抢占"
+        );
+        drop(sock);
+    };
     tokio::spawn(async move {
         let _ = tokio::io::copy_bidirectional(&mut unix, &mut server).await;
     });
@@ -1346,6 +1429,11 @@ where
 
     let mut head = [0u8; 4];
     stream.read_exact(&mut head).await?;
+    // 版本字节也必须校验：只查 REP 会让「非 SOCKS5 的服务端」被当成握手成功，
+    // 后续把它的响应体当隧道数据读出（诊断时会表现为莫名其妙的协议错）。
+    if head[0] != 0x05 {
+        bail!("socks5 bad reply version {:#04x} (expected 0x05)", head[0]);
+    }
     if head[1] != 0x00 {
         bail!("socks5 connect failed code {}", head[1]);
     }
@@ -1403,5 +1491,163 @@ pub async fn proxy_page_rule(
             .status(StatusCode::BAD_GATEWAY)
             .body(full(format!("page rule pass error: {e:#}")))
             .unwrap(),
+    }
+}
+
+#[cfg(test)]
+mod tor_socks_tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// 假 SOCKS5 服务端：按脚本应答，并记录客户端发来的请求字节。
+    /// 返回 (服务端任务句柄, 收到的请求字节)。
+    fn fake_socks5(
+        reply: Vec<u8>,
+    ) -> (tokio::task::JoinHandle<Vec<u8>>, tokio::io::DuplexStream) {
+        let (client, mut server) = tokio::io::duplex(4096);
+        let h = tokio::spawn(async move {
+            // 握手：+05 +01 +00 → 回 +05 +00
+            let mut hs = [0u8; 3];
+            let _ = server.read_exact(&mut hs).await;
+            let _ = server.write_all(&[0x05, 0x00]).await;
+            // 请求：ver cmd rsv atyp len host port
+            let mut head = [0u8; 5];
+            let _ = server.read_exact(&mut head).await;
+            let mut host = vec![0u8; head[4] as usize];
+            let _ = server.read_exact(&mut host).await;
+            let mut port = [0u8; 2];
+            let _ = server.read_exact(&mut port).await;
+            let mut req = Vec::from(head.as_slice());
+            req.extend_from_slice(&host);
+            req.extend_from_slice(&port);
+            let _ = server.write_all(&reply).await;
+            req
+        });
+        (h, client)
+    }
+
+    /// 正常路径：握手 + CONNECT(域名) + 各种 ATYP 应答都要能收干净。
+    #[tokio::test]
+    async fn socks5_success_all_atyps() {
+        for (name, reply) in [
+            ("ipv4", vec![0x05, 0x00, 0x00, 0x01, 1, 2, 3, 4, 0, 80]),
+            // 域名应答：len=3 "abc" port
+            ("domain", vec![0x05, 0x00, 0x00, 0x03, 3, b'a', b'b', b'c', 0, 80]),
+            (
+                "ipv6",
+                {
+                    let mut v = vec![0x05, 0x00, 0x00, 0x04];
+                    v.extend_from_slice(&[0u8; 16]);
+                    v.extend_from_slice(&[0, 80]);
+                    v
+                },
+            ),
+        ] {
+            let (srv, mut c) = fake_socks5(reply);
+            do_socks5(&mut c, "example.onion", 443)
+                .await
+                .unwrap_or_else(|e| panic!("{name}: {e:#}"));
+            let req = srv.await.unwrap();
+            // 请求必须是 CONNECT + ATYP=domain + 主机名原样（**不做本地 DNS**）
+            assert_eq!(&req[..4], &[0x05, 0x01, 0x00, 0x03], "{name}");
+            assert_eq!(req[4] as usize, "example.onion".len(), "{name}");
+            assert_eq!(&req[5..5 + "example.onion".len()], b"example.onion", "{name}");
+            assert_eq!(&req[5 + "example.onion".len()..], &[0x01, 0xBB], "{name}"); // 443
+        }
+    }
+
+    /// REP != 0 → 必须报错（不能把失败当成功）。
+    #[tokio::test]
+    async fn socks5_reject_code_is_error() {
+        // 0x04 = host unreachable
+        let (srv, mut c) = fake_socks5(vec![0x05, 0x04, 0x00, 0x01, 0, 0, 0, 0, 0, 0]);
+        let e = do_socks5(&mut c, "x.onion", 80).await.unwrap_err();
+        assert!(format!("{e:#}").contains("code 4"), "实际: {e:#}");
+        let _ = srv.await;
+    }
+
+    /// 应答版本字节不是 0x05 → 必须报错（非 SOCKS5 服务端不能当成功）。
+    #[tokio::test]
+    async fn socks5_bad_reply_version_is_error() {
+        let (srv, mut c) = fake_socks5(vec![0x04, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0]);
+        let e = do_socks5(&mut c, "x.onion", 80).await.unwrap_err();
+        assert!(format!("{e:#}").contains("bad reply version"), "实际: {e:#}");
+        let _ = srv.await;
+    }
+
+    /// 握手被拒（服务端要求认证）→ 报错。
+    #[tokio::test]
+    async fn socks5_handshake_reject_is_error() {
+        let (client, mut server) = tokio::io::duplex(256);
+        tokio::spawn(async move {
+            let mut hs = [0u8; 3];
+            let _ = server.read_exact(&mut hs).await;
+            let _ = server.write_all(&[0x05, 0x02]).await; // 需要用户名口令
+        });
+        let mut c = client;
+        let e = do_socks5(&mut c, "x.onion", 80).await.unwrap_err();
+        assert!(format!("{e:#}").contains("handshake rejected"), "实际: {e:#}");
+    }
+
+    /// 未知 ATYP → 报错（而不是把剩余字节当作隧道数据）。
+    #[tokio::test]
+    async fn socks5_unknown_atyp_is_error() {
+        let (srv, mut c) = fake_socks5(vec![0x05, 0x00, 0x00, 0x07, 0, 0]);
+        let e = do_socks5(&mut c, "x.onion", 80).await.unwrap_err();
+        assert!(format!("{e:#}").contains("unknown atyp"), "实际: {e:#}");
+        let _ = srv.await;
+    }
+
+    /// 主机名超过 255 字节 → 拒绝（SOCKS5 的 len 是单字节，否则会截断成错误主机）。
+    #[tokio::test]
+    async fn socks5_host_too_long_rejected() {
+        let (srv, mut c) = fake_socks5(vec![0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0]);
+        let long = "a".repeat(256);
+        let e = do_socks5(&mut c, &long, 80).await.unwrap_err();
+        assert!(format!("{e:#}").contains("too long"), "实际: {e:#}");
+        // 客户端在发请求**之前**就拒绝了，假服务端会永远等在 read_exact 上 ⇒ 必须 abort
+        // （否则 `srv.await` 挂死整个测试二进制，本轮就踩到了）。
+        srv.abort();
+    }
+
+    /// TCP SOCKS 只允许 loopback —— 非回环必须拒绝（否则等于把 tor 出口暴露成开放代理）。
+    #[test]
+    fn tcp_socks_must_be_loopback() {
+        let ok: SocketAddr = "127.0.0.1:9050".parse().unwrap();
+        assert!(ensure_loopback_socks(ok, "test").is_ok());
+        let ok6: SocketAddr = "[::1]:9050".parse().unwrap();
+        assert!(ensure_loopback_socks(ok6, "test").is_ok());
+        let bad: SocketAddr = "10.0.0.5:9050".parse().unwrap();
+        let e = ensure_loopback_socks(bad, "CRUCIBLE_TOR_SOCKS").unwrap_err();
+        assert!(format!("{e:#}").contains("must be loopback"), "实际: {e:#}");
+        let bad_pub: SocketAddr = "8.8.8.8:9050".parse().unwrap();
+        assert!(ensure_loopback_socks(bad_pub, "test").is_err());
+    }
+
+    /// `.onion.`（尾点）也必须走 Tor：否则会直连并把 onion 名交给 DNS。
+    #[test]
+    fn needs_tor_for_trailing_dot_onion() {
+        use crate::server::onion_ca::is_onion_host;
+        let rule = ProxyRuleConfig {
+            path: "/".into(),
+            upstream: "http://x.onion/".into(),
+            ssl_mode: "no_verify".into(),
+            ..Default::default()
+        };
+        let v3 = "w6sxlmzmz2mgzkg5r5fcvycu3lx2i5mkc4z3ycpuj5l22ewpplr2q70.onion";
+        assert!(needs_tor(v3, &rule));
+        assert!(needs_tor(&format!("{v3}."), &rule), "带尾点也必须走 Tor");
+        assert!(is_onion_host(&format!("{v3}.")));
+    }
+
+    /// 默认 UDS 候选链里必须包含 orig 规格 A 列出的那几个路径。
+    #[test]
+    fn default_uds_candidates_cover_spec_paths() {
+        let v = default_tor_uds_candidates();
+        let joined: Vec<String> = v.iter().map(|p| p.display().to_string()).collect();
+        for want in ["/run/tor/socks", "/var/run/tor/socks", "/run/tor/socks.sock"] {
+            assert!(joined.iter().any(|j| j == want), "缺少候选 {want}: {joined:?}");
+        }
+        assert!(joined.iter().any(|j| j.ends_with("state/tor-client/socks.sock")));
     }
 }

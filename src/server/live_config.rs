@@ -141,6 +141,9 @@ impl LiveConfig {
         // （accept_and_serve 每连接都会查一次缓存），所以在配置重载这个低频点上显式清空。
         crate::server::tls::boring_path::clear_acceptor_cache();
         crate::server::apps::reconcile_apps_runtime(self);
+        // 热重载后确保 Hidden Service 仍按新配置在跑（改 ports/enabled/tor_bin 时生效）。
+        // `ensure_hs` 幂等：hostname 已存在则复用，不会重启已在跑的 tor。
+        crate::server::tor_hs::spawn_from_config(self.snapshot().tor_hs.clone());
         log::info!("config reloaded from {}", self.path.display());
         Ok(())
     }

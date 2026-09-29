@@ -269,7 +269,12 @@ img.preview{max-width:100%;max-height:420px}
     <div class="card">
       <h2>反向代理</h2>
       <p class="hint">上游 SSL 模式：verify（强制校验）/ no_verify / trust_self_signed（信任自签）/ off（关闭 SSL）。
-      Tor/.onion：SOCKS 连接顺序 FFI → unix socket → TCP(127.0.0.1:9050)；.onion 上游 verify 模式强制校验 v3 公钥。</p>
+      Tor/.onion：SOCKS 连接顺序 <b>FFI → 默认 UDS（/run/tor/socks 等）→ 环境变量 → TCP 127.0.0.1:9050</b>（TCP 仅允许 loopback）；
+      .onion 上游 verify 模式强制校验 v3 公钥。带尾点的 <code>xxx.onion.</code> 同样走 Tor。</p>
+      <div class="row">
+        <div><label>Hidden Service（.onion 入站）</label><span id="torOnion">（未启用/未就绪）</span></div>
+        <div><button class="act ghost" id="btnTorRefresh">刷新 .onion</button></div>
+      </div>
       <div class="row">
         <div><label>站点（端口）</label><select id="pxPort"></select></div>
         <div><button class="act" id="btnPxLoad">载入</button><button class="act ghost" id="btnPxAdd">加一行</button><button class="act" id="btnPxSave">保存反代</button></div>
@@ -721,6 +726,31 @@ function refreshAccounts(){
 }
 
 /* ============ tab 切换 ============ */
+// Tor Hidden Service 状态：读 /api/tor/status 显示 .onion 地址。
+// 这个端点此前不存在，导致 tor_hs 写的 hostname.log 没有任何读方 —— 面板看不到自己的 .onion。
+// 用既有 `base`/`api()` 约定（凭据与错误处理都已在 api() 里统一）。
+async function loadTorStatus(){
+  const el=$('torOnion');
+  if(!el) return;
+  try{
+    const j=await api('/api/tor/status');
+    if(!j){ el.textContent='（读取失败）'; return; }
+    if(!j.enabled){ el.textContent='（未启用：config.toml 里 [tor_hs] enabled = false）'; return; }
+    if(j.onion){
+      let t=document.createElement('b'); t.textContent=j.onion; el.textContent=''; el.appendChild(t);
+      if(j.ports&&j.ports.length){
+        el.appendChild(document.createTextNode(' · 端口映射 '+
+          j.ports.map(p=>p[0]+'→127.0.0.1:'+p[1]).join(', ')));
+      }
+    } else {
+      el.textContent='（已启用但尚未就绪：tor 生成 hostname 需 10~30s；失败原因见 state/tor-hs/data/notice.log）';
+    }
+  }catch(e){ el.textContent='（读取失败：'+(e&&e.message?e.message:e)+'）'; }
+}
+document.addEventListener('DOMContentLoaded',()=>{
+  loadTorStatus();
+  const b=$('btnTorRefresh'); if(b) b.onclick=loadTorStatus;
+});
 document.querySelectorAll('#tabs button').forEach(btn=>{
   btn.addEventListener('click',async()=>{
     document.querySelectorAll('#tabs button').forEach(b=>b.classList.remove('active'));
