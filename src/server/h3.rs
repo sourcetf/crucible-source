@@ -451,7 +451,7 @@ mod imp {
         // 不用通过鉴权就能放大内存。守卫是 RAII 的，早退不会漏 qmux 账。
         {
             let snap = live.snapshot();
-            if req.uri().path().starts_with(&snap.admin.path) {
+            if crate::server::access::is_admin_path(&snap.admin.path, req.uri().path()) {
                 use crate::server::basic_auth::{admin_gate, retry_after_secs, AdminGate};
                 let t0 = std::time::Instant::now();
                 // (状态码, Retry-After, 文案)；None = 已过鉴权门，交给 admin::handle
@@ -1020,7 +1020,7 @@ use chunked uploads (Content-Range) or HTTP/1.1 for larger bodies",
         }
 
         // P2-21（任务 4）：admin 暴露面——[admin].listeners_allow 非空时仅列出的端口可达。
-    if path.starts_with(&snap.admin.path) && !snap.admin.listener_allowed(lc.port) {
+    if crate::server::access::is_admin_path(&snap.admin.path, &path) && !snap.admin.listener_allowed(lc.port) {
         return tag(
             Response::builder()
                 .status(StatusCode::NOT_FOUND)
@@ -1044,7 +1044,7 @@ use chunked uploads (Content-Range) or HTTP/1.1 for larger bodies",
 
     // P1-4：admin 走与 h1/h2 一致的完整 handle（旧实现只回 UI shell）。
         // 注：旧实现把 admin 放在 ip_access 之前，这里一并修正为规格顺序。
-        if path.starts_with(&snap.admin.path) {
+        if crate::server::access::is_admin_path(&snap.admin.path, &path) {
             // admin::handle 是 h1 体类型（Bytes）的接口：先收齐（≤8MiB）。
             let req = match h3_collect_bytes(req, REQUEST_BODY_CAP).await {
                 Ok(r) => r,
@@ -1543,7 +1543,12 @@ use chunked uploads (Content-Range) or HTTP/1.1 for larger bodies",
     }
 
     fn would_proxy(lc: &ListenerConfig, path: &str) -> bool {
-        lc.proxy_rules.iter().any(|r| path.starts_with(&r.path))
+        // 必须与 `proxy::try_proxy` 用同一判据（带 `/` 边界）。无边界版本会把 `/apidocs`
+        // 判成命中 `path = "/api"` 的规则，而 try_proxy 又拒绝匹配 ⇒ 502「rule matched but
+        // produced no response」；`path = ""` 时更是整个 listener 全 502。
+        lc.proxy_rules
+            .iter()
+            .any(|r| crate::server::proxy::path_matches_proxy_prefix(path, &r.path))
     }
 
     fn tag(mut resp: Response<Bytes>, engine: &'static str) -> Response<Bytes> {

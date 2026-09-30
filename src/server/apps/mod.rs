@@ -131,11 +131,31 @@ pub fn match_app<'a>(
     match_app_indexed(lc, path, ext).map(|(_, a)| a)
 }
 
+/// 路径里是否有**隐藏段**（某一段以 `.` 开头）；`/.well-known/`（ACME）是唯一例外。
+///
+/// 为什么引擎侧也要判：`extensions` 为空的应用（如 `/c`、`/go`）声明「本前缀下全是我的」，
+/// 而 Rust 的 `Path::extension()` 对 `.env` 返回 **None**（前导点算文件主干）⇒ `ext` 是空串，
+/// 于是连 `extensions = ["rs", ""]` 的 `/rust` 也把 `.env` 认成自己的。实测：生产口上
+/// `GET /rust/.env`、`GET /c/.env` 都是 **200**（access log 的 handler 是 `app`，即引擎直接
+/// 把文件吐了出来）—— 而 `.env` 正是 `deps.rs` 读进引擎进程环境的 `KEY=VAL`。
+/// 引擎是「执行脚本」的层，不是「把 docroot 里所有文件都端出去」的层。
+fn has_hidden_segment(path: &str) -> bool {
+    path.split('/').any(|seg| {
+        !seg.is_empty()
+            && seg != "."
+            && seg.starts_with('.')
+            && !seg.eq_ignore_ascii_case(".well-known")
+    })
+}
+
 fn match_app_indexed<'a>(
     lc: &'a ListenerConfig,
     path: &str,
     ext: &str,
 ) -> Option<(usize, &'a AppRouteConfig)> {
+    if has_hidden_segment(path) {
+        return None;
+    }
     lc.apps.iter().enumerate().find(|(_, a)| {
         if !a.enabled {
             return false;
@@ -144,6 +164,39 @@ fn match_app_indexed<'a>(
             true
         } else {
             // 前缀必须落在 '/' 边界上，避免 /phplint 命中 /php。
+            a.paths
+                .iter()
+                .any(|p| p == "/" || path == p || path.starts_with(&format!("{p}/")))
+        };
+        if !path_ok {
+            return false;
+        }
+        if a.extensions.is_empty() {
+            true
+        } else {
+            a.extensions.iter().any(|e| e == ext || e == "*")
+        }
+    })
+}
+
+/// 「这个路径**本该**由某个应用引擎处理」——与 [`would_handle`] 的区别是**不看 `enabled`**。
+///
+/// 为什么需要它：引擎被临时 `enabled = false`（排障、灰度、误配）时，`would_handle` 返回
+/// false，静态层于是高高兴兴把 `GET /php/index.php` 当普通文件吐出去 —— **PHP 源码**
+/// （里面的数据库口令、密钥）就这样被下载走；`/rust/main.rs` 同理。引擎开关是**服务**
+/// 的开关，不该变成「源码公开」的开关。静态层用这个判据拒服务，改由 404 回。
+pub fn route_owns_path(lc: &ListenerConfig, path: &str) -> bool {
+    let ext = Path::new(path)
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("");
+    if has_hidden_segment(path) {
+        return false;
+    }
+    lc.apps.iter().any(|a| {
+        let path_ok = if a.paths.is_empty() {
+            true
+        } else {
             a.paths
                 .iter()
                 .any(|p| p == "/" || path == p || path.starts_with(&format!("{p}/")))
@@ -441,6 +494,26 @@ mod script_rel_tests {
             quic_ecn: false,
             qmux: false,
         }
+    }
+
+    /// 隐藏文件不归引擎：`/rust/.env`（`extensions=["rs",""]`）与 `/c/.env`（无 extensions）
+    /// 都必须落到静态层（再由静态层的隐藏路径策略回 404），绝不能由引擎直接吐出内容。
+    /// 实测基线：两者在生产口上都是 200，handler 是 `app`。
+    #[test]
+    fn hidden_paths_are_not_owned_by_engines() {
+        let mut lc = listener_with_rust_app();
+        assert!(super::would_handle(&lc, "/rust/index.rs"));
+        assert!(!super::would_handle(&lc, "/rust/.env"), "{:?}", lc.apps);
+        assert!(!super::route_owns_path(&lc, "/rust/.env"));
+        // 无 extensions 的 catch-all 应用同样不得吞下隐藏路径
+        lc.apps[0].extensions.clear();
+        assert!(super::would_handle(&lc, "/rust/anything.txt"));
+        assert!(!super::would_handle(&lc, "/rust/.env"));
+        // .well-known 是例外（ACME 需要它可服务）
+        assert!(!super::has_hidden_segment("/.well-known/acme-challenge/tok"));
+        assert!(super::has_hidden_segment("/rust/.env"));
+        assert!(super::has_hidden_segment("/rust/.git/config"));
+        assert!(!super::has_hidden_segment("/rust/normal.txt"));
     }
 
     #[test]

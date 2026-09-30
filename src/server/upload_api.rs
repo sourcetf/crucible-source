@@ -24,6 +24,12 @@ const EXEC_EXTS: &[&str] = &[
     "aspx", "ashx", "asmx", "cgi", "fcgi", "pl", "pm", "py", "rb", "lua", "sh", "bash", "zsh",
     "ksh", "so", "dll", "exe", "com", "bat", "cmd", "ps1", "jar", "war", "class", "tsx", "js",
     "mjs", "cjs", "html", "htm", "xhtml", "svg", "xml", "xsl", "xslt",
+    // 第二组不是「服务端会执行」，而是**浏览器会执行**：static 层用 `mime_guess` 定
+    // Content-Type，而这些扩展名被它映射成 `text/html` / `application/xhtml+xml` /
+    // `image/svg+xml`（Auto 模式**不带 nosniff**）——上传一个 `.shtml` 就等于在同源上放
+    // 了一个 XSS payload，而同一 listener 还挂着 `/__admin`：管理员一点开，脚本就能用
+    // 浏览器自带的 Basic 凭据去调管理 API。第一组里的 html/svg/xml 早拒了，这里补齐同类。
+    "shtml", "shtm", "stm", "xht", "svgz", "mhtml", "mht", "hta", "htc", "appcache", "vtt",
 ];
 
 /// 扩展名闸门。
@@ -42,6 +48,23 @@ fn has_exec_ext(path: &str) -> bool {
         Some((_, ext)) => EXEC_EXTS.iter().any(|e| e.eq_ignore_ascii_case(ext)),
         None => false,
     }
+}
+
+/// 返回第一个「以 `.` 开头」的路径段（已被 percent-decode、去空段）。`None` = 没有隐藏段。
+///
+/// `.well-known`（ACME http-01 验证目录）是唯一例外：那里的内容是公开的校验串。
+fn hidden_segment(decoded_path: &str) -> Option<String> {
+    for seg in decoded_path.split(['/', '\\']) {
+        if seg.is_empty() || seg == "." || !seg.starts_with('.') {
+            continue;
+        }
+        // 唯一例外：ACME http-01 的校验目录（其内容是公开串）
+        if seg.eq_ignore_ascii_case(".well-known") {
+            continue;
+        }
+        return Some(seg.to_string());
+    }
+    None
 }
 
 /// 该请求是否应交给上传处理（调用方在 ACL/限速/鉴权之后、静态分发之前问一次）。
@@ -101,11 +124,44 @@ where
     if decoded.split(['/', '\\']).any(|seg| seg == "..") {
         return resp(StatusCode::BAD_REQUEST, "路径含 .. 段，拒绝", None);
     }
+    // 隐藏路径（任一段以 `.` 开头）不得作为上传目标。
+    //
+    // 为什么必须拦：`.env` 会被引擎当作环境变量读进进程（`deps.rs` 里的 `KEY=VAL`），
+    // `.git/hooks/*` 是提权点，`.htpasswd`/`.part` 同理；而这些**都不是可执行扩展名**，
+    // 扩展名闸门与 `would_execute_on_get` 都拦不住。未认证客户端只要
+    // `PUT /<root>/.env`（或 `/.git/hooks/pre-commit`）就能改写它们 —— 实测基线里
+    // `/rust/.env`、`/c/.env`、`/php/init.sh` 还是可以**匿名 GET 到**的，等于先读后写。
+    // 例外只有 `.well-known`：ACME 验证要往那儿放文件（且内容是公开的）。
+    if let Some(bad) = hidden_segment(&decoded) {
+        return resp(
+            StatusCode::FORBIDDEN,
+            &format!("隐藏路径（.{bad}…）不允许作为上传目标；只有 /.well-known 例外"),
+            None,
+        );
+    }
+    // 「GET 时会被引擎执行」的闸门**必须在这里**，不能靠分发顺序。
+    //
+    // 分发（h1/h2/h3）拿**原始** URL 路径去问 `apps::would_handle`，而落盘用的是
+    // `safe_join` 归一化后的路径；两者对 `/./cgi/pwn`、`//cgi/pwn` 这种写法结论不同 ——
+    // 分发把请求交给上传器，文件却写进 CGI 引擎的 docroot，随后 `GET /cgi/pwn` 由引擎
+    // 执行（`has_exec_ext` 只看扩展名，`pwn` 没有扩展名，拦不住）⇒ 一条请求换一个 webshell。
+    // 这里复用 admin 文件写入同一套归一化判据（`would_execute_on_get` 内部走 `web_path_of`）。
+    if crate::server::admin_files::would_execute_on_get(lc, decoded.trim_start_matches('/')) {
+        return resp(
+            StatusCode::FORBIDDEN,
+            "该路径由应用引擎执行（归一化后仍落在引擎路径上），禁止上传",
+            None,
+        );
+    }
     // containment 第二道：safe_join 拒绝 `..`/绝对路径/反斜杠/Windows 盘符。
     let rel = path.trim_start_matches('/');
     let target: PathBuf = match crate::server::admin_files::safe_join(&lc.root, rel) {
         Ok(p) => p,
-        Err(e) => return resp(StatusCode::BAD_REQUEST, &format!("路径不合法: {e}"), None),
+        // 不回显文件系统细节（`canon /abs/path: Permission denied` 会把绝对路径交给匿名客户端）
+        Err(e) => {
+            log::debug!("upload: 路径不合法 path={path:?}: {e:#}");
+            return resp(StatusCode::BAD_REQUEST, "路径不合法", None);
+        }
     };
 
     // Content-Range（可选）：`bytes <start>-<end>/<total|*>`；缺省 = 全量、start=0。
@@ -167,7 +223,10 @@ where
         Err(UploadErr::Io(e)) => {
             // 其他分支都是 return（类型 `!`），这一支也必须 return，否则 match 各臂类型不一致
             //（build42 实测 E0308）。
-            return resp(StatusCode::INTERNAL_SERVER_ERROR, &e, None);
+            // 不回显 e：Io 错误里带的是**绝对路径**（`canon /opt/.../x: Permission denied`），
+            // 给匿名客户端等于免费泄露部署布局；细节只进本地日志。
+            log::warn!("upload: session_for({}) 失败: {e}", target.display());
+            return resp(StatusCode::INTERNAL_SERVER_ERROR, "写入失败", None);
         }
     };
 
@@ -178,7 +237,8 @@ where
         let frame = match body.frame().await {
             Some(Ok(f)) => f,
             Some(Err(e)) => {
-                return resp(StatusCode::BAD_REQUEST, &format!("读取请求体失败: {e}"), Some(sess.received()))
+                log::debug!("upload: 读取请求体失败: {e:#}");
+                return resp(StatusCode::BAD_REQUEST, "读取请求体失败", Some(sess.received()))
             }
             None => break,
         };
@@ -191,11 +251,10 @@ where
             return match e {
                 UploadErr::OffsetMismatch(cur) => resp(StatusCode::CONFLICT, "偏移不符", Some(cur)),
                 UploadErr::TooLarge => resp(StatusCode::PAYLOAD_TOO_LARGE, "超过单文件上限", None),
-                other => resp(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    &format!("写入失败: {other:?}"),
-                    Some(sess.received()),
-                ),
+                other => {
+                    log::warn!("upload: append 失败: {other:?}");
+                    resp(StatusCode::INTERNAL_SERVER_ERROR, "写入失败", Some(sess.received()))
+                }
             };
         }
     }

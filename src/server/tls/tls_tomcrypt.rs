@@ -154,10 +154,13 @@ pub async fn accept_and_serve(
         Ok(()) => Ok(()),
         Err(e) => {
             // Never escalate legacy failures into process-killing panics.
-            log::error!(
+            // 只写短原因（同 accept.rs / tls_nss.rs）：`{e:#}` 可能带着客户端字节。
+            log::warn!(
                 target: "tls_tomcrypt",
-                "tomcrypt legacy TLS soft-fail peer={peer} peek_len={peek_len}: {e:#}"
+                "tomcrypt legacy TLS soft-fail peer={peer} peek_len={peek_len}: {}",
+                crate::server::tls::handshake_failure_reason(&e)
             );
+            log::debug!(target: "tls_tomcrypt", "tomcrypt soft-fail peer={peer} 完整错误: {e:#}");
             Ok(())
         }
     }

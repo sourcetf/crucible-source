@@ -19,7 +19,16 @@ pub async fn accept_connection(
     match accept_connection_inner(stream, live, lc, peer).await {
         Ok(()) => Ok(()),
         Err(e) => {
-            log::error!("tls accept soft-fail peer={peer}: {e:#}");
+            // 公网 TLS 端口上「明文请求 / 扫描器 / 老客户端」是**预期流量**，不是服务端故障：
+            // 因此是 warn 而不是 error。更关键的是**不能把 `{e:#}` 原文写进日志** —— boring 的
+            // 失败 Debug 里带着整个 ClientHello 字节（实测单条 ≈2KB），一次匿名请求就能写 2KB，
+            // 是放大上万倍的远程日志洪泛（这台机器磁盘长期紧张）。短原因见
+            // `handshake_failure_reason`，完整原文降级到 debug。
+            log::warn!(
+                "tls accept soft-fail peer={peer}: {}",
+                crate::server::tls::handshake_failure_reason(&e)
+            );
+            log::debug!("tls accept soft-fail peer={peer} 完整错误: {e:#}");
             Ok(())
         }
     }
@@ -32,14 +41,21 @@ async fn accept_connection_inner(
     peer: SocketAddr,
 ) -> Result<()> {
     let ssl_cfg = lc.ssl.clone().context("ssl listener without ssl config")?;
-    stream.readable().await.ok();
-    let mut peek = vec![0u8; 4096];
-    let n = match stream.try_read(&mut peek) {
-        Ok(n) => n,
-        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => 0,
-        Err(e) => return Err(e).context("peek ClientHello"),
-    };
-    let peek = peek[..n].to_vec();
+
+    // 规格：cert 未配置前一律走 HTTP。`[listeners.ssl]` 段落存在但没填 cert/key
+    // （面板保存顺序、手写配置）时，旧行为是 build_acceptor 报错 → 连接被静默丢弃，
+    // 客户端只能挂到超时。这里改为按明文 HTTP 服务（HSTS/301 由 h1 侧照常处理）。
+    // 只判「未配置」：证书文件一时读不到（轮换中）不算未配置，那时仍走 TLS 失败重试。
+    if ssl_cfg.cert.is_none() || ssl_cfg.key.is_none() {
+        log::warn!(
+            "tls listener :{} 未配置 ssl.cert/ssl.key —— 按规格以明文 HTTP 服务 peer={peer}",
+            lc.port
+        );
+        let peek = peek_first_record(&stream).await;
+        return crate::server::h1::serve_with_prefix(stream, live, lc, peer, &peek).await;
+    }
+
+    let peek = peek_first_record(&stream).await;
 
     // Defense-in-depth: never hand malformed SSLv2-framed garbage to any stack.
     if !peek.is_empty() && peek[0] & 0x80 != 0 {
@@ -61,11 +77,22 @@ async fn accept_connection_inner(
             .as_deref()
             .map(|s| s.to_string())
             .or_else(|| lc.server_name.clone());
-        let got = client_hello::parse_sni(&peek);
-        let ok = match (want, got) {
-            (Some(w), Some(g)) => g.eq_ignore_ascii_case(&w),
-            _ => false,
+        let Some(want) = want else {
+            // 规格：sni_only 开启时**必须**配 sni_name。没配就没有可比对的期望值，
+            // 按 fail-closed 全部丢弃（不能退化成「任意 SNI 都放行」），但要如实报警：
+            // 否则运维只看到「站点静默不可用」，不知是配置缺项。只报一次，防刷日志。
+            if !sni_unconfigured_warned() {
+                log::error!(
+                    "tls listener :{} 开了 ssl.sni_only 但既无 ssl.sni_name 也无 server_name —— \
+                     所有连接都会按规格被丢弃；请补 ssl.sni_name",
+                    lc.port
+                );
+            }
+            drop(stream);
+            return Ok(());
         };
+        let got = client_hello::parse_sni(&peek);
+        let ok = got.as_deref().map(|g| sni_host_eq(g, &want)).unwrap_or(false);
         if !ok {
             log::info!("tls sni_only: dropped peer={peer} (missing/mismatched SNI)");
             drop(stream);
@@ -126,5 +153,112 @@ async fn accept_connection_inner(
             #[cfg(not(any(feature = "tls_boring", feature = "tls_rustls")))]
             anyhow::bail!("TLS feature disabled");
         }
+    }
+}
+
+/// peek 上限（与历史行为一致，避免无界缓冲）。
+const PEEK_CAP: usize = 4096;
+/// 补齐首个 record 时最多再等几轮（每轮上限 300ms），防慢速攻击。
+const PEEK_MAX_ROUNDS: u8 = 8;
+
+/// 读出**首个 TLS/SSLv2 record 的全部字节**。
+///
+/// `try_read` 只保证「有字节可读」，一次调用可能只拿到 ClientHello 的一段
+/// （TCP 分段，或 ClientHello 大于 MSS/4096 字节）。旧实现只读一次就拿结果做
+/// 分流与 sni_only 判定：被分段的**正常**客户端会因 SNI 解析不到而被
+/// `sni_only` 静默丢弃（空 SNI 语义被误用成「读到的字节不够」）。
+/// 这里按 record 头声明的长度补齐；补齐不了（对端不再发送）就按现状返回，
+/// 后续判定依旧是 fail-closed。
+pub(crate) async fn peek_first_record(stream: &TcpStream) -> Vec<u8> {
+    let mut buf = vec![0u8; PEEK_CAP];
+    stream.readable().await.ok();
+    let mut n = match stream.try_read(&mut buf) {
+        Ok(n) => n,
+        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => 0,
+        Err(e) => {
+            log::debug!("peek ClientHello failed: {e}");
+            0
+        }
+    };
+    let mut rounds = 0u8;
+    while let Some(want) = record_need(&buf[..n]) {
+        let want = want.min(PEEK_CAP);
+        if n >= want || n >= PEEK_CAP || rounds >= PEEK_MAX_ROUNDS {
+            break;
+        }
+        rounds += 1;
+        match tokio::time::timeout(std::time::Duration::from_millis(300), stream.readable()).await {
+            Ok(Ok(())) => {}
+            // 超时/出错：对端不会再补齐这段 record，别再等。
+            _ => break,
+        }
+        match stream.try_read(&mut buf[n..]) {
+            Ok(m) if m > 0 => n += m,
+            _ => break,
+        }
+    }
+    buf.truncate(n);
+    buf
+}
+
+/// 首个 record 在线上声明的总长度（不足以判断时返回 `None`）。
+pub(crate) fn record_need(buf: &[u8]) -> Option<usize> {
+    match *buf.first()? {
+        // SSLv2 记录头：2 字节长度（MSB 置位）+ 负载
+        first if first & 0x80 != 0 => {
+            if buf.len() < 2 {
+                return Some(2);
+            }
+            let len = (((first & 0x7f) as usize) << 8) | buf[1] as usize;
+            Some(2 + len)
+        }
+        // TLS 记录层：type(1) version(2) len(2)
+        0x16 => {
+            if buf.len() < 5 {
+                return Some(5);
+            }
+            Some(5 + u16::from_be_bytes([buf[3], buf[4]]) as usize)
+        }
+        _ => None,
+    }
+}
+
+/// SNI 主机名比较：大小写不敏感，且忽略末尾的点
+/// （`example.com.` 是合法的 FQDN 写法，语义与 `example.com` 相同）。
+pub(crate) fn sni_host_eq(a: &str, b: &str) -> bool {
+    let norm = |s: &str| s.trim().trim_end_matches('.').to_ascii_lowercase();
+    norm(a) == norm(b)
+}
+
+/// 「sni_only 未配 sni_name」告警只报一次（进程内），避免每连接一条 error。
+fn sni_unconfigured_warned() -> bool {
+    static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    WARNED.swap(true, std::sync::atomic::Ordering::AcqRel)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sni_compare_ignores_case_and_trailing_dot() {
+        assert!(sni_host_eq("Example.COM", "example.com"));
+        assert!(sni_host_eq("example.com.", "example.com"));
+        assert!(sni_host_eq(" example.com. ", "EXAMPLE.com"));
+        assert!(!sni_host_eq("example.com", "other.com"));
+        assert!(!sni_host_eq("evil-example.com", "example.com"));
+    }
+
+    #[test]
+    fn record_need_reads_declared_lengths() {
+        // TLS record: 0x16 0301 0040 → 5 + 64
+        assert_eq!(record_need(&[0x16, 0x03, 0x01, 0x00, 0x40]), Some(69));
+        // 头不全时先要头本身，不越界。
+        assert_eq!(record_need(&[0x16, 0x03]), Some(5));
+        // SSLv2 记录头（MSB 置位）。
+        assert_eq!(record_need(&[0x80, 0x2e]), Some(2 + 0x2e));
+        // 明文 HTTP 不做补齐。
+        assert_eq!(record_need(b"GET / HTTP/1.1\r\n"), None);
+        assert_eq!(record_need(&[]), None);
     }
 }

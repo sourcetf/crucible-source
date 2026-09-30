@@ -167,11 +167,22 @@ pub fn session_for(
     if map.len() >= MAX_SESSIONS {
         return Err(UploadErr::TooManySessions);
     }
+    // 目标必须是文件（不是目录）：`with_file_name` 在目录上替换的是**路径最后一段**，
+    // 于是目标为 docroot 本身（`PUT /`、`PUT /subdir/`）时，临时文件会落到
+    // **docroot 的父目录**（`/opt/crucible/www` → `/opt/crucible/.www.upload.part`）——
+    // 既逃出了 docroot 的包含关系，又去写另一块文件系统（父目录常在系统盘上，实测顶到
+    // 2GiB 上限，而 commit 必然 EISDIR 失败、sweep 一小时后才回收）。
+    if target.is_dir() {
+        return Err(UploadErr::Io("upload target is a directory".into()));
+    }
     let name = target
         .file_name()
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_else(|| "upload".to_string());
-    let tmp = target.with_file_name(format!(".{name}.upload.part"));
+    let parent = target
+        .parent()
+        .ok_or_else(|| UploadErr::Io("upload target has no parent dir".into()))?;
+    let tmp = parent.join(format!(".{name}.upload.part"));
     if let Err(e) = std::fs::File::create(&tmp) {
         return Err(UploadErr::Io(e.to_string()));
     }

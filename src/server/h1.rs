@@ -291,7 +291,7 @@ async fn handle_request_inner(
     // 时会先回 401 —— 浏览器立刻弹出 Basic 口令框，等于把一个本该完全不可见的口
     // 变成凭据输入面；h2/h3 在同一场景回的是 404。白名单的语义是「这个口根本没有
     // 管理面」，所以 404 必须先生效。
-    if path.starts_with(&snap.admin.path) && !snap.admin.listener_allowed(lc.port) {
+    if crate::server::access::is_admin_path(&snap.admin.path, &path) && !snap.admin.listener_allowed(lc.port) {
         return tag(
             Response::builder()
                 .status(StatusCode::NOT_FOUND)
@@ -399,7 +399,7 @@ async fn handle_request_inner(
     }
 
     // admin：在 ip_access / rate limit / basic auth 之后、页面规则改写之前
-    if path.starts_with(&snap.admin.path) {
+    if crate::server::access::is_admin_path(&snap.admin.path, &path) {
         // CSRF 补强（详见 access::cross_site_blocked）：admin.rs 的检查缺 `Origin` 时
         // 整段跳过、且 GET 从不带 `Origin`，这里用浏览器自写的 Sec-Fetch-Site 拒跨站。
         // 与 h2/h3 同序：先判跨站（403），再判鉴权（401/429）。
@@ -611,7 +611,12 @@ async fn dispatch_tail(
 }
 
 fn would_proxy(lc: &ListenerConfig, path: &str) -> bool {
-    lc.proxy_rules.iter().any(|r| path.starts_with(&r.path))
+    // 必须与 `proxy::try_proxy` 用同一判据（带 `/` 边界）。无边界版本会把 `/apidocs`
+    // 判成命中 `path = "/api"` 的规则，而 try_proxy 又拒绝匹配 ⇒ 502「rule matched but
+    // produced no response」；`path = ""` 时更是整个 listener 全 502。
+    lc.proxy_rules
+        .iter()
+        .any(|r| crate::server::proxy::path_matches_proxy_prefix(path, &r.path))
 }
 
 pub fn full(s: impl Into<Bytes>) -> BoxBody {

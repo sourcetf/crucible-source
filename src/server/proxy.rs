@@ -195,6 +195,13 @@ impl AsyncRead for UpstreamIo {
         buf: &mut ReadBuf<'_>,
     ) -> Poll<std::io::Result<()>> {
         // 先把上次多读出来的字节交出去，再读 socket。
+        //
+        // `remaining() == 0` 时必须直接返回：`ReadBuf::put_slice` 在容量不足时**panic**，
+        // 而 hyper 的 h1 读循环会算出 `next = min(strategy.next(), max - len)`，某些缓冲
+        // 状态下这一轮就是 0 —— 那时这里会带着 leftover 走进 put_slice，把任务打死。
+        if buf.remaining() == 0 {
+            return Poll::Ready(Ok(()));
+        }
         if !self.leftover.is_empty() {
             let n = self.leftover.len().min(buf.remaining());
             let rest = self.leftover.split_off(n);
@@ -323,11 +330,15 @@ pub async fn try_proxy(
             match proxy_once(req, rule, peer_ip, client_https).await {
                 Ok(r) => return Some((true, r)),
                 Err(e) => {
+                    // 不回显 `{e:#}`：那是**完整错误链**，里面有上游地址与端口、tor 的
+                    // unix socket 路径、TLS 后端与库错误文本、超时预算等内网布局信息，
+                    // 而拿到它的人只是任意一个能命中该规则的客户端。细节进本地日志。
+                    log::warn!("proxy: 规则 {} 处理 {path} 失败: {e:#}", rule.path);
                     return Some((
                         true,
                         Response::builder()
                             .status(StatusCode::BAD_GATEWAY)
-                            .body(full(format!("proxy error: {e:#}")))
+                            .body(full("502 Bad Gateway"))
                             .unwrap(),
                     ));
                 }
@@ -339,7 +350,14 @@ pub async fn try_proxy(
 
 
 /// Path prefix match that requires a boundary (end or `/`) to avoid `/api@evil` SSRF.
-fn path_matches_proxy_prefix(path: &str, prefix: &str) -> bool {
+///
+/// `pub(crate)`：h1/h2/h3 的 `would_proxy` 必须用**同一判据**。此前三个 dispatcher
+/// 各自写了 `path.starts_with(&r.path)`（无边界），于是规则 `path = "/api"` 会把
+/// `/apidocs/x` 也判成「归代理」，而 `try_proxy` 内部用的是带边界的版本 → 请求拿到
+/// 502「proxy rule matched but produced no response」，而不是落到 static/apps/404。
+/// 更糟的是手写配置里 `path = ""`（面板校验拒、`Config::validate` 不拒）在无边界时
+/// **任何路径都 starts_with("")** ⇒ 整个 listener 全部 502。
+pub(crate) fn path_matches_proxy_prefix(path: &str, prefix: &str) -> bool {
     if prefix.is_empty() {
         return false;
     }
@@ -353,12 +371,13 @@ fn path_matches_proxy_prefix(path: &str, prefix: &str) -> bool {
     path.starts_with(p) && path[p.len()..].starts_with('/')
 }
 
-/// Join upstream base + rest without allowing `@` authority injection in rest.
+/// Join upstream base + rest（rest 里的 `@` 不能再造出 authority —— 见下面补 `/` 的说明）。
 fn join_upstream(upstream: &str, rest: &str) -> Result<String> {
     let rest = if rest.is_empty() { "/" } else { rest };
-    if rest.contains('@') {
-        bail!("proxy refused path component containing '@' (authority injection)");
-    }
+    // **不再**因为 rest 含 `@` 就拒绝：`rest` 是「路径 + 查询串」，`@` 在两者里都很常见
+    //（`/api/users/@me`、`?u=user@host`、`?next=mailto:a@b`），旧版把这些正常请求全打成
+    // 502。它当年要防的是「用 `@` 再造一个 authority」，而下面「必须补 `/` 分隔符」那句
+    // 已经把门关死：rest 一定以 `/` 开头，拼出的 URL 的 authority 就是 upstream 自己的。
     if rest.starts_with("//") {
         bail!("proxy refused protocol-relative suffix");
     }
@@ -442,7 +461,13 @@ async fn proxy_once(
     // 规格 11：回源 HTTP 版本可配（h2 显式启用；不配置时按 ALPN 协商结果自动选）。
     // UpSender 定义在模块级（连接池 POOL 按它声明类型，两处必须同一个类型）。
 
-    let want_h2 = rule.upstream_http_version.as_deref() == Some("h2")
+    // 大小写/空白归一：面板与手写 TOML 里 `"H2"`、`" h2 "` 都是合法写法，
+    // 而精确比较会让它们**静默**按 h1 处理（保存成功、行为不变 —— 最难查的一类）。
+    let want_h2 = rule
+        .upstream_http_version
+        .as_deref()
+        .map(|v| v.trim().eq_ignore_ascii_case("h2"))
+        .unwrap_or(false)
         || (rule.upstream_http_version.is_none() && alpn_h2);
     let pool_key = PoolKey::new(
         &host,
@@ -494,6 +519,9 @@ async fn proxy_once(
         .await
         .map_err(|e| anyhow::anyhow!("read upstream request body: {e}"))?
         .to_bytes();
+    // 先把「是不是 HEAD」记下来：`parts.method` 马上会被 move 进 builder，
+    // 而响应侧判断上游 Content-Length 能不能透传时还要用它（HEAD 的 CL 描述 GET 体大小）。
+    let req_is_head = parts.method == http::Method::HEAD;
     let mut builder = Request::builder().method(parts.method).uri(&uri);
     // hop-by-hop 头与 Connection 列名的头一律不上游（host 单独重写）。
     let conn_tokens: Vec<String> = parts
@@ -525,17 +553,32 @@ async fn proxy_once(
         builder = builder.header(k, v);
     }
     builder = builder.header(HOST, upstream_host_header(&host, port, &scheme));
-    // P2-5：标准代理头注入——XFF 追加客户端 IP；proto 按 listener 是否 TLS。
-    let xff = match parts.headers.get("x-forwarded-for").and_then(|v| v.to_str().ok()) {
-        Some(existing) => format!("{existing}, {peer_ip}"),
-        None => peer_ip.to_string(),
-    };
-    builder = builder.header("x-forwarded-for", xff);
+    // 标准代理头注入：**只写我们自己看到的对端地址**。
+    //
+    // 旧实现是「客户端那份 + `, ` + peer_ip」（= nginx 的 $proxy_add_x_forwarded_for），
+    // 也就是把**未认证客户端**提供的值当成信任链的第一跳；后端按惯例「取第一个」记日志/
+    // 做 ACL 时，任何客户端都能用一行 `X-Forwarded-For: 1.2.3.4` 冒充来源 IP（本项目的
+    // ip_access / GeoIP 就是按 IP 决策）。要接续上游代理链，应当显式配「受信代理白名单」，
+    // 而不是无条件信任客户端。现在链上只有我们这一跳，语义明确。
+    builder = builder.header("x-forwarded-for", peer_ip.to_string());
     builder = builder.header(
         "x-forwarded-proto",
         if client_https { "https" } else { "http" },
     );
     for (k, v) in &rule.modify_request_headers {
+        // 与响应方向（response_header_injectable）对称：报文定界头与 authority 头不得由规则
+        // 注入。`builder.header` 是**追加**语义，于是 `{"Host": "evil.tld"}` 会发出**两个**
+        // Host；`{"Content-Length": N}` 会成为 hyper 的定界长度（与真实 body 不符时静默截断）；
+        // `Connection: x` 让规则指定额外逐跳头，绕过我们在两个方向上的剥离。
+        let Ok(name) = http::header::HeaderName::from_bytes(k.as_bytes()) else {
+            log::warn!("proxy: 忽略规则里非法的请求头名 {k:?}");
+            continue;
+        };
+        let l = name.as_str();
+        if HOP_BY_HOP.contains(&l) || l == "content-length" || l == "host" {
+            log::warn!("proxy: 忽略规则注入的请求头 {k:?}（定界头/authority/逐跳头不得注入）");
+            continue;
+        }
         builder = builder.header(k, v);
     }
     let upstream_req = builder
@@ -571,6 +614,9 @@ async fn proxy_once(
     })?
     .map_err(|e| anyhow::anyhow!("read upstream response body: {e}"))?
     .to_bytes();
+    // 重建后的 body 长度：`rbytes` 马上会被 move 进 body，而响应头过滤要用这个值
+    // 判断上游声明的 Content-Length 是否可信（见下面的说明）。
+    let body_len = rbytes.len();
     let mut out = Response::builder()
         .status(rparts.status)
         .body(full(rbytes))
@@ -584,6 +630,29 @@ async fn proxy_once(
         for (k, v) in rparts.headers.iter() {
             let kl = k.as_str().to_ascii_lowercase();
             if HOP_BY_HOP.contains(&kl.as_str()) || conn_tokens.iter().any(|t| *t == kl) {
+                continue;
+            }
+            // 上游声明的长度必须与**重建后**的 body 一致，否则不能透传。
+            //
+            // 这里的 body 是我们重新序列化出来的（`body(full(rbytes))`），而 hyper 的
+            // 服务端按 **body 的长度**定界、却把用户给的头值**原样**写出去（一致性检查只在
+            // debug_assertions 下）。于是上游只要回一个 `Transfer-Encoding: chunked` +
+            // 谎报的 `Content-Length: N`（tor 规则下就是恶意线路端），客户端/中间缓存就会
+            // 按 N 去读、把**多出来的字节当成下一条响应**——响应走私。配置方向的同类头
+            //（response_header_injectable）早就拒了，漏的正是「上游那一份」。
+            // HEAD 例外：它的 CL 描述的是 GET 体的大小，body 本就为空。
+            if k == http::header::CONTENT_LENGTH
+                && !req_is_head
+                && v.to_str()
+                    .ok()
+                    .and_then(|s| s.trim().parse::<usize>().ok())
+                    != Some(body_len)
+            {
+                log::debug!(
+                    "proxy: 丢弃上游 Content-Length（声明 {:?}，实际 {} 字节）",
+                    v.to_str().unwrap_or("?"),
+                    body_len
+                );
                 continue;
             }
             out_headers.append(k.clone(), v.clone());
@@ -818,33 +887,60 @@ async fn connect_upstream_inner(
         return Ok(UpstreamIo::plain(tcp));
     }
 
+    // 回源 ALPN 三态（此前只有「显式指定就完全不发 ALPN」两态，于是 `h2` 这个**文档化的
+    // 配置项永远不可能工作**）：普通 TLS h2 上游（nginx/Caddy/Envoy）靠 ALPN 协商协议，
+    // 不发 ALPN 时它按 HTTP/1.1 回话，而我们按 h2 起始帧（prior-knowledge 前奏）讲话 ⇒
+    // 握手后立刻协议错、请求 502。
+    //   * 显式 h2  → 只给 h2（不给上游挑 h1 的机会，我们只会说 h2）
+    //   * 显式 h1  → 不发 ALPN
+    //   * 未指定   → h2 + http/1.1（现状：按协商结果选 client conn）
+    let alpn = match rule
+        .upstream_http_version
+        .as_deref()
+        .map(|v| v.trim().to_ascii_lowercase())
+        .as_deref()
+    {
+        Some("h2") => UpstreamAlpn::H2Only,
+        Some(_) => UpstreamAlpn::Off,
+        None => UpstreamAlpn::Auto,
+    };
     wrap_upstream_tls(
         tcp,
         host,
         mode,
         rule.upstream_tls_version.as_deref(),
-        // 未显式指定回源 HTTP 版本 → 让 ALPN 自动协商（规格 11）。
-        rule.upstream_http_version.is_none(),
+        alpn,
     )
     .await
 }
 
 /// TLS wrap for HTTPS / onion upstreams. Onion `verify` checks leaf DER via
 /// [`onion_cert_matches_host`]; missing peer-cert APIs reject the connection.
+/// 回源 ALPN 策略（见调用点的说明）。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum UpstreamAlpn {
+    /// 未指定回源 HTTP 版本：h2 + http/1.1，按协商结果选 client conn。
+    Auto,
+    /// 显式 `h2`：只提供 h2。
+    H2Only,
+    /// 显式 `h1`：不发 ALPN。
+    Off,
+}
+
 async fn wrap_upstream_tls(
     tcp: TcpStream,
     host: &str,
     mode: OnionSslMode,
     tls_version: Option<&str>,
-    alpn_auto: bool,
+    alpn: UpstreamAlpn,
 ) -> Result<UpstreamIo> {
     #[cfg(feature = "tls_boring")]
     {
-        return wrap_upstream_tls_boring(tcp, host, mode, tls_version, alpn_auto).await;
+        return wrap_upstream_tls_boring(tcp, host, mode, tls_version, alpn).await;
     }
     #[cfg(all(feature = "tls_rustls", not(feature = "tls_boring")))]
     {
-        let _ = alpn_auto;
+        let _ = alpn;
         return wrap_upstream_tls_rustls(tcp, host, mode, tls_version).await;
     }
     #[cfg(not(any(feature = "tls_boring", feature = "tls_rustls")))]
@@ -868,7 +964,7 @@ async fn wrap_upstream_tls_boring(
     host: &str,
     mode: OnionSslMode,
     tls_version: Option<&str>,
-    alpn_auto: bool,
+    alpn: UpstreamAlpn,
 ) -> Result<UpstreamIo> {
     use boring::ssl::{SslConnector, SslMethod, SslVerifyMode, SslVersion};
 
@@ -901,10 +997,18 @@ async fn wrap_upstream_tls_boring(
     // 规格 11「不配置时自动处理」：未显式指定回源 HTTP 版本时，用 ALPN 让上游
     // 自己选。ALPN 线格式是「1 字节长度 + 名字」序列。协商结果在握手后读回，
     // 据此决定用 h2 还是 h1 的 client conn。
-    if alpn_auto {
-        config
-            .set_alpn_protos(&[2, b'h', b'2', 8, b'h', b't', b't', b'p', b'/', b'1', b'.', b'1'])
-            .context("upstream set_alpn_protos")?;
+    match alpn {
+        UpstreamAlpn::Auto => {
+            config
+                .set_alpn_protos(&[2, b'h', b'2', 8, b'h', b't', b't', b'p', b'/', b'1', b'.', b'1'])
+                .context("upstream set_alpn_protos")?;
+        }
+        UpstreamAlpn::H2Only => {
+            config
+                .set_alpn_protos(&[2, b'h', b'2'])
+                .context("upstream set_alpn_protos")?;
+        }
+        UpstreamAlpn::Off => {}
     }
     // SNI: use host; for .onion Boring still accepts the name string.
     let mut tls = tokio_boring::connect(config, host, tcp)
@@ -934,9 +1038,9 @@ async fn wrap_upstream_tls_boring(
         .selected_alpn_protocol()
         .map(|p| p == b"h2")
         .unwrap_or(false);
-    if alpn_auto {
+    if alpn != UpstreamAlpn::Off {
         log::debug!(
-            "upstream {host}: ALPN auto → {}",
+            "upstream {host}: ALPN {alpn:?} → {}",
             if negotiated_h2 { "h2" } else { "http/1.1" }
         );
     }
@@ -1143,6 +1247,17 @@ async fn read_http_head(stream: &mut UpstreamIo) -> Result<(StatusCode, HeaderMa
             let head = buf[..pos + 4].to_vec();
             // 头部之后剩下的字节**回注**，交给后续隧道/正文读取
             stream.leftover = buf[pos + 4..].to_vec();
+            // 1xx 是**中间响应**（`HTTP/1.1 100 Continue` 最常见：客户端带
+            // `Expect: 100-continue` 时 nginx/Caddy 会先回 100 再回 101），不是最终状态行。
+            // 旧实现在第一个空行处就返回，于是 WS 升级被判成「上游返回 100 Continue」→ 硬 502。
+            // hyper 自己的客户端会跳过 1xx，这里补上同一语义（丢弃该段头，继续读真正的头）。
+            if let Ok((code, _)) = parse_http_head(&head) {
+                if code.as_u16() < 200 {
+                    log::debug!("ws upstream 中间响应 {}：继续读最终头", code.as_u16());
+                    buf = std::mem::take(&mut stream.leftover);
+                    continue;
+                }
+            }
             return parse_http_head(&head);
         }
         if buf.len() > 65536 {
@@ -1193,6 +1308,12 @@ async fn connect_tor_socks(
     port: u16,
     socks_override: Option<&str>,
 ) -> Result<TcpStream> {
+    // 走 SOCKS5 的名字必须与路由判定用**同一规范形态**：`is_onion_host`/`needs_tor` 会把
+    // 尾点规范化掉（`x.onion.` 也走 Tor），但 SOCKS 请求里若原样带上尾点，tor 的 v3 校验
+    // 要求恰好 62 字符，会把 `xxx.onion.` 当成**普通域名**（既不认成隐藏服务，还等于把
+    // 名字交给出口去解析）。这里统一成小写、去尾点后再发。
+    let host_owned = host.trim().trim_end_matches('.').to_ascii_lowercase();
+    let host: &str = &host_owned;
     if let Some(stream) = try_tor_ffi_connect(host, port).await {
         return stream;
     }

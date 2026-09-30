@@ -1149,6 +1149,25 @@ impl Config {
         // 配置期一律拦住（见各自 validate 的注释）。
         crate::server::tor_hs::validate(&self.tor_hs)?;
 
+        // ip_access 的空条目：运行期 `access::cidr_or_exact("")` 把空串当成**匹配所有地址**
+        // （`pattern.is_empty() || pattern == "*" => true`），于是手写配置里一个空项
+        // （`allow = ["1.2.3.4", ""]`、deny 里多打一个逗号）会变成「整站 403」或「放行所有人」
+        // ——两种结果都不会有任何报错，只表现为「站点突然全 403 / 白名单形同虚设」。
+        // 面板保存路径（admin.rs::check_ip_access_entry）已经拒空串，这里补上配置期这一道。
+        for (name, list) in [
+            ("allow", &self.ip_access.allow),
+            ("deny", &self.ip_access.deny),
+        ] {
+            for (i, p) in list.iter().enumerate() {
+                if p.trim().is_empty() {
+                    anyhow::bail!(
+                        "[ip_access].{name}[{i}] 是空串 —— 运行期空串等于「匹配所有地址」\
+（deny 会让全站 403、allow 会放行所有人），请删掉这一项或显式写 \"*\""
+                    );
+                }
+            }
+        }
+
         // TLS 相关的 fail-fast：这几条错了不会「报错」，而是**静默降级或整站不可用**，
         // 必须在加载期拦住（用户明确要求：拒绝异常配置，而不是运行期悄悄跳过）。
         for l in &self.listeners {
@@ -1274,6 +1293,43 @@ cert = "cert.pem"
         let cfg: Config = toml::from_str(toml).expect("parse");
         let err = cfg.validate().expect_err("cert 无 key 必须报错");
         assert!(format!("{err}").contains("成对"), "错误信息应说明成对: {err}");
+    }
+
+    /// ip_access 里的空串必须被配置期拒绝：运行期它等于「匹配所有地址」，
+    /// `deny = [""]` 会让全站 403、`allow = [""]` 会放行所有人 —— 两种都只有
+    /// 「站点突然全 403 / 白名单形同虚设」这一个表现，且毫无报错。
+    #[test]
+    fn empty_ip_access_entries_are_rejected() {
+        // 用 raw string 拼 TOML，免得转义把测试自己搞错
+        let load = |extra: &str| -> Config {
+            toml::from_str(&format!(
+                r#"
+[[listeners]]
+address = "127.0.0.1"
+port = 14443
+root = "/tmp/ipacc"
+{extra}
+"#
+            ))
+            .expect("parse")
+        };
+        let e = load("[ip_access]\nallow = [\"1.2.3.4\", \"  \"]")
+            .validate()
+            .expect_err("allow 里的空串必须报错");
+        assert!(format!("{e}").contains("allow[1]"), "{e}");
+
+        let e = load("[ip_access]\ndeny = [\"\"]")
+            .validate()
+            .expect_err("deny 里的空串必须报错");
+        assert!(format!("{e}").contains("deny[0]"), "{e}");
+
+        // 正常配置（含显式 "*"）不受影响
+        assert!(
+            load("[ip_access]\nallow = [\"10.0.0.0/8\", \"*\"]")
+                .validate()
+                .is_ok(),
+            "合法条目不该被拦"
+        );
     }
 
     /// sni_only 但没有可比对的名字：必须加载失败（否则所有连接被丢弃）。

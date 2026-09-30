@@ -37,7 +37,11 @@ impl OnionSslMode {
     pub fn parse(s: &str) -> Self {
         match s.trim().to_ascii_lowercase().as_str() {
             "verify" => Self::Verify,
-            "no_verify" | "noverify" | "tor" => Self::NoVerify,
+            // `tor` 只表示「强制走 Tor」（`proxy::needs_tor` 认的是这个字符串），**不是**
+            // 安全档位：把它映射成 NoVerify 等于让面板上一个看起来只是「走 Tor」的选项悄悄
+            // 关掉 `.onion` 的证书即公钥校验（唯一的认证手段）。按最严格档处理。
+            "tor" => Self::Verify,
+            "no_verify" | "noverify" => Self::NoVerify,
             "trust_self_signed" | "trust" => Self::TrustSelfSigned,
             "off" | "plain" => Self::Off,
             // 未知值一律按最严格处理：宁可能连不上，也不能静默不校验。
@@ -106,16 +110,11 @@ pub fn onion_cert_matches_host(leaf_der: &[u8], host: &str) -> bool {
     let Some(expected) = decode_v3_onion_pubkey(host) else {
         return false;
     };
-    if let Some(spki_key) = extract_spki_ed25519_key(leaf_der) {
-        return spki_key == expected;
-    }
-    // Fallback: only scan BIT STRING payloads (tag 0x03), not arbitrary DER bytes.
-    bit_string_payloads(leaf_der).any(|payload| {
-        payload == expected.as_slice()
-            || payload
-                .windows(32)
-                .any(|w| w == expected)
-    })
+    // 不做任何「回退扫描」：在整份证书里找「哪儿出现过这 32 字节」等于把「证书即公钥」
+    // 退化成「证书里恰好含这 32 字节」——签名值、扩展的 OCTET STRING、DN 字符串都算，
+    // 而期望值（.onion 地址里的公钥）是**公开的**，攻击者可以把它塞进任意位置。
+    // SPKI 路径走不通就是**不匹配**（fail-closed）。
+    extract_spki_ed25519_key(leaf_der).is_some_and(|k| k == expected)
 }
 
 /// Walk X.509 DER → TBSCertificate → subjectPublicKeyInfo → BIT STRING key bytes.
@@ -136,65 +135,32 @@ fn extract_spki_ed25519_key(cert_der: &[u8]) -> Option<[u8; 32]> {
     }
     // subjectPublicKeyInfo ::= SEQUENCE { algorithm, subjectPublicKey BIT STRING }
     let (spki, _) = der_expect_seq(tbs_body)?;
-    let (_, after_alg) = der_skip_tlv(spki)?;
+    // **必须**核对 AlgorithmIdentifier 是 Ed25519（OID 1.3.101.112 = 2b 65 70）：
+    // 旧实现跳过算法直接取 BIT STRING 的「最后 32 字节」，对 RSA 证书那就是模数尾巴 +
+    // 指数编码、对 P-256 就是 Y 坐标 —— 比对的根本不是公钥本身，却能「匹配成功」。
+    let (alg, after_alg) = der_expect_seq(spki)?;
+    if !alg.windows(3).any(|w| w == ED25519_OID) {
+        return None;
+    }
     let (bitstr, _) = der_expect_tag(after_alg, 0x03)?;
     // BIT STRING: first byte = unused bits count
     if bitstr.is_empty() {
         return None;
     }
     let key = &bitstr[1..];
-    if key.len() == 32 {
-        let mut out = [0u8; 32];
-        out.copy_from_slice(key);
-        return Some(out);
+    // 长度必须**恰好** 32：不截断、不补长（`key.len() > 32` 时旧代码取尾 32 字节，
+    // 等于拿与被检对象无关的字节去比）。
+    if key.len() != 32 {
+        return None;
     }
-    // Some encodings wrap the key; take last 32 bytes if long enough.
-    if key.len() > 32 {
-        let mut out = [0u8; 32];
-        out.copy_from_slice(&key[key.len() - 32..]);
-        return Some(out);
-    }
-    None
+    let mut out = [0u8; 32];
+    out.copy_from_slice(key);
+    Some(out)
 }
 
-fn bit_string_payloads(der: &[u8]) -> BitStringIter<'_> {
-    BitStringIter { der, i: 0 }
-}
+/// Ed25519 的 OID（1.3.101.112）DER 编码，不含 tag/len。
+const ED25519_OID: &[u8] = &[0x2b, 0x65, 0x70];
 
-struct BitStringIter<'a> {
-    der: &'a [u8],
-    i: usize,
-}
-
-impl<'a> Iterator for BitStringIter<'a> {
-    type Item = &'a [u8];
-    fn next(&mut self) -> Option<Self::Item> {
-        while self.i < self.der.len() {
-            if self.der[self.i] != 0x03 {
-                self.i += 1;
-                continue;
-            }
-            let Some((content, hdr)) = read_der_len(&self.der[self.i..]) else {
-                self.i += 1;
-                continue;
-            };
-            let start = self.i + hdr;
-            let end = start + content;
-            if end > self.der.len() {
-                self.i += 1;
-                continue;
-            }
-            self.i = end;
-            let body = &self.der[start..end];
-            if body.is_empty() {
-                continue;
-            }
-            // Skip unused-bits leading byte.
-            return Some(&body[1..]);
-        }
-        None
-    }
-}
 
 fn der_expect_seq(input: &[u8]) -> Option<(&[u8], &[u8])> {
     der_expect_tag(input, 0x30)
@@ -330,6 +296,96 @@ mod tests {
         let host2 = format!("{}.onion", base32_encode(&raw2));
         assert!(!onion_cert_matches_host(&cert, &host2));
     }
+    /// 非 Ed25519 的 SPKI 不得匹配 —— 旧实现跳过算法、取 BIT STRING 的**最后 32 字节**，
+    /// 于是「构造一张 RSA 证书，让模数尾巴 + 指数编码正好等于目标公钥」就能骗过
+    /// `ssl_mode=verify`（对攻击者来说只需一张自己签的证书）。这里用一张「OID 是 RSA、
+    /// 密钥尾部恰好是目标公钥」的证书，断言拒绝。
+    #[test]
+    fn non_ed25519_spki_never_matches() {
+        let mut raw = [0u8; 35];
+        raw[0..32].fill(0x33);
+        raw[34] = 0x03;
+        let host = format!("{}.onion", base32_encode(&raw));
+        let pk = decode_v3_onion_pubkey(&host).unwrap();
+
+        fn seq(body: &[u8]) -> Vec<u8> {
+            let mut v = vec![0x30];
+            if body.len() < 128 {
+                v.push(body.len() as u8);
+            } else {
+                v.push(0x81);
+                v.push(body.len() as u8);
+            }
+            v.extend_from_slice(body);
+            v
+        }
+        // RSA OID 1.2.840.113549.1.1.1 + 128 字节「模数」，最后 32 字节 = 目标公钥
+        let rsa_oid = [0x06, 0x09, 0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x01];
+        let mut key = vec![0x5au8; 96];
+        key.extend_from_slice(&pk);
+        let bitstr = {
+            let mut b = vec![0x03, (key.len() + 1) as u8, 0x00];
+            b.extend_from_slice(&key);
+            b
+        };
+        let mut spki_body = rsa_oid.to_vec();
+        spki_body.extend_from_slice(&bitstr);
+        let spki = seq(&spki_body);
+        let placeholder = seq(&[0x02, 0x01, 0x01]);
+        let mut tbs_body = Vec::new();
+        for _ in 0..5 {
+            tbs_body.extend_from_slice(&placeholder);
+        }
+        tbs_body.extend_from_slice(&spki);
+        let cert = seq(&seq(&tbs_body));
+
+        assert!(
+            !onion_cert_matches_host(&cert, &host),
+            "OID 不是 Ed25519 就不是「证书即公钥」，不许匹配"
+        );
+    }
+
+    /// Ed25519 但密钥长度不是 32 字节 ⇒ 不允许（旧实现会取尾巴凑 32 字节）。
+    #[test]
+    fn ed25519_wrong_length_never_matches() {
+        let mut raw = [0u8; 35];
+        raw[0..32].fill(0x44);
+        raw[34] = 0x03;
+        let host = format!("{}.onion", base32_encode(&raw));
+        let pk = decode_v3_onion_pubkey(&host).unwrap();
+
+        fn seq(body: &[u8]) -> Vec<u8> {
+            let mut v = vec![0x30];
+            if body.len() < 128 {
+                v.push(body.len() as u8);
+            } else {
+                v.push(0x81);
+                v.push(body.len() as u8);
+            }
+            v.extend_from_slice(body);
+            v
+        }
+        let mut key = vec![0u8; 31];
+        key.extend_from_slice(&pk[..31]); // 31 字节，最后 31 字节里有 31/32 的目标值
+        let bitstr = {
+            let mut b = vec![0x03, (key.len() + 1) as u8, 0x00];
+            b.extend_from_slice(&key);
+            b
+        };
+        let alg = seq(&[0x06, 0x03, 0x2b, 0x65, 0x70]);
+        let mut spki_body = alg;
+        spki_body.extend_from_slice(&bitstr);
+        let spki = seq(&spki_body);
+        let placeholder = seq(&[0x02, 0x01, 0x01]);
+        let mut tbs_body = Vec::new();
+        for _ in 0..5 {
+            tbs_body.extend_from_slice(&placeholder);
+        }
+        tbs_body.extend_from_slice(&spki);
+        let cert = seq(&seq(&tbs_body));
+        assert!(!onion_cert_matches_host(&cert, &host), "密钥长度必须恰好 32 字节");
+    }
+
     /// 尾点（FQDN 写法）必须仍判为 onion —— 否则会绕过 Tor 路由并把 onion 名交给 DNS。
     #[test]
     fn trailing_dot_still_onion() {

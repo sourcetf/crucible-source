@@ -23,6 +23,21 @@ pub fn is_allowed(cfg: &IpAccessConfig, peer: SocketAddr) -> bool {
     cfg.allow.iter().any(|p| cidr_or_exact(p, ip))
 }
 
+/// 请求路径是否属于管理面：**必须带段边界**。
+///
+/// `admin.path` 默认 `/__admin`（校准时会去掉尾斜杠），于是裸 `starts_with` 会让
+/// `/__adminX/api/files` 也进管理分发 —— 而 `admin.rs` 内部的判定是
+/// `path.ends_with("/api/files")` 这类**后缀**匹配，于是文件管理器 API 在配置的
+/// 管理前缀之外也能被调（安全边界仍靠 Basic + CSRF，但运维常在前置代理上用
+/// `location /__admin/` 把管理面挡在公网之外 —— 绕过点正是这里）。
+pub fn is_admin_path(admin_path: &str, path: &str) -> bool {
+    if path == admin_path {
+        return true;
+    }
+    let with_slash = format!("{}/", admin_path.trim_end_matches('/'));
+    path.starts_with(&with_slash)
+}
+
 pub fn deny_response() -> (http::StatusCode, &'static str) {
     (http::StatusCode::FORBIDDEN, "forbidden by ip_access")
 }
@@ -140,5 +155,23 @@ mod tests {
         assert!(!cross_site_blocked(&h));
         h.insert("sec-fetch-site", HeaderValue::from_static("Cross-Site"));
         assert!(cross_site_blocked(&h));
+    }
+}
+
+#[cfg(test)]
+mod admin_path_tests {
+    use super::is_admin_path;
+
+    #[test]
+    fn admin_path_needs_a_segment_boundary() {
+        assert!(is_admin_path("/__admin", "/__admin"));
+        assert!(is_admin_path("/__admin", "/__admin/"));
+        assert!(is_admin_path("/__admin", "/__admin/api/files"));
+        // 关键：同前缀的**别站**路径不算管理面
+        assert!(!is_admin_path("/__admin", "/__adminX/api/files"));
+        assert!(!is_admin_path("/__admin", "/__administrator"));
+        // 前缀本身带尾斜杠也要正常
+        assert!(is_admin_path("/__admin/", "/__admin/api"));
+        assert!(!is_admin_path("/__admin/", "/__adminX"));
     }
 }

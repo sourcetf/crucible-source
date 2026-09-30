@@ -100,7 +100,13 @@ fn engine_owns(lc: &ListenerConfig, url_path: &str, mode: FileOpenMode) -> bool 
         return false;
     }
     match normalize_url_path(url_path) {
-        Some(normalized) => crate::server::apps::would_handle(lc, &normalized),
+        Some(normalized) => {
+            crate::server::apps::would_handle(lc, &normalized)
+                // 引擎被 `enabled = false` 关掉时 `would_handle` 为 false，但该路径下的脚本/
+                // 源码**仍然不能被当静态文件服务** —— 否则「临时停掉 php 引擎」等于把
+                // `index.php` 的源码（含口令）公开下载。判据见 apps::route_owns_path。
+                || crate::server::apps::route_owns_path(lc, &normalized)
+        }
         // 归一化失败（含 `..` 等，resolve_path 本已拒绝）：fail-closed。
         None => true,
     }
@@ -461,6 +467,22 @@ fn resolve_path(root: &Path, url_path: &str) -> Result<PathBuf> {
         if name.starts_with('.') && name.ends_with(".upload.part") {
             bail!("upload temp file is not served");
         }
+    }
+    // 隐藏文件/目录一律不服务（唯一例外：ACME 的 `/.well-known/`，其内容是公开校验串）。
+    //
+    // 实测过的泄露：生产 listener（`root = www-apps`）上 `GET /rust/.env`、`GET /c/.env`
+    // 都是 **200** —— 这些 `.env` 正是 `deps.rs` 读进**引擎进程环境变量**的 `KEY=VAL`
+    //（数据库口令之类）；`.git/config`、`.htpasswd`、`.crucible_manifest` 同理。它们既不在
+    // 可执行扩展名名单里、也不归引擎，静态层于是照单全收。判据放在 `resolve_path` 里，
+    // h1 与 h2/h3 两条服务路径同时生效。
+    for seg in decoded.split(['/', '\\']) {
+        if seg.is_empty() || seg == "." || !seg.starts_with('.') {
+            continue;
+        }
+        if seg.eq_ignore_ascii_case(".well-known") {
+            continue; // ACME http-01：必须可服务
+        }
+        bail!("hidden path is not served");
     }
     let joined = root.join(&decoded);
     let canon_root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
