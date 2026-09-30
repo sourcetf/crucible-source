@@ -623,3 +623,47 @@ DNS 递归正常、`/api/tor/status` 新 schema `enabled:false/running:false`（
 deadline，而 **tor 的 SOCKS5 应答要等电路建好才返回**，冷电路首次请求必然吃满 10s 报 502（注释里
 「Tor 建路在数秒量级」的说法是错的；对照：同一目标经 tor 的 TCP SocksPort 冷 2.27s、热 0.97s）。
 已改为 Tor 单独 45s（直连仍 10s）+ 单测防回退 + 「永不回话的假 SOCKS」真机验证（45s 后 502）。
+
+---
+
+### Session 1008 (2026-09-30) — 进展 15（3 个审计 agent × 19 项 findings → 修 21 处 + 真机复验）
+
+**三个只读审计 agent**（proxy+onion_ca / static+upload+admin-files / TLS+ECH+DNS）报的 19 项里，
+凡能核实的都核实并修了（提交 `c95e917`，单测 **208/208**，生产已部署并复验）。要点：
+
+**① 最严重是上传端点的 webshell 闸门（P0）**：分发用**原始** URL 路径问引擎、落盘用
+`safe_join` **归一化**路径 ⇒ `PUT /./cgi/pwn`（无扩展名，`has_exec_ext` 拦不住）写进 CGI
+docroot，随后 `GET /cgi/pwn` 被引擎执行。修法：上传前用与 admin 文件写入同一套归一化判据
+`would_execute_on_get`。
+
+**② 隐藏文件在生产口匿名可读（P1，已实测）**：`GET /rust/.env`、`/c/.env` 都是 **200**，
+access log 的 handler 是 `app` —— 因为 `Path::extension(".env")` 是 `None`，`ext` 成空串，
+于是 `extensions = ["rs",""]` 与 catch-all 路由都把 `.env` 认成自己的，引擎直接把
+`deps.rs` 读进进程环境的 `KEY=VAL` 吐了出来。三处一起修：引擎侧隐藏段不归任何引擎、
+静态层隐藏路径不服务（`.well-known` 例外）、上传也不许以隐藏路径为目标。顺带修了
+「引擎 `enabled=false` 后脚本源码被当静态文件下载」（`/php/index.php` 给源码）。
+
+**③ 代理/回源 10 处**：`would_proxy` 无边界（`/apidocs` 502、`path=""` 整站 502）、
+`join_upstream` 因 `@` 拒绝（`/api/users/@me` 502）、上游 `Content-Length` 透传导致
+**响应走私**、`modify_request_headers` 可注入 Host/CL/逐跳头、客户端 XFF 被当链首、
+502 回显内部错误链、显式 `h2` 时**完全不发 ALPN**（该配置永远连不上）、`.onion.` 原样发进
+SOCKS5、WS 不跳 1xx（`Expect: 100-continue` 硬 502）、`poll_read` 潜在 panic。
+
+**④ onion_ca**：`ssl_mode="tor"` 曾等于 `NoVerify`（顺手关掉唯一的认证）；SPKI 不核对算法、
+长了就取尾 32 字节、还有「整证书扫 BIT STRING」回退 ⇒ 全部收紧为 Ed25519 OID + 恰好 32 字节。
+
+**⑤ 其它**：admin 前缀加**段边界**（`/__adminX/api/files` 曾进管理分发）、`[ip_access]` 空串
+配置期拒绝（`deny=[""]` = 全站 403）、上传错误不回显绝对路径、目标是目录时临时文件不再写到
+docroot 之外、TLS 握手失败日志从 ERROR+整份 ClientHello（2KB/条、占日志 67%、匿名可触发）
+改为 WARN+折叠头尾。
+
+**真机复验**：`/rust/.env`、`/c/.env` 200→**404**，`/rust/index.rs` 仍 200；
+`/__adminX/api/files` → 404 而 `/__admin/api/*` → 200；`.well-known/acme-challenge/<token>` → 200
+（ACME 不受影响）；h1/h2/**h3** 全 200、DNS 正常；代理边界：`/apidocs/x` → 404（改前 502）。
+
+**未修（知情选择）**：上传体量/每 IP 限额（**生产未启用上传**，且需设计取舍）；
+app docroot 里非隐藏非引擎所属的文件（如 `/php/init.sh`，属运维放置策略，建议移出 docroot 或
+`file_open` 标注）；无 `tls_boring` 构建下 rustls 回源不做 CertificateVerify（本部署未触发）。
+
+**协作提醒**：本批我用 Python 文本模式改文件，把 10 个文件误转成 CRLF（Windows 默认），
+已还原为 LF 再传。**改文件的脚本请用 `open(p,'wb')` / `newline=''`**，否则会给别人整文件 diff。

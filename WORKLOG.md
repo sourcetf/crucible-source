@@ -1453,3 +1453,95 @@ A 下一帧用 `sess.received()` 取 offset 继续追加 ⇒ 两段数据混在�
 修法：Tor 走单独的 `UPSTREAM_CONNECT_TIMEOUT_TOR = 45s`（直连仍是 10s），超时信息里也点明
 「经 Tor：冷电路建路可能较慢」；新增单测 `tor_gets_a_larger_connect_budget` 防回退，
 并用「accept 但永不回话的假 SOCKS 端口」真机验证：请求 45s 后 502、错误文本写明 45s（改前是 10s）。
+
+### 21.17 审计批次（3 个并行 agent × 19 项findings）：21 处缺陷修复 + 真机复验
+
+**做法**：三个只读审计 agent 分别扫 `proxy+onion_ca`、`static+upload+admin-files`、
+`TLS+ECH+DNS`。报告里凡是我能核实的都核实了（对着代码逐条看，能上真机的一律上真机），
+**核实即修**；无法核实或属于运维策略的**如实列出未修原因**（见文末）。
+
+#### 一、最严重：上传端点的 webshell 闸门（P0）
+
+分发（h1/h2/h3）用**原始** URL 路径问 `apps::would_handle`，落盘用 `safe_join` 的**归一化**
+路径 —— 两者对 `/./cgi/pwn`、`//cgi/pwn` 结论不同：分发认为「不归引擎」→ 交给上传器，
+文件却写进 CGI 引擎的 docroot，随后 `GET /cgi/pwn` 由引擎执行。
+`has_exec_ext` 只看最后一段的扩展名，`pwn` 没有扩展名 ⇒ 拦不住。
+**一条不带扩展名的 PUT 换一个 webshell**。修法：上传前用与 admin 文件写入**同一套归一化**
+判据 `would_execute_on_get`（内部走 `web_path_of`），归一化后仍在引擎路径上就 403。
+
+#### 二、隐藏文件泄露（P1，且**实测生产口匿名可读**）
+
+基线证据（改前）：
+```
+GET /rust/.env  -> 200 (21B, text/plain)     GET /c/.env -> 200
+GET /php/init.sh -> 200 (application/x-sh)   GET /php/.env -> 403（php 路由另有规则挡下）
+```
+access log 的 handler 显示 `/rust/.env`、`/c/.env` 是 **`app`**（引擎）吐出来的，不是静态层 ——
+因为 `Path::extension(".env")` 是 `None`（前导点算主干），`ext` 成空串，于是
+`extensions = ["rs", ""]` 与「无 extensions 的 catch-all」都把 `.env` 认成自己的。
+而这些 `.env` 正是 `deps.rs` 读进**引擎进程环境变量**的 `KEY=VAL`。
+
+三处一起修（缺一处就漏）：
+1. `apps::match_app_indexed` / 新增 `route_owns_path`：**隐藏段不归任何引擎**（`.well-known` 例外）；
+2. `static_files::resolve_path`：**隐藏路径不服务**（`.well-known` 例外，且同目录下的
+   `.well-known/.secret` 仍拒 —— 例外只覆盖 `/.well-known` 这一层）；
+3. `upload_api`：隐藏路径不得作为**上传目标**（`.env`、`.git/hooks/pre-commit`）。
+
+另有「引擎被 `enabled=false` 关掉后脚本源码被当静态文件下载」（`GET /php/index.php` 直接
+给源码）：`engine_owns` 现在同时问 `route_owns_path`（不看 enabled）—— 引擎开关是**服务**的
+开关，不该变成「源码公开」的开关。
+
+#### 三、代理/回源（10 处）
+
+| 缺陷 | 后果 | 修法 |
+|---|---|---|
+| `would_proxy` 无边界，`try_proxy` 有边界 | `/apidocs` 被 502；手写 `path=""` **整站 502** | 三协议统一用 `path_matches_proxy_prefix` |
+| `join_upstream` 拒绝含 `@` 的 rest | `/api/users/@me`、`?u=a@b` 一律 502 | 去掉该检查（authority 由「补 `/`」关死） |
+| 上游 `Content-Length` 原样透传，body 却是重建的 | **响应走私**（客户端/缓存按谎报长度读下一条） | 与重建体不符即丢弃（HEAD 例外） |
+| `modify_request_headers` 可注入 Host/CL/逐跳头 | 两个 Host、body 静默截断、绕过逐跳头剥离 | 与响应侧对称的过滤 |
+| 客户端 XFF 被当作链首 | 后端按「取第一个」时来源 IP 可伪造 | 只写我们自己看到的对端 |
+| 502 正文 `{e:#}` | 泄露上游地址、tor socket 路径、TLS 后端错误 | 固定 `502 Bad Gateway` + 本地 warn |
+| 显式 `upstream_http_version="h2"` 时**不发 ALPN** | 该配置对着普通 h2 上游**永远连不上** | ALPN 三态（H2Only/Off/Auto） |
+| `.onion.`（尾点）原样发进 SOCKS5 | tor 按普通域名解析 ⇒ 连不上 | 发之前去尾点+小写 |
+| WS 握手读头不跳 1xx | `Expect: 100-continue` 场景硬 502 | 跳 1xx 继续读最终头 |
+| `poll_read` 在 `remaining()==0` 时 `put_slice` | 潜在 panic | 提前返回 |
+
+#### 四、onion_ca（.onion 回源**唯一**的认证手段）
+
+* `ssl_mode = "tor"` 被映射成 `NoVerify` —— 它只是「强制走 Tor」的开关，却顺手关掉了
+  「证书即公钥」校验；改为 `Verify`。
+* SPKI 提取不核对算法、密钥长了就「取最后 32 字节」（对 RSA 是模数尾巴+指数、对 P-256 是 Y
+  坐标 ⇒ 比的根本不是公钥），walk 失败还回退到「整份证书扫 BIT STRING」——而期望值是**公开的**
+  （就从 .onion 地址解出来），攻击者可把它塞进任意位置骗过校验。现在：核对 Ed25519 OID、
+  长度必须**恰好** 32 字节、**删除回退**（fail-closed）。
+
+#### 五、其它
+
+* admin 前缀加段边界（`/__adminX/api/files` 曾能进管理分发，`admin.rs` 内部是后缀匹配）；
+* `[ip_access]` 空串配置期拒绝（运行期空串=匹配所有 ⇒ `deny=[""]` 全站 403）；
+* 上传错误不回显文件系统路径；目标是目录时拒绝并让临时文件留在目标父目录（此前 `PUT /`
+  会把 `.www.upload.part` 写到 docroot **之外**）；
+* TLS 握手失败日志：由 ERROR + 完整 Debug（含**整个 ClientHello 字节**，实测 2KB/条、占日志
+  67%，**任何匿名客户端**发一次明文 GET 就能写 ⇒ 远程日志洪泛）改为 WARN + 折叠字节数组 +
+  头尾各留 180 字（保住 boring 写在末尾的 `reason: "HTTP_REQUEST"` 之类结论），完整原文降级 debug。
+
+#### 六、验证（全部真机）
+
+* 单测 **208/208**；
+* 生产：`/rust/.env`、`/c/.env` **200 → 404**；`/rust/index.rs` 仍 200（引擎照常执行）；
+  `/__adminX/api/files` → 404 而 `/__admin/api/*` → 200；`.well-known/acme-challenge/<token>`
+  → 200（ACME 不受影响）而同目录隐藏名 → 404；h1/h2/**h3(QUIC)** 全 200、DNS 递归正常；
+* 代理边界真机：规则 `path="/api"` 时 `/apidocs/x` → **404**（改前 502），`/api`、`/api/` → 502；
+* TLS 日志真机：明文探测 8443 现在新增 **~500B/WARN**（改前 ~2KB/ERROR），且结论可读。
+
+#### 七、有意未修（知情选择，非遗漏）
+
+1. **上传体量预算 / 每 IP 限额**：生产**未启用上传**（所有 listener 都没有 `enable_upload`），
+   而限额设计需要取舍（全局字节数？每 IP 会话数？拒绝时要不要保留已收字节？），不在本批动。
+2. **app docroot 里「非隐藏、非引擎所属」的文件**（如 `/php/init.sh` 部署脚本仍 200）：这是
+   运维放置策略问题 —— 建议把脚本移出 docroot，或用 `file_open` 标注；默认全拒会误伤正常的
+   静态资源（css/js/png 也在同一目录）。
+3. **未启用 `tls_boring` 的构建**下 rustls 回源不做 CertificateVerify：本部署启用 boring，
+   该分支未触发（记录在案，避免下次有人以为「已经全路径校验」）。
+4. **行尾**：本批用 Python 文本模式改文件，把 10 个文件误转成 CRLF（Windows 默认行为），
+   已还原为 LF 再上传。**教训**：改文件的脚本一律用 `open(p,'wb')` 或 `newline=''`。
