@@ -36,13 +36,24 @@ const POOL_CAP: usize = 16;
 /// 回源分阶段超时。此前整条链路一个 deadline 都没有：一个「接受连接但永不回包」
 /// 的上游会永久占住请求、任务与缓冲（body 缓冲上限 64MiB/请求）。取值理由：
 ///
-/// - connect 10s：TCP + SOCKS5 握手 + TLS 握手全在这一段。公网 RTT 在数十 ms、
-///   Tor 建路在数秒量级，10s 留了 20 倍以上余量，同时保证连不上时及时失败。
+/// - connect 10s：TCP + SOCKS5 握手 + TLS 握手全在这一段。公网 RTT 在数十 ms 量级，
+///   10s 对直连上游足够宽，又能在连不上时及时失败。
+/// - **Tor 上游另给一份预算**（见 `UPSTREAM_CONNECT_TIMEOUT_TOR`）：tor 的 SOCKS 应答
+///   会一直等到**电路建好**才返回，冷 tor 的第一条电路不属于「数秒量级」。
 /// - head 30s：请求已发出、等响应头。上游可能要现做一次 RDAP/DB 查询，Tor 冷启动
 ///   首包常达 3–10s；30s 覆盖这类慢启动，又能把僵死上游在 30s 内踢掉。
 /// - body 300s：响应体本身是合法的长时间传输（64MiB 上限对 300s 相当于
 ///   ≥218KB/s），所以这里只兜「一个字节都不再发」的上游，把总时长框住。
 const UPSTREAM_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+/// 走 Tor 的连接预算。
+///
+/// 为什么必须单独放宽：`do_socks5` 里的应答**不是**「握手完成」就回来 —— tor 会等到电路
+/// 建好（甚至先取一次新的网络共识）才回 SOCKS5 应答，冷电路实测可超过 10s。本轮真机复现：
+/// 一台刚启动的 tor 上，经我们反代取 `icanhazip.com` 直接吃满 10s 预算报
+/// `upstream connect timed out after 10s`；同一个目标在电路热了之后 0.6~1.2s 就返回（curl
+/// 走 tor 的 TCP SocksPort 对照也是 0.9~2.3s）。也就是说通用 10s 会把「tor 还在建电路」
+/// 误判成上游故障，给 Tor 规则带来周期性 502 —— 而 tor 自身的 SOCKS 等待上限是三分钟量级。
+const UPSTREAM_CONNECT_TIMEOUT_TOR: std::time::Duration = std::time::Duration::from_secs(45);
 const UPSTREAM_HEAD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 const UPSTREAM_BODY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
 
@@ -728,25 +739,38 @@ fn upstream_host_header(host: &str, port: u16, scheme: &str) -> String {
     }
 }
 
+/// 连接阶段的预算选择：Tor 单独放宽（原因见 `UPSTREAM_CONNECT_TIMEOUT_TOR` 的说明）。
+fn connect_budget(via_tor: bool) -> std::time::Duration {
+    if via_tor {
+        UPSTREAM_CONNECT_TIMEOUT_TOR
+    } else {
+        UPSTREAM_CONNECT_TIMEOUT
+    }
+}
+
 async fn connect_upstream(
     host: &str,
     port: u16,
     scheme: &str,
     rule: &ProxyRuleConfig,
 ) -> Result<UpstreamIo> {
+    let via_tor = needs_tor(host, rule);
+    let budget = connect_budget(via_tor);
     // 连接阶段统一 deadline：TCP connect、SOCKS5 握手、TLS 握手都在这一段里，
     // 上游或 SOCKS 端「接受连接后不推进握手」会被这里掐断（future 一并取消）。
-    tokio::time::timeout(
-        UPSTREAM_CONNECT_TIMEOUT,
-        connect_upstream_inner(host, port, scheme, rule),
-    )
-    .await
-    .map_err(|_| {
-        anyhow::anyhow!(
-            "upstream connect timed out after {}s ({host}:{port})",
-            UPSTREAM_CONNECT_TIMEOUT.as_secs()
-        )
-    })?
+    tokio::time::timeout(budget, connect_upstream_inner(host, port, scheme, rule))
+        .await
+        .map_err(|_| {
+            anyhow::anyhow!(
+                "upstream connect timed out after {}s ({host}:{port}{})",
+                budget.as_secs(),
+                if via_tor {
+                    "，经 Tor：冷电路建路可能较慢，若持续超时请查 tor 的 notice.log"
+                } else {
+                    ""
+                }
+            )
+        })?
 }
 
 async fn connect_upstream_inner(
@@ -1638,6 +1662,22 @@ mod tor_socks_tests {
         assert!(needs_tor(v3, &rule));
         assert!(needs_tor(&format!("{v3}."), &rule), "带尾点也必须走 Tor");
         assert!(is_onion_host(&format!("{v3}.")));
+    }
+
+    /// Tor 的连接预算必须**明显大于**直连预算：tor 的 SOCKS5 应答要等电路建好才回，
+    /// 冷电路实测超过 10s（本轮真机复现的 502 就是它）。这条断言防的是「有人把预算改回 10s」。
+    #[test]
+    fn tor_gets_a_larger_connect_budget() {
+        assert_eq!(connect_budget(false), UPSTREAM_CONNECT_TIMEOUT);
+        assert_eq!(connect_budget(true), UPSTREAM_CONNECT_TIMEOUT_TOR);
+        assert!(
+            connect_budget(true) > connect_budget(false),
+            "tor 预算必须大于直连预算"
+        );
+        assert!(
+            connect_budget(true).as_secs() >= 30,
+            "冷电路实测可超 10s，预算不该压回十几秒"
+        );
     }
 
     /// 默认 UDS 候选链里必须包含 orig 规格 A 列出的那几个路径。

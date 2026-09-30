@@ -618,3 +618,8 @@ DNS 递归正常、`/api/tor/status` 新 schema `enabled:false/running:false`（
 
 **测试残留已清理**（config-tor*.toml / www-e2e/ / state/tor-hs / bin/webserver-test / 客户端 tor）；
 **留给用户的两项**（未代做）：生产面板密码仍是样例 `admin`、`[admin].listeners_allow` 未收紧。
+
+**补遗（同上）**：真机验证时又抓到 `proxy.rs` 的一个 Tor 真 bug —— connect 阶段只有一个 **10s**
+deadline，而 **tor 的 SOCKS5 应答要等电路建好才返回**，冷电路首次请求必然吃满 10s 报 502（注释里
+「Tor 建路在数秒量级」的说法是错的；对照：同一目标经 tor 的 TCP SocksPort 冷 2.27s、热 0.97s）。
+已改为 Tor 单独 45s（直连仍 10s）+ 单测防回退 + 「永不回话的假 SOCKS」真机验证（45s 后 502）。

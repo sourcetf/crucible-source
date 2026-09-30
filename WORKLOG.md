@@ -1436,3 +1436,20 @@ A 下一帧用 `sess.received()` 取 offset 继续追加 ⇒ 两段数据混在�
 4. `ps -o args=` 在 OpenBSD 上按终端宽度截断（实测 80 列）⇒ pid 复用防护按「首词是 tor 且命令行含我们的
    torrc 路径」判断，不能整串比较；
 5. 两个 listener 不能共用同一个 `root`（校验器会拦：「duplicate listener root」），e2e 测试配置要分开 docroot。
+
+**补遗（同轮真机验证发现的第二个真 bug）：Tor 的连接预算是固定的 10s，冷电路必然误报 502**
+
+`proxy.rs` 里 connect 阶段只有一个 10s deadline，常量注释还写着「Tor 建路在数秒量级，
+10s 留了 20 倍以上余量」—— 这句话是**错的**：tor 的 SOCKS5 **应答**要等电路建好（必要时
+还要先取一次新的网络共识）才返回。实测证据链：
+
+1. 新起的 tor（UDS SOCKS，刚 bootstrap）+ 我们的反代取 `icanhazip.com` →
+   `proxy error: upstream connect timed out after 10s` → 502；
+2. 同一目标改走 curl + tor 的 **TCP SocksPort** 对照：冷 2.27s、热 0.97s（目标本身没问题）；
+3. 我们的反代改取 `check.torproject.org`（同一台 tor）连打 6 次：1.19s / 0.80s / 0.56s ×4
+   —— UDS 桥本身正确（debug 日志每次都是「使用默认 UDS /crucible/state/tor-client/socks.sock」）。
+
+结论：**冷电路上的第一次请求**会吃掉 10s 预算，表现为周期性 502（尤其刚重启/刚部署后）。
+修法：Tor 走单独的 `UPSTREAM_CONNECT_TIMEOUT_TOR = 45s`（直连仍是 10s），超时信息里也点明
+「经 Tor：冷电路建路可能较慢」；新增单测 `tor_gets_a_larger_connect_budget` 防回退，
+并用「accept 但永不回话的假 SOCKS 端口」真机验证：请求 45s 后 502、错误文本写明 45s（改前是 10s）。
