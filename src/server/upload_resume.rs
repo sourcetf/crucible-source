@@ -29,6 +29,19 @@ pub const MAX_SESSIONS: usize = 256;
 /// 「从 0 全量重传」允许截断旧会话前，旧会话必须静默多久。
 /// 30s 足以区分「客户端断线后重试」与「另一个客户端在并发上传同名文件」。
 pub const RESET_IDLE_GRACE: Duration = Duration::from_secs(30);
+/// **进程内**在飞字节上限（所有会话已收字节之和）。
+///
+/// 为什么要有：单文件上限（2GiB）与会话数上限（256）都是**逐个**计量的，乘起来是 512GiB，
+/// 而一台小机器的盘只有几十 GB —— 一个匿名客户端开 256 个会话、每个写几百 MB 就能把盘写满
+/// （本项目历史上真的被写满过一次：GeoIP 的 merge 因此死在半路）。这里给一个全局预算，
+/// 与下面的「磁盘余量闸门」一起把「用上传打满磁盘」这条路堵死。
+/// 与单文件上限取同一个值：既要**支持**文档承诺的单文件上限（否则 2GiB 的上限永远是空话、
+/// 1GiB 以上直接 507），又要给并发上传一个全局闸门。真正兜住磁盘的是下面的余量闸门。
+pub const MAX_INFLIGHT_BYTES: u64 = MAX_UPLOAD_BYTES;
+/// 同一来源 IP 的并发会话上限（防单机占满会话表，把正常用户挤成 503）。
+pub const MAX_SESSIONS_PER_IP: usize = 16;
+/// 磁盘余量下限：低于它就不再接受新的写入（留出系统/日志/数据库的呼吸空间）。
+pub const MIN_FREE_BYTES: u64 = 512 * 1024 * 1024;
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum UploadErr {
@@ -40,12 +53,16 @@ pub enum UploadErr {
     TooManySessions,
     /// 同名会话的 total 与本次不一致 → 400（让客户端换名或先 DELETE）。
     TotalMismatch,
+    /// 进程在飞字节预算或磁盘余量不足 → 507（不是客户端的错，也不是请求格式错）。
+    NoSpace,
     Io(String),
 }
 
 pub struct Session {
     /// 目标文件（调用方已做 containment 校验）。
     pub target: PathBuf,
+    /// 创建该会话的来源 IP：释放「每 IP 会话数」配额时要按它回收。
+    owner: Option<std::net::IpAddr>,
     /// 同目录临时文件：保证 rename 原子（跨目录 rename 不是原子的）。
     pub tmp: PathBuf,
     received: AtomicU64,
@@ -90,6 +107,79 @@ impl Session {
 static SESSIONS: Lazy<Mutex<HashMap<PathBuf, Arc<Session>>>> =
     Lazy::new(|| Mutex::new(HashMap::new()));
 
+/// 进程级预算：在飞字节数 + 每 IP 会话数（会话增删时同步维护）。
+#[derive(Default)]
+struct Budget {
+    /// 已落盘字节（各会话 `received` 之和）。
+    inflight: u64,
+    /// **已声明但还没写完**的字节（各会话 `total` 之和）。
+    ///
+    /// 少了这一项，「先开 256 个声明 2GiB 的会话、再慢慢写」就能绕过在飞预算 ——
+    /// 检查时必须 `inflight + reserved` 一起算。它只会**高估**（同一会话两个数都算），
+    /// 高估是安全方向。我的第一版只检查不记账，被自己的单测抓出来。
+    reserved: u64,
+    by_ip: HashMap<std::net::IpAddr, usize>,
+}
+
+static BUDGET: Lazy<Mutex<Budget>> = Lazy::new(|| Mutex::new(Budget::default()));
+
+/// 目标所在文件系统的可用字节（拿不到就返回 `None` = 不做这道判断）。
+///
+/// **必须沿父目录上溯**：上传目标是**还不存在**的新文件，直接 `statvfs(目标)` 会 ENOENT
+/// ⇒ 返回 None ⇒ 磁盘闸门永远不会生效（我自己写的单测抓到了这一点）。语义上也该看
+/// 「它将被创建在哪块盘上」。
+#[cfg(unix)]
+fn free_bytes(path: &Path) -> Option<u64> {
+    let mut p = path;
+    loop {
+        if let Some(free) = statvfs_free(p) {
+            return Some(free);
+        }
+        p = p.parent()?;
+    }
+}
+
+#[cfg(unix)]
+fn statvfs_free(p: &Path) -> Option<u64> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+    let c = CString::new(p.as_os_str().as_bytes()).ok()?;
+    // SAFETY: statvfs 只写它自己的结构体；c 是合法的 NUL 结尾路径。
+    let mut st: libc::statvfs = unsafe { std::mem::zeroed() };
+    if unsafe { libc::statvfs(c.as_ptr(), &mut st) } != 0 {
+        return None;
+    }
+    Some((st.f_bavail as u64).saturating_mul(st.f_frsize as u64))
+}
+
+#[cfg(not(unix))]
+fn free_bytes(_path: &Path) -> Option<u64> {
+    None
+}
+
+/// 磁盘余量闸门：目标盘可用空间不足 `MIN_FREE_BYTES + 本次要写的量` 时拒绝。
+fn space_ok(target: &Path, want: u64) -> bool {
+    match free_bytes(target) {
+        Some(free) => free >= MIN_FREE_BYTES.saturating_add(want),
+        None => true, // 拿不到就只靠字节预算兜着
+    }
+}
+
+/// 会话结束时回收预算（每 IP 计数 + 在飞字节）。
+fn release_budget(sess: &Session) {
+    let mut b = BUDGET.lock();
+    b.inflight = b.inflight.saturating_sub(sess.received());
+    b.reserved = b.reserved.saturating_sub(sess.total.unwrap_or(0));
+    if let Some(ip) = sess.owner {
+        if let Some(c) = b.by_ip.get_mut(&ip) {
+            *c = c.saturating_sub(1);
+            if *c == 0 {
+                b.by_ip.remove(&ip);
+            }
+        }
+    }
+}
+
 /// 解析 `Content-Range: bytes <start>-<end>/<total|*>` → `(start, end, total)`。
 pub fn parse_content_range(v: &str) -> Option<(u64, u64, Option<u64>)> {
     let rest = v.trim().strip_prefix("bytes")?.trim_start();
@@ -115,11 +205,18 @@ pub fn session_for(
     target: &Path,
     start: u64,
     total: Option<u64>,
+    peer: Option<std::net::IpAddr>,
 ) -> Result<Arc<Session>, UploadErr> {
     if let Some(t) = total {
         if t > MAX_UPLOAD_BYTES {
             return Err(UploadErr::TooLarge);
         }
+    }
+    // 新建会话前的三道闸门（对**已有**会话的续传不重复计费，见下）。
+    // 已知总量时按总量预留，避免「先开 256 个 2GiB 会话、再慢慢写」绕过预算。
+    let reserve = total.unwrap_or(0);
+    if !space_ok(target, reserve) {
+        return Err(UploadErr::NoSpace);
     }
     let mut map = SESSIONS.lock();
     if let Some(s) = map.get(target).cloned() {
@@ -149,7 +246,13 @@ pub fn session_for(
                 if let Err(e) = std::fs::File::create(&s.tmp) {
                     return Err(UploadErr::Io(e.to_string()));
                 }
-                s.received.store(0, Ordering::Relaxed);
+                // 截断后旧字节不再占盘：同步从在飞预算里扣掉（否则反复「全量重传」会把
+                // 预算永久吃满，之后所有人都被 507）。
+                let old = s.received.swap(0, Ordering::Relaxed);
+                {
+                    let mut b = BUDGET.lock();
+                    b.inflight = b.inflight.saturating_sub(old);
+                }
             }
             *s.touched.lock() = Instant::now();
             return Ok(s);
@@ -186,8 +289,24 @@ pub fn session_for(
     if let Err(e) = std::fs::File::create(&tmp) {
         return Err(UploadErr::Io(e.to_string()));
     }
+    {
+        let mut b = BUDGET.lock();
+        if b.inflight
+            .saturating_add(b.reserved)
+            .saturating_add(reserve)
+            > MAX_INFLIGHT_BYTES
+        {
+            return Err(UploadErr::NoSpace);
+        }
+        if let Some(ip) = peer {
+            if b.by_ip.get(&ip).copied().unwrap_or(0) >= MAX_SESSIONS_PER_IP {
+                return Err(UploadErr::TooManySessions);
+            }
+        }
+    }
     let sess = Arc::new(Session {
         target: target.to_path_buf(),
+        owner: peer,
         tmp,
         received: AtomicU64::new(0),
         total,
@@ -196,6 +315,14 @@ pub fn session_for(
         lock: Mutex::new(()),
     });
     map.insert(target.to_path_buf(), Arc::clone(&sess));
+    // 计数在**插入成功之后**再加：上面任何一条提前 return 都不会漏计/多计。
+    {
+        let mut b = BUDGET.lock();
+        b.reserved = b.reserved.saturating_add(reserve);
+        if let Some(ip) = peer {
+            *b.by_ip.entry(ip).or_insert(0) += 1;
+        }
+    }
     Ok(sess)
 }
 
@@ -210,6 +337,20 @@ pub fn append(sess: &Arc<Session>, offset: u64, data: &[u8]) -> Result<u64, Uplo
     if next > MAX_UPLOAD_BYTES {
         return Err(UploadErr::TooLarge);
     }
+    // 在飞预算与磁盘余量：两道都过才写。`data.len()` 是本片新增的字节。
+    //
+    // 这里**故意**只算 `inflight` 不算 `reserved`：会话创建时已经把它的 `total` 预留过
+    // 一次，若这里再算一遍，一个合法的大文件会在写到「inflight + 自己的 total 超过上限」
+    // 时被自己饿死（传到一半突然 507）。创建闸门管「总量」，这里管「实写」。
+    {
+        let b = BUDGET.lock();
+        if b.inflight.saturating_add(data.len() as u64) > MAX_INFLIGHT_BYTES {
+            return Err(UploadErr::NoSpace);
+        }
+    }
+    if !space_ok(&sess.tmp, data.len() as u64) {
+        return Err(UploadErr::NoSpace);
+    }
     let mut f = std::fs::OpenOptions::new()
         .append(true)
         .open(&sess.tmp)
@@ -217,23 +358,35 @@ pub fn append(sess: &Arc<Session>, offset: u64, data: &[u8]) -> Result<u64, Uplo
     f.write_all(data).map_err(|e| UploadErr::Io(e.to_string()))?;
     f.flush().map_err(|e| UploadErr::Io(e.to_string()))?;
     sess.received.store(next, Ordering::Relaxed);
+    {
+        let mut b = BUDGET.lock();
+        b.inflight = b.inflight.saturating_add(data.len() as u64);
+    }
     *sess.touched.lock() = Instant::now();
     Ok(next)
 }
 
 /// 收齐后原子落盘（临时文件 rename → 目标），并移除会话。
+///
+/// 锁序固定为 **SESSIONS → 会话锁 → BUDGET**：`session_for` 的「全量重传」分支也是
+/// 先拿 SESSIONS 再拿会话锁，两边反过来就会与这里形成经典的 AB/BA 死锁
+/// （同目标名「一个在 commit、一个在做 start=0 重传」即可触发）。
 pub fn commit(sess: &Arc<Session>) -> Result<(), UploadErr> {
+    let mut map = SESSIONS.lock();
     let _g = sess.lock.lock();
     std::fs::rename(&sess.tmp, &sess.target).map_err(|e| UploadErr::Io(e.to_string()))?;
-    SESSIONS.lock().remove(&sess.target);
+    map.remove(&sess.target);
+    release_budget(sess);
     Ok(())
 }
 
 /// 放弃会话并删临时文件。
 pub fn abort(sess: &Arc<Session>) {
+    let mut map = SESSIONS.lock();
     let _g = sess.lock.lock();
     let _ = std::fs::remove_file(&sess.tmp);
-    SESSIONS.lock().remove(&sess.target);
+    map.remove(&sess.target);
+    release_budget(sess);
 }
 
 /// 清理超时会话（维护任务调用），返回清理数量。
@@ -245,12 +398,15 @@ pub fn sweep_expired() -> usize {
         .filter(|(_, s)| now.duration_since(*s.touched.lock()) > SESSION_TTL)
         .map(|(k, _)| k.clone())
         .collect();
+    let mut freed = 0usize;
     for k in &dead {
         if let Some(s) = map.remove(k) {
             let _ = std::fs::remove_file(&s.tmp);
+            release_budget(&s);
+            freed += 1;
         }
     }
-    dead.len()
+    freed
 }
 
 #[cfg(test)]
@@ -274,7 +430,7 @@ mod tests {
         let part = target.with_file_name(".f1.bin.upload.part");
         let _ = std::fs::remove_file(&target);
         let _ = std::fs::remove_file(&part);
-        let s = session_for(&target, 0, Some(6)).expect("begin");
+        let s = session_for(&target, 0, Some(6), None).expect("begin");
         assert_eq!(append(&s, 0, b"abc").unwrap(), 3);
         // 偏移不符必须报错并回当前偏移（调用方据此回 409 + X-Upload-Offset）
         assert_eq!(append(&s, 0, b"x"), Err(UploadErr::OffsetMismatch(3)));
@@ -289,17 +445,87 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// 每来源 IP 的并发会话上限必须真的生效（否则单机就能把会话表占满、把别人挤成 503）。
+    #[test]
+    fn per_ip_session_cap_is_enforced() {
+        let dir = std::env::temp_dir().join(format!("crucible-up-ip-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let ip: std::net::IpAddr = "203.0.113.7".parse().unwrap();
+        let mut opened = Vec::new();
+        for i in 0..MAX_SESSIONS_PER_IP {
+            let t = dir.join(format!("ipv{i}.bin"));
+            opened.push(session_for(&t, 0, Some(1), Some(ip)).expect("前 N 个应放行"));
+        }
+        let over = dir.join("ipv-over.bin");
+        match session_for(&over, 0, Some(1), Some(ip)) {
+            Err(UploadErr::TooManySessions) => {}
+            other => panic!("第 N+1 个应回 TooManySessions，实际 {:?}", other.err()),
+        }
+        // 换一个 IP 不受影响（不是全局串扰）
+        let other_ip: std::net::IpAddr = "203.0.113.8".parse().unwrap();
+        assert!(session_for(&dir.join("ipv-other.bin"), 0, Some(1), Some(other_ip)).is_ok());
+        // 清理（abort 会回收每 IP 计数与在飞字节）
+        for s in &opened {
+            abort(s);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 声明总量即**预留**：一堆「声称很大却不发数据」的会话不能无限开。
+    ///
+    /// 用 64MiB 的声明量把「在飞预算」精确填满（2GiB / 64MiB = 32 个），第 33 个必须被拒。
+    /// 不能用「单个 1GiB+」的声明来测：那会先撞上**磁盘余量**闸门（本机盘余量就 1GB 出头），
+    /// 测出来的是另一条规则 —— 第一版就是这么写的，被这台机器的真实余量打回来了。
+    #[test]
+    fn declared_total_reserves_inflight_budget() {
+        let dir = std::env::temp_dir().join(format!("crucible-up-budget-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let chunk = 64 * 1024 * 1024u64;
+        let n = (MAX_INFLIGHT_BYTES / chunk) as usize; // 正好填满预算
+        let mut open_sessions = Vec::new();
+        for i in 0..n {
+            let t = dir.join(format!("budget-{i}.bin"));
+            // peer=None：这条测的是字节预算，别撞上每 IP 会话数上限
+            open_sessions.push(
+                session_for(&t, 0, Some(chunk), None)
+                    .unwrap_or_else(|e| panic!("第 {i} 个不该被拒：{e:?}")),
+            );
+        }
+        match session_for(&dir.join("budget-over.bin"), 0, Some(chunk), None) {
+            Err(UploadErr::NoSpace) => {}
+            other => panic!("预算已满，再开应回 NoSpace，实际 {:?}", other.err()),
+        }
+        // 释放之后应能再开（证明回收路径有效）
+        for s in &open_sessions {
+            abort(s);
+        }
+        let after = dir.join("budget-after.bin");
+        let s = session_for(&after, 0, Some(chunk), None).expect("释放后应可再开");
+        abort(&s);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 磁盘余量闸门：用一个**不可能满足**的余量要求反证闸门在（把 MIN_FREE_BYTES 当 want 放大）。
+    #[test]
+    fn disk_headroom_gate_rejects_when_free_is_tiny() {
+        let dir = std::env::temp_dir();
+        // 直接测它的判据函数：want 取一个天文数字时必须为 false
+        assert!(!space_ok(&dir.join("x.bin"), u64::MAX / 2));
+        // 正常小文件应当放行（本机 /tmp 至少有 MB 级余量）
+        assert!(space_ok(&dir.join("x.bin"), 1024));
+    }
+
     #[test]
     fn oversize_and_missing_session_rejected() {
         let target = std::path::PathBuf::from("/nonexistent/x.bin");
         // 不要在 `Result<Arc<Session>, _>` 上做 == ：Session 含 Mutex/Atomic 字段，
         // 既不可能（也不该）为它实现 PartialEq —— 断言错误**变体**即可
         //（此前这两条 assert_eq! 让整个测试目标编译不过，cargo test 形同虚设）。
-        match session_for(&target, 0, Some(MAX_UPLOAD_BYTES + 1)) {
+        match session_for(&target, 0, Some(MAX_UPLOAD_BYTES + 1), None) {
             Err(UploadErr::TooLarge) => {}
             other => panic!("超限应回 TooLarge，实际 {:?}", other.err()),
         }
-        match session_for(&target, 10, None) {
+        match session_for(&target, 10, None, None) {
             // 没有会话却要从中间续 → 应告诉它从 0 开始
             Err(UploadErr::OffsetMismatch(0)) => {}
             other => panic!("应从 0 重来，实际 {:?}", other.err()),

@@ -179,6 +179,22 @@ fn match_app_indexed<'a>(
     })
 }
 
+/// 路径是否落在**某个应用路由的前缀**下（不看 `enabled`、不看 `extensions`）。
+///
+/// 用途：静态层的「应用 docroot 内私密文件」策略（见 `static_files::app_private_path`）——
+/// 需要判断「这是应用的地盘」，而不是「应用会处理这个文件」。
+pub fn under_app_prefix(lc: &ListenerConfig, path: &str) -> bool {
+    lc.apps.iter().any(|a| {
+        if a.paths.is_empty() {
+            // paths 为空 = 该路由对所有路径生效（与 match_app 的语义一致）
+            return true;
+        }
+        a.paths
+            .iter()
+            .any(|p| p == "/" || path == p || path.starts_with(&format!("{p}/")))
+    })
+}
+
 /// 「这个路径**本该**由某个应用引擎处理」——与 [`would_handle`] 的区别是**不看 `enabled`**。
 ///
 /// 为什么需要它：引擎被临时 `enabled = false`（排障、灰度、误配）时，`would_handle` 返回
@@ -494,6 +510,39 @@ mod script_rel_tests {
             quic_ecn: false,
             qmux: false,
         }
+    }
+
+    /// P0 机制回归：**分发判据与落盘判据看到的是两个不同的路径**。
+    ///
+    /// 分发拿**原始** URL 路径问 `would_handle`（字面前缀匹配，不做点段折叠），而落盘用
+    /// `safe_join`/`web_path_of` 归一化后的路径。于是 `/./rust/x.rs` 这种写法：
+    /// **分发**判「不归引擎」（`/./rust/...` 不以 `/rust/` 开头）→ 交给上传器；
+    /// 而**落盘**归一化成 `/rust/x.rs` → 正好写进引擎 docroot，随后 `GET /rust/x.rs` 由
+    /// 引擎执行 ⇒ 一条请求换一个 webshell。上传端点现在用 `would_execute_on_get`
+    /// （归一化后的判据）兜住 —— 这个测试把这个「两个判据不一致」的事实钉住，
+    /// 免得以后有人把闸门挪回原始路径比较。
+    #[test]
+    fn dot_folded_path_bypasses_dispatch_but_not_the_normalized_gate() {
+        let lc = listener_with_rust_app();
+        // 前缀被折叠/加重斜杠：分发判据（原始路径）认不出来
+        for raw in ["/./rust/x.rs", "//rust/x.rs"] {
+            assert!(
+                !super::would_handle(&lc, raw),
+                "分发判据（原始路径）对 {raw} 应为 false —— 这正是缺口所在"
+            );
+        }
+        // 尾段被折叠（`/rust/./x.rs`）**不构成缺口**：前缀 `/rust/` 仍然字面匹配，
+        // 引擎自己会拿到它并用归一化后的 script_rel 解析到同一个文件。
+        assert!(super::would_handle(&lc, "/rust/./x.rs"));
+
+        // 归一化后的判据（上传闸门用它）必须把上面两类**都**认成「引擎的地盘」
+        assert!(would_execute_on_get(&lc, "./rust/x.rs"));
+        assert!(would_execute_on_get(&lc, "rust/./x.rs"));
+        assert!(would_execute_on_get(&lc, "//rust/x.rs"));
+
+        // 正常路径两边一致
+        assert!(super::would_handle(&lc, "/rust/x.rs"));
+        assert!(would_execute_on_get(&lc, "rust/x.rs"));
     }
 
     /// 隐藏文件不归引擎：`/rust/.env`（`extensions=["rs",""]`）与 `/c/.env`（无 extensions）

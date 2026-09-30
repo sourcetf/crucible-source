@@ -1063,6 +1063,41 @@ async fn wrap_upstream_tls_rustls(
     use std::sync::Arc;
     use tokio_rustls::TlsConnector;
 
+    /// 支持的握手签名算法集合：取**已安装的** crypto provider（`main.rs` 里
+    /// `rustls::crypto::ring::default_provider()`），拿不到再退回 ring 的默认值。
+    ///
+    /// 注意 rustls 0.23 的 `verify_tls1{2,3}_signature` 收的是 `&WebPkiSupportedAlgorithms`
+    /// （0.22 那种传切片的形式已改），所以这里缓存的是整个结构体。
+    fn verify_algs() -> &'static rustls::crypto::WebPkiSupportedAlgorithms {
+        use std::sync::OnceLock;
+        static ALGS: OnceLock<rustls::crypto::WebPkiSupportedAlgorithms> = OnceLock::new();
+        ALGS.get_or_init(|| match rustls::crypto::CryptoProvider::get_default() {
+            // WebPkiSupportedAlgorithms 是 Clone 而非 Copy（rustls 0.23）
+            Some(p) => p.signature_verification_algorithms.clone(),
+            None => rustls::crypto::ring::default_provider().signature_verification_algorithms,
+        })
+    }
+
+    /// 校验 CertificateVerify 的签名（TLS1.2 / TLS1.3 各一个入口）。
+    ///
+    /// **为什么必须有**：这两个回调此前是 `HandshakeSignatureValid::assertion()` 的桩
+    /// —— 即「握手签名一律不验」。在 `.onion` 的 `verify` 档下，攻击者只要拿到目标隐藏
+    /// 服务的**公开**证书（`cert-as-pubkey` 的 SPKI 本来就是 .onion 地址里那 32 字节），
+    /// 就能原样重放，**无需任何私钥** ⇒「证书即公钥」校验形同虚设。
+    fn verify_handshake_signature(
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+        tls13: bool,
+    ) -> Result<HandshakeSignatureValid, TlsError> {
+        let algs = verify_algs();
+        if tls13 {
+            rustls::crypto::verify_tls13_signature(message, cert, dss, algs)
+        } else {
+            rustls::crypto::verify_tls12_signature(message, cert, dss, algs)
+        }
+    }
+
     #[derive(Debug)]
     struct AcceptAll;
     impl ServerCertVerifier for AcceptAll {
@@ -1078,19 +1113,19 @@ async fn wrap_upstream_tls_rustls(
         }
         fn verify_tls12_signature(
             &self,
-            _message: &[u8],
-            _cert: &CertificateDer<'_>,
-            _dss: &DigitallySignedStruct,
+            message: &[u8],
+            cert: &CertificateDer<'_>,
+            dss: &DigitallySignedStruct,
         ) -> Result<HandshakeSignatureValid, TlsError> {
-            Ok(HandshakeSignatureValid::assertion())
+            verify_handshake_signature(message, cert, dss, false)
         }
         fn verify_tls13_signature(
             &self,
-            _message: &[u8],
-            _cert: &CertificateDer<'_>,
-            _dss: &DigitallySignedStruct,
+            message: &[u8],
+            cert: &CertificateDer<'_>,
+            dss: &DigitallySignedStruct,
         ) -> Result<HandshakeSignatureValid, TlsError> {
-            Ok(HandshakeSignatureValid::assertion())
+            verify_handshake_signature(message, cert, dss, true)
         }
         fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
             vec![
@@ -1123,19 +1158,19 @@ async fn wrap_upstream_tls_rustls(
         }
         fn verify_tls12_signature(
             &self,
-            _message: &[u8],
-            _cert: &CertificateDer<'_>,
-            _dss: &DigitallySignedStruct,
+            message: &[u8],
+            cert: &CertificateDer<'_>,
+            dss: &DigitallySignedStruct,
         ) -> Result<HandshakeSignatureValid, TlsError> {
-            Ok(HandshakeSignatureValid::assertion())
+            verify_handshake_signature(message, cert, dss, false)
         }
         fn verify_tls13_signature(
             &self,
-            _message: &[u8],
-            _cert: &CertificateDer<'_>,
-            _dss: &DigitallySignedStruct,
+            message: &[u8],
+            cert: &CertificateDer<'_>,
+            dss: &DigitallySignedStruct,
         ) -> Result<HandshakeSignatureValid, TlsError> {
-            Ok(HandshakeSignatureValid::assertion())
+            verify_handshake_signature(message, cert, dss, true)
         }
         fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
             vec![

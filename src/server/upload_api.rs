@@ -94,7 +94,7 @@ fn resp(status: StatusCode, msg: &str, offset: Option<u64>) -> Response<BoxBody>
 }
 
 /// 处理上传。body 泛型化以便 h1（Incoming）/h2/h3（Bytes）共用同一条路径。
-pub async fn handle<B>(req: Request<B>, lc: &ListenerConfig, _peer: std::net::SocketAddr) -> Response<BoxBody>
+pub async fn handle<B>(req: Request<B>, lc: &ListenerConfig, peer: std::net::SocketAddr) -> Response<BoxBody>
 where
     B: Body<Data = Bytes> + Unpin + Send + 'static,
     B::Error: std::fmt::Display,
@@ -198,7 +198,7 @@ where
             (0, cl)
         }
     };
-    let sess = match upload_resume::session_for(&target, start, total) {
+    let sess = match upload_resume::session_for(&target, start, total, Some(peer.ip())) {
         Ok(s) => s,
         Err(UploadErr::OffsetMismatch(cur)) => {
             return resp(
@@ -211,7 +211,18 @@ where
             return resp(StatusCode::PAYLOAD_TOO_LARGE, "超过单文件上限", None)
         }
         Err(UploadErr::TooManySessions) => {
-            return resp(StatusCode::SERVICE_UNAVAILABLE, "上传会话过多，稍后再试", None)
+            return resp(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "上传会话过多（或本来源 IP 的并发上传已达上限），稍后再试",
+                None,
+            )
+        }
+        Err(UploadErr::NoSpace) => {
+            return resp(
+                StatusCode::INSUFFICIENT_STORAGE,
+                "服务端存储余量不足（在飞上传总量或磁盘余量触及上限），请稍后重试",
+                None,
+            )
         }
         Err(UploadErr::TotalMismatch) => {
             return resp(
@@ -251,6 +262,11 @@ where
             return match e {
                 UploadErr::OffsetMismatch(cur) => resp(StatusCode::CONFLICT, "偏移不符", Some(cur)),
                 UploadErr::TooLarge => resp(StatusCode::PAYLOAD_TOO_LARGE, "超过单文件上限", None),
+                UploadErr::NoSpace => resp(
+                    StatusCode::INSUFFICIENT_STORAGE,
+                    "存储余量不足，请稍后重试",
+                    Some(sess.received()),
+                ),
                 other => {
                     log::warn!("upload: append 失败: {other:?}");
                     resp(StatusCode::INTERNAL_SERVER_ERROR, "写入失败", Some(sess.received()))

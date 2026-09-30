@@ -1545,3 +1545,88 @@ access log 的 handler 显示 `/rust/.env`、`/c/.env` 是 **`app`**（引擎）
    该分支未触发（记录在案，避免下次有人以为「已经全路径校验」）。
 4. **行尾**：本批用 Python 文本模式改文件，把 10 个文件误转成 CRLF（Windows 默认行为），
    已还原为 LF 再上传。**教训**：改文件的脚本一律用 `open(p,'wb')` 或 `newline=''`。
+
+### 21.18 三项遗留补齐：上传体量/每 IP 预算、应用 docroot 私密文件、rustls 握手验签
+
+§21.17 末尾列的「有意未修」三项，本轮按用户要求补齐（提交见 c 系列后续）。
+
+#### 一、上传的体量与端点预算（此前只有「单文件 2GiB」「全局 256 会话」两个孤立上限）
+
+**问题**：两个上限是**逐个**计量的，乘起来是 512GiB —— 而机器磁盘只有几十 GB，一个匿名客户端
+就能把盘写满（本项目历史上真被写满过一次）。另外 `autoindex.upload_threads` 是**死配置**
+（面板能改、写进 config、运行时无人读），以及 `session_for` 把 `peer` 参数**丢掉**（`_peer`），
+于是「每 IP 限额」根本无从做起。
+
+**做法**（`upload_resume.rs`）：
+* 全局在飞预算 `MAX_INFLIGHT_BYTES`（= 单文件上限，2GiB）：会话创建时按**声明的 total 预留**，
+  写入时按实际字节累计；两处都记账（`reserved` 与 `inflight`）。
+* 每来源 IP 并发会话上限 `MAX_SESSIONS_PER_IP = 16`（`session_for` 现在收 `peer`）。
+* **磁盘余量闸门**（`statvfs`，下限 `MIN_FREE_BYTES = 512MiB`）：创建与每次写入都要过。
+  新增 507 `Insufficient Storage` 与对应文案。
+* `upload_threads` 变成真闸门：按 listener 端口缓存一个 `Semaphore`，拿不到许可直接 503
+  —— 面板上改这个值现在真的会改变并发上限。
+* 顺手修一个**潜在死锁**：`session_for`（先 `SESSIONS` 再会话锁）与 `commit`/`abort`
+  （先会话锁再 `SESSIONS`）锁序相反，同目标名「一个在 commit、一个在做 start=0 重传」可触发
+  AB/BA；现在统一为 `SESSIONS → 会话锁 → BUDGET`。
+
+**两个 bug 是被我自己写的单测抓出来的**（值得记一笔）：
+1. 第一版只「检查」声明总量却不记账 ⇒ 预留形同虚设（测试里第 33 个 64MiB 会话没被拒）；
+2. `statvfs(目标路径)` 对**还不存在**的新文件直接 ENOENT ⇒ 磁盘闸门从来没生效；
+   改为沿父目录上溯到最近存在的祖先。第二个尤其阴：不做断言的话它永远不会报错，
+   只是「以为有闸门」。
+
+#### 二、应用 docroot 里的运维/私密文件（`GET /php/init.sh` 此前 200）
+
+**问题**：引擎只「拥有」自己声明的扩展名（`/php` 是 `["php",""]`），`init.sh` 既不是 php 也
+不是隐藏文件 ⇒ 静态层照常服务（实测 `200 application/x-sh`，部署脚本原文）。同类还有
+`*.sql`/`*.ini`/`*.log`/`*.pem`/`Makefile`/`Cargo.toml` 等。
+
+**做法**：`static_files::app_private_path` —— 判据是「**落在应用路由前缀下** + **引擎不拥有它**
++ 命中私密扩展名/文件名」，命中就 404（`file_open = preview/download` 仍可显式放行）。
+**只在这个范围内拒绝**是有意的：站点自己的 `backup.sql`（不在应用目录里）照常可分享，
+而应用目录里的密钥/脚本不该被顺手端出去。
+
+**真机**：`/php/init.sh`、`/php/Makefile` 由 200 → **404**；`/php/index.php`、`/rust/index.rs`
+仍 200（引擎照常执行）、`/c/` 仍 200。
+
+#### 三、rustls 回源的握手验签（`HandshakeSignatureValid::assertion()` 桩）
+
+**问题**：`tls_rustls` 路径下两个 verifier（`AcceptAll` 与 onion 那个）的
+`verify_tls1{2,3}_signature` 都是 `assertion()` —— **握手签名一律不验**。在 `.onion` 的 `verify`
+档下，攻击者拿着目标隐藏服务的**公开**证书（SPKI 本来就来自 .onion 地址）即可原样重放、
+无需私钥 ⇒「证书即公钥」形同虚设。
+
+**做法**：改为真实验签 —— `rustls::crypto::verify_tls1{2,3}_signature(msg, cert, dss, algs)`，
+算法集合取已安装的 crypto provider（`CryptoProvider::get_default()`，退回 ring 默认）。
+API 形状对着 vendored 的 rustls 0.23.43 源码核对过（0.23 收 `&WebPkiSupportedAlgorithms`，
+不是 0.22 那种切片；`WebPkiSupportedAlgorithms` 是 `Clone` 非 `Copy`）。
+
+**诚实的验证边界**：这条改动**没有被编译验证过**，因为 `tls_rustls` 而**不带** `tls_boring`
+的配置在本仓库**根本编译不过** —— 实测 `cargo check --no-default-features --features
+'tls,tls_rustls,go_shm_ipc'` 报 **50 个既有错误**（`boring_path.rs`/`ocsp_fetcher.rs`/
+`rustls_path.rs`/`cipher_catalog.rs`/`sync.rs` 等处的 `boring::` 引用没有 cfg 门）。
+也就是说：这个「rustls 回退」不仅是未验证，而是**当前不可构建**（本部署启用 boring，不受影响）。
+要么另开一轮把这些站点 cfg 门补齐（工作量不小），要么在文档里去掉「rustls 可作回退」的说法。
+本轮先保证：**桩换成真校验**，且与 rustls 0.23.43 的 API 完全对齐（逐行核对源码）。
+
+#### 四、验证汇总（全部真机）
+
+| 项 | 结果 |
+|---|---|
+| P0：`PUT /./cgi2/pwn`（`--path-as-is`，h1） | **403**，磁盘无文件，`GET` 404（不可执行） |
+| P0：同上走 **h2** | **403**（两个协议都堵住） |
+| 折叠写法 `//cgi2/pwn2`、`/%2e/cgi2/pwn3` | **403**，无落盘 |
+| 非应用前缀的可执行扩展名 `PUT /x.php` | 403（扩展名闸门） |
+| 隐藏目标 `PUT /.env`、`PUT /cgi2/.env` | 403 |
+| 正常上传 `PUT /fine.txt` | **201**（未误伤） |
+| 每 IP 会话上限 | s1..s16 → 202，**s17/s18 → 503** |
+| 引擎仍执行 `GET /cgi2/index.cgi` | **200** + `cgi-ok` |
+| 应用目录私密文件（生产） | `/php/init.sh`、`/php/Makefile` → **404**；`/php/index.php`、`/rust/index.rs` → 200 |
+| 单测 | **212**（新增：P0 机制回归、每 IP 上限、声明量预留、磁盘余量、折叠路径不回退） |
+
+**踩坑记录（下次直接用）**
+1. **测 `PUT /./x` 必须 `curl --path-as-is`**：普通 curl 会把 `/./` 归一化掉，日志里看到的是
+   `/cgi2/pwn` —— 第一轮验证因此误判成「引擎拦下了」，其实压根没发出去那个路径。
+2. 磁盘闸门用 `statvfs` 时**必须沿父目录上溯**：上传目标还不存在，直接 statvfs 会 ENOENT。
+3. 预算类改动一定要写「断言被拒」的单测：只写正向用例，两条 bug（不记账、闸门不生效）
+   都会静默通过。

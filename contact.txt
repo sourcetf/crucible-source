@@ -667,3 +667,36 @@ app docroot 里非隐藏非引擎所属的文件（如 `/php/init.sh`，属运�
 
 **协作提醒**：本批我用 Python 文本模式改文件，把 10 个文件误转成 CRLF（Windows 默认），
 已还原为 LF 再传。**改文件的脚本请用 `open(p,'wb')` / `newline=''`**，否则会给别人整文件 diff。
+
+---
+
+### Session 1008 (2026-09-30) — 进展 16（三项遗留补齐：上传预算 / 应用目录私密文件 / rustls 验签）
+
+§21.17 里那三条「有意未修」，按用户要求补齐了：
+
+**① 上传的体量与端点预算**：全局在飞字节上限（按声明 total **预留** + 按实写累计）、每来源 IP
+并发会话上限 16、`statvfs` 磁盘余量闸门（512MiB 下限，新增 507）、`upload_threads` 从**死配置**
+变成真闸门（按端口缓存 Semaphore，超限 503）。顺手修了 `session_for`/`commit` 之间的**锁序反转**
+（同目标名并发时 AB/BA 死锁）。
+**两个 bug 是我自己的单测抓出来的**：① 第一版只「检查」声明量不记账 ⇒ 预留形同虚设；
+② `statvfs` 对**尚不存在**的新文件 ENOENT ⇒ 磁盘闸门从来没生效（改成沿父目录上溯）。
+**真机**：s1..s16 → 202，**s17/s18 → 503**；`PUT /fine.txt` → 201（未误伤）。
+
+**② 应用 docroot 的运维/私密文件**：`GET /php/init.sh` 此前 **200**（部署脚本原文，
+`application/x-sh`）。新增 `static_files::app_private_path`：落在应用路由前缀下 + 引擎不拥有 +
+命中私密扩展名/文件名（sh/sql/ini/log/pem/Makefile/Cargo.toml…）→ 404；`file_open` 仍可显式放行。
+**只在这个范围内拒绝**是有意的（站点自己的 `backup.sql` 照常可分享）。真机：
+`/php/init.sh`、`/php/Makefile` → **404**，`/php/index.php`、`/rust/index.rs`、`/c/` 仍正常。
+
+**③ rustls 回源的握手验签**：两个 verifier 的 `verify_tls1{2,3}_signature` 原本是
+`assertion()` 桩（**一律不验签**）⇒ `.onion` 的 verify 档只要拿到**公开**证书就能重放。
+改为真实验签（对齐 rustls 0.23.43 的 API：收 `&WebPkiSupportedAlgorithms`）。
+**诚实说明**：这条**没被编译验证** —— `tls_rustls` 而不带 `tls_boring` 的配置在本仓库
+**本来就编译不过**（实测 50 个既有错误，`boring::` 引用没 cfg 门），本部署启用 boring 不受影响。
+
+**P0 字节级复现要点**：测 `PUT /./x` **必须 `curl --path-as-is`** —— 普通 curl 会先把 `/./`
+归一化掉，第一轮验证因此误判（日志里看到的是 `/cgi2/pwn`，说明路径根本没按原样发出去）。
+用 `--path-as-is` 后：h1 **403**、h2 **403**、磁盘无文件、`GET` 404（不可执行）；
+`//cgi2/pwn2`、`/%2e/cgi2/pwn3` 同样 403。
+
+单测 **212**；生产已部署（h1/h2/h3 200、DNS 正常）。

@@ -82,6 +82,11 @@ pub async fn serve(req: &Request<Incoming>, lc: &ListenerConfig) -> Result<Respo
     if engine_owns(lc, path, mode) {
         bail!("path is owned by an app engine");
     }
+    // 应用 docroot 里的运维/私密文件（部署脚本、配置、密钥、库文件）也不静态服务，
+    // 见 app_private_path 的说明。
+    if app_private_path(lc, path, mode) {
+        bail!("app docroot private file is not served");
+    }
     serve_file(req, &fs_path, &meta, mode).await
 }
 
@@ -111,6 +116,58 @@ fn engine_owns(lc: &ListenerConfig, url_path: &str, mode: FileOpenMode) -> bool 
         None => true,
     }
 }
+
+/// 应用 docroot 内的「运维/私密文件」不得静态服务。
+///
+/// 背景（实测基线）：`GET /php/init.sh` → **200**（`application/x-sh`，部署脚本原文）。
+/// 引擎只「拥有」自己声明的扩展名（`/php` 是 `["php", ""]`），`init.sh` 既不是 php、
+/// 也不是隐藏文件 ⇒ 静态层照常服务。同类还有 `*.sql`/`*.ini`/`*.log`/`*.pem`/`Makefile`/
+/// `Cargo.toml` 等 —— 它们都是「放在 docroot 里方便引擎读」的东西，而不是给公网下载的。
+///
+/// 判据：**落在应用路由前缀下** + **引擎不拥有该文件** + 命中私密扩展名/文件名。
+/// 只在这个范围内拒绝是有意的：站点自己的 `backup.sql`（不在应用目录里）仍可正常分享，
+/// 而应用目录里的密钥/脚本不该被顺手端出去。`file_open = preview/download` 是显式的
+/// 「我就是要暴露它」，因此优先级更高（与本文件的 engine_owns 同一取向）。
+fn app_private_path(lc: &ListenerConfig, url_path: &str, mode: FileOpenMode) -> bool {
+    if matches!(mode, FileOpenMode::Preview | FileOpenMode::Download) {
+        return false;
+    }
+    let Some(normalized) = normalize_url_path(url_path) else {
+        return true; // 归一化失败 → fail-closed（resolve_path 本来也会拒）
+    };
+    if !crate::server::apps::under_app_prefix(lc, &normalized) {
+        return false;
+    }
+    if crate::server::apps::would_handle(lc, &normalized) {
+        return false; // 引擎拥有它 → 交给引擎（该执行执行、该 404 404）
+    }
+    let name = normalized.rsplit('/').next().unwrap_or("");
+    let ext = name
+        .rsplit_once('.')
+        .map(|(_, e)| e.to_ascii_lowercase())
+        .unwrap_or_default();
+    APP_PRIVATE_EXTS.iter().any(|e| *e == ext)
+        || APP_PRIVATE_NAMES.iter().any(|n| name.eq_ignore_ascii_case(n))
+}
+
+/// 应用 docroot 里「不给公网」的扩展名（凭据/脚本/配置/库/备份/私钥）。
+const APP_PRIVATE_EXTS: &[&str] = &[
+    // 脚本（引擎不拥有它们时也没有理由对外）
+    "sh", "bash", "zsh", "ksh", "csh", "tcsh", "fish", "ps1", "psm1",
+    // 配置 / 凭据 / 密钥
+    "ini", "cfg", "conf", "cnf", "env", "toml", "lock", "pem", "key", "crt", "cer", "p12",
+    "pfx", "jks", "keystore", "htpasswd", "netrc",
+    // 数据 / 库 / 备份 / 日志
+    "sql", "sqlite", "sqlite3", "db", "db3", "mdb", "dump", "bak", "backup", "orig", "old",
+    "log", "swp", "swn", "pid", "sock",
+];
+
+/// 应用 docroot 里「不给公网」的具体文件名（没有扩展名可判的）。
+const APP_PRIVATE_NAMES: &[&str] = &[
+    "Makefile", "makefile", "GNUmakefile", "Dockerfile", "docker-compose.yml",
+    "docker-compose.yaml", "id_rsa", "id_dsa", "id_ecdsa", "id_ed25519", "passwd", "shadow",
+    "authorized_keys", "known_hosts",
+];
 
 /// 与 `config::normalize_path_key` / [`resolve_path`] 同一套 URL 路径归一化：
 /// percent-decode + 丢弃空段与 `.` 段；含 `..` 或 `\` 段返回 `None`。
@@ -317,6 +374,9 @@ pub async fn serve_simple<T>(req: &Request<T>, lc: &ListenerConfig) -> Result<Re
     // §16.2：static 层不得替引擎把「应执行的脚本」当普通文件吐出去（见 engine_owns）。
     if engine_owns(lc, path, mode) {
         bail!("path is owned by an app engine");
+    }
+    if app_private_path(lc, path, mode) {
+        bail!("app docroot private file is not served");
     }
 
     let len = meta.len();
