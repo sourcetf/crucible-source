@@ -580,87 +580,41 @@ ipapi.is hosting、gaoyifan/china-operator-ip、五大 RIR delegated、QQWry/CER
 腾空间可删 `sources/GeoCn.jsonl`（505MB，可由同目录 mmdb 经 `geoip-mmdb2jsonl` 再生）与
 `sources/ripe.db.gz`（351MB 下载缓存）；**别在更新运行中替换 `geoip_update.sh`**（bash 按偏移读文件）。
 
-[工号 1008 / 2026-09-26 04:10] h2 请求体窗口死锁 + 全站 h2 DoS + 条件请求 + 大文件流式（build45→build48）
+---
 
-**我改动的文件（请勿与我同时编辑这些）**
-`src/server/h2.rs`、`src/server/h3.rs`、`src/server/h1.rs`、`src/server/static_files.rs`、
-`src/server/upload_api.rs`、`src/server/upload_resume.rs`、`Cargo.toml`(+`Cargo.lock`)、`WORKLOG.md`
+### Session 1008 (2026-09-30) — 进展 14（Tor 全链路：入站 HS 接线 + 出站 5 缺陷 + 自愈/关停；双向真实 200）
 
-**改了什么**
-1. **h2 请求体窗口死锁**（真 bug，生产也有）：h2 0.4 的契约是**调用方**在消费掉每个 DATA 之后
-   调用 `RecvStream::flow_control().release_capacity(n)`；少这一步 ⇒ 收满初始窗口 1MiB 后
-   窗口停在 0 ⇒ 对端发不出、我们等不到 ⇒ 双向互等。实测阈值精确落在 1048576 字节上。
-2. **全站 h2 DoS**：`H2_INFLIGHT.acquire().await` 原本在 `conn.accept()` 循环体内、spawn 之前，
-   await 期间连接驱动停摆 —— 一条连接开 256 个慢速流即可让**所有** h2 连接失去响应。
-   已改为任务内限时获取（5s）+ 503 快速失败；另加请求体空闲超时 60s → 408。
-3. 恢复 **h2/h3 上传 hook**（此前因误判挂住而临时移除）；413 文案如实说明 8MiB 单请求上限。
-4. **条件请求**（ETag/Last-Modified/If-Match/If-Unmodified-Since/If-None-Match/
-   If-Modified-Since/If-Range），h1 与 h2/h3 共用一套实现。
-5. **>16MiB 大文件流式**（此前一律 413，浏览器点大文件就下不动）：静态层给「FileSource 标记」，
-   h1/h2/h3 各自分块读盘发送。
-6. 依赖新增 `httpdate = "1"`（纯 Rust、无传递依赖）。
+**用户要求**「检查 tor 相关的功能是否完整实现」→「检查实现 bug 和不完全的地方，然后全部补上」。
+结论：**两半都没真正跑起来** —— 出站 `connect_upstream_inner` 曾无条件
+`bail!("tor upstream not supported")`（`via_tor` / `ssl_mode=tor` / `rule.tor_socks` 三个配置项因此全是
+死代码）；入站 `tor_hs::spawn_from_config` **全树零调用点**（`mod.rs` 里只剩一句 "tor_hs removed" 的注释，
+而模块明明在）⇒ `[tor_hs] enabled = true` 是个彻底静默的假开关。本轮补齐，且**全部走真实 Tor 网络实测**。
 
-**已部署**：生产 = **build48**（`/crucible/target/release/webserver`，2026-09-26 04:05 重启）。
-**已实测**：h1/h2/h2c/h3 四协议 20MiB 下载 sha256 全部一致；条件请求 304/412/If-Range 各分支；
-h2 3MB 上传 201 + sha 一致；h2 PUT/POST 3MB 不再挂住（405/56ms）。
+**改动面**：`proxy.rs`（SOCKS5 应答版本校验 / UDS 桥同机抢占 / 默认 UDS 探测链 / arti 文档纠偏 + 15 测试）、
+`tor_hs.rs`（HiddenServiceDir 0700 / **幂等≠存活** / notice.log / 关停不留孤儿 / 60s 巡检自愈 / 进程内锁 /
+可选 `user` 降权 / 状态字段补 running+pid）、`mod.rs`（启动+巡检接线）、`live_config.rs`、
+`main.rs`（退出钩子）、`admin.rs`+`admin_ui.html`（状态与提示）、`config.rs`（`[tor_hs].user` + ports 语义）、
+`.gitignore`（`/bin/` 部署目录）。
 
-**未做（谁接手都行，附线索）**
-* h2/h3 上传的单请求上限 8MiB（`REQUEST_BODY_CAP`）：需要把 `handle_h2` 的「闸门」与「分发」拆开
-  （ACL/限速/basic_auth/apps/proxy 必须先于 body 消费），再把 h2 的 `RecvStream` 包成
-  `http_body::Body`（每帧 `release_capacity`）交给 `upload_api::handle` 流式写盘。
-* ECH 配置未进 DNS 应答：`ech_auto` 已产出 `ECHConfigList`（`ech_config_list_b64()`），
-  只需在 `dns::gen_zone_file` 里为 ECH 的 public name 生成 `HTTPS` 记录（`ech="<b64>"` + `alpn`）。
-* QMux 协议本体未实现；h3/QUIC 限额在 `libs/quinn-boring`。
+**关键坑（动这块必看）**
+1. `HiddenServiceDir` 必须 **0700**：0755 时 tor 的报错是
+   `Failed to parse/validate config: Failed to configure rendezvous options` —— **看不出是权限问题**；
+2. `--RunAsDaemon` 会让 stdout 作废 ⇒ torrc 里不显式 `Log notice file` 就等于**没有任何 tor 日志**
+   （`data/notice.log` 是空的，v3 的 descriptor 上传还只在 **info** 级）；
+3. `.onion` 上访客用的是**虚拟端口**：只映射 8080 就必须 `http://<onion>:8080/`，
+   tor 报 `No virtual port mapping exists for port 80` 是**配置**问题、不是服务故障；
+4. `ps -o args=` 在 OpenBSD 上按终端宽度**截断**（实测 80 列）⇒ pid 复用防护按「首词是 tor 且命令行含
+   我们的 torrc 路径」判断，不能整串比较；
+5. 两个 listener 不能共用同一个 `root`（校验器拦「duplicate listener root」），e2e 配置要分开 docroot；
+6. `ensure_hs` 的「复用」必须同时满足 *进程在 + torrc 与配置逐字节一致*：只看 hostname 文件会让
+   「改了 ports 重启服务」静默失效（实测 tor 进程 pid 都没变）。
 
-[工号 1008 / 2026-09-26 08:0x] 续：ECH 进 DNS 应答 + h3/QUIC 显式限额（build49 → build50）
+**验证（build73/74）**：单测 **196/196**；客户端 tor `--socks5-hostname` 直取 `.onion/index.html` → **200**；
+出站反代 `28081/o/index.html` → tor SOCKS5 → .onion → HS → 本机 28080 → **200**（双向一条链同时验到）；
+`ssl_mode=verify` + 明文上游 → **502 WRONG_VERSION_NUMBER**（未静默降级）；热重载改 ports → tor 重启、torrc 更新、
+pid 变更；`kill` tor → 状态端点立刻 `running:false` → **20s 内自愈**；`enabled=false` → tor 真停；
+SIGTERM → **无孤儿**。生产部署 build74 后：h1 9095/9081 200、h2 200、**h3(QUIC) 200**、TLS1.2 9445 200、
+DNS 递归正常、`/api/tor/status` 新 schema `enabled:false/running:false`（**生产未启用 `[tor_hs]`，本次为惰性**）。
 
-**本轮改动的文件**：`src/server/dns/mod.rs`、`src/server/h3.rs`、`config-test.toml`、`WORKLOG.md`
-
-**1. ECH 配置进 DNS 应答（build49，已提交 2757251）**
-`DnsConfig` 新增 `[[dns.https_rr]]`（name/alpn/port/ech/priority/target，**默认空 = 现网零影响**）；
-按 zone 归属自动生成 `HTTPS(type65)` 记录，`ech=` 取自 `state/ech/ech_config_list.bin`
-（服务端实际在用的那份）；面板同名记录优先。实测 `dig echo.test HTTPS` → NOERROR + ANSWER: 1
-且带 ech 参数。**要真在生产发布**：在 `[dns]` 里加 `[[dns.https_rr]] name = "<你的公开名>" alpn = "h2,h3" port = 443 ech = true`
-（我**没有**动生产 DNS 配置——发布记录会改变对外的 DNS 应答，需要你确认域名后再开）。
-**坑**：测试态明文 DNS 在 **5353**，11853 是 DoT 口（我一开始查错了，不是服务端问题）。
-
-**2. h3/QUIC 显式限额（build50）**
-`src/server/h3.rs` 里新增 `quic_transport_config()`：quinn 的默认值有一条是危险的 ——
-`receive_window = VarInt::MAX`（连接级接收窗口无上限），单连接内存上界 ≈ 流数 × 单流窗口
-（默认 100 × 1.25MB ≈ 125MB），攻击者开多连接即可按连接数放大内存。
-现在显式写死：bidi/uni 流各 256、空闲 60s、单流窗口 1MiB、**连接窗口 8MiB（单连接接收缓冲上界）**、
-发送窗口 8MiB、datagram 接收 1MiB；**不设 keep-alive**（空闲连接 60s 回收）。
-
-**其余遗留（我没有动，线索见 WORKLOG §21.8/§21.9）**
-* h2/h3 上传的单请求 8MiB 上限：分片上传（Content-Range）在 h1/h2/h3 上**都已实测可用**，
-  我们的面板 UI 就是分片发的，所以正常路径不受影响；只有「单请求 >8MiB 的裸 PUT」会被 413
-  （文案已说明出路）。要彻底解掉需要把 `handle_h2` 的闸门/分发拆开（设计写在 WORKLOG §21.8）。
-* QMux 协议本体：`src/server/qmux.rs` 目前是「真在生效的流预算 + 诚实说明」，协议本体未实现。
-
-[工号 1008 / 2026-09-26 收尾] 审计全部落地（build45→build59，生产已切 build59）
-
-**本轮+上轮改动的文件（请勿与我并行编辑）**
-`src/server/h2.rs`、`h3.rs`、`h1.rs`、`static_files.rs`、`upload_api.rs`、`upload_resume.rs`、
-`dns/mod.rs`、`dns/dot_doh.rs`、`dns/admin_api.rs`、`connect_udp.rs`、`server/mod.rs`、
-`Cargo.toml`(+lock)、`config-test.toml`、`WORKLOG.md`
-
-**审计 12 条已全部落地并实测**（详见 WORKLOG §21.12–§21.15）
-DoT 准入（ACL/限速/并发上限）、上传 P0 闸门绕过、上传会话回收、完成判定三态、`enabled_for` 边界、
-h3 头部上限与请求体空闲超时、CONNECT-UDP 计入 QMux 预算、`fec0::/10` 准入、
-zone 导入 NBSP panic、RPZ/answers SOA serial 单调性、RPZ value 类型校验、`.part` 不可下载且不进列表。
-
-**功能补齐**：h2 上传流式（单请求 20MB 从 413 变 201）、条件请求、>16MiB 大文件流式（三协议）、
-ECH 进 DNS 应答、h3/QUIC 显式限额。
-
-**未做（方法与改动点见 WORKLOG §21.11 / §21.8）**
-1. h3 请求体流式化：`RequestStream::split()` + recv 半边包成 `http_body::Body`。当前 h3 单请求 8MiB
-   （h2 无此限、h1 是 2GiB），**分片上传在三个协议上都实测可用**，面板 UI 走分片。
-2. QMux 协议本体：需 patch vendored `quinn-proto` 的帧解析以支持新帧类型。
-
-**运维须知（我改过的默认语义）**
-* DoT：白名单解析顺序 `[dns.dot] allow` → `[dns] recursion_acl` → 都空则仅回环；
-  默认 20/s/IP 限速 + 128 并发连接。生产目前是显式 `recursion_acl = 0.0.0.0/0`（公开递归），
-  要收紧就写 `[dns.dot] allow`。
-* 上传：同名并发从 0 重传需静默 30s（`RESET_IDLE_GRACE`），否则 409 + X-Upload-Offset。
-* ECH：DNS 侧发布需在 `[dns]` 加 `[[dns.https_rr]]`（示例只在 config-test.toml）。
-* 生产验证用的一次性文件都已清理；测试实例跑在 18443 / DNS 5353（明文）/DoT 11853。
+**测试残留已清理**（config-tor*.toml / www-e2e/ / state/tor-hs / bin/webserver-test / 客户端 tor）；
+**留给用户的两项**（未代做）：生产面板密码仍是样例 `admin`、`[admin].listeners_allow` 未收紧。

@@ -270,7 +270,10 @@ img.preview{max-width:100%;max-height:420px}
       <h2>反向代理</h2>
       <p class="hint">上游 SSL 模式：verify（强制校验）/ no_verify / trust_self_signed（信任自签）/ off（关闭 SSL）。
       Tor/.onion：SOCKS 连接顺序 <b>FFI → 默认 UDS（/run/tor/socks 等）→ 环境变量 → TCP 127.0.0.1:9050</b>（TCP 仅允许 loopback）；
-      .onion 上游 verify 模式强制校验 v3 公钥。带尾点的 <code>xxx.onion.</code> 同样走 Tor。</p>
+      .onion 上游 verify 模式强制校验 v3 公钥。带尾点的 <code>xxx.onion.</code> 同样走 Tor。
+      Hidden Service 在 <code>[tor_hs]</code> 上配：<code>ports = [[80, 本地端口]]</code> 里的第一个数就是访客用的端口
+      （没映射 80 就得带端口访问），日志在 <code>state/tor-hs/notice.log</code>，
+      可选 <code>user = "_tor"</code> 让 tor 降权运行（不配则以 webserver 身份运行）。</p>
       <div class="row">
         <div><label>Hidden Service（.onion 入站）</label><span id="torOnion">（未启用/未就绪）</span></div>
         <div><button class="act ghost" id="btnTorRefresh">刷新 .onion</button></div>
@@ -735,15 +738,28 @@ async function loadTorStatus(){
   try{
     const j=await api('/api/tor/status');
     if(!j){ el.textContent='（读取失败）'; return; }
+    el.textContent='';
     if(!j.enabled){ el.textContent='（未启用：config.toml 里 [tor_hs] enabled = false）'; return; }
     if(j.onion){
-      let t=document.createElement('b'); t.textContent=j.onion; el.textContent=''; el.appendChild(t);
-      if(j.ports&&j.ports.length){
-        el.appendChild(document.createTextNode(' · 端口映射 '+
-          j.ports.map(p=>p[0]+'→127.0.0.1:'+p[1]).join(', ')));
+      const b=document.createElement('b'); b.textContent=j.onion; el.appendChild(b);
+      const ports=j.ports||[];
+      // 访客在 .onion 上访问的是**虚拟端口**：没映射 80 就必须显式带端口，否则 tor 直接拒绝
+      // （tor 日志里的 "No virtual port mapping exists for port 80"），这不是服务器故障。
+      if(ports.length&&!ports.some(p=>p[0]===80)){
+        el.appendChild(document.createTextNode(' · 未映射虚拟端口 80 ⇒ 访客须用 http://'+j.onion+':'+ports[0][0]+'/'));
       }
+      if(ports.length){
+        el.appendChild(document.createTextNode(' · 端口映射 '+
+          ports.map(p=>p[0]+'→127.0.0.1:'+p[1]).join(', ')));
+      }
+      // 光有 hostname 不够：tor 进程可能已经不在了（崩了/被杀了），地址却还留在磁盘上。
+      const st=document.createElement('span');
+      st.textContent=j.running?(' · tor 运行中 (pid '+j.pid+')')
+        :' · ⚠ tor 未运行：.onion 不可达（看 state/tor-hs/notice.log）';
+      if(!j.running) st.style.color='#c00';
+      el.appendChild(st);
     } else {
-      el.textContent='（已启用但尚未就绪：tor 生成 hostname 需 10~30s；失败原因见 state/tor-hs/data/notice.log）';
+      el.textContent='（已启用但尚未就绪：tor 生成 hostname 需 10~30s；失败原因见 state/tor-hs/notice.log）';
     }
   }catch(e){ el.textContent='（读取失败：'+(e&&e.message?e.message:e)+'）'; }
 }

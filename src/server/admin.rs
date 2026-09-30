@@ -337,6 +337,9 @@ pub async fn handle(req: Request<Full<Bytes>>, live: Arc<LiveConfig>) -> Respons
     if path.ends_with("/api/tor/status") && method == Method::GET {
         let hs = cfg.tor_hs.clone();
         let onion = crate::server::tor_hs::current_onion_name(&hs);
+        // tor 进程实际状态：只有 hostname 是不够的（tor 可能已经崩了，.onion 名却还在磁盘上
+        // ——面板会显示一个"看起来正常"的地址，实际连不进去）。
+        let pid = crate::server::tor_hs::running_pid(&hs);
         // outbound 只报告**配置了什么**，不报告探测结果（探测要走网络/stat，不该在 HTTP 请求里做）
         let env_unix = std::env::var("CRUCIBLE_TOR_SOCKS_UNIX").unwrap_or_default();
         let env_tcp = std::env::var("CRUCIBLE_TOR_SOCKS").unwrap_or_default();
@@ -344,7 +347,11 @@ pub async fn handle(req: Request<Full<Bytes>>, live: Arc<LiveConfig>) -> Respons
             serde_json::json!({
                 "enabled": hs.enabled,
                 "onion": onion,
+                "running": pid.is_some(),
+                "pid": pid,
+                // 虚拟端口 = 访客在 .onion 上必须用的端口（没映射 80 就得写 http://<onion>.onion:8080/）
                 "ports": hs.ports,
+                "user": hs.user,
                 "outbound": {
                     "env_unix": env_unix,
                     "env_tcp": env_tcp,

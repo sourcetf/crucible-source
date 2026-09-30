@@ -80,12 +80,7 @@ scripts/*/mmdb2jsonl
 *.bak-*
 contact.txt
 *.sh
-.agents-backups-1008/
-crucible_project.tar.gz
-_commit_msg.txt
-www-apps/*/deps/
-src/**/*.orig
-src/**/*.broken
-build*.log
-base-build*.log
-*.tgz
+
+# 部署用二进制目录（/crucible/bin/webserver 是生产运行的那一份；target/ 里的是 cargo 产物，
+# 重建时会被替换，硬链接计数为 2，不能直接当生产入口）
+/bin/

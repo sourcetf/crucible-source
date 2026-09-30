@@ -36,6 +36,8 @@ fn main() -> Result<()> {
 
     let dns_cfg_path = config_path.clone();
     let live = Arc::new(LiveConfig::new(cfg, config_path));
+    // 退出路径要用（见文件尾）：Arc 会被 move 进下面的 async 块，这里留一份句柄。
+    let live_for_shutdown = live.clone();
 
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
@@ -53,6 +55,9 @@ fn main() -> Result<()> {
     });
     // 退出路径：终止注册的引擎子进程，防止孤儿 fpm / sidecar 堆积。
     server::apps::child_registry::kill_all();
+    // tor（Hidden Service）是 `--RunAsDaemon` 的独立进程，不在 child_registry 里：
+    // 不主动停，它就以孤儿形式继续挂着 —— 服务已经停了，.onion 却仍然可解析、连进去是死连接。
+    server::tor_hs::stop_on_shutdown(&live_for_shutdown.snapshot().tor_hs);
     // 关停必须有**截止时间**。
     //
     // `Runtime` 被 drop 时会等所有 `spawn_blocking` 任务收尾，而那些任务里是同步 IO

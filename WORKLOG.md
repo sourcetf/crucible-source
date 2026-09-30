@@ -1370,484 +1370,69 @@ A 下一帧用 `sess.received()` 取 offset 继续追加 ⇒ 两段数据混在�
 
 
 
----
-
-### 21.16 验收清单（给运维/用户复验本轮 13 条修复用）
-
-前置：测试实例跑在 build60（`config-test.toml`；18443 = TLS+h2+h3 且已开 `enable_upload`，
-19081 = 明文 h2c，DNS 明文 5353 / DoT 11853）；生产 = 9095（明文 h1/h2）、8443（TLS h1/h2/h3）、9081（明文）。
-
-| # | 症状（修之前） | 复现命令 | 期望结果 |
-|---|---|---|---|
-| 1 | h2 上请求体 >1MiB 的 PUT/POST **挂死** | `curl -sk --http2 -X PUT --data-binary @20MB https://127.0.0.1:18443/t.bin` | **201**（<1s）；不再挂到客户端超时 |
-| 2 | 一条 h2 连接开 256 个慢速流可让**所有** h2 连接停摆 | 256 个 `curl --http2` 只发 HEADERS 不发完 body | 其它连接的请求照常 200；慢速流 60s 空闲后被 **408** 收掉 |
-| 3 | `PUT /x.php/`（尾斜杠/`/.`/`//`）绕过扩展名闸门 → **webshell 落盘** | `for p in '/x.php/' '/x.php/.' '/x.php//'; do curl -sk --http2 -X PUT --data-binary x -o /dev/null -w "$p %{http_code}\n" "https://127.0.0.1:18443$p"; done` | 全部 **403**，且 `ls /crucible/www/x.php` 不存在 |
-| 4 | 256 个被弃上传会话后，新文件名上传**永久 503** | 见 §21.13（并发/断连制造会话），或直接看维护循环日志 | 300s 内出现 `upload: swept N 个过期上传会话`；不再 503 |
-| 5 | `Content-Range: N-M/*` 首片被判完成 → **201 静默截断** | `curl -sk --http2 -X PUT --data-binary @1MB -H 'Content-Range: bytes 0-1048575/*' https://127.0.0.1:18443/w.bin` | **202** + `x-upload-offset: 1048576`；随后用带具体 total 的请求收尾才 **201** |
-| 6 | 空文件上传永远 202、文件不生成 | `curl -sk --http2 -X PUT --data-binary '' https://127.0.0.1:18443/e.bin` | **201**，且文件 0 字节存在 |
-| 7 | 同名并发上传互相截断/混写（双方都可能 201） | 先发一片（start=0），立刻再发一片 start=0 | 第二次 **409** + `x-upload-offset`；静默 30s 后允许重传（**202**） |
-| 8 | h3 声明「HEADERS 帧长 4GiB」可无界吃内存 | `curl -sk --http3 -H "X-Big: $(python3 -c 'print("A"*100000)')" https://127.0.0.1:18443/` | **431**（被拒），服务不崩、随后请求仍 200 |
-| 9 | 在途 `.part` 可被下载 / 被列入目录 | `curl -sk --http2 https://127.0.0.1:18443/.secret.bin.upload.part`（先造一个该名字的文件） | **404**；目录列表里也**不出现**该名字 |
-| 10 | CONNECT-UDP 不受 QMux 预算约束（单连接 256 隧道） | 需要 h3 CONNECT-UDP 客户端；无客户端时看启动日志与代码路径 | 预算在 CONNECT 前获取（`qmux budget` 日志可见）；超限 503 |
-| 11 | zone 导入含 NBSP → **panic**（按字节切下标） | 面板 `POST /__admin/api/dns/zones`，`{"action":"import","name":"t.test","text":"www\u00a0 300 IN A 192.0.2.1\n"}` | **200**（或结构化报错），服务存活 |
-| 12 | RPZ/answers 同秒两次编辑 → 面板 ok 但 **BIND 仍服务旧内容** | 连续两次 `POST /api/dns/override`，每次读 `state/dns-test/zones/answers.zone` 的 SOA serial | serial **严格递增**（实测 1790391945 → 946 → 947） |
-| 13 | 一条坏 RPZ value 让**整个 answers 区**加载失败（override 全失效） | `{"action":"add","name":"b.test","rtype":"a","value":""}` | **400** + 明确文案；answers 区里零坏记录 |
-| 14 | CGI 引擎请求体无上限 | `curl --http1.1 -X POST --data-binary @40MB <CGI 路由>` | 超 32MiB 被拒（带说明），不再无界吃内存 |
-
-**回归基线（每次改动后都该跑）**
-
-```sh
-# 上传：三个协议都要 201 + sha 一致（分片路径走 202 → 201）
-cd /crucible && curl -sk --http1.1 -X PUT --data-binary @3MB https://127.0.0.1:18443/a.bin
-curl -sk --http2  -X PUT --data-binary @3MB https://127.0.0.1:18443/b.bin
-curl -sk --http3  -X PUT --data-binary @3MB https://127.0.0.1:18443/c.bin
-sha256 -q a.bin b.bin c.bin 3MB        # 四者一致
-# 大文件流式（>16MiB 不再 413）
-curl -sk --http2 -o /tmp/d.bin -w '%{http_code} %{size_download}\n' https://127.0.0.1:18443/20MB.bin
-# 条件请求
-E=$(curl -sk --http2 -D - -o /dev/null https://127.0.0.1:18443/index.html | tr -d '\r' | grep -i ^etag | cut -d' ' -f2)
-curl -sk --http2 -o /dev/null -w '%{http_code}\n' -H "If-None-Match: $E" https://127.0.0.1:18443/index.html   # 期望 304
-# 单元测试（此前整个目标编译不过，现在应 145 passed）
-cd /crucible && cargo test --bin webserver --release --features 'tls,tls_boring,go_shm_ipc,tls_nss,tls_tomcrypt'
-```
-
-**注意**：清单里的复现命令都按测试实例的端口/路径写；在生产上跑请把 18443 换成 8443 并注意**生产未开 `enable_upload`**
-（上传类用例在生产会得到 405，这是预期）。
-
----
-
-### 21.17 h3 请求体流式化：施工细则（照此实现即可，蓝本是 h2 已做好的那套）
-
-**目标**：h3 上的**裸单请求**上传不再受 `REQUEST_BODY_CAP`(8MiB) 限制（改成流式写盘，上限 `MAX_UPLOAD_BYTES`=2GiB），
-与 h1/h2 行为一致。**注意**：分片上传（Content-Range）在 h1/h2/h3 上现在就已可用，面板 UI 走的就是分片；
-本项只影响「一条请求传完一个大文件」这种用法。
-
-**验收**（做完必须全过）
-```sh
-# 1) 单请求 20MB（当前 413 → 期望 201 + sha 一致）
-dd if=/dev/urandom of=/tmp/u20.bin bs=1M count=20
-curl -sk --http3 -T /tmp/u20.bin https://127.0.0.1:18443/h3big.bin -o /dev/null -w '%{http_code}\n'
-sha256 -q /tmp/u20.bin; sha256 -q /crucible/www/h3big.bin
-# 2) 回归：h3 常规下载/上传、h1/h2 不变、cargo test 仍 145 passed
-# 3) 不再有 >8MiB 的 413（对照：修复前 20MB 单请求返回 413）
-```
-
-#### 第 1 步：加「装箱」请求体类型与流式适配器（`src/server/h3.rs`，放在 `imp` 模块内）
-
-仿 `h2.rs` 的 `H2Body` / `H2RecvBody`，但 h3 两个关键差异：
-* h3-quinn **自己归还流控**（`recv_data()` 消费即归还），所以适配器**不需要** `release_capacity`；
-* h3 的 `RecvStream` 只有 async 的 `recv_data()`，没有 poll 版 ⇒ 用 **mpsc 后台任务**做适配
-  （与 h1 的 `h1::stream_file` 同一手法，方向相反），通道容量取 2 帧以获得背压：
-
-```rust
-/// h3 请求体的装箱类型（错误类型擦除，和 h2 的 H2Body 同构）。
-pub type H3Body = http_body_util::combinators::BoxBody<Bytes, Box<dyn std::error::Error + Send + Sync>>;
-
-/// 把 h3 的 recv 半边适配成 `http_body::Body`：
-/// 后台任务循环 `recv_data()` → 送进 mpsc（容量 2）→ body 侧 poll 通道。
-/// 客户端断开/任务结束时会 drop recv 半边 ⇒ quinn 发 STOP_SENDING，不会吊住流。
-struct H3RecvBody { rx: parking_lot::Mutex<tokio::sync::mpsc::Receiver<Bytes>> }
-impl hyper::body::Body for H3RecvBody {
-    type Data = Bytes;
-    type Error = Box<dyn std::error::Error + Send + Sync>;
-    fn poll_frame(self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>)
-        -> std::task::Poll<Option<Result<hyper::body::Frame<Bytes>, Self::Error>>> {
-        match self.get_mut().rx.lock().poll_recv(cx) {
-            std::task::Poll::Ready(Some(b)) => std::task::Poll::Ready(Some(Ok(hyper::body::Frame::data(b)))),
-            std::task::Poll::Ready(None) => std::task::Poll::Ready(None),
-            std::task::Poll::Pending => std::task::Poll::Pending,
-        }
-    }
-}
-fn h3_body_from_recv(mut recv: /* recv 半边类型 */) -> H3Body {
-    let (tx, rx) = tokio::sync::mpsc::channel::<Bytes>(2);
-    tokio::spawn(async move {
-        loop {
-            // 沿用 H3_BODY_IDLE_TIMEOUT_SECS 的空闲超时：读不到新数据就收摊
-            match tokio::time::timeout(std::time::Duration::from_secs(H3_BODY_IDLE_TIMEOUT_SECS), recv.recv_data()).await {
-                Ok(Ok(Some(mut buf))) => {
-                    let b = buf.copy_to_bytes(buf.remaining());
-                    if tx.send(b).await.is_err() { return; } // 接收端已丢弃
-                }
-                Ok(Ok(None)) => return,
-                Ok(Err(e)) => { log::debug!("h3 body task: {e:#}"); return; }
-                Err(_) => { log::warn!("h3 body idle timeout"); return; }
-            }
-        }
-    });
-    H3Body::new(H3RecvBody { rx: parking_lot::Mutex::new(rx) })
-}
-```
-> `parking_lot::Mutex` 是必需的：`tokio::sync::mpsc::Receiver` 是 `Send` 但**不是 `Sync`**，
-> 而 `BoxBody`（= `Send + Sync` 的 trait object）要求 `Sync`（h1 的 `stream_file` 已踩过同一坑）。
-
-#### 第 2 步：`handle_incoming` 里分两种取 body 的方式
-
-现状（`handle_incoming` 的 `let result = async { ... }` 块内）：无条件 `stream.recv_data()` 循环
-收齐 body（8MiB → 413，带 60s 空闲超时）→ `req.map(|()| Bytes::from(body))` → `handle_h3(...)`。
-
-改为：
-1. 在收 body **之前**算出预判（与 h2 完全同构，谓词要保持一致）：
-   ```rust
-   let pre_path = req.uri().path().to_string();
-   let is_upload_like = matches!(*req.method(), http::Method::PUT | http::Method::PATCH | http::Method::POST)
-       && !crate::server::apps::would_handle(&lc, &pre_path)
-       && !crate::server::proxy::would_proxy(&lc, &pre_path)   // h3 的 would_proxy 是文件内私有 fn，同文件直接用
-       && crate::server::upload_api::enabled_for(&lc, &pre_path);
-   ```
-   （**只做预判**：各分支仍按需自行收齐 ⇒ page_rules 改写路径 / app / proxy 抢走 URL 时最坏少一次流式机会，语义不分叉。）
-2. `is_upload_like == false`：**保持现有收齐逻辑不动**（含 8MiB→413、空闲超时、DoH/admin/apps/proxy 都要 Bytes）。
-3. `is_upload_like == true`：**不读 body**，改为
-   ```rust
-   let (mut send, recv) = stream.split();      // ← 先核对 h3 0.0.8 的 split 返回类型
-   let body = h3_body_from_recv(recv);
-   let req = req.map(|()| body);               // Request<H3Body>
-   let response = handle_h3(req, live.clone(), lc, peer).await;
-   // 用 split 出来的 send 半边发响应（原来是 stream.send_response/send_data/finish）
-   ```
-4. 响应发送与收尾：`send.send_response(resp)` → 若 `body_out` 非空 `send.send_data(body_out)` →
-   `send.finish()`。**大文件响应**（static 层的 `FileSource` 标记）那段分块发送也要改走 `send`（同 h3.rs 现有 `FileSource` 分支）。
-
-#### 第 3 步：`handle_h3` / `h3_tail` 的签名
-
-* `handle_h3` 与 `h3_tail` 目前收 `Request<Bytes>`。**最小改动**：让它们在*上传分支*上能接受流式 body ⇒
-  两种做法，选一种并保持只有一份分发逻辑：
-  - **(推荐) 装箱统一**：把两者的参数改成 `Request<H3Body>`；非上传分支在需要 Bytes 时收齐
-    （加一个 `collect_bytes(req, REQUEST_BODY_CAP)` 辅助，与 h2 同名同语义），
-    apps/proxy/admin/DoH 分支各调一次。上传分支直接把 `req` 交给 `upload_api::handle_stream`。
-  - 或保持 `Request<Bytes>`，只在 `is_upload_like` 时**在 `handle_incoming` 里直接调**
-    `upload_api::handle_stream` 并返回 —— **不推荐**：那会绕过 `handle_h3` 里的
-    ACL/限速/basic_auth/status_path/page_rules 闸门顺序（h1/h2 都是闸门之后才进上传）。
-* **分发顺序不许变**：apps → proxy → 上传 → 静态（与 h1/h2 一致）。
-
-#### 风险点（做完逐条自查）
-1. **CONNECT-UDP 分支**在 `handle_resolver` 里 `return proxy_connect_udp(...)`，**不读 body**：
-   改成 split 后不要影响它（它不经过 `is_upload_like` 路径）。
-2. **必须仍然 `send.finish()`**：漏了会让响应不结束（客户端一直等）。
-3. **访问日志**的字节数：流式响应记得用真实长度（h3.rs 现在已按 `FileSource` 长度记），
-   请求侧字节数无法预知，保持不记即可。
-4. **do not 手工 release 流控**：h3-quinn 会在 `recv_data()` 消费时自动归还；
-   手工再调会 double-release。
-5. **空闲超时**：两条路径都要有（收齐路径已有；流式路径放在适配器任务里，见第 1 步）。
-6. `cargo build` 前先确认磁盘有空间（见 §21.16 上方说明）。
-
----
-
-### 21.18 build61：h3 请求体流式化**已完成**（§21.17 的方案落地）
-
-**结果**：h3 单请求上传上限从 8MiB（`REQUEST_BODY_CAP`）抬到 2GiB（`MAX_UPLOAD_BYTES`），
-与 h1/h2 对齐。**实测 h3 单请求 20MB → 201 / 1.46s、sha256 一致**（此前 413）。
-
-**落地时与 §21.17 的差异 / 新增经验**
-
-1. `h3::server::RequestStream::split()` 返回的是**两个 `RequestStream`**（不是裸 send/recv）：
-   `(RequestStream<S::SendStream, B>, RequestStream<S::RecvStream, B>)` —— send 半边保留
-   `send_response/send_data/finish` ✓，recv 半边保留 `recv_data()` ✓，正好可用。
-2. 泵任务的 bound 是 **`R: quic::RecvStream + Send + 'static`**：只写 `RecvStream` 会报
-   E0310（"parameter type R may not live long enough"）+ "future cannot be sent between threads safely"。
-   （§21.17 没写到这一条，实测补上。）
-3. 响应发送**收敛成一条** `h3_send_response`（普通请求与流式上传共用）：HSTS 注入、`FileSource`
-   分块读盘、全字段访问日志、`send_response + send_data + finish` 全在其中 —— 这样两条路径
-   不可能漂移（此前散文式的"复制一份"方案被否掉，正是因为漂移风险）。
-4. 413 由**调用方**发（recv 半边发不了响应）：`h3_collect_stream` 返回 `H3BodyErr::{Overflow,Other}`，
-   `Overflow` 由 `handle_incoming` 用 send 半边回 413 + 出路说明，`Other`（空闲超时/读错）直接断开
-   （drop 会向对端发 STOP_SENDING/RESET）。
-5. DoH 分支改成「只对确实是 DoH 的请求收 body」（复用 `dot_doh::is_doh_request`）——
-   否则 DoH 一开，普通上传就被白白套上 8MiB 上限（这一点与 h2 上一轮的做法一致）。
-
-**实测（build61，测试实例 18443）**
-
-| 检查 | 结果 |
-|---|---|
-| h3 单请求 20MB | **201 / 1.46s**，sha256 一致、无残留 `.part` ✓（此前 413） |
-| h3 单请求 9MB | 201 + sha 一致 ✓ |
-| h3 分片上传（2 片 4MiB） | 202 → 201 + sha 一致 ✓ |
-| h3 闸门 | `PUT /x.php/` → **403**、穿越 → **400** ✓ |
-| h3 20MB 下载 | 200 + sha 一致 ✓ |
-| h3 DoH POST | **200** + 113 字节应答 ✓（我改过这条分支） |
-| h3 admin GET/POST | 200 / 200 ✓（我改过 admin 分支） |
-| h1 / h2 各 3MB 上传 | 201 + sha 一致 ✓ |
-| `cargo test --bin webserver --release` | **145 passed / 0 failed** ✓ |
-
-**生产**：build61 已部署（h2/h3 200、DNS 正常、admin 200）。部署时出现约 2 分钟中断
-（我先把生产停掉、但测试任务没起来，随后立刻拉起）—— 如实记录，未影响数据。
-
-**剩余未做**：QMux 协议本体（需 patch vendored `quinn-proto` 的帧解析支持新帧类型）。
-至此 §21.8/§21.11 里「h2/h3 单请求 >8MiB」这一条**已全部解决**（h1 一直是流式 2GiB）。
----
-
-### 21.19 QMux v1 协议本体：已实现 + 19 条一致性测试；HTTP-over-QMux 端到端**未跑通**
-
-**背景**：`src/server/qmux.rs` 此前是「真在生效的流预算 + 诚实说明」，协议本体未实现，
-理由是「仓库里拿不到草案正文，不发明 wire format」（这个克制是对的）。本轮取到正文并实现。
-
-**取到的材料**：`draft-ietf-quic-qmux-02`（2026-07-06，WG draft；-01 也取来对比）。
-它是在**双向字节流（TLS over TCP 等）上提供 QUIC v1 那套流/数据报操作**的复用协议 ——
-不是 QUIC 扩展、不需要 patch quinn，因此**可以在应用层完整实现**。
-
-**实现**（`src/server/qmux/{proto.rs,conn.rs}`，约 1400 行 + 19 条测试）
-* §3.2 记录：`Size(i)+Frames` 自定界；帧不跨记录；末尾对不齐帧边界 → FRAME_ENCODING_ERROR；
-* §4 帧集合：QUIC v1 的 PADDING/RESET_STREAM/STOP_SENDING/STREAM/MAX_DATA/MAX_STREAM_DATA/
-  MAX_STREAMS/DATA_BLOCKED/STREAM_DATA_BLOCKED/STREAMS_BLOCKED/CONNECTION_CLOSE，
-  其余（PING/ACK/CRYPTO/NEW_TOKEN/…/HANDSHAKE_DONE）收到即 FRAME_ENCODING_ERROR；
-* §4.1 同一流的 STREAM 必须连续（offset 紧接上一字节）→ 否则 PROTOCOL_VIOLATION（因此无需重组缓冲）；
-* §4.2 第一个帧必须是 QX_TRANSPORT_PARAMETERS；我方参数**立刻发**，不等对端；
-* §4.3 QX_PING 请求序号严格递增、响应原样回显；
-* §5 传输参数：允许 7 个 QUIC 参数 + `max_record_size`；被禁的 → TRANSPORT_PARAMETER_ERROR；
-  未知的忽略；§5.2 默认 16382 且不得小于默认；记录不得超对端声明；
-* §6 读侧**永不**因应用不读而阻塞（缓冲上限=声明的额度，消费即回补 MAX_*）；
-* §7.1 空闲超时按「记录」计（收满/发完都重置）；§7.2/§7.3 CONNECTION_CLOSE 与优雅关闭；
-* §9.1 DATAGRAM（不可交付时可丢）、§9.2 RESET_STREAM_AT（按 RESET_STREAM 语义）；
-* `QmuxStream: AsyncRead+AsyncWrite` ⇒ 直接喂现有 h1（**HTTP/1.1 over QMux**）。
-
-**集成**：`ListenerConfig.qmux`（**默认 false**）；ALPN 加 `h1-02qx`（§8.1：QMux 自己没有 ALPN，
-由上层协议指定，命名沿用草案示例 `<协议>-<草案号>qx`）；服务端偏好 h2 > http/1.1 > qmux
-⇒ **开 qmux 不改变老客户端行为**；明文监听器按 §10.1 用首 8 字节魔数识别；配置校验要求 h1 开着。
-
-**实测**
-
-| 检查 | 结果 |
-|---|---|
-| 19 条 QMux 单测/一致性测试 | **全过**（握手、回显、主动发参数、读后续记录、首帧规则、禁止帧、偏移连续性、PING 语义、被禁参数、魔数、varint 边界、记录增量解析…） |
-| 全套测试 | **161 passed / 0 failed** |
-| TLS ALPN 协商 | 客户端拿到 **`h1-02qx`** ✓ |
-| 服务端主动发传输参数（§4.2，不等对端） | ✓（客户端读到 `\xffQMX…` 记录的 74 字节） |
-| 服务端读后续记录并发 QX_PING 响应（§4.3） | ✓（客户端发 PING(1) → 收到 `...be 01` 回显） |
-| **HTTP-over-QMux 端到端** | **✗ 未跑通**：STREAM 帧里的 HTTP 请求没有产生正确响应（日志显示 h1 会话有被拉起，但没拿到正确请求字节） |
-
-**过程中修掉的两个真 bug**（都由测试暴露）
-1. 协议错误时 `writer.abort()` 抢在队列落盘前 → 刚入队的 CONNECTION_CLOSE **从未写出**，
-   对端只看到连接被断、看不到原因。改成「发停止信号 → 冲刷队列 → 收摊」，2s 上限兜底。
-2. 单测客户端每条记录都新建解析器，丢掉一次 read 里多带的记录（6 个用例因此假失败）。
-
-**草案自身的一处不一致**（-01/-02 都有，已核对两版）：类型写成十六进制 `0x3f5153300d0a0d0a`，
-同句又说 wire 是 `"\xffQMX\r\n\r\n"`，二者不可能同时成立（varint(0x3f515330…) 是 `\xffQS0\r\n\r\n`）。
-本实现**以 ASCII 形式为准**（正文明确标注 on wire，且该魔数的全部意义就是认出 "QMX"），
-同时**接收**两种都认。
-
-**下一步（交接）**：排障入口已经很少了 —— 协议层与 ALPN 都验证过，问题在
-「STREAM 载荷 → h1 会话」这一小段。建议：① 在 `handle_frame` 的 Stream 分支与
-`QmuxStream::poll_read` 各加一行 debug 日志，确认 h1 到底收到了什么字节；
-② 用单测直接驱动 `qmux::serve_h1`（内存 duplex）跑一个真实 HTTP 请求，把范围压到
-「handler 装配」或「流 I/O」二者之一。`qmux` 默认关，生产未启用，不影响现网。
-
-### 21.20 QMux 端到端打通（build67）—— 两个真 bug 的根因与修法
-
-**① hyper 把「响应派发前的 EOF」判成 IncompleteMessage（半关闭默认关）**
-QMux 客户端把 FIN 与请求数据放在**同一条记录**里发出（实测如此），服务端在同一次交付里既给
-请求字节又给 EOF。hyper 的 `allow_half_close` 默认 **false**，`proto/h1/conn.rs::mid_message_detect_eof`
-直接报 `IncompleteMessage` —— 哪怕请求头已收全。现象：ALPN 成功、服务端发了参数、流上字节正确
-（日志确认 `GET /probe2 HTTP/1.` 已交付 h1），但**永远没有响应**，且 h1 的错误此前只在 debug 级。
-修法：h1 新增 `serve_tls_half_close()`（`http1::Builder::half_close(true)`），**只给 QMux 用**；
-TCP 侧不变（现网客户端不会同时半关闭；要不要一起改属单独评估项）。
-排障手法记录：先用「只读服务端参数」和「发 QX_PING 看是否回声」把范围压到「协议层没问题」，
-再写一个**内存 duplex 的端到端单测**（`h1_over_qmux_end_to_end`）把 HTTP 跑起来，
-一次构建就能复现，比反复重启线上实例快得多 —— 这条单测现在留在仓库里防回归。
-
-**② 明文识别的魔数位置偏一**（草案自身的表述与 §3.2 冲突）
-§10.1 说用「first 8 bytes exchanged on the transport (i.e., the type field …)」识别，但 §3.2
-规定字节流上**每条记录以 Size 变长整数开头** ⇒ 真实首字节是 Size，魔数在其后。
-原 `prefix.starts_with(MAGIC)` 因此永不成立（明文口把二进制当 h1 直接断开）。
-修法：`proto::plaintext_is_qmux()` —— 魔数在偏移 0 **或**「记录 Size 之后」都认。
-
-**实测（build67）**：端到端单测 ok；全套 **162 passed / 0 failed**；
-TLS（ALPN `h1-02qx`）与明文（魔数）两条路径用 Python QMux 客户端各自拿到 **HTTP/1.1 200 OK**；
-链路日志 `对端发起新流 0` → `首个数据帧 N 字节` → h1 访问日志齐全 ✓。
-
-**顺带**：`serve_h1` 里 h1 会话失败由 debug 提到 **warn**（「协议面不可用」级别事件不该静默 ——
-本轮排障就是被它卡的）。
-
-**未做（交接）**：① 生产尚未部署 build67（生产配置没开 `qmux`，不受影响；要上线就停/起两次调用）；
-② TCP 侧是否也该允许半关闭（RFC 上更宽容，现有实现会把「发完就 FIN」的客户端判失败）——
-建议单独评估，不要与其它改动混在一起。
-### 21.21 build67 上生产 + TCP 半关闭**无需改动**（用实验否掉了一个猜测）
-
-**部署**：生产已切 build67（两次独立调用：先 kill、再单起）。复验：单实例运行（`ps` 里另一条
-匹配是启动它的 `ksh -c` 外壳，不是第二个进程），h1 9095 / h2 8443 / h3 8443 / h1 9081 全 **200**，
-DNS 解析正常，admin API **200**，生产配置 `qmux` 未开（`grep -c qmux config.toml` = 0）
-⇒ 对现网行为是零变化（QMux 与 `half_close` 辅助函数都不参与生产路径）。
-
-**TCP 半关闭：实测「本来就是好的」，因此不做改动**
-上一节修 QMux 时我怀疑「h1 的 `allow_half_close=false` 会让『发完请求就 shutdown(WR)』的客户端拿不到
-响应」，并把它列为交接项。这轮先做实验再改代码：用一个「发完就 `shutdown(SHUT_WR)`」的客户端
-分别打**测试实例**（19081，build67，h1 仍是 half_close=false）与**生产**（9095）：
-
-| 目标 | 结果 |
-|---|---|
-| 19081（build67） | **OK 拿到响应 284 字节: HTTP/1.1 200 OK** |
-| 9095（生产现网二进制） | **OK 拿到响应 857 字节: HTTP/1.1 200 OK** |
-
-即：TCP 上这类客户端**一直是被正常服务的**（EOF 在响应派发之后才到达，不触发 hyper 的
-`mid_message_detect_eof` 错误分支）。差异只在 QMux：那里的 FIN 与请求字节**在同一次交付里**到达，
-才会被判失败。**结论：`half_close(true)` 保持只给 QMux 用，TCP 侧不改** ——
-避免为了「可能存在的问题」去改一条已经在正确工作的生产路径。
-（这条实验值得记下来：交接项里写的「建议单独评估」被实验直接否掉了，省掉一次无谓的行为变更。）### 21.22 审计剩余 3 条（build68，已上生产）
-
-前几轮把审计报告清得差不多了，本轮补上最后三条，其中两条是**真缺陷**：
-
-**① [P2] 上游响应头之后的字节被静默丢弃**（`proxy::read_http_head`）
-读响应头按 `\r\n\r\n` 切分，而一次 `read` 往往**同时带回响应头与正文起始字节**。旧实现只解析
-`buf[..pos+4]`、剩余直接丢 ⇒ 升级 WebSocket（101）时那些字节就是**上游的首批 WS 帧**：
-隧道开头缺数据、WS 帧错位（两端都解析失败，现象是「WS 连上但立刻报协议错」）。
-修法：`UpstreamIo` 加 `leftover` 缓冲、`poll_read` 优先吐出；`read_http_head` 把头部之后的
-字节**回注**（不是丢）。非 101 的路径连接本就废弃，故影响集中在 WS。
-
-**② [P2] 并发「写进程环境」+「读进程环境」是 UB**
-`env_lock` 在**引擎请求期间**会 `set_var`/`remove_var`，而 glibc 的 `setenv` 可能 **realloc
-`environ`** —— 此刻任何其它线程的 `std::env::var`（**哪怕读的是另一个键**）都可能走到已释放内存：
-间歇性崩溃或读到垃圾值。Rust 把「多线程下改进程环境」列为不应发生的场景（2024 edition 该 API 已
-unsafe），所以**写者互斥并不够**。
-修法：新增 `env_lock::read_static_env()` —— 只读一次并**缓存**。涉及的键
-（`CRUCIBLE_BATCH_CAP`、`CRUCIBLE_TOR_SOCKS(_UNIX)`、`CRUCIBLE_TOR_FFI_LIB`、`APPENGINE_*_LIB`）
-都是运维启动前设好的只读配置，缓存即可消除竞争，且不必把应用层锁塞进热路径。
-**诚实边界**（写进函数文档）：缓存后运行期再改这些环境变量不会被读到 —— 对启动期配置正是期望
-行为；要热改就该用配置文件。
-
-**③ QMux 排障期的两条 per-stream `log::info!` 降为 `debug`**（每请求一行的 info 是噪声）。
-
-**实测**：`cargo test --bin webserver --release` → **162 passed / 0 failed**。
-**生产已切 build68**：单实例（`ps` 里另有同事的 `remgr` 与启动外壳）、h1 9095 / h2 8443 /
-h3 8443 / h1 9081 全 **200**、DNS 解析正常、admin **200**。
-
-**至此三份审计报告的条目已全部处理完**（累计 16 条：1 P0 + 7 P1 + 8 P2），加上本轮新增的
-QMux v1 协议本体与端到端打通。仍然留在用户手上的只有投产前四项决定（admin 强口令、
-`[admin].listeners_allow`、metrics 凭据、是否公开发布 ECH）——那些是只有用户能拍板的。### 21.23 项目自带验收脚本：DNS 两个脚本恒红（6 个真 bug）+ openssl 依赖收尾
-
-**起因**：在 build68 上跑 `scripts/acceptance_test_ports.sh` 的**检查部分**（省略了它会强制重编
-7+ 分钟、以及需要联网下载的步骤），发现项目自己的两个 DNS 验收脚本恒失败
-（`dns_verify.sh` 7/15、`dns_smoke.sh` 18/5）。逐条排查后确认**全是脚本自身的 bug**，
-服务端功能正常（生产递归、DoT、DoH 均实测可用）。这类「验收脚本永远红」等于**DNS 这条线
-从未被真正验过**，属于最该修的一类问题。
-
-**`dns_verify.sh` 的 3 个 bug**
-1. **端口取错**：`grep -oE '"port":[0-9]+' | head -1` —— status JSON 里 `dot` 是嵌套对象且
-   序列化在前，第一个 `"port"` 是 **DoT 口 11853**（测试态）。于是明文 DNS 查询全打到 DoT 口上，
-   A/AAAA/SOA/NS/AXFR/RPZ **全部误报 FAIL**。改为用 python3 解析顶层字段。
-2. **`q2.bin` 从未生成**：DoH POST 与 DoT 都用 `--data-binary @/tmp/q2.bin`，但没有任何地方写过
-   它（原本靠另一个脚本残留）⇒ 两项恒失败。改为脚本内从 base64 生成。
-3. **依赖 openssl**（DoT 用 `openssl s_client … | strings`）：用户明确要求项目不依赖 openssl。
-   改用 python3 + ssl 实现 RFC7858 探测。
-
-**`dns_smoke.sh` 的 3 个 bug**
-4. **`api()` 不带 `$BASE`**：调用点写的是 `api /api/dns/status`，相对路径被 curl 当 URL ⇒
-   **所有 GET 检查恒失败**（POST 因 `post()` 自己拼了 `$BASE` 反而正常）。新增 `get()` 并替换。
-5. **`$WIRE_B64` 先用后定义**（第 77 行用、第 88 行才赋值）且把 `/tmp/dns_smoke_q.bin` 当**命令**
-   执行 ⇒ DoT/DoH 恒失败。
-6. 同上的 openssl 依赖。
-
-**两个脚本的共性问题（也修了）**：递归检查在 `modes.root = true` 时会得到**权威 NXDOMAIN** ——
-那是**正确行为**不是故障（`dns_smoke.sh` 第 0 步自己就把 root 打开了）。改为读 status 判断 root
-模式并如实 **SKIP**，不报假 FAIL。
-
-**openssl 依赖收尾**：`generate_test_certs.sh` 会在第 5 行 `openssl version` 失败即 `exit 1`
-（且带 `set -e`）—— **即使四张证书全都存在、什么都没必要做，脚本仍然报错退出**，让调用方
-（`acceptance.sh`）在「已卸载 openssl 的正常机器」上直接失败。改为：证书齐全 → 直接成功退出
-（部署路径本就不需要生成工具）；只有证书缺失时才找生成器（先 `bssl`，再 `openssl`），
-都没有则给出明确指引。**实测**：`sh scripts/generate_test_certs.sh` → 打印
-「test certs ready（仓库自带，无需生成）」、`exit=0`。
-（仍以 openssl 为**最后**回退的还有 `start_server*.sh` / `nightly_complete.sh` 的证书生成块，
-它们本就 `if [ ! -f ]` 守卫，证书在时不会调用 openssl；要彻底去掉得先有 bssl 可用的生成路径。）
-
-**实测**
-
-| 脚本 | 修复前 | 修复后 |
-|---|---|---|
-| `scripts/dns_verify.sh` | `PASS=7 FAIL=15` | **`PASS=21 FAIL=0`** |
-| `scripts/dns_smoke.sh` | `PASS=18 FAIL=5` | **`PASS=22 FAIL=0`** |
-| `scripts/generate_test_certs.sh` | 缺 openssl 即失败（哪怕证书齐全） | **退出 0** |
-
-**同轮 acceptance 检查（build68，省略强制重编/联网步骤）**：引擎 smoke 大多 200
-（`ruby`/`psgi`/`rack`/`jsp` → 502，是本机**未装 ruby**、JSP sidecar 未起，且它们是**诚实的 502**
-而不是静默回落到静态）；TLS1.3/1.2 真实套件探针通过；**h3 200**；**SSLv2 探针通过**
-（`sslv2_probe_ok` + 服务存活 + 之后 TLS1.3 仍可用）；geoip ASN 查询返回真实 ASN；
-**无凭据访问 admin → 401** ✓。
-**注**：本轮只改脚本，生产 build68 不受影响。### 21.24 ECH 按 RFC 9849 严格部署（build70）：判据、证书分离、MITM 不可区分
-
-**起因**：用户先问「ECH 需要外层 cover 证书吧」，我实现后他追问
-「看看是否符合安全和隐私的最佳实践」。复查发现**我自己的实现有两处真缺陷**，且其中一条
-是安全相关的：
-
-* **[安全] 证书选择用「域名比较」判据**（`seen != ech_public_name` ⇒ 换真实证书）——
-  等价于「**谁把 SNI 猜成真实名，谁就拿到真实证书**」。这既让 cover 形同虚设，
-  又向主动探测者**确认**「本机持有该域名证书」。RFC 9849 的判据是 **`SSL_ech_accepted()`**。
-* **[正确性] 两张证书只有一份 OCSP staple**：`set_ocsp_status` 是**逐证书的单份 DER**，
-  而我们在两套证书间切换 ⇒ 必然一边错配（严格客户端校验失败；宽松客户端**撤回检查静默失效**，
-  比不装订更糟）。这是我引入的且无测试覆盖。
-
-**按用户明确要求实施（RFC 标准 + 不混用证书 + 日志不脱敏）**
-
-1. **判据改为 `SslRef::ech_accepted()`**（`boring_path.rs` servername 回调）：
-   * `true`（客户端用了 ECH 且服务端解密成功）⇒ 用**真实（内层）证书**；
-   * `false`（没发 ECH，或发了被拒后回退）⇒ 一律 **cover** —— **包括 SNI 恰好写成真实名的
-     探测连接**，它们只配看到外层证书。
-2. **证书严格分离，配置期 fail-fast**（三条，均 bail 不静默降级）：
-   * cover 与真实证书 **DER 相同 ⇒ 拒绝**（同一张证书让 ECH 无意义：中间人凭证书即可关联）；
-   * cover 必须**覆盖 `ech_public_name`**（SAN 优先、CN 回退、通配符只匹配一个标签）——
-     否则未用 ECH/被拒的客户端按 public_name 校验必然失败；
-   * cover 与 `ssl.ocsp_der_path` **同时配置 ⇒ 拒绝**（staple 逐证书单份，必然错配）。
-3. **日志不脱敏**（本地存储安全）：保留内层名便于排障。我上一轮建议的"脱敏"作废。
-
-**新增 4 条真机验收用例**（`ech_handshake_test.rs`，用 boring 当 ECH 客户端；
-自签证书带 SAN，不依赖 openssl）
-
-| 用例 | 断言 |
-|---|---|
-| `ech_handshake_accepted_and_inner_name_visible_to_server` | `ech_accepted=true` **且服务端看到内层真实名**（只断前者会被"标称成功"骗过） |
-| `probe_with_real_name_without_ech_gets_cover` | **探测防护**：不带 ECH、SNI=真实名 ⇒ 只拿到 **cover** |
-| `rejected_ech_falls_back_to_cover` | **ECH 被拒**（客户端用不匹配的 ECHConfig）⇒ 回退到 **cover**，`ech_accepted=false` |
-| `same_cert_for_inner_and_outer_is_rejected` / `cover_not_covering_public_name_is_rejected` | 配置期必须报错 |
-
-**MITM 不可区分**如何保证（链路逐段）：
-* 被动观察者只能看到**外层名**（= public_name）与 TLS1.3 加密后的内容；
-* ECH 被接受时证书是**真实证书但经 TLS1.3 加密**传输，MIDM 看不到真实域名；
-* 客户端 **ECH 被拒/未支持**时看到的是 **cover** ⇒ 与普通站点无区别；
-* 内外层证书**必须不同**（配置期强制）⇒ 不存在"同一张证书把两边关联起来"的通路；
-* 探测者用真实名 SNI 也**只**拿到 cover（判据是 `ech_accepted` 而非域名）。
-
-**诚实边界（不遮掩）**：① **TLS1.2 无法承载 ECH** ⇒ 那条路径真实名明文可见、证书明文可见；
-若真实名需要保密，必须同时确保客户端走 TLS1.3+ECH（本报文不解决这一点）。
-② 自动 OCSP（`ocsp_fetcher`）按 `ssl.cert` 取 staple，配了 cover 时同样会错配 ——
-本次只对**显式** `ocsp_der_path` 做了 fail-fast；自动路径的组合限制记在待办。### 21.25 清尾：CONNECT-UDP capsule 协议、ech_advertise 假开关、GeoIP 周期同步（+ 更正两条陈旧待办）
-
-把 WORKLOG 里剩余的「未做/待办」逐条查证后处理，结果如下。
-
-**① [功能缺口] CONNECT-UDP 的 `?1`（RFC 9297 capsule 协议）此前直接回 501**
-RFC 9298 §3.2 规定客户端**应当**带 `?1`，真实 MASQUE 客户端（Chrome 等）就是这么发的 ——
-所以「只支持裸长度前缀（早期草稿形态）」等于**对标准客户端不可用**。
-* 新增 `Framing { LengthPrefixed, Capsules }` 与 `TunnelEvent { Datagram, Close }`；
-* `?1` ⇒ capsule 形态：`varint(type)+varint(len)+payload`（`0x00`=DATAGRAM，`0x01`=CLOSE），
-  且**响应**必须回 `Capsule-Protocol: ?1`（RFC 9297 §3），否则客户端仍按裸形态发；
-* 不带 `?1` ⇒ 保持原样（裸长度前缀），**老客户端行为不变**；
-* **未知 capsule 一律跳过负载并继续解析下一条**（RFC 9297 §3.2 要求忽略）。
-  这里踩到一个真坑：第一版跳过未知 capsule 后返回 `Ok(None)`，而调用方的
-  `Ok(None) => break` 会退出循环 —— 缓冲里紧随其后的 DATAGRAM 在**没有新数据到达**时
-  永远取不到（隧道静默卡死）。改为在解析器内部 `continue` 循环。这正是新加的
-  `unknown_capsule_is_skipped` 用例逼出来的。
-* 新增 6 条单测：往返、**两种形态不可混**（同一串字节在两种 Framing 下含义不同）、
-  未知 capsule 跳过、CLOSE、增量分片解析、伪造超长 capsule 必须报错。
-
-**② [假开关] `ssl.ech_advertise`（默认 true）声称「发布到 HTTPS(type65) DNS 记录」，但从未接线**
-`SslConfig::ech_advertise_enabled()` 是**死代码**（全树无调用者），真正的发布动作在
-`[dns] [[dns.https_rr]]`。于是「ECH 已启用」与「客户端拿不到 ECHConfig」可以同时成立而无人察觉
-—— 正是本项目反复出现的「开关是假的」那一类。
-* 新增启动期自检 `warn_unpublished_ech`：开了 `ech_advertise` 且有 `ech_public_name`、
-  但 `[dns].https_rr` 里没有对应的 `ech=true` 条目时，**明确告警**并给出两条出路
-  （补配置，或关掉 `ech_advertise` 以免误解）。
-
-**③ [未实现] GeoIP 定时同步（原注：`ops::spawn_cron_scheduler` 未实现）**
-`geoip::ensure_synced` 原本只在**启动**与**面板保存**时被调用，靠 `sync_days` +
-磁盘时间戳判断过期 ⇒ **长期运行且从不改配置的服务器永远不会再同步**，而
-`geo.mmdb.sync_days` 的文案是「cron 每日」。已补周期任务：每 6 小时检查一次
-（是否真的下载仍由 `ensure_synced` 按 `sync_days` 判定；重复调用只 stat 时间戳，很廉价），
-并在 `dns.enabled && geo.enabled && mmdb.is_active()` 时才动作。
-
-**两条陈旧待办——查证后确认「早已实现」，本次更正 WORKLOG，不写代码**
-* **从区记录在面板显示为空**：`admin_api` 对非 master 区已走 `list_secondary_records`
-  （读盘解析 named 自己维护的 zone 文件），返回 `{records, readonly: true, kind}`，
-  文件未生成时给 `note` 说明「传输可能还没完成」而不是 500；`admin_ui.html` 里
-  `readonly` 有 17 处引用、据此关闭编辑入口。实测 `?zone=slave1.test` 返回
-  `{"kind":"slave","note":"……尚未生成（传输可能还没完成）","readonly":true,"records":[]}` ✓
-* **优雅关闭无截止时间（旧实例永久残留）**：`src/main.rs` 已有
-  `rt.shutdown_timeout(3s)` + 8s 看门狗（`std::process::exit`），注释里写明正是为这个场景加的。
-
-**测试**：全套 `cargo test --bin webserver --release` 结果见下方提交（capsule 6 条新用例在内）。
+### 21.16 build73/74：Tor 全链路（入站 HS 接线 + 出站 5 缺陷 + 自愈/关停）—— 双向真实 200 验证
+
+**起因**：`检查tor相关的功能是否完整实现`。查出来的不是「缺一点」，而是**两半都没真正跑起来**：
+出站反代曾在 `connect_upstream_inner` 里无条件 `bail!("tor upstream not supported")`（于是 `via_tor` /
+`ssl_mode=tor` / `rule.tor_socks` 三个配置项全是死代码）；入站 `spawn_from_config` **全树零调用点**
+（`mod.rs` 里只有一句 "tor_hs removed" 的注释，而模块明明在）⇒ 配 `[tor_hs] enabled = true`
+什么都不会发生，也不报错。两处的修复与证据分列如下。
+
+**① 出站 SOCKS5（`proxy.rs`，commit 142cbb1）**
+- 应答**版本字节**未校验（只看 REP）：非 SOCKS5 服务端会被当成握手成功，后续把它的响应体当隧道数据读；
+- UDS 桥 `socks5_unix_bridge` 只 `accept()` 一次且不看对端：同机任何进程都能抢先占掉那条回环连接
+  （实测端口被抢则隧道接到别人身上）⇒ 改为循环 accept + 只收 peer 端口等于本连接 `local_addr().port()` 的那条；
+- 默认 UDS 探测链**不存在**（文档却写着「内置优先链」）⇒ 补 `state/tor-client/socks.sock`、
+  `/run/tor/socks`、`/var/run/tor/socks`、`/run/tor/socks.sock`（`stat` 判定 socket 再连）；
+- config 文档里的「arti」是**从来没实现过**的承诺 ⇒ 文档与实现对齐（不做 arti：会带进第二套 TLS 栈）；
+- 新增 15 条测试（用 `tokio::io::duplex` 造假 SOCKS5 服务端，覆盖 ATYP 成功 ×3 / REP≠0 /
+  坏版本 / 握手拒绝 / 未知 ATYP / host 过长 / 回环强制 / 尾点 .onion 必须走 Tor / UDS 候选覆盖）。
+
+**② 入站 HS（`tor_hs.rs`）—— 接线之后才暴露的一串问题**
+- `state_dir()` 是全仓库唯一**相对** state 路径 ⇒ cwd 漂移会把 HS 密钥写错地方；改为 `current_dir()` 绝对化；
+- **tor 硬要求 `HiddenServiceDir` 是 0700**：0755 时 tor 直接
+  `Failed to parse/validate config: Failed to configure rendezvous options` 退出（实测），现在建目录即 chmod 0700；
+- **幂等 ≠ 存活**（最要命的一条）：旧逻辑只要 `hostname` 文件在就「复用已有 HS」直接返回，**从不检查
+  tor 进程还在不在、torrc 是否已与配置不一致**。实测证据：把 `ports` 从 `[[8080,28080]]` 改成
+  `[[80,28080]]` 后重启服务 —— 日志照样打「复用已有 HS」，磁盘 torrc 仍是 8080，tor 进程还是上一次那个
+  （`ps -o lstart` 未变），而客户端访问 `http://<onion>/` 拿到的是 tor 的
+  `No virtual port mapping exists for port 80`。现在复用必须同时满足「进程在（pidfile + `ps` 核对命令行）
+  + torrc 与配置逐字节一致」，否则停旧起新（密钥在磁盘上，.onion 名不变）；
+- **tor 日志无处可看**：`--RunAsDaemon` 之后 stdout 被丢弃，torrc 里又没有 `Log`，于是
+  `data/notice.log` 是**空的**（tor 默认 notice→stdout，而 stdout 没了）。现在 torrc 显式
+  `Log notice file state/tor-hs/notice.log`，且失败时按 stderr/stdout → notice.log 的顺序取回 tor 原话；
+- **关停留孤儿**：tor 是 `--RunAsDaemon` 的独立进程，不在 `child_registry` 里 ⇒ webserver 退出后
+  .onion 仍可解析、连进去必然是死的。现在退出路径显式停掉「pidfile + ps 核对过」的那一份；
+- **巡检自愈**（原来没有任何东西看管 tor，进程一死就静默不可达）：每 60s 调一次幂等的 `ensure_hs`，
+  且**每轮读实时配置**（否则热重载后巡检会拿旧快照把 tor 改回旧配置）；
+- `ensure_hs` 加进程内锁：启动/热重载/巡检三处并发时会同时判定「不在跑」各起一个 tor，第二个必因
+  DataDirectory 锁失败；
+- `enabled` 由 true 改 false 时**真的把 tor 停掉**（否则面板显示「未启用」而 .onion 继续对外服务）；
+- 状态端点补 `running`/`pid`/`user` 三个字段：只有 hostname 会让面板显示一个「看起来正常」实则不可达的地址；
+- 新增可选 `[tor_hs].user`（如 `_tor`）：启动前把 `state/tor-hs` 整棵树 chown 给该用户并把 `User` 写进 torrc
+  （tor 解析完配置即降权，root 独占目录会让它启动失败）；不配时以 webserver 身份运行，并在 root 下
+  **一次性**提示建议降权（tor 自己那条告警只落在 notice.log 里，面板看不到）。
+
+**实测（build73/74，全部走真实 Tor 网络，非单测模拟）**
+- 单测 **196/196**（191 + 新增 5 条 torrc/复用判据/pid 防护/user 校验）；
+- 客户端 tor（独立 torrc，`SocksPort 127.0.0.1:19050`）`curl --socks5-hostname` 直取
+  `.onion/index.html` → **HTTP 200**，正文 `<h1>crucible-onion-e2e-ok</h1>`；
+- **出站端到端**：请求本机 `28081/o/index.html` → 反代经 tor SOCKS5 → .onion → HS → `127.0.0.1:28080`
+  → 同一台服务器 → **HTTP 200 + 同一 marker**（双向在一条链里同时验到）；
+- 负向对照：`ssl_mode=verify` + 明文上游 → **502** `boring TLS connect ... [WRONG_VERSION_NUMBER]`
+  （verify 档没有被静默降级成明文）；
+- 热重载：改 `ports` → 日志「重启 tor —— torrc 与当前配置不一致（改了 ports / user 等）」，
+  torrc 出现两行 `HiddenServicePort`，tor pid 由 86385 → 45087；
+- 巡检：`kill` 掉 tor → `/api/tor/status` 立刻报 `"running":false` → **20s 内自动拉起**
+  （日志「重启 tor —— tor 进程不在」）；
+- `enabled=false`（热重载）→ 日志「enabled 变成 false → 停止 tor」→ 状态端点 `enabled:false, running:false`；
+- SIGTERM 关停 → 无孤儿 tor（`OK_no_orphan`）。
+
+**踩坑（写进这里省得下次再踩）**
+1. `HiddenServiceDir` 必须 **0700**；0755 的错误信息是「Failed to configure rendezvous options」，与权限二字无关；
+2. `--RunAsDaemon` 会让 stdout 作废 ⇒ 不显式写 `Log` 文件就等于没有日志；
+3. `.onion` 上访客用的是**虚拟端口**：只映射 8080 就必须 `http://<onion>:8080/`，
+   `No virtual port mapping exists for port 80` 是**配置**问题而非服务故障（面板已就地提示）；
+4. `ps -o args=` 在 OpenBSD 上按终端宽度截断（实测 80 列）⇒ pid 复用防护按「首词是 tor 且命令行含我们的
+   torrc 路径」判断，不能整串比较；
+5. 两个 listener 不能共用同一个 `root`（校验器会拦：「duplicate listener root」），e2e 测试配置要分开 docroot。

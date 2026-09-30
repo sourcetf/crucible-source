@@ -866,12 +866,26 @@ pub struct BasicAuthConfig {
 pub struct TorHsConfig {
     #[serde(default)]
     pub enabled: bool,
+    /// `[(虚拟端口, 本地端口)]`，对应 torrc 的 `HiddenServicePort`。
+    ///
+    /// 虚拟端口就是访客在 .onion 上看到的端口：只映射 8080 时访客必须用
+    /// `http://<onion>.onion:8080/`；要让 `http://<onion>.onion/` 直接可用，
+    /// 就必须有一条 `(80, 本地端口)`。tor 对未映射端口的拒绝（日志里的
+    /// `No virtual port mapping exists for port 80`）不是服务器故障。
     #[serde(default)]
     pub ports: Vec<(u16, u16)>,
     #[serde(default)]
     pub data_dir: Option<String>,
     #[serde(default)]
     pub tor_bin: Option<String>,
+    /// 可选：`tor` 进程的运行用户（对应 torrc 的 `User`）。
+    ///
+    /// 不设时 tor 以 webserver 的身份运行（生产上 webserver 是 root ⇒ tor 也是 root，
+    /// tor 自己会为此告警）。设成 `_tor` 之类的专用账号后，启动前会把
+    /// `state/tor-hs`（HS 密钥、hostname、torrc、日志）整棵树 chown 给该用户并把
+    /// `User` 写进 torrc —— tor 被攻破也拿不到 root。账号不存在 ⇒ 配置期直接报错。
+    #[serde(default)]
+    pub user: Option<String>,
 }
 
 /// 与 serde 默认值**严格对齐**的 `Default`（`ssl_mode` 默认 `verify` —— 最严格档）。
