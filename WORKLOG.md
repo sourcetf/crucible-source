@@ -1630,3 +1630,41 @@ API 形状对着 vendored 的 rustls 0.23.43 源码核对过（0.23 收 `&WebPki
 2. 磁盘闸门用 `statvfs` 时**必须沿父目录上溯**：上传目标还不存在，直接 statvfs 会 ENOENT。
 3. 预算类改动一定要写「断言被拒」的单测：只写正向用例，两条 bug（不记账、闸门不生效）
    都会静默通过。
+
+### 21.19 修好 `tls_rustls`（不带 boring）配置：从「编译不过」到 195/195 测试全绿
+
+§21.18 里我留了一条诚实的边界：「rustls 回源的握手验签**没有被编译验证**，因为该配置在本仓库
+根本编译不过（实测 40+ 错误）」。本轮把它修掉了 —— 顺带把那句「rustls 可作回退」从**空话**变回
+**事实**，也让 §21.18 的验签改动拿到了编译验证。
+
+#### 原因（都是同一类：BoringSSL 专属模块被**无条件**编译）
+
+| 模块 | 为什么不能无条件编译 | 处理 |
+|---|---|---|
+| `tls/boring_path.rs` | 全文是 boring 类型（acceptor/SslStream/ECH/OCSP 装订） | `#[cfg(feature = "tls_boring")]` 整模块门控 |
+| `ocsp_fetcher.rs` | `StapleSlot` 用 boring 的 X509/hash 类型，唯一调用方是 boring_path | 同上 |
+| `dns/dot_doh.rs` 的 `run_dot` | `tokio_boring::accept` + `boring::ssl::SslAcceptor` | 与调用点（本就 cfg 分叉）同一门控 |
+| `tls/cipher_catalog.rs` `probe()` | `SslContextBuilder` 探套件 | 只门控函数体：非 boring 构建返回**空表**，语义是「探测不可用 ⇒ 不武断拒绝」（原有注释即此意） |
+| `ech_auto.rs` 的 `generate`/`raw_x25519` | X25519 keygen 走 boring `PKey` | 只门控这两处；非 boring 构建下 `generate` 给出明确报错（不是静默失败） |
+| `live_config.rs` 的 `clear_acceptor_cache()` | 函数在被门控的模块里 | `#[cfg(feature = "tls_boring")]` 调用点 |
+| `tls::active_stack` / `legacy_modules` | 定义在 boring_path 里，但**只用 `cfg!` 宏** | 移到 `tls/mod.rs`（两种配置共用一份实现，避免复制粘贴出两份漂移的文案） |
+| 4 个测试 | 断言 BoringSSL 行为（探测/PSK 表/ECH 装载） | 与它们依赖的能力同一门控 |
+
+#### 验证
+
+* `cargo check --no-default-features --features 'tls,tls_rustls,go_shm_ipc'` → **CHECK_EXIT=0**（此前 40+ 错误）
+* 该配置的**完整测试套件**：`cargo test --release --no-default-features --features 'tls,tls_rustls,go_shm_ipc' --bin webserver`
+  → **195 passed / 0 failed**（比 boring 配置少 17 个 —— 那些是 BoringSSL 专属用例，已被正确地
+  cfg 门控掉，而不是失败）
+* boring 配置（生产用）：**212 passed / 0 failed**，行为不变
+
+#### 顺手修的两件事（都是本轮自己踩出来的）
+
+1. **磁盘被我自己顶到 102%**：`cargo test` **忘了 `--release`** ⇒ 生成 1.7G `target/debug` 产物，
+   `/` 从 1.4G 余量变成 **-364M**（写盘开始失败）。`rm -rf crucible/target/debug` 后恢复 1.4G。
+   生产未受影响（当场复验 h1/h2/h3 全 200）。**教训：这台机器上跑测试一律 `--release`**，
+   辅助脚本已改并在注释里写明原因。
+2. **5 个上传用例变得依赖环境**：§21.18 新加的磁盘余量闸门（`MIN_FREE_BYTES = 512MiB`）在盘紧时
+   会正确地拒绝一切会话 —— 于是那 5 个「真落盘」用例集体失败。这不是被测对象的 bug，而是
+   **用例把环境当常量**。现在：环境不足时跳过并打印原因；磁盘闸门那条用例改成**自洽断言**
+   （拿 `free_bytes()` 的实测值与闸门结论比对），不再硬编码「小文件一定放得进」。

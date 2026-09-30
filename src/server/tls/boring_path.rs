@@ -22,36 +22,6 @@ use std::sync::Arc;
 use tokio::net::TcpStream;
 use tokio_boring::SslStream;
 
-pub fn active_stack() -> &'static str {
-    if cfg!(feature = "tls_boring") {
-        "boringssl"
-    } else if cfg!(feature = "tls_rustls") {
-        "rustls-fallback"
-    } else {
-        "none"
-    }
-}
-
-pub fn legacy_modules() -> &'static str {
-    use std::sync::OnceLock;
-    static CACHED: OnceLock<String> = OnceLock::new();
-    let s = CACHED.get_or_init(|| {
-        let mut mods = Vec::new();
-        if cfg!(all(feature = "tls_nss", tls_nss_enabled)) {
-            mods.push("nss");
-        }
-        if cfg!(all(feature = "tls_tomcrypt", tls_tomcrypt_enabled)) {
-            mods.push("tomcrypt");
-        }
-        if mods.is_empty() {
-            "none".to_string()
-        } else {
-            mods.join(",")
-        }
-    });
-    s.as_str()
-}
-
 pub fn build_acceptor(ssl: &SslConfig, lc: &ListenerConfig) -> Result<SslAcceptor> {
     let mut builder = SslAcceptor::mozilla_modern(SslMethod::tls())?;
     // boring 的 mozilla_modern 预设带 SSL_OP_NO_TLSV1_3,不清掉 TLS1.3 永远握手失败(

@@ -333,7 +333,6 @@ fn build_tls_acceptor(
     Ok(b.build())
 }
 
-#[cfg(feature = "tls_boring")]
 /// DoT 客户端白名单的解析：`[dns.dot] allow` 非空用它；否则沿用 `[dns] recursion_acl`；
 /// 两者都空 ⇒ **仅回环**（与 `[dns] recursion_acl`「空 = 仅本机」的文档语义一致）。
 fn dot_effective_allow(cfg: &crate::server::dns::DnsConfig) -> Vec<String> {
@@ -398,6 +397,9 @@ fn dot_max_conns(cfg: &crate::server::dns::DnsConfig) -> usize {
     }
 }
 
+/// DoT 监听循环：整个函数依赖 boring 的 acceptor / `tokio_boring::accept`，
+/// 因此与调用点（`#[cfg(feature = "tls_boring")]` 那一支）保持同一门控。
+#[cfg(feature = "tls_boring")]
 async fn run_dot(
     cfg: crate::server::dns::DnsConfig,
     listen: u16,

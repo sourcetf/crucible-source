@@ -26,6 +26,9 @@
 //! 生成的配置任何客户端都无法用于握手。这里改为真实 X25519 keypair。
 
 use anyhow::{bail, Context, Result};
+// ECH 的密钥生成（X25519）走 BoringSSL 的 PKey：rustls 配置下没有等价的
+// 「bssl 兼容」密钥生成路径，因此这两个函数在该配置下给出明确报错（见 generate 的分支）。
+#[cfg(feature = "tls_boring")]
 use boring::pkey::{Id, PKey, Private};
 use std::path::{Path, PathBuf};
 
@@ -188,15 +191,26 @@ pub fn parse_suites(spec: &str) -> Result<Vec<(u16, u16)>> {
 
 /// 生成一份新的 ECH 材料（真实 X25519 keypair）。
 pub fn generate(spec: &EchSpec) -> Result<EchMaterial> {
-    let pkey = PKey::generate(Id::X25519).context("X25519 keygen")?;
-    let (key, public) = raw_x25519(&pkey)?;
-    let config_id = 1u8; // BoringSSL 测试向量亦用 1；0 留给 retry config 之外的语义
-    let config = encode_config(config_id, &public, spec)?;
-    let config_list = encode_config_list(&config);
-    Ok(EchMaterial { config, key, config_list, reused: false })
+    #[cfg(not(feature = "tls_boring"))]
+    {
+        let _ = spec;
+        anyhow::bail!(
+            "ECH 密钥生成需要 BoringSSL 栈（本构建未启用 tls_boring）：\n             请用 boring 构建生成，或手工放置 state/ech 下的既有材料"
+        );
+    }
+    #[cfg(feature = "tls_boring")]
+    {
+        let pkey = PKey::generate(Id::X25519).context("X25519 keygen")?;
+        let (key, public) = raw_x25519(&pkey)?;
+        let config_id = 1u8; // BoringSSL 测试向量亦用 1；0 留给 retry config 之外的语义
+        let config = encode_config(config_id, &public, spec)?;
+        let config_list = encode_config_list(&config);
+        Ok(EchMaterial { config, key, config_list, reused: false })
+    }
 }
 
 /// 取 X25519 原始私钥/公钥（各 32 字节）。
+#[cfg(feature = "tls_boring")]
 fn raw_x25519(pkey: &PKey<Private>) -> Result<(Vec<u8>, Vec<u8>)> {
     let plen = pkey.raw_private_key_len().context("raw_private_key_len")?;
     let mut pbuf = vec![0u8; plen];
@@ -518,6 +532,8 @@ mod tests {
         assert_eq!(len, c.len() - 4);
     }
 
+    // 需要 boring 的 X25519 keygen（见 generate 的分支）。
+    #[cfg(feature = "tls_boring")]
     #[test]
     fn roundtrip_parse() {
         // 只用 BoringSSL 真正接受的组合（HKDF-SHA256）：其它 KDF 会让它**拒绝整个
@@ -552,6 +568,10 @@ mod tests {
 
     /// 生成的私钥必须与配置里的公钥配对：用 HpkeKey 初始化不报错即格式正确，
     /// 并用 boring 的 ECH API 真正装载一次（最接近真实使用的校验）。
+    ///
+    /// 这个用例同时依赖 `generate`（boring 的 X25519 keygen）与 `tls::ech_pem`
+    /// （boring 的 SslEchKeys），因此与它们同一门控 —— rustls 配置下它无从运行。
+    #[cfg(feature = "tls_boring")]
     #[test]
     fn material_loads_into_boringssl() {
         let spec = EchSpec::from_config(Some("crucible.local"), None, Some(64)).unwrap();

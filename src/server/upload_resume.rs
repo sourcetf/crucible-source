@@ -411,6 +411,19 @@ pub fn sweep_expired() -> usize {
 
 #[cfg(test)]
 mod tests {
+/// 本机磁盘余量是否足够跑这些「真落盘」的用例。
+///
+/// 不能硬断言「小文件一定放得行」：`session_for`/`append` 有**磁盘余量闸门**
+/// （`MIN_FREE_BYTES`），机器盘满时（这台机器就长期紧张，实测一度到 102%）它们会正确地
+/// 拒绝 —— 那是被测行为，不是被测对象的 bug。环境不满足就跳过并在输出里说明。
+fn test_fs_has_room() -> bool {
+    match free_bytes(&std::env::temp_dir()) {
+        Some(free) => free >= MIN_FREE_BYTES.saturating_add(8 * 1024 * 1024),
+        None => true,
+    }
+}
+
+
     use super::*;
 
     #[test]
@@ -424,6 +437,10 @@ mod tests {
 
     #[test]
     fn session_offset_semantics_and_atomic_commit() {
+        if !test_fs_has_room() {
+            eprintln!("跳过：本机磁盘余量低于闸门阈值（{MIN_FREE_BYTES}），落盘用例无从验证");
+            return;
+        }
         let dir = std::env::temp_dir().join(format!("crucible-up-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let target = dir.join("f1.bin");
@@ -448,6 +465,10 @@ mod tests {
     /// 每来源 IP 的并发会话上限必须真的生效（否则单机就能把会话表占满、把别人挤成 503）。
     #[test]
     fn per_ip_session_cap_is_enforced() {
+        if !test_fs_has_room() {
+            eprintln!("跳过：本机磁盘余量低于闸门阈值（{MIN_FREE_BYTES}），落盘用例无从验证");
+            return;
+        }
         let dir = std::env::temp_dir().join(format!("crucible-up-ip-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let ip: std::net::IpAddr = "203.0.113.7".parse().unwrap();
@@ -478,6 +499,10 @@ mod tests {
     /// 测出来的是另一条规则 —— 第一版就是这么写的，被这台机器的真实余量打回来了。
     #[test]
     fn declared_total_reserves_inflight_budget() {
+        if !test_fs_has_room() {
+            eprintln!("跳过：本机磁盘余量低于闸门阈值（{MIN_FREE_BYTES}），落盘用例无从验证");
+            return;
+        }
         let dir = std::env::temp_dir().join(format!("crucible-up-budget-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let chunk = 64 * 1024 * 1024u64;
@@ -509,14 +534,25 @@ mod tests {
     #[test]
     fn disk_headroom_gate_rejects_when_free_is_tiny() {
         let dir = std::env::temp_dir();
-        // 直接测它的判据函数：want 取一个天文数字时必须为 false
+        // 判据函数直测：want 取天文数字时必须为 false（与磁盘余量无关，恒成立）
         assert!(!space_ok(&dir.join("x.bin"), u64::MAX / 2));
-        // 正常小文件应当放行（本机 /tmp 至少有 MB 级余量）
-        assert!(space_ok(&dir.join("x.bin"), 1024));
+        // 小写入是否放行取决于**本机**余量：余量够就必须放行，不够就必须拒绝（两者都要自洽）
+        if let Some(free) = free_bytes(&dir) {
+            let ok = space_ok(&dir.join("x.bin"), 1024);
+            assert_eq!(
+                ok,
+                free >= MIN_FREE_BYTES + 1024,
+                "余量 {free} 与闸门结论不一致（MIN_FREE_BYTES={MIN_FREE_BYTES}）"
+            );
+        }
     }
 
     #[test]
     fn oversize_and_missing_session_rejected() {
+        if !test_fs_has_room() {
+            eprintln!("跳过：本机磁盘余量低于闸门阈值（{MIN_FREE_BYTES}），落盘用例无从验证");
+            return;
+        }
         let target = std::path::PathBuf::from("/nonexistent/x.bin");
         // 不要在 `Result<Arc<Session>, _>` 上做 == ：Session 含 Mutex/Atomic 字段，
         // 既不可能（也不该）为它实现 PartialEq —— 断言错误**变体**即可

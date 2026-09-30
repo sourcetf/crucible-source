@@ -8,6 +8,9 @@ pub mod ech_auto;
 // OCSP 自动获取 + 后台续期（boring_path::apply_ocsp_auto 依赖）。
 // 此前这个文件存在但**从未声明**，于是 boring_path 里那整条自动装订路径
 // 一直解析不到 `crate::server::ocsp_fetcher`，编译直接失败。
+/// OCSP 装订材料抓取：只服务于 BoringSSL 路径（`StapleSlot` 用 boring 的 X509/hash 类型），
+/// 所以跟着 `tls_boring` 一起门控。rustls 配置下不编译（它也没有别的调用方）。
+#[cfg(feature = "tls_boring")]
 pub mod ocsp_fetcher;
 pub mod type65_api;
 

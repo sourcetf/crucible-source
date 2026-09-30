@@ -139,6 +139,8 @@ impl LiveConfig {
         // 同一路径上换了证书（certbot 续期、面板覆盖 ssl.cert）时指纹不变，
         // 进程会一直用旧证书/旧 ECH 配置服务到重启为止。热路径不能加 stat
         // （accept_and_serve 每连接都会查一次缓存），所以在配置重载这个低频点上显式清空。
+        // acceptor 缓存是 BoringSSL 路径的东西（rustls 配置下那个模块整个不编译）。
+        #[cfg(feature = "tls_boring")]
         crate::server::tls::boring_path::clear_acceptor_cache();
         crate::server::apps::reconcile_apps_runtime(self);
         // 热重载后确保 Hidden Service 仍按新配置在跑（改 ports/enabled/tor_bin 时生效）。

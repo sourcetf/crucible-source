@@ -90,18 +90,26 @@ pub const TLS13_SUITES: &[&str] = &[
 static SUPPORTED: OnceCell<Vec<String>> = OnceCell::new();
 
 fn probe() -> Vec<String> {
-    let mut ok = Vec::new();
-    let Ok(mut ctx) = boring::ssl::SslContextBuilder::new(boring::ssl::SslMethod::tls()) else {
-        // 连 TLS 上下文都建不起来（极早期/无 TLS 特性）→ 返回空表：
-        // 调用方（配置校验）在空表时**不做套件名校验**，避免把能跑的配置判死。
-        return ok;
-    };
-    for &name in CANDIDATES {
-        if ctx.set_cipher_list(name).is_ok() {
-            ok.push(name.to_string());
-        }
+    // 空表 = 「不武断拒绝」：配置校验看到空表就不做套件名校验（见 is_acceptable）。
+    // rustls 配置下没有 boring 的 cipher list 可探，返回空表正是这个语义。
+    #[cfg(not(feature = "tls_boring"))]
+    {
+        return Vec::new();
     }
-    ok
+    #[cfg(feature = "tls_boring")]
+    {
+        let mut ok = Vec::new();
+        let Ok(mut ctx) = boring::ssl::SslContextBuilder::new(boring::ssl::SslMethod::tls()) else {
+            // 连 TLS 上下文都建不起来（极早期/无 TLS 特性）→ 返回空表。
+            return ok;
+        };
+        for &name in CANDIDATES {
+            if ctx.set_cipher_list(name).is_ok() {
+                ok.push(name.to_string());
+            }
+        }
+        ok
+    }
 }
 
 /// BoringSSL 实际接受的套件名（首次调用时探测，之后缓存）。
@@ -140,6 +148,8 @@ mod tests {
     use super::*;
 
     /// 探测必须能拿到非空集合（否则说明探测方式失效，配置校验会退化成"不校验"）。
+    // 探测本身要 BoringSSL 的 SslContextBuilder：只在 boring 构建下有意义（rustls 配置下 probe 返回空表 = 不武断拒绝）。
+    #[cfg(feature = "tls_boring")]
     #[test]
     fn probe_finds_real_suites() {
         let s = supported();
@@ -152,6 +162,8 @@ mod tests {
 
     /// 反面：OpenSSL 有、BoringSSL 没有的名字必须被识别为不可用
     /// （这正是之前 psk 静默失效的原因）。
+    // 「拒绝 OpenSSL-only 名字」判据依赖 BoringSSL 的实际探测结果：只在 boring 构建下有意义（rustls 配置下 probe 返回空表 = 不武断拒绝）。
+    #[cfg(feature = "tls_boring")]
     #[test]
     fn openssl_only_names_are_rejected() {
         assert!(!is_acceptable("PSK-AES128-GCM-SHA256"));
@@ -160,6 +172,8 @@ mod tests {
     }
 
     /// PSK 族从目录里筛出来，且非空（psk=true 才有意义）。
+    // PSK 套件表来自 BoringSSL 的 cipher list：只在 boring 构建下有意义（rustls 配置下 probe 返回空表 = 不武断拒绝）。
+    #[cfg(feature = "tls_boring")]
     #[test]
     fn psk_family_is_nonempty() {
         let p = psk_suites();

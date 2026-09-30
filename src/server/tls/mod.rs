@@ -10,6 +10,12 @@
 use crate::config::SslConfig;
 
 pub mod accept;
+/// BoringSSL 路径整模块只在 `tls_boring` 下编译。
+///
+/// 它用 `boring`/`tokio_boring`/`boring_sys` 的类型贯穿全文（acceptor、SslStream、
+/// ECH 密钥、OCSP 装订），没有「用 rustls 也能跑」的语义 —— 之前是**无条件编译**，
+/// 于是 `tls_rustls`（不带 boring）配置下整个 crate 编译不过（实测 17 个错误）。
+#[cfg(feature = "tls_boring")]
 pub mod boring_path;
 pub mod cipher_catalog;
 pub mod client_hello;
@@ -30,7 +36,40 @@ pub mod nss;
 #[path = "tls_tomcrypt.rs"]
 pub mod tomcrypt;
 
-pub use boring_path::{active_stack, legacy_modules};
+/// 主 TLS 实现名（面板/状态端点在用）。
+///
+/// 定义在这里而不是 `boring_path`：它只用 `cfg!` 宏、不依赖 boring 类型，
+/// 而 `boring_path` 在 rustls 配置下整个不编译 —— 放那边就得再写一份重复实现。
+pub fn active_stack() -> &'static str {
+    if cfg!(feature = "tls_boring") {
+        "boringssl"
+    } else if cfg!(feature = "tls_rustls") {
+        "rustls-fallback"
+    } else {
+        "none"
+    }
+}
+
+/// 已编译并启用的遗留协议栈（nss/tomcrypt），没启用时是 `"none"`。
+pub fn legacy_modules() -> &'static str {
+    use std::sync::OnceLock;
+    static CACHED: OnceLock<String> = OnceLock::new();
+    let s = CACHED.get_or_init(|| {
+        let mut mods = Vec::new();
+        if cfg!(all(feature = "tls_nss", tls_nss_enabled)) {
+            mods.push("nss");
+        }
+        if cfg!(all(feature = "tls_tomcrypt", tls_tomcrypt_enabled)) {
+            mods.push("tomcrypt");
+        }
+        if mods.is_empty() {
+            "none".to_string()
+        } else {
+            mods.join(",")
+        }
+    });
+    s.as_str()
+}
 
 /// Primary stack for a listener (always BoringSSL when compiled in).
 /// Legacy NSS/TomCrypt are selected per-connection via [`client_hello::resolve`].
