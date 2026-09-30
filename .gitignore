@@ -40,6 +40,8 @@ config/secrets.*
 
 # Local notes
 *.local
+# 例外：部署钩子按 OpenBSD 惯例就叫 rc.local / daily.local，必须入库（见 scripts/deploy/）
+!scripts/deploy/*.local
 *.log
 *.tmp
 *.bak

@@ -1,0 +1,46 @@
+#!/bin/sh -
+# ============================================================================
+# 部署钩子：OpenBSD /etc/rc.local —— 开机启动 Crucible webserver
+# ============================================================================
+# 安装：cp scripts/deploy/rc.local /etc/rc.local && chmod 755 /etc/rc.local
+# （本机没有 daemon(8)，所以用 nohup 版本；要改成 rc.d 服务需先给 webserver 加
+#  自己的 pidfile，那是另一件事。）
+#
+# 为什么需要：生产实例此前是**手工 nohup 起的**，机器一重启就再也不会回来。
+# /etc/rc.local —— 开机启动 Crucible webserver（本机没有 daemon(8)，用 nohup 版本）
+#
+# 为什么需要它：生产实例此前是**手工 nohup 起的**，机器一重启就再也不会回来
+# （站点 + DNS 控制面全停，只能等人登上去手工拉起）。
+#
+# 幂等：已在跑就直接退出（rc.local 可能被手工重跑，或与运维手工启动撞上）。
+# cwd 必须是 /crucible：state/ 下的相对路径（tor_hs、dns、ech_auto 等）以 cwd 为基准。
+
+cd /crucible || exit 1
+LOG=/var/log/crucible-restart.log
+
+running() {
+	# 两步判定，缺一不可：
+	#  * `pgrep -x webserver` 只匹配**可执行名**（`ksh -c '... webserver ...'` 这类包装、
+	#    名字里带 webserver 的编辑器/客户端都不会命中；测试用的 webserver-uds 亦不会）；
+	#  * 再核对命令行里的配置路径 —— 生产实例既可能是 `./bin/webserver`（手工从 /crucible 起）
+	#    也可能是 `/crucible/bin/webserver`（本脚本起的），只按绝对路径字符串匹配会**漏判**。
+	#    实测漏判的后果：起了第二个实例，它抢不到 853/9095 端口，自己退出（幸好如此）。
+	for p in $(pgrep -x webserver); do
+		if ps -o args= -p "$p" 2>/dev/null | grep -q -- '--config /crucible/config.toml'; then
+			return 0
+		fi
+	done
+	return 1
+}
+
+if [ -f /crucible/bin/webserver ]; then
+	if running; then
+		echo "crucible: already running"
+	else
+		printf '%s crucible: starting\n' "$(date)" >> "$LOG"
+		nohup /crucible/bin/webserver --config /crucible/config.toml >> "$LOG" 2>&1 </dev/null &
+		echo "crucible: started pid $!"
+	fi
+else
+	echo "crucible: /crucible/bin/webserver 不存在，跳过" >&2
+fi

@@ -1,0 +1,46 @@
+#!/bin/sh -
+# ============================================================================
+# 部署钩子：OpenBSD /etc/daily.local —— Crucible 日志轮转（copytruncate）
+# ============================================================================
+# 安装：cp scripts/deploy/daily.local /etc/daily.local && chmod 755 /etc/daily.local
+# 为什么不用 newsyslog：它靠 **rename** 轮转，而本机没有 daemon(8)、webserver 又是
+# 前台进程由 nohup 承接 stdout —— 进程不会重开日志文件，rename 之后它仍往旧 inode 写，
+# 新文件永远空、`Z` 还会去压一个正在被写的 inode（日志静默丢失）。
+# cp + `: > log` 保持 inode 不变，进程 fd 一直有效；代价是 cp 与截断之间可能丢几行。
+# /etc/daily.local —— Crucible 日志轮转（每日 03:00 由 /etc/daily 调用）
+#
+# 为什么是「拷贝 + 清空」而不是 newsyslog：
+# 本机没有 daemon(8)，而 newsyslog 的轮转是 **rename** —— 我们的 webserver 是前台进程、
+# 由 nohup 承接 stdout，它**不会**在收信号后重开日志文件。rename 之后进程仍持有旧 inode，
+# 于是新文件永远是空的、真正的写入落在已改名的文件上，`Z` 压缩还会去压一个正在被写的 inode
+# （结果是日志静默丢失/损坏）。cp + 截断保持 inode 不变，进程的 fd 一直有效 —— 代价是
+# cp 与截断之间理论上可能丢掉几行（对访问日志可接受，且这台机器磁盘长期紧张，
+# 必须有个上限）。
+#
+# 阈值 2MB / 保留 7 代（压缩后每代百 KB 级）。
+
+# 可用环境变量覆盖（便于验证与运维调整）：CRUCIBLE_LOG / CRUCIBLE_ROT_MAX / CRUCIBLE_ROT_KEEP
+LOG=${CRUCIBLE_LOG:-/var/log/crucible-restart.log}
+MAX=${CRUCIBLE_ROT_MAX:-2097152}
+KEEP=${CRUCIBLE_ROT_KEEP:-7}
+
+[ -f "$LOG" ] || exit 0
+size=$(stat -f %z "$LOG" 2>/dev/null || echo 0)
+if [ "$size" -lt "$MAX" ]; then
+	exit 0
+fi
+
+# 依次后移：crucible-restart.log.(N-1).gz -> .N.gz
+i=$((KEEP - 1))
+while [ "$i" -gt 0 ]; do
+	prev=$((i - 1))
+	if [ -f "$LOG.$prev.gz" ]; then
+		mv -f "$LOG.$prev.gz" "$LOG.$i.gz"
+	fi
+	i=$prev
+done
+
+cp -p "$LOG" "$LOG.0"
+: > "$LOG"
+gzip -f "$LOG.0"
+echo "crucible: rotated $LOG ($size bytes) -> $LOG.0.gz"
