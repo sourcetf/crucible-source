@@ -722,3 +722,24 @@ cfg 正确门控），boring 配置仍是 **212/212**（生产行为不变）。
 1.4G 余量，生产当场复验 h1/h2/h3 全 200。**在这台机器上跑任何 cargo test 都必须带 `--release`。**
 另外 §21.18 新加的磁盘余量闸门让 5 个上传用例变成「依赖环境」（盘紧时它们会被正确拒绝）——
 已改成环境不足即跳过并打印原因，磁盘闸门那条改为自洽断言。
+
+---
+
+### Session 1008 (2026-10-01) — 进展 18（部署面：开机自启 + 日志轮转，均真机验证）
+
+补上两处**部署**缺口（非代码 bug）：① 生产实例一直是手工 nohup 起的，**机器一重启站点就没了**
+（`/etc/rc.local` 不存在、rc.d 无此服务）；② 日志无上限（newsyslog 的 rename 语义对本进程有害，
+详见下）。
+
+* `scripts/deploy/rc.local` → `/etc/rc.local`：`cd /crucible` + 幂等判活后 nohup 起服务。
+  **踩坑**：第一版用 `pgrep -f '/crucible/bin/webserver …'` 判活，而实例是 `./bin/webserver`
+  起的 ⇒ 漏判、真起了第二个（抢不到端口自己退了）。现改为 `pgrep -x webserver`（只匹配可执行名，
+  ksh 包装不受骗）+ `ps -o args=` 核对配置路径。已验证幂等与启动两条路径。
+* `scripts/deploy/daily.local` → `/etc/daily.local`：**copytruncate** 轮转（2MB/7 代/gzip）。
+  为什么不用 newsyslog：本机没有 `daemon(8)`，webserver 是前台进程由 nohup 承接 stdout，
+  不会重开日志文件 ⇒ rename 会让新文件永远为空、还把正在写的 inode 拿去压缩（日志静默丢失）。
+  已验证：轮转后**真实日志**继续接收新行、归档内容正确、代数滚动与丢弃都对。
+* 诚实边界：**没有重启机器**（不能为验证重启生产），验证的是两条执行路径 + `/etc/rc.local`
+  是 OpenBSD 标准钩子。
+* 生产终检：md5 一致、实例数 1、h1 9095/9081 + h2 + h3 全 200、DNS 正常、`/php/init.sh` 404、
+  `/php/index.php` 200、`/api/tor/status` 200。

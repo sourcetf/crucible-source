@@ -1668,3 +1668,53 @@ API 形状对着 vendored 的 rustls 0.23.43 源码核对过（0.23 收 `&WebPki
    会正确地拒绝一切会话 —— 于是那 5 个「真落盘」用例集体失败。这不是被测对象的 bug，而是
    **用例把环境当常量**。现在：环境不足时跳过并打印原因；磁盘闸门那条用例改成**自洽断言**
    （拿 `free_bytes()` 的实测值与闸门结论比对），不再硬编码「小文件一定放得进」。
+
+### 21.20 部署面收尾：开机自启（rc.local）+ 日志轮转（daily.local，copytruncate）
+
+补上两处**生产环境**的缺口（不是代码 bug，是「机器一重启站点就没了」「日志没有上限」）。
+
+#### 缺口一：没有开机自启
+
+生产实例一直是**手工 nohup 起的**：`/etc/rc.local` 不存在、`/etc/rc.conf.local` 没有条目、
+`/etc/rc.d/` 里也没有这个服务 ⇒ 机器一重启，站点与 DNS 控制面就停在那儿等人上去手工拉。
+
+做法：`scripts/deploy/rc.local`（安装到 `/etc/rc.local`，OpenBSD 启动时执行）。要点：
+* `cd /crucible` 必须在最前 —— `state/` 下的相对路径（tor_hs、dns、ech_auto）以 cwd 为基准；
+* **幂等**：先判「是否已在跑」。这里踩了一次坑：第一版用
+  `pgrep -f '/crucible/bin/webserver --config ...'` 判活，而当时那个实例是
+  **`./bin/webserver`（相对路径）**起的 ⇒ **漏判，真的起了第二个实例**（它抢不到 853/9095
+  端口，自己退出了，没造成事故，但很危险）。现在改成两步判定：`pgrep -x webserver`
+  只匹配**可执行名**（`ksh -c '… webserver …'` 这类包装、名字里带 webserver 的进程都不会
+  命中），再用 `ps -o args=` 核对配置路径（相对/绝对两种启动方式都能认）。
+* 本机没有 `daemon(8)`，所以是 nohup 版；要变成 rc.d 服务得先给 webserver 自己写 pidfile（另说）。
+
+#### 缺口二：日志没有轮转
+
+之前查过 `newsyslog`：它的轮转语义是 **rename + 给进程发信号重开文件**，而
+(a) 本机没有 `daemon(8)`（没法用它接管 stdout 并支持 SIGHUP 重开）、
+(b) webserver 是前台进程、由 nohup 承接 stdout，**不会**重开日志文件。
+于是加 newsyslog 条目反而有害：rename 之后进程继续往旧 inode 写，新文件永远是空的，
+`Z` 压缩还会去压一个正在被写的 inode（日志静默丢失/损坏）。
+
+做法：`scripts/deploy/daily.local`（安装到 `/etc/daily.local`，`/etc/daily` 每日 01:30 由 cron 调用）
+= **copytruncate**：`cp -p $LOG $LOG.0 && : > $LOG && gzip -f $LOG.0`。inode 不变 ⇒ 进程的 fd
+一直有效；代价是 cp 与截断之间理论上可能丢几行（访问日志可接受，而且这台机器磁盘长期紧张，
+必须有个上限）。阈值 2MB、保留 7 代（可用 `CRUCIBLE_LOG`/`CRUCIBLE_ROT_MAX`/`CRUCIBLE_ROT_KEEP`
+覆盖，便于验证与运维调整）。
+
+#### 验证（全部真机）
+
+| 项 | 结果 |
+|---|---|
+| rc.local 幂等（生产在跑时执行） | 打印 `already running`，`pgrep -x webserver` 仍为 1（没有第二个实例） |
+| rc.local **启动路径**（停→同一次调用内执行） | `started pid 24114`，`pgrep -x webserver`=1，h1=200 |
+| 「假命中」对照 | `ksh -c '… webserver --config /crucible/config.toml --help'` 不会被 `pgrep -x` 认成实例 |
+| 小日志不轮转 | 真实日志 245KB（< 2MB）⇒ 不动 ✓ |
+| 轮转代数与内容 | 临时日志连续轮转：`.0/.1/.2.gz` 各 3072 字节原文、主文件截为 0、`KEEP=3` 时第 4 代被丢弃 ✓ |
+| **copytruncate 不变量** | 对**真实日志**轮转后发一次请求：新行写进（已截断的）`crucible-restart.log`，归档 `.0.gz` 里是轮转前内容 ⇒ 进程 fd 未失效 ✓ |
+| `/etc/daily` 计划 | root crontab `30 1 * * * /bin/sh /etc/daily` ✓ |
+| 生产终检 | `bin/webserver` 与构建产物 md5 一致、实例数 1、h1 9095/9081 + h2 + h3 全 200、DNS 正常、`/php/init.sh`=404、`/php/index.php`=200、`/api/tor/status`=200 |
+
+**诚实说明**：真正的「重启机器」路径**没有实测**（不能为验证去重启生产机）。已验证的是
+rc.local 的幂等与启动两条路径 + `/etc/rc.local` 是 OpenBSD 标准启动钩子（`/etc/rc` 会执行它）。
+两份钩子都收进了 `scripts/deploy/`（含安装命令与上面这些理由），便于复核与重建。
