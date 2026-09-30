@@ -406,7 +406,7 @@ fn apply_groups(builder: &mut SslAcceptorBuilder, ssl: &SslConfig) -> Result<()>
     Ok(())
 }
 
-/// 应用 ECH 密钥。
+/// 应用 ECH 密钥（**仅当 `ssl.ech = true`**；关掉就是一点 ECH 材料都不装）。
 ///
 /// 三条路径，优先级从高到低：
 ///   1. `ssl.ech_keys` 显式配置 → 用管理员材料（原行为不变）；
@@ -416,8 +416,16 @@ fn apply_groups(builder: &mut SslAcceptorBuilder, ssl: &SslConfig) -> Result<()>
 ///   3. 自动配置失败（如未填 `ech_public_name`）→ 仅 warn，不阻断 TLS。
 ///
 /// 早期实现只走路径 1：`ech_keys` 没配就直接放弃，于是「ECH 自动配置」实际不存在。
+/// `ech_advertise` 不参与这里的开关判断，它只决定「配置要不要发到 HTTPS(type65) 记录」，
+/// 见 `SslConfig::ech_advertise_enabled`。
 fn apply_ech(builder: &mut SslAcceptorBuilder, ssl: &SslConfig) -> Result<()> {
-    if !ssl.ech && !ssl.ech_advertise {
+    // 判据只能是 `ssl.ech`。旧写法 `!ssl.ech && !ssl.ech_advertise` 有真实后果：
+    // `ech_advertise` 的 serde 默认值是 **true**，于是只要 `ech_public_name` 配了
+    // （它同时是 `SslConfig::ocsp_host()` 的身份来源），**显式关掉** ECH 的 listener
+    // 也会继续走到下面的自动配置 —— 生成密钥、装进 acceptor，ECH 被实际打开。
+    // 开关必须名副其实。反向情形（`ech = true` 但材料不全）仍要走到下面的 warn：
+    // 那是「开了却没生效」，必须吵（见回归测试 ech_false_disables_ech_even_with_public_name）。
+    if !ssl.ech {
         return Ok(());
     }
     if let Some(keys_path) = ssl.ech_keys.as_deref() {

@@ -14,6 +14,13 @@ build = "build.rs"
 name = "webserver"
 path = "src/main.rs"
 
+# ECH 现场探针（诊断用）：本机 curl 不带 ECH 支持（LibreSSL 后端），
+# 线上「ECH 到底生不生效」只能用自己的 boring 客户端回答。
+[[bin]]
+name = "ech_probe"
+path = "src/bin/ech_probe.rs"
+required-features = ["tls_boring"]
+
 [features]
 # `tls` = TLS accept paths compiled in (marker). Primary stack is BoringSSL.
 # rustls is opt-in fallback only (`tls_rustls`) so TLS1.3 benches stay clean.

@@ -119,11 +119,12 @@ pub async fn run(live: Arc<LiveConfig>) -> Result<()> {
 
     // Initial listeners.
     let cfg = live.snapshot();
-    // ECH 广告自检：`ssl.ech_advertise`（默认 true）声称「生成/加载配置并发布 HTTPS(type65)
-    // 记录」，而**发布**这件事实际由 `[dns] [[dns.https_rr]]` 完成 —— 两者没接上时，
-    // 客户端解析不出 ech= 参数，ECH 等于对客户端不存在（面板与日志都看不出来）。
-    // 这里在启动期把这种「开了广告却没人发布」的组合显式指出来。
-    warn_unpublished_ech(&cfg);
+    // ECH 启动期自检（三条方向互补的检查，见 `ech_selfcheck_problems`）：
+    // ① 要广告却没人发布 ② 启用了却内外层共用一张证书 ③ 发布了却没人服务。
+    // 三者共同点是「面板/日志看起来都正常」，只有把两处配置放在一起比才看得出来。
+    for problem in ech_selfcheck_problems(&cfg) {
+        log::warn!("{problem}");
+    }
     for (idx, lc) in cfg.listeners.iter().enumerate() {
         if let Err(e) = spawn_listener_port(
             Arc::clone(&live),
@@ -339,13 +340,49 @@ fn maybe_set_busy_poll_stream(stream: &tokio::net::TcpStream) {
 #[cfg(not(all(target_os = "linux", feature = "linux_busy_poll")))]
 fn maybe_set_busy_poll_stream(_stream: &tokio::net::TcpStream) {}
 
-/// 启动期自检：开了 ECH 广告、却没有对应的 `[[dns.https_rr]]` 发布条目时给出明确告警。
+// ============ ECH 启动期自检（三条，方向互补） ============
+//
+// 这一组检查存在的理由都一样：ECH 的「配置」分散在**两处** —— listener 的 `ssl.*`
+// 与 `[dns] [[dns.https_rr]]`，而它们都会在面板/日志里显示为「已启用」，于是
+// 「一边改了另一边没跟上」这种组合可以长期无人察觉（属于本项目一直避免的
+// 「开关是假的」那一类）。三个方向都覆盖：
+//   1. listener 声称要广告，但 DNS 里没有对应记录（发布了才算数）；
+//   2. 启用了 ECH，却没配 cover 证书（内外层共用一张真证书，伪装不存在）；
+//   3. DNS 里发布了 `ech=`，但没有 listener 在服务它（客户端白试一次再回落）。
+//
+// 每个检查都返回**问题描述**而不是直接 log：这样单测能断言「什么配置会报、什么配置不报」，
+// 不必去抓日志（`log::warn!` 在测试里没有 logger，抓不到就等于没测）。
+
+/// 该 listener **实际在服务哪个 public_name**：优先 `ssl.ech_public_name`，
+/// 其次磁盘上已落盘的 ECH 配置（`ssl.ech_keys` 显式配置路径下，public_name 只写在
+/// 密钥文件里的 ECHConfig 中，配置项本身可以没有）。
 ///
-/// 为什么需要：`ech_advertise` 的字面含义是「发布到 DNS」，但真正的发布动作在
+/// 为什么需要这层回落：自检要对照「DNS 发布的名字」与「服务端服务/广告的名字」，
+/// 只认配置项会把 `ech_keys` 形态误判成「什么都没在服务」（反之也会让提示里出现
+/// `public_name(?)` 这种没用的信息）。
+fn served_public_name(ssl: &crate::config::SslConfig) -> Option<String> {
+    if let Some(n) = ssl.ech_public_name.as_deref() {
+        let t = n.trim().trim_end_matches('.');
+        if !t.is_empty() {
+            return Some(t.to_ascii_lowercase());
+        }
+    }
+    if ssl.ech_keys.is_some() {
+        // 名字在密钥文件的 ECHConfig 里；解析细节归 `ech_auto` 管
+        //（别在这里拿 `persisted_config_list()` 去 parse —— 那是 List 不是 Config）。
+        return crate::server::ech_auto::persisted_public_name();
+    }
+    None
+}
+
+/// 启动期自检：开了 ECH 广告、却没有对应的 `[[dns.https_rr]]` 发布条目。
+///
+/// `ech_advertise` 的字面含义是「发布到 DNS」，但真正的发布动作在
 /// `[dns] [[dns.https_rr]]`（见 `dns::auto_https_records`）。少了这层检查，
-/// 「ECH 已启用」与「客户端拿不到 ECHConfig」可以同时成立而无人察觉 ——
-/// 属于本项目一直避免的「开关是假的」那一类。
-fn warn_unpublished_ech(cfg: &crate::config::Config) {
+/// 「ECH 已启用」与「客户端拿不到 ECHConfig」可以同时成立而无人察觉。
+fn ech_selfcheck_problems(cfg: &crate::config::Config) -> Vec<String> {
+    let mut out = Vec::new();
+
     let published: Vec<String> = cfg
         .dns
         .https_rr
@@ -353,23 +390,180 @@ fn warn_unpublished_ech(cfg: &crate::config::Config) {
         .filter(|r| r.ech)
         .map(|r| r.name.trim().trim_end_matches('.').to_ascii_lowercase())
         .collect();
+
+    // 方向 1：要广告但没发布。
+    //
+    // 判据用 `ssl.ech && ssl.ech_advertise` +「服务中的 public_name」（含密钥文件回落），
+    // 而不是 `ech_advertise_enabled()`：后者要求 `ssl.ech_public_name` 非空，于是
+    // `ech_keys` 显式配置（public_name 只写在密钥文件里）这种形态会被整条跳过 ——
+    // 而默认 `ech_advertise = true` 下正是它最容易「以为发了、其实没人发」。
     for lc in &cfg.listeners {
         let Some(ssl) = lc.ssl.as_ref() else { continue };
-        if !ssl.ech_advertise_enabled() {
+        if !(ssl.ech && ssl.ech_advertise) {
             continue;
         }
-        let Some(name) = ssl.ech_public_name.as_deref() else {
-            // 没有 public_name 时 ECHConfig 无法生成（ech_auto 需要它），
-            // 广告同样落空；ech_advertise_enabled() 已把这个情况排除，这里不重复报。
-            continue;
-        };
-        let want = name.trim().trim_end_matches('.').to_ascii_lowercase();
-        if !published.contains(&want) {
-            log::warn!(
-                "ECH: listener {}:{} 开了 ech_advertise（public_name={name}），但 [dns] 里没有对应的 [[dns.https_rr]]（name=\"{name}\"、ech=true）—— **ECH 不会被发布**，客户端解析不到 ech= 参数就等同于没有 ECH。补上该配置，或把 ech_advertise 关掉以免误解",
-                lc.address,
-                lc.port
-            );
+        let Some(name) = served_public_name(ssl) else { continue };
+        if !published.contains(&name) {
+            out.push(format!(
+                "ECH: listener {}:{} 开了 ech_advertise（服务中的 public_name={name}），但 [dns] 里没有对应的 [[dns.https_rr]]（name=\"{name}\"、ech=true）—— **ECH 不会被发布**，客户端解析不到 ech= 参数就等同于没有 ECH。补上该配置，或把 ech_advertise 关掉以免误解",
+                lc.address, lc.port
+            ));
         }
+    }
+
+    // 方向 2（内外层不得共用一张证书）：启用了 ECH 却没有 cover 证书。
+    //
+    // 没有 cover 时，非 ECH 客户端（**以及任何主动探测者**）拿到的就是内层那张**真实证书**
+    // —— 「外层看起来像公共名」这层伪装不存在，探测者把 SNI 写成 public_name 就能确认本机
+    // 持有该站证书。不提升为配置错误：同一张通配证书覆盖内外层名在某些部署里是刻意的，
+    // 这里要防的是**默认/无意**地共用一张。
+    for lc in &cfg.listeners {
+        let Some(ssl) = lc.ssl.as_ref() else { continue };
+        if !ssl.ech {
+            continue;
+        }
+        // 没材料就没 ECH 可谈（`apply_ech` 在 ech=true 但两者都缺时会自己 warn），不重复报。
+        let has_material = ssl.ech_keys.is_some()
+            || ssl
+                .ech_public_name
+                .as_deref()
+                .map(|s| !s.trim().is_empty())
+                .unwrap_or(false);
+        if !has_material {
+            continue;
+        }
+        if ssl.ech_cover_cert.is_some() && ssl.ech_cover_key.is_some() {
+            continue;
+        }
+        out.push(format!(
+            "ECH: listener {}:{} 已启用 ECH，但没有配置 cover 证书（ssl.ech_cover_cert / ech_cover_key）—— 外层（非 ECH 客户端与主动探测者）会拿到与内层**相同的**真实证书，public_name({}) 那层伪装等于不存在。按本项目对 ECH 的部署要求（内外层不共用一张 SSL），应当为 public_name 单独配一张 cover 证书",
+            lc.address,
+            lc.port,
+            served_public_name(ssl).unwrap_or_else(|| "未声明".into())
+        ));
+    }
+
+    // 方向 3（方向 1 的反面）：DNS 里发布了 ech=，却没有 listener 在服务它。
+    //
+    // 发布而不服务比干脆不发布更糟：客户端拿到 `ech=` 会先试 ECH、被拒后再回落外层 ——
+    // 白白多一次往返，还把「本机在做 ECH」写进了公开 DNS。
+    let serving: Vec<String> = cfg
+        .listeners
+        .iter()
+        .filter_map(|lc| lc.ssl.as_ref())
+        // 自动配置路径（只有 public_name、没有 ech_keys）同样会服务 ECH，所以判据是
+        // 「ech = true 且有材料来源」，而不是「有 ech_keys」。
+        .filter(|ssl| {
+            ssl.ech
+                && (ssl.ech_keys.is_some()
+                    || ssl
+                        .ech_public_name
+                        .as_deref()
+                        .map(|s| !s.trim().is_empty())
+                        .unwrap_or(false))
+        })
+        .filter_map(served_public_name)
+        .collect();
+    for name in &published {
+        if !serving.contains(name) {
+            out.push(format!(
+                "ECH: [dns] 里发布了 {name} 的 ech=（HTTPS 记录），但没有 listener 在服务它的 ECH（需要该 listener 配了 ssl.ech = true 且有 ech_keys/public_name，并让 public_name 与这条记录同名）—— 客户端会先试 ECH 再回落，等于既没拿到隐私又多一次往返"
+            ));
+        }
+    }
+
+    out
+}
+
+#[cfg(test)]
+mod ech_selfcheck_tests {
+    use super::ech_selfcheck_problems;
+    use crate::config::Config;
+
+    fn cfg_of(toml_extra: &str) -> Config {
+        // 所有用例共用一份最小 listener，附加片段再叠上去。
+        let base = r#"
+[[listeners]]
+address = "127.0.0.1"
+port = 8443
+root = "/tmp/echcheck"
+"#;
+        toml::from_str(&format!("{base}{toml_extra}")).expect("parse")
+    }
+
+    /// 方向 1：开了 ech_advertise（默认 true）+ public_name，却没有 https_rr 记录 ⇒ 必须报。
+    #[test]
+    fn advertise_without_https_rr_is_reported() {
+        let cfg = cfg_of(
+            "ssl = { cert = \"cert.pem\", key = \"key.pem\", ech = true, ech_public_name = \"v.example.com\" }\n",
+        );
+        let problems = ech_selfcheck_problems(&cfg);
+        assert!(
+            problems.iter().any(|p| p.contains("ECH 不会被发布")),
+            "应报告「要广告但没发布」: {problems:?}"
+        );
+        // 补上对应记录后，方向 1 不再报（方向 2 仍会因为没 cover 证书而报 —— 那是另一条）。
+        let cfg2 = cfg_of(
+            "ssl = { cert = \"cert.pem\", key = \"key.pem\", ech = true, ech_public_name = \"v.example.com\" }\n\n[[dns.https_rr]]\nname = \"v.example.com\"\nech = true\n",
+        );
+        let p2 = ech_selfcheck_problems(&cfg2);
+        assert!(
+            !p2.iter().any(|p| p.contains("ECH 不会被发布")),
+            "记录了就不该再报方向 1: {p2:?}"
+        );
+    }
+
+    /// 方向 2：启用 ECH 却没配 cover 证书 ⇒ 必须报；配全 cover 后不再报。
+    #[test]
+    fn ech_without_cover_cert_is_reported() {
+        let cfg = cfg_of(
+            "ssl = { cert = \"cert.pem\", key = \"key.pem\", ech = true, ech_keys = \"state/ech/ech_keys.pem\" }\n",
+        );
+        assert!(
+            ech_selfcheck_problems(&cfg)
+                .iter()
+                .any(|p| p.contains("没有配置 cover 证书")),
+            "缺 cover 证书必须报"
+        );
+        let cfg_ok = cfg_of(
+            "ssl = { cert = \"cert.pem\", key = \"key.pem\", ech = true, ech_keys = \"state/ech/ech_keys.pem\", ech_cover_cert = \"cover.pem\", ech_cover_key = \"cover.key.pem\" }\n",
+        );
+        assert!(
+            !ech_selfcheck_problems(&cfg_ok)
+                .iter()
+                .any(|p| p.contains("没有配置 cover 证书")),
+            "配全 cover 后不该再报"
+        );
+        // `ech = false` 的 listener 不参与（开关关掉就没有内外层共用问题）。
+        let cfg_off = cfg_of(
+            "ssl = { cert = \"cert.pem\", key = \"key.pem\", ech = false, ech_public_name = \"v.example.com\" }\n",
+        );
+        assert!(
+            !ech_selfcheck_problems(&cfg_off)
+                .iter()
+                .any(|p| p.contains("没有配置 cover 证书")),
+            "ech = false 不该报 cover 证书问题"
+        );
+    }
+
+    /// 方向 3：DNS 发布了 ech= 但没人服务 ⇒ 必须报；有对应 listener 后不报。
+    #[test]
+    fn published_but_not_served_is_reported() {
+        let cfg = cfg_of("\n[[dns.https_rr]]\nname = \"v.example.com\"\nech = true\n");
+        assert!(
+            ech_selfcheck_problems(&cfg)
+                .iter()
+                .any(|p| p.contains("没有 listener 在服务")),
+            "发布了却没人服务必须报"
+        );
+        let cfg_ok = cfg_of(
+            "ssl = { cert = \"cert.pem\", key = \"key.pem\", ech = true, ech_keys = \"state/ech/ech_keys.pem\", ech_public_name = \"v.example.com\" }\n\n[[dns.https_rr]]\nname = \"v.example.com\"\nech = true\n",
+        );
+        assert!(
+            !ech_selfcheck_problems(&cfg_ok)
+                .iter()
+                .any(|p| p.contains("没有 listener 在服务")),
+            "服务端就绪后不该再报方向 3"
+        );
     }
 }

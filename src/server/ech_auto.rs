@@ -409,6 +409,22 @@ pub fn persisted_config_list_base64() -> Option<String> {
     persisted_config_list().map(|v| base64_std(&v))
 }
 
+/// 已落盘 ECH 配置里的 public_name（对外身份，已小写化、去掉尾点）。
+///
+/// 用途：启动期自检要把「DNS 里发布的名字」与「服务端在服务的名字」对起来，而
+/// `ssl.ech_keys` 显式配置形态下 public_name **只写在密钥文件的 ECHConfig 里**，
+/// 配置项 `ssl.ech_public_name` 可以是空的。
+///
+/// 注意别拿 [`persisted_config_list`] 直接喂 [`parse_config`]：前者是 **ECHConfigList**
+/// （开头多 2 字节总长），后者要的是单个 **ECHConfig** —— 混用会解析失败（实测：
+/// 自检因此把名字当成「未声明」）。
+pub fn persisted_public_name() -> Option<String> {
+    let (config, _key) = load_persisted()?;
+    let (name, _mlen, _suites) = parse_config(&config).ok()?;
+    let t = name.trim().trim_end_matches('.');
+    (!t.is_empty()).then(|| t.to_ascii_lowercase())
+}
+
 /// 兼容旧入口：只生成 config list（不做持久化复用）。
 /// 保留名字以免破坏既有调用点；新代码应优先用 [`ensure_material`]。
 pub fn generate_ech_config_list(

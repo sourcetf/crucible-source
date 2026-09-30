@@ -86,3 +86,6 @@ contact.txt
 # 部署用二进制目录（/crucible/bin/webserver 是生产运行的那一份；target/ 里的是 cargo 产物，
 # 重建时会被替换，硬链接计数为 2，不能直接当生产入口）
 /bin/
+
+# 应用引擎运行期生成的依赖标记目录（只有 manifest/.ready 这类标记，没有源码）
+www-apps/*/deps/

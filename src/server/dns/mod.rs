@@ -1511,9 +1511,41 @@ fn load_or_make_secret() -> String {
     });
     let secret: String = buf.iter().map(|b| format!("{b:02x}")).collect();
     let _ = std::fs::create_dir_all(state_root().join("etc"));
-    let _ = std::fs::write(&p, format!("secret={secret}\n"));
-    let _ = set_mode_0600(&p);
+    let _ = write_atomic(&p, format!("secret={secret}\n").as_bytes(), 0o600, None);
     secret
+}
+
+/// 原子落盘：写**同目录**临时文件 → 设权限/属主 → `rename` 覆盖目标。
+///
+/// 为什么必须原子：`named.conf` / 各 zone 文件 / RPZ / answers / rndc.conf / session.key
+/// 此前都是 `std::fs::write`（**原地截断**）。写到一半进程被杀（本项目有强制退出、OOM、
+/// 满盘的先例）或断电，就会留下**半截文件**：`named.conf` 半截 ⇒ named 起不来 ⇒ 整个 DNS
+/// 全挂；zone 文件半截 ⇒ named 拒载该区（`not loaded due to errors`）⇒ 该区 SERVFAIL。
+/// `rename(2)` 同文件系统内原子：named 要么看到旧文件、要么看到新文件，没有中间态。
+///
+/// 权限与属主必须在 **rename 之前**设好：否则 rename 到 chmod 之间有个窗口，
+/// `named.conf`（内含 rndc 密钥，本该 0640）会以 umask 权限（0644）短暂暴露给本机用户。
+fn write_atomic(path: &Path, data: &[u8], mode: u32, owner: Option<&str>) -> Result<()> {
+    let dir = path.parent().unwrap_or_else(|| Path::new("."));
+    let mut name = path
+        .file_name()
+        .map(|n| n.to_os_string())
+        .unwrap_or_else(|| std::ffi::OsString::from("dnsfile"));
+    name.push(format!(".tmp{}", std::process::id()));
+    let tmp = dir.join(name);
+    std::fs::write(&tmp, data).with_context(|| format!("write {}", tmp.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(mode));
+    }
+    #[cfg(not(unix))]
+    let _ = mode;
+    if let Some(u) = owner {
+        let _ = std::process::Command::new("chown").arg(u).arg(&tmp).status();
+    }
+    std::fs::rename(&tmp, path)
+        .with_context(|| format!("rename {} -> {}", tmp.display(), path.display()))
 }
 
 #[cfg(unix)]
@@ -1648,24 +1680,22 @@ pub fn write_all(cfg: &DnsConfig) -> Result<Vec<(String, PathBuf)>> {
     }
     let conf = gen_named_conf(cfg, &zones);
     let conf_path = etc.join("named.conf");
-    std::fs::write(&conf_path, &conf)?;
-    // _bind 只需读；0600 会拒读 → 0640 + 属主 _bind
-    let _ = std::fs::set_permissions(&conf_path, {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::Permissions::from_mode(0o640)
-    });
-    let _ = std::process::Command::new("chown").arg("_bind").arg(&conf_path).status();
+    // _bind 只需读；0600 会拒读 → 0640 + 属主 _bind。权限/属主在 rename **之前**设好，
+    // 避免出现「新 named.conf 已是 umask 权限」的窗口（里面有 rndc 密钥）。
+    write_atomic(&conf_path, conf.as_bytes(), 0o640, Some("_bind"))?;
 
     let secret = load_or_make_secret();
     let rndc_port = cfg.rndc_port_or_default();
-    std::fs::write(
-        etc.join("rndc.conf"),
+    write_atomic(
+        &etc.join("rndc.conf"),
         // 9.20 rndc.conf：options 里必须用 default-key（裸 key 是非法语句，named -g/rndc 实测拒绝）
         format!(
             "options {{ default-server 127.0.0.1; default-port {rndc_port}; default-key \"rndc-key\"; }};\nserver 127.0.0.1 {{ key \"rndc-key\"; }};\nkey \"rndc-key\" {{ algorithm hmac-sha256; secret \"{secret}\"; }};\n"
-        ),
+        )
+        .as_bytes(),
+        0o600,
+        None,
     )?;
-    let _ = set_mode_0600(&etc.join("rndc.conf"));
 
     // per-view 变体落盘——必须与 gen_named_conf 的 view 列表一致（view_tag, line_tag）；
     // 同一 zone 文件不得跨 view 复用（named 'writeable file already in use' 拒载）
@@ -1767,9 +1797,12 @@ pub fn write_all(cfg: &DnsConfig) -> Result<Vec<(String, PathBuf)>> {
                 .chain(std::iter::once(hw).filter(|v| *v > 0))
                 .chain(std::iter::once(named_serial).filter(|v| *v > 0))
                 .max();
-            std::fs::write(
+            write_atomic(
                 &path,
-                gen_zone_file_monotonic_ext(&z.name, &z.kind, &recs, prev_serial, &extra_https),
+                gen_zone_file_monotonic_ext(&z.name, &z.kind, &recs, prev_serial, &extra_https)
+                    .as_bytes(),
+                0o644,
+                None,
             )?;
             // zone 文件是控制面的 source of truth：regen 后旧 journal/inline-signing
             // 产物必然失步（named 'journal out of sync' 拒载），一并清掉
@@ -1796,7 +1829,7 @@ pub fn write_all(cfg: &DnsConfig) -> Result<Vec<(String, PathBuf)>> {
             let path = zones_dir.join(&f);
             if !path.exists() {
                 // 空文件会让 named 拒载 root zone；先写最小合法占位，rootzone_refresh 覆盖
-                std::fs::write(&path, minimal_root_zone(cfg))?;
+                write_atomic(&path, minimal_root_zone(cfg).as_bytes(), 0o644, None)?;
             }
         }
     }
@@ -1809,7 +1842,7 @@ pub fn write_all(cfg: &DnsConfig) -> Result<Vec<(String, PathBuf)>> {
             // rndc reload 只在 serial 更大时才加载新内容，同秒内的两次编辑会撞成同一个值。
             // 这里从**已落盘的旧文件**里读回上一个 serial 取 max(now, prev+1)。
             let prev_rpz = read_zone_serial(&path);
-            std::fs::write(&path, gen_rpz_file(&cfg.rpz, prev_rpz))?;
+            write_atomic(&path, gen_rpz_file(&cfg.rpz, prev_rpz).as_bytes(), 0o644, None)?;
             let mut j = path.clone().into_os_string();
             j.push(".jnl");
             let _ = std::fs::remove_file(&j);
@@ -1818,7 +1851,7 @@ pub fn write_all(cfg: &DnsConfig) -> Result<Vec<(String, PathBuf)>> {
             let af = if view_tag.is_empty() { "answers.zone".to_string() } else { format!("answers.{view_tag}.zone") };
             let apath = zones_dir.join(&af);
             let prev_ans = read_zone_serial(&apath);
-            std::fs::write(&apath, gen_answers_file(&cfg.rpz, prev_ans))?;
+            write_atomic(&apath, gen_answers_file(&cfg.rpz, prev_ans).as_bytes(), 0o644, None)?;
             let mut j2 = apath.clone().into_os_string();
             j2.push(".jnl");
             let _ = std::fs::remove_file(&j2);
@@ -2087,8 +2120,9 @@ pub fn upload_key(filename: &str, b64: &str) -> Result<PathBuf> {
     let dir = state_root().join("keys");
     std::fs::create_dir_all(&dir)?;
     let p = dir.join(filename);
-    std::fs::write(&p, &decoded)?;
-    let _ = set_mode_0600(&p);
+    // 0600 + _bind：named（_bind）要读它做签名，本机其它用户不该读私钥；
+    // 原子落盘避免「半截密钥文件」——那会让 named 解析失败、该区 DNSSEC 起不来。
+    write_atomic(&p, &decoded, 0o600, Some("_bind"))?;
     Ok(p)
 }
 
@@ -2798,6 +2832,38 @@ pub async fn maintenance_loop(live: Arc<crate::server::live_config::LiveConfig>,
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod dns_atomic_write_tests {
+    use super::write_atomic;
+    use std::os::unix::fs::PermissionsExt;
+
+    /// 原子落盘：内容换新、权限保持调用方指定值、不留临时文件。
+    /// 权限必须在 rename 前设好 —— 否则 named.conf（内含 rndc 密钥）会有 umask 权限窗口。
+    #[test]
+    fn write_atomic_replaces_content_and_keeps_mode() {
+        let dir = std::env::temp_dir().join(format!("crucible-dns-aw-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("named.conf");
+        std::fs::write(&p, b"old").unwrap();
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+        write_atomic(&p, b"new-content", 0o640, None).expect("atomic write");
+
+        assert_eq!(std::fs::read(&p).unwrap(), b"new-content");
+        let mode = std::fs::metadata(&p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o640, "权限必须是指定的 0640，实际 {mode:o}");
+        // 不留 tmp
+        let leftovers: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.contains(".tmp"))
+            .collect();
+        assert!(leftovers.is_empty(), "残留临时文件: {leftovers:?}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
 

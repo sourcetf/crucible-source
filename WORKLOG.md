@@ -1804,3 +1804,125 @@ cat notice.log 才找到原因）。现在：两处都读，按 **`[err]` → `[
 **这个修复的排序逻辑第一版是错的**（末尾统一 `reverse()` 把优先级翻掉了：`[err]` 行虽然出现
 却排在 notice 后面），被我同时加的单测 `tor_said_prioritizes_fatal_lines_from_notice_log`
 抓住 —— 那个用例的数据形状就来自这次真机故障。修好后 **213/213 通过**。
+
+### 21.23 DNS 落盘改为**原子写**（rename）：不再有「半截 named.conf / 半截 zone」的窗口
+
+三个 agent 的 DNS 审计一直没回报，我自己把这块过了一遍。查到的第一个真问题是**落盘语义**：
+
+`named.conf` / 各 zone 文件 / `root.zone` 占位 / RPZ / answers / `rndc.conf` / `session.key`
+此前**全部**是 `std::fs::write` —— 也就是**原地截断再写**。本项目有明确的历史证据说明进程会
+非正常终止（日志里反复出现 `shutdown: 8s 内未能正常退出 → 强制 exit(1)`、worklog 里记过
+OOM 与满盘），而这类文件写到一半被杀/断电的后果是：
+
+* `named.conf` 半截 ⇒ **named 起不来 ⇒ 整个 DNS 全挂**（还有 `named.conf` 里的 rndc 密钥）；
+* zone 文件半截 ⇒ named 拒载该区（`not loaded due to errors`）⇒ 该区 SERVFAIL，
+  而面板上一切显示正常。
+
+修法：新增 `write_atomic(path, data, mode, owner)` —— 写**同目录**临时文件 → 设权限/属主 →
+`rename(2)` 覆盖。同文件系统内 rename 是原子的，named 只会看到旧文件或新文件。
+**权限/属主必须在 rename 之前设**：否则 rename 到 chmod 之间会出现「新 named.conf 是 umask
+权限」的窗口（0640 → 短暂 0644，里面有 rndc 密钥）。全部 8 处（含 DNSSEC 密钥上传）已改。
+
+真机验证（部署后即触发：启动时 `dns::startup → reconcile → write_all` 会重写全部文件）：
+
+| 项 | 结果 |
+|---|---|
+| DNS 仍正常 | `dig @127.0.0.1 google.com A` → 正常应答；named 在跑 |
+| 权限未被放宽 | `named.conf` **0640** `_bind`、`rndc.conf` **0600**、zone 文件 **0644** ✓ |
+| 无临时文件残留 | `etc/` 与 `zones/` 目录下无 `*.tmp*` ✓ |
+| 单测 | 新增 `write_atomic_replaces_content_and_keeps_mode`（内容换新 + 权限仍是指定值 + 不留 tmp）→ **214/214** |
+
+**顺带的自我提醒**：这轮 patch 被 MSYS 的反斜杠处理坑了两次（heredoc 里 `\n` 被吞成真换行、
+带 `\"` 的锚点匹配不上），以及一次 `format!(...)` 少写 `.as_bytes()`（编译期抓到）。
+**结论**：改 Rust 源码的 Python 锚点里不要出现反斜杠或引号，用「不含引号/反斜杠的短锚点」。
+
+### 21.24 ECH 的开关**是假的**：`ech_advertise` 默认 true 让 `ech = false` 放行了整条自动配置路径（真红/真绿 + 现场探针 + 三条自检）
+
+**怎么发现的**：§21.23 部署后扫启动日志，看到两条 WARN 恰好落在我第一次连 9445/9446 的时刻 ——
+而这两个 listener **根本没配 ECH**（config.toml 里只有 8443 有 `ech = true`）：
+
+```
+WARN webserver::server::tls::boring_path] ECH 自动配置不可用（配置 ssl.ech_public_name 后可用）:
+     ech_public_name 未配置：无法生成 ECH 配置; continuing without ECH
+```
+
+**根因**：`apply_ech` 的提前返回写成 `if !ssl.ech && !ssl.ech_advertise { return Ok(()) }`，而
+`SslConfig::ech_advertise` 的 serde 默认值与 `Default::default()` **都是 `true`**（config.rs 里
+唯一那个非平凡默认值）⇒ 该判据对**任何** TLS listener 都放行，每个 listener 首次构建 acceptor
+（缓存懒建）都会走一遍 ECH 材料装载。两个后果：
+
+1. 没配 ECH 的 listener 每次首连刷一条吓人的 WARN；
+2. **更严重**：若 listener 配了 `ech_public_name`（它同时是 `ocsp_host()`，即 OCSP 自动装订的
+   身份来源，本来就常配）而把 `ech` 显式关掉 —— 自动配置会**生成密钥、落盘、并 `set_ech_keys`
+   装进 acceptor**。`ech = false` **什么都关不掉**；而 DNS 侧发布判据 `ech_advertise_enabled()`
+   （要求 `self.ech && …`）又认为「没开」⇒ 可以同时存在「服务端在跑 ECH、DNS 不敢发布、
+   面板显示 ECH 已关」这种自相矛盾的状态。
+
+**修法**：判据只认 `ssl.ech`（`if !ssl.ech { return Ok(()) }`），关掉就是一点材料都不装；
+`ech_advertise` 只保留字面职责（要不要把配置发到 HTTPS(type65) 记录）。反向情形
+（`ech = true` 但 keys/public_name 全缺）仍照旧 warn「开了却没生效」。
+
+**红/绿（走了三步才拿到真证据，过程本身值得记）**：
+
+1. 第一版测试用**自建材料**当客户端，配旧判据跑「红」—— **红跑通过了**。原因：自动配置让
+   **服务端自己生成**了另一份密钥，客户端手里的 ECHConfigList 对不上，`ech_accepted()` 在
+   两种实现下都是 false。**两种实现都通过的测试不是回归测试**。
+2. 更早那轮「红」其实什么都没改：OpenBSD 的 `sed -i ''` 写在脚本里**静默不生效**（跑完文件
+   没变）。现在脚本加了自检：替换后必须 grep 到旧判据，否则 `exit 7`，不产出结论。
+3. 最终改用**子进程 + 临时 cwd**：`ech_auto::state_dir()` 是 cwd 相对的 `state/ech`，而本项目
+   的 `cargo test` 就跑在仓库根（= 生产目录），所以只有把 acceptor 构建放进临时目录，才能既
+   **观察到材料有没有落盘**、又**不碰生产材料**。带**正对照**（`ech = true` 必须写文件）与
+   `1 passed` 输出断言（`--exact` 过滤名写错时 cargo 仍 exit 0 —— 没有这条断言，测试可能
+   因「压根没跑到目标用例」而永远为真）。
+
+| 阶段 | 判据 | 结果 |
+|---|---|---|
+| 红 | `!ssl.ech && !ssl.ech_advertise` | **RED_EXIT=101**：`ech = false 时不得生成/落盘 ECH 材料（/tmp/…/ech_keys.pem 被写出来了 ⇒ 开关失效）` |
+| 绿 | `!ssl.ech` | **217/217 passed**（补完三条自检后 220/220） |
+
+**现场探针 `src/bin/ech_probe.rs`（顺带说明为什么不用 curl）**：本机 curl 8.21.0 是 **LibreSSL
+后端**，`--ech` 只有帮助文本、实际报 `the installed libcurl version does not support this`。
+于是拿我们自己依赖的 `boring` 写了个客户端：读 `state/ech/ech_config_list.bin`、对线上端口做真
+ECHClientHello，打印 `ECH_ACCEPTED=` / 对端证书 CN/SAN/SHA256，握手后再**真的发一次请求**
+（「握手成功却传不了数据」同样是坏的）。对生产 8443 实测：
+
+```
+ECH_ACCEPTED=true   PEER_CN=crucible.local   HTTP_FIRST_LINE="HTTP/1.0 200 OK"
+--no-ech 对照：ECH_ACCEPTED=false，HTTP 200（回落外层正常）
+```
+
+外层名（ECHConfig 的 public_name，从 key 文件解出）是 `crucible.local`、内层真实名是探针传的
+`prod.crucible.local` ⇒ **服务端确实用我们的 ECH 私钥解开了 ClientHelloInner**。并且关掉开关
+的修为真机可见：重启后连 9445/9446，当前实例里 `ECH 自动配置不可用` 计数 **0**（旧实例里是 2）。
+
+**顺手补上三条「配置分散两处、无人对照」的启动期自检**（`ech_selfcheck_problems()`，返回问题
+列表而不是直接 log，便于单测断言什么配置该报、什么不该报；配了 3 个单测）：
+
+1. 要广告却没发布（`ech_advertise` 默认 true，而真正的发布动作在 `[[dns.https_rr]]`）；
+2. **启用了 ECH 却没配 cover 证书** —— 内外层会共用同一张真实证书；
+3. DNS 发布了 `ech=` 却没有 listener 在服务它（客户端白试一次再回落）。
+
+判据里「服务中的 public_name」优先配置项、其次**读密钥文件里的 ECHConfig**（`ech_keys` 形态下
+public_name 只写在密钥文件里）。这里踩了一次：直接把 `persisted_config_list()`（**ECHConfigList**，
+开头多 2 字节总长）喂给 `parse_config`（要 **ECHConfig**）解析失败，自检把名字显示成「未声明」；
+现在解析归 `ech_auto::persisted_public_name()` 管，真机日志确认显示 `public_name=crucible.local`。
+
+**生产现状（两条真实、可执行的告警，需要证书材料，不是代码能补的）**：
+
+```
+ECH: listener 0.0.0.0:8443 开了 ech_advertise（服务中的 public_name=crucible.local），
+     但 [dns] 里没有对应的 [[dns.https_rr]]（name="crucible.local"、ech=true）—— ECH 不会被发布
+ECH: listener 0.0.0.0:8443 已启用 ECH，但没有配置 cover 证书（ssl.ech_cover_cert / ech_cover_key）
+     —— 外层会拿到与内层相同的真实证书，public_name(crucible.local) 那层伪装等于不存在
+```
+
+对照 `cert.pem` 实测：自签 `CN=crucible.local`、**无 SAN**、有效期 2026-08-25→2036 —— 也就是说
+现在「外层名」和「内层真实名」用的是同一张证书，且内层名 `prod.crucible.local` 根本没有证书覆盖
+（真实客户端按内层名校验会失败）。要按需求「内外层不共用一张 SSL」上线，需要：给 public_name
+配一张 cover 证书（`ssl.ech_cover_cert/ech_cover_key`）、给内层真实名配真实证书，并在
+`[[dns.https_rr]]` 里发布 `ech=`。
+
+**教训（比这次改动本身更值钱）**：① 任何「开关」都要有**判别性**测试 —— 在旧实现下必须失败，
+否则等于没测；② 测试脚本里做源码替换必须**自检替换生效**（OpenBSD sed 静默失败 + `--exact`
+过滤名写错都只会表现为「通过」）；③ `state_dir()` 这类 cwd 相对路径，在「测试就跑在生产目录」
+的项目里意味着**测试会写生产数据** —— 凡涉及它的检查都要放到临时 cwd 的子进程里跑。

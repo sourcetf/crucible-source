@@ -781,3 +781,39 @@ stdio 指向 `/dev/null`，降权到 `_tor` 后 open 失败 → `[err] /dev/null
 notice.log**，而旧 `tor_said()` 是「stderr/stdout 全空才读它」⇒ 把唯一真因漏掉、报一串噪音。
 改为两处都读 + 按 `[err]`→`[warn]`→其它排序。**该排序第一版写错了**（末尾统一 reverse 把优先级
 翻掉），被同时加的单测抓住；修好后 **213/213 通过**，生产已部署（h1/h2/h3 200、DNS 正常）。
+
+---
+
+### Session 1008 (2026-10-01) — 进展 21（DNS 落盘改原子写：不再有半截 named.conf/zone）
+
+审计 agent 没回报，我自己过 DNS 落盘路径，找到并修掉一个真问题：`named.conf`/zone/root.zone/
+RPZ/answers/`rndc.conf`/`session.key` **全部是 `std::fs::write`（原地截断）** —— 而本项目有强制
+退出/OOM/满盘的历史（日志里常见 `shutdown: 8s 内未能正常退出 → 强制 exit(1)`）。写一半被杀就留下
+半截文件：`named.conf` 半截 ⇒ **DNS 全挂**；zone 半截 ⇒ 该区拒载、面板却显示正常。
+
+改为新增 `write_atomic()`（同目录 tmp → **先**设权限/属主 → rename 覆盖），8 处全改（含 DNSSEC
+密钥上传）；权限必须在 rename 前设，否则 0640 的 named.conf（内含 rndc 密钥）会有 0644 窗口。
+
+真机：部署后启动即重写全部文件 —— DNS 正常应答、`named.conf` 0640 `_bind`、`rndc.conf` 0600、
+zone 0644、目录里无 `.tmp` 残留；单测 **214/214**（新增原子写用例）。
+
+---
+
+### Session 1008 (2026-10-01) — 进展 22（ECH 开关是假的：`ech_advertise` 默认 true 让 `ech = false` 关不掉 + 现场探针）
+
+扫启动日志时发现：**没配 ECH 的 9445/9446** 首连就打印「ECH 自动配置不可用」。根因是
+`apply_ech` 的提前返回 `if !ssl.ech && !ssl.ech_advertise`，而 `ech_advertise` 默认 **true**
+⇒ 任何 TLS listener 都会走进 ECH 自动配置；若再配了 `ech_public_name`（OCSP 自动装订的身份
+来源，常配），**`ech = false` 也照样生成密钥、落盘、装进 acceptor** —— 开关是假的。
+
+已修（判据只认 `ssl.ech`）。**真红/真绿**：旧判据下新回归测试 **RED_EXIT=101**（材料被写出来），
+新判据下 **217/217 → 220/220** 全绿。踩了两个坑并写进测试基建：OpenBSD `sed -i` 静默不生效
+（脚本现已自检替换是否生效，否则 exit 7）；第一版测试「红跑也通过」（客户端材料与服务端自动
+生成的密钥对不上 ⇒ 两种实现都 `ech_accepted()=false`）—— 现改为**子进程 + 临时 cwd + 正对照**，
+既判别性成立又不碰生产 `state/ech`。
+
+**现场探针** `src/bin/ech_probe.rs`（本机 curl 是 LibreSSL 后端，`--ech` 不可用）：对生产 8443
+实测 `ECH_ACCEPTED=true`、HTTP 200；`--no-ech` 对照 false、200。另外补了三条启动期自检
+（要广告没发布 / 启用却没 cover 证书 / 发布了没人服务），**生产现在报两条真问题**：
+`[[dns.https_rr]]` 没发布 `ech=`；8443 **没配 cover 证书**（内层外同一张 `cert.pem`，且内层名
+`prod.crucible.local` 无证书覆盖）。两条都需要证书材料，等你定。

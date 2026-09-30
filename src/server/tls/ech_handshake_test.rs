@@ -288,6 +288,141 @@ fn ech_cover_certificate_selection() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// **`ech = false` 的对外表现**：客户端带 ECHConfigList 也拿不到 ECH。
+///
+/// ⚠️ 这不是判别性测试：服务端即使（在旧判据下）自己生成了密钥，客户端手上的
+/// ECHConfigList 是另一份材料，`ech_accepted()` **同样**为 false —— 也就是说本用例
+/// 在「修好」与「没修好」两种实现下都会通过。真正钉住开关的是
+/// [`ech_false_generates_no_ech_material`]（子进程 + 临时 cwd，检查材料有没有落盘）。
+/// 保留本用例是因为它盯的是**管理员看得见的那一面**（ECH 关掉时握手不许是 ECH）。
+#[test]
+fn ech_false_disables_ech_even_with_public_name() {
+    use crate::config::{ListenerConfig, SslConfig};
+    use crate::server::ech_auto::{generate, EchSpec};
+
+    let dir = std::env::temp_dir().join(format!("crucible-ech-off-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("mkdir");
+    let (real_cert, real_key) = self_signed("real.example.com");
+    let (rc, rk) = write_pair(&dir, "real", &real_cert, &real_key);
+
+    let spec = EchSpec::from_config(Some("cover.example.com"), None, None).expect("spec");
+    let mat = generate(&spec).expect("generate ECH material");
+
+    // 关键：`ech = false`，且**只**配 ech_public_name（无 ech_keys）——这正是旧实现的漏洞形态。
+    let ssl_cfg = SslConfig {
+        cert: Some(rc),
+        key: Some(rk),
+        ech: false,
+        ech_keys: None,
+        ech_public_name: Some("cover.example.com".into()),
+        ..Default::default()
+    };
+    let acceptor = crate::server::tls::boring_path::build_acceptor(&ssl_cfg, &ListenerConfig::default())
+        .expect("acceptor");
+    let (accepted, srv_sni, _cn) = handshake(
+        &acceptor.context(),
+        &client_ctx(),
+        "real.example.com",
+        Some(&mat.config_list),
+    );
+    eprintln!("[ech-off] accepted={accepted} 服务端 SNI={srv_sni:?}");
+    assert!(!accepted, "ech=false 的 listener 不得接受 ECH");
+    assert_eq!(
+        srv_sni.as_deref(),
+        Some("cover.example.com"),
+        "服务端只应看到外层名（public_name），看不到内层真实名"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// **子进程助手**（不是给别人单独跑的用例）：只在 `CRUCIBLE_ECH_GATE_CHILD=1` 时干活。
+///
+/// 外层测试 [`ech_false_generates_no_ech_material`] 会在**临时工作目录**里起这个测试
+/// 二进制、用 `--exact` 只跑本函数；因为 `ech_auto::state_dir()` 是 cwd 相对的
+/// `state/ech`，材料会落在临时目录里 —— 既观察得到「构建 acceptor 有没有生成材料」，
+/// 又不会碰到仓库/生产的 `state/ech`。
+///
+/// 普通 `cargo test`（无该环境变量）里它是空操作：否则它会以仓库 cwd 构建 acceptor，
+/// 一旦判据退化就会往生产 `state/ech` 写材料。
+#[test]
+fn ech_gate_child_build_acceptor() {
+    if std::env::var("CRUCIBLE_ECH_GATE_CHILD").as_deref() != Ok("1") {
+        return;
+    }
+    use crate::config::{ListenerConfig, SslConfig};
+    let src = std::env::temp_dir().join(format!("crucible-ech-gate-src-{}", std::process::id()));
+    std::fs::create_dir_all(&src).expect("mkdir src");
+    let (cert, key) = self_signed("real.example.com");
+    let (rc, rk) = write_pair(&src, "real", &cert, &key);
+    let ech = std::env::var("CRUCIBLE_ECH_GATE_ECH").as_deref() == Ok("1");
+    let ssl_cfg = SslConfig {
+        cert: Some(rc),
+        key: Some(rk),
+        ech,
+        ech_public_name: Some("cover.example.com".into()),
+        ..Default::default()
+    };
+    let _ = crate::server::tls::boring_path::build_acceptor(&ssl_cfg, &ListenerConfig::default())
+        .expect("acceptor");
+    let _ = std::fs::remove_dir_all(&src);
+}
+
+/// **判别性回归**：`ech = false` 时**不得**生成/落盘任何 ECH 材料。
+///
+/// 旧判据是 `!ssl.ech && !ssl.ech_advertise`，而 `ech_advertise` 的 serde 默认值/`Default`
+/// 都是 **true** ⇒ 只要 `ech_public_name` 配了（它同时是 `ocsp_host()` 的身份来源，本来就常配），
+/// `ech = false` 的 listener 也会走进自动配置：`ensure_material` 在磁盘上找不到可用材料 →
+/// `generate` + `persist` → `state/ech/ech_keys.pem` 出现，同时 `set_ech_keys` 把密钥装进
+/// acceptor。**开关形同虚设**。本用例把这个行为钉死：
+/// * 关掉时必须**没有** `state/ech/ech_keys.pem`；
+/// * 正对照（`ech = true`）必须**有** —— 没有这条，断言可能因为「子进程压根没跑到目标用例」
+///   而永远为真（`--exact` 名字写错时 cargo test 仍然 exit 0，所以还额外断言 stdout 里
+///   的 `1 passed`）。
+#[test]
+fn ech_false_generates_no_ech_material() {
+    let exe = std::env::current_exe().expect("current_exe");
+    let run = |ech_on: bool| -> std::path::PathBuf {
+        let tag = if ech_on { "on" } else { "off" };
+        let dir = std::env::temp_dir().join(format!("crucible-ech-gate-{}-{tag}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("mkdir cwd");
+        let out = std::process::Command::new(&exe)
+            .arg("--exact")
+            .arg("server::tls::ech_handshake_test::ech_gate_child_build_acceptor")
+            .arg("--nocapture")
+            .current_dir(&dir)
+            .env("CRUCIBLE_ECH_GATE_CHILD", "1")
+            .env("CRUCIBLE_ECH_GATE_ECH", if ech_on { "1" } else { "0" })
+            .output()
+            .expect("spawn child test");
+        let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+        assert!(
+            out.status.success(),
+            "子进程 `--exact` 跑失败: {stdout}\n{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(
+            stdout.contains("1 passed"),
+            "子进程没有执行到目标用例（过滤名写错了？）: {stdout}"
+        );
+        dir.join("state").join("ech").join("ech_keys.pem")
+    };
+
+    let with_ech = run(true);
+    assert!(
+        with_ech.exists(),
+        "正对照失败：ech = true 时**应当**生成并落盘 {} —— 说明本检查本身不成立",
+        with_ech.display()
+    );
+    let without = run(false);
+    assert!(
+        !without.exists(),
+        "ech = false 时不得生成/落盘 ECH 材料（{} 被写出来了 ⇒ 开关失效）",
+        without.display()
+    );
+}
+
 /// **探测防护**（关键安全验收）：客户端**不带 ECH**、却把 SNI 写成**内层真实名**时，
 /// 必须只拿到 **cover 证书** —— 否则任何主动探测者都能用「猜 SNI」确认本机持有该域名的
 /// 证书，cover 也就形同虚设。判据必须是 `ech_accepted()`，不能按域名。
