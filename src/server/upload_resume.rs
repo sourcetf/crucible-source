@@ -157,10 +157,28 @@ fn free_bytes(_path: &Path) -> Option<u64> {
     None
 }
 
-/// 磁盘余量闸门：目标盘可用空间不足 `MIN_FREE_BYTES + 本次要写的量` 时拒绝。
+/// 磁盘余量下限（字节）。默认 [`MIN_FREE_BYTES`]，可用环境变量 `CRUCIBLE_MIN_FREE_BYTES`
+/// 覆盖：
+/// * 运维：磁盘很小的机器可以**调高**它（留更多呼吸空间）；
+/// * 验证：可以**调到必然触发**的值，确认这道闸门真的接在落盘路径上 —— 这类「检查了但
+///   没接上」的闸门是最难发现的（本项目 §21.18 就踩过一个：statvfs 对新文件 ENOENT，
+///   闸门从来没生效，全靠单测才发现）。
+fn min_free_bytes() -> u64 {
+    use std::sync::OnceLock;
+    static OVERRIDE: OnceLock<Option<u64>> = OnceLock::new();
+    OVERRIDE
+        .get_or_init(|| {
+            std::env::var("CRUCIBLE_MIN_FREE_BYTES")
+                .ok()
+                .and_then(|v| v.trim().parse::<u64>().ok())
+        })
+        .unwrap_or(MIN_FREE_BYTES)
+}
+
+/// 磁盘余量闸门：目标盘可用空间不足 `min_free_bytes() + 本次要写的量` 时拒绝。
 fn space_ok(target: &Path, want: u64) -> bool {
     match free_bytes(target) {
-        Some(free) => free >= MIN_FREE_BYTES.saturating_add(want),
+        Some(free) => free >= min_free_bytes().saturating_add(want),
         None => true, // 拿不到就只靠字节预算兜着
     }
 }
@@ -418,7 +436,7 @@ mod tests {
 /// 拒绝 —— 那是被测行为，不是被测对象的 bug。环境不满足就跳过并在输出里说明。
 fn test_fs_has_room() -> bool {
     match free_bytes(&std::env::temp_dir()) {
-        Some(free) => free >= MIN_FREE_BYTES.saturating_add(8 * 1024 * 1024),
+        Some(free) => free >= min_free_bytes().saturating_add(8 * 1024 * 1024),
         None => true,
     }
 }

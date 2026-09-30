@@ -1754,3 +1754,53 @@ rc.local 的幂等与启动两条路径 + `/etc/rc.local` 是 OpenBSD 标准启�
 
 **顺带踩坑**：验证脚本里用了 `wait` 等 6 个后台 curl —— 结果它**把同脚本里 nohup 起的服务端
 也一起等了**（`wait` 等所有子进程），脚本挂住。清理后手动补完了 ③–⑥ 的检查。
+
+### 21.22 两处「声称已做但没真机验过」的补验 —— 顺带挖出一个**宿主机配置**问题
+
+上一轮我在 §21.16/§21.18 里写过 `[tor_hs].user` 降权与「磁盘余量闸门」，但都没真机跑过。
+本轮补验，两条都不虚 —— 其中一条**当时根本跑不通**。
+
+#### 一、`[tor_hs].user = "_tor"`：代码没问题，是宿主机 `/dev/null` 坏了
+
+补验结果：tor 退出码 1、onion 生成不出来，`ps` 里根本没有 tor 进程；但目录属主已经正确
+chown 成 `_tor`（`drwx------ _tor _tor`）。查日志发现真因是 tor 自己写的：
+```
+[err] /dev/null can't be opened. Exiting.
+```
+`ls -la /dev/null` → **`crw-r--r--`（0644）** —— 而 `/dev/null` **必须是 0666**（POSIX：任何进程
+都要能写它）。tor 在 `--RunAsDaemon` 之后会 fork 并把 stdin/stdout/stderr 指向 `/dev/null`，
+于是降权到 `_tor` 之后这一 open 失败、直接退出。同机 `/dev/zero` 是正常的 0666，说明某次
+`MAKEDEV`/手工操作把 `/dev/null` 改成了 0644（时间戳已不可考）。
+**这不是我们的代码问题，但它会让「任何」降权运行的守护进程挂掉**（不只是 tor）。
+
+处理：`chmod 666 /dev/null`，随后同一个测试实例重跑：
+* tor 进程属主 = **`_tor`**（`ps -o user=` 实测）
+* `state/tor-hs`、`hs`、`data` 全部 `drwx------ _tor _tor`
+* onion 正常生成（`b5orj6y3…onion`），`/api/tor/status` → `running:true, pid:91288, user:"_tor"`
+
+**运维须知**：`chmod 666 /dev/null` 已生效且重启后仍在（OpenBSD 的 /dev 是静态节点目录），
+但如果哪天重跑 `MAKEDEV` 或重新安装系统，**要复查 `/dev/null` 的权限**（本机曾是非标准的 0644）。
+
+#### 二、磁盘余量闸门：以前只有单测，现在真机触发过
+
+闸门本身（§21.18）此前只有单测覆盖 —— 无法在不填满磁盘的前提下让它生效。为此加了一个
+**运维/验证用**的环境变量 `CRUCIBLE_MIN_FREE_BYTES`（覆盖 `MIN_FREE_BYTES`，默认不变）：
+运维可以把小磁盘机器的余量下限调高，验证时可以调到「必然触发」。
+
+真机：`CRUCIBLE_MIN_FREE_BYTES=2000000000`（2GB > 本机 1.3G 余量）起测试实例 →
+`PUT` 上传回 **507**（`服务端存储余量不足（在飞上传总量或磁盘余量触及上限）`）、
+**磁盘上没有任何文件**；把阈值调回默认重启 → 同一个 PUT 回 **201**、落盘 4096 字节。
+这条闸门现在是真的接在落盘路径上，而不只是「一个没人调用的判据」。
+
+#### 三、顺带修掉一个我自己的**错误上报缺陷**（就是上面那次故障暴露的）
+
+`--RunAsDaemon` 之后 tor 的**致命错误常常只写进它自己的 `notice.log`**，而我们捕获的
+stderr/stdout 里只剩启动 notice。旧 `tor_said()` 的实现是「stderr/stdout 全空才去读
+notice.log」——于是它把唯一的原因（`[err] /dev/null can't be opened`）**漏掉了**，
+报出来的是一串「Tor can't help you if you use it wrong」的噪音（我第一次排查时就是靠手工
+cat notice.log 才找到原因）。现在：两处都读，按 **`[err]` → `[warn]` → 其它** 排序，
+各取最近几条，致命行排最前。
+
+**这个修复的排序逻辑第一版是错的**（末尾统一 `reverse()` 把优先级翻掉了：`[err]` 行虽然出现
+却排在 notice 后面），被我同时加的单测 `tor_said_prioritizes_fatal_lines_from_notice_log`
+抓住 —— 那个用例的数据形状就来自这次真机故障。修好后 **213/213 通过**。

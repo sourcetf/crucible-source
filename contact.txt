@@ -761,3 +761,23 @@ clamp 1..=16，热重载改值即换新）；`handle()` 入口 `try_acquire_owne
 已部署生产（md5 一致，经 `/etc/rc.local` 启动，h1/h2/h3 全 200、DNS 正常）。
 
 **流程修正**：以后文档写「已实现」前先 grep 到调用点 —— 字段能被解析/校验 ≠ 被使用。
+
+---
+
+### Session 1008 (2026-10-01) — 进展 20（补验两条「声称已做」+ 挖出宿主机 /dev/null 是 0644）
+
+**① `[tor_hs].user="_tor"` 当时根本跑不通** —— 不是代码问题：本机 **`/dev/null` 是 `crw-r--r--`
+（0644，非标准；同机 `/dev/zero` 是正常 0666）**，而 tor 在 `--RunAsDaemon` 后会 fork 并把
+stdio 指向 `/dev/null`，降权到 `_tor` 后 open 失败 → `[err] /dev/null can't be opened. Exiting.`。
+`chmod 666 /dev/null` 后重测：tor 属主 = **`_tor`**、HS 目录全部 `_tor` 所有、onion 正常生成、
+`/api/tor/status` → `running:true,user:"_tor"`。**任何降权守护进程都会踩这个坑，不只是 tor。**
+提醒：若重跑 MAKEDEV/重装系统，要复查 `/dev/null` 权限。
+
+**② 磁盘余量闸门**（§21.18 只有单测）：新增 `CRUCIBLE_MIN_FREE_BYTES` 环境变量（运维可调高、
+验证可调到必然触发）。真机：阈值 2GB > 本机 1.3G → 上传 **507** 且**不落盘**；回默认 → **201**
+落盘 4096B。闸门确认真的接在落盘路径上。
+
+**③ 顺带修掉一个我自己写的错误上报缺陷**：`--RunAsDaemon` 后 tor 的致命错误常**只在
+notice.log**，而旧 `tor_said()` 是「stderr/stdout 全空才读它」⇒ 把唯一真因漏掉、报一串噪音。
+改为两处都读 + 按 `[err]`→`[warn]`→其它排序。**该排序第一版写错了**（末尾统一 reverse 把优先级
+翻掉），被同时加的单测抓住；修好后 **213/213 通过**，生产已部署（h1/h2/h3 200、DNS 正常）。

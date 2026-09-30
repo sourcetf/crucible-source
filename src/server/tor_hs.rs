@@ -428,36 +428,61 @@ pub async fn ensure_hs(cfg: &TorHsConfig) -> Result<String> {
     )
 }
 
-/// 收集 tor 说的话：stderr/stdout（配置期错误）优先，其次 notice.log（跑起来之后才出错的情况）。
+/// 收集 tor 说的话：**先致命（`[err]`）、再警告、最后过程**。
+///
+/// 为什么要把 notice.log 也算进来（而不是只在 stderr/stdout 为空时兜底）：`--RunAsDaemon`
+/// 之后 tor 的致命错误常常**只写进它自己的日志文件**，我们捕获的 stderr/stdout 里只剩启动
+/// notice —— 实测「`/dev/null can't be opened. Exiting.`」这条唯一的真因就在 notice.log，
+/// 而旧实现因为 stderr 非空就完全没读它，报出来的是一串「Tor can't help you if you use it
+/// wrong」之类的噪音。现在：两处都读，按 `[err]` > `[warn]` > 其它排序，各取最近几条。
 fn tor_said(dir: &Path, stderr: &[u8], stdout: &[u8]) -> Vec<String> {
-    let mut said: Vec<String> = Vec::new();
+    let mut all: Vec<String> = Vec::new();
     for (label, bytes) in [("stderr", stderr), ("stdout", stdout)] {
-        let t = String::from_utf8_lossy(bytes);
-        for line in t.lines().rev().take(6) {
+        for line in String::from_utf8_lossy(bytes).lines() {
             let l = line.trim();
             if !l.is_empty() {
-                said.push(format!("[{label}] {l}"));
+                all.push(format!("[{label}] {l}"));
             }
         }
     }
-    if said.is_empty() {
-        // torrc 里的 `Log notice file`（本轮加的）优先，其次 DataDirectory 下的默认位置。
-        for p in [dir.join("notice.log"), dir.join("data").join("notice.log")] {
-            if let Ok(log) = std::fs::read_to_string(&p) {
-                for line in log.lines().rev().take(5) {
-                    let l = line.trim();
-                    if !l.is_empty() {
-                        said.push(format!("[{}] {l}", p.file_name().unwrap_or_default().to_string_lossy()));
-                    }
-                }
-                if !said.is_empty() {
-                    break;
-                }
+    for p in [dir.join("notice.log"), dir.join("data").join("notice.log")] {
+        let Ok(log) = std::fs::read_to_string(&p) else {
+            continue;
+        };
+        let tag = p
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "log".into());
+        // 日志可能很长：只看尾部若干行
+        let lines: Vec<&str> = log.lines().collect();
+        let tail_from = lines.len().saturating_sub(40);
+        for line in &lines[tail_from..] {
+            let l = line.trim();
+            if !l.is_empty() {
+                all.push(format!("[{tag}] {l}"));
             }
         }
+        break;
     }
-    said.reverse();
-    said
+
+    // 分组收集，**组内保持时间顺序**，组的顺序就是优先级：致命 → 警告 → 其余。
+    // （第一版在最后统一 reverse()，把优先级顺序整个翻掉了 —— 我的单测抓到了这一点：
+    //   `[err]` 行虽然出现，却排在了一串 notice 之后。）
+    let mut out: Vec<String> = Vec::new();
+    for pat in ["[err]", "[warn]"] {
+        let group: Vec<String> = all.iter().filter(|l| l.contains(pat)).cloned().collect();
+        let keep = group.len().saturating_sub(3); // 只留最近 3 条
+        out.extend(group[keep..].iter().cloned());
+    }
+    let rest: Vec<String> = all
+        .iter()
+        .filter(|l| !l.contains("[err]") && !l.contains("[warn]"))
+        .cloned()
+        .collect();
+    let keep = rest.len().saturating_sub(4);
+    out.extend(rest[keep..].iter().cloned());
+    out.truncate(9);
+    out
 }
 
 /// 面板/启动钩子：读 `[tor_hs]` 配置并确保 HS 运行；错误仅记录不中断服务。
@@ -622,6 +647,42 @@ mod tests {
     fn disabled_reports_no_onion() {
         assert!(current_onion_name(&cfg(false, vec![(80, 8080)])).is_none());
         assert!(running_pid(&cfg(false, vec![(80, 8080)])).is_none());
+    }
+
+    /// `tor_said` 必须把**致命行**捞出来，哪怕它只在 notice.log 里。
+    ///
+    /// 这条用例的形状来自真机：`user = "_tor"` 那次 tor 退出码 1，而捕获到的 stderr/stdout
+    /// 只有启动 notice（没有原因），唯一的真因
+    /// `[err] /dev/null can't be opened. Exiting.` 只写在 notice.log —— 旧实现因为
+    /// stderr 非空就完全没读它，报出来的是一串噪音。
+    #[test]
+    fn tor_said_prioritizes_fatal_lines_from_notice_log() {
+        let dir = std::env::temp_dir().join(format!("crucible-torhs-said-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        std::fs::write(
+            dir.join("notice.log"),
+            "Oct 01 03:04:09.489 [notice] Tor can't help you if you use it wrong!
+Oct 01 03:04:09.489 [notice] Read configuration file \"/crucible/state/tor-hs/torrc\".
+Oct 01 03:04:09.000 [err] /dev/null can't be opened. Exiting.
+",
+        )
+        .unwrap();
+        let stdout = b"Oct 01 03:04:09.489 [notice] Tor 0.4.9.11 running on OpenBSD
+";
+        let said = tor_said(&dir, b"", stdout);
+        let joined = said.join(" | ");
+        assert!(
+            joined.contains("/dev/null can't be opened"),
+            "致命行必须出现在报告里：{joined}"
+        );
+        // 致命行应排在过程性 notice 之前
+        let fatal_pos = said.iter().position(|l| l.contains("[err]"));
+        let notice_pos = said.iter().position(|l| l.contains("running on OpenBSD"));
+        assert!(
+            fatal_pos < notice_pos,
+            "致命行要排在 notice 前面：{said:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// 复用的三个条件缺一不可（这是本轮修的核心 bug：原来只看 hostname 文件在不在）。
