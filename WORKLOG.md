@@ -1926,3 +1926,7 @@ ECH: listener 0.0.0.0:8443 已启用 ECH，但没有配置 cover 证书（ssl.ec
 否则等于没测；② 测试脚本里做源码替换必须**自检替换生效**（OpenBSD sed 静默失败 + `--exact`
 过滤名写错都只会表现为「通过」）；③ `state_dir()` 这类 cwd 相对路径，在「测试就跑在生产目录」
 的项目里意味着**测试会写生产数据** —— 凡涉及它的检查都要放到临时 cwd 的子进程里跑。
+
+**补记**：探针第一次被我拿 `| head -1` 截断时 panic 了（Rust 默认忽略 SIGPIPE ⇒ `println!` 撞 EPIPE）。
+诊断工具被管道截断是正常用法，已在 `main()` 开头把 SIGPIPE 恢复默认处置；`bin/ech_probe` 是独立文件、
+不随服务进程，换新二进制不需要重启服务，实测 `| head -1` 干净退出、完整输出仍为 `ECH_ACCEPTED=true`。

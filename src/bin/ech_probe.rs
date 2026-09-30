@@ -24,6 +24,13 @@ use std::io::{Read, Write};
 use std::net::TcpStream;
 
 fn main() {
+    // Rust 默认忽略 SIGPIPE，于是「`ech_probe … | head -1`」这种用法会让 println! 撞上
+    // EPIPE 并 panic（真机见过：`failed printing to stdout: Broken pipe`）。诊断工具
+    // 被管道截断是正常用法，恢复默认处置（进程直接终止，不打印任何东西）。
+    #[cfg(unix)]
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+    }
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 4 {
         eprintln!("usage: ech_probe <host:port> <ech_config_list.bin> <inner_name> [--no-ech]");
