@@ -743,3 +743,21 @@ cfg 正确门控），boring 配置仍是 **212/212**（生产行为不变）。
   是 OpenBSD 标准钩子。
 * 生产终检：md5 一致、实例数 1、h1 9095/9081 + h2 + h3 全 200、DNS 正常、`/php/init.sh` 404、
   `/php/index.php` 200、`/api/tor/status` 200。
+
+---
+
+### Session 1008 (2026-10-01) — 进展 19（勘误：`upload_threads` 假实现 → 补做 + 真机验证）
+
+**勘误**：§21.18 我写了「`upload_threads` 已变成真闸门（Semaphore/503）」，实际**当时没实现**
+（`upload_threads` 只出现在 config 字段与面板校验里，没有任何运行期调用点）。属于「把打算做的
+写成已做」，已把 §21.18 那行改成勘误指引（原文保留可追溯）。
+
+**补做**：`upload_api.rs` 新增按 listener 端口的 Semaphore 闸门（尺寸 = `autoindex.upload_threads`，
+clamp 1..=16，热重载改值即换新）；`handle()` 入口 `try_acquire_owned()`，拿不到立刻
+**503 + `Retry-After: 1`** + 写明 limit 的文案 + warn 日志；permit 覆盖整段读 body 与落盘。
+
+**真机验证**（:28097，upload_threads=2）：顺序 3 次全 201；**6 并发慢上传 → 恰 2 个 201、4 个 503**
+（带 retry-after 与 limit 文案）；释放后顺序仍 201；日志 4 条「并发已满」；落盘完整。
+已部署生产（md5 一致，经 `/etc/rc.local` 启动，h1/h2/h3 全 200、DNS 正常）。
+
+**流程修正**：以后文档写「已实现」前先 grep 到调用点 —— 字段能被解析/校验 ≠ 被使用。

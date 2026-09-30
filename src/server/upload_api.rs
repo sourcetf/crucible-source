@@ -9,6 +9,7 @@
 //! * 鉴权/限速/ACL 由调用方（h1/h2/h3 的 dispatcher）在此之前完成 —— 本模块只管落盘语义。
 
 use crate::config::ListenerConfig;
+use once_cell::sync::Lazy;
 use bytes::Bytes;
 use http::{header, Method, Request, Response, StatusCode};
 use http_body_util::{BodyExt, Full};
@@ -31,6 +32,31 @@ const EXEC_EXTS: &[&str] = &[
     // 浏览器自带的 Basic 凭据去调管理 API。第一组里的 html/svg/xml 早拒了，这里补齐同类。
     "shtml", "shtm", "stm", "xht", "svgz", "mhtml", "mht", "hta", "htc", "appcache", "vtt",
 ];
+
+/// 每监听端口的「并发上传」闸门。
+///
+/// 为什么要有：`autoindex.upload_threads` 以前是**死配置**（面板能改、写进 config、运行时
+/// 无人读）—— 而上传会真的落盘，并发数直接决定磁盘写入压力与 fd 占用。这里把它变成真闸门：
+/// 尺寸取自该 listener 的 `upload_threads`（clamp 1..=16），`try_acquire` 拿不到就回 503 +
+/// `Retry-After`，让客户端稍后重试而不是排队把连接堆起来。
+///
+/// 配置热重载改了 `upload_threads` 时：尺寸不一致就**换一个新的 Semaphore**（旧的在飞请求
+/// 继续持有旧 permit，退出后自然释放）。
+static UPLOAD_GATES: Lazy<parking_lot::Mutex<std::collections::HashMap<u16, (std::sync::Arc<tokio::sync::Semaphore>, u16)>>> =
+    Lazy::new(|| parking_lot::Mutex::new(std::collections::HashMap::new()));
+
+fn upload_gate(port: u16, threads: u16) -> std::sync::Arc<tokio::sync::Semaphore> {
+    let want = threads.clamp(1, 16);
+    let mut m = UPLOAD_GATES.lock();
+    match m.get(&port) {
+        Some((sem, size)) if *size == want => sem.clone(),
+        _ => {
+            let sem = std::sync::Arc::new(tokio::sync::Semaphore::new(want as usize));
+            m.insert(port, (sem.clone(), want));
+            sem
+        }
+    }
+}
 
 /// 扩展名闸门。
 ///
@@ -104,6 +130,27 @@ where
     if !matches!(method, Method::PUT | Method::PATCH | Method::POST) {
         return resp(StatusCode::METHOD_NOT_ALLOWED, "method not allowed", None);
     }
+    // 并发闸门：拿不到本端口的许可就直接 503（不排队、不占 body 缓冲）。
+    // permit 活到函数返回 —— 覆盖整段 body 读取与落盘。
+    let _permit = match upload_gate(lc.port, lc.autoindex.upload_threads).try_acquire_owned() {
+        Ok(p) => p,
+        Err(_) => {
+            log::warn!(
+                "upload: 并发已满（listener :{}，upload_threads={}）peer={peer}",
+                lc.port,
+                lc.autoindex.upload_threads
+            );
+            return Response::builder()
+                .status(StatusCode::SERVICE_UNAVAILABLE)
+                .header(header::RETRY_AFTER, "1")
+                .header(header::CONTENT_TYPE, "text/plain; charset=utf-8")
+                .body(full(format!(
+                    "上传并发已满（limit={}，可在面板调整 autoindex.upload_threads）",
+                    lc.autoindex.upload_threads.clamp(1, 16)
+                )))
+                .unwrap_or_else(|_| Response::new(full("upload busy".to_string())));
+        }
+    };
     // 扩展名闸门：在**落盘之前**拒，避免任何可执行内容进入 docroot。
     if has_exec_ext(&path) {
         return resp(

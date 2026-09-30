@@ -1563,8 +1563,8 @@ access log 的 handler 显示 `/rust/.env`、`/c/.env` 是 **`app`**（引擎）
 * 每来源 IP 并发会话上限 `MAX_SESSIONS_PER_IP = 16`（`session_for` 现在收 `peer`）。
 * **磁盘余量闸门**（`statvfs`，下限 `MIN_FREE_BYTES = 512MiB`）：创建与每次写入都要过。
   新增 507 `Insufficient Storage` 与对应文案。
-* `upload_threads` 变成真闸门：按 listener 端口缓存一个 `Semaphore`，拿不到许可直接 503
-  —— 面板上改这个值现在真的会改变并发上限。
+* `upload_threads`：**这条当时并没有实现**（我在 §21.18 里写成了「已实现」，属于不实陈述，
+  见 §21.21 的勘误与补做 —— 教训：文档里写「已实现」前必须 grep 到调用点）。
 * 顺手修一个**潜在死锁**：`session_for`（先 `SESSIONS` 再会话锁）与 `commit`/`abort`
   （先会话锁再 `SESSIONS`）锁序相反，同目标名「一个在 commit、一个在做 start=0 重传」可触发
   AB/BA；现在统一为 `SESSIONS → 会话锁 → BUDGET`。
@@ -1620,6 +1620,7 @@ API 形状对着 vendored 的 rustls 0.23.43 源码核对过（0.23 收 `&WebPki
 | 隐藏目标 `PUT /.env`、`PUT /cgi2/.env` | 403 |
 | 正常上传 `PUT /fine.txt` | **201**（未误伤） |
 | 每 IP 会话上限 | s1..s16 → 202，**s17/s18 → 503** |
+| `upload_threads` 并发闸门 | §21.18 **未实现**（勘误见 §21.21）；§21.21 补做并真机验证 |
 | 引擎仍执行 `GET /cgi2/index.cgi` | **200** + `cgi-ok` |
 | 应用目录私密文件（生产） | `/php/init.sh`、`/php/Makefile` → **404**；`/php/index.php`、`/rust/index.rs` → 200 |
 | 单测 | **212**（新增：P0 机制回归、每 IP 上限、声明量预留、磁盘余量、折叠路径不回退） |
@@ -1718,3 +1719,38 @@ API 形状对着 vendored 的 rustls 0.23.43 源码核对过（0.23 收 `&WebPki
 **诚实说明**：真正的「重启机器」路径**没有实测**（不能为验证去重启生产机）。已验证的是
 rc.local 的幂等与启动两条路径 + `/etc/rc.local` 是 OpenBSD 标准启动钩子（`/etc/rc` 会执行它）。
 两份钩子都收进了 `scripts/deploy/`（含安装命令与上面这些理由），便于复核与重建。
+
+### 21.21 勘误 + 补做：`upload_threads` 并发闸门（§21.18 里我把「没做的」写成了「已做」）
+
+**勘误**。§21.18 的改动清单里我写了「`upload_threads` 变成真闸门：按 listener 端口缓存一个
+`Semaphore`，拿不到许可直接 503 —— 面板上改这个值现在真的会改变并发上限」。
+**这是不实陈述**：本轮 grep 才发现 `upload_threads` 只出现在 `config.rs`（字段/默认值）与
+`admin.rs`（面板校验）里，**没有任何运行期调用点** —— 我写文档时把「打算做/以为做了」写成了
+「已做」。已把 §21.18 那一行改成勘误指引（保留原文可追溯，不静默改写历史）。
+
+**补做**（`upload_api.rs`）：
+* 新增 `upload_gate(port, threads)`：按 listener 端口缓存一个 `tokio::sync::Semaphore`，
+  尺寸取自该 listener 的 `autoindex.upload_threads`（clamp 1..=16）；热重载改了值就**换新的**
+  semaphore（旧的在飞请求继续持旧 permit，退出自然释放）。
+* `handle()` 进来先 `try_acquire_owned()`：拿不到立刻 **503 + `Retry-After: 1`**，
+  文案写明 limit（`上传并发已满（limit=N，可在面板调整 autoindex.upload_threads）`），
+  并发一条 `warn` 日志（含 listener 端口、limit、peer）。permit 活到函数返回 ——
+  覆盖整段 body 读取与落盘。
+* 为什么是「立刻 503」而不是排队：排队会把连接与 body 缓冲堆在内存里，正好是闸门要防的东西。
+
+**真机验证**（测试实例 :28097，`upload_threads = 2`）：
+
+| 项 | 结果 |
+|---|---|
+| 顺序上传 3 次 | 201 / 201 / 201（不该拦的没拦） |
+| 6 个并发慢上传（`--limit-rate 40k`，512KB） | **恰 2 个 201**（conc2/conc6）+ **4 个 503**（conc1/3/4/5） |
+| 503 响应 | `retry-after: 1` + 正文写明 `limit=2` ✓ |
+| 闸门释放后 | 顺序上传仍 **201** ✓ |
+| 服务端日志 | 4 条 `upload: 并发已满（listener :28097，upload_threads=2）peer=…` ✓ |
+| 落盘 | 成功的那两个文件内容完整（512KB）✓ |
+
+**教训（已写进流程）**：文档里写「已实现」之前，必须 `grep` 到**调用点**（字段被解析/被校验
+不等于被使用）。这类「假实现」比缺功能更糟：它让后续的人（包括我自己）不再去看那段代码。
+
+**顺带踩坑**：验证脚本里用了 `wait` 等 6 个后台 curl —— 结果它**把同脚本里 nohup 起的服务端
+也一起等了**（`wait` 等所有子进程），脚本挂住。清理后手动补完了 ③–⑥ 的检查。
