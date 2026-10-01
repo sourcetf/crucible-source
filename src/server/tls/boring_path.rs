@@ -831,7 +831,14 @@ fn apply_alpn(builder: &mut SslAcceptorBuilder, lc: &ListenerConfig) -> Result<(
 // 注意：PSK 若经环境变量注入，env 变化不会反映到指纹（配置 ssl.psk_key 即可热生效）。
 static ACCEPTOR_CACHE: Lazy<Mutex<HashMap<u64, Arc<SslAcceptor>>>> =
     Lazy::new(|| Mutex::new(HashMap::new()));
-const ACCEPTOR_CACHE_CAP: usize = 64;
+/// acceptor 缓存条目上限。
+///
+/// 必须**大于等于**允许的 listener 数（`admin_config_edit::MAX_LISTENERS = 128`）：
+/// 指纹里含 `lc.port`，每个 listener 至少占一项；以前是 64 < 128，一旦配置里的
+/// ssl listener 超过 64 个（或 ssl 参数组合多），满上限就**整表清空** ⇒ 命中率跌到 0，
+/// 每次握手都重新读 PEM/解析链/装 ECH 密钥（纯性能悬崖，不是正确性问题）。
+/// 取 256 = 128 listener × 2（同一 listener 在 h1/h2 两种 ALPN 组合下各一项）+ 余量。
+pub const ACCEPTOR_CACHE_CAP: usize = 256;
 
 /// 清空 acceptor 缓存。
 ///

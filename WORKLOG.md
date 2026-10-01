@@ -2006,3 +2006,36 @@ acceptor 缓存上限 64 → 256（`MAX_LISTENERS = 128`，满上限会整表清
 A-P2-3（QMux 流数按累计计，需要流生命周期回收，风险高于收益）、C-9（端口 bind 失败每 2s 告警）、
 C-17（`[dns]` 零校验 + `panel.toml` 整体覆盖）、C-4（连接期配置冻结）、
 以及需要运维决定的两项（admin 示例口令、ECH cover 证书）。全部记在 `_audit_*.md` 与本节。
+
+### 21.27 **发现 4 个源文件只有本地版本、从未上传**（含两项安全加固）+ 一处判断更正
+
+**背景**：批次 4 的编译一直报 `cannot find value MAX_LISTENERS in module ...admin_config_edit`，
+而本地那份文件明明有。于是做了**逐文件字节对比**（本地 vs 生产 `/crucible`，比对全部 118 个 `.rs`），
+查出 4 个文件本地比远端大、且远端从**未被上传过**：
+
+| 文件 | 差值 | 里面是什么 | 后果（在此之前） |
+|---|---|---|---|
+| `src/server/ocsp_fetcher.rs` | +13.7 KB | OCSP 缓存加固：叶子证书指纹做缓存键、CertID 序列号匹配、`response_covers_leaf`（**这份 staple 是否真的覆盖当前叶子**）、原子写缓存、旧缓存文件迁移 | 通道里那些加固**没有生效** |
+| `src/server/admin_config_edit.rs` | +11.2 KB | 配置写盘上限：`MAX_LISTENERS=128` / `MAX_APPS_PER_LISTENER=64` / `MAX_RULES_PER_LISTENER=512` / `MAX_ADMIN_USERS=64` / `MAX_TOML_TEXT_BYTES=2MiB` 等 + 校验辅助 | **面板/TOML 编辑器可以写进十万条**，把 `Config::load`+序列化+热重载一起拖死 |
+| `src/server/tls/cipher_catalog.rs` | +3.9 KB | BoringSSL 套件表枚举（`SSL_get_cipher_by_value` 扫 IANA 编号空间）+ 目录/探针合并 | 见我下面的**判断更正** |
+| `src/server/dns/geoip.rs` | +532 B | 一个测试辅助函数 | 无 |
+| **`src/server/dns/geoip.rs`（第二处）** | — | — | — |
+
+**教训（工作流层面）**：这轮还有一次 `_put.py` **静默失败**（输出被我吞进 /dev/null），
+是靠远端 `grep` 才发现文件根本没上去。之后所有上传都改成「上传后立刻在远端比对字节数」。
+**这两件事合起来说明：唯一可信的判据是「远端文件的实际内容」**，而不是「我以为我上传了」。
+
+**一处必须更正的判断**：我曾判断「BoringSSL 支持、但我们手抄名单里没有的套件名会被误拒」，
+并写了断言「枚举结果一定比手抄名单多」。**在 OpenBSD 上实测为假** —— 本机 BoringSSL 的套件表
+与 `CANDIDATES` **恰好一致**（22 项，全部重合）。因此：
+* 那条断言**已删除**，换成可验证的**超集关系**（枚举不得丢掉手抄候选中 BoringSSL 认可的名字）；
+* 模块文档写明了这次更正：枚举的价值是「不再依赖假设」（换 BoringSSL 版本/构建选项后表会变），
+  而**不是**「名单一定会漏」。我之前的判断在这台机器上不成立。
+
+**编译期还修了一个真错误**：`ocsp_fetcher.rs` 里写了个闭包 `|s: &[u8]| -> &[u8]` ——
+闭包的返回引用**拿不到**「返回值生命周期来自参数」的自动推导（elision 只对 `fn` 生效），
+直接 `lifetime may not live long enough`。已改成独立 `fn strip_leading_zeros`。
+
+**结果**：`cargo test` **242 passed / 0 failed / 1 ignored**（这批文件带来 11 个新测试），
+`cargo build --bins` 通过，已部署并复验：1 实例、h1 200、h2 200、**h3 200（HTTP/3）**、
+ECH 现场探针 `ECH_ACCEPTED=true`、DNS 正常、PHP 200、`__admin` 401。

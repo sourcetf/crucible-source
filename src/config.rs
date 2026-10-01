@@ -1327,6 +1327,26 @@ cover 只用于「未使用 / 被拒 ECH」的连接，ECH 关闭时它会成为
             );
         }
 
+        // ①b 其余路径型配置项同理：写错就是「静默不匹配」（页面 404 / DoH 端点消失）。
+        {
+            let tp = self.telemetry.path.trim();
+            if self.telemetry.enabled && (tp.is_empty() || !tp.starts_with('/')) {
+                anyhow::bail!(
+                    "telemetry.path = {:?} 必须是非空、以 `/` 开头的路径（写错 ⇒ /__metrics 静默 404）",
+                    self.telemetry.path
+                );
+            }
+            if self.dns.doh.enabled {
+                let dp = self.dns.doh.path.trim();
+                if dp.is_empty() || !dp.starts_with('/') {
+                    anyhow::bail!(
+                        "dns.doh.path = {:?} 必须是非空、以 `/` 开头的路径（写错 ⇒ DoH 端点永远不匹配）",
+                        self.dns.doh.path
+                    );
+                }
+            }
+        }
+
         if self.listeners.is_empty() {
             anyhow::bail!("listeners 为空：至少需要一个监听口（空列表会让全部 accept 循环退出，进程活着但不再服务）");
         }
@@ -1606,6 +1626,36 @@ root = {resolved:?}
                 "root={ok} 不该被拒"
             );
         }
+    }
+
+    /// 第三/四批新增的几条配置期检查：写错就是**静默失效**，都必须在加载期拦下。
+    #[test]
+    fn path_fields_and_fake_switches_are_rejected() {
+        let base = "[[listeners]]\naddress = \"127.0.0.1\"\nport = 14443\nroot = \"/tmp/pf\"\n";
+        let mk = |extra: &str| -> Config {
+            toml::from_str(&format!("{base}{extra}")).expect("parse")
+        };
+        // status_path 缺前导 `/` ⇒ h1 的精确比较永不命中（页面静默 404）
+        let e = mk("status_path = \"status\"\n")
+            .validate()
+            .expect_err("status_path 缺 / 必须报错");
+        assert!(format!("{e}").contains("status_path"), "{e}");
+        assert!(mk("status_path = \"/status\"\n").validate().is_ok());
+
+        // telemetry.path 同理
+        let e = mk("[telemetry]\nenabled = true\npath = \"metrics\"\n")
+            .validate()
+            .expect_err("telemetry.path 缺 / 必须报错");
+        assert!(format!("{e}").contains("telemetry.path"), "{e}");
+
+        // geoip 假开关：enabled 但没有 db_path
+        let e = mk("[geoip]\nenabled = true\n")
+            .validate()
+            .expect_err("geoip 无 db_path 必须报错");
+        assert!(format!("{e}").contains("geoip"), "{e}");
+        assert!(mk("[geoip]\nenabled = true\ndb_path = \"/tmp/x.mmdb\"\n")
+            .validate()
+            .is_ok());
     }
 
     /// CONNECT-UDP（公网 UDP 中继）必须**默认关闭**，且能按 listener 打开。

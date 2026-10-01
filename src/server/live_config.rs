@@ -150,7 +150,17 @@ impl LiveConfig {
         Ok(())
     }
 
+    /// 用一份**已经构造好**的配置替换内存快照（面板局部修改用）。
+    ///
+    /// 它必须与 [`LiveConfig::reload`] 有一模一样的副作用，否则将来有人拿它做局部热更时
+    /// 会**静默绕过** acceptor 缓存清理与 mtime 记账：证书/ECH 材料已经变了，
+    /// 进程却继续用旧 acceptor 服务（就是 C-1 那个陷阱）。
     pub fn replace(&self, cfg: Config) {
+        #[cfg(feature = "tls_boring")]
+        crate::server::tls::boring_path::clear_acceptor_cache();
+        if let Ok(m) = std::fs::metadata(&self.path).and_then(|m| m.modified()) {
+            *self.last_mtime.write() = Some(m);
+        }
         *self.inner.write() = Arc::new(cfg);
     }
 
@@ -209,12 +219,28 @@ pub fn spawn_mtime_watcher(live: Arc<LiveConfig>, interval: Duration) {
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(interval);
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        // 坏配置会**一直**留在磁盘上，而轮询间隔是 2s：不同一个错误去重就是
+        // 约 4.3 万条/天，既淹没日志又会吃掉 `daily.local` 的轮转代数。
+        // 同一条错误只 warn 一次，内容变了或恢复正常后再重新报。
+        let mut last_err: Option<String> = None;
         loop {
             tick.tick().await;
             match live.reload_if_changed() {
-                Ok(true) => {}
+                Ok(true) => {
+                    last_err = None;
+                }
                 Ok(false) => {}
-                Err(e) => log::warn!("config watch reload failed: {e:#}"),
+                Err(e) => {
+                    let msg = format!("{e:#}");
+                    if last_err.as_deref() != Some(msg.as_str()) {
+                        log::warn!(
+                            "config watch reload failed（同一条错误只报一次）: {msg}"
+                        );
+                        last_err = Some(msg);
+                    } else {
+                        log::debug!("config watch reload failed（与上次相同，已折叠）: {msg}");
+                    }
+                }
             }
         }
     });

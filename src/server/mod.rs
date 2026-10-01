@@ -567,3 +567,20 @@ root = "/tmp/echcheck"
         );
     }
 }
+
+#[cfg(all(test, feature = "tls_boring"))]
+mod capacity_tests {
+    /// acceptor 缓存上限必须 ≥ 允许的 listener 数。
+    ///
+    /// 指纹里含 `lc.port`，每个 listener 至少占一项；上限小于 listener 数时，
+    /// 缓存满会**整表清空** ⇒ 命中率归零，每次握手都重建 acceptor（性能悬崖）。
+    /// 放在 `server` 模块里是因为 `admin_config_edit` 是本模块的私有子模块。
+    #[test]
+    fn acceptor_cache_cap_covers_max_listeners() {
+        assert!(
+            crate::server::tls::boring_path::ACCEPTOR_CACHE_CAP
+                >= crate::server::admin_config_edit::MAX_LISTENERS,
+            "acceptor 缓存上限必须覆盖最大 listener 数"
+        );
+    }
+}

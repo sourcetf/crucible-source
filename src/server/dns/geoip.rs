@@ -317,10 +317,21 @@ fn is_disallowed_ip(ip: &IpAddr) -> bool {
     }
 }
 
-/// 对外：给 panel 看的状态
+/// 对外：给 panel 看的状态。
+///
+/// 判定「已加载」必须看**reader 本身**，不能看缓存槽是否存在：槽里记的是路径，
+/// 文件不存在/打不开时槽内是 `(path, None)` —— `is_some()` 会把它报成已加载，
+/// 面板于是显示一个根本没打开的库（与「synced:true 但什么都没同步」同类假报告）。
 pub fn status() -> serde_json::Value {
+    fn loaded(slot: &std::sync::Mutex<Option<(String, Option<ArcReader>)>>) -> bool {
+        slot.lock()
+            .unwrap()
+            .as_ref()
+            .map(|(_, db)| db.is_some())
+            .unwrap_or(false)
+    }
     serde_json::json!({
-        "city_loaded": CITY_DB.lock().unwrap().is_some(),
-        "asn_loaded": ASN_DB.lock().unwrap().is_some(),
+        "city_loaded": loaded(&CITY_DB),
+        "asn_loaded": loaded(&ASN_DB),
     })
 }

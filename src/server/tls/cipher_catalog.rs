@@ -89,6 +89,40 @@ pub const TLS13_SUITES: &[&str] = &[
 
 static SUPPORTED: OnceCell<Vec<String>> = OnceCell::new();
 
+/// 枚举 BoringSSL **内部套件表**（不是「当前配置的列表」）：用
+/// `SSL_get_cipher_by_value` 扫一遍 IANA 编号空间（0..=u16::MAX，65k 次查表，毫秒级）。
+///
+/// 为什么枚举而不是只试探 [`CANDIDATES`]：`apply_ciphers` 见到目录里没有的名字会
+/// 直接 `bail!`（**加载期报错**，不是忽略），所以「目录」必须是库的真实能力。
+/// 枚举是**权威**来源；手抄名单只作为补充（别名/关键字类写法）。
+///
+/// 实测更正（2026-10-01，OpenBSD）：本机 BoringSSL 的表与 `CANDIDATES` **恰好一致**
+/// （22 项），所以「手抄名单一定会漏」这个最初的假设在这台机器上**不成立**；
+/// 枚举的价值是「不再依赖假设」—— 换 BoringSSL 版本/构建选项后表会变，而代码不用改。
+///
+/// 返回的名字是 OpenSSL/IANA 风格（`SSL_CIPHER_get_name`），与本项目配置里
+/// 书写套件名的方式一致；TLS1.3 套件不在 `kCiphers` 表里（它们不能经
+/// `set_cipher_list` 配置），由 [`TLS13_SUITES`] 单独列出。
+fn enumerate_by_value() -> Vec<String> {
+    #[cfg(not(feature = "tls_boring"))]
+    {
+        Vec::new()
+    }
+    #[cfg(feature = "tls_boring")]
+    {
+        let mut out: Vec<String> = (0u16..=u16::MAX)
+            .filter_map(|v| boring::ssl::SslCipher::from_value(v).map(|c| c.name().to_string()))
+            // TLS1.3 套件名一律 `TLS_` 前缀，而它们**不能**经 set_cipher_list 配置
+            //（BoringSSL 没有 set_ciphersuites）⇒ 不放进「可用于 ssl.ciphers 的目录」，
+            // 否则面板会给管理员一个配了不生效的选项。它们的合法性由 TLS13_SUITES 回答。
+            .filter(|n| !n.is_empty() && !n.starts_with("TLS_"))
+            .collect();
+        out.sort_unstable();
+        out.dedup();
+        out
+    }
+}
+
 fn probe() -> Vec<String> {
     // 空表 = 「不武断拒绝」：配置校验看到空表就不做套件名校验（见 is_acceptable）。
     // rustls 配置下没有 boring 的 cipher list 可探，返回空表正是这个语义。
@@ -98,16 +132,20 @@ fn probe() -> Vec<String> {
     }
     #[cfg(feature = "tls_boring")]
     {
-        let mut ok = Vec::new();
-        let Ok(mut ctx) = boring::ssl::SslContextBuilder::new(boring::ssl::SslMethod::tls()) else {
-            // 连 TLS 上下文都建不起来（极早期/无 TLS 特性）→ 返回空表。
-            return ok;
-        };
-        for &name in CANDIDATES {
-            if ctx.set_cipher_list(name).is_ok() {
-                ok.push(name.to_string());
+        // ① 权威全集：枚举库内部表。
+        let mut ok = enumerate_by_value();
+        // ② 再用手抄候选项补充：枚举拿不到「cipher string 元素」类写法
+        //    （`HIGH` / `AESGCM` / `kRSA` 这类别名与关键字），它们不是套件名，
+        //    但对 `ssl.ciphers` 是合法输入。验证方式仍是让 BoringSSL 自己说。
+        if let Ok(mut ctx) = boring::ssl::SslContextBuilder::new(boring::ssl::SslMethod::tls()) {
+            for &name in CANDIDATES {
+                if ctx.set_cipher_list(name).is_ok() && !ok.iter().any(|x| x == name) {
+                    ok.push(name.to_string());
+                }
             }
         }
+        ok.sort_unstable();
+        ok.dedup();
         ok
     }
 }
@@ -127,11 +165,22 @@ pub fn is_acceptable(name: &str) -> bool {
         return true;
     }
     let table = supported();
-    if table.is_empty() {
-        // 探测不可用（无 TLS/上下文建不起来）→ 不武断拒绝。
+    if table.iter().any(|s| s.eq_ignore_ascii_case(n)) {
         return true;
     }
-    table.iter().any(|s| s.eq_ignore_ascii_case(n))
+    // 目录里没有：**不武断拒绝**，直接问 BoringSSL（`set_cipher_list` 成功即合法）。
+    //
+    // 这一步是「支持所有 BoringSSL 支持的套件名」的兜底：目录再全也可能漏掉
+    // 别名/新套件，而这里按库的真实能力回答；反过来，乱写的名字会被库拒绝
+    // （`SSL_R_NO_CIPHER_MATCH`），typo 仍拦得住。
+    #[cfg(feature = "tls_boring")]
+    {
+        if let Ok(mut ctx) = boring::ssl::SslContextBuilder::new(boring::ssl::SslMethod::tls()) {
+            return ctx.set_cipher_list(n).is_ok();
+        }
+    }
+    // 探测不可用（rustls 构建 / 建不起上下文）→ 不武断拒绝。
+    true
 }
 
 /// PSK 族的可用套件（替代手工维护的 PSK_SUITE_TAIL）。
@@ -169,6 +218,38 @@ mod tests {
         assert!(!is_acceptable("PSK-AES128-GCM-SHA256"));
         assert!(!is_acceptable("不存在的套件名"));
         assert!(is_acceptable("TLS_AES_128_GCM_SHA256"), "TLS1.3 套件名应视为合法");
+    }
+
+    /// 目录必须是「BoringSSL 自己说的那套」，而不是只回显手抄名单。
+    ///
+    /// **实测更正**：最初这里断言「枚举结果一定比手抄名单多」—— 在 OpenBSD 上**为假**
+    /// （本机 BoringSSL 的套件表恰好与 `CANDIDATES` 一致，22 项）。那条断言是假设，已删。
+    /// 保留的判据是可验证的超集关系：枚举/探测的结果必须包含手抄候选中 BoringSSL 认可的全部名字，
+    /// 且含现代必配套件 —— 这样「枚举把名单里的名字弄丢」这类退化仍会被抓到。
+    #[cfg(feature = "tls_boring")]
+    #[test]
+    fn catalog_is_a_superset_of_the_handwritten_probe() {
+        let full = supported();
+        assert!(!full.is_empty(), "目录为空：枚举与探测都失效 → 配置校验会退化成不校验");
+        for must in ["ECDHE-RSA-AES128-GCM-SHA256", "ECDHE-ECDSA-AES128-GCM-SHA256"] {
+            assert!(full.iter().any(|x| x == must), "缺少 {must}: {full:?}");
+        }
+        let mut kept = 0;
+        for c in CANDIDATES.iter().copied() {
+            if is_acceptable(c) {
+                assert!(
+                    full.iter().any(|x| x.eq_ignore_ascii_case(c)),
+                    "枚举丢了手抄候选里可用的 {c}"
+                );
+                kept += 1;
+            }
+        }
+        eprintln!(
+            "[cipher-catalog] 目录 {} 项 / 手抄候选 {} 项（其中 {} 项 BoringSSL 认可）",
+            full.len(),
+            CANDIDATES.len(),
+            kept
+        );
     }
 
     /// PSK 族从目录里筛出来，且非空（psk=true 才有意义）。

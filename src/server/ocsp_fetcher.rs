@@ -53,8 +53,30 @@ fn cache_dir() -> std::path::PathBuf {
     std::path::Path::new("state").join("ocsp")
 }
 
-/// 缓存文件路径。
-fn cache_file(host: &str) -> std::path::PathBuf {
+/// 证书指纹（SHA-256 前 16 字节 hex）——缓存键与缓存文件名都用它。
+///
+/// 旧实现用 **leaf DER 长度** 当指纹（`format!("{host}:{}", leaf_der.len())`），
+/// 缓存文件名干脆只有 host：
+/// - 同密钥类型的续期证书 DER 长度几乎不变（`certbot renew` 后仍是同样的字段布局），
+///   于是新证书会命中旧证书的缓存条目，把 **A 证书的 OCSPResponse 装订到 B 证书上**；
+///   客户端按 CertID 校验必然对不上（must-staple 直接握手失败），而续期线程要等
+///   缓存「不新鲜」（最长 23h）才会重拉；
+/// - 同一 host 上并存两张证书（RSA + ECDSA `cert_ec`、两个 listener）时同理。
+fn leaf_fingerprint(leaf_der: &[u8]) -> String {
+    match hash(MessageDigest::sha256(), leaf_der) {
+        Ok(d) => d.iter().take(16).map(|b| format!("{b:02x}")).collect(),
+        Err(_) => "00000000000000000000000000000000".to_string(),
+    }
+}
+
+/// 缓存文件：`state/ocsp/{host}-{指纹}.der`（指纹进文件名，杜绝跨证书复用）。
+fn cache_file_for(host: &str, fingerprint: &str) -> std::path::PathBuf {
+    cache_dir().join(format!("{}-{}.der", sanitize(host), fingerprint))
+}
+
+/// 旧版（无指纹）缓存文件路径：`state/ocsp/{host}.der`。
+/// 只用于**带 CertID 校验**的兼容读取（见 [`load_disk_cache`]）。
+fn legacy_cache_file(host: &str) -> std::path::PathBuf {
     cache_dir().join(format!("{}.der", sanitize(host)))
 }
 
@@ -137,7 +159,14 @@ fn parse_next_update(resp: &[u8]) -> Option<i64> {
             let (_, _, nh) = der_head(basic, r)?;
             let (gt, glen, gh) = der_head(basic, r + nh)?;
             if gt == 0x18 {
-                let s = std::str::from_utf8(&basic[r + nh + gh..r + nh + gh + glen]).ok()?;
+                // 时间串必须整体落在缓冲区内：der_head 的短长度形式不做越界检查，
+                // 直接切片会在畸形响应上 panic（这条路径在 acceptor 冷构建里也会走到）。
+                let s_start = r + nh + gh;
+                let s_end = match s_start.checked_add(glen) {
+                    Some(e) if e <= basic.len() => e,
+                    _ => return None,
+                };
+                let s = std::str::from_utf8(&basic[s_start..s_end]).ok()?;
                 if let Some(v) = parse_generalized_time(s) {
                     return Some(v);
                 }
@@ -171,15 +200,35 @@ fn ocsp_basic_response(resp: &[u8]) -> Option<&[u8]> {
     if t != 0x04 {
         return None;
     }
-    q += oh;
-    Some(&resp[q..q + olen])
+    // 内容必须整体在缓冲区内：der_head 对短长度形式只读长度字节、不验证是否越界，
+    // 直接切片会在**畸形/截断响应**上 panic（这里的输入是网络抓回或磁盘缓存的文件）。
+    let start = q + oh;
+    let end = match start.checked_add(olen) {
+        Some(e) if e <= resp.len() => e,
+        _ => return None,
+    };
+    Some(&resp[start..end])
 }
 
-/// GeneralizedTime `YYYYMMDDHHMMSSZ` → UNIX 秒（只接受 Z 结尾的 UTC 形式）。
+/// GeneralizedTime `YYYYMMDDHHMMSS[.fff]Z` → UNIX 秒（只接受 UTC 的 `Z` 形式）。
+///
+/// 旧实现要求第 15 个字节就是 `Z`，于是 `20240101120000.000Z`（部分 responder 会带
+/// 小数秒）解析失败 → 整条响应被当作「无 nextUpdate」→ 退回 23h 兜底 TTL：一个
+/// 1 小时后就过期的响应会被继续装订最多 22 小时（客户端按 nextUpdate 判过期 → 失败）。
 fn parse_generalized_time(s: &str) -> Option<i64> {
     let b = s.as_bytes();
-    if b.len() < 15 || b[14] != b'Z' {
+    if b.len() < 15 || b[14] != b'Z' && b[14] != b'.' && b[14] != b',' {
         return None;
+    }
+    if b[14] != b'Z' {
+        // 小数秒：'.' / ',' + 至少 1 位数字 + 'Z'（小数部分忽略，秒是最小粒度）。
+        let frac = &b[15..];
+        if frac.len() < 2 || *frac.last()? != b'Z' {
+            return None;
+        }
+        if !frac[..frac.len() - 1].iter().all(|c| c.is_ascii_digit()) {
+            return None;
+        }
     }
     let num = |r: std::ops::Range<usize>| -> Option<i64> { s.get(r)?.parse().ok() };
     let (y, mo, d) = (num(0..4)?, num(4..6)?, num(6..8)?);
@@ -317,14 +366,17 @@ pub fn extract_aia(cert_der: &[u8]) -> (Vec<String>, Vec<String>) {
         let seg_end = (i + 200).min(cert_der.len());
         let seg = &cert_der[i + 10..seg_end];
         if let Some(q) = seg.iter().position(|&b| b == 0x86) {
-            let l = seg[q + 1] as usize;
-            if q + 2 + l <= seg.len() {
-                let url = String::from_utf8_lossy(&seg[q + 2..q + 2 + l]).into_owned();
-                if url.starts_with("http") {
-                    if is_ocsp {
-                        ocsp.push(url);
-                    } else {
-                        cai.push(url);
+            // seg[q] 可能就是最后一个字节：先取长度字节再切片，否则越界 panic。
+            if let Some(&l) = seg.get(q + 1) {
+                let l = l as usize;
+                if q + 2 + l <= seg.len() {
+                    let url = String::from_utf8_lossy(&seg[q + 2..q + 2 + l]).into_owned();
+                    if url.starts_with("http") {
+                        if is_ocsp {
+                            ocsp.push(url);
+                        } else {
+                            cai.push(url);
+                        }
                     }
                 }
             }
@@ -430,12 +482,21 @@ fn https_req(
 
 // ------------------------------------------------------------ 响应校验
 
-/// OCSPResponse 外层 status 必须为 0（successful）。
+/// OCSPResponse 外层 status 必须为 0（successful），且外层 SEQUENCE 必须长度自洽。
+///
+/// 旧实现只看「tag == SEQUENCE」与 responseStatus 两个字节，不看外层声明长度是否
+/// 落在缓冲区内 —— 而 DER **短长度形式**（内容 < 128 字节）的 `der_head` 不做越界
+/// 检查，于是一个声明长度超出缓冲区的响应（截断的小响应、构造的垃圾文件）也能通过
+/// 这道检查，随后被当成有效装订物发给客户端（客户端回源校验失败，
+/// must-staple 部署直接握手失败）。
 fn ocsp_response_ok(der: &[u8]) -> bool {
-    let (_, _, h) = match der_head(der, 0) {
+    let (t, l, h) = match der_head(der, 0) {
         Some(x) => x,
         None => return false,
     };
+    if t != 0x30 || h + l > der.len() {
+        return false;
+    }
     if der.get(h) != Some(&0x0A) {
         return false;
     }
@@ -444,6 +505,126 @@ fn ocsp_response_ok(der: &[u8]) -> bool {
         None => return false,
     };
     l == 1 && der.get(h + hh) == Some(&0)
+}
+
+/// OCSPResponse 中所有 SingleResponse 的 `CertID.serialNumber`（DER INTEGER 内容）。
+///
+/// 用于核对「这份响应确实是关于**这张**证书的」（CertID 的其余三个字段是 issuer
+/// 相关，序列号是最便宜、最直接的比对项）。解析不出来时返回空表，调用方据此保持
+/// 宽容（只在能确定不匹配时才拒绝），避免误杀格式特殊的响应。
+fn response_serials(resp: &[u8]) -> Vec<Vec<u8>> {
+    let mut out = Vec::new();
+    let Some(basic) = ocsp_basic_response(resp) else {
+        return out;
+    };
+    let Some((t, _, bh)) = der_head(basic, 0) else {
+        return out;
+    };
+    if t != 0x30 {
+        return out;
+    }
+    let Some((t, rd_len, rh)) = der_head(basic, bh) else {
+        return out;
+    };
+    if t != 0x30 {
+        return out;
+    }
+    let rd_start = bh + rh;
+    let rd_end = (rd_start + rd_len).min(basic.len());
+    let mut p = rd_start;
+    // version [0] EXPLICIT（可选）
+    if basic.get(p) == Some(&0xA0) {
+        match der_next(basic, p) {
+            Some(n) => p = n,
+            None => return out,
+        }
+    }
+    // responderID + producedAt
+    match der_next(basic, p) {
+        Some(n) => p = n,
+        None => return out,
+    }
+    match der_next(basic, p) {
+        Some(n) => p = n,
+        None => return out,
+    }
+    let Some((t, _, sh)) = der_head(basic, p) else {
+        return out;
+    };
+    if t != 0x30 {
+        return out;
+    }
+    let mut q = p + sh;
+    while q < rd_end {
+        let Some((t, sr_len, srh)) = der_head(basic, q) else {
+            break;
+        };
+        if t != 0x30 {
+            break;
+        }
+        let sr_end = (q + srh + sr_len).min(rd_end);
+        // certID ::= SEQUENCE { hashAlg, issuerNameHash, issuerKeyHash, serialNumber }
+        if let Some((ct, clen, ch)) = der_head(basic, q + srh) {
+            if ct == 0x30 {
+                let cid_start = q + srh + ch;
+                let cid_end = (cid_start + clen).min(basic.len());
+                let mut c = cid_start;
+                let mut ok = true;
+                for _ in 0..3 {
+                    match der_next(basic, c) {
+                        Some(n) if n <= cid_end => c = n,
+                        _ => {
+                            ok = false;
+                            break;
+                        }
+                    }
+                }
+                if ok {
+                    if let Some((st, slen, sh2)) = der_head(basic, c) {
+                        if st == 0x02 && c + sh2 + slen <= basic.len() {
+                            out.push(basic[c + sh2..c + sh2 + slen].to_vec());
+                        }
+                    }
+                }
+            }
+        }
+        if sr_end <= q {
+            break;
+        }
+        q = sr_end;
+    }
+    out
+}
+
+/// DER INTEGER 内容比较：去掉前导 0x00 后逐字节相同
+/// （同一序列号在证书与 CertID 里都可能带/不带正数补零）。
+fn same_serial(a: &[u8], b: &[u8]) -> bool {
+    if a.is_empty() || b.is_empty() {
+        return false;
+    }
+    strip_leading_zeros(a) == strip_leading_zeros(b)
+}
+
+/// 去掉 DER INTEGER 内容的前导 0x00（正数补零）。
+///
+/// 写成独立 `fn` 而不是闭包：闭包的返回引用**不会**自动获得
+/// 「返回值的生命周期来自参数」这条推导（elision 只对 `fn` 生效），
+/// 写成 `|s: &[u8]| -> &[u8]` 会直接编译失败（lifetime may not live long enough）。
+fn strip_leading_zeros(s: &[u8]) -> &[u8] {
+    let mut v = s;
+    while v.len() > 1 && v[0] == 0 {
+        v = &v[1..];
+    }
+    v
+}
+
+/// 这份响应是否覆盖 `leaf`（CertID 序列号匹配）。`None` = 无法判定。
+fn response_covers_leaf(resp: &[u8], leaf_serial: &[u8]) -> Option<bool> {
+    let serials = response_serials(resp);
+    if serials.is_empty() {
+        return None;
+    }
+    Some(serials.iter().any(|s| same_serial(s, leaf_serial)))
 }
 
 // ------------------------------------------------------------ 智能入口
@@ -490,7 +671,8 @@ fn parse_issuer_from_body(body: &[u8], leaf: &X509) -> Option<X509> {
 /// 只在后台刷新/续期线程里调用——握手路径必须走 [`StapleSlot::cached_or_spawn`]。
 pub fn obtain(host: &str, leaf: &X509, chain_pem: &[u8]) -> Option<Vec<u8>> {
     let leaf_der = leaf.to_der().ok()?;
-    let cache_key = format!("{host}:{}", leaf_der.len());
+    let fingerprint = leaf_fingerprint(&leaf_der);
+    let cache_key = cache_key_of(host, leaf);
     let (ocsp_urls, cai_urls) = extract_aia(&leaf_der);
     let ocsp_url = ocsp_urls.first()?.clone();
     let issuer = match find_issuer_in_pem(chain_pem, leaf) {
@@ -514,9 +696,20 @@ pub fn obtain(host: &str, leaf: &X509, chain_pem: &[u8]) -> Option<Vec<u8>> {
     if !ocsp_response_ok(&resp) {
         return None;
     }
+    // 响应必须覆盖**这张**证书（CertID 序列号）。缓存键已按证书指纹隔离，这里是
+    // 最后一道：responder 返回别的证书的 SingleResponse / 中间环节串了响应时，
+    // 绝不能装订出去（客户端按 CertID 校验失败 → must-staple 直接握手失败）。
+    let leaf_serial = extract_serial(&leaf_der)?;
+    if response_covers_leaf(&resp, &leaf_serial) == Some(false) {
+        log::warn!("ocsp: {host} 响应 CertID 序列号与站点证书不符，丢弃本次响应");
+        return None;
+    }
     let dir = cache_dir();
     let _ = std::fs::create_dir_all(&dir);
-    let _ = std::fs::write(cache_file(host), &resp);
+    // 原子落盘：崩溃/断电留下的截断文件会被下次启动当成有效缓存（见 write_cache_atomic）。
+    if let Err(e) = write_cache_atomic(&cache_file_for(host, &fingerprint), &resp) {
+        log::warn!("ocsp: {host} 缓存落盘失败: {e}");
+    }
     let entry = Cached {
         fetched_unix: now_unix(),
         next_update_unix: parse_next_update(&resp),
@@ -535,11 +728,53 @@ pub fn obtain(host: &str, leaf: &X509, chain_pem: &[u8]) -> Option<Vec<u8>> {
     Some(resp)
 }
 
+/// 原子写入缓存：先写同目录临时文件再 rename。
+///
+/// 直接 `fs::write` 在写到一半时崩溃/断电会留下**截断的** OCSPResponse 文件，
+/// 而校验侧（[`ocsp_response_ok`]）对外层长度的检查本来就偏弱（DER 短长度形式
+/// 不做越界检查），截断文件有被当成有效缓存装订出去的风险。rename 是原子的：
+/// 要么是完整的新文件，要么还是旧的。
+fn write_cache_atomic(path: &std::path::Path, data: &[u8]) -> std::io::Result<()> {
+    let tmp = path.with_extension("tmp");
+    std::fs::write(&tmp, data)?;
+    match std::fs::rename(&tmp, path) {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            let _ = std::fs::remove_file(&tmp);
+            Err(e)
+        }
+    }
+}
+
 /// 冷路径启动时把磁盘缓存读回内存（不触网）。
-fn load_disk_cache(host: &str, cache_key: &str) -> Option<Vec<u8>> {
-    let path = cache_file(host);
-    let der = std::fs::read(&path).ok()?;
-    if der.is_empty() || !ocsp_response_ok(&der) {
+///
+/// 读**先按证书指纹命名**的文件；为兼容升级前留下的 `state/ocsp/{host}.der`，
+/// 回退读旧文件但要求其 CertID 与本站证书序列号匹配（旧文件名不含证书身份，
+/// 无法排除是别的证书的响应——这就是本次修复要堵的「A 证书装订到 B 上」）。
+fn load_disk_cache(host: &str, leaf: &X509) -> Option<Vec<u8>> {
+    let leaf_der = leaf.to_der().ok()?;
+    let fingerprint = leaf_fingerprint(&leaf_der);
+    let path = cache_file_for(host, &fingerprint);
+    let (path, der) = match std::fs::read(&path) {
+        Ok(der) if !der.is_empty() => (path, der),
+        _ => {
+            let legacy = legacy_cache_file(host);
+            let der = std::fs::read(&legacy).ok()?;
+            if der.is_empty() || !ocsp_response_ok(&der) {
+                return None;
+            }
+            let serial = extract_serial(&leaf_der)?;
+            if response_covers_leaf(&der, &serial) == Some(false) {
+                log::warn!(
+                    "ocsp: {host} 旧缓存 {} 的 CertID 与当前证书不符，忽略（等待重新获取）",
+                    legacy.display()
+                );
+                return None;
+            }
+            (legacy, der)
+        }
+    };
+    if !ocsp_response_ok(&der) {
         return None;
     }
     let entry = Cached {
@@ -547,7 +782,7 @@ fn load_disk_cache(host: &str, cache_key: &str) -> Option<Vec<u8>> {
         next_update_unix: parse_next_update(&der),
         der: der.clone(),
     };
-    CACHE.lock().insert(cache_key.to_string(), entry);
+    CACHE.lock().insert(cache_key_of(host, leaf), entry);
     Some(der)
 }
 
@@ -572,8 +807,7 @@ pub struct StapleSlot {
 impl StapleSlot {
     /// 从磁盘缓存初始化（**不触网**）；无缓存则 der 为空，稍后由续期线程补。
     fn from_disk(host: &str, leaf: &X509) -> Arc<Self> {
-        let key = cache_key_of(host, leaf);
-        let der = load_disk_cache(host, &key);
+        let der = load_disk_cache(host, leaf);
         Arc::new(StapleSlot {
             der: Mutex::new(der),
         })
@@ -589,9 +823,14 @@ impl StapleSlot {
     }
 }
 
-/// 缓存键：host + leaf DER 长度（换证书即失效）。
+/// 缓存键：host + **证书指纹**（换证书即失效；长度不同不算换证书——见
+/// [`leaf_fingerprint`] 里旧实现「按 DER 长度」导致的跨证书复用）。
 fn cache_key_of(host: &str, leaf: &X509) -> String {
-    format!("{host}:{}", leaf.to_der().map(|d| d.len()).unwrap_or(0))
+    let fp = leaf
+        .to_der()
+        .map(|d| leaf_fingerprint(&d))
+        .unwrap_or_else(|_| "noder".to_string());
+    format!("{host}:{fp}")
 }
 
 // ------------------------------------------------------------ 后台续期循环
@@ -720,4 +959,77 @@ fn parse_simple(url: &str) -> Option<SimpleUrl> {
         path: path.to_string(),
         https,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// GeneralizedTime：`Z` 形式与带小数秒的形式都要能用（旧实现遇到小数秒就
+    /// 退回 23h 兜底 TTL，可能把已过 nextUpdate 的响应继续装订出去）。
+    #[test]
+    fn generalized_time_parses_z_and_fractional() {
+        let base = parse_generalized_time("20240101120000Z").expect("plain Z");
+        assert_eq!(base, parse_generalized_time("20240101120000.000Z").expect("fraction"));
+        assert_eq!(base, parse_generalized_time("20240101120000,5Z").expect("comma fraction"));
+        // 非法/非 UTC 形式一律 None（不能猜）。
+        assert!(parse_generalized_time("20240101120000").is_none());
+        assert!(parse_generalized_time("20240101120000+0100").is_none());
+        assert!(parse_generalized_time("20240101120000.Z").is_none());
+        assert!(parse_generalized_time("20241301120000Z").is_none()); // 月份 13
+        assert!(parse_generalized_time("").is_none());
+    }
+
+    #[test]
+    fn serial_compare_ignores_der_padding() {
+        assert!(same_serial(&[0x00, 0x7f, 0x01], &[0x7f, 0x01]));
+        assert!(same_serial(&[0x01], &[0x01]));
+        assert!(!same_serial(&[0x00, 0x7f, 0x01], &[0x7f, 0x02]));
+        assert!(!same_serial(&[], &[0x01]));
+    }
+
+    /// 截断的响应不能通过有效性检查（否则会被当作有效缓存装订出去）。
+    #[test]
+    fn truncated_response_is_rejected() {
+        // 自洽的最小外壳：SEQUENCE { ENUMERATED 0 }（内容 5 字节，短长度形式）
+        let ok = [0x30u8, 0x05, 0x0A, 0x01, 0x00, 0x00, 0x00];
+        assert!(ocsp_response_ok(&ok));
+        // 声明 0x50 字节内容、实际只有 3 字节：DER 短长度形式不做越界检查，
+        // 旧实现只比 tag + responseStatus，会把这个判成「有效」（本次修复补上长度自洽）。
+        let bogus = [0x30u8, 0x50, 0x0A, 0x01, 0x00];
+        assert!(!ocsp_response_ok(&bogus));
+        // 长长度形式声明的内容越界（截断文件）同样必须拒绝。
+        let cut = [0x30u8, 0x82, 0x01, 0x00, 0x0A, 0x01, 0x00];
+        assert!(!ocsp_response_ok(&cut));
+        // 连 responseStatus 都不完整。
+        let short = [0x30u8, 0x05, 0x0A, 0x01];
+        assert!(!ocsp_response_ok(&short));
+    }
+
+    /// 同一 DER **长度**的两张证书必须得到不同指纹（旧实现按长度做缓存键，
+    /// 于是续期证书会命中旧证书的 OCSPResponse）。
+    #[test]
+    fn fingerprint_distinguishes_equal_length_certs() {
+        let a = vec![0x11u8; 1024];
+        let mut b = vec![0x11u8; 1024];
+        b[512] = 0x22;
+        assert_eq!(a.len(), b.len());
+        assert_ne!(leaf_fingerprint(&a), leaf_fingerprint(&b));
+        assert_eq!(leaf_fingerprint(&a), leaf_fingerprint(&a.clone()));
+        assert_eq!(leaf_fingerprint(&a).len(), 32);
+    }
+
+    /// 缓存文件名必须带证书指纹（同 host 的不同证书不能共用文件）。
+    #[test]
+    fn cache_file_name_carries_fingerprint() {
+        let p1 = cache_file_for("example.com", "aaaa");
+        let p2 = cache_file_for("example.com", "bbbb");
+        assert_ne!(p1, p2);
+        assert!(p1.to_string_lossy().ends_with("example.com-aaaa.der"));
+        // host 里的路径分隔符被 sanitize 掉（文件名只剩一个组件，无法穿越目录）。
+        let hostile = cache_file_for("../evil", "aa");
+        let name = hostile.file_name().unwrap().to_string_lossy().to_string();
+        assert!(!name.contains('/') && !name.contains('\\'), "name={name}");
+        assert_eq!(hostile.parent(), p1.parent());
+    }
 }
