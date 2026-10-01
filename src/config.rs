@@ -570,6 +570,19 @@ pub struct ListenerConfig {
     /// 默认 **false**：不开就没有这个协议面（零行为变化）。
     #[serde(default)]
     pub qmux: bool,
+    /// 是否在该监听器上提供 **CONNECT-UDP（RFC 9298 / MASQUE）中继**。
+    ///
+    /// 打开后，H3 客户端可以用 `:protocol = connect-udp` + `:path = /<IP>:<端口>`
+    /// 让本服务代它收发 UDP。**这是公网的 UDP 中继面**：内网/环回/链路本地/ULA/CGNAT/
+    /// NAT64/6to4/Teredo 等地址一律拒绝（`server::connect_udp::is_disallowed_ip`），
+    /// 所以不构成 SSRF、也不能用来放大（响应只回隧道给发起者）；但它是**流量洗白/
+    /// 匿名代理**面，等于用本机 IP 去打第三方 UDP 服务。
+    ///
+    /// 默认 **false** 的理由和其它「开了就对外服务」的项一致（proxy 要显式规则、
+    /// 上传要 autoindex+enable_upload）：中继面对运维必须是**显式**决定，
+    /// 而不是不配任何东西就存在。开启时建议同时配 `ip_access` / basic_auth。
+    #[serde(default)]
+    pub connect_udp: bool,
 }
 
 impl Default for ListenerConfig {
@@ -594,6 +607,7 @@ impl Default for ListenerConfig {
             l4_forward: None,
             quic_ecn: false,
             qmux: false,
+            connect_udp: false,
         }
     }
 }
@@ -1044,6 +1058,14 @@ impl Config {
             listeners: raw_cfg.listeners,
         };
         cfg.resolve_paths(&base)?;
+        // 防自曝：listener 的 root **解析后**不得等于配置目录、也不得是它的祖先 ——
+        // 否则该 listener 会把 config.toml 本体公开给未鉴权访问者（口令哈希、
+        // MaxMind license_key、TLS/ECH 材料路径全在里面），并可升级为面板接管。
+        //
+        // 面板侧（admin.rs）本来就有这道检查，但它只比字面量 `"."`/`".."`：
+        // `"./"`、`".//"`、`"../"`、`"sub/.."`、绝对路径写成配置目录…… 全部绕过，
+        // 而 `base.join("./")` 归一化后**正好是配置目录**。这里改成解析后比较。
+        check_roots_do_not_expose_config(&cfg, &base)?;
         cfg.validate()?;
         Ok(cfg)
     }
@@ -1291,6 +1313,20 @@ cover 只用于「未使用 / 被拒 ECH」的连接，ECH 关闭时它会成为
         // ① 至少一个 listener。空列表能通过校验并通过 reload，随后所有 accept 循环
         //    退出 ⇒ 进程活着、端口全空、日志只有一行 "removed from config; shutting down"
         //    —— 面板上误删最后一个 listener 就能造出这种静默停服。
+        // ①a geoip 假开关：`enabled = true` 但没有 db_path 时，
+        // `geoip_panel` 侧只认 `db_path.is_some()` ⇒ 面板显示已启用、查询全部落空。
+        if self.geoip.enabled
+            && self
+                .geoip
+                .db_path
+                .as_deref()
+                .map_or(true, |p| p.as_os_str().is_empty())
+        {
+            anyhow::bail!(
+                "geoip.enabled = true 但没有配置 geoip.db_path —— 查询会全部落空（面板仍显示已启用）"
+            );
+        }
+
         if self.listeners.is_empty() {
             anyhow::bail!("listeners 为空：至少需要一个监听口（空列表会让全部 accept 循环退出，进程活着但不再服务）");
         }
@@ -1365,6 +1401,22 @@ cover 只用于「未使用 / 被拒 ECH」的连接，ECH 关闭时它会成为
                         "listener {}:{}: rate_limit.burst = {} 必须 > 0（0 ⇒ 第一个请求就被拒）",
                         l.address, l.port, rl.burst
                     );
+                }
+            }
+
+            // ⑥a 路径型配置项必须以 `/` 开头：`status_path = "status"` 永不命中
+            //      （`h1.rs` 用的是精确比较）⇒ 页面静默 404，没有任何提示。
+            for (what, p) in [
+                ("status_path", l.status_path.as_deref()),
+            ] {
+                if let Some(v) = p {
+                    let t = v.trim();
+                    if t.is_empty() || !t.starts_with('/') {
+                        anyhow::bail!(
+                            "listener {}:{}: {what} = {:?} 必须是非空、以 `/` 开头的路径",
+                            l.address, l.port, v
+                        );
+                    }
                 }
             }
 
@@ -1445,6 +1497,51 @@ fn safe_header_value(s: &str) -> bool {
     !s.is_empty() && s.bytes().all(ok)
 }
 
+/// 判据（对每个 listener 的 root，经过 `resolve_paths` 后已是绝对路径）：
+/// root **等于**配置目录 ⇒ 目录列表/静态服务会把 `config.toml` 端出去；
+/// root 是配置目录的**祖先** ⇒ 连 `config.toml` 与 `state/`（TLS/ECH 私钥、rndc key）
+/// 一起暴露。两种都拒绝，并在错误里说清为什么会危险。
+///
+/// 比较用「按组件消除 `..`/`.`」的字典序规范化（不要求目录存在，也不跟随符号链接）——
+/// 这是配置期就该拦住的形态问题；真实路径解析留给运行期的 canonicalize 一致性检查。
+fn check_roots_do_not_expose_config(cfg: &Config, config_dir: &Path) -> Result<()> {
+    let norm = |p: &Path| -> std::path::PathBuf {
+        let mut out = std::path::PathBuf::new();
+        for c in p.components() {
+            match c {
+                std::path::Component::ParentDir => {
+                    out.pop();
+                }
+                std::path::Component::CurDir => {}
+                other => out.push(other.as_os_str()),
+            }
+        }
+        out
+    };
+    let base = norm(config_dir);
+    for l in &cfg.listeners {
+        let r = norm(&l.root);
+        if r == base {
+            anyhow::bail!(
+                "listener {}:{} 的 root 解析后就是配置目录 {} —— 该端口会把 config.toml （管理员口令哈希、MaxMind key、TLS/ECH 材料路径）当作静态文件公开出去。请把 root 指向 www 目录",
+                l.address,
+                l.port,
+                base.display()
+            );
+        }
+        if base.starts_with(&r) {
+            anyhow::bail!(
+                "listener {}:{} 的 root {} 是配置目录 {} 的祖先 —— 该端口会连同 config.toml 与 state/（TLS/ECH 私钥、rndc key）一起暴露。请把 root 指向具体的 www 目录",
+                l.address,
+                l.port,
+                r.display(),
+                base.display()
+            );
+        }
+    }
+    Ok(())
+}
+
 fn resolve_ssl_material(field: &mut Option<String>, base: &Path) {
     let Some(v) = field.as_ref() else {
         return;
@@ -1473,6 +1570,61 @@ cert = "cert.pem"
         let cfg: Config = toml::from_str(toml).expect("parse");
         let err = cfg.validate().expect_err("cert 无 key 必须报错");
         assert!(format!("{err}").contains("成对"), "错误信息应说明成对: {err}");
+    }
+
+    /// 防自曝：root **解析后**等于配置目录（或它的祖先）必须被拒。
+    ///
+    /// 面板侧本来有这道检查，但它只比字面量 `.`/`..` —— `"./"` 一个字就能绕过，
+    /// 而 `base.join("./")` 归一化后正好是配置目录 ⇒ 该端口把 config.toml
+    ///（含管理员口令哈希）当静态文件公开。
+    #[test]
+    fn root_must_not_expose_config_dir() {
+        let cfg_dir = std::path::Path::new("/crucible");
+        // 模拟 `resolve_paths` 之后的样子（函数拿到的就是绝对路径）
+        let mk = |root: &str| -> Config {
+            let resolved = cfg_dir.join(root).display().to_string();
+            toml::from_str(&format!(
+                "[[listeners]]
+address = \"0.0.0.0\"
+port = 1
+root = {resolved:?}
+"
+            ))
+            .expect("parse")
+        };
+        for bad in ["./", ".//", ".", "..", "../", "/", "/crucible", "sub/.."] {
+            let cfg = mk(bad);
+            let err = check_roots_do_not_expose_config(&cfg, cfg_dir)
+                .err()
+                .unwrap_or_else(|| panic!("root={bad} 必须被拒"));
+            eprintln!("[root-check] {bad} -> {err}");
+        }
+        for ok in ["www", "www-apps/php", "/srv/www", "../srv/www"] {
+            let cfg = mk(ok);
+            assert!(
+                check_roots_do_not_expose_config(&cfg, cfg_dir).is_ok(),
+                "root={ok} 不该被拒"
+            );
+        }
+    }
+
+    /// CONNECT-UDP（公网 UDP 中继）必须**默认关闭**，且能按 listener 打开。
+    ///
+    /// 这条断言的意义：中继面对运维必须是显式决定 —— 旧行为是「不配任何东西就可用」，
+    /// 与 proxy（要显式规则）、上传（要 autoindex+enable_upload）都不一致。
+    #[test]
+    fn connect_udp_defaults_off_and_is_per_listener() {
+        assert!(!ListenerConfig::default().connect_udp, "默认必须关闭");
+        let base = "address = \"0.0.0.0\"
+port = 1
+root = \"/tmp\"
+";
+        let off: ListenerConfig = toml::from_str(base).expect("parse");
+        assert!(!off.connect_udp, "未写该字段必须等价于关闭");
+        let on: ListenerConfig =
+            toml::from_str(&format!("{base}connect_udp = true
+")).expect("parse");
+        assert!(on.connect_udp, "显式打开必须生效");
     }
 
     /// ECH cover 证书的三种非法组合必须在配置期拦住。

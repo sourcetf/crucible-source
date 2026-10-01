@@ -113,6 +113,15 @@ struct Conn {
     /// (已接收, 已交付, 我们声明的上限) —— 连接级接收窗口
     conn_recv: Mutex<(u64, u64, u64)>,
     peer_max_record: AtomicU64,
+    /// 待发送的窗口更新（流级）：`on_consumed` 推进本地额度后记在这里，
+    /// 由 [`Conn::flush_window_updates`] 在出向队列有空间时补发。
+    ///
+    /// 为什么不能直接 `push_one`：那是**机会式**发送（队列满即丢），而窗口更新的
+    /// 触发条件（剩余 < 窗口/2）在额度推进后不再满足 ⇒ 丢一次就永久丢失，
+    /// 对端收不到 MAX_STREAM_DATA 只能干等到空闲超时。
+    pending_stream_updates: Mutex<HashMap<u64, u64>>,
+    /// 待发送的连接级窗口更新（MAX_DATA）。
+    pending_max_data: Mutex<Option<u64>>,
     peer_bidi_opened: AtomicU64,
     closed: AtomicBool,
     last_activity: Mutex<Instant>,
@@ -199,14 +208,39 @@ impl Conn {
                 need_conn = Some(cr.2);
             }
         }
+        // 记 pending（覆盖同流旧值即可：新的额度总是更大），再由 flush 补发。
         if let Some(maximum) = need_stream {
-            self.push_one(Frame::MaxStreamData {
-                stream_id,
-                maximum,
-            });
+            self.pending_stream_updates.lock().insert(stream_id, maximum);
         }
         if let Some(lim) = need_conn {
-            self.push_one(Frame::MaxData(lim));
+            *self.pending_max_data.lock() = Some(lim);
+        }
+        self.flush_window_updates();
+    }
+
+    /// 把待发的窗口更新尽力送出去；队列满就留着，等下一轮（serve 主循环每轮调用一次）。
+    ///
+    /// 这些帧**不能丢**：丢掉就意味着对端再也拿不到新额度（见 `pending_stream_updates`）。
+    fn flush_window_updates(&self) {
+        loop {
+            let next = self
+                .pending_stream_updates
+                .lock()
+                .iter()
+                .next()
+                .map(|(k, v)| (*k, *v));
+            let Some((stream_id, maximum)) = next else { break };
+            let left = self.push_frames(vec![Frame::MaxStreamData { stream_id, maximum }]);
+            if !left.is_empty() {
+                return; // 队列满：保留 pending，下一轮再试
+            }
+            self.pending_stream_updates.lock().remove(&stream_id);
+        }
+        let pending = *self.pending_max_data.lock();
+        if let Some(lim) = pending {
+            if self.push_frames(vec![Frame::MaxData(lim)]).is_empty() {
+                *self.pending_max_data.lock() = None;
+            }
         }
     }
 
@@ -452,6 +486,8 @@ where
         conn_sent: Mutex::new((0, 0)),
         conn_recv: Mutex::new((0, 0, CONN_RECV_WINDOW)),
         peer_max_record: AtomicU64::new(DEFAULT_MAX_RECORD_SIZE),
+        pending_stream_updates: Mutex::new(HashMap::new()),
+        pending_max_data: Mutex::new(None),
         peer_bidi_opened: AtomicU64::new(0),
         closed: AtomicBool::new(false),
         last_activity: Mutex::new(Instant::now()),
@@ -561,6 +597,8 @@ where
         // 默认值（16382）在 reader 里；没有这一步，对端**合法**发来的大记录会被我们按默认
         // 值拒掉，而**完全不设上限**则是旧实现的「按声明长度无界缓冲」。
         reader.set_max_record_size(conn.peer_max_record.load(Ordering::Relaxed));
+        // 补发上一轮没送出去的窗口更新（出向队列空出来之后）。
+        conn.flush_window_updates();
         let body = match reader.next_record() {
             Ok(Some(b)) => b,
             Ok(None) => return Ok(()),

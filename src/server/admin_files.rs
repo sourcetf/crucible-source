@@ -5,6 +5,16 @@ use serde::Serialize;
 use std::fs;
 use std::path::{Component, Path, PathBuf};
 
+/// 相对路径长度上限（字节）。为什么不设更小：Windows 长路径前非长路径的 MAX_PATH 是 260、
+/// 加上 root 前缀很容易接近，4096 只是挡住「把整段 JSON/超大 body 当路径传进来」这类输入
+/// （正常文件名远小于它）。越界报错而不是截断 —— 截断会落到另一个文件上。
+pub const MAX_REL_PATH_LEN: usize = 4096;
+
+/// 单次写入上限（字节）。与 h1 的 admin 体上限（`ADMIN_BODY_CAP` = 32MiB）一致：
+/// 入口已经收不下更大体，这里再判一次是为了「入口上限将来放宽 / 别的调用点绕过入口」时
+/// 也不会把磁盘写爆，并给出可读原因（而不是写到一半 ENOSPC）。
+pub const MAX_WRITE_BYTES: usize = 32 * 1024 * 1024;
+
 #[derive(Debug, Serialize)]
 pub struct DirEntryInfo {
     pub name: String,
@@ -17,10 +27,32 @@ pub fn safe_join(root: &Path, rel: &str) -> Result<PathBuf> {
     let root = fs::canonicalize(root).unwrap_or_else(|_| abs(root));
     let mut out = root.clone();
     let rel = rel.trim_start_matches('/').trim_start_matches('\\');
+    // 长度 / NUL 先判：两者在 fs 层都会以难读的 OS 错误冒泡（Windows 上超长路径
+    // 还可能落到 \\?\ 语义之外的神秘失败），在入口给出可读原因。
+    if rel.len() > MAX_REL_PATH_LEN {
+        bail!(
+            "path too long ({} > {MAX_REL_PATH_LEN} bytes)",
+            rel.len()
+        );
+    }
+    if rel.contains('\0') {
+        bail!("NUL byte in path rejected");
+    }
     // Web 上下文路径分隔符只可能是 /；反斜杠是 Windows 分隔符，出现即拒绝
     // （防 ..\\windows 式穿越在 Unix component 匹配下漏网——回归测试 script_rel_rejects_traversal）
     if rel.contains('\\') {
         bail!("backslash in path rejected");
+    }
+    // Windows：`name:stream` 是 NTFS 交替数据流（ADS）语法，正常文件名不允许冒号。
+    // 这里必须显式拒绝，否则 webshell 闸门（would_execute_on_get）可被绕过：
+    // `php/shell.php::$DATA` 的扩展名是 `php::$DATA` → 闸门按不存在该扩展名放行，
+    // 而 `::$DATA` 指的就是**默认数据流**（即 `shell.php` 本体）→ 写下去的就是
+    // 可执行的 shell.php。Linux 上冒号是合法文件名，故只按平台收紧。
+    #[cfg(windows)]
+    {
+        if rel.contains(':') {
+            bail!("colon in path rejected (NTFS alternate data stream)");
+        }
     }
     if rel.is_empty() || rel == "." {
         return Ok(root);
@@ -120,11 +152,18 @@ pub fn list_dir(root: &Path, rel: &str) -> Result<Vec<DirEntryInfo>> {
     let mut entries = Vec::new();
     for e in fs::read_dir(&dir)? {
         let e = e?;
-        let meta = e.metadata()?;
+        // 单个条目 metadata 失败不能拖垮整个目录：悬空符号链接（或正在被并发删除的
+        // 文件）会让 `e.metadata()?` 返回错，旧实现直接 `?` 冒泡 —— 面板上
+        // 「该目录永久无法列出」，一条坏链接就能把文件管理锁死。
+        // 退回 file_type（不跟随符号链接）并把大小记 0。
+        let (is_dir, size) = match e.metadata() {
+            Ok(m) => (m.is_dir(), m.len()),
+            Err(_) => (e.file_type().map(|t| t.is_dir()).unwrap_or(false), 0),
+        };
         entries.push(DirEntryInfo {
             name: e.file_name().to_string_lossy().into_owned(),
-            is_dir: meta.is_dir(),
-            size: meta.len(),
+            is_dir,
+            size,
         });
     }
     entries.sort_by(|a, b| match (a.is_dir, b.is_dir) {
@@ -157,6 +196,12 @@ pub fn read_file(root: &Path, rel: &str, max_bytes: usize) -> Result<(Vec<u8>, b
 }
 
 pub fn write_file(root: &Path, rel: &str, data: &[u8]) -> Result<()> {
+    if data.len() > MAX_WRITE_BYTES {
+        bail!(
+            "write too large ({} > {MAX_WRITE_BYTES} bytes)",
+            data.len()
+        );
+    }
     let path = safe_join(root, rel)?;
     let root_canon = fs::canonicalize(root).unwrap_or_else(|_| abs(root));
     if let Some(parent) = path.parent() {
@@ -188,6 +233,12 @@ pub fn mkdir(root: &Path, rel: &str) -> Result<()> {
     if !made.starts_with(&root_canon) {
         let _ = fs::remove_dir(&path);
         bail!("mkdir escaped root after create (symlink race?)");
+    }
+    // 目标原本是**普通文件**时，`create_dir_all_within` 的「最深已存在祖先」直接
+    // 命中该文件，一级都不建就返回 Ok，面板会显示「已创建」但磁盘上仍是文件。
+    // 建完必须复核类型。
+    if !made.is_dir() {
+        bail!("target already exists and is not a directory");
     }
     Ok(())
 }
@@ -346,6 +397,7 @@ mod tests {
             l4_forward: None,
             quic_ecn: false,
             qmux: false,
+            connect_udp: false,
         }
     }
 
@@ -425,6 +477,35 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// 超长相对路径必须报错（而不是交给 OS 报一个平台相关的怪错），
+    /// 且不能因为截断而落到别的文件上。
+    #[test]
+    fn safe_join_rejects_oversized_and_nul_paths() {
+        let root = std::env::temp_dir().join("crucible_admin_pathlen_test");
+        let _ = std::fs::create_dir_all(&root);
+        let long = "a".repeat(MAX_REL_PATH_LEN + 1);
+        let e = safe_join(&root, &long).unwrap_err().to_string();
+        assert!(e.contains("path too long"), "unexpected: {e}");
+        assert!(safe_join(&root, &format!("sub/{}{}", "b".repeat(64), "\u{0}x")).is_err());
+        // 边界内仍正常。
+        assert!(safe_join(&root, &"a".repeat(MAX_REL_PATH_LEN)).is_ok());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// 写入上限：超限直接拒绝（不写半截文件）。
+    #[test]
+    fn write_file_rejects_oversized_payload() {
+        let root = std::env::temp_dir().join("crucible_admin_writecap_test");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let big = vec![b'x'; MAX_WRITE_BYTES + 1];
+        let e = write_file(&root, "big.bin", &big).unwrap_err().to_string();
+        assert!(e.contains("write too large"), "unexpected: {e}");
+        assert!(!root.join("big.bin").exists(), "must not leave a partial file");
+        assert!(write_file(&root, "ok.txt", b"small").is_ok());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     /// 符号链接逃逸回归：`root/link` → root 外的目录，且中间段 `sub` 不存在。
     /// 词法前缀检查看不出问题（旧实现因此放行），create_dir_all/fs::write 会顺着
     /// link 把目录与文件建到 root 外。加固后必须直接报错且不留下任何外部痕迹。
@@ -452,5 +533,51 @@ mod tests {
         assert!(!outside.join("sub").join("x.txt").exists());
 
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// `mkdir` 落在**已存在的普通文件**上时必须报错：否则 create_dir_all_within 把该
+    /// 文件当成「最深的已存在祖先」，一级都不建却返回 Ok，面板显示「已创建」。
+    #[test]
+    fn mkdir_over_existing_file_must_fail() {
+        let root = std::env::temp_dir().join("crucible_admin_mkdir_file_test");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("a.txt"), b"x").unwrap();
+
+        assert!(mkdir(&root, "a.txt").is_err(), "mkdir over a file must fail");
+        assert!(root.join("a.txt").is_file(), "the file must stay untouched");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// 悬空符号链接（或并发被删的条目）不能让整个目录列表失败 ——
+    /// 旧实现 `e.metadata()?` 会把错误冒泡，一条坏链接就此锁死面板的文件管理。
+    #[cfg(unix)]
+    #[test]
+    fn list_dir_tolerates_dangling_symlink() {
+        use std::os::unix::fs::symlink;
+        let root = std::env::temp_dir().join("crucible_admin_listdir_test");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("ok.txt"), b"x").unwrap();
+        symlink(root.join("does-not-exist"), root.join("dangling")).unwrap();
+
+        let entries = list_dir(&root, "").expect("list_dir must survive a dangling symlink");
+        assert!(entries.iter().any(|e| e.name == "ok.txt"));
+        assert!(entries.iter().any(|e| e.name == "dangling"));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Windows：NTFS ADS 语法必须被拒 —— 否则 `x.php::$DATA` 的扩展名是
+    /// `php::$DATA`（闸门判为不可执行而放行），实际写入的却是 `x.php` 本体。
+    #[cfg(windows)]
+    #[test]
+    fn safe_join_rejects_ntfs_ads() {
+        let root = std::env::temp_dir().join("crucible_admin_ads_test");
+        let _ = std::fs::create_dir_all(&root);
+        assert!(safe_join(&root, "shell.php::$DATA").is_err());
+        assert!(safe_join(&root, "sub/x.txt:evil").is_err());
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

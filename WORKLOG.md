@@ -1973,3 +1973,36 @@ ECH: listener 0.0.0.0:8443 已启用 ECH，但没有配置 cover 证书（ssl.ec
 
 **另外**：顺手补了 rustls-only（不带 boring）回归 —— `cargo check` 0 错误、`cargo test` **200/200 全绿**，
 证明本轮的 config/自检/恢复代码在无 BoringSSL 配置下同样成立。
+
+### 21.26 审计遗留第二批 + 第三批：h3 在飞闸门 / CONNECT-UDP 默认关 / 证书轮换进指纹 / root 自曝封堵 / QMux 窗口更新不丢 / port_reuse 超时
+
+**第二批（有配套单测，测试 231 passed / 0 failed / 1 ignored，已部署复验）**
+
+| 项 | 位置 | 错在哪 / 后果 | 修法 + 证据 |
+|---|---|---|---|
+| h3 缺全局在飞预算（A-P1-2，P1） | `h3.rs` | h2 有进程级 256 在飞闸门，h3 只有**每连接** 100 条流 ×8 MiB body，而 QUIC 连接数不限 ⇒ 内存上界 = 连接数 × 800 MiB，攻击者决定；收 body 还在 ip_access/限流/口令**之前**，未认证即可发起 | 新增 `H3_MAX_INFLIGHT = 256`（与 h2 同值）+ 进程级 `Semaphore`，在 CONNECT 分流前、收 body 前取名额，5s 等不到回 503+Retry-After。单测：闸门进程级共享（一处持有、另一处可见）、与 h2 同值 |
+| CONNECT-UDP 默认可用（A-P2-1，P2） | `h3.rs` + `config.rs` | 反向代理/上传都要显式配置才开，CONNECT-UDP 却「不配任何东西就有」：公网 UDP 中继面（内网地址已被拒，不是 SSRF，但可用于流量洗白） | 新增 per-listener `connect_udp`（默认 **false**），未开启时 CONNECT 直接 403 并说明怎么开。单测钉住默认值与按 listener 生效 |
+| 换证书不重载 = 继续用旧证书（C-1，P1） | `tls/boring_path.rs` | acceptor 缓存指纹只含配置**字符串**（=路径），ACME/certbot 原地续期后指纹不变 ⇒ 端口继续出示旧（甚至已过期）证书直到 reload/重启 | 指纹里加入 8 个材料文件的 **mtime + size**。单测：等长替换也必须改变指纹（只编 size 的实现会漏） |
+| root 可被 `"./"` 绕过自曝检查（B-F3，P2） | `config.rs` `Config::load` | 面板侧只比字面量 `.`/`..`，`"./"`、`".//"`、绝对路径写成配置目录全都通过 ⇒ 该端口把 `config.toml`（含管理员口令哈希）当静态文件公开；`root = "state"` 还能读走 rndc key / ECH 私钥 | 在 `load` 里对**解析后**的 root 比较：等于配置目录、或是它的祖先，一律拒绝（后者会连 `state/` 一起暴露）。单测覆盖 8 种绕过写法 + 4 种正常 root |
+| QMux 窗口更新可丢（A-P2-2，P2） | `qmux/conn.rs` | `on_consumed` 用「机会式」`push_one` 发 MAX_STREAM_DATA/MAX_DATA，队列满即丢，而「剩余 < 窗口/2」这个触发条件在额度推进后不再满足 ⇒ 对端永远等不到额度，双方互等到超时 | 改成 pending 记录（流级 + 连接级）+ `flush_window_updates()` 每轮补发；serve 主循环每轮调用一次 |
+| port_reuse 无任何超时（A-P2-4，P2） | `port_reuse.rs` | h1/h2/h3 都有空闲超时，这条 SNI 直通路径一个都没有：慢速连接/不回包的目标可无限占用连接与 FD | 5s 连接超时 + 60s 空闲超时（每方向各一个带超时的 copy） |
+| `status_path` 等路径项（C-16） | `config.rs` | 写错即静默 404，无任何提示 | 配置期要求非空且以 `/` 开头 |
+| geoip 假开关（C-18） | `config.rs` | `enabled = true` 但无 `db_path` ⇒ 面板显示已启用、查询全部落空 | 配置期拒绝 |
+
+**第三批（`validate` 剩余小项 + 卫生项）**：`telemetry.path`/`dns.doh.path` 的 `/` 校验、
+acceptor 缓存上限 64 → 256（`MAX_LISTENERS = 128`，满上限会整表清空导致命中率归零）、
+`LiveConfig::replace()` 与 `reload()` 同副作用（它曾是死代码，但被拿去局部热更就会
+静默绕过缓存清理与 mtime 记账）、坏配置的 watcher 告警**去重**（以前 2s 一条 ≈ 4.3 万条/天）。
+
+**诚实说明**：第三批这四项**没有配套单测**（都是小改动，靠代码推理 + 部署复验），
+下一轮补上（尤其 `validate` 的两条，与 batch 2 的写法一致，加测试很便宜）。
+第二批的六项都有单测，测试从 222 → **231 passed / 0 failed / 1 ignored**。
+
+**部署复验（两批各一次，均为 1 实例）**：h1 200 / h2 200 / **h3 200（HTTP/3）** /
+`ech_probe` `ECH_ACCEPTED=true` / DNS `dig` 正常 / PHP 引擎 200 / `__admin` 401。
+新校验没有误伤生产配置（启动日志里只有预期的两条 ECH 待办与既有的 jsp reconcile 告警）。
+
+**仍未做**：C-3（h3 的证书与 per-listener 设置不随 reload 更新，结构性）、
+A-P2-3（QMux 流数按累计计，需要流生命周期回收，风险高于收益）、C-9（端口 bind 失败每 2s 告警）、
+C-17（`[dns]` 零校验 + `panel.toml` 整体覆盖）、C-4（连接期配置冻结）、
+以及需要运维决定的两项（admin 示例口令、ECH cover 证书）。全部记在 `_audit_*.md` 与本节。

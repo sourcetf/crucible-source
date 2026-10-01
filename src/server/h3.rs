@@ -11,6 +11,31 @@ use anyhow::Result;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
+/// 全局「同时在飞」h3 请求上限（含**正在收 body** 的阶段）。
+///
+/// 为什么必须有这一层：h2 有等价闸门（`h2::H2_MAX_INFLIGHT`），h3 此前只有
+/// **每连接** 100 条流（`qmux::DEFAULT_MAX_ACTIVE`）×每请求 8 MiB 的 body 上限，
+/// 而 QUIC 连接数**不限**（quinn 默认）⇒ 进程内存上界 = 连接数 × 100 × 8 MiB，
+/// 完全由攻击者决定；更要命的是收 body 发生在 ip_access / 限流 / basic_auth
+/// **之前**，未认证即可发起。一条连接的 100 条慢流 ≈ 800 MiB。
+///
+/// 取 256 与 h2 同值：两者共用同一台机器的内存预算，语义也一致
+///（h1 有 32 MiB/请求的流式上限与连接级并发的天然约束，故不设此闸门）。
+pub const H3_MAX_INFLIGHT: usize = 256;
+
+/// 等配额的最长时间（与 h2 同语义）：拿不到就快速 503，
+/// 而不是把这条连接的请求循环堵死（否则一条恶意连接能拖住整条连接上所有流）。
+pub const H3_INFLIGHT_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// 进程级共享的在飞闸门（`Arc<Semaphore>` 便于 `acquire_owned` 给出 RAII 守卫）。
+static H3_INFLIGHT: once_cell::sync::Lazy<Arc<tokio::sync::Semaphore>> =
+    once_cell::sync::Lazy::new(|| Arc::new(tokio::sync::Semaphore::new(H3_MAX_INFLIGHT)));
+
+/// 全局在飞闸门的引用（测试用；也为将来把配额做成可配置留出入口）。
+pub fn h3_inflight_gate() -> Arc<tokio::sync::Semaphore> {
+    H3_INFLIGHT.clone()
+}
+
 #[cfg(feature = "tls")]
 mod imp {
     use super::*;
@@ -314,12 +339,69 @@ mod imp {
         };
         crate::server::telemetry::record_request();
 
+        // **全局在飞闸门：先取名额，再收 body / 建隧道。**
+        //
+        // 位置很关键：必须在 CONNECT 分流**之前**、收 body **之前**（见 `H3_MAX_INFLIGHT`
+        // 的说明 —— 否则「未认证客户端并发慢速请求」仍能把内存吃光）。守卫是 RAII，
+        // 早退（包括下面的 CONNECT 拒绝、503、413）都会自动归还，不会漏账。
+        let _inflight = match tokio::time::timeout(H3_INFLIGHT_WAIT, h3_inflight_gate().acquire_owned())
+            .await
+        {
+            Ok(Ok(p)) => Some(p),
+            // 信号量关闭（进程退出中）：不加限制，交给上层收尾，别在这里制造新错误。
+            Ok(Err(_)) => None,
+            Err(_) => {
+                let t0 = std::time::Instant::now();
+                let resp = Response::builder()
+                    .status(StatusCode::SERVICE_UNAVAILABLE)
+                    .header(http::header::RETRY_AFTER, "1")
+                    .body(())
+                    .unwrap();
+                let _ = stream.send_response(resp).await;
+                let _ = stream
+                    .send_data(Bytes::from_static(b"server busy (h3 in-flight limit)\n"))
+                    .await;
+                let _ = stream.finish().await;
+                crate::server::access_log::log_response(
+                    &live,
+                    peer,
+                    "h3",
+                    req.method().as_str(),
+                    req.uri().path(),
+                    StatusCode::SERVICE_UNAVAILABLE.as_u16(),
+                    None,
+                    t0.elapsed(),
+                    "busy",
+                );
+                return Ok(());
+            }
+        };
+
         // RFC 9298 CONNECT-UDP 必须在**收请求体之前**分流。
         //
         // 旧代码把 CONNECT 判断放在下面的 body 循环之后，而那个循环对
         // 「发完 HEADERS 就等 200」的客户端会一直阻塞在 `recv_data()` 上：
         // CONNECT-UDP 的负载本来就要等 200 之后才发，于是隧道还没建就先卡死。
         if req.method() == http::Method::CONNECT {
+            // 开关（默认关）：CONNECT-UDP 是**公网 UDP 中继**（RFC 9298），
+            // 反向代理与上传都要显式配置才开，它此前却默认可用 —— 不配任何东西就
+            // 得到一条到任意公网 IP/端口的隧道（内网地址已被 `connect_udp` 拒绝，
+            // 所以不是 SSRF，但仍是流量洗白/匿名代理面）。默认关、按 listener 显式打开。
+            if !lc.connect_udp {
+                let path = req.uri().path().to_string();
+                let t0 = std::time::Instant::now();
+                connect_reject(
+                    &mut stream,
+                    &live,
+                    peer,
+                    &path,
+                    StatusCode::FORBIDDEN,
+                    t0,
+                    "connect-udp disabled on this listener (set listeners[].connect_udp = true)",
+                )
+                .await;
+                return Ok(());
+            }
             // 分流提前了，但**不能连访问控制一起绕过**：原先这里直接 return
             // proxy_connect_udp，于是 ip_access / 限流 / listener Basic Auth
             // 三项检查（都在下面的 handle_h3 里）对 CONNECT 完全失效 ——
@@ -1564,4 +1646,43 @@ pub use imp::serve;
 #[cfg(not(feature = "tls"))]
 pub async fn serve(_bind: SocketAddr, _lc: ListenerConfig, _live: Arc<LiveConfig>) -> Result<()> {
     anyhow::bail!("HTTP/3 (QUIC) requires feature `tls`")
+}
+
+#[cfg(test)]
+mod inflight_tests {
+    use super::*;
+
+    /// 闸门必须是**进程级共享**的：每条连接各自一份就挡不住「连接数 × 每连接 100」，
+    /// 而 h3 的 QUIC 连接数是不限的。判据：一处在持有时，另一处立刻看到可用数少 1。
+    #[tokio::test]
+    async fn h3_inflight_gate_is_process_global() {
+        let before = h3_inflight_gate().available_permits();
+        assert!(before >= 1, "闸门初始可用数应 > 0，实际 {before}");
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let jh = tokio::spawn(async move {
+            let p = h3_inflight_gate().acquire_owned().await.expect("acquire");
+            let _ = tx.send(());
+            tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+            drop(p);
+        });
+        rx.await.expect("子任务应拿到名额");
+        assert_eq!(
+            h3_inflight_gate().available_permits(),
+            before - 1,
+            "闸门不是进程级共享的（另一处看不到被占用的名额）"
+        );
+        jh.await.expect("join");
+        assert!(
+            h3_inflight_gate().available_permits() >= before,
+            "释放后必须归还名额"
+        );
+    }
+
+    /// 上限值要钉住：它是「进程能同时在飞的 h3 请求数（含正在收 body）」，
+    /// 与 h2 的 256 同值 —— 同一台机器的内存预算只该有一份口径。
+    #[test]
+    fn h3_inflight_limit_matches_h2() {
+        assert_eq!(H3_MAX_INFLIGHT, 256);
+        assert_eq!(H3_MAX_INFLIGHT, crate::server::h2::H2_MAX_INFLIGHT);
+    }
 }

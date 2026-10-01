@@ -842,3 +842,27 @@ zone 0644、目录里无 `.tmp` 残留；单测 **214/214**（新增原子写用
 
 **回归**：boring 配置 220/220（本轮新增 5 个用例）；rustls-only（不带 boring）`cargo check` 0 错误 +
 **200/200 全绿**。
+
+---
+
+### Session 1008 (2026-10-01) — 进展 24（审计遗留第二/三批：h3 在飞闸门、CONNECT-UDP 默认关、证书轮换进指纹、root 自曝封堵、QMux 窗口更新不丢、port_reuse 超时）
+
+第二批六项（**都有单测**，222 → 231 passed / 0 failed / 1 ignored，已部署复验）：
+
+1. **h3 补全局在飞预算**（与 h2 同值 256；位置在 CONNECT 分流前、收 body 前）—— 此前内存上界
+   = 连接数 × 100 流 × 8 MiB，且收 body 在鉴权之前，未认证可发起；
+2. **CONNECT-UDP 改为默认关**（新增 per-listener `connect_udp`，未开启 403）；
+3. **acceptor 指纹加入证书材料 mtime+size** —— ACME 原地续期后下一次握手就用新证书，
+   不再需要 reload/重启（单测含「等长替换」）；
+4. **root 防自曝**（`Config::load` 里按解析后路径比较，拒绝等于配置目录/其祖先的 root；
+   面板侧原来只比 `.`/`..`，`"./"` 一个字就能绕过）；
+5. **QMux 窗口更新不再丢**（pending + 每轮补发；以前队列满即丢，对端永久等额度）；
+6. **port_reuse 补超时**（5s 连接 / 60s 空闲；此前 SNI 直通路径没有任何超时）。
+
+第三批：`telemetry.path`/`doh.path` 的 `/` 校验、acceptor 缓存上限 64→256、
+`LiveConfig::replace()` 与 reload 同副作用、坏配置 watcher 告警去重（2s 一条 → 只报一次）。
+**这三批里第三批没有配套单测**（小改动，靠推理 + 部署复验），下一轮补。
+
+部署复验：h1/h2/**h3(HTTP/3)** 全 200、ECH 现场探针 `ECH_ACCEPTED=true`、DNS、PHP、admin 401。
+仍未做：h3 设置不随 reload 更新（C-3）、QMux 流数语义（P2-3）、`[dns]` 覆盖与零校验（C-17）、
+以及需要你拍板的 admin 示例口令与 ECH cover 证书。

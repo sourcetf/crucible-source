@@ -868,6 +868,44 @@ fn acceptor_fingerprint(ssl: &SslConfig, lc: &ListenerConfig) -> u64 {
     lc.port.hash(&mut h);
     lc.allows_h1().hash(&mut h);
     lc.allows_h2().hash(&mut h);
+    // **材料指纹（mtime + size）**：证书/密钥路径不变、内容被原地替换（certbot/acme.sh/
+    // `dns.acme` 续期、运维手工覆盖）时，只哈希**路径字符串**会让指纹不变 ⇒ 命中旧
+    // acceptor ⇒ 对继续出示**旧证书**（甚至已过期的）直到 config.toml 被 reload 或重启。
+    // 哈希 mtime+size 让「文件被换掉」这件事本身进指纹：mtime 由内核在写入/替换时更新，
+    // 精确到纳秒（OpenBSD: st_mtim），两次续期落在同一纳秒的可能性可以忽略。
+    //
+    // 热路径不额外 stat：`build_acceptor_cached` 只在**握手路径**上（每连接一次），
+    // 这里 stat 的是 4~8 个小文件（内核 denty 缓存），代价远小于一次 TLS 握手。
+    for p in [
+        &ssl.cert,
+        &ssl.key,
+        &ssl.cert_ec,
+        &ssl.key_ec,
+        &ssl.ech_keys,
+        &ssl.ech_cover_cert,
+        &ssl.ech_cover_key,
+        &ssl.ocsp_der_path,
+    ] {
+        if let Some(path) = p.as_deref() {
+            if path.contains("-----BEGIN") {
+                // 内联 PEM：内容本身就是配置的一部分，上面已经哈希过字段值。
+                continue;
+            }
+            match std::fs::metadata(path) {
+                Ok(m) => {
+                    m.len().hash(&mut h);
+                    if let Ok(t) = m.modified() {
+                        if let Ok(d) = t.duration_since(std::time::UNIX_EPOCH) {
+                            d.as_nanos().hash(&mut h);
+                        }
+                    }
+                }
+                // 打不开的文件：把「打不开」也编进指纹，避免「文件先消失后出现」
+                // 一直命中旧 acceptor（真正读不到时 build_acceptor 会自己报错）。
+                Err(_) => 0u8.hash(&mut h),
+            }
+        }
+    }
     h.finish()
 }
 
@@ -925,5 +963,57 @@ async fn dispatch_alpn(
         h2::serve_tls(tls, live, lc, peer).await
     } else {
         h1::serve_tls(tls, live, lc, peer).await
+    }
+}
+
+#[cfg(test)]
+mod fingerprint_tests {
+    use super::*;
+
+    /// 证书文件被**原地替换**（路径不变）时，指纹必须变化。
+    ///
+    /// 旧实现只哈希**路径字符串**：certbot/acme.sh/`dns.acme` 续期、运维手工覆盖
+    /// `ssl.cert` 之后指纹不变 ⇒ 命中旧 acceptor ⇒ 端口继续出示旧（甚至已过期的）
+    /// 证书，直到 config.toml 被 reload 或进程重启。
+    #[test]
+    fn fingerprint_follows_material_changes() {
+        let dir = std::env::temp_dir().join(format!("crucible-fp-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let cert = dir.join("cert.pem");
+        let key = dir.join("key.pem");
+        std::fs::write(&cert, b"first").expect("write");
+        std::fs::write(&key, b"key").expect("write");
+        let ssl = crate::config::SslConfig {
+            cert: Some(cert.display().to_string()),
+            key: Some(key.display().to_string()),
+            ..Default::default()
+        };
+        let lc = crate::config::ListenerConfig::default();
+
+        let fp1 = acceptor_fingerprint(&ssl, &lc);
+        assert_eq!(
+            fp1,
+            acceptor_fingerprint(&ssl, &lc),
+            "同样的材料必须得到同样的指纹（否则缓存永不命中）"
+        );
+
+        // ① 长度不同的替换
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        std::fs::write(&cert, b"second-cert-content").expect("rewrite");
+        let fp2 = acceptor_fingerprint(&ssl, &lc);
+        assert_ne!(fp1, fp2, "证书被替换后指纹必须变化（否则继续用旧证书）");
+
+        // ② **同样长度**、不同内容（只把 size 编进指纹的实现会在这条上漏掉）
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        std::fs::write(&cert, b"THIRD-cert-content!").expect("rewrite2");
+        let fp3 = acceptor_fingerprint(&ssl, &lc);
+        assert_ne!(fp2, fp3, "等长替换也必须改变指纹（要靠 mtime）");
+
+        // ③ 与内容无关的字段变化同样要影响指纹
+        let mut ssl2 = ssl.clone();
+        ssl2.prefer_tls13 = true;
+        assert_ne!(fp3, acceptor_fingerprint(&ssl2, &lc), "配置字段变化必须影响指纹");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

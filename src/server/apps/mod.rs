@@ -509,6 +509,7 @@ mod script_rel_tests {
             l4_forward: None,
             quic_ecn: false,
             qmux: false,
+            connect_udp: false,
         }
     }
 
