@@ -8,17 +8,43 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::net::TcpStream;
 
+/// 该 listener 是否就是 `local`（实际接受连接的那个 socket 地址）对应的配置。
+///
+/// 规则：端口必须相同；地址按解析后的 IP 比较，**通配地址按同族匹配任意本地地址**
+///（`0.0.0.0` 匹配任何 v4、`::` 匹配任何 v6）。`address_v6` 也参与比较。
+fn listener_matches_local(l: &ListenerConfig, local: SocketAddr) -> bool {
+    if l.port != local.port() {
+        return false;
+    }
+    let ip = local.ip();
+    let parse = |s: &str| s.trim().parse::<std::net::IpAddr>().ok();
+    if let Some(v6) = l.address_v6.as_deref().and_then(parse) {
+        if v6 == ip {
+            return true;
+        }
+    }
+    match parse(&l.address) {
+        Some(a) if a == ip => true,
+        Some(std::net::IpAddr::V4(v4)) if v4.is_unspecified() && ip.is_ipv4() => true,
+        Some(std::net::IpAddr::V6(v6)) if v6.is_unspecified() && ip.is_ipv6() => true,
+        _ => false,
+    }
+}
+
 pub async fn handle_connection(
     stream: TcpStream,
     live: Arc<LiveConfig>,
-    port: u16,
+    local: SocketAddr,
     peer: SocketAddr,
 ) -> Result<()> {
     let cfg = live.snapshot();
+    // 按「端口 + **实际绑定的地址**」选配置：同端口不同地址的两个 listener 各自服务
+    // 自己的站点（见 `mod.rs::bind_key` 与审计 C-2）。只按端口取会拿到另一个站点的配置。
     let lc = cfg
         .listeners
         .iter()
-        .find(|l| l.port == port)
+        .find(|l| listener_matches_local(l, local))
+        .or_else(|| cfg.listeners.iter().find(|l| l.port == local.port()))
         .cloned()
         .context("listener vanished")?;
 

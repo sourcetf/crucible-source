@@ -114,7 +114,7 @@ pub async fn run(live: Arc<LiveConfig>) -> Result<()> {
         });
     }
 
-    let active: Arc<tokio::sync::Mutex<std::collections::HashSet<u16>>> =
+    let active: Arc<tokio::sync::Mutex<std::collections::HashSet<String>>> =
         Arc::new(tokio::sync::Mutex::new(std::collections::HashSet::new()));
 
     // Initial listeners.
@@ -124,6 +124,14 @@ pub async fn run(live: Arc<LiveConfig>) -> Result<()> {
     // 三者共同点是「面板/日志看起来都正常」，只有把两处配置放在一起比才看得出来。
     for problem in ech_selfcheck_problems(&cfg) {
         log::warn!("{problem}");
+    }
+    // B-F2：管理面默认对**所有** listener 开放（`listeners_allow` 为空 = 不限制），
+    // 而管理面走 Basic 认证 ⇒ 任何**明文 HTTP** 端口都成了凭据输入面（口令明文上线），
+    // 防爆破面也扩到全部端口。默认值站在不安全的一侧，至少要在启动日志里说清楚。
+    if cfg.admin.listeners_allow.is_empty() {
+        log::warn!(
+            "admin: [admin].listeners_allow 未配置 —— 管理面在**所有** listener 上可达（含明文 HTTP 端口）；建议显式列出端口，例如 listeners_allow = [8443]"
+        );
     }
     for (idx, lc) in cfg.listeners.iter().enumerate() {
         if let Err(e) = spawn_listener_port(
@@ -165,7 +173,8 @@ pub async fn run(live: Arc<LiveConfig>) -> Result<()> {
                     }
                 }
                 for (idx, lc) in snap.listeners.iter().enumerate() {
-                    if active_r.lock().await.contains(&lc.port) {
+                    let key = crate::server::bind_key(lc);
+                    if active_r.lock().await.contains(&key) {
                         continue;
                     }
                     match spawn_listener_port(
@@ -178,14 +187,14 @@ pub async fn run(live: Arc<LiveConfig>) -> Result<()> {
                     {
                         Ok(()) => {
                             bind_err.remove(&lc.port);
-                            log::info!("hot-spawned listener port {}", lc.port)
+                            log::info!("hot-spawned listener {}", key)
                         }
                         Err(e) => {
                             let msg = format!("{e:#}");
                             if bind_err.get(&lc.port).map(String::as_str) != Some(msg.as_str()) {
                                 log::warn!(
-                                    "hot-spawn listener port {} failed（同一条错误只报一次）: {msg}",
-                                    lc.port
+                                    "hot-spawn listener {} failed（同一条错误只报一次）: {msg}",
+                                    key
                                 );
                                 bind_err.insert(lc.port, msg);
                             } else {
@@ -204,16 +213,33 @@ pub async fn run(live: Arc<LiveConfig>) -> Result<()> {
     }
 }
 
+/// 监听的**绑定键**：本实现按 `(address, address_v6, port)` 绑定，因此存活判定必须用它，
+/// 而不是只用 `port`（审计 C-2）。
+///
+/// 只按 port 判的后果：把 `address` 从 `0.0.0.0` 改成 `127.0.0.1`（端口不变）后 reload
+/// 报成功、socket 却**不重建**，仍全网卡监听（以为收紧了暴露面，实际没有）；
+/// 同端口不同地址的两个 listener 也只会绑第一个，第二个**永不监听且无告警**。
+pub fn bind_key(lc: &crate::config::ListenerConfig) -> String {
+    format!(
+        "{}|{}|{}",
+        lc.address,
+        lc.address_v6.as_deref().unwrap_or(""),
+        lc.port
+    )
+}
+
 async fn spawn_listener_port(
     live: Arc<LiveConfig>,
     lc: crate::config::ListenerConfig,
     idx: usize,
-    active: Arc<tokio::sync::Mutex<std::collections::HashSet<u16>>>,
+    active: Arc<tokio::sync::Mutex<std::collections::HashSet<String>>>,
 ) -> Result<()> {
     let port = lc.port;
+    // 绑定键含地址：同端口不同地址是**两个** listener，改地址也能正确重建（C-2）。
+    let key = bind_key(&lc);
     {
         let mut a = active.lock().await;
-        if !a.insert(port) {
+        if !a.insert(key.clone()) {
             return Ok(());
         }
     }
@@ -238,7 +264,7 @@ async fn spawn_listener_port(
         match TcpListener::bind(addr).await {
             Ok(l) => listeners.push((addr, l)),
             Err(e) => {
-                active.lock().await.remove(&port);
+                active.lock().await.remove(&key);
                 // 已绑定的要关闭（Drop 自动）
                 return Err(e).with_context(|| format!("bind {addr}"));
             }
@@ -251,9 +277,12 @@ async fn spawn_listener_port(
     for (a, listener) in listeners {
         let live_c = Arc::clone(&live);
         let active_c = Arc::clone(&active);
+        let key_c = key.clone();
         tokio::spawn(async move {
-            let res = accept_loop(listener, live_c, port).await;
-            active_c.lock().await.remove(&port);
+            // 把**实际绑定的地址**（而不是配置里的字符串）交给连接分发：
+            // 同端口不同地址的两个 listener 各自服务自己的站点（C-2）。
+            let res = accept_loop(listener, live_c, key_c.clone(), a).await;
+            active_c.lock().await.remove(&key_c);
             log::warn!("accept_loop {a} ended: {res:?}");
         });
     }
@@ -269,10 +298,10 @@ async fn spawn_listener_port(
                     .snapshot()
                     .listeners
                     .iter()
-                    .find(|l| l.port == port)
+                    .find(|l| crate::server::bind_key(l) == key)
                     .cloned()
                 else {
-                    log::info!("h3 listener port {port} removed; stopping");
+                    log::info!("h3 listener {key} removed; stopping");
                     break;
                 };
                 let fp = crate::server::h3::h3_config_fingerprint(&cur);
@@ -290,14 +319,20 @@ async fn spawn_listener_port(
     Ok(())
 }
 
-async fn accept_loop(listener: TcpListener, live: Arc<LiveConfig>, port: u16) -> Result<()> {
+async fn accept_loop(
+    listener: TcpListener,
+    live: Arc<LiveConfig>,
+    key: String,
+    local: std::net::SocketAddr,
+) -> Result<()> {
+    let port = local.port();
     loop {
         // Hot-reload: if this port disappeared from config, stop accepting.
         {
             let snap = live.snapshot();
-            if !snap.listeners.iter().any(|l| l.port == port) {
+            if !snap.listeners.iter().any(|l| crate::server::bind_key(l) == key) {
                 log::info!(
-                    "listener port {port} removed from config; shutting down accept loop"
+                    "listener {key} removed/changed in config; shutting down accept loop"
                 );
                 return Ok(());
             }
@@ -309,9 +344,9 @@ async fn accept_loop(listener: TcpListener, live: Arc<LiveConfig>, port: u16) ->
                 res = &mut accept => break res?,
                 _ = tokio::time::sleep(std::time::Duration::from_secs(2)) => {
                     let snap = live.snapshot();
-                    if !snap.listeners.iter().any(|l| l.port == port) {
+                    if !snap.listeners.iter().any(|l| crate::server::bind_key(l) == key) {
                         log::info!(
-                            "listener port {port} removed from config; shutting down accept loop"
+                            "listener {key} removed/changed in config; shutting down accept loop"
                         );
                         return Ok(());
                     }
@@ -323,7 +358,7 @@ async fn accept_loop(listener: TcpListener, live: Arc<LiveConfig>, port: u16) ->
         crate::server::syncookie::note_syn();
         let live_c = Arc::clone(&live);
         tokio::spawn(async move {
-            if let Err(e) = listener::handle_connection(stream, live_c, port, peer).await {
+            if let Err(e) = listener::handle_connection(stream, live_c, local, peer).await {
                 log::debug!("connection {peer} error: {e:#}");
             }
         });

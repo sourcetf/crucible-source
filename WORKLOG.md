@@ -2109,3 +2109,46 @@ config OK: /crucible/config.toml (listeners=5, apps=18)
 
 测试：**244 passed / 0 failed / 1 ignored**（P2-3 与 https_rr 两条新用例在内），已按新流程部署
 （`--check-config` 预检 → 停 → 换 → 起），复验 h1/h2/h3 全 200、ECH accepted、DNS、PHP。
+
+### 21.30 listener 绑定键含地址（审计 C-2，最后一条 P1）+ 管理面 listeners_allow 告警（B-F2）
+
+**C-2 的两个静默表现**（都属于「运维以为改了，其实没效果」）：
+1. 把某 listener 的 `address` 从 `0.0.0.0` 改成 `127.0.0.1`（端口不变）后 reload：
+   报成功、日志说 binds changed，但 socket **不重建** —— 仍绑在 0.0.0.0。以为收紧了
+   暴露面，实际全网可达（反向改动则是「改了没生效」）。
+2. 同端口不同地址的两个 listener：配置能过校验，但按 port 去重只会绑第一个，
+   第二个**永不监听且无任何告警**；即便绑上，连接分发按 port 取配置也会取错站点。
+
+**修法**：
+* 新增 `server::bind_key(lc)` = `"address|address_v6|port"`；`active` 集合（已激活判定）、
+  accept 循环的存活判定、h3 任务的存活判定全部改用它 —— 地址一变，旧循环退出、新循环按新地址绑定；
+* 「实际接受连接的那个 socket 地址」透传给 `listener::handle_connection`，
+  连接分发按 **端口 + 地址** 选配置（新增 `listener_matches_local`，通配地址按同族匹配，
+  并回退到「同端口第一个」以免行为退化）；
+* 同端口不同地址的两个 listener 从此**各自绑定**（地址不冲突时都能起来；冲突时 bind 失败会
+  **明确报错**，而不是静默只绑一个）。
+* 仍按端口寻址的地方（面板 API、上传闸门的 live 查询）保持原样并注明：那两处是既定接口，
+  同端口不同地址属边缘部署。
+
+**B-F2**：`[admin].listeners_allow` 为空 = 管理面在**所有** listener 上可达（含明文 HTTP 端口，
+Basic 凭据明文上线、防爆破面扩到全部端口）。这是「默认值站在不安全的一侧」，加启动期告警。
+
+**真机验证（C-2，含一处对先前说法的更正）**：临时追加 `127.0.0.1:18080` → `netstat` 显示
+`tcp 0 0 127.0.0.1.18080 LISTEN` 且能应答 ✓；把 `address` 改成 `127.0.0.2` 后 reload，日志：
+
+```
+config reload: listener binds changed (added=[("127.0.0.2", 18080)] removed=[("127.0.0.1", 18080)])
+hot-spawn listener 127.0.0.2||18080 failed: bind 127.0.0.2:18080: Can't assign requested address
+listener 127.0.0.1||18080 removed/changed in config; shutting down accept loop
+```
+
+**三条都在证明修复生效**：① reload **识别出绑定变了**（旧代码只比 port，会判定「什么都没变」，
+socket 不重建）；② 旧 socket 被**主动退休**（旧代码会一直绑着 127.0.0.1）；③ 新地址绑不上时
+**大声报错**，而不是继续用旧绑定假装成功。
+
+**更正**：我起初以为「127.0.0.2 也是 loopback、可以绑」，实测在本机**不行** ——
+`nc` 同样报 `Can't assign requested address`，`ifconfig lo0` 只有 `::1`（v4 侧仅有 127.0.0.1）。
+所以第 2 步的「新地址没监听」不是缺陷，而是**真实的绑定失败 + 如实上报**；这条更正也说明
+「换地址」这类验证必须挑一个本机确实可绑的地址，或像这里一样把失败路径当作验证目标。
+
+（验证脚本 `_vfy_c2.py` 每次都会还原 config.toml；本次已还原并复验生产 5 个 listener 正常。）
