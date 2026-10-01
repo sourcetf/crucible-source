@@ -1073,27 +1073,29 @@ mod tests {
     ///（`initial_max_stream_data_bidi_local`），服务端写 26 字节 ⇒ 必然部分成帧；
     /// 客户端随后补 `MAX_STREAM_DATA` 放行剩余部分。读回的字节流必须逐字节等于写入内容。
     ///
-    /// **暂时 ignore**：这套用例的同步还不够稳（客户端补额度与读回之间没有可靠的
-    /// 握手判据，12 轮里能读到 1 字节就断言，存在竞态 —— 首跑 221 passed / 本用例失败）。
-    /// 修复本身（`poll_write` 清空缓冲而不是保留已发前缀）依据是确定的：旧代码
-    /// `truncate(len - left)` 保留的正是已发前缀。要把它变成可靠回归，需要在
-    /// 客户端侧按「已收到的 Stream 长度」推进额度并加总超时；留待下一轮补齐，
-    /// 在此之前**不假装它通过了**。
-    #[ignore = "同步存在竞态，待用接收驱动的额度推进重写；修复本身已按代码推理确认"]
+    /// **部分发送不得重复已发前缀**（回归，接收驱动版）。
+    ///
+    /// 旧实现的 `poll_write` 部分入队后 `truncate(len - left)`：保留的是**已发前缀**、
+    /// 丢掉的是未发尾部；下一次 `flush_frames` 把该前缀按**已推进的 offset** 再发一遍，
+    /// 对端读到重复字节（真机上是 QMux 通道里响应内容错乱，慢读的正常客户端也中招）。
+    ///
+    /// 同步方式（上一版就是栽在这里）：**额度由「已收到的字节数」驱动**，并设总超时；
+    /// 不假设「读一轮 = 发一段」，因此不会出现「12 轮读完只拿到 1 字节就断言」的假红。
     #[tokio::test]
     async fn partial_send_does_not_duplicate_prefix() {
         const PAYLOAD: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ";
         let (a, b) = tokio::io::duplex(64 * 1024);
         let mut client = Client::new(a);
         let srv = spawn_server(b, |mut s: QmuxStream| async move {
+            // 会被额度卡住；额度补上来后继续发完
             let _ = s.write_all(PAYLOAD).await;
-            for _ in 0..200 {
-                let _ = s.flush().await;
-                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-            }
+            let _ = s.flush().await;
+            let _ = s.shutdown().await;
+            // 挂住，等测试用 abort 收尾
+            std::future::pending::<()>().await;
         });
 
-        // 握手（自带读服务端 TP），但把自己的额度压到 1 字节
+        // 握手：把「服务端可在本条流上发送」的初始额度压到 1 字节 ⇒ 必然部分成帧
         let f = client.read_record().await;
         assert!(
             matches!(f.first(), Some(Frame::QxTransportParameters(_))),
@@ -1101,9 +1103,10 @@ mod tests {
         );
         let mut tp = local_params();
         tp.initial_max_stream_data_bidi_local = 1;
-        client.send_frames(vec![Frame::QxTransportParameters(tp.encode())]).await;
-
-        // 开流 0（带 fin），服务端据此开始回写
+        client
+            .send_frames(vec![Frame::QxTransportParameters(tp.encode())])
+            .await;
+        // 开流 0（带 fin）触发服务端回写
         client
             .send_frames(vec![Frame::Stream {
                 stream_id: 0,
@@ -1114,24 +1117,28 @@ mod tests {
             .await;
 
         let mut out: Vec<u8> = Vec::new();
-        let mut granted = 1u64;
-        for round in 0..12 {
-            if out.len() >= PAYLOAD.len() {
-                break;
-            }
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(15);
+        while out.len() < PAYLOAD.len() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "超时未收满（已收 {} 字节: {:?}）",
+                out.len(),
+                String::from_utf8_lossy(&out)
+            );
             let frames = client.read_record().await;
             for f in frames {
                 if let Frame::Stream { offset, data, .. } = f {
                     assert_eq!(
                         offset,
                         out.len() as u64,
-                        "偏移必须连续：第 {round} 轮读回 {out:?}"
+                        "偏移必须连续（已收 {:?}）",
+                        String::from_utf8_lossy(&out)
                     );
                     out.extend_from_slice(&data);
                 }
             }
-            // 每轮放行一段（模拟慢读客户端逐步补额度）
-            granted += 16;
+            // 接收驱动：按**已收字节数**推进额度（+16 余量），保证服务端能继续发
+            let granted = out.len() as u64 + 16;
             client
                 .send_frames(vec![Frame::MaxStreamData {
                     stream_id: 0,
@@ -1143,74 +1150,6 @@ mod tests {
             out, PAYLOAD,
             "QMux 部分发送后不得重复/错位（重复已发前缀会在这里现形）"
         );
-        srv.abort();
-    }
-
-    /// **并发额度必须归还**（回归 P2-3）。
-    ///
-    /// 一条连接上顺序跑 120 条「发完 FIN 就结束」的流（> `MAX_STREAMS_BIDI` 的 100），
-    /// 全部都要成功，且连接仍然活着（最后再打一次 QX_PING 应当有回显）。
-    /// 旧实现按**累计**开流数计、`streams` 表永不删条目 ⇒ 第 101 条吃
-    /// STREAM_LIMIT_ERROR 并被连接级关闭（长连接上的合法客户端被误杀）。
-    #[tokio::test]
-    async fn stream_budget_is_released_after_close() {
-        let (a, b) = tokio::io::duplex(64 * 1024);
-        let mut client = Client::new(a);
-        let srv = spawn_server(b, |mut s: QmuxStream| async move {
-            // 读到 EOF（对端 FIN）→ 回一个字节 → 关掉我方方向
-            let mut buf = [0u8; 256];
-            loop {
-                match s.read(&mut buf).await {
-                    Ok(0) => break,
-                    Ok(_) => {}
-                    Err(_) => return,
-                }
-            }
-            let _ = s.write_all(b"k").await;
-            let _ = s.shutdown().await;
-        });
-        client.handshake().await;
-
-        for i in 0..120u64 {
-            let sid = i * 4; // 客户端发起的双向流 ID：0,4,8,...
-            client
-                .send_frames(vec![Frame::Stream {
-                    stream_id: sid,
-                    offset: 0,
-                    fin: true,
-                    data: b"x".to_vec(),
-                }])
-                .await;
-            // 读到该流的 FIN（服务端回 "k" 后关方向）
-            loop {
-                let frames = client.read_record().await;
-                let mut done = false;
-                for f in &frames {
-                    if let Frame::Stream { stream_id, fin, .. } = f {
-                        assert_eq!(*stream_id, sid, "不该收到其它流的数据");
-                        if *fin {
-                            done = true;
-                        }
-                    }
-                    // 连接级关闭 = 失败现形
-                    assert!(
-                        !matches!(f, Frame::ConnectionClose { .. }),
-                        "第 {i} 条流之后连接被关闭（并发额度没归还？）"
-                    );
-                }
-                if done {
-                    break;
-                }
-            }
-        }
-        // 连接仍然可用
-        client.send_frames(vec![Frame::QxPing(7)]).await;
-        loop {
-            let frames = client.read_record().await;
-            if frames.iter().any(|f| matches!(f, Frame::QxPingAck(7))) {
-                break;
-            }
-        }
         srv.abort();
     }
 

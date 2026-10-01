@@ -455,6 +455,37 @@ mod tests {
         assert!(!enabled_for(&live, &lc, "/up/x.txt"), "默认必须不接管");
     }
 
+    /// 上传闸门必须跟**当前**配置走（审计 C-4）。
+    ///
+    /// 旧实现只看建连时的快照：h1/h2 的长连接能活几小时，期间面板「关上传」不生效。
+    /// 这条测试在**同一份 live** 上把 `enable_upload` 打开/关掉，判定要立刻翻转 ——
+    /// 没有它，「改回读快照」这种退化不会有测试变红。
+    #[test]
+    fn enabled_for_follows_live_config() {
+        let toml_text = "[[listeners]]\naddress = \"127.0.0.1\"\nport = 1\nroot = \"/tmp\"\nautoindex = { enabled = true, enable_upload = false, paths = [\"/up\"] }\n";
+        let cfg: crate::config::Config = ::toml::from_str(toml_text).expect("parse");
+        let lc = cfg.listeners[0].clone();
+        let live = std::sync::Arc::new(crate::server::live_config::LiveConfig::new(
+            cfg,
+            std::path::PathBuf::from("/tmp/crucible-upload-live.toml"),
+        ));
+        assert!(
+            !enabled_for(&live, &lc, "/up/x.txt"),
+            "enable_upload=false 时必须不接管"
+        );
+
+        // 模拟面板保存后的热更新（同一份 live 的当前配置变了）
+        let mut cfg2 = (*live.snapshot()).clone();
+        cfg2.listeners[0].autoindex.enable_upload = true;
+        live.replace(cfg2);
+        assert!(
+            enabled_for(&live, &lc, "/up/x.txt"),
+            "打开后必须立刻生效（否则长连接上关/开上传都无效）"
+        );
+        // 路径边界仍按当前配置判：不在 paths 里的路径不接管
+        assert!(!enabled_for(&live, &lc, "/other/x.txt"));
+    }
+
     #[test]
     fn response_carries_offset_header() {
         let r = resp(StatusCode::ACCEPTED, "partial", Some(1234));

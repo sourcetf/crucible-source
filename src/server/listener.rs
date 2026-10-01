@@ -19,7 +19,10 @@ fn listener_matches_local(l: &ListenerConfig, local: SocketAddr) -> bool {
     let ip = local.ip();
     let parse = |s: &str| s.trim().parse::<std::net::IpAddr>().ok();
     if let Some(v6) = l.address_v6.as_deref().and_then(parse) {
-        if v6 == ip {
+        // 通配 v6（`::`）匹配同族任意本地地址 —— 与 `address = "0.0.0.0"` 对称。
+        // 这条是本轮单测抓出来的：此前只做精确相等，`address_v6 = "::"` 的 listener
+        // 会**匹配不上任何 v6 连接**（生产配置没有 address_v6，所以真机验证看不见这个缺口）。
+        if v6 == ip || (v6.is_unspecified() && ip.is_ipv6()) {
             return true;
         }
     }
@@ -218,4 +221,61 @@ pub fn hsts_header_value() -> &'static str {
 
 pub fn should_redirect_http_to_https(lc: &ListenerConfig) -> bool {
     lc.ssl.is_some()
+}
+
+#[cfg(test)]
+mod match_tests {
+    use super::*;
+
+    fn lc(address: &str, address_v6: Option<&str>, port: u16) -> ListenerConfig {
+        let mut l = ListenerConfig::default();
+        l.address = address.into();
+        l.address_v6 = address_v6.map(|s| s.to_string());
+        l.port = port;
+        l
+    }
+
+    /// 连接分发按「端口 + **实际绑定的地址**」选配置（审计 C-2）：
+    /// 同端口不同地址的两个 listener 必须各认自己的 socket。
+    #[test]
+    fn matches_by_port_and_address() {
+        // 精确匹配
+        assert!(listener_matches_local(
+            &lc("127.0.0.1", None, 8443),
+            "127.0.0.1:8443".parse().unwrap()
+        ));
+        // 端口不同 ⇒ 不匹配
+        assert!(!listener_matches_local(
+            &lc("127.0.0.1", None, 8443),
+            "127.0.0.1:9443".parse().unwrap()
+        ));
+        // 地址不同 ⇒ 不匹配（否则同端口两个站点会串）
+        assert!(!listener_matches_local(
+            &lc("127.0.0.1", None, 8443),
+            "127.0.0.2:8443".parse().unwrap()
+        ));
+        // 通配 v4 匹配任意 v4 本地地址（生产就是 0.0.0.0）
+        assert!(listener_matches_local(
+            &lc("0.0.0.0", None, 8443),
+            "127.0.0.1:8443".parse().unwrap()
+        ));
+        assert!(listener_matches_local(
+            &lc("0.0.0.0", None, 8443),
+            "83.229.125.81:8443".parse().unwrap()
+        ));
+        // 通配 v4 **不**匹配 v6 本地地址
+        assert!(!listener_matches_local(
+            &lc("0.0.0.0", None, 8443),
+            "[::1]:8443".parse().unwrap()
+        ));
+        // address_v6 参与匹配
+        assert!(listener_matches_local(
+            &lc("0.0.0.0", Some("::"), 8443),
+            "[::1]:8443".parse().unwrap()
+        ));
+        assert!(listener_matches_local(
+            &lc("0.0.0.0", Some("::1"), 8443),
+            "[::1]:8443".parse().unwrap()
+        ));
+    }
 }

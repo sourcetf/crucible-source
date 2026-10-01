@@ -2152,3 +2152,31 @@ socket 不重建）；② 旧 socket 被**主动退休**（旧代码会一直绑
 「换地址」这类验证必须挑一个本机确实可绑的地址，或像这里一样把失败路径当作验证目标。
 
 （验证脚本 `_vfy_c2.py` 每次都会还原 config.toml；本次已还原并复验生产 5 个 listener 正常。）
+
+### 21.31 补上 C-2 / C-4 的判别性单测（我欠的账）+ 交叉特性配置回归
+
+**为什么这三条测试值得单独写**：C-2（绑定键）与 C-4（闸门读 live）都只做了真机验证 ——
+真机验证证明「现在是对的」，但**挡不住**以后有人把它们改回去。三条测试各钉一个退化方向：
+
+1. `server::bind_key_tests::bind_key_includes_address_v6_and_port`：把「同端口不同地址 ⇒
+   不同键」钉住 —— 没有它，有人把 `bind_key` 简化成 `port.to_string()`（就是 C-2 的旧行为）
+   不会有任何测试变红；同时断言同参数**稳定**（去重与存活判定依赖它）。
+2. `listener::match_tests::matches_by_port_and_address`：连接分发选配置的判据 ——
+   精确匹配、端口不同不匹配、地址不同不匹配（否则同端口两个站点会串）、
+   通配 `0.0.0.0` 匹配任意 v4 本地地址（生产就是这种）但**不**匹配 v6 本地地址、
+   `address_v6` 参与匹配。
+3. `upload_api::tests::enabled_for_follows_live_config`（C-4）：在**同一份 live** 上把
+   `enable_upload` 从 false 翻到 true，断言判定**立刻翻转**，并保留路径边界断言 ——
+   旧实现只看建连快照，这条会红。
+
+**顺带**：本轮把「rustls-only（不带 boring）」的 `cargo check` 与 `cargo test` 也放进了同一次
+回归（我这些改动动了 `mod.rs`/`listener.rs`/`upload_api.rs`/`h3.rs`，必须确认不带 BoringSSL 的
+配置照样编译与通过），并在脚本末尾回收 `target/debug`（`cargo check` 的 dev 产物，磁盘长期 95%）。
+
+**这一轮单测立刻抓到一个真缺口**（值得记）：`listener_matches_local` 里 `address_v6 = "::"`
+（通配 v6）没被当成通配 —— 只做精确相等 ⇒ 配了 `address_v6 = "::"` 的 listener **匹配不上任何
+v6 连接**（`0.0.0.0` 那侧是对称处理过的，v6 这侧漏了）。生产配置没有 `address_v6`，所以
+真机验证看不见它；是刚写的单测把它逼出来的。已修（`v6.is_unspecified() && ip.is_ipv6()`）。
+
+另外把上一轮标了 `#[ignore]` 的 QMux「部分发送重复前缀」用例**改成接收驱动版**（额度按已收字节
+推进 + 总超时），消除了导致假红的竞态，现在它是这条 P1 修复的真正回归测试。

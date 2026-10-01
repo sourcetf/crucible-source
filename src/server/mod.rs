@@ -640,6 +640,54 @@ root = "/tmp/echcheck"
     }
 }
 
+#[cfg(test)]
+mod bind_key_tests {
+    use crate::config::ListenerConfig;
+
+    /// 绑定键必须**含地址**（审计 C-2）。
+    ///
+    /// 只按 port 判的后果是真机实测过的那种静默失效：改 `address` 后 reload 报成功、
+    /// socket 不重建。这条测试把「同端口不同地址 ⇒ 不同键」钉住，没有它，
+    /// 有人把 bind_key 简化成 `port.to_string()` 也不会有测试变红。
+    #[test]
+    fn bind_key_includes_address_v6_and_port() {
+        let mut a = ListenerConfig::default();
+        a.address = "0.0.0.0".into();
+        a.port = 8443;
+
+        let mut same = a.clone();
+        assert_eq!(
+            crate::server::bind_key(&a),
+            crate::server::bind_key(&same),
+            "同参数必须稳定（去重/存活判定依赖它）"
+        );
+
+        same = a.clone();
+        same.address = "127.0.0.1".into();
+        assert_ne!(
+            crate::server::bind_key(&a),
+            crate::server::bind_key(&same),
+            "同端口不同地址必须是不同的键（否则改地址不重建 socket）"
+        );
+
+        same = a.clone();
+        same.address_v6 = Some("::".into());
+        assert_ne!(
+            crate::server::bind_key(&a),
+            crate::server::bind_key(&same),
+            "address_v6 必须参与键"
+        );
+
+        same = a.clone();
+        same.port = 9443;
+        assert_ne!(
+            crate::server::bind_key(&a),
+            crate::server::bind_key(&same),
+            "端口必须参与键"
+        );
+    }
+}
+
 #[cfg(all(test, feature = "tls_boring"))]
 mod capacity_tests {
     /// acceptor 缓存上限必须 ≥ 允许的 listener 数。
