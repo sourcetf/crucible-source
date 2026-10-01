@@ -902,3 +902,19 @@ zone 0644、目录里无 `.tmp` 残留；单测 **214/214**（新增原子写用
 先补配置恢复站点，再删掉那条校验（检查改到生效配置侧、只 warn）。
 **新增 `--check-config`**（加载+校验后退出）：部署流程改为「build → 预检（新二进制 × 生产配置）→
 停-换-起」。这是同一个坑第二次踩，所以写进流程。本次部署已按新流程执行（预检 rc=0 → 复验全绿）。
+
+---
+
+### Session 1008 (2026-10-01) — 进展 27（QMux 并发额度归还 + 上传闸门改读 live 配置）
+
+**P2-3**：QMux 的 `initial_max_streams_bidi`（100）此前按**累计**开流数计且 `streams` 表永不删
+⇒ 一条连接总共只能跑 100 条流，第 101 条断连。现在按**当前活着的流**判，双向结束（FIN 两侧 /
+RESET）就摘掉条目归还额度；回归测试顺序跑 120 条流并要求连接仍可用。
+
+**C-4**：上传闸门与落盘 root 改读 **live 当前配置**（新增 `live_config::listener_by_port`），
+`enabled_for`/`handle`/`handle_stream`/`handle_bytes` 都加了 `live` 参数 —— 此前长连接上
+「面板关上传/改并发/改 root」不生效，而上传是写盘面。
+
+测试 244 passed / 0 failed / 1 ignored，部署走「`--check-config` 预检 → 停 → 换 → 起」，复验全绿。
+剩下的审计项只有 **C-2**（listener 只按 port 去重：改 address 不重建 socket、同端口不同地址的
+第二个 listener 静默不绑）与 B-F2（`listeners_allow` 未配置时不告警），下一轮处理。

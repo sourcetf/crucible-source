@@ -2082,3 +2082,30 @@ config OK: /crucible/config.toml (listeners=5, apps=18)
 部署流程从此变成：**build → 预检（新二进制 × 当前生产配置）→ 通过才停-换-起**。
 这是同一个坑第二次踩（第一次是 `autoindex.paths = ["/"]`），所以把它写进流程而不是靠记性。
 本次部署就是这么做的：预检 rc=0 → 换二进制 → 1 实例、h1/h2/h3 全 200、ECH accepted、DNS 正常。
+
+### 21.29 QMux 并发额度归还（P2-3）+ 上传闸门与落盘 root 改读 live 配置（C-4）
+
+**P2-3（QMux 流数被当成「累计开流数」）**：`initial_max_streams_bidi` 是**并发**额度
+（RFC 9000 §4.6），而实现里是单调计数器 `peer_bidi_opened` 且 `streams` 表**永不删条目** ——
+一条 QMux 连接**总共**只能跑 100 条流，第 101 条直接 `STREAM_LIMIT_ERROR` 并把连接关掉
+（长连接上的合法客户端被误杀）。修法：
+* 额度判据改成「**当前活着的流**数」（判定时正持有 `streams` 锁，`len()` 与判定天然一致）；
+* 新增 `Conn::maybe_retire_stream`：双向都收到/发出 FIN（或对端 STOP_SENDING 且我已 FIN）
+  就把条目从表里摘掉、归还额度，挂在三处——收到对端 FIN、我方 FIN 发完、收到 RESET_STREAM；
+* 删掉已无用的 `peer_bidi_opened` 字段。
+* 回归测试 `stream_budget_is_released_after_close`：**顺序跑 120 条流**（>100），全部要成功，
+  且最后再打一次 QX_PING 仍要有回显（连接没被关）。旧实现下第 101 条就会断连。
+
+**C-4（请求期配置冻结）**：上传闸门尺寸取自 `lc.autoindex.upload_threads`，而 `lc` 是**建连时**
+的快照 —— h1/h2 长连接可存活数小时，期间面板「关上传 / 收紧并发 / 改 root」只对新连接生效，
+旧连接照旧收上传、往旧 root 写。上传是**写盘面**，`enable_upload: true → false` 不能有窗口。
+修法：
+* `live_config::listener_by_port(live, port)`：按端口取**当前生效**的 listener 配置；
+* `upload_api::enabled_for` 与三个入口（`handle`/`handle_stream`/`handle_bytes`）加 `live` 参数，
+  `handle` 进来就按端口取当前配置（取不到才回退调用方的快照），闸门与落盘 root 都用它；
+* `enabled_for` 同样按当前配置判 —— 否则「已关上传」的连接连 405 分流都不会走。
+* 7 处调用点（h1 ×1、h2 ×3、h3 ×3）同步传 `live`；单测里那个用默认配置断言「不接管」的用例
+  改成构造最小 `LiveConfig`（新签名要求）。
+
+测试：**244 passed / 0 failed / 1 ignored**（P2-3 与 https_rr 两条新用例在内），已按新流程部署
+（`--check-config` 预检 → 停 → 换 → 起），复验 h1/h2/h3 全 200、ECH accepted、DNS、PHP。

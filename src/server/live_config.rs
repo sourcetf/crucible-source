@@ -214,6 +214,18 @@ impl LiveConfig {
 
 pub type SharedLive = Arc<LiveConfig>;
 
+/// 按端口取**当前生效**的 listener 配置（`None` = 该端口已从配置里删掉）。
+///
+/// 用途：请求路径上的决策（上传闸门、落盘 root 等）必须用**现在**的配置，而不是
+/// 建连时那份快照 —— h1/h2 的长连接可以活几小时，期间面板改的配置不会自己生效。
+pub fn listener_by_port(live: &LiveConfig, port: u16) -> Option<crate::config::ListenerConfig> {
+    live.snapshot()
+        .listeners
+        .iter()
+        .find(|l| l.port == port)
+        .cloned()
+}
+
 /// 周期性监视 config.toml mtime（OpenBSD 无可靠 inotify 时用轮询即可）。
 pub fn spawn_mtime_watcher(live: Arc<LiveConfig>, interval: Duration) {
     tokio::spawn(async move {

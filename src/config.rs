@@ -1674,6 +1674,22 @@ root = {resolved:?}
             .is_ok());
     }
 
+    /// `[[dns.https_rr]].name` 为空 ⇒ 渲染出的 HTTPS 记录名是空串（等于往 zone 里写垃圾）。
+    #[test]
+    fn empty_https_rr_name_is_rejected() {
+        let base = "[[listeners]]\naddress = \"127.0.0.1\"\nport = 14443\nroot = \"/tmp/hr\"\n";
+        let mk = |extra: &str| -> Config {
+            toml::from_str(&format!("{base}{extra}")).expect("parse")
+        };
+        let e = mk("[[dns.https_rr]]\nname = \"\"\nech = true\n")
+            .validate()
+            .expect_err("https_rr 空 name 必须报错");
+        assert!(format!("{e}").contains("https_rr"), "{e}");
+        assert!(mk("[[dns.https_rr]]\nname = \"v.example.com\"\nech = true\n")
+            .validate()
+            .is_ok());
+    }
+
     /// CONNECT-UDP（公网 UDP 中继）必须**默认关闭**，且能按 listener 打开。
     ///
     /// 这条断言的意义：中继面对运维必须是显式决定 —— 旧行为是「不配任何东西就可用」，

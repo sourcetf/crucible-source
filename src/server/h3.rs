@@ -711,7 +711,7 @@ mod imp {
                 http::Method::PUT | http::Method::PATCH | http::Method::POST
             ) && !apps::would_handle(&lc, &pre_path)
                 && !would_proxy(&lc, &pre_path)
-                && crate::server::upload_api::enabled_for(&lc, &pre_path);
+                && crate::server::upload_api::enabled_for(&live, &lc, &pre_path);
 
             let method = req.method().as_str().to_string();
             let t0 = std::time::Instant::now();
@@ -1316,11 +1316,11 @@ use chunked uploads (Content-Range) or HTTP/1.1 for larger bodies",
             http::Method::PUT | http::Method::PATCH | http::Method::POST
         ) && !apps::would_handle(&lc, path)
             && !would_proxy(&lc, path)
-            && crate::server::upload_api::enabled_for(&lc, path);
+            && crate::server::upload_api::enabled_for(&live, &lc, path);
         if upload_like {
             // 流式上传：body 不进内存，逐帧落盘（上限 2GiB，见 upload_resume::MAX_UPLOAD_BYTES）。
             return tag(
-                crate::server::upload_api::handle_stream(req, &lc, peer).await,
+                crate::server::upload_api::handle_stream(req, &live, &lc, peer).await,
                 "upload",
             );
         }
@@ -1353,10 +1353,10 @@ use chunked uploads (Content-Range) or HTTP/1.1 for larger bodies",
         if matches!(
             *req.method(),
             http::Method::PUT | http::Method::PATCH | http::Method::POST
-        ) && crate::server::upload_api::enabled_for(&lc, path)
+        ) && crate::server::upload_api::enabled_for(&live, &lc, path)
         {
             return tag(
-                crate::server::upload_api::handle_bytes(req, &lc, peer).await,
+                crate::server::upload_api::handle_bytes(req, &live, &lc, peer).await,
                 "upload",
             );
         }

@@ -9,6 +9,8 @@
 //! * 鉴权/限速/ACL 由调用方（h1/h2/h3 的 dispatcher）在此之前完成 —— 本模块只管落盘语义。
 
 use crate::config::ListenerConfig;
+use crate::server::live_config::LiveConfig;
+use std::sync::Arc;
 use once_cell::sync::Lazy;
 use bytes::Bytes;
 use http::{header, Method, Request, Response, StatusCode};
@@ -94,7 +96,11 @@ fn hidden_segment(decoded_path: &str) -> Option<String> {
 }
 
 /// 该请求是否应交给上传处理（调用方在 ACL/限速/鉴权之后、静态分发之前问一次）。
-pub fn enabled_for(lc: &ListenerConfig, path: &str) -> bool {
+pub fn enabled_for(live: &Arc<LiveConfig>, lc: &ListenerConfig, path: &str) -> bool {
+    // 判据用**当前生效**的 listener 配置（连接期快照只作回退）：否则「面板里关掉上传」
+    // 之后，已建立的长连接仍会被当成「开了上传」的端口。
+    let cur = crate::server::live_config::listener_by_port(live, lc.port);
+    let lc = cur.as_ref().unwrap_or(lc);
     let a = &lc.autoindex;
     if !a.enabled || !a.enable_upload {
         return false;
@@ -120,11 +126,20 @@ fn resp(status: StatusCode, msg: &str, offset: Option<u64>) -> Response<BoxBody>
 }
 
 /// 处理上传。body 泛型化以便 h1（Incoming）/h2/h3（Bytes）共用同一条路径。
-pub async fn handle<B>(req: Request<B>, lc: &ListenerConfig, peer: std::net::SocketAddr) -> Response<BoxBody>
+pub async fn handle<B>(
+    req: Request<B>,
+    live: &Arc<LiveConfig>,
+    lc: &ListenerConfig,
+    peer: std::net::SocketAddr,
+) -> Response<BoxBody>
 where
     B: Body<Data = Bytes> + Unpin + Send + 'static,
     B::Error: std::fmt::Display,
 {
+    // 闸门尺寸与落盘 root 都取**当前生效**的配置：`lc` 是建连快照，长连接下可能已经过期
+    //（面板关上传 / 改 upload_threads / 改 root 都应当立刻生效，见文件头说明）。
+    let lc_now = crate::server::live_config::listener_by_port(live, lc.port);
+    let lc = lc_now.as_ref().unwrap_or(lc);
     let path = req.uri().path().to_string();
     let method = req.method().clone();
     if !matches!(method, Method::PUT | Method::PATCH | Method::POST) {
@@ -367,12 +382,13 @@ where
 /// （逻辑仍只有一份），再把响应体收集回 `Bytes`（响应都是很小的文案，收集无成本）。
 pub async fn handle_bytes(
     req: Request<Bytes>,
+    live: &Arc<LiveConfig>,
     lc: &ListenerConfig,
     peer: std::net::SocketAddr,
 ) -> Response<Bytes> {
     let (parts, body) = req.into_parts();
     let full_req = Request::from_parts(parts, Full::new(body));
-    let resp = handle(full_req, lc, peer).await;
+    let resp = handle(full_req, live, lc, peer).await;
     let (parts, body) = resp.into_parts();
     let bytes = BodyExt::collect(body)
         .await
@@ -388,6 +404,7 @@ pub async fn handle_bytes(
 /// 大文件上传可以逐帧落盘（上限 `MAX_UPLOAD_BYTES`=2GiB），而不是先撞 `REQUEST_BODY_CAP`(8MiB)。
 pub async fn handle_stream<B>(
     req: Request<B>,
+    live: &Arc<LiveConfig>,
     lc: &ListenerConfig,
     peer: std::net::SocketAddr,
 ) -> Response<Bytes>
@@ -395,7 +412,7 @@ where
     B: Body<Data = Bytes> + Unpin + Send + 'static,
     B::Error: std::fmt::Display,
 {
-    let resp = handle(req, lc, peer).await;
+    let resp = handle(req, live, lc, peer).await;
     let (parts, body) = resp.into_parts();
     let bytes = BodyExt::collect(body)
         .await
@@ -426,9 +443,16 @@ mod tests {
 
     #[test]
     fn enabled_only_when_configured() {
-        // 用默认配置构造：enable_upload 默认 false → 必须不接管
-        let lc = crate::config::ListenerConfig::default();
-        assert!(!enabled_for(&lc, "/up/x.txt"));
+        // `enabled_for` 现在按 live 里的**当前**配置判（连接期快照只作回退），
+        // 所以这里搭一个最小的 LiveConfig：默认 `enable_upload = false` → 必须不接管。
+        let toml_text = "[[listeners]]\naddress = \"127.0.0.1\"\nport = 1\nroot = \"/tmp\"\n";
+        let cfg: crate::config::Config = ::toml::from_str(toml_text).expect("parse");
+        let lc = cfg.listeners[0].clone();
+        let live = std::sync::Arc::new(crate::server::live_config::LiveConfig::new(
+            cfg,
+            std::path::PathBuf::from("/tmp/crucible-upload-test.toml"),
+        ));
+        assert!(!enabled_for(&live, &lc, "/up/x.txt"), "默认必须不接管");
     }
 
     #[test]

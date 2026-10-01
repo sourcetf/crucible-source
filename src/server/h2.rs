@@ -270,7 +270,7 @@ where
                 http::Method::PUT | http::Method::PATCH | http::Method::POST
             ) && !crate::server::apps::would_handle(&lc, &pre_path)
                 && !would_proxy(&lc, &pre_path)
-                && crate::server::upload_api::enabled_for(&lc, &pre_path);
+                && crate::server::upload_api::enabled_for(&live, &lc, &pre_path);
             let req: Request<H2Body> = if is_upload_like {
                 // 注意：这里必须用**泛型**的 `combinators::BoxBody::new`（错误类型擦除成
                 // Box<dyn Error>），不能用 h1 的 `BoxBody` 别名（那个的 Error 是 Infallible）。
@@ -927,11 +927,11 @@ async fn h2_tail(
         http::Method::PUT | http::Method::PATCH | http::Method::POST
     ) && !crate::server::apps::would_handle(&lc, &path)
         && !would_proxy(&lc, &path)
-        && crate::server::upload_api::enabled_for(&lc, &path);
+        && crate::server::upload_api::enabled_for(&live, &lc, &path);
     if upload_like {
         // 流式上传：body 不进内存，逐帧落盘（上限 2GiB，见 upload_resume::MAX_UPLOAD_BYTES）。
         return tag(
-            crate::server::upload_api::handle_stream(req, &lc, peer).await,
+            crate::server::upload_api::handle_stream(req, &live, &lc, peer).await,
             "upload",
         );
     }
@@ -962,10 +962,10 @@ async fn h2_tail(
     if matches!(
         *req.method(),
         http::Method::PUT | http::Method::PATCH | http::Method::POST
-    ) && crate::server::upload_api::enabled_for(&lc, &path)
+    ) && crate::server::upload_api::enabled_for(&live, &lc, &path)
     {
         return tag(
-            crate::server::upload_api::handle_bytes(req, &lc, peer).await,
+            crate::server::upload_api::handle_bytes(req, &live, &lc, peer).await,
             "upload",
         );
     }

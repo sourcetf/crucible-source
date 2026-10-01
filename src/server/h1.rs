@@ -591,10 +591,10 @@ async fn dispatch_tail(
     if matches!(
         *req.method(),
         http::Method::PUT | http::Method::PATCH | http::Method::POST
-    ) && crate::server::upload_api::enabled_for(&lc, &path)
+    ) && crate::server::upload_api::enabled_for(&live, &lc, &path)
     {
         return tag(
-            crate::server::upload_api::handle(req, &lc, peer).await,
+            crate::server::upload_api::handle(req, &live, &lc, peer).await,
             "upload",
         );
     }

@@ -122,7 +122,6 @@ struct Conn {
     pending_stream_updates: Mutex<HashMap<u64, u64>>,
     /// 待发送的连接级窗口更新（MAX_DATA）。
     pending_max_data: Mutex<Option<u64>>,
-    peer_bidi_opened: AtomicU64,
     closed: AtomicBool,
     last_activity: Mutex<Instant>,
 }
@@ -241,6 +240,30 @@ impl Conn {
             if self.push_frames(vec![Frame::MaxData(lim)]).is_empty() {
                 *self.pending_max_data.lock() = None;
             }
+        }
+    }
+
+    /// 双向都结束（或对端 RESET 且我们已收尾）时把流从表里移除，**归还并发额度**。
+    ///
+    /// 是「从表里移除」而不是析构：应用侧可能仍持有 `QmuxStream`（Arc<StreamState>），
+    /// 读已收数据、写剩余数据都不受影响；只是它不再计入并发额度。此后对端若再对该
+    /// stream_id 发 STREAM，会被当成**新流**（offset 必须从 0 起）——而「FIN 之后再发
+    /// STREAM」本来就违反 §4.1 的约定。
+    fn maybe_retire_stream(&self, stream_id: u64) {
+        let done = {
+            let map = self.streams.lock();
+            match map.get(&stream_id) {
+                Some(st) => {
+                    let c = st.core.lock();
+                    // 双向都收到/发出 FIN；或对端要求停发（STOP_SENDING）且我们已把 FIN 发完。
+                    (c.fin && c.fin_sent) || (c.send_stopped && c.fin)
+                }
+                None => false,
+            }
+        };
+        if done {
+            self.streams.lock().remove(&stream_id);
+            log::debug!("qmux: 流 {stream_id} 双向结束，归还并发额度");
         }
     }
 
@@ -464,6 +487,8 @@ impl AsyncWrite for QmuxStream {
                 data: Vec::new(),
             });
         }
+        // 两个方向都结束了就把流从表里摘掉（归还并发额度，见 `maybe_retire_stream`）。
+        this.conn.maybe_retire_stream(this.id);
         Poll::Ready(Ok(()))
     }
 }
@@ -488,7 +513,6 @@ where
         peer_max_record: AtomicU64::new(DEFAULT_MAX_RECORD_SIZE),
         pending_stream_updates: Mutex::new(HashMap::new()),
         pending_max_data: Mutex::new(None),
-        peer_bidi_opened: AtomicU64::new(0),
         closed: AtomicBool::new(false),
         last_activity: Mutex::new(Instant::now()),
     });
@@ -687,11 +711,16 @@ where
                 if let Some(s) = map.get(&stream_id) {
                     Arc::clone(s)
                 } else {
-                    let opened = conn.peer_bidi_opened.fetch_add(1, Ordering::Relaxed) + 1;
-                    if opened > MAX_STREAMS_BIDI {
+                    // **并发**额度（RFC 9000 §4.6：`initial_max_streams_bidi` 是同时在飞的流数，
+                    // 流关闭后归还）。旧实现用单调计数器 `peer_bidi_opened` 且 `streams` 表
+                    // 永不删条目 ⇒ 一条连接**总共**只能跑 100 条流，第 101 条直接
+                    // STREAM_LIMIT_ERROR 并把连接关掉（长连接上的合法客户端被误杀）。
+                    // 现在按当前活着的流数判；双向结束时 `maybe_retire_stream` 删条目、归还额度。
+                    // （此处正持有 `streams` 锁，`len()` 与判定一致，无需再加锁。）
+                    if map.len() as u64 >= MAX_STREAMS_BIDI {
                         return Err(ProtoError::new(
                             err::STREAM_LIMIT_ERROR,
-                            "超过 initial_max_streams_bidi",
+                            "并发流数超过 initial_max_streams_bidi",
                         ));
                     }
                     let (sl, cl) = conn
@@ -778,6 +807,9 @@ where
                     }
                 }
             }
+            if fin {
+                conn.maybe_retire_stream(stream_id);
+            }
         }
         Frame::MaxData(v) => {
             conn.conn_sent.lock().1 = v;
@@ -814,6 +846,8 @@ where
                     let _ = tx.send(StreamEvent::Reset(error_code));
                 }
             }
+            drop(map);
+            conn.maybe_retire_stream(stream_id);
         }
         Frame::ResetStreamAt { .. } => {
             // §9.2 扩展：数据已按序到达，「可靠部分」即全部已收数据 ⇒ 按 RESET_STREAM 语义处理
@@ -1109,6 +1143,74 @@ mod tests {
             out, PAYLOAD,
             "QMux 部分发送后不得重复/错位（重复已发前缀会在这里现形）"
         );
+        srv.abort();
+    }
+
+    /// **并发额度必须归还**（回归 P2-3）。
+    ///
+    /// 一条连接上顺序跑 120 条「发完 FIN 就结束」的流（> `MAX_STREAMS_BIDI` 的 100），
+    /// 全部都要成功，且连接仍然活着（最后再打一次 QX_PING 应当有回显）。
+    /// 旧实现按**累计**开流数计、`streams` 表永不删条目 ⇒ 第 101 条吃
+    /// STREAM_LIMIT_ERROR 并被连接级关闭（长连接上的合法客户端被误杀）。
+    #[tokio::test]
+    async fn stream_budget_is_released_after_close() {
+        let (a, b) = tokio::io::duplex(64 * 1024);
+        let mut client = Client::new(a);
+        let srv = spawn_server(b, |mut s: QmuxStream| async move {
+            // 读到 EOF（对端 FIN）→ 回一个字节 → 关掉我方方向
+            let mut buf = [0u8; 256];
+            loop {
+                match s.read(&mut buf).await {
+                    Ok(0) => break,
+                    Ok(_) => {}
+                    Err(_) => return,
+                }
+            }
+            let _ = s.write_all(b"k").await;
+            let _ = s.shutdown().await;
+        });
+        client.handshake().await;
+
+        for i in 0..120u64 {
+            let sid = i * 4; // 客户端发起的双向流 ID：0,4,8,...
+            client
+                .send_frames(vec![Frame::Stream {
+                    stream_id: sid,
+                    offset: 0,
+                    fin: true,
+                    data: b"x".to_vec(),
+                }])
+                .await;
+            // 读到该流的 FIN（服务端回 "k" 后关方向）
+            loop {
+                let frames = client.read_record().await;
+                let mut done = false;
+                for f in &frames {
+                    if let Frame::Stream { stream_id, fin, .. } = f {
+                        assert_eq!(*stream_id, sid, "不该收到其它流的数据");
+                        if *fin {
+                            done = true;
+                        }
+                    }
+                    // 连接级关闭 = 失败现形
+                    assert!(
+                        !matches!(f, Frame::ConnectionClose { .. }),
+                        "第 {i} 条流之后连接被关闭（并发额度没归还？）"
+                    );
+                }
+                if done {
+                    break;
+                }
+            }
+        }
+        // 连接仍然可用
+        client.send_frames(vec![Frame::QxPing(7)]).await;
+        loop {
+            let frames = client.read_record().await;
+            if frames.iter().any(|f| matches!(f, Frame::QxPingAck(7))) {
+                break;
+            }
+        }
         srv.abort();
     }
 
