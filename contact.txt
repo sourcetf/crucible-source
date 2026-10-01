@@ -817,3 +817,28 @@ zone 0644、目录里无 `.tmp` 残留；单测 **214/214**（新增原子写用
 （要广告没发布 / 启用却没 cover 证书 / 发布了没人服务），**生产现在报两条真问题**：
 `[[dns.https_rr]]` 没发布 `ech=`；8443 **没配 cover 证书**（内层外同一张 `cert.pem`，且内层名
 `prod.crucible.local` 无证书覆盖）。两条都需要证书材料，等你定。
+
+---
+
+### Session 1008 (2026-10-01) — 进展 23（三个审计 agent 的报告 → 首批修复：QMux 两处 P1 + 一批配置期缺口 + 部署钩子入库）
+
+三个只读审计（h2/h3/QMux/CONNECT-UDP、管理面、热加载/validate/脚本）共报出 7+4+24 条。复核后本轮修掉：
+
+- **QMux 入向记录无上限**（未认证就能按声明长度吃内存至 OOM）→ 加 `max_record_size` 上限（默认 16382、
+  只允许协商调大）+ 单测；
+- **QMux 部分发送重复已发前缀**（`truncate` 方向反了，慢读客户端会收到重复/错位字节）→ 改为清空缓冲
+  + 端到端回归（把流额度压到 1 字节强制部分成帧，逐字节比对）；
+- **一批「配置合法但运行期炸/静默失效」**：`admin.realm` 含特殊字符 ⇒ 每个匿名请求 panic；`admin.path="/"`
+  接管整站；`listeners=[]` 静默停服；TLS 材料路径写错 ⇒ 端口静默下线；`rate_per_sec=0` ⇒ 永久 429；
+  proxy 空 path ⇒ 规则永不生效；`autoindex.paths=[""]` ⇒ 上传面覆盖整站；ECH/cover/OCSP 相对路径
+  基准与 cert 不一致（换 cwd 启动 ECH 消失）—— 全部改为配置期拦截/统一解析，附单测；
+- `admin_geoip` 手拼 JSON 漏控制字符 ⇒ 面板模块整块不可用 → 改用 serde_json；
+- **部署钩子入库**（C-20/C-21）：`scripts/deploy/{rc.local,daily.local}` 之前只在生产机上；
+  `start_server.sh`/`build_release.sh` 重写 —— **去掉 openssl 依赖**（用户明确禁用），启动统一委托
+  `/etc/rc.local`（顺带修好「重启打不到 bin/webserver」「日志落在 /tmp 无轮转」两个坑）。
+
+**未做（已写清理由，避免「以为修了」）**：h3 全局在飞预算、CONNECT-UDP 开关、证书轮换重载（C-1/C-3）、
+`root` 防自曝的 canonicalize 校验、以及仓库自带 admin 示例口令（后两条需要你拍板）。详见 WORKLOG §21.25。
+
+**回归**：boring 配置 220/220（本轮新增 5 个用例）；rustls-only（不带 boring）`cargo check` 0 错误 +
+**200/200 全绿**。

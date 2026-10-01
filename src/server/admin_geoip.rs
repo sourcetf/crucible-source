@@ -702,13 +702,21 @@ fn query_param(q: &str, key: &str) -> Option<String> {
 }
 
 fn json_str(s: &str) -> String {
-    format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""))
+    // 交给 serde_json：手工拼接漏掉控制字符（`\n`/`\t`/`\r` 与其余 <0x20）时，
+    // 值里一个换行就能让整个响应不再是合法 JSON —— 前端 `JSON.parse` 立刻失败，
+    // 该面板模块直接不可用。值来源包括面板写入的 `edit.value`（`%0A` 可注入）
+    // 与外部 GeoIP 库字段；同文件的 `handle_conflict_source` 早就用 serde_json，这里与它一致。
+    serde_json::to_string(s).unwrap_or_else(|_| "\"\"".to_string())
 }
 
-/// 与 `json_str` 相同但**不带外层引号**，用于已预置引号的 JSON 字面量内部
-/// （避免出现 `""…""` 这种非法 JSON）。
+/// 与 `json_str` 相同但**不带外层引号**（用 serde_json 生成再剥引号，
+/// 控制字符与转义一次处理干净）。
 fn json_escape(s: &str) -> String {
-    s.replace('\\', "\\\\").replace('"', "\\\"")
+    let q = json_str(s);
+    q.strip_prefix('"')
+        .and_then(|x| x.strip_suffix('"'))
+        .unwrap_or(&q)
+        .to_string()
 }
 
 fn json_ok(body: String) -> Response<BoxBody> {

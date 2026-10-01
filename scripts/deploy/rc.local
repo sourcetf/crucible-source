@@ -6,8 +6,6 @@
 # （本机没有 daemon(8)，所以用 nohup 版本；要改成 rc.d 服务需先给 webserver 加
 #  自己的 pidfile，那是另一件事。）
 #
-# 为什么需要：生产实例此前是**手工 nohup 起的**，机器一重启就再也不会回来。
-# /etc/rc.local —— 开机启动 Crucible webserver（本机没有 daemon(8)，用 nohup 版本）
 #
 # 为什么需要它：生产实例此前是**手工 nohup 起的**，机器一重启就再也不会回来
 # （站点 + DNS 控制面全停，只能等人登上去手工拉起）。

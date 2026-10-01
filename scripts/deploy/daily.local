@@ -3,10 +3,6 @@
 # 部署钩子：OpenBSD /etc/daily.local —— Crucible 日志轮转（copytruncate）
 # ============================================================================
 # 安装：cp scripts/deploy/daily.local /etc/daily.local && chmod 755 /etc/daily.local
-# 为什么不用 newsyslog：它靠 **rename** 轮转，而本机没有 daemon(8)、webserver 又是
-# 前台进程由 nohup 承接 stdout —— 进程不会重开日志文件，rename 之后它仍往旧 inode 写，
-# 新文件永远空、`Z` 还会去压一个正在被写的 inode（日志静默丢失）。
-# cp + `: > log` 保持 inode 不变，进程 fd 一直有效；代价是 cp 与截断之间可能丢几行。
 # /etc/daily.local —— Crucible 日志轮转（每日 03:00 由 /etc/daily 调用）
 #
 # 为什么是「拷贝 + 清空」而不是 newsyslog：

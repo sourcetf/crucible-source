@@ -741,16 +741,33 @@ pub fn encode_record(frames: &[Frame], out: &mut Vec<u8>) {
 /// 记录解析器：从字节流里增量取记录（§3.2 的自定界）。
 ///
 /// 用法：`push(&bytes)` 累积，然后反复 `next_record()`；返回 `Ok(None)` 表示还需要更多字节。
-#[derive(Default)]
 pub struct RecordReader {
     buf: Vec<u8>,
     /// 已读到的大小（None = 还没读完 Size 字段）
     need: Option<usize>,
+    /// 允许的单条记录上限。默认 [`DEFAULT_MAX_RECORD_SIZE`]，协商 `max_record_size`
+    /// 传输参数后由 [`RecordReader::set_max_record_size`] **提高**（草案 §5.2 只允许调大）。
+    max_record_size: u64,
+}
+
+impl Default for RecordReader {
+    fn default() -> Self {
+        Self {
+            buf: Vec::new(),
+            need: None,
+            max_record_size: DEFAULT_MAX_RECORD_SIZE,
+        }
+    }
 }
 
 impl RecordReader {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// 协商后的单条记录上限（取「默认值」与「对端声明值」的较大者，对齐 §5.2 的语义）。
+    pub fn set_max_record_size(&mut self, v: u64) {
+        self.max_record_size = v.max(DEFAULT_MAX_RECORD_SIZE);
     }
 
     pub fn push(&mut self, bytes: &[u8]) {
@@ -769,6 +786,16 @@ impl RecordReader {
             let mut pos = 0usize;
             match get_varint(&self.buf, &mut pos) {
                 Ok(size) => {
+                    // **先查上限再缓冲**。旧实现把 Size 原样当作「还要再收多少字节」，
+                    // 于是任何能连上 QMux 的客户端发 8 字节 `FF..FF`（≈2^62）就能让我们
+                    // 按声明值无界涨内存 —— 未认证的 OOM。上限来自协商值
+                    //（`set_max_record_size`），默认 16382（§5.2）。
+                    if size > self.max_record_size {
+                        return Err(ProtoError::frame(format!(
+                            "记录声明长度 {size} 超过上限 {}（max_record_size）",
+                            self.max_record_size
+                        )));
+                    }
                     self.need = Some(size as usize);
                     self.buf.drain(..pos);
                 }
@@ -788,6 +815,48 @@ impl RecordReader {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 声明长度必须**先**与上限比较：超限立刻报错，绝不按声明值缓冲。
+    ///
+    /// 这是「一条未认证连接吃光内存」那个问题的回归测试：旧实现的 `next_record`
+    /// 把 Size 直接当成待收字节数，客户端发 `C0 FF FF FF FF FF FF FF FF` 即可无界占用。
+    #[test]
+    fn declared_record_size_is_capped_before_buffering() {
+        let mut r = RecordReader::new();
+        // 8 字节 varint = 2^62-1：远超上限
+        r.push(&[0xC0, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF]);
+        let e = r.next_record().expect_err("超限声明必须报错，而不是等待缓冲");
+        assert!(format!("{e}").contains("上限"), "{e}");
+        // 缓冲里最多只有我们推给它的那几个字节（**没有**按声明长度涨起来）
+        assert!(
+            r.buffered() <= 9,
+            "不得按声明长度缓冲：buffered={}",
+            r.buffered()
+        );
+
+        // 恰好等于默认上限：合法，只是还需要更多字节
+        let mut r2 = RecordReader::new();
+        let mut h = Vec::new();
+        put_varint(&mut h, DEFAULT_MAX_RECORD_SIZE);
+        r2.push(&h);
+        assert!(matches!(r2.next_record(), Ok(None)), "等于上限的长度的记录应当继续等待字节");
+
+        // 协商把上限调高后，比默认值大的记录合法
+        let mut r3 = RecordReader::new();
+        r3.set_max_record_size(DEFAULT_MAX_RECORD_SIZE + 1);
+        let mut h3 = Vec::new();
+        put_varint(&mut h3, DEFAULT_MAX_RECORD_SIZE + 1);
+        r3.push(&h3);
+        assert!(matches!(r3.next_record(), Ok(None)), "协商调高后的记录应当合法");
+
+        // 但协商值**不能低于默认**（§5.2：只允许调大）
+        let mut r4 = RecordReader::new();
+        r4.set_max_record_size(16);
+        let mut h4 = Vec::new();
+        put_varint(&mut h4, DEFAULT_MAX_RECORD_SIZE);
+        r4.push(&h4);
+        assert!(matches!(r4.next_record(), Ok(None)), "set 传入过小值时不得低于默认上限");
+    }
 
     #[test]
     fn varint_roundtrip_boundaries() {

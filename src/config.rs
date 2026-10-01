@@ -1054,10 +1054,20 @@ impl Config {
                 l.root = base.join(&l.root);
             }
             if let Some(ssl) = &mut l.ssl {
+                // 这些 TLS 材料字段必须**同一基准**：以前只有前 4 个按配置目录解析，
+                // 其余走 `ssl_material::load_bytes` 的相对路径（基准是**进程 cwd**）。
+                // 从非配置目录启动（rc.d / cron / 手工 cd 后启动）时，cert 正常而
+                // ECH/cover/OCSP 材料找不到 ⇒ ECH 静默消失、cover 构建失败，
+                // 而配置本身看不出任何问题。
                 resolve_ssl_material(&mut ssl.cert, base);
                 resolve_ssl_material(&mut ssl.key, base);
                 resolve_ssl_material(&mut ssl.cert_ec, base);
                 resolve_ssl_material(&mut ssl.key_ec, base);
+                resolve_ssl_material(&mut ssl.ech_keys, base);
+                resolve_ssl_material(&mut ssl.ech_cover_cert, base);
+                resolve_ssl_material(&mut ssl.ech_cover_key, base);
+                resolve_ssl_material(&mut ssl.ocsp_der_path, base);
+                resolve_ssl_material(&mut ssl.ech_cover_ocsp_der_path, base);
             }
             for app in &mut l.apps {
                 if let Some(d) = &app.docroot {
@@ -1139,6 +1149,22 @@ impl Config {
                 anyhow::bail!(
                     "listener {}:{}: 配了 ECH cover 证书但没有 ssl.ech_public_name —— \
 证书选择靠它区分「外层名」与「ECH 解密后的内层真实名」，缺了它必然选错证书",
+                    l.address,
+                    l.port
+                );
+            }
+            // cover 证书 + `ech = false`：容器默认证书是 **cover**，而切换回调只在
+            // `ech_accepted()` 为真时换成真实证书 —— ECH 关掉时它**永远为假**，
+            // 于是这个 listener 对外**只发 cover 证书**，真实证书一次都用不上，
+            // 客户端按本 listener 的真实名/身份校验证书会失败。这不是「配置冗余」，
+            // 是静默发错证书（`load_identity` 的注释里写明了 cover 的用途只在
+            // 「非 ECH 客户端 / ECH 被拒」这一条路径上，没有内层就无从谈起）。
+            if cover_cert && !ssl.ech {
+                anyhow::bail!(
+                    "listener {}:{}: 配了 ECH cover 证书却没有开 ssl.ech —— \
+cover 只用于「未使用 / 被拒 ECH」的连接，ECH 关闭时它会成为**唯一的**证书\
+（真实证书永不出现），客户端按真实身份校验必然失败。要么把 ssl.ech 打开并配好材料，\
+要么删掉 cover 证书",
                     l.address,
                     l.port
                 );
@@ -1257,12 +1283,166 @@ impl Config {
             }
         }
 
+        // ── 管理面 / 限流 / proxy / autoindex / TLS 材料 的成组校验 ──
+        //
+        // 这一组的共同点：**写错时配置合法、服务也起得来**，但运行期要么静默失效、
+        // 要么按最坏方式生效。每一条都对应一个已观察到的坏表现，所以放在配置期拦。
+
+        // ① 至少一个 listener。空列表能通过校验并通过 reload，随后所有 accept 循环
+        //    退出 ⇒ 进程活着、端口全空、日志只有一行 "removed from config; shutting down"
+        //    —— 面板上误删最后一个 listener 就能造出这种静默停服。
+        if self.listeners.is_empty() {
+            anyhow::bail!("listeners 为空：至少需要一个监听口（空列表会让全部 accept 循环退出，进程活着但不再服务）");
+        }
+
+        // ② admin.path：必须是以 `/` 开头的绝对路径，且不能是 `/`。
+        //    `"/"` 会让 `is_admin_path` 对**一切**路径成立（面板门接管整站：全站 401/404）；
+        //    `"admin"`（缺前导斜杠）则永不匹配 ⇒ 面板静默 404，没有任何提示。
+        {
+            let ap = self.admin.path.trim();
+            if ap.is_empty() || !ap.starts_with('/') {
+                anyhow::bail!("admin.path = {:?} 必须以 `/` 开头（否则管理面永不匹配，表现为面板静默 404）", self.admin.path);
+            }
+            if ap == "/" {
+                anyhow::bail!("admin.path 不能是 `/`：那会让管理面匹配一切路径并接管整站（所有请求都走鉴权/CSRF 门）");
+            }
+        }
+
+        // ③ realm 会被拼进 `WWW-Authenticate: Basic realm="…"`。含换行/引号/非 ASCII 时
+        //    header 构造失败，而代码里随后是 `.unwrap()` ⇒ **每个匿名请求 panic**。
+        //    面板侧本来就有这道检查（admin_config_edit），手写 config.toml 却漏了。
+        for (what, realm) in realm_fields(self) {
+            if !safe_header_value(&realm) {
+                anyhow::bail!(
+                    "{what} 含不能放进 HTTP 头的字符（只允许可打印 ASCII，且不含双引号与反斜杠）：{:?} —— 构造 WWW-Authenticate 头会失败，未认证请求会直接 panic",
+                    realm
+                );
+            }
+        }
+
+        for l in &self.listeners {
+            // ④ TLS 材料路径必须真实存在（内联 PEM 除外）：路径打错时 reload 通过、
+            //    但每次握手都在 build_acceptor 里失败并被 soft-fail 丢弃 ⇒
+            //    该端口等于下线，日志里只有一行 warn（本项目吃过这个）。
+            if let Some(ssl) = &l.ssl {
+                for (what, field) in [
+                    ("ssl.cert", &ssl.cert),
+                    ("ssl.key", &ssl.key),
+                    ("ssl.cert_ec", &ssl.cert_ec),
+                    ("ssl.key_ec", &ssl.key_ec),
+                    ("ssl.ech_cover_cert", &ssl.ech_cover_cert),
+                    ("ssl.ech_cover_key", &ssl.ech_cover_key),
+                ] {
+                    let Some(v) = field.as_deref() else { continue };
+                    let t = v.trim();
+                    if t.is_empty() {
+                        anyhow::bail!("listener {}:{}: {what} 是空串（要留空请删掉该字段）", l.address, l.port);
+                    }
+                    if t.contains("-----BEGIN") {
+                        continue; // 内联 PEM 内容，不做存在性检查
+                    }
+                    if !std::path::Path::new(t).exists() {
+                        anyhow::bail!(
+                            "listener {}:{}: {what} 指向的文件不存在：{t} —— 配置能加载但该端口的每次 TLS 握手都会失败（连接被静默丢弃）",
+                            l.address,
+                            l.port
+                        );
+                    }
+                }
+            }
+
+            // ⑤ rate_limit=0/负数：令牌永远不会被补回，burst 用完后**永久 429**。
+            //    `burst = 0` 则第一个请求就被拒。运维看到的是「站点上线几分钟后全 429」。
+            if let Some(rl) = &l.rate_limit {
+                if rl.enabled && !(rl.rate_per_sec > 0.0) {
+                    anyhow::bail!(
+                        "listener {}:{}: rate_limit.rate_per_sec = {} 必须 > 0（0 或负数 ⇒ 令牌不再补充，burst 用完后该端口永久 429）",
+                        l.address, l.port, rl.rate_per_sec
+                    );
+                }
+                if rl.enabled && !(rl.burst > 0.0) {
+                    anyhow::bail!(
+                        "listener {}:{}: rate_limit.burst = {} 必须 > 0（0 ⇒ 第一个请求就被拒）",
+                        l.address, l.port, rl.burst
+                    );
+                }
+            }
+
+            // ⑥ proxy 规则：`path` 为空串时 `path_matches_proxy_prefix` 恒假 ⇒ 规则永不生效
+            //    且无任何告警；`upstream` 为空则在连接阶段报错（502）。
+            for r in &l.proxy_rules {
+                let pth = r.path.trim();
+                if pth.is_empty() || !pth.starts_with('/') {
+                    anyhow::bail!(
+                        "listener {}:{}: proxy 规则 path = {:?} 必须是非空、以 `/` 开头的路径前缀（空串会让该规则永不匹配）",
+                        l.address, l.port, r.path
+                    );
+                }
+                if r.upstream.trim().is_empty() {
+                    anyhow::bail!(
+                        "listener {}:{}: proxy 规则 path={pth} 的 upstream 为空",
+                        l.address, l.port
+                    );
+                }
+            }
+
+            // ⑦ autoindex.paths 里的空串等于「整站」：`allows()` 用
+            //    `path.starts_with("/")` 判断，空串裁掉尾斜杠后恒真 ⇒ 上传面覆盖整个 listener。
+            if l.autoindex.enabled {
+                for pth in &l.autoindex.paths {
+                    // 注意 `"/"` 是**合法且明确**的写法（= 整个 listener），必须放行；
+                    // 要拦的是**空条目**（多打一个逗号/写了空串）—— 它在
+                    // `trim_end_matches('/')` 之后同样是空，运行期 `starts_with("/")`
+                    // 恒真 ⇒ 上传与目录列表覆盖整站，而运维以为自己只开了 `/up`。
+                    let t = pth.trim();
+                    if t.is_empty() {
+                        anyhow::bail!(
+                            "listener {}:{}: autoindex.paths 含空条目（要整站请显式写 \"/\"）",
+                            l.address, l.port
+                        );
+                    }
+                    if !t.starts_with('/') {
+                        anyhow::bail!(
+                            "listener {}:{}: autoindex.paths 的条目 {:?} 必须以 `/` 开头",
+                            l.address, l.port, pth
+                        );
+                    }
+                }
+            }
+        }
+
         Ok(())
     }
 
     pub fn to_toml_string(&self) -> Result<String> {
         Ok(toml::to_string_pretty(self)?)
     }
+}
+
+/// 所有会进 `WWW-Authenticate: Basic realm="…"` 的 realm（管理面 + 每个 listener 的 basic_auth）。
+///
+/// 返回 `(字段名, realm)`，字段名用于报错定位。
+fn realm_fields(cfg: &Config) -> Vec<(String, String)> {
+    let mut out = vec![("admin.realm".to_string(), cfg.admin.realm.clone())];
+    for l in &cfg.listeners {
+        if let Some(ba) = &l.basic_auth {
+            out.push((
+                format!("listener {}:{}: basic_auth.realm", l.address, l.port),
+                ba.realm.clone(),
+            ));
+        }
+    }
+    out
+}
+
+/// realm 必须能安全放进 HTTP 头字段值：可打印 ASCII，且不含 `"` 与 `\`
+///（quoted-string 里的转义字符）。UTF-8 与换行都会让 header 构造失败 ——
+/// 而调用点随后 `.unwrap()`，等于「配置里一个中文 realm 就能让每个匿名请求 panic」。
+fn safe_header_value(s: &str) -> bool {
+    // `'"'` 与 `'\\'` 在 quoted-string 里是转义/结束符，
+    // 其余可打印 ASCII 原样保留；非 ASCII 与换行会让 header 构造失败。
+    let ok = |b: u8| (0x20..=0x7e).contains(&b) && b != b'"' && b != b'\\';
+    !s.is_empty() && s.bytes().all(ok)
 }
 
 fn resolve_ssl_material(field: &mut Option<String>, base: &Path) {
@@ -1293,6 +1473,90 @@ cert = "cert.pem"
         let cfg: Config = toml::from_str(toml).expect("parse");
         let err = cfg.validate().expect_err("cert 无 key 必须报错");
         assert!(format!("{err}").contains("成对"), "错误信息应说明成对: {err}");
+    }
+
+    /// ECH cover 证书的三种非法组合必须在配置期拦住。
+    ///
+    /// 第三种（cover 配了但 `ech = false`）最隐蔽：容器默认证书是 cover，而切换回调只在
+    /// `ech_accepted()` 为真时换回真实证书 —— ECH 关掉时它**恒为假**，于是这个 listener
+    /// 对外只发 cover，真实证书一次都不出现，客户端按真实身份校验证书必然失败，
+    /// 而配置、面板、日志全都没有异常。
+    #[test]
+    fn ech_cover_cert_requires_pair_public_name_and_ech() {
+        // 校验会 stat TLS 材料路径（路径写错 ⇒ 该端口每次握手都失败），
+        // 所以这里用**真实存在的临时文件**，内容无关紧要。
+        let dir = std::env::temp_dir().join(format!("crucible-cover-cfg-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let q = '"';
+        let mk = |n: &str| -> String {
+            let p = dir.join(n);
+            std::fs::write(&p, b"x").expect("write");
+            p.display().to_string().replace('\\', "/")
+        };
+        let (cert, key, cover, cover_key) = (
+            mk("cert.pem"),
+            mk("key.pem"),
+            mk("cover.pem"),
+            mk("cover.key.pem"),
+        );
+        let base = format!(
+            "
+[[listeners]]
+address = {q}127.0.0.1{q}
+port = 14443
+root = {q}/tmp/covercheck{q}
+",
+            q = q
+        );
+        let cases: [(&str, String, &str); 3] = [
+            (
+                "只配 cert 不配 key",
+                format!(
+                    "ssl = {{ cert = {q}{cert}{q}, key = {q}{key}{q}, ech = true, ech_public_name = {q}v.example.com{q}, ech_cover_cert = {q}{cover}{q} }}
+",
+                    q = q
+                ),
+                "成对",
+            ),
+            (
+                "cover 但没有 public_name",
+                format!(
+                    "ssl = {{ cert = {q}{cert}{q}, key = {q}{key}{q}, ech = true, ech_cover_cert = {q}{cover}{q}, ech_cover_key = {q}{cover_key}{q} }}
+",
+                    q = q
+                ),
+                "ech_public_name",
+            ),
+            (
+                "cover 配了但 ech = false",
+                format!(
+                    "ssl = {{ cert = {q}{cert}{q}, key = {q}{key}{q}, ech = false, ech_public_name = {q}v.example.com{q}, ech_cover_cert = {q}{cover}{q}, ech_cover_key = {q}{cover_key}{q} }}
+",
+                    q = q
+                ),
+                "ssl.ech",
+            ),
+        ];
+        for (what, ssl, want) in cases {
+            let cfg: Config = toml::from_str(&format!("{base}{ssl}")).expect("parse");
+            let err = cfg
+                .validate()
+                .err()
+                .unwrap_or_else(|| panic!("{what} 必须报错"));
+            let msg = format!("{err}");
+            // 断言命中的是**对应的那条**检查，而不是碰巧别的错误
+            assert!(msg.contains(want), "{what} 的错误信息应含 {want:?}: {msg}");
+            eprintln!("[cover-check] {what} -> {msg}");
+        }
+        // 正对照：三项都配齐时必须通过 —— 否则上面三条可能只是「什么配置都报错」。
+        let ok: Config = toml::from_str(&format!(
+            "{base}ssl = {{ cert = {q}{cert}{q}, key = {q}{key}{q}, ech = true, ech_public_name = {q}v.example.com{q}, ech_cover_cert = {q}{cover}{q}, ech_cover_key = {q}{cover_key}{q} }}
+",
+            q = q
+        ))
+        .expect("parse");
+        assert!(ok.validate().is_ok(), "配齐 cover/public_name/ech 时不该报错");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// ip_access 里的空串必须被配置期拒绝：运行期它等于「匹配所有地址」，

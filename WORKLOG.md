@@ -1930,3 +1930,46 @@ ECH: listener 0.0.0.0:8443 已启用 ECH，但没有配置 cover 证书（ssl.ec
 **补记**：探针第一次被我拿 `| head -1` 截断时 panic 了（Rust 默认忽略 SIGPIPE ⇒ `println!` 撞 EPIPE）。
 诊断工具被管道截断是正常用法，已在 `main()` 开头把 SIGPIPE 恢复默认处置；`bin/ech_probe` 是独立文件、
 不随服务进程，换新二进制不需要重启服务，实测 `| head -1` 干净退出、完整输出仍为 `ECH_ACCEPTED=true`。
+
+### 21.25 三个审计 agent 的报告 → 修复批次（QMux 无界缓冲 + 部分发送重复 / 一批 validate 缺口 / 部署钩子入库）
+
+三个只读审计 agent（A：h2/h3/QMux/CONNECT-UDP；B：管理面/WebUI；C：热加载/validate/脚本）都交了报告
+（`_audit_a.md` / `_audit_b.md` / `_audit_c.md`）。逐条**自己复核后**动手的与**看清但留待**的分列如下。
+
+**已修（每条都有单测或真机复验）**
+
+| 项 | 位置 | 错在哪 / 后果 | 修法 |
+|---|---|---|---|
+| QMux 入向记录无上限（A-P1-1） | `qmux/proto.rs` `RecordReader::next_record` | 记录头的 Size 被原样当作「还要收多少字节」，从不与 16382/协商值比较 ⇒ 任何能连上 QMux 的客户端发 8 字节 `FF…FF` 就能让我们**按声明值无界涨内存**（未认证 OOM） | `RecordReader` 加 `max_record_size`（默认 16382，`set_max_record_size` 只允许调大，§5.2）；**先查上限再缓冲**，超限立刻 `FRAME_ENCODING_ERROR`。`drain_records` 每轮从 `peer_max_record` 同步。单测 `declared_record_size_is_capped_before_buffering` |
+| QMux 部分发送重复已发前缀（A-P1-3） | `qmux/conn.rs` `poll_write` | 部分入队后 `truncate(len - left)` **保留的是已发前缀**、丢掉的是未发尾部（注释写的意图与之相反）；下一次 `flush_frames` 把该前缀按已推进的 offset **再发一遍** ⇒ 对端读到重复字节（慢读的正常客户端也中招） | 改为清空缓冲（未发尾部交给调用方重发，符合 AsyncWrite 语义）。端到端回归 `partial_send_does_not_duplicate_prefix`（客户端把额度压到 1 字节 ⇒ 必然部分成帧，逐字节比对） |
+| `admin.realm` / `basic_auth.realm` 未校验（C-10） | `config.rs` `validate()` | realm 含换行/引号/中文 ⇒ `WWW-Authenticate` 构造失败，而调用点 `.unwrap()` ⇒ **每个匿名 admin 请求 panic** | 新增 `safe_header_value()`（可打印 ASCII、不含 `"`/`\`）+ `realm_fields()`，配置期拒绝 |
+| `admin.path` 未校验（C-11） | 同上 | `"/"` 让管理面匹配一切路径（接管整站）；`"admin"` 缺前导斜杠 ⇒ 面板静默 404 | 配置期要求非空、以 `/` 开头、且不是 `/` |
+| `listeners = []` 通过校验（C-8） | 同上 | reload 成功后所有 accept 循环退出 ⇒ 进程活着但**全站停服**，日志只有一行 | 配置期要求至少一个 listener |
+| TLS 材料路径不检查（C-12） | 同上 | `ssl.cert` 路径打错 ⇒ reload 通过、每次握手失败被 soft-fail 丢弃 ⇒ 端口静默下线 | 校验 cert/key/cert_ec/key_ec/cover 的存在性（内联 PEM 除外；`ech_keys`/`ocsp_der_path` 仍有运行期降级路径，故不强制） |
+| `rate_per_sec = 0`（C-15） | 同上 | 令牌不再补充 ⇒ burst 用完后**永久 429** | `enabled` 时要求 `rate_per_sec > 0 && burst > 0` |
+| proxy 规则空 path / 空 upstream（C-14） | 同上 | 空 path 的规则**永不匹配**且无告警 | 要求 path 非空且以 `/` 开头、upstream 非空 |
+| `autoindex.paths = [""]`（C-19） | 同上 | 空串裁尾斜杠后恒真 ⇒ 上传/目录列表覆盖**整站** | 要求条目非空且以 `/` 开头 |
+| 相对路径基准不一致（C-13） | `resolve_paths` | 只有 cert/key/cert_ec/key_ec 按配置目录解析，`ech_keys`/cover/OCSP 走**进程 cwd** ⇒ 换 cwd 启动时 ECH 静默消失 | 全部 9 个 TLS 材料字段统一按配置目录解析 |
+| `admin_geoip::json_str` 不转义控制字符（B-F4） | `admin_geoip.rs` | 值里一个换行 ⇒ 整个响应非法 JSON ⇒ 该面板模块不可用 | 改用 `serde_json::to_string`（`json_escape` 同理剥引号） |
+| 部署钩子不在版本控制（C-20/C-21） | `scripts/` | `/etc/rc.local`、`daily.local` 只存在于生产机；`*.sh` 被 gitignore 吞掉 ⇒ 启动方式不可评审/不可复现 | 两份 `.local` 已入库（去掉重复注释）；`start_server.sh`/`build_release.sh` 重写：**删除 openssl 依赖**（本项目明确不依赖它，旧脚本用 `openssl req` 静默生成自签证书）、启动统一委托 `/etc/rc.local`（C-23 的错目标、C-24 的 /tmp 日志一并消失） |
+
+**看清楚了但**没做**（连同理由，避免「以为修了」）**
+
+- **h3 缺全局在飞预算**（A-P1-2）：h2 有进程级 256 在飞闸门，h3 只有「每连接 100」+ 无连接数上限 ⇒
+  理论内存上界 = 连接数 × 100 × 8MiB，攻击者可控。修法明确（照抄 h2 的信号量），但会动到 h3 请求
+  生命周期，**留到下一轮**专门做 + 压测。
+- **CONNECT-UDP 无开关**（A-P2-1）：默认开启的任意公网 UDP 中继（内网地址已被拒，不是 SSRF）。
+  需要新增 per-listener 配置项（面板/文档同步），下一轮。
+- **证书轮换不重载**（C-1）与 **H3 证书/设置不随 reload 更新**（C-3）：acceptor 缓存键里只有配置
+  字符串，证书文件被 ACME 原地替换后进程继续用旧证书。修法是把材料 mtime/size 进指纹 + 让 h3 任务
+  在 reload 时重建，属结构性改动，下一轮。
+- **`root` 防自曝校验可被 `"./"` 绕过**（B-F3）：面板侧只比字面量 `"."`/`".."`，需 canonicalize 后
+  与配置目录比较；涉及「绝对路径 root 是否合法」的产品决定，留待与运维确认。
+- **仓库自带 admin 示例口令**（B-F1）：`config.toml` 里带着 `admin` 的可用哈希、且 `[admin]` 未设
+  `listeners_allow` ⇒ 面板等同无鉴权。这是**部署决定**（需要你给新口令），我加不了。
+- 其余小项（QMux 窗口更新可丢 P2-2、流数按累计计 P2-3、port_reuse 无超时 P2-4、acceptor 缓存上限
+  64 < listener 上限 128 C-5、坏配置刷日志 C-7、`replace()` 死代码 C-6、`[dns]` 覆盖 C-17、
+  geoip 假开关 C-18）已记录在 `_audit_*.md`，按优先级后续处理。
+
+**另外**：顺手补了 rustls-only（不带 boring）回归 —— `cargo check` 0 错误、`cargo test` **200/200 全绿**，
+证明本轮的 config/自检/恢复代码在无 BoringSSL 配置下同样成立。

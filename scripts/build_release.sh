@@ -40,13 +40,23 @@ fi
 echo "[build] ok: $BIN"
 
 if [[ "$RESTART" -eq 1 ]]; then
-  LOG=/tmp/webserver-restart.log
-  {
-    echo "=== restart $(date) ==="
-    # Prefer exact --config argv; avoid killing unrelated processes.
-    pkill -f '[/]target/release/webserver.*--config' 2>/dev/null || true
+  # 生产入口是 bin/webserver（.gitignore 里写明：它与 target 产物是硬链接，重建后
+  # 不指向新 inode，所以必须**显式拷贝**），启动方式统一走 /etc/rc.local。
+  # 旧实现 pkill 的是 `target/release/webserver.*--config` —— 打不到生产进程，
+  # 「重启」变成起第二个实例；日志还落在 /tmp（无轮转覆盖）。
+  if [[ ! -f /etc/rc.local ]]; then
+    echo "[restart] 缺少 /etc/rc.local：请先 cp scripts/deploy/rc.local /etc/rc.local" >&2
+    exit 1
+  fi
+  # 先停（cp 覆盖正在执行的二进制会 ETXTBSY），再装，再起。
+  pkill -x webserver 2>/dev/null || true
+  # 不用 seq（OpenBSD base 里未必有）：显式计数
+  n=0
+  while pgrep -x webserver >/dev/null && [ "$n" -lt 20 ]; do
     sleep 1
-    nohup "$BIN" --config "${ROOT}/config.toml" >>"$LOG" 2>&1 &
-    echo "pid $!"
-  } | tee -a "$LOG"
+    n=$((n + 1))
+  done
+  cp "$BIN" "${ROOT}/bin/webserver"
+  echo "[restart] installed ${ROOT}/bin/webserver"
+  sh /etc/rc.local
 fi
