@@ -89,3 +89,6 @@ contact.txt
 
 # 应用引擎运行期生成的依赖标记目录（只有 manifest/.ready 这类标记，没有源码）
 www-apps/*/deps/
+
+# 运维/验证脚本：*.sh 整体忽略，但这个要入库（ECH 内外层端到端演示）
+!scripts/ech_demo.sh
