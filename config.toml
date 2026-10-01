@@ -259,8 +259,12 @@ enabled = true
 lines = []
 
 [dns.dot]
+# 注意：state/dns/etc/panel.toml 存在时会**整体覆盖** [dns]（见 WORKLOG 21.28）；
+# 那里的 dot 提供 cert/key。这里保持自洽：只用 config.toml 时 DoT 也能起来。
 enabled = true
 port = 53          # test_mode 下 11853
+cert = "cert.pem"
+key = "key.pem"
 
 [dns.doh]
 enabled = true

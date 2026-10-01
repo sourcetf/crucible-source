@@ -458,6 +458,37 @@ pub fn effective(cfg: &Config) -> DnsConfig {
         // and silently disable DNS that is enabled in config.toml).
         if !text.trim().is_empty() {
             if let Ok(p) = toml::from_str::<DnsConfig>(&text) {
+                // 面板文件**整体覆盖** config.toml 的 `[dns]`：此后在 config.toml 里改
+                // `[dns]`（含 recursion_acl 这种安全相关项）**不会生效**，而面板与文档
+                // 都显示「已保存」。只提示一次（每 2s 刷屏没有意义）。
+                static WARNED: std::sync::atomic::AtomicBool =
+                    std::sync::atomic::AtomicBool::new(false);
+                if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                    let differs = toml::to_string(&p).ok() != toml::to_string(&cfg.dns).ok();
+                    log::warn!(
+                        "dns: {} 存在且生效 —— config.toml 的 [dns] 被**整体覆盖**{}；在 config.toml 里改 [dns] 不会生效，请改面板或删掉该文件",
+                        panel.display(),
+                        if differs { "（两者内容不同，当前生效的是面板文件）" } else { "（当前内容相同）" }
+                    );
+                }
+                // 面板文件**绕过** `Config::validate()`（那只作用于 config.toml），
+                // 所以「开了但配不全 / 路径写错」在这里再查一遍 —— 只 warn，
+                // DNS 侧本来就有降级路径（DoT 起不来不影响 DNS 本身）。
+                if p.dot.enabled {
+                    let has_cert = p.dot.cert.as_deref().map_or(false, |s| !s.trim().is_empty());
+                    let has_key = p.dot.key.as_deref().map_or(false, |s| !s.trim().is_empty());
+                    if !has_cert || !has_key {
+                        log::warn!(
+                            "dns: panel.toml 里 dot.enabled = true 但 cert/key 不全 —— DoT 起不来（配置本身「合法」，只有启动日志一行 error）"
+                        );
+                    }
+                }
+                if p.doh.enabled && !p.doh.path.trim().starts_with('/') {
+                    log::warn!(
+                        "dns: panel.toml 里 doh.path = {:?} 不以 `/` 开头 ⇒ DoH 端点永不匹配",
+                        p.doh.path
+                    );
+                }
                 return p;
             }
         }

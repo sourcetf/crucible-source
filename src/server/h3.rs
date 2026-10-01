@@ -11,6 +11,77 @@ use anyhow::Result;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
+/// per-port「h3 端点当前生效的配置指纹」通道。
+///
+/// * 写入：`mod.rs` 的 reconciler（每 2s 算一遍）与 h3 任务自己；
+/// * 读取：运行中的 [`serve`] —— 它 `select!` 这条通道，值变了就退出，
+///   由调用方用**最新**的 listener 配置重新拉起端点（新证书随之生效）。
+static H3_CFG_FP: once_cell::sync::Lazy<
+    parking_lot::Mutex<std::collections::HashMap<u16, tokio::sync::watch::Sender<u64>>>,
+> = once_cell::sync::Lazy::new(|| parking_lot::Mutex::new(std::collections::HashMap::new()));
+
+/// h3 端点关心的配置指纹：整份 listener 配置（Debug 形式，含 ssl.*、early_data、
+/// root/autoindex/限流/口令等所有 per-listener 字段）+ 证书/私钥文件的 mtime/size。
+///
+/// 为什么要文件指纹：ACME/certbot 续期是**原地替换同一路径**，配置字符串完全不变；
+/// 只看配置就发现不了（与 `${crate}::server::tls::boring_path` 的 acceptor 指纹同一个坑）。
+pub fn h3_config_fingerprint(lc: &ListenerConfig) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    lc.port.hash(&mut h);
+    format!("{lc:?}").hash(&mut h);
+    if let Some(ssl) = lc.ssl.as_ref() {
+        for p in [&ssl.cert, &ssl.key] {
+            if let Some(v) = p.as_deref() {
+                if v.contains("-----BEGIN") {
+                    continue; // 内联 PEM：内容已随 Debug 进指纹
+                }
+                match std::fs::metadata(v) {
+                    Ok(m) => {
+                        m.len().hash(&mut h);
+                        if let Ok(t) = m.modified() {
+                            if let Ok(d) = t.duration_since(std::time::UNIX_EPOCH) {
+                                d.as_nanos().hash(&mut h);
+                            }
+                        }
+                    }
+                    Err(_) => 0u8.hash(&mut h),
+                }
+            }
+        }
+    }
+    h.finish()
+}
+
+/// 把指纹喂给（可能在跑的）端点：值变了就唤醒它退出重启。
+pub fn set_h3_config_fingerprint(port: u16, fp: u64) {
+    let mut m = H3_CFG_FP.lock();
+    match m.get(&port) {
+        Some(tx) => {
+            if *tx.borrow() != fp {
+                let _ = tx.send(fp);
+            }
+        }
+        None => {
+            let (tx, _rx) = tokio::sync::watch::channel(fp);
+            m.insert(port, tx);
+        }
+    }
+}
+
+/// 取本端点的指纹接收器（`serve` 用它监听配置变化）。
+pub fn h3_config_watch(port: u16, fp: u64) -> tokio::sync::watch::Receiver<u64> {
+    let mut m = H3_CFG_FP.lock();
+    let tx = m.entry(port).or_insert_with(|| {
+        let (tx, _rx) = tokio::sync::watch::channel(fp);
+        tx
+    });
+    if *tx.borrow() != fp {
+        let _ = tx.send(fp);
+    }
+    tx.subscribe()
+}
+
 /// 全局「同时在飞」h3 请求上限（含**正在收 body** 的阶段）。
 ///
 /// 为什么必须有这一层：h2 有等价闸门（`h2::H2_MAX_INFLIGHT`），h3 此前只有
@@ -56,6 +127,8 @@ mod imp {
         bind: SocketAddr,
         lc: ListenerConfig,
         live: Arc<LiveConfig>,
+        cfg_fp: u64,
+        cfg_rx: tokio::sync::watch::Receiver<u64>,
     ) -> Result<()> {
         let ssl = lc.ssl.as_ref().context("h3 listener requires ssl config")?;
         let cert_pem = crate::server::ssl_material::load_bytes(
@@ -92,6 +165,30 @@ mod imp {
         )
         .context("h3 quinn endpoint")?;
         log::info!("h3 quinn endpoint ready on {bind} (boring crypto preferred)");
+
+        // **配置/材料变化 → 关闭端点、让本函数返回**，调用方（mod.rs 的任务）会用
+        // 最新的 listener 配置重新拉起 QUIC 端点 ⇒ 新证书/新 per-listener 设置随之生效。
+        //
+        // 为什么用「关端点」而不是在 accept 循环里 select：`serve()` 的循环是
+        // `while let Some(incoming) = endpoint.accept().await`（不是 `loop/match`），
+        // 直接改它的控制流要动整段长循环体；而 `Endpoint::close()` 会让 accept 返回
+        // None、循环自然收尾，改动面小得多。代价是**在飞的连接会被关闭**（配置/证书
+        // 变更时这是可接受的：H3 没有 per-connection 的热更新路径）。
+        {
+            let mut rx = cfg_rx.clone();
+            let ep = endpoint.clone();
+            tokio::spawn(async move {
+                while rx.changed().await.is_ok() {
+                    if *rx.borrow() != cfg_fp {
+                        log::info!(
+                            "h3 endpoint config/materials changed; closing QUIC endpoint to restart with new config"
+                        );
+                        ep.close(quinn::VarInt::from_u32(0), b"config changed");
+                        return;
+                    }
+                }
+            });
+        }
 
         while let Some(incoming) = endpoint.accept().await {
             let live_c = Arc::clone(&live);
@@ -1644,7 +1741,13 @@ use chunked uploads (Content-Range) or HTTP/1.1 for larger bodies",
 pub use imp::serve;
 
 #[cfg(not(feature = "tls"))]
-pub async fn serve(_bind: SocketAddr, _lc: ListenerConfig, _live: Arc<LiveConfig>) -> Result<()> {
+pub async fn serve(
+    _bind: SocketAddr,
+    _lc: ListenerConfig,
+    _live: Arc<LiveConfig>,
+    _cfg_fp: u64,
+    _cfg_rx: tokio::sync::watch::Receiver<u64>,
+) -> Result<()> {
     anyhow::bail!("HTTP/3 (QUIC) requires feature `tls`")
 }
 

@@ -2039,3 +2039,46 @@ C-17（`[dns]` 零校验 + `panel.toml` 整体覆盖）、C-4（连接期配置�
 **结果**：`cargo test` **242 passed / 0 failed / 1 ignored**（这批文件带来 11 个新测试），
 `cargo build --bins` 通过，已部署并复验：1 实例、h1 200、h2 200、**h3 200（HTTP/3）**、
 ECH 现场探针 `ECH_ACCEPTED=true`、DNS 正常、PHP 200、`__admin` 401。
+
+### 21.28 h3 随 reload 更新（C-3）+ 批次 6 + **我用新校验第二次打挂生产**（以及真正的防护：`--check-config`）
+
+**C-3（h3 端点不随 reload 更新）**：`h3::serve()` 启动时一次性读入证书、之后每连接的 `lc` 都是
+冻结克隆 ⇒ 换证书/改 `early_data`/改限流口令对 H3 **一律不生效**，直到进程重启。
+修法：给每个 h3 端点一条 `watch<u64>` **指纹通道**（整份 lc 的 Debug 形式 + 证书/私钥文件的
+mtime/size）——`mod.rs` 的 reconciler 每 2s 算一遍并喂进去；`serve()` 里挂一个看门狗，值变了就
+`endpoint.close()`，让 `while let endpoint.accept()` 自然收尾、由外层用**最新配置**重启端点。
+真机验证：`touch /crucible/cert.pem` → 日志
+`h3 endpoint config/materials changed; closing QUIC endpoint to restart with new config`
+→ `h3 quinn endpoint ready on 0.0.0.0:8443` → h3 仍 200、ECH 仍 accepted。
+
+（第一版把 `select!` 插进了**每连接**的 `handle_incoming` 循环而不是端点循环 —— 两个循环长得很像，
+锚点撞了。改成看门狗后改动面更小，也不再有「配置一变就砍在飞连接」的歧义：端点重启本来就会
+重连。）
+
+**批次 6（C-9 + C-17）**：
+* C-9 端口 bind 失败以前**每 2s 一条 warn**（≈4.3 万条/天）→ 同一端口同一条错误只报一次；
+* C-17 `[dns]` 缺校验 + `panel.toml` 整体覆盖无人知 → 新增 `https_rr[].name` 非空校验，
+  并在 `dns::effective()` 里对**生效配置**（panel.toml 那份）做检查 + 进程内只提示一次。
+  真机日志（本次部署后）：
+  `dns: /crucible/state/dns/etc/panel.toml 存在且生效 —— config.toml 的 [dns] 被**整体覆盖**
+  （两者内容不同，当前生效的是面板文件）；在 config.toml 里改 [dns] 不会生效` ✓
+
+**事故（我造成的第二次停机）**：批次 6 里我给 `validate()` 加了一条
+「`dot.enabled = true` 必须有 `dot.cert`/`dot.key`」，而生产的 DoT 证书其实来自 `panel.toml`
+（它**整体覆盖** `[dns]`），config.toml 里的 `[dns.dot]` 只写了 `enabled/port`、**从未被使用**。
+校验看 config.toml、运行用 panel.toml ⇒ **误拒**，部署后进程启动即退出（`rc.local` 打印了
+`started pid`，但实例数 0、全站 000）。
+处置：① 先让配置自洽（给 config.toml 的 `[dns.dot]` 补 `cert/key` —— 运行时仍被 panel.toml 覆盖，
+**零行为变化**）→ 站点恢复；② 删掉那条校验（注释写明原因），检查改到 `effective()` 里对着
+**真正生效**的配置做、且只 warn。
+
+**真正的防护：新增 `--check-config`** —— 只做「加载 + 校验」后退出，不绑端口、不起服务：
+
+```
+./bin/webserver.new --config /crucible/config.toml --check-config
+config OK: /crucible/config.toml (listeners=5, apps=18)
+```
+
+部署流程从此变成：**build → 预检（新二进制 × 当前生产配置）→ 通过才停-换-起**。
+这是同一个坑第二次踩（第一次是 `autoindex.paths = ["/"]`），所以把它写进流程而不是靠记性。
+本次部署就是这么做的：预检 rc=0 → 换二进制 → 1 实例、h1/h2/h3 全 200、ECH accepted、DNS 正常。

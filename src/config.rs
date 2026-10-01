@@ -1327,6 +1327,22 @@ cover 只用于「未使用 / 被拒 ECH」的连接，ECH 关闭时它会成为
             );
         }
 
+        // ①c `[dns]` 的「开了但配不全」**不能**在 `validate()` 里当错误拦：
+        // `state/dns/etc/panel.toml` 存在时会把 `[dns]` **整体覆盖**（见 `dns::effective`），
+        // 于是 config.toml 里那份 `[dns.dot]` 可能根本不被使用 —— 拿它当判据会**误拒**
+        // 一个实际可用的配置（实测：生产的 DoT 证书来自 panel.toml，config.toml 只写了
+        // `enabled/port`，被我这条校验拦到起不来）。检查放在 `dns::effective()` 里，
+        // 对着**真正生效**的那份配置做，且只 warn（DNS 侧本来就有降级路径）。
+        //
+        // 这条注释本身就是教训：新增配置期校验前，必须用「生产配置 + 生效路径」核对。
+
+        // `[[dns.https_rr]].name` 为空 ⇒ 渲染出的记录名是空串。
+        for (i, r) in self.dns.https_rr.iter().enumerate() {
+            if r.name.trim().is_empty() {
+                anyhow::bail!("[dns].https_rr[{i}].name 不能为空（渲染出的 HTTPS 记录名会是空串）");
+            }
+        }
+
         // ①b 其余路径型配置项同理：写错就是「静默不匹配」（页面 404 / DoH 端点消失）。
         {
             let tp = self.telemetry.path.trim();

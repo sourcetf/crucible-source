@@ -148,9 +148,22 @@ pub async fn run(live: Arc<LiveConfig>) -> Result<()> {
         tokio::spawn(async move {
             let mut tick = tokio::time::interval(std::time::Duration::from_secs(2));
             tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            // 端口 bind 失败（被占用等）会**每 2s 重试一次**：同一个端口的同一条错误
+            // 只报一次，否则一天 4 万条 warn 会把真正的问题淹掉（错误内容变了再报）。
+            let mut bind_err: std::collections::HashMap<u16, String> = std::collections::HashMap::new();
             loop {
                 tick.tick().await;
                 let snap = live_r.snapshot();
+                // h3 端点：配置（含证书材料）变了就通知在跑的那个重启 ——
+                // `serve()` 只在启动时读一次证书，不重启就永远用旧证书/旧设置（C-3）。
+                for l in snap.listeners.iter() {
+                    if l.http_versions.iter().any(|v| v.eq_ignore_ascii_case("h3")) {
+                        crate::server::h3::set_h3_config_fingerprint(
+                            l.port,
+                            crate::server::h3::h3_config_fingerprint(l),
+                        );
+                    }
+                }
                 for (idx, lc) in snap.listeners.iter().enumerate() {
                     if active_r.lock().await.contains(&lc.port) {
                         continue;
@@ -163,8 +176,22 @@ pub async fn run(live: Arc<LiveConfig>) -> Result<()> {
                     )
                     .await
                     {
-                        Ok(()) => log::info!("hot-spawned listener port {}", lc.port),
-                        Err(e) => log::warn!("hot-spawn listener port {} failed: {e:#}", lc.port),
+                        Ok(()) => {
+                            bind_err.remove(&lc.port);
+                            log::info!("hot-spawned listener port {}", lc.port)
+                        }
+                        Err(e) => {
+                            let msg = format!("{e:#}");
+                            if bind_err.get(&lc.port).map(String::as_str) != Some(msg.as_str()) {
+                                log::warn!(
+                                    "hot-spawn listener port {} failed（同一条错误只报一次）: {msg}",
+                                    lc.port
+                                );
+                                bind_err.insert(lc.port, msg);
+                            } else {
+                                log::debug!("hot-spawn port {} 仍失败（已折叠）", lc.port);
+                            }
+                        }
                     }
                 }
             }
@@ -233,16 +260,26 @@ async fn spawn_listener_port(
 
     if lc.allows_h3() {
         let udp_addr = addr;
-        let lc_h3 = lc.clone();
         let live_h3 = Arc::clone(&live);
         tokio::spawn(async move {
             loop {
-                if !live_h3.snapshot().listeners.iter().any(|l| l.port == port) {
+                // 每轮都从 live 快照**重新取**配置（不再克隆一次用到天荒地老）：
+                // `serve()` 因配置/材料变化主动返回后，这里就能用新配置重启端点。
+                let Some(cur) = live_h3
+                    .snapshot()
+                    .listeners
+                    .iter()
+                    .find(|l| l.port == port)
+                    .cloned()
+                else {
                     log::info!("h3 listener port {port} removed; stopping");
                     break;
-                }
+                };
+                let fp = crate::server::h3::h3_config_fingerprint(&cur);
+                crate::server::h3::set_h3_config_fingerprint(port, fp);
+                let rx = crate::server::h3::h3_config_watch(port, fp);
                 if let Err(e) =
-                    crate::server::h3::serve(udp_addr, lc_h3.clone(), Arc::clone(&live_h3)).await
+                    crate::server::h3::serve(udp_addr, cur, Arc::clone(&live_h3), fp, rx).await
                 {
                     log::warn!("h3 listener {udp_addr}: {e:#}; retry in 5s");
                     tokio::time::sleep(std::time::Duration::from_secs(5)).await;

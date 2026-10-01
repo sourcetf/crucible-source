@@ -28,6 +28,22 @@ fn main() -> Result<()> {
     let cfg = Config::load(&config_path)
         .with_context(|| format!("load config {}", config_path.display()))?;
 
+    // `--check-config`：**只做「加载 + 校验」然后退出**，不绑定端口、不起服务。
+    //
+    // 为什么要它：新增配置期校验时，若只能靠「重启看看会不会挂」来验证，代价就是**停机**——
+    // 我为 `autoindex.paths = ["/"]` 与 `[dns.dot]` 两条校验各打挂过一次生产。
+    // 有了这个开关，部署流程可以先用**新二进制**对着**当前生产配置**验一遍，通过再换二进制：
+    //   ./bin/webserver.new --config /crucible/config.toml --check-config && 停 → 换 → 起
+    if std::env::args().any(|a| a == "--check-config") {
+        println!(
+            "config OK: {} (listeners={}, apps={})",
+            config_path.display(),
+            cfg.listeners.len(),
+            cfg.listeners.iter().map(|l| l.apps.len()).sum::<usize>()
+        );
+        return Ok(());
+    }
+
     log::info!(
         "Crucible starting; config={} listeners={}",
         config_path.display(),
