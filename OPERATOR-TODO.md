@@ -188,6 +188,19 @@ cp -p state/dns/etc/named.conf.bak-20261002-131111 state/dns/etc/named.conf
 kill $(pgrep -x webserver) $(pgrep -x named); sleep 2; sh /etc/rc.local
 ```
 
+**回滚整个方案 A（自有根区 / 根服务器模式）**：DNS 的生效配置是 `state/dns/etc/panel.toml`
+（见 C 项），它在上方案 A 之前的备份是 `state/dns/etc/panel.toml.bak-20261001`：
+
+```sh
+cd /crucible
+cp -p state/dns/etc/panel.toml.bak-20261001 state/dns/etc/panel.toml
+kill $(pgrep -x webserver) $(pgrep -x named); sleep 2; sh /etc/rc.local
+named-checkconf -z state/dns/etc/named.conf && echo OK   # 回滚后仍是单实例 53
+```
+
+（回滚掉 A 会同时撤掉 `recursion_acl`、`[modes] root`、`[rootzone] enabled` —— 也就是撤掉
+「递归走自有根」和「对外当根服务器」。若只想关掉其中一个，用面板改对应开关即可，不必整体回滚。）
+
 ---
 
 ## F. DoT 对外策略（**需要你决定**：公网 DoT 要不要给递归）
