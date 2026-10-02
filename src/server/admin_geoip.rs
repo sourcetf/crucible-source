@@ -80,10 +80,16 @@ pub async fn handle_filter_with_live(
     let Some(db_path) = db_path else {
         return json_ok("{\"rows\":[],\"error\":\"no_db\"}".into());
     };
+    // 国家别名归一化：库里存的是 ISO（CN/US/…），而面板/调用方常传「中国」「China」。
+    // `resolve_country_alias` 早就写好（aliases.rs，含 中国/China/CN → CN 这类映射），
+    // 但此前**没有任何调用者** ⇒ 传中文名时筛选结果为空、看起来像「库里没有数据」。
+    let country_norm = country
+        .as_deref()
+        .map(|c| crate::server::geoip_panel::aliases::resolve_country_alias(c));
     match db::open(&db_path) {
         Ok(conn) => match crate::server::geoip_panel::ops::filter_prefixes(
             &conn,
-            country.as_deref(),
+            country_norm.as_deref(),
             isp.as_deref(),
             cloud.as_deref(),
             limit,

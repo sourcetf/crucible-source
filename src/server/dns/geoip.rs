@@ -39,8 +39,20 @@ static ASN_DB: std::sync::Mutex<Option<(String, Option<ArcReader>)>> = std::sync
 
 /// clear cached reader (after a fresh sync)
 pub fn reset_cache() {
-    *CITY_DB.lock().unwrap() = None;
-    *ASN_DB.lock().unwrap() = None;
+    *lock_city() = None;
+    *lock_asn() = None;
+}
+
+/// **容忍 poisoning** 的取锁：这两个缓存是「进程级的分线路数据库句柄」，任何一处持有
+/// 守卫时 panic（例如 `open_db` 里的日志、mmap 失败路径）都会把 Mutex 永久标记为 poisoned
+/// —— 此后所有 `.lock().unwrap()` 全部 panic，GeoIP 分线路功能**永久失效且无恢复**。
+/// 缓存本身只是一个 `Option`，被 poisoning 保护的数据并不需要「拒绝访问」语义。
+fn lock_city() -> std::sync::MutexGuard<'static, Option<(String, Option<ArcReader>)>> {
+    CITY_DB.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+fn lock_asn() -> std::sync::MutexGuard<'static, Option<(String, Option<ArcReader>)>> {
+    ASN_DB.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 fn open_db(path: &str) -> Option<ArcReader> {
@@ -60,7 +72,7 @@ fn open_db(path: &str) -> Option<ArcReader> {
 }
 
 fn city_db(cfg: &GeoMmdbCfg) -> Option<ArcReader> {
-    let mut slot = CITY_DB.lock().unwrap();
+    let mut slot = lock_city();
     let path = cfg.city_db();
     let need = match slot.as_ref() {
         None => true,
@@ -74,7 +86,7 @@ fn city_db(cfg: &GeoMmdbCfg) -> Option<ArcReader> {
 }
 
 fn asn_db(cfg: &GeoMmdbCfg) -> Option<ArcReader> {
-    let mut slot = ASN_DB.lock().unwrap();
+    let mut slot = lock_asn();
     let path = cfg.asn_db();
     let need = match slot.as_ref() {
         None => true,

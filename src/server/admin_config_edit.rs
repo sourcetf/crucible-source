@@ -209,7 +209,10 @@ pub fn write_tree(live: &Arc<LiveConfig>, tree: &Toml) -> Result<()> {
     // 先写临时文件通过校验，再用「保留权限」的原子写定稿（原来直接 fs::write + rename
     // 会把 config.toml 的权限降级成 umask 值）。
     let tmp = crate::server::live_config::unique_tmp_path(&path, "tmp");
-    std::fs::write(&tmp, &out).with_context(|| format!("write {}", tmp.display()))?;
+    // 0600 写校验副本：它含**完整** config.toml 内容（口令哈希、MaxMind key、材料路径），
+    // 用 `fs::write` 会按 umask 是 0644 —— 校验窗口内本机任何用户可读。
+    crate::server::dns::write_new_0600(&tmp, out.as_bytes())
+        .with_context(|| format!("write {}", tmp.display()))?;
     if let Err(e) = Config::load(&tmp) {
         let _ = std::fs::remove_file(&tmp);
         bail!("校验失败（未写盘）: {e:#}");
@@ -226,6 +229,37 @@ pub fn write_tree(live: &Arc<LiveConfig>, tree: &Toml) -> Result<()> {
 /// §CRITICAL-1 fix: 与磁盘当前文件 diff-merge，而非全量覆盖。
 /// 只替换传入 text 中显式声明的顶级 key；传入文本中没有的顶级 key（listeners/dns/geoip）
 /// 从磁盘原文件保留，避免 admin 误操作导致 listener 全表被删。
+/// 一次「原始 TOML 编辑器」的合并结果是否会把**所有**管理员账号删掉。
+///
+/// `write_toml_text` 是「按顶级 key 覆盖」：patch 里出现 `[admin]` 就会把**整张 admin 表**
+/// 换掉，于是「只带 realm 的 [admin]」会把 `[[admin.users]]` 一起删掉。而用户表为空时
+/// `check_admin_headers` 是 fail-closed ⇒ 重载成功后所有请求 401，管理面永久锁死。
+/// 只有「本来有账号、改完没有账号」才算危险（本来就是空账号表的配置无从进入这条路径，
+/// 因为面板已经不可用）；旧的扁平 `[admin] password_hash` 视作「有账号」。
+fn raw_edit_drops_all_admins(base: &Toml, merged: &Toml) -> bool {
+    let count = |t: &Toml| -> (usize, bool) {
+        match t.get("admin").and_then(|v| v.as_table()) {
+            None => (0, false),
+            Some(a) => {
+                let users = a
+                    .get("users")
+                    .and_then(|u| u.as_array())
+                    .map_or(0, |x| x.len());
+                let legacy = a
+                    .get("password_hash")
+                    .and_then(|v| v.as_str())
+                    .map_or(false, |h| !h.trim().is_empty());
+                (users, legacy)
+            }
+        }
+    };
+    let (before, before_legacy) = count(base);
+    let (after, after_legacy) = count(merged);
+    let had = before > 0 || before_legacy;
+    let has = after > 0 || after_legacy;
+    had && !has
+}
+
 pub fn write_toml_text(live: &Arc<LiveConfig>, text: &str) -> Result<()> {
     use std::collections::HashSet;
     // 正文长度上限：入口体上限是 32MiB，而这份文本要 parse + 序列化 + Config::load +
@@ -261,6 +295,18 @@ pub fn write_toml_text(live: &Arc<LiveConfig>, text: &str) -> Result<()> {
         }
     }
     let tree = Toml::Table(merged.clone());
+    // **账号锁死守卫**（审计第三轮）：本函数是「全文替换 + 按顶级 key 覆盖」——
+    // patch 里只要出现 `[admin]`，**整张 admin 表**就会被 patch 的内容替换掉，
+    // 于是「粘贴一段只带 realm 的 [admin]」会把 `[[admin.users]]` 一起删掉。
+    // 而 `check_admin_headers` 在用户表为空时 fail-closed ⇒ 重载成功后**所有**请求
+    // 401，管理面永久锁死（只能上机器改 config.toml 再重启）。
+    // 结构化端点早就避开这一点（admin.rs 有注释说明「从空表重建会把用户数组删掉」），
+    // 这条路径此前没有。兼容旧的扁平 `[admin] password_hash` 写法。
+    if raw_edit_drops_all_admins(&base, &tree) {
+        bail!(
+            "这次保存会把管理员账号**全部删掉**（patch 里的 [admin] 覆盖了原有的 [[admin.users]]）—— 保存后所有请求都会被拒（401），管理面永久锁死、只能改磁盘上的 config.toml 再重启。请在 patch 里带上至少一个 [[admin.users]]，或不要提交 [admin] 这一段"
+        );
+    }
     write_tree(live, &tree)
 }
 
@@ -470,6 +516,50 @@ mod tests {
 
     /// realm 会被拼进 `WWW-Authenticate` 头：含换行/非 ASCII 时构造 HeaderValue 失败，
     /// 后续 `.body().unwrap()` 直接 panic。必须在落盘前拒绝。
+    /// 原始 TOML 编辑器不得把账号全删掉（那会让面板永久 401）。
+    #[test]
+    fn raw_edit_dropping_all_admins_is_detected() {
+        let base: Toml = toml::from_str(
+            "[admin]
+realm=\"r\"
+[[admin.users]]
+username=\"admin\"
+password_hash=\"h\"
+",
+        )
+        .unwrap();
+        // 只带 realm 的 patch ⇒ 整张 admin 表被换掉、账号没了 ⇒ 必须判为危险
+        let merged: Toml = toml::from_str("[admin]
+realm=\"r\"
+").unwrap();
+        assert!(raw_edit_drops_all_admins(&base, &merged), "删光账号必须被发现");
+        // 带上账号就不危险
+        let ok: Toml = toml::from_str(
+            "[admin]
+realm=\"r\"
+[[admin.users]]
+username=\"a\"
+password_hash=\"h\"
+",
+        )
+        .unwrap();
+        assert!(!raw_edit_drops_all_admins(&base, &ok));
+        // 本来就是空的（无账号表）⇒ 不算「删光」（否则会误拒无关编辑）
+        let empty: Toml = toml::from_str("[ip_access]
+allow=[]
+").unwrap();
+        assert!(!raw_edit_drops_all_admins(&empty, &empty));
+        // 旧式扁平 password_hash 也算「有账号」
+        let flat: Toml = toml::from_str("[admin]
+password_hash=\"h\"
+").unwrap();
+        let flat_ok: Toml = toml::from_str("[admin]
+password_hash=\"h2\"
+").unwrap();
+        assert!(!raw_edit_drops_all_admins(&flat, &flat_ok));
+        assert!(raw_edit_drops_all_admins(&flat, &empty), "扁平哈希被删掉同样要拦");
+    }
+
     #[test]
     fn admin_identity_rejects_header_unsafe_values() {
         for bad in [

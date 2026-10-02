@@ -52,7 +52,8 @@ fn persist_admin_hash_structured(path: &Path, username: &str, hash: &str) -> any
     }
     let text = toml::to_string_pretty(&tree).map_err(|e| anyhow::anyhow!("toml encode: {e}"))?;
     let tmp_validate = unique_tmp_path(path, "validate");
-    std::fs::write(&tmp_validate, &text)?;
+    // 同 write_tree：校验副本含口令哈希等，必须 0600（否则窗口内世界可读）。
+    crate::server::dns::write_new_0600(&tmp_validate, text.as_bytes())?;
     let parsed = crate::config::Config::load(&tmp_validate).map_err(|e| {
         let _ = std::fs::remove_file(&tmp_validate);
         anyhow::anyhow!("config validate: {e}")
@@ -163,6 +164,11 @@ impl LiveConfig {
             *self.last_mtime.write() = Some(m);
         }
         *self.inner.write() = Arc::new(cfg);
+        // **与 reload 保持一致**（见上面的文档承诺）：漏掉这两步时，用 replace 做局部热更
+        // 会静默保住旧的应用引擎进程与旧的 Hidden Service 状态（例如新配置把某个 app
+        // 关掉/换个端口，运行时却照旧）。
+        crate::server::apps::reconcile_apps_runtime(self);
+        crate::server::tor_hs::spawn_from_config(self.snapshot().tor_hs.clone());
     }
 
     pub fn update_admin_hash(&self, hash: String) {

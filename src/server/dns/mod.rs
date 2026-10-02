@@ -1662,7 +1662,7 @@ fn write_atomic(path: &Path, data: &[u8], mode: u32, owner: Option<&str>) -> Res
 ///
 /// 用于**先写临时文件、再定稿权限、最后 rename** 的落盘路径：创建时就 0600，
 /// 保证「最终权限设定之前」的那段窗口是过严而非过松。
-fn write_new_0600(path: &Path, data: &[u8]) -> Result<()> {
+pub(crate) fn write_new_0600(path: &Path, data: &[u8]) -> Result<()> {
     use std::io::Write;
     #[cfg(unix)]
     let mut f = {

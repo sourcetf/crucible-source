@@ -160,7 +160,11 @@ fn load_from_geoip(conn: &Connection, ip: &str) -> Result<Vec<CoveringPrefix>> {
                 ip_start,
                 ip_end
          FROM geoip
-         WHERE start_i <= ?1 AND end_i >= ?1
+         -- 与下面 range 表那条查询**口径一致**：老行（迁移前建的）start_i/end_i 为 NULL，
+         -- 而 `NULL <= ?` 结果是 NULL ⇒ 这些行会被整条排除掉。range 表那条早就为这个加了
+         -- `IS NULL` 放行（见文件下方的注释），geoip 这张表漏了 —— 同一个库两条路径给出
+         -- 不同的覆盖结果（面板 lookup 少行/空）。
+         WHERE start_i IS NULL OR (start_i <= ?1 AND end_i >= ?1)
          ORDER BY COALESCE(commit_unix, 0) ASC, COALESCE(weight, 0) ASC, COALESCE(bits, 0) ASC",
     )?;
     let rows = stmt.query_map([target_i], |row| {

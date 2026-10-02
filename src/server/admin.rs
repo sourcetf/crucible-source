@@ -668,15 +668,21 @@ pub async fn handle(req: Request<Full<Bytes>>, live: Arc<LiveConfig>) -> Respons
             if !apath.is_empty() {
                 table.insert("path".into(), toml::Value::String(apath));
             }
-            table.insert(
-                "listeners_allow".into(),
-                toml::Value::Array(
-                    allow
-                        .into_iter()
-                        .map(|p| toml::Value::Integer(p as i64))
-                        .collect(),
-                ),
-            );
+            // **只在请求带了该键时才写**（与下面 metrics_public 同理，见那里的注释）。
+            // 它是一个**安全开关**（把管理面限制到指定端口）；旧实现把「缺键」当成空数组
+            // 无条件写回，于是任何一次无关的保存（例如只改 realm，或前端某次改版漏发该字段）
+            // 都会把白名单**静默清空**，管理面重新暴露在**所有**端口（含明文 HTTP）。
+            if v.get("listeners_allow").is_some() {
+                table.insert(
+                    "listeners_allow".into(),
+                    toml::Value::Array(
+                        allow
+                            .into_iter()
+                            .map(|p| toml::Value::Integer(p as i64))
+                            .collect(),
+                    ),
+                );
+            }
             // 任务 3：/__metrics 的公开开关。**只在请求带了该键时才写** ——
             // 这个字段是安全开关，面板/脚本漏发它时不能被一次无关的保存动作悄悄
             // 改回默认值（反之亦然：面板上关掉它必须立即生效）。

@@ -251,12 +251,23 @@ pub fn proc_is_geoip_update(pid: i32) -> bool {
         .unwrap_or(false)
 }
 
+/// 进程内串行化「检查→spawn」这一步。
+///
+/// 锁文件与进程扫描都是**快照**：两个并发请求（面板双点、两个人同时点、或与 cron 撞上）
+/// 可以同时通过两道检查、然后各 spawn 一个 updater，而 merge/enrich 不是为并发写的
+/// （同一份 SQLite 会被两个进程同时改 → `database is locked`，代码注释里记过
+/// 「实测一次误操作就出现了 4 个并发更新进程」）。跨进程那两道检查保留，这里补上
+/// **进程内**的原子性。
+static SPAWN_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// Spawn offline geoip_update.sh (non-blocking).
 pub fn spawn_geoip_update(root: &Path) -> Result<()> {
     let script = root.join("scripts/geoip_update.sh");
     if !script.is_file() {
         anyhow::bail!("missing {}", script.display());
     }
+    // 注意：`_guard` 必须活到 spawn 之后（drop 即放锁），所以绑定在函数作用域里。
+    let _guard = SPAWN_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let pid_file = root.join("data/geoip/logs/update.pid");
     let lock_dir = root.join("data/geoip/logs/update.lock");
     // 单实例保护：面板按钮点两次、两个人同时点、或按钮与 cron 撞上，都会拉起第二个 updater，

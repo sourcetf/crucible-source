@@ -177,14 +177,44 @@ mod imp {
         {
             let mut rx = cfg_rx.clone();
             let ep = endpoint.clone();
+            // 周期性自检也要做：**不能只依赖 watch**。reconciler 只为「仍然允许 h3」的
+            // listener 更新指纹（见 `mod.rs` 里那段循环），所以当 h3 被从 `http_versions`
+            // 里删掉、或整个 listener 被删掉时，watch **永远不会触发** ⇒ 端点一直服务下去
+            // （实测：改完配置 8 秒后 `netstat` 仍显示 UDP 在听）。每 2s 重新核对一次
+            // 「这个 listener 还在、且仍然允许 h3」，不满足就关端点（上层监督任务随即退出）。
+            let live_w = Arc::clone(&live);
+            let key_w = crate::server::bind_key(&lc);
             tokio::spawn(async move {
-                while rx.changed().await.is_ok() {
-                    if *rx.borrow() != cfg_fp {
-                        log::info!(
-                            "h3 endpoint config/materials changed; closing QUIC endpoint to restart with new config"
-                        );
-                        ep.close(quinn::VarInt::from_u32(0), b"config changed");
-                        return;
+                let mut tick = tokio::time::interval(std::time::Duration::from_secs(2));
+                tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                loop {
+                    tokio::select! {
+                        r = rx.changed() => {
+                            if r.is_err() {
+                                return; // 发送端没了：上层监督任务已退出，端点交给它收尾
+                            }
+                            if *rx.borrow() != cfg_fp {
+                                log::info!(
+                                    "h3 endpoint config/materials changed; closing QUIC endpoint to restart with new config"
+                                );
+                                ep.close(quinn::VarInt::from_u32(0), b"config changed");
+                                return;
+                            }
+                        }
+                        _ = tick.tick() => {
+                            let keep = live_w
+                                .snapshot()
+                                .listeners
+                                .iter()
+                                .any(|l| crate::server::bind_key(l) == key_w && l.allows_h3());
+                            if !keep {
+                                log::info!(
+                                    "h3 endpoint 不再需要（listener 已移除或 http_versions 不再含 h3）；关闭 QUIC 端点"
+                                );
+                                ep.close(quinn::VarInt::from_u32(0), b"h3 disabled");
+                                return;
+                            }
+                        }
                     }
                 }
             });

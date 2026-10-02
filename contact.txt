@@ -1169,3 +1169,55 @@ config.toml 每次保存把权限从 0600 静默降级成 0644；ECH HPKE 私钥
 **测试** 261 passed / 0 failed。生产待部署复验。**仍暂缓（OPERATOR-TODO J）**：h1/h2 长连接沿用
 建连时快照（h3 已由指纹+端点重启覆盖）、h2 缺 header 读超时、`rate_limit` 按完整 IP 分桶
 （v6 /64 可绕过）、`env_lock` 进程环境并发污染。
+### Session 1008 (2026-10-03) — 进展 37（第三轮并行审计：admin 面 / GeoIP 面板 / 生命周期 —— 修 14 处，含我上轮修复的漏网处）
+
+三片新模块。无 P0。**一条直接补在上轮修复上**：上轮我加了 `write_config_atomic`（保留权限、
+写入期恒 0600）修「保存把 config.toml 从 0600 降级成 0644」，但 `write_tree` 与
+`persist_admin_hash` 各自还会先写一份 **validate 临时文件**（内容与 config.toml 完全相同：
+口令哈希、MaxMind key）走 `std::fs::write` ⇒ 那份仍是 0644，校验窗口内本机可读。已改为 0600。
+
+**安全相关**：
+- `/api/admin/save` **无条件写回 `listeners_allow`**（缺键当成空数组）⇒ 任何一次无关保存都会
+  静默**清空管理面端口白名单**，面板重新暴露在所有端口（含明文 HTTP）。紧邻的 `metrics_public`
+  明确写着「安全开关不能被无关保存改回默认」——这条没享受同等待遇。已改为只在带键时写。
+- listener `root` 自曝检查只挡了「== 配置目录」与「是配置目录的祖先」，**`root = "state"` 这种
+  后代逃过** ⇒ 该端口把 `state/ech`（ECH 私钥）、`state/dns/etc/rndc.conf`（rndc 密钥）当静态文件
+  **未认证**发出。已追加「落在 `<配置目录>/state` 内一律拒绝」。
+- 原始 TOML 编辑器可存出「0 个 `[[admin.users]]`」⇒ 重载后**所有**请求 401、管理面永久锁死
+  （只能上机器改文件+重启）。**注意位置**：先放进 `validate_tree_shape` 撞了两条既有测试
+  （该函数的语义是「形状校验」，测试明确断言「没有 users 的 [admin] 片段形状合法」），
+  已挪到真正的风险点 `write_toml_text`（按顶级 key 覆盖 ⇒ patch 里的 `[admin]` 会整张换掉），
+  并抽成可单测的 `raw_edit_drops_all_admins` + 5 个断言。
+- access_log 把 `path` 原样放进引号字段 ⇒ 含 `"` 的请求可**伪造该行剩余字段**（审计证据）→ 转义。
+- `headers_mod::set_header` 对非法头**静默丢弃** ⇒ 运维配的安全头永不出现且无日志 → 丢弃时 warn。
+
+**生命周期（都是「配置改了、运行时没跟着变」）**：
+- h3 监督任务只判「listener 还在不在」，**不判 `allows_h3()`** ⇒ 从 `http_versions` 删掉 h3 后
+  QUIC 端点每轮照旧 bind+serve（面板显示已关）→ 每轮检查，不再含 h3 就停。
+- `LiveConfig::replace` 的文档明确承诺「与 reload 有完全相同的副作用」，实际漏了
+  `reconcile_apps_runtime` 与 `tor_hs::spawn_from_config` → 补齐。
+- `address`/`address_v6` **从不做语法校验**：`localhost` 也能过预检（预检只构建 acceptor），
+  而热重载时该端口永远绑不上 —— 进程继续跑但**一个端口都不在服务** → 配置期要求 IP 字面量；
+  且出现「全部监听都没绑上」时升级为 `error`。
+
+**GeoIP**：`geoip` 表与 range 表的数值范围查询口径不一致（后者容忍 `start_i IS NULL`，前者没有
+⇒ 同库两条路径结果不同）；两个 mmdb 缓存用 `.lock().unwrap()` ⇒ 任一处 panic 就永久 poisoned、
+GeoIP 分线路**永久失效无恢复** → 改 `unwrap_or_else(|e| e.into_inner())`；
+`resolve_country_alias`（中国/China/CN → CN）**从未被调用** ⇒ 面板按中文名筛选恒为空 → 接到
+filter 入口；updater 的「查锁→扫进程→spawn」是快照，两个并发请求会各起一个（并发写同一 SQLite）
+→ 补进程内原子性。
+
+**记录但不改**（写入 OPERATOR-TODO 第 K 节）：面板 SQLite 每次 lookup 重新 open+跑 DDL 且在
+tokio worker 上同步执行；anycast 表每次 lookup 全表扫；`ensure_synced`（含 120s 下载）在周期
+async 任务里直接同步调用；updater 的 pid 文件与状态清理存在互删窗口；`url_decode` 的
+`byte as char` 多字节问题；`headers_mod::append_security_headers` 是死代码。
+
+**复验（这次逐条做了）**：D4 隔离复验**第一次是失败的**——reconciler 只为「仍允许 h3」的
+listener 更新指纹，所以删掉 h3 时 watch **永不触发**，端点照旧每轮 bind+serve（8s 后 netstat
+仍有 UDP）。补「端点内每 2s 自检」后复验通过（8s 内 UDP 消失）。D5/D6 负控（`address="localhost"`、
+`root="state"`）都 RC=1；生产预检 RC=0 且 `tls acceptors built=3`；D1 面板设 `[8443,9095]` →
+无关保存 → 读回未清空。**测试** 262 passed / 0 failed。
+
+**⚠️ 提交范围**：生产 `config.toml` 含**真实**口令哈希（文件自己写着「生产值不入库」），
+已**排除在本轮提交之外**并设 `--skip-worktree`。**请勿**用 `git checkout -- config.toml`
+「恢复」它（会用空哈希覆盖生产文件 ⇒ 管理面锁死）。

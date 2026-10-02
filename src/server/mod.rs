@@ -203,6 +203,14 @@ pub async fn run(live: Arc<LiveConfig>) -> Result<()> {
                             } else {
                                 log::debug!("hot-spawn port {} 仍失败（已折叠）", lc.port);
                             }
+                            // 一个端口都没绑上 ⇒ 进程活着但**什么也不服务**（站点、管理面、
+                            // DNS 控制面全停），而面板显示「已保存」。这种情况不能折叠在
+                            // warn 里，必须升级成 error 让人看见。
+                            if active_r.lock().await.is_empty() {
+                                log::error!(
+                                    "当前**没有任何监听在服务**（配置里的地址/端口都绑定失败）—— 站点/API/DNS 控制面全部不可用；请检查 address 是否为可绑定的 IP、端口是否被占用"
+                                );
+                            }
                         }
                     }
                 }
@@ -307,6 +315,13 @@ async fn spawn_listener_port(
                     log::info!("h3 listener {key} removed; stopping");
                     break;
                 };
+                // **http_versions 去掉 "h3"** 也必须停：原来只判「listener 还在不在」，
+                // 于是把 h3 从 http_versions 里删掉后，QUIC 端点每轮照旧重新 bind+serve
+                // —— UDP/QUIC 面继续在服务（面板显示 h3 已关），只有删掉整个 listener 才停。
+                if !cur.allows_h3() {
+                    log::info!("h3 listener {key}: http_versions 不再含 h3，停止 QUIC 端点");
+                    break;
+                }
                 let fp = crate::server::h3::h3_config_fingerprint(&cur);
                 crate::server::h3::set_h3_config_fingerprint(port, fp);
                 let rx = crate::server::h3::h3_config_watch(port, fp);

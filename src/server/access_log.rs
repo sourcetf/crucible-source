@@ -45,8 +45,15 @@ pub fn log_response(
         Some(n) => n.to_string(),
         None => "-".to_string(),
     };
+    // `path` 是请求目标，**不能原样进引号字段**：一个含 `"` 的请求就能提前结束引号、
+    // 把后面的字段伪造成任意内容（日志是审计证据，伪造一行等于污染审计）。
+    // 换行/控制字符由 hyper 的 URI 校验挡住，这里的重点是引号与个别控制字符。
+    let path_esc: String = path
+        .chars()
+        .map(|c| if c == '"' || c == '\\' || (c as u32) < 0x20 { '\u{fffd}' } else { c })
+        .collect();
     let line = format!(
-        "{ts} {proto} {peer} \"{method} {path}\" {status} {bytes_field} {}ms {engine}",
+        "{ts} {proto} {peer} \"{method} {path_esc}\" {status} {bytes_field} {}ms {engine}",
         dur.as_millis()
     );
     match cfg.access_log.level.as_str() {

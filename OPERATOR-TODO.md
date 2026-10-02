@@ -343,3 +343,28 @@ SSH/同步小脚本）。本地快照仓库的基线提交（`caf3466`）还跟�
 4. **h1 长连接沿用「建连时」的 listener 快照**：改 `basic_auth` / `root` / `page_rules` 对**已建立**
    的长连接不生效（直到它断开重连）。这与已修的上传闸门（C-4，改读 live 配置）是同一类；
    h1 的请求路径要改成「每请求重取 live 配置」，改动面比上传大，单独列出来。
+
+---
+
+## K. 第三轮审计中**记录但未改**的几条（低危 / 需脚本约定）
+
+这些都是真的、但不是安全边界问题，改动会碰脚本约定或属性能优化，所以留档：
+
+1. **GeoIP 面板每次 lookup 都重开 SQLite 并跑 DDL**（`geoip_panel/covering.rs::merge_pipeline`
+   调 `db::open_panel("data/geoip/panel.sqlite")`）：它是**硬编码相对路径**（`CRUCIBLE_GEOIP_PANEL`
+   与配置里的 db_path 都是死代码），且 `open_panel` 每次执行 `CREATE TABLE/ALTER TABLE`；
+   整个调用发生在 tokio worker 上（未 `spawn_blocking`）。影响：每次面板查询都有同步文件 I/O + DDL。
+   真正的修法是「连接缓存 + 移到 spawn_blocking」，但会动到面板 DB 的打开语义，先记。
+2. **`anycast` 表每次 lookup 全表扫**（`geoip_panel/anycast.rs`，无 `LIMIT`/无 v6 判断）。
+   种子表小的时候无害；导入大表后会变成每次查询一次全表读。
+3. **`ensure_synced` 在周期任务里同步调用**（`server/mod.rs` 的 `tokio::spawn` 里直接调，
+   内含最长 120s 的网络下载 + tar 解包）：admin 触发路径用了 `spawn_blocking`，周期任务没有。
+   影响：一次同步会占住一个 tokio worker（该机只有 2 个）。
+4. **updater 的 pid 文件与状态清理存在互删窗口**（`geoip_panel/ops.rs` 写 `update.pid`，
+   `admin_geoip::handle_update_status` 在锁目录不存在时删它）：极端时序下面板会误报
+   「更新已结束」。已在 Rust 侧补了**进程内** spawn 原子性，跨进程部分依赖脚本的锁约定。
+5. **`admin_geoip::url_decode` 用 `byte as char`**：百分号编码的多字节 UTF-8 会被解成 Latin-1
+   （值只进参数化 SQL 与白名单，所以是显示/筛选层面的正确性问题）。
+6. **`headers_mod::append_security_headers` 是死代码**（无调用者）：全局的
+   `X-Content-Type-Options`/`X-Frame-Options`/`Referrer-Policy` 因此只在少数路径出现。
+   要不要全局加属于产品决策（会影响所有响应），先记。

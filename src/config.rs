@@ -1170,6 +1170,32 @@ impl Config {
             }
         }
 
+        // address / address_v6 必须是**合法 IP 字面量**：写 "localhost" 或拼错时
+        // `--check-config` 会打印 config OK（它只构建 acceptor），而启动/热重载时该端口
+        // 永远绑不上 —— 热重载下进程会**继续运行且一个端口都不在服务**，只在日志里留一条
+        // 折叠过的 warn。配置期直接拒，把错误提前到加载时。
+        for l in &self.listeners {
+            if l.address.parse::<std::net::IpAddr>().is_err() {
+                anyhow::bail!(
+                    "listener {}:{} 的 address {:?} 不是合法 IP 字面量（不要写域名；IPv6 直接写地址本体，如 ::）",
+                    l.address,
+                    l.port,
+                    l.address
+                );
+            }
+            if let Some(v6) = l.address_v6.as_deref() {
+                let t = v6.trim();
+                if !t.is_empty() && t.parse::<std::net::IpAddr>().is_err() {
+                    anyhow::bail!(
+                        "listener {}:{} 的 address_v6 {:?} 不是合法 IP 字面量",
+                        l.address,
+                        l.port,
+                        v6
+                    );
+                }
+            }
+        }
+
         for l in &self.listeners {
             let Some(ssl) = &l.ssl else { continue };
             // ECH cover 证书必须成对：只给一半会在握手时静默回落到「不能用于 public_name
@@ -1687,6 +1713,20 @@ fn check_roots_do_not_expose_config(cfg: &Config, config_dir: &Path) -> Result<(
                 l.port,
                 r.display(),
                 base.display()
+            );
+        }
+        // **root 落在 state/ 里**同样必须拒绝：state/ 下有 ECH 私钥（state/ech）、
+        // rndc 密钥（state/dns/etc/rndc.conf）与 DNS 分区库。上面两条只挡了
+        // 「root == 配置目录」与「root 是配置目录的祖先」，而 `root = "state"` 这种
+        // **后代**会逃过检查 ⇒ 该端口把私钥当静态文件发出去（未认证可读），
+        // 面板的文件 API 也能读写它们。
+        let state_dir = base.join("state");
+        if r == state_dir || r.starts_with(&state_dir) {
+            anyhow::bail!(
+                "listener {}:{} 的 root {} 落在 state/ 里 —— 该目录含 ECH 私钥、rndc 密钥与 DNS 分区库，把它当 docroot 等于未认证公开这些密钥。请把 root 指向具体的 www 目录",
+                l.address,
+                l.port,
+                r.display()
             );
         }
     }
