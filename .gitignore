@@ -92,3 +92,10 @@ www-apps/*/deps/
 
 # 运维/验证脚本：*.sh 整体忽略，但这个要入库（ECH 内外层端到端演示）
 !scripts/ech_demo.sh
+
+# 我的临时备份目录（agent 快照补丁，不属于项目）
+.agents-backups-*/
+
+# 运维/验证脚本：*.sh 整体忽略，但这个要入库（named 换监听配置后的重新部署流程：
+# 必须显式 kill named，否则 reconcile 认为 named「活着」不会重建 socket）
+!scripts/deploy/dns_listen_redeploy.sh

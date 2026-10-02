@@ -2180,3 +2180,97 @@ v6 连接**（`0.0.0.0` 那侧是对称处理过的，v6 这侧漏了）。生�
 
 另外把上一轮标了 `#[ignore]` 的 QMux「部分发送重复前缀」用例**改成接收驱动版**（额度按已收字节
 推进 + 总超时），消除了导致假红的竞态，现在它是这条 P1 修复的真正回归测试。
+### 21.32 named 只在 loopback 监听（生产 53 收不到公网查询）——根因：`listen-on { 0.0.0.0; }` 被 BIND 静默丢弃
+
+**这一节同时是两条更正**：一条是对「方案 A 已做完」的更正（R4 其实没达成），一条是对我此前
+「外部 vantage 看到递归还开着」那批证据的更正（那批证据全是假的，见下）。
+
+#### 现象
+方案 A 落地后从**本机 loopback** 复验全绿（`. NS` 13 条真根 NS + `aa`、`com.` 转交、`com. DS`、
+递归 `google.com A` + RRSIG），但用户要求的 R4「客户端把这个机子当根服务器查询」是**外部**判据：
+从外网看 53 端口 **TCP 直接 refused**。`netstat`/`sockstat`/`fstat -p <named pid>` 三处一致 ——
+named 只持有 `127.0.0.1:53`（UDP+TCP），**没有** `83.229.125.81:53`，而 `named.conf` 里明明写着
+`listen-on port 53 { 0.0.0.0; 127.0.0.1; }`。`pf` 侧 53 是放行的，`rndc status` 显示的配置路径与
+boot 时间也都是新的（说明不是「改了配置没重载」）。
+
+#### 定位：一个对照实验就定性
+在 5301/5302 端口起两个一次性 named 实例（`-g` 前台、独立目录、`fstat -p` 看 socket）：
+
+| `listen-on` 内容 | named 实际建出的 socket |
+|---|---|
+| `{ any; }` | `127.0.0.1:5301`、**`83.229.125.81:5301`**、`10.126.126.1:5301` |
+| `{ 0.0.0.0; }` | **一个都没有**（连 loopback 都没有），日志里**无任何告警** |
+
+结论：named 的 `listen-on` 是**逐接口枚举**语义（不是 bind 一个通配地址）—— 关键字 `any` 展开成
+「每个接口地址各建一个 socket」，而**字面量 `0.0.0.0` 匹配不到任何接口地址，于是被静默丢弃**。
+`listen-on-v6 { any; }` 一直是对的（v6 地址全建出来了），所以只有 IPv4 这一侧漏；这也解释了
+为什么 loopback 复验看不出来：`127.0.0.1` 恰好是我们**显式**列在 listen-on 里的那一项。
+
+**自欺环节（必须留档）**：我此前用「外部 vantage」看到 `. NS` 超时、`google.com A` 却有答案，
+据此以为「外部递归仍开着」。后来发现**本机 UDP/53 被运营商劫持**：向 `192.0.2.1`（TEST-NET-1，
+RFC 5737 保证不可达）发查询也照样返回真实 A 记录；向真根 `198.41.0.4` 发 `com. NS +RD=0` 返回的是
+带 `ra`、TTL 77952 的**递归器缓存答案**而不是 `aa` 转交。所以那批「外部证据」全部来自本地递归器，
+与我们的 named 无关 —— **「没验证」和「验证了但证据是假的」是同一件事**。
+现在外部视角一律走 **TCP/53**：劫持只拦 UDP（TCP 对 192.0.2.1 如实 connect 失败），
+对真根 `198.41.0.4` 能拿到 `flags: qr`、`an=0 ns=13 ar=26` 的正经转交（`_dnsq.py` 已支持 `tcp` 模式）。
+
+#### 修复（`src/server/dns/mod.rs`）
+把 named.conf 的地址表生成抽成纯函数 `listen_lists(addr, test_mode, geo_lines) -> (listen-on, listen-on-v6)`：
+
+- `0.0.0.0` → 关键字 **`any`**（绝不再落字面量）；`::` → v6 侧 `any`、v4 侧 `none`；
+- v4 字面量 → v4 侧原样、v6 侧 `none`；v6 字面量 → v6 侧原样、v4 侧 `none`
+  （旧代码在 `listen_addr = "::1"` 时把 **v6 表也写成 `none`**，等于「配了 v6 却哪里都不听」，一并修正）；
+- `any`/`none`/`localhost`/`localnets` 关键字两侧透传；
+- **`127.0.0.1` 永远补进 v4 表**（本进程 DoT/DoH 转发的源地址就是它，少了它每个查询被自己的
+  named 回 REFUSED）；测试模式固定 `127.0.0.1` / `none`。
+
+#### 顺带查出的第二个缺陷：分线路 loopback 地址少了中间那段 `0`
+同一段代码里分线路转发地址写的是 `format!(" 127.0.{};", 2 + i)` ⇒ 生成 `127.0.2`、`127.0.3`…，
+而另外三处用的都是 `127.0.0.{2+i}`：fwd view 的 `match-destinations { 127.0.0.{2+i}; }`、
+`ifconfig lo0 inet 127.0.0.{2+i} alias`、以及 DoT/DoH 的 `resolve_fwd_dest`（返回 `127.0.0.(2+i)`）。
+三处不一致 ⇒ **配了 geo 分线路时，fwd-<line> view 的 `match-destinations` 上根本没有 socket，
+分线路转发静默失效**（生产 `geo.lines` 为空，所以一直没暴露）。已统一为 `127.0.0.{2+i}`，
+索引范围与 `resolve_fwd_dest` 的 `i.min(250)` 对齐（可达 `127.0.0.2`..`127.0.0.252`），
+且**分线路为 0 时一个都不加**。
+
+#### 回归测试（8 条，`dns::listen_lists_tests`）
+`wildcard_v4_becomes_any_never_literal`（钉住「绝不出字面量 `0.0.0.0`」）、
+`loopback_is_always_in_v4_table_and_never_duplicated`、`v6_literal_never_leaks_into_v4_table`
+（含 `::1` 时 v6 表必须是 `::1` 而不是 `none`）、`keywords_pass_through_to_both_tables`、
+`geo_line_loopbacks_are_listed_explicitly`（含「老写法 `127.0.2` 不许出现」）、
+`geo_line_loopbacks_cover_the_resolver_index_cap`、`no_geo_lines_adds_no_forwarding_loopbacks`、
+`test_mode_is_loopback_only_even_with_public_addr`。
+
+**其中 `no_geo_lines_adds_no_forwarding_loopbacks` 是「单测当场抓到我自己的 bug」**：我先把上限写成
+`0..=geo_lines.min(250)`，`lines=0` 时 `0..=0` 会多加一个 `127.0.0.2`，两条既有用例立刻变红。
+（另：这个包**没有 lib target**，测试必须用 `--bin webserver` 跑，`--lib` 会直接
+`error: no library targets found` —— 我第一次就踩了这个，别把那个 101 当成测试失败。）
+
+#### 真机复验（部署 2026-10-02 13:11，备份 stamp `20261002-131111`）
+部署流程：build → `--check-config`（rc=0）→ 停 webserver **与 named** → 换二进制 → `sh /etc/rc.local` → 复验。
+**必须显式杀 named**：reconcile 只判「named 活着与否」，旧配置下 named 是活着的，只重启 webserver
+会让它继续用旧的 loopback-only 绑定（我第一次重启后 fstat 仍只有 `127.0.0.1:53` 就是这个原因）。
+
+生成的配置（已落地）：`listen-on port 53 { any; 127.0.0.1; };` / `listen-on-v6 port 53 { none; };`；
+`named-checkconf -z` OK（只有根区里 SHA-1 DS 的 deprecated 提示，那是真实根区的数据）。
+named 实际 socket（`fstat -p 91042`）：`127.0.0.1:53`、**`83.229.125.81:53`**、`10.126.126.1:53`（UDP+TCP 各一）。
+
+**外部视角（全部 TCP/TLS —— 本机 UDP/53 被劫持，见上）**：
+
+| 查询 | 结果 | 判据 |
+|---|---|---|
+| `. NS` RD=0（TCP） | `qr aa`，an=13，ar=26 | 根服务器视角：权威回答 13 条真根 NS + glue |
+| `. NS` RD=0（UDP，经公网 IP 自身） | `qr aa`，ANSWER 13，ADDITIONAL 27 | UDP socket 在公网 IP 上确实应答 |
+| `com. NS` RD=0 | `qr`，an=0 ns=13 ar=26 | 正经转交（不是递归答案） |
+| `com. DS` RD=0 | `qr aa`，an=1 | 根区里 com 的 DS，权威 |
+| `com. NS` RD=0 +DO | `qr`，AUTHORITY 15，含 RRSIG(DS) | 签名转交 |
+| `google.com A` RD=1（外部） | `qr rd`，an=0 ns=13 ar=26 | **无 `ra`、无递归答案** = 外部递归关闭 |
+| DoT `83.229.125.81:853` `com. NS` RD=0 | `qr ra`，转交 | DoT 监听可用（`1.1.1.1:853` 作对照同样通过） |
+
+**本机侧（loopback，UDP 可信）**：`google.com A` → `qr rd ra` + `142.250.197.46`；
+`example.org A` → 有答案（确实在用我们自己的根迭代）。h1 9095/9081 → 200，h3 8443 → 200，
+853/5349/8443/9445/9446 均在听；ECH 探针 `ECH_ACCEPTED=true`。
+
+**遗留（不是 bug，是待拍板的策略）**：`panel.toml` 里 `dot.allow = ["0.0.0.0/0","::/0"]`（面板意图是对
+所有人开 DoT），但 `recursion_acl` 只有 `127.0.0.1` ⇒ 公网 DoT 客户端只能拿到根区转交、拿不到递归答案。
+取哪边是策略问题（开放递归 = 放大攻击面），我按「外部递归关闭」处理，并记进 `OPERATOR-TODO.md` E 项。

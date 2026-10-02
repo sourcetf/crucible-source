@@ -146,3 +146,59 @@ config.toml 的 `[dns]` 从此不生效（启动日志已明确报出这件事�
 - **配置预检**：改动配置后可先 `./bin/webserver --config <cfg> --check-config` 验证再重启。
   这是「新校验误拒生产配置」两次事故后的固定流程。
 - **磁盘**：长期 95%，构建脚本末尾会回收 `cargo check` 的 dev 产物；日志轮转已设上限。
+
+---
+
+## E. 53 端口对外服务（「把本机当根服务器」）—— **此前并未真正可用，现已修，只需你确认**
+
+**背景**：`named.conf` 原本写 `listen-on port 53 { 0.0.0.0; 127.0.0.1; }`，但 BIND 会把**字面量
+`0.0.0.0` 静默丢弃**（不建 socket、不打任何警告）⇒ 53 只在 `127.0.0.1` 上监听，外网一条查询都
+收不到。也就是说「客户端把这个机子当根服务器」这件事，在修之前**只是本机自测通过**。
+代码已改为生成关键字 `any`（`src/server/dns/mod.rs::listen_lists`，复盘见 WORKLOG 21.32）。
+
+**你只需确认**（全部走 **TCP/TLS**：本机/本网 UDP/53 被运营商劫持 —— 向 `192.0.2.1` 发查询也返回
+真实 A 记录，所以 UDP 的外部结果不可信）：
+
+```sh
+python _dnsq.py 83.229.125.81 .   NS 0 0 tcp          # 期望 qr aa；13 条根 NS + glue
+python _dnsq.py 83.229.125.81 com. NS 0 0 tcp         # 期望转交 an=0 ns=13 ar=26
+python _dnsq.py 83.229.125.81 com. DS 0 0 tcp         # 期望 qr aa，1 条 DS
+python _dnsq.py 83.229.125.81 google.com A 1 0 tcp    # 期望「无 ra、无递归答案」= 外部递归关闭
+python _dnsq.py 83.229.125.81 com. NS 0 0 tls         # DoT :853，期望同样拿到转交
+```
+
+机上自查：
+
+```sh
+fstat -p $(pgrep -x named) | grep ':53'               # 期望出现 83.229.125.81:53（UDP+TCP）
+named-checkconf -z /crucible/state/dns/etc/named.conf && echo OK
+dig +norec @127.0.0.1 . NS                            # 本机也应 aa + 13 条
+```
+
+**部署坑（下次别再踩）**：换监听/端口相关配置后，只重启 webserver **不够** —— `reconcile` 只判
+「named 活着与否」，旧配置下 named 是活着的 ⇒ 它会继续用旧绑定。必须**显式 `kill $(pgrep -x named)`**，
+让它按新生成的 named.conf 重建 socket。
+
+**回滚**（本次部署的备份 stamp 为 `20261002-131111`）：
+
+```sh
+cd /crucible
+cp -p bin/webserver.bak-20261002-131111 bin/webserver
+cp -p state/dns/etc/named.conf.bak-20261002-131111 state/dns/etc/named.conf
+kill $(pgrep -x webserver) $(pgrep -x named); sleep 2; sh /etc/rc.local
+```
+
+---
+
+## F. DoT 对外策略（**需要你决定**：公网 DoT 要不要给递归）
+
+**现状**：`panel.toml` 里 `dot.allow = ["0.0.0.0/0","::/0"]`（面板意图：对所有人提供 DoT），
+但 `recursion_acl = ["127.0.0.1"]`。合起来的效果是：**公网 DoT 客户端能连上、能问，但只拿得到根区
+转交，拿不到递归答案**（对外的 DoT 目前是「根/权威服务器」，不是解析器）。
+
+两条路：
+
+1. **保持现状**（推荐，安全）：对外 DoT 只做权威/根服务。无需动作。
+2. **对公网开递归**：把 `recursion_acl` 扩到**具体网段**。注意**不要**写 `0.0.0.0/0` ——
+   开放递归是 DNS 放大攻击的帮凶（会被用来打别人），要开就只写固定客户网段。改完复验：
+   `named-checkconf -z` + 从**外部** `python _dnsq.py 83.229.125.81 <外部域名> A 1 0 tls` 能拿到答案。
