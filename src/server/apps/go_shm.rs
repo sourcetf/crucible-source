@@ -18,6 +18,9 @@ use http::{Request, Response, StatusCode};
 use http_body_util::BodyExt;
 use hyper::body::Incoming;
 use once_cell::sync::Lazy;
+
+/// 冷启动串行化锁（见 `ensure_runtime`）。只保护「还没起来」的那一小段。
+static COLD_START: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
 use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::fs::{self, OpenOptions};
@@ -91,7 +94,24 @@ pub async fn execute(
     let key = format!("{}-{}-go", lc.port, app_idx);
     let method = req.method().as_str().to_string();
     let path = req.uri().path().to_string();
-    let body = req.into_body().collect().await?.to_bytes();
+    // 与其它引擎口径一致：先把请求体卡在 APP_BODY_CAP 再收。本引擎是唯一漏掉这层的
+    //（php / app_ffi / cgi_script / native_http 都用了 `Limited`），而 GO_SHM_BODY_MAX
+    // (64 KiB) 的检查发生在**整个 body 已在内存里**之后 ⇒ chunked 超大请求能在那之前
+    // 就把进程内存吃光。
+    // 注意 `Limited` 的错误类型不实现 `std::error::Error`，所以只能 match，不能 `?`
+    //（php.rs 同样处理：超限直接 413，不再把 body 收进内存）。
+    let body = match http_body_util::Limited::new(req.into_body(), crate::server::h1::APP_BODY_CAP)
+        .collect()
+        .await
+    {
+        Ok(c) => c.to_bytes(),
+        Err(_) => {
+            return Ok(Response::builder()
+                .status(StatusCode::PAYLOAD_TOO_LARGE)
+                .body(full("request body too large"))
+                .unwrap())
+        }
+    };
 
     // P2-11：ensure（spawn 子进程 + 5s 等待）与整个 slot IPC（acquire_slot 50µs 忙等 +
     // notify 阻塞 UnixStream）全部放 spawn_blocking——不再阻塞 tokio worker。
@@ -207,6 +227,17 @@ fn ensure_runtime(key: &str) -> Result<()> {
         let map = RUNTIMES.lock();
         if map.contains_key(key) {
             return Ok(());
+        }
+    }
+    // 冷启动串行化：「查表 → spawn」不是原子的。两个并发首请求会各自 spawn 一个
+    // go-shm-server，后者 `init_shm_file` 会把共享内存文件 truncate 掉，而前者的子进程
+    // 还活着 ⇒ 泄漏进程 + 数据错乱。`native_http::ensure_sidecar` 早就有 per-key 锁。
+    // 这里用一把**全局冷启动锁**（只在冷启动路径上竞争，热路径不碰）。
+    let _cold = COLD_START.lock();
+    {
+        let map = RUNTIMES.lock();
+        if map.contains_key(key) {
+            return Ok(()); // 等锁期间别人已经起好了
         }
     }
     let bin = server_binary().context("go-shm-server binary missing; run make engines")?;

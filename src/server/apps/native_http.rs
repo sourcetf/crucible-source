@@ -242,14 +242,19 @@ async fn proxy_unix(
             .method(parts.method.clone())
             .uri(parts.uri.clone());
         for (k, v) in parts.headers.iter() {
+            // **丢弃客户端自带的转发头**，否则客户端可以把任意 IP 放在最左边，
+            // 后端拿它做日志/ACL 就是伪造点（proxy.rs 的 WS 路径早就是「跳过再写」，
+            // 这里此前是「追加语义」，把客户端值原样传下去了）。
+            if matches!(
+                k.as_str(),
+                "x-forwarded-for" | "x-forwarded-proto" | "x-forwarded-host" | "x-real-ip"
+            ) {
+                continue;
+            }
             builder = builder.header(k, v);
         }
-        // P2-5：X-Forwarded-For 注入（追加语义；sidecar 是本地应用后端）。
-        let xff = match parts.headers.get("x-forwarded-for").and_then(|v| v.to_str().ok()) {
-            Some(existing) => format!("{existing}, {peer_ip}"),
-            None => peer_ip.clone(),
-        };
-        builder = builder.header("x-forwarded-for", xff);
+        // 只写真实 peer（sidecar 是本地应用后端，它要的就是「谁连到了 webserver」）。
+        builder = builder.header("x-forwarded-for", peer_ip.clone());
         builder.body(Full::new(bytes.clone()))
             .context("build upstream req")
     };

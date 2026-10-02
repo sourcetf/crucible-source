@@ -77,6 +77,12 @@ pub async fn serve(req: &Request<Incoming>, lc: &ListenerConfig) -> Result<Respo
         }
         bail!("directory");
     }
+    // 只服务**普通文件**：docroot 里若存在 FIFO / unix socket / 设备节点，
+    // 对它 open/read 会**永久阻塞**，白白占住一个阻塞池 worker（连续几个就能把池抽干）。
+    // （`resolve_path` 的 canonicalize 只保证在 root 内，不保证类型。）
+    if !meta.is_file() {
+        bail!("not a regular file");
+    }
     let mode = lc.file_open_mode(path);
     // §16.2：static 层不得替引擎把「应执行的脚本」当普通文件吐出去（见 engine_owns）。
     if engine_owns(lc, path, mode) {
@@ -930,9 +936,13 @@ fn autoindex_html(dir: &Path, url: &str, enable_upload: bool) -> Result<String> 
         .filter_map(|e| e.ok())
         // 上传临时文件（`.{目标名}.upload.part`）不进目录列表：它们不可下载（见 resolve_path），
         // 但把名字列出来等于告诉所有人「谁正在往这里传什么文件、传到一半」。
+        // 目录列表**不列任何点开头的名字**（`.env`、`.git`、`.htpasswd`…）。
+        // 它们本来就下载不了（`resolve_path` 拒隐藏段），但列出来等于告诉访问者
+        // 「这里有个 .env、它叫什么」—— 本仓库自己的注释就写着部署的 `.env` 里放 DB 口令。
+        // （原来只排除了 `.x.upload.part`，隐藏文件照列。）
         .filter(|e| {
             let n = e.file_name().to_string_lossy().to_string();
-            !(n.starts_with('.') && n.ends_with(".upload.part"))
+            !n.starts_with('.')
         })
         .collect();
     entries.sort_by_key(|e| e.file_name());

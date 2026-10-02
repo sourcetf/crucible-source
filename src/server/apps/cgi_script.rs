@@ -13,7 +13,13 @@ use hyper::body::Incoming;
 use std::net::SocketAddr;
 use std::path::Path;
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use tokio::task;
+
+/// CGI 脚本单次响应的输出上限（stdout）。与其它引擎的 APP_BODY_CAP 同量级：
+/// 超限说明脚本失控，宁可回 502 也不能把内存交给它。
+const CGI_OUTPUT_CAP: usize = 32 * 1024 * 1024;
 
 /// Spawn `binary` with CGI/1.1 environment; parse Status/headers/body.
 pub async fn execute_binary(
@@ -54,6 +60,15 @@ pub async fn execute_binary(
             .env("SERVER_PROTOCOL", "HTTP/1.1")
             .env("SERVER_PORT", port.to_string())
             .env("CONTENT_LENGTH", body.len().to_string());
+        // 让脚本与**它的子进程**同属一个新进程组（组长 = 子进程 pid）。看门狗要杀的
+        // 是**整组**而不是单个进程：`#!/bin/sh` 脚本里起 `sleep`/`cat` 这类子命令时，
+        // 杀 shell 并不会杀掉孙进程，而孙进程**继承了 stdout 管道** ⇒ 我们这端永远等不到
+        // EOF、请求继续挂着。实测踩过（sleep 100 的脚本 50s 仍不返回）。
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            cmd.process_group(0);
+        }
         let mut child = cmd.spawn().context("cgi_script spawn")?;
         if !body.is_empty() {
             use std::io::Write;
@@ -61,7 +76,71 @@ pub async fn execute_binary(
                 stdin.write_all(&body)?;
             }
         }
-        Ok(child.wait_with_output().context("cgi_script wait")?.stdout)
+        // 关掉 stdin：CGI 脚本靠 EOF 才知道请求体结束（否则它会一直等着读）。
+        drop(child.stdin.take());
+        // 超时：std 没有 `wait_timeout`，用一个看门狗线程到点 SIGKILL **整个进程组** ——
+        // 组内进程全死光，下面阻塞的 `read` 才会返回 EOF（只杀脚本本身不够，见上）。
+        // 在此之前这条路径**没有任何超时**：一个不退出（或只往 stdout 猛写）的脚本
+        // 会永久占住一个 spawn_blocking 线程，重复几次就把阻塞池抽干。
+        // 上限与 app_ffi 的 CGI_TIMEOUT_MS 口径一致。
+        const CGI_TIMEOUT_SECS: u64 = 30;
+        // 组长 pid == 子进程 pid（上面 process_group(0)）
+        let pgid = child.id() as i32;
+        let done = Arc::new(AtomicBool::new(false));
+        let timed_out = Arc::new(AtomicBool::new(false));
+        {
+            let done = done.clone();
+            let timed_out = timed_out.clone();
+            std::thread::spawn(move || {
+                let deadline = std::time::Instant::now()
+                    + std::time::Duration::from_secs(CGI_TIMEOUT_SECS);
+                while std::time::Instant::now() < deadline {
+                    if done.load(Ordering::Relaxed) {
+                        return; // 子进程已被 wait 收走，无需再管
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(200));
+                }
+                if !done.load(Ordering::Relaxed) {
+                    timed_out.store(true, Ordering::Relaxed);
+                    // 负 pid = 杀**整个进程组**（含脚本起的孙进程）——只杀脚本本身时，
+                    // 孙进程仍持有 stdout 管道，读端就永远等不到 EOF。
+                    // 安全：pgid 就是紧接着 spawn 出来的那个子进程 pid（process_group(0)），
+                    // 且 done 未置位 ⇒ 这一组还在跑。
+                    unsafe {
+                        libc::kill(-pgid, libc::SIGKILL);
+                    }
+                }
+            });
+        }
+        // 有界读取：此前是 `wait_with_output()`，stdout 有多少收多少 ——
+        // 一个往 stdout 猛写的脚本能把内存吃光，所以读的时候就要卡住上限。
+        let mut stdout = Vec::new();
+        if let Some(mut so) = child.stdout.take() {
+            use std::io::Read;
+            let mut buf = [0u8; 64 * 1024];
+            loop {
+                let n = match so.read(&mut buf) {
+                    Ok(0) => break,
+                    Ok(n) => n,
+                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                    Err(e) => return Err(e).context("cgi_script read stdout"),
+                };
+                if stdout.len() + n > CGI_OUTPUT_CAP {
+                    let _ = child.kill();
+                    bail!("cgi_script 输出超过上限 {CGI_OUTPUT_CAP} 字节（疑似脚本失控）");
+                }
+                stdout.extend_from_slice(&buf[..n]);
+            }
+        }
+        let status = child.wait().context("cgi_script wait")?;
+        done.store(true, Ordering::Relaxed);
+        if timed_out.load(Ordering::Relaxed) {
+            bail!("cgi_script 超时（{CGI_TIMEOUT_SECS}s）已被终止");
+        }
+        if !status.success() && stdout.is_empty() {
+            bail!("cgi_script 退出异常（{:?}）且无输出", status.code());
+        }
+        Ok(stdout)
     })
     .await
     .context("cgi_script join")??;

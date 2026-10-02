@@ -73,11 +73,26 @@ fn redirect_response(target: String) -> Response<BoxBody> {
         Some(("308", u)) => (StatusCode::PERMANENT_REDIRECT, u.to_string()),
         _ => (StatusCode::FOUND, target),
     };
-    Response::builder()
+    // **不 unwrap**：`HeaderValue` 拒绝控制字符与非 ASCII，而 `target` 来自配置/面板。
+    // 手写配置里一个带换行或非 ASCII 的 target，会让**每一个命中该规则的请求**在 hyper 的
+    // service future 里 panic（连接被直接丢弃，日志只有一行 panic）。非法值降级为
+    // 「不带 Location 的 302」并把原因写日志 —— 站点不因此整条规则全挂。
+    match Response::builder()
         .status(status)
-        .header(header::LOCATION, loc)
+        .header(header::LOCATION, loc.as_str())
         .body(full(""))
-        .unwrap()
+    {
+        Ok(r) => r,
+        Err(e) => {
+            log::warn!(
+                "page_rules redirect: target 不能作为 Location 响应头（{e}），降级为无 Location 的 302"
+            );
+            Response::builder()
+                .status(StatusCode::FOUND)
+                .body(full(""))
+                .unwrap()
+        }
+    }
 }
 
 /// `rewrite` 动作:把 match_url 匹配的前缀替换为 target,返回新路径。

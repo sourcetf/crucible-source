@@ -1667,10 +1667,16 @@ pub async fn proxy_page_rule(
     };
     match proxy_once(req, &rule, peer_ip, client_https).await {
         Ok(r) => r,
-        Err(e) => Response::builder()
-            .status(StatusCode::BAD_GATEWAY)
-            .body(full(format!("page rule pass error: {e:#}")))
-            .unwrap(),
+        Err(e) => {
+            // 与 `try_proxy` 同口径：**不回显** `{e:#}` —— 那是完整错误链，里面有上游地址
+            // 与端口、tor 的 unix socket 路径、TLS 后端错误文本、超时预算等内网布局信息，
+            // 而能拿到它的人只是任意一个命中该 page rule 的客户端。细节只进本地日志。
+            log::warn!("proxy: page rule pass 处理失败: {e:#}");
+            Response::builder()
+                .status(StatusCode::BAD_GATEWAY)
+                .body(full("502 Bad Gateway"))
+                .unwrap()
+        }
     }
 }
 

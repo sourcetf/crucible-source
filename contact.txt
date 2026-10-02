@@ -1098,3 +1098,42 @@ public_name」的校验，但 `ech_auto::ensure_material` 的**复用条件里�
 
 **测试**：259 passed / 0 failed（+1 条孤儿检测）。生产复验：无孤儿误报、HTTPS 记录仍在
 （ech= 解码后与 ech_config_list.bin 逐字节相同）、递归正常、h1/h3 = 200。
+
+
+---
+
+### Session 1008 (2026-10-03) — 进展 35（派 3 个并行 agent 审计三片未覆盖区域；修 15 处；含一次「我的修复没生效」的纠正）
+
+按用户早前要求「启用尽可能多个 agent 扫描代码的 bug」，派 3 个**只读** agent 并行审计此前没深挖的
+三片：静态文件/h1、反代/访问控制/L4、应用引擎/Tor。方法是先把生产 `src/` 整树拉到本地镜像再审
+（避免审到本地仓库那份过时快照）。结论：**无 P0**；修掉的是资源耗尽 / 信息泄露 / 配置静默失效三类。
+
+**最有价值的模式**：同一段逻辑有两份实现，只修了其中一份，而**生效的是另一份**。
+最典型：`port_reuse.rs` 里有一份带超时守卫的转发实现，却**没有任何调用者**（死代码），
+而 `listener.rs` 自己内联了一遍零超时的。现在守卫下沉到 `l4::forward_guarded`，两条路径共用。
+
+**修的 15 处**：go_shm 请求体无上限（唯一漏掉 `Limited` 的引擎）/ cgi_script 无超时+无界输出 /
+l4 零超时 / port_reuse 死代码与内联路径 / proxy page-rule 回显错误链 / **apps/mod.rs 全部 14 处
+引擎错误体回显 `{e:#}`（含 docroot/socket 路径）** / child_registry `kill_all` 只凭 pid（pid 复用
+误杀）/ php 重启泄漏子进程 / go_shm 冷启动竞态 / native_http 信任客户端 `X-Forwarded-For` /
+autoindex 列隐藏文件 / 非普通文件（FIFO）被服务会占死 worker / connect_udp 漏 5 个非单播段 /
+page_rules 与 server_name 进 Location 的可 panic 路径（改成降级 + 配置期拦截）/
+ip_access 非法条目静默失效（`deny` 形同虚设）。
+
+**⚠️ 一次纠正（本轮最值得记的）**：cgi_script 超时的**第一版修复没生效**——看门狗只 `SIGKILL`
+脚本本身，而脚本是 `#!/bin/sh` 起的 `sleep` 是**孙进程**、继承了 stdout 管道 ⇒ 读端永远等不到
+EOF，隔离验证里 50 秒仍不返回。改成 `process_group(0)` + `kill(-pgid)` 杀**整个进程组**后，
+`GET /slow` → **502，30 秒**。若只有代码审阅或「编译+单测通过」，我会把第一版当成修好了。
+
+**隔离验证**（临时实例 18445 + /tmp docroot；cwd 换成 /tmp 以防碰生产 state/）：
+autoindex `.env` 出现 0 次、`ok.txt` 正常列出；`GET /queue`(FIFO) → 404 用 0 秒（不再挂）；
+CGI 正常路径回归 `cgi-ok`；引擎错误体 = `502 Bad Gateway (engine error)` 且不含路径；
+CGI 超时 → 502/30s。
+
+**测试** 261 passed / 0 failed（+1 条 pid 复核单测）。生产终态：webserver+named up、14 个监听、
+ECH 内外层不同（`af6fca4d…`/`dbcc988e…`）、HTTPS 记录含 `ech=`、递归正常、`admin:admin=401`、
+本次启动无新增 WARN。
+
+**暂缓/记录（不擅自改，需你确认）**：`env_lock` 的进程环境变量并发污染（架构级）；
+`rate_limit` 按完整地址分桶 ⇒ 持 /64 的 v6 客户端换地址可绕过（改成按 /64 聚合是行为变更）；
+`h1` 长连接沿用建连时的 listener 快照（与已修的上传闸门同类，但改动面更大）。

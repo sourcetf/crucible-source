@@ -70,7 +70,23 @@ pub struct FcgiResponse {
     pub body: Bytes,
 }
 
+/// 一次 FastCGI 往返的墙钟上限。
+///
+/// 上游是 php-fpm，也可能是运维配置的 `engine = "fastcgi"` + `socket = <任意地址>`：
+/// 一个「接受连接但永不发 FCGI_END_REQUEST」的上游会让请求任务永久挂着（且内存随
+/// 累积的 STDOUT 增长）。这条路径此前**没有任何超时**。
+const FCGI_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+/// STDOUT + STDERR 的合计上限：上游一直灌数据时不能把内存吃光。
+const FCGI_OUTPUT_CAP: usize = 32 * 1024 * 1024;
+
 pub async fn exchange(addr: &FcgiAddr, req: &FcgiRequest) -> Result<FcgiResponse> {
+    match tokio::time::timeout(FCGI_TIMEOUT, exchange_inner(addr, req)).await {
+        Ok(r) => r,
+        Err(_) => bail!("fastcgi: 上游响应超时（{FCGI_TIMEOUT:?}）"),
+    }
+}
+
+async fn exchange_inner(addr: &FcgiAddr, req: &FcgiRequest) -> Result<FcgiResponse> {
     match addr {
         #[cfg(unix)]
         FcgiAddr::Unix(path) => {
@@ -158,6 +174,10 @@ where
         let (rtype, rid, content) = read_record(stream).await?;
         if rid != request_id && rid != 0 {
             continue;
+        }
+        // 每个分片都要卡总上限：上游一直灌数据时，此前 stdout/stderr 会无限增长到 OOM。
+        if stdout.len() + stderr.len() > FCGI_OUTPUT_CAP {
+            bail!("fastcgi: 上游输出超过上限 {FCGI_OUTPUT_CAP} 字节");
         }
         match rtype {
             FCGI_STDOUT => {

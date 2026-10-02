@@ -16,10 +16,39 @@ use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::process::{Child, Command};
 
-static REGISTRY: Lazy<Mutex<HashMap<i32, String>>> = Lazy::new(|| Mutex::new(HashMap::new()));
+/// pid -> (逻辑名, 程序名)。程序名用于退出时按 pid 复核命令行 —— OpenBSD 无 /proc，
+/// 长运行期里 pid 会被复用，只凭 pid 发信号可能杀掉一个无关进程
+///（`kill_if_matches`/`tor_pid` 早就这么做，`kill_all` 此前没有）。
+static REGISTRY: Lazy<Mutex<HashMap<i32, (String, String)>>> = Lazy::new(|| Mutex::new(HashMap::new()));
 
 pub fn register(pid: i32, name: &str) {
-    REGISTRY.lock().insert(pid, name.to_string());
+    REGISTRY.lock().insert(pid, (name.to_string(), String::new()));
+}
+
+/// spawn 时用这个：额外记录**程序名**，供退出时复核。
+fn register_with_program(pid: i32, name: &str, program: &str) {
+    let base = std::path::Path::new(program)
+        .file_name()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_else(|| program.to_string());
+    REGISTRY.lock().insert(pid, (name.to_string(), base));
+}
+
+/// pid 还活着、且命令行里仍能看到当初记录的程序名（没记录程序名则退回「还活着就动手」）。
+fn alive_and_matches(pid: i32, program: &str) -> bool {
+    if pid <= 1 {
+        return false;
+    }
+    if unsafe { libc::kill(pid, 0) } != 0 {
+        return false; // 已退出
+    }
+    if program.is_empty() {
+        return true; // 旧式注册（无程序名）→ 保持旧行为
+    }
+    match ps_command(pid) {
+        Some(cmd) => cmd.contains(program),
+        None => false,
+    }
 }
 
 pub fn unregister(pid: i32) {
@@ -29,18 +58,29 @@ pub fn unregister(pid: i32) {
 /// 终止所有已注册子进程（SIGTERM → 短等 → SIGKILL）。
 /// 在 spawn_blocking 中调用（内含 thread::sleep）。
 pub fn kill_all() {
-    let entries: Vec<(i32, String)> = REGISTRY
+    let entries: Vec<(i32, String, String)> = REGISTRY
         .lock()
         .iter()
-        .map(|(k, v)| (*k, v.clone()))
+        .map(|(k, v)| (*k, v.0.clone(), v.1.clone()))
         .collect();
-    for (pid, name) in &entries {
+    for (pid, name, prog) in &entries {
+        // pid 复用防线：命令行里仍能看到当初记的程序名才动手。
+        if !alive_and_matches(*pid, prog) {
+            if prog.is_empty() {
+                log::info!("child_registry: skip {name} pid={pid}（已退出）");
+            } else {
+                log::warn!(
+                    "child_registry: skip {name} pid={pid}（pid 已被复用或已退出，命令行无 {prog}）"
+                );
+            }
+            continue;
+        }
         log::info!("child_registry: SIGTERM {name} pid={pid}");
         let _ = unsafe { libc::kill(*pid, libc::SIGTERM) };
     }
     std::thread::sleep(std::time::Duration::from_millis(300));
-    for (pid, name) in &entries {
-        if unsafe { libc::kill(*pid, 0) } == 0 {
+    for (pid, name, prog) in &entries {
+        if alive_and_matches(*pid, prog) {
             log::warn!("child_registry: SIGKILL {name} pid={pid}");
             let _ = unsafe { libc::kill(*pid, libc::SIGKILL) };
         }
@@ -50,8 +90,9 @@ pub fn kill_all() {
 
 /// spawn 并注册。注意：`Child` 被 drop 不会终止进程，生命周期靠 registry 兜底。
 pub fn spawn_tracked(cmd: &mut Command, name: &str) -> Result<Child> {
+    let program = cmd.get_program().to_string_lossy().to_string();
     let child = cmd.spawn()?;
-    register(child.id() as i32, name);
+    register_with_program(child.id() as i32, name, &program);
     Ok(child)
 }
 
@@ -190,5 +231,22 @@ mod tests {
         assert!(REGISTRY.lock().contains_key(&999999));
         unregister(999999);
         assert!(!REGISTRY.lock().contains_key(&999999));
+    }
+
+    /// pid 复用防线：`alive_and_matches` 对**不存在的 pid** 必须为假（不能盲目发信号），
+    /// 对「记录了程序名但命令行读不到」也必须是假。
+    /// 真机教训：长运行期里 php 被反复重启、旧 pid 永久留在表里，退出时可能杀掉复用者。
+    #[test]
+    fn kill_all_matches_guard_semantics() {
+        assert!(!alive_and_matches(999999, "php-fpm"), "不存在的 pid 不能算匹配");
+        assert!(!alive_and_matches(1, "php-fpm"), "pid<=1 必须拒绝");
+        // 自身进程：命令行里肯定不含 "php-fpm" ⇒ 也必须为假（这是防误杀的关键一条）
+        let me = std::process::id() as i32;
+        assert!(
+            !alive_and_matches(me, "php-fpm"),
+            "命令行不含程序名时不能动手（否则就是误杀）"
+        );
+        // 记录为空串（旧式 register）⇒ 退回旧行为：活着即 true
+        assert!(alive_and_matches(me, ""), "旧式注册应保持旧行为");
     }
 }

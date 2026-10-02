@@ -3,6 +3,20 @@
 pub mod app_ffi;
 pub mod asp;
 pub mod aspnet;
+/// 引擎失败的统一响应：**不回显** `{e:#}`。
+///
+/// `{e:#}` 是完整 anyhow 链，里面是 docroot 绝对路径、socket 路径、被 spawn 的二进制
+/// 路径、库/后端错误文本 —— 而拿到它的人只是任意一个能命中该路由的客户端。项目里
+/// `proxy::try_proxy` 早就按这个口径处理（并写明了原因），本文件这十几处是漏网的。
+/// 细节只进本地日志（本项目明确要求「日志不要脱敏」，日志就是排障入口）。
+fn engine_error(engine: &str, e: &anyhow::Error) -> Response<BoxBody> {
+    log::warn!("{engine} engine error: {e:#}");
+    Response::builder()
+        .status(StatusCode::BAD_GATEWAY)
+        .body(full("502 Bad Gateway (engine error)"))
+        .unwrap()
+}
+
 pub mod cgi_script;
 pub mod child_registry;
 pub mod deps;
@@ -164,9 +178,13 @@ fn match_app_indexed<'a>(
             true
         } else {
             // 前缀必须落在 '/' 边界上，避免 /phplint 命中 /php。
-            a.paths
-                .iter()
-                .any(|p| p == "/" || path == p || path.starts_with(&format!("{p}/")))
+            // 同时**归一化尾斜杠**：配置里写 `/php/` 时 `format!("{p}/")` 会变成 `/php//`，
+            // 前缀永远匹配不上 ⇒ 该 app 静默不生效（排查起来毫无线索）。
+            a.paths.iter().any(|p| {
+                let p = p.trim_end_matches('/');
+                let p = if p.is_empty() { "/" } else { p };
+                p == "/" || path == p || path.starts_with(&format!("{p}/"))
+            })
         };
         if !path_ok {
             return false;
@@ -240,26 +258,17 @@ async fn dispatch(
     match engine.as_str() {
         "php" => match php::handle(req, lc, app, peer, app_idx).await {
             Ok(r) => r,
-            Err(e) => Response::builder()
-                .status(StatusCode::BAD_GATEWAY)
-                .body(full(format!("php error: {e:#}")))
-                .unwrap(),
+            Err(e) => engine_error("php", &e),
         },
         "fastcgi" => match php::handle_external(req, lc, app, peer).await {
             Ok(r) => r,
-            Err(e) => Response::builder()
-                .status(StatusCode::BAD_GATEWAY)
-                .body(full(format!("fastcgi error: {e:#}")))
-                .unwrap(),
+            Err(e) => engine_error("fastcgi", &e),
         },
         "c" | "rust" => {
             if native_http::lib_available(app, &engine) {
                 match app_ffi::execute(req, lc, app, peer).await {
                     Ok(resp) => resp,
-                    Err(e) => Response::builder()
-                        .status(StatusCode::BAD_GATEWAY)
-                        .body(full(format!("app ffi error: {e:#}")))
-                        .unwrap(),
+                    Err(e) => engine_error("app ffi", &e),
                 }
             } else if native_http::sidecar_available(app, lc) {
                 match native_http::try_handle(req, lc, app, peer, app_idx).await {
@@ -286,10 +295,7 @@ async fn dispatch(
             if native_http::lib_available(app, "go") {
                 match app_ffi::execute(req, lc, app, peer).await {
                     Ok(resp) => resp,
-                    Err(e) => Response::builder()
-                        .status(StatusCode::BAD_GATEWAY)
-                        .body(full(format!("app ffi error: {e:#}")))
-                        .unwrap(),
+                    Err(e) => engine_error("app ffi", &e),
                 }
             } else {
                 #[cfg(all(feature = "go_shm_ipc", unix))]
@@ -298,10 +304,7 @@ async fn dispatch(
                         match go_shm::execute(req, lc, app, app_idx, peer).await {
                             Ok(resp) => return resp,
                             Err(e) => {
-                                return Response::builder()
-                                    .status(StatusCode::BAD_GATEWAY)
-                                    .body(full(format!("go shm error: {e:#}")))
-                                    .unwrap();
+                                return engine_error("go shm", &e);
                             }
                         }
                     }
@@ -316,86 +319,56 @@ async fn dispatch(
         }
         "lua" => match lua::handle(req, lc, app, peer, app_idx).await {
             Ok(r) => r,
-            Err(e) => Response::builder()
-                .status(StatusCode::BAD_GATEWAY)
-                .body(full(format!("lua error: {e:#}")))
-                .unwrap(),
+            Err(e) => engine_error("lua", &e),
         },
         // "do" is an Apache/Tomcat-style alias for JSP dispatch.
         "jsp" | "do" => match jsp::handle(req, lc, app, peer, app_idx).await {
             Ok(r) => r,
-            Err(e) => Response::builder()
-                .status(StatusCode::BAD_GATEWAY)
-                .body(full(format!("jsp error: {e:#}")))
-                .unwrap(),
+            Err(e) => engine_error("jsp", &e),
         },
         "asp" => {
             if native_http::lib_available(app, "asp") {
                 match app_ffi::execute(req, lc, app, peer).await {
                     Ok(resp) => resp,
-                    Err(e) => Response::builder()
-                        .status(StatusCode::BAD_GATEWAY)
-                        .body(full(format!("asp ffi error: {e:#}")))
-                        .unwrap(),
+                    Err(e) => engine_error("asp ffi", &e),
                 }
             } else {
                 match asp::handle(req, lc, app, peer, app_idx).await {
                     Ok(r) => r,
-                    Err(e) => Response::builder()
-                        .status(StatusCode::BAD_GATEWAY)
-                        .body(full(format!("asp error: {e:#}")))
-                        .unwrap(),
+                    Err(e) => engine_error("asp", &e),
                 }
             }
         },
         "aspnet" | "aspx" => match aspnet::handle(req, lc, app, peer, app_idx).await {
             Ok(r) => r,
-            Err(e) => Response::builder()
-                .status(StatusCode::BAD_GATEWAY)
-                .body(full(format!("aspnet error: {e:#}")))
-                .unwrap(),
+            Err(e) => engine_error("aspnet", &e),
         },
         "tsx" => match tsx::handle(req, lc, app, peer, app_idx).await {
             Ok(r) => r,
-            Err(e) => Response::builder()
-                .status(StatusCode::BAD_GATEWAY)
-                .body(full(format!("tsx error: {e:#}")))
-                .unwrap(),
+            Err(e) => engine_error("tsx", &e),
         },
         "python" | "ruby" | "perl" => {
             if native_http::lib_available(app, &engine) {
                 match app_ffi::execute(req, lc, app, peer).await {
                     Ok(resp) => resp,
-                    Err(e) => Response::builder()
-                        .status(StatusCode::BAD_GATEWAY)
-                        .body(full(format!("{engine} ffi error: {e:#}")))
-                        .unwrap(),
+                    Err(e) => engine_error(&format!("{engine} ffi"), &e),
                 }
             } else {
                 match script_ffi::handle(req, lc, app, peer, app_idx).await {
                     Ok(r) => r,
-                    Err(e) => Response::builder()
-                        .status(StatusCode::BAD_GATEWAY)
-                        .body(full(format!("script_ffi error: {e:#}")))
-                        .unwrap(),
+                    Err(e) => engine_error("script_ffi", &e),
                 }
             }
         },
         "cgi" | "wsgi" | "asgi" | "psgi" | "rack" | "uwsgi" => {
             match app_ffi::execute(req, lc, app, peer).await {
                 Ok(resp) => resp,
-                Err(e) => Response::builder()
-                    .status(StatusCode::BAD_GATEWAY)
-                    .body(full(format!("app engine error: {e:#}")))
-                    .unwrap(),
+                Err(e) => engine_error("app engine", &e),
             }
         }
         "cgi_script" => match cgi_script::handle(req, lc, app, peer).await {
             Ok(r) => r,
-            Err(e) => Response::builder()
-                .status(StatusCode::BAD_GATEWAY)
-                .body(full(format!("cgi_script error: {e:#}")))
-                .unwrap(),
+            Err(e) => engine_error("cgi_script", &e),
         },
         other => Response::builder()
             .status(StatusCode::NOT_IMPLEMENTED)

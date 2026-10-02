@@ -238,7 +238,15 @@ async fn ensure_runtime(
             return Ok(());
         }
         log::warn!("php sock dead, restarting {key}");
-        PHP_RUNTIME.lock().remove(key);
+        // **先杀并注销**旧子进程再摘除：`Child` 被 drop 不会终止进程（child_registry
+        // 的文档明写），此前这里只做 `remove` ⇒ 每重启一次就泄漏一个 php-fpm/php-cgi，
+        // 而且它的 pid 永久留在 REGISTRY 里（退出时可能误杀复用了该 pid 的无关进程）。
+        let old = PHP_RUNTIME.lock().remove(key);
+        if let Some(mut rt) = old {
+            if let Some(mut c) = rt.child.take() {
+                crate::server::apps::child_registry::kill_child(&mut c);
+            }
+        }
     }
 
     let state_dir = abs_state_php();

@@ -151,22 +151,18 @@ async fn dispatch_plain(
                     let target_addr = SocketAddr::new(bind_ip, tl.port);
                     log::info!("port_reuse: SNI={} TLS ClientHello → 转接 {}:{} (listener idx)",
                         sni, tl.address, tl.port);
-                    // 透明 TCP 转发（TLS 握手在目标 listener 侧完成）
-                    let (mut pr, mut pw) = stream.into_split();
-                    return match tokio::net::TcpStream::connect(target_addr).await {
-                        Ok(mut up) => {
-                            use tokio::io::{AsyncReadExt, AsyncWriteExt};
-                            // 先把已读走的 TLS record 前缀补发过去
-                            let _ = up.write_all(&peek[..n]).await?;
-                            let (mut ur, mut uw) = up.into_split();
-                            let _ = tokio::try_join!(
-                                tokio::io::copy(&mut pr, &mut uw),
-                                tokio::io::copy(&mut ur, &mut pw),
-                            );
-                            Ok(())
-                        }
+                    // 透明 TCP 转发（TLS 握手在目标 listener 侧完成）。
+                    // 走 `l4::forward_guarded`：**带守卫**（connect 5s 上限 + 两个方向各自
+                    // 60s 空闲上限）。本路径在 h1/h2/h3 之前跑、不继承它们的任何超时；
+                    // 此前这里是内联的 `TcpStream::connect` + `tokio::io::copy`（零超时）。
+                    // 已读走的 TLS record 前缀由 prefix 参数补发给上游。
+                    return match crate::server::l4::forward_guarded(stream, target_addr, &peek[..n]).await {
+                        Ok(()) => Ok(()),
                         Err(e) => {
-                            log::warn!("port_reuse: connect to TLS listener {}:{} failed: {}", tl.address, tl.port, e);
+                            log::warn!(
+                                "port_reuse: 转发到 TLS listener {}:{} 失败: {}",
+                                tl.address, tl.port, e
+                            );
                             Err(anyhow::anyhow!("port_reuse upstream connect failed"))
                         }
                     };

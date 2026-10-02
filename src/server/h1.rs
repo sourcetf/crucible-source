@@ -384,15 +384,27 @@ async fn handle_request_inner(
             Some(h) => format!("https://{h}{pq}"),
             None => pq,
         };
-        let mut resp = Response::builder()
+        // **不 unwrap**：`target` 里含请求的 `Host`（虽已被 is_plausible_hostname 过滤）。
+        // 万一它仍不能作为 header 值，宁可降级成「不带 Location 的 301」，也不要在
+        // hyper 的 service future 里 panic —— 那会直接丢掉这条连接。
+        let mut resp = match Response::builder()
             .status(StatusCode::MOVED_PERMANENTLY)
-            .header(http::header::LOCATION, target)
+            .header(http::header::LOCATION, target.as_str())
             .header(
                 http::header::STRICT_TRANSPORT_SECURITY,
                 "max-age=31536000; includeSubDomains; preload",
             )
             .body(full("moved to https"))
-            .unwrap();
+        {
+            Ok(r) => r,
+            Err(e) => {
+                log::warn!("port_reuse 301: Location 头非法（{e}），降级为无 Location 的 301");
+                Response::builder()
+                    .status(StatusCode::MOVED_PERMANENTLY)
+                    .body(full("moved to https"))
+                    .unwrap()
+            }
+        };
         resp.extensions_mut()
             .insert(crate::server::access_log::EngineTag("hsts"));
         return resp;

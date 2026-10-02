@@ -2470,3 +2470,84 @@ public_name 相等**（不一致即重新生成并落盘）⇒ 不一致状态�
 file channel 强制走 stderr（代码注释记录「自 9/9 起再没被写过」，实测三份 mtime 都在 9 月）。
 **没有删除**（生产数据、非我创建），改为 **gzip**：13.8MB → 982KB，内容仍可 `zcat` 读回；
 是否彻底删除记进 OPERATOR-TODO H 由运维决定。
+
+### 21.38 并行审计三片未覆盖区域（静态/h1、反代/访问控制/L4、应用引擎/Tor）—— 12 处修复
+
+前几轮都是按既有审计报告逐条修；这次按用户早前的要求「启用尽可能多个 agent 扫描代码的 bug」，
+派 3 个只读审计 agent 并行扫**此前没深挖过**的三片区域，要求每条都给 file:line + 可复现判据。
+工具：把生产 `src/`（89 个 .rs）整树拉到本地镜像后审计，避免审到本地仓库里那份**过时的**快照。
+
+结论先说：**没找到 P0**（无未鉴权状态变更、无注入、无路径穿越越界）。修掉的是
+「资源耗尽 / 信息泄露 / 配置静默失效」三类，其中最有价值的一批属于**同一个模式**：
+
+> **同一段逻辑有两份实现，人们只修了其中一份 —— 而生效的是另一份。**
+
+#### 批次 1（资源耗尽与信息泄露；全部对齐已有兄弟代码的写法）
+| # | 位置 | 问题 | 修法 |
+|---|---|---|---|
+| 1 | `apps/go_shm.rs` | 请求体**无上限**收齐（唯一漏掉 `Limited` 的引擎；`GO_SHM_BODY_MAX` 的检查发生在整个 body 已在内存之后） | 与 php.rs 同写法：`Limited::new(.., APP_BODY_CAP)`，超限 413 |
+| 2 | `apps/cgi_script.rs` | 子进程**无超时**、`wait_with_output` **无输出上限**（一个 `sleep` 脚本永久占住一个阻塞池 worker） | 看门狗线程到点 SIGKILL（子进程一死阻塞的 read 立刻 EOF）+ 有界读取 32MiB |
+| 3 | `l4.rs` | L4 转发 `connect`/两个方向 `copy` **零超时**（本路径跑在 h1/h2/h3 之前，不继承任何超时） | 抽出 `forward_guarded`：connect 5s + 每方向 60s 空闲 |
+| 4 | `listener.rs` + `port_reuse.rs` | **本条的教训最典型**：port_reuse.rs 里有一份带守卫的实现，却**没有任何调用者**（死代码），而 listener.rs 自己内联了一遍不带守卫的 | 守卫实现下沉到 `l4::forward_guarded`，两条路径共用；删掉重复实现并留注释说明 |
+| 5 | `proxy.rs` | page rule `pass` 失败时把**完整错误链**回显给客户端（上游地址端口、tor socket 路径、TLS 库文本）—— 同一文件里的 `try_proxy` 明确写着「不回显」 | 改为固定 `502 Bad Gateway` + 本地 warn |
+| 6 | `apps/fastcgi.rs` | 一次往返**无超时**、STDOUT/STDERR **无上限**（上游永不发 END_REQUEST 就永久挂着） | 整次往返 60s 超时 + 输出 32MiB 上限 |
+
+#### 批次 2（子进程身份 / 信息泄露 / 配置校验）
+| # | 位置 | 问题 | 修法 |
+|---|---|---|---|
+| 7 | `apps/child_registry.rs` | `kill_all` 只凭 **pid** 发信号；长运行期里 pid 会被复用（`kill_if_matches`/`tor_pid` 早就按命令行复核，`kill_all` 没有） | 注册时记**程序名**，退出前用 `ps` 复核命令行；复核不过只记日志不动手。含单测（不存在的 pid / pid≤1 / 命令行不含程序名 都必须为假） |
+| 8 | `apps/php.rs` | 重启 php runtime 只 `remove`，`Child` 被 drop **不会终止进程** ⇒ 每次重启泄漏一个 fpm/cgi，pid 永久留在表里 | 先 `kill_child`（SIGTERM→KILL + 注销）再摘除 |
+| 9 | `apps/go_shm.rs` | 冷启动「查表→spawn」非原子 ⇒ 两个并发首请求各 spawn 一个，后者 truncate 共享内存（`native_http` 早就有 per-key 锁） | 全局冷启动锁 + 锁内复查 |
+| 10 | `apps/native_http.rs` | 把**客户端自带的** `X-Forwarded-For` 原样传给 sidecar（「追加语义」），后端拿它做 ACL/日志就是伪造点（proxy.rs 一直是「跳过再写」） | 丢掉客户端 `X-Forwarded-*` + `X-Real-IP`，只写真实 peer |
+| 11 | `static_files.rs` | autoindex **列隐藏文件**（`.env`/`.git`/`.htpasswd`）；且 `is_dir` 之外不判类型 ⇒ 服务 FIFO/socket 会让读操作**永久阻塞**、占死一个 worker | 列表不列任何点开头的名字；`!is_file()` 直接拒 |
+| 12 | `connect_udp.rs` | 目标校验漏了 `240.0.0.0/4`、`198.18.0.0/15`、`2001:db8::/32`、`2001:2::/48`、`2001:10::/28` | 显式补齐（含注释说明为何不用 `is_documentation()`） |
+
+另外两处「配置静默失效 / 可 panic」：
+- `page_rules` 的 redirect target 与 port_reuse 的 `server_name` 会进 `Location` 响应头，而
+  `HeaderValue` 拒绝控制字符与非 ASCII、`http::Builder` 把错误**推迟到 `.body()`** ——
+  手写配置里一个带换行/非 ASCII 的值会让**每个命中该规则的请求**在 hyper 的 service future
+  里 panic。两处都改成**不 unwrap 的降级路径**（不带 Location 的 30x），并在 `Config::validate`
+  加一道拦截。
+- `ip_access` 条目**非法时静默失效**：`access::cidr_or_exact` 对解析失败一律返回 false ⇒
+  `deny = ["10.0.0.0/33"]` 这种拼错**永不匹配**（你以为封住了）。配置期直接拒，并说清
+  「要匹配全部请写 `*`」。
+
+**同时否掉/暂缓的**（诚实记录，避免以后重复讨论）：
+- `env_lock` 的「进程环境变量并发污染」：`setenv` 与其它线程的 `getenv` 并发是 UB，
+  但动机是兼容老引擎的 `.env` 语义，改成完全隔离是**架构级**改动；已记录，不在本轮动。
+- `rate_limit` 按**完整地址**分桶 ⇒ 持 /64 的 v6 客户端换地址即可绕过。改成按 /64 聚合是
+  **行为变更**（会连带影响现有 v4/v6 配置的限流粒度），需要操作员确认，记入 OPERATOR-TODO。
+- `h1.rs` 长连接沿用**建连时**的 listener 快照（改 basic_auth/root/page_rules 对已建立的长连接
+  不生效）：这与已修的 C-4（上传闸门改读 live）是同一类，但 h1 的请求路径要改成「每请求重取
+  live 配置」，改动面比上传大，单列一条待办。
+
+#### 批次 3（同一类信息泄露的**最大面**）：所有引擎的错误体都在回显 `{e:#}`
+审计报告里只有 proxy 那条（我已在批次 1 修掉）。顺着同一模式自查时发现：`apps/mod.rs` 的
+dispatch 里**每一个**引擎的错误分支都把 `format!("<engine> error: {e:#}")` 写进**响应体**
+给客户端 —— 共 **14 处**。`{e:#}` 是完整 anyhow 链，里面有 docroot 绝对路径、socket 路径、
+被 spawn 的二进制路径、库/后端错误文本；而拿到它的人只是任意一个能命中该路由的客户端。
+同一项目的 `proxy::try_proxy` 早就写明「不回显」并给出理由，这批是漏网的。
+修法：统一 `engine_error(engine, &e)` —— 本地 `warn!("{engine} engine error: {e:#}")`，
+响应体固定为 `502 Bad Gateway (engine error)`。已确认没有测试依赖这些文本。
+
+#### 隔离验证（临时实例 127.0.0.1:18445 + /tmp docroot；**cwd 必须换**，
+否则 `state_root()` 是 cwd 相对的，在 /crucible 跑会碰生产 state/）
+| 判据 | 结果 |
+|---|---|
+| autoindex 不列隐藏文件 | 页面里 `.env` 出现 **0** 次；`ok.txt` 正常列出 |
+| FIFO 不被服务、且不挂住 | `GET /queue` → **404，0 秒**返回（此前会永久阻塞读、占死一个 worker） |
+| CGI 正常路径（回归） | `cgi-ok` |
+| 引擎错误体不回显错误链 | body = `502 Bad Gateway (engine error)`，**不含 `/tmp/vfy`** |
+| CGI 超时 | 见下（第一版**没通过**） |
+
+#### ⚠️ 我的第一版 CGI 超时修复**没生效**（被上表最后一条抓出来）
+第一版是「看门狗线程到点 `SIGKILL` 子进程」。隔离验证里 `GET /slow`（脚本 `sleep 100`）
+**50 秒仍不返回**。根因：脚本是 `#!/bin/sh`，它起的 `sleep` 是**孙进程**；杀 shell 不会杀孙进程，
+而孙进程**继承了 stdout 管道** ⇒ 我们这端永远等不到 EOF，`read` 一直阻塞。
+
+正确修法：`CommandExt::process_group(0)` 让脚本与它的子进程同属一个新进程组（组长 = 子进程 pid），
+看门狗杀**整组**（`libc::kill(-pgid, SIGKILL)`）。组内进程全死光，管道才关闭、`read` 才返回 EOF。
+
+**这条值得单独记**：如果只有代码审阅（或只看「编译通过 + 单测通过」），我会把第一版当成修好了 ——
+是**隔离验证**把它证伪的。所以「杀子进程」这类修复必须用「脚本里带子命令」的用例验证，
+而不是「进程本身 sleep」。

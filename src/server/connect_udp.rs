@@ -166,6 +166,8 @@ pub fn is_disallowed_ip(ip: &IpAddr) -> bool {
                 || v.is_documentation()
                 || is_cgnat(*v)
                 || v.octets()[0] == 0 // 0.0.0.0/8
+                || v.octets()[0] >= 240 // 240.0.0.0/4 保留段（含 255.255.255.255）
+                || is_benchmark_v4(*v) // 198.18.0.0/15（RFC 2544 基准测试）
         }
         V6(v) => {
             v.is_loopback()
@@ -175,8 +177,36 @@ pub fn is_disallowed_ip(ip: &IpAddr) -> bool {
                 || v.is_unicast_link_local()
                 || is_site_local(*v)
                 || is_teredo_or_nat64_local(*v)
+                || is_doc_v6(*v) // 2001:db8::/32（文档用）
+                || is_benchmark_v6(*v) // 2001:2::/48（RFC 5180 基准测试）
+                || is_orchid_v6(*v) // 2001:10::/28（ORCHID）
         }
     }
+}
+
+/// `198.18.0.0/15`（RFC 2544 基准测试；不是可路由的单播目的地）。
+fn is_benchmark_v4(v: std::net::Ipv4Addr) -> bool {
+    let o = v.octets();
+    o[0] == 198 && (o[1] == 18 || o[1] == 19)
+}
+
+/// `2001:db8::/32`（RFC 3849 文档地址）。显式判而不是用 `Ipv6Addr::is_documentation()`
+///（后者在部分 Rust 版本仍是 unstable）。
+fn is_doc_v6(v: std::net::Ipv6Addr) -> bool {
+    let s = v.segments();
+    s[0] == 0x2001 && s[1] == 0x0db8
+}
+
+/// `2001:2::/48`（RFC 5180 基准测试）。
+fn is_benchmark_v6(v: std::net::Ipv6Addr) -> bool {
+    let s = v.segments();
+    s[0] == 0x2001 && s[1] == 0x0002 && s[2] == 0
+}
+
+/// `2001:10::/28`（RFC 4843 ORCHID）。
+fn is_orchid_v6(v: std::net::Ipv6Addr) -> bool {
+    let s = v.segments();
+    s[0] == 0x2001 && (s[1] & 0xfff0) == 0x0010
 }
 
 /// `fec0::/10`（RFC 3879 已弃用的 site-local）。

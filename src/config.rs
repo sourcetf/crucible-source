@@ -1260,6 +1260,14 @@ cover 只用于「未使用 / 被拒 ECH」的连接，ECH 关闭时它会成为
 （deny 会让全站 403、allow 会放行所有人），请删掉这一项或显式写 \"*\""
                     );
                 }
+                // 非法条目（拼错、前缀越界）在运行期**永不匹配**（`access::cidr_or_exact`
+                // 解析失败一律返回 false）⇒ `deny` 会**静默失效**，比不写更糟（你以为封住了）。
+                // 配置期直接拒，并把「要匹配全部请写 *」说清楚。
+                if !ip_access_entry_is_valid(p) {
+                    anyhow::bail!(
+                        "[ip_access].{name}[{i}] 不是合法 IP/CIDR：{p:?} —— 运行期这类条目**永不匹配**（deny 会静默失效）；要匹配全部地址请显式写 \"*\""
+                    );
+                }
             }
         }
 
@@ -1489,6 +1497,39 @@ cover 只用于「未使用 / 被拒 ECH」的连接，ECH 关闭时它会成为
                 }
             }
 
+            // ⑤b page_rules 的 redirect target 会进 Location 响应头。`HeaderValue` 拒绝
+            //     控制字符与非 ASCII，而 `http::Builder` 把错误**推迟到 `.body()`** ——
+            //     手写配置里一个带换行/非 ASCII 的 target，会让每个命中该规则的请求在 hyper
+            //     的 service future 里 panic（连接被直接丢弃）。代码侧已改成不 unwrap 的降级
+            //     路径，这里再加一道配置期拦截，让错误在加载时就报出来。
+            for (i, r) in l.page_rules.iter().enumerate() {
+                if r.action == "redirect" {
+                    let t = r.target.as_deref().unwrap_or("/");
+                    let loc = match t.split_once(':') {
+                        Some(("301" | "307" | "308", u)) => u,
+                        _ => t,
+                    };
+                    if !safe_header_value(loc) {
+                        anyhow::bail!(
+                            "listener {}:{}: page_rules[{i}]（redirect）的 target 不能作为 Location 响应头（含控制字符、非 ASCII、引号或反斜杠）: {loc:?}",
+                            l.address, l.port
+                        );
+                    }
+                }
+            }
+            // port_reuse 的 301 会把 server_name 拼进 Location（`https://<server_name>/…`），
+            // 同样必须是安全的 header 值。只在 port_reuse 下检查，避免误伤别的用法。
+            if l.port_reuse {
+                if let Some(sn) = l.server_name.as_deref() {
+                    if !safe_header_value(sn) {
+                        anyhow::bail!(
+                            "listener {}:{}: port_reuse 下 server_name 会进 Location 响应头，但不能作为 header 值（含控制字符/非 ASCII）: {sn:?}",
+                            l.address, l.port
+                        );
+                    }
+                }
+            }
+
             // ⑥a 路径型配置项必须以 `/` 开头：`status_path = "status"` 永不命中
             //      （`h1.rs` 用的是精确比较）⇒ 页面静默 404，没有任何提示。
             for (what, p) in [
@@ -1580,6 +1621,27 @@ fn safe_header_value(s: &str) -> bool {
     // 其余可打印 ASCII 原样保留；非 ASCII 与换行会让 header 构造失败。
     let ok = |b: u8| (0x20..=0x7e).contains(&b) && b != b'"' && b != b'\\';
     !s.is_empty() && s.bytes().all(ok)
+}
+
+/// `ip_access` 条目是否可解析。
+///
+/// 运行期 `access::cidr_or_exact` 对解析失败的条目一律返回 false —— 也就是**永不匹配**。
+/// 放在 `deny` 里等于静默失效（运维以为封住了）。`"*"` 是显式的「匹配所有地址」。
+/// 前缀还必须落在该地址族的合法范围（`/33`、`/129` 同样永不匹配）。
+fn ip_access_entry_is_valid(p: &str) -> bool {
+    let t = p.trim();
+    if t == "*" {
+        return true;
+    }
+    use std::net::IpAddr;
+    match t.split_once('/') {
+        Some((net, bits)) => match (net.trim().parse::<IpAddr>(), bits.trim().parse::<u8>()) {
+            (Ok(IpAddr::V4(_)), Ok(b)) => b <= 32,
+            (Ok(IpAddr::V6(_)), Ok(b)) => b <= 128,
+            _ => false,
+        },
+        None => t.parse::<IpAddr>().is_ok(),
+    }
 }
 
 /// 判据（对每个 listener 的 root，经过 `resolve_paths` 后已是绝对路径）：
