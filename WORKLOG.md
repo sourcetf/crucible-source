@@ -2610,3 +2610,72 @@ dispatch 里**每一个**引擎的错误分支都把 `format!("<engine> error: {
 并对它设 `git update-index --skip-worktree` 防止后续 `git commit -a` 误带。
 注：**不要**用 `git checkout -- config.toml` 去「恢复」它 —— 那会用占位空哈希覆盖生产文件，
 管理面随即锁死。
+### 21.41 第四轮并行审计（上传/文件面、准入/身份面、引擎 FFI/进程/Tor）—— 19 处，其中两条是我上一轮修复的漏网处
+
+前三轮各自只覆盖了一部分：按提交记录，`upload_api.rs`/`upload_resume.rs`/`admin_files.rs`/
+`access.rs`/`basic_auth.rs`/`password.rs`/`rate_limit.rs`/`syncookie.rs`/`ecn.rs`/`telemetry.rs`/
+`tor_hs.rs`/`onion_ca.rs`/`apps/{app_ffi,deps,env_lock}.rs` 以及 `libs/**` 的 C 引擎**一次都没被审过**。
+这一轮按「同一文件只由一个人改」的原则切成三片，各派一个 agent 并行读改。
+
+#### P1（三条，都是「静默地不该发生的事」）
+| # | 位置 | 问题 | 修法 |
+|---|---|---|---|
+| 1 | `apps/app_ffi.rs` | c/go/rust 有一条「同线程内联、**跳过 env 锁**」的快路（§7.3），前提是「extra JSON 下发 .env、不碰进程 env」。但 C 侧的 `appengine_apply_extra` 落地方式就是 **setenv**（`appengine_common.c` + samples/{c,rust}-plugin）⇒ 这条快路成了进程 env 唯一不受 `env_lock` 保护、**也从不恢复**的写者：既与别的引擎在锁内 install/restore 并发（`environ` realloc 时 `getenv` 踩已释放内存），又把上一个应用的 `.env`（常是密钥）永久留在进程环境里给后面任何脚本读 | 删掉这条快路，c/go/rust 与其它引擎同路（走有界通用池 + `env_lock`） |
+| 2 | `static_files.rs` `serve_simple` | h1 的 `serve` 有「必须是普通文件」判据，h2/h3 的 `serve_simple` **没有** ⇒ docroot 里一个 FIFO 就能让 `fs::read` 永久阻塞、占死一个 tokio worker（本机只有 2 条），两个这样的请求整站失去响应。同一 URL 在 h1 上安全、在 h2/h3 上死锁，而浏览器默认走 h2/h3 | 补上同一道判据 |
+| 3 | `tor_hs.rs` | `data_dir` 配在 state 之外时对**父目录**做 `chown -R`：`data_dir = "/onion"` ⇒ `parent()` 是 `/` ⇒ `chown -R / _tor`（tor 一旦被攻破，主机上所有东西的属主都归了它）；`/var/tor/hs` ⇒ 连带改掉父目录里**别的东西**的属主 | 只 chown HS 目录本身（父目录只需要可搜索的 x 位） |
+
+#### P1 的延伸（我自己补的）：`data_dir` 本身也没有任何校验
+上一轮修的「root 落在 state/ 里」是同一类问题，`data_dir` 这条更狠 —— 它会被 `chmod 0700`
+且（配了 `user` 时）`chown -R` 给低权账号。`data_dir = "/"` 就是 `chmod 0700 /` + `chown -R / _tor`；
+`data_dir = "/crucible"` 则把 `config.toml`（admin 口令哈希）与 `state/` 下的 TLS/ECH 私钥、
+rndc 密钥一并交出去。新增 `check_tor_hs_data_dir`：归一化后拒绝「文件系统根」「配置目录本身或
+其祖先」「配置目录内、但不在 `state/` 之下」「就是 `state/` 本身」，只放行 `state/` 的**真后代**
+与配置目录之外的目录。含 11 个负例 + 5 个正例。
+
+#### P2
+| # | 位置 | 问题 | 修法 |
+|---|---|---|---|
+| 4 | `upload_resume.rs` `session_for` | 预算/每-IP 闸门在 `File::create(tmp)` **之后** ⇒ 每次被拒都在 docroot 留下一个**没有会话**的 `.x.upload.part`：不在 `SESSIONS` 里，`sweep_expired` 永远扫不到 ⇒ 磁盘/inode 只增不减 | 闸门提到创建之前 |
+| 5 | `upload_resume.rs` `commit` | `rename` 只保证目录项原子，不保证内容落盘；本项目有强制 exit/OOM 的历史 ⇒ 客户端收到 201、目标文件却是空洞 | rename 前 `sync_all`（用可写句柄，否则 Windows 上 FlushFileBuffers 直接失败） |
+| 6 | `upload_api.rs` | wildcard 判据用原始头 `ends_with("/*")`，而解析器用 `trim()=="*"` ⇒ `Content-Range: bytes 0-99/ *`（`/` 与 `*` 间有空白）被判成「有总长」⇒ **唯一的首片直接 commit**（静默截断 + 会话被合并）——正是文件里 ③ 要避免的那个 bug | 直接用解析结果 `t.is_none()` |
+| 7 | `admin_files.rs` `write_file` | `fs::write` 是**先截断再写**：写到一半失败（ENOSPC/OOM/强制退出，都有先例）会把**原本完好的文件**毁成半截 —— 面板报「保存失败」，磁盘上旧文件已经没了 | 同目录临时文件 + rename（与 upload_resume/DNS 同一套），临时名带 pid+单调计数 |
+| 8 | `access.rs` `cidr_or_exact` | 空串/纯空白被当成「匹配所有地址」（`pattern.is_empty() \|\| pattern == "*"`）。`[ip_access]` 有配置期拦截，但**同一个函数**被 DNS 数据面复用（`dot_doh` 的 `dot_peer_allowed` ← `[dns] dot.allow` / `recursion_acl`），而 `[dns]` 没有条目级校验 ⇒ 一个多余的空元素就把 DoT/递归白名单**放宽到全世界**（放大器） | 只有显式 `*` 才通配；空串 fail-closed（永不匹配） |
+| 9 | `basic_auth.rs` `FailTable` | 失败表按**原始** `peer.ip()` 分键 ⇒ 双栈 listener 上的 IPv4 客户端是 `::ffff:1.2.3.4`、单栈 v4 上是 `1.2.3.4`，同一来源两副面孔各自计数：连续失败阈值与「成功即清零」只作用在一半上，换地址族/换监听口就能把在线爆破预算翻倍 | 加 `fail_key()`（v4-mapped→v4，与 `rate_limit`/`access` 同一套归一化） |
+| 10 | `page_rules.rs` `apply_simple` | 返回值被 h2/h3 直接 `.header(LOCATION, loc).body(..).unwrap()`：含控制字符的 target 会让**每个命中该规则的 h2/h3 请求** panic 掉连接。h1 那条路径早已降级为「不带 Location 的 302」，这两处漏了 | 返回前用 `HeaderValue::from_str` 校验，非法则跳过该规则 |
+| 11 | `apps/app_ffi.rs` 响应头 | 引擎声明的 `Content-Length` 原样透传，而 hyper 按**真实 body 长度**成帧 ⇒ 声明 5 实发 100 时多出的 95 字节被客户端当成**下一个响应**（keep-alive 响应走私）。脚本自己拼这个头（`header("Content-Length: "..n)`）很容易写错 | 只在 `declared == body.len()` 时保留，否则丢弃（与 proxy.rs 那条同一条规则） |
+| 12 | `apps/app_ffi.rs` headers 块 | 用 C 侧给的 `headers_len` 直接 `from_raw_parts` 建 slice ⇒ 引擎忘填/填了残留值时读出分配之外的内存并当响应头发出去 | 先按 NUL 定界取真实长度，`len` 只当上限（ABI 契约就是 NUL 结尾，`appengine_result_set_headers` 用 `strlen` 填 len） |
+| 13 | `tor_hs.rs` `spawn_from_config` | 「enabled 变 false → 停 tor」在调用线程上同步做：`tor_pid` 要 spawn `ps`、`stop_tor_blocking` 最长 7s（TERM 等 5s + KILL 等 2s），而它是从 `LiveConfig::reload/replace` 调的（tokio worker，本机只有 2 条）⇒ 一次「关掉 tor_hs」的保存让服务 7s 不响应 | 整段进 `spawn_blocking`，并借 `hs_lock` 与 `ensure_hs` 串行 |
+| 14 | `tor_hs.rs` 巡检 + `stop_on_shutdown` | 巡检的 `if !cfg.enabled { continue; }` 从不拉闸，`stop_on_shutdown` 又用 `if !cfg.enabled { return; }` 提前返回 ⇒ 上面那次异步停止只要读丢 pidfile 或 kill 失败，`.onion` 就永久挂在一个「已关闭」的服务上 | 巡检每轮做一次幂等停止（只认 pidfile + `ps` 核对过的 pid）；`stop_on_shutdown` 去掉 enabled 提前返回 |
+| 15 | `apps/deps.rs` `ensure_app_deps` | `init.sh`（pip/npm/make）超时只 `child.kill()` 杀壳进程 ⇒ **孙进程留成孤儿**：继续占着 docroot（失败后下一次 ensure 又要 `remove_dir_all` 它）、继续吃 CPU/磁盘 | `process_group(0)` + 超时 `kill(-pgid, SIGKILL)`（与 cgi_script.rs 同一套；`libc` 已是既有依赖） |
+| 16 | `apps/deps.rs` `resolve_docroot` | 未配 `docroot` 时回落 `live.listeners.first().root` ⇒ **多 listener** 部署下这个应用会拿到**另一个站点**的 docroot，读到别人的 `.env`（数据库口令/API key）并注入自己的执行环境 | 回落**当前 listener** 的 `lc.root`（与 `php::resolve_docroot(lc, app)` 同形）；`try_cached` 的签名从 `live` 改为 `lc`，两处调用点同步 |
+| 17 | `apps/mod.rs` | 引擎错误体仍有两处回显完整 `{e:#}`（docroot/socket/二进制绝对路径）—— 上一轮「15 处引擎错误体回显」的漏网处（h1 走 helper，h2/h3 的 simple 路径与 native sidecar 路径没走） | 统一走 `engine_error()` |
+| 18 | `syncookie.rs` 评估循环 | `enabled=false` 期间不推进 `prev`，而 accept 计数仍在累加 ⇒ 「首次启用」那个 tick 把禁用期间的全部累计当成一次**假洪水**，白写一次 `value_on`（对已有流量的部署重开开关时立刻误动作） | 无论启用与否都推进窗口 |
+| 19 | `config.rs` 注释 | 「运行期空串等于『匹配所有地址』」在第 8 条修完后已过时 | 更新为「任何语义下空项都是错的」 |
+
+#### 明确**不做**的两件事（附理由）
+- **不给 `[dns]` 的 `recursion_acl`/`axfr_out_acl`/`dot.allow` 加条目级校验**：第 8 条已经把
+  「空串 = 放行所有人」这个**危险方向**堵死（现在空串永不匹配），剩下的只是「拼错的条目静默
+  不生效」——那是 fail-closed 方向。而加校验就得维护 BIND 关键字白名单，本项目为此**被误拒
+  打过两次**（第二轮第 14 条已定调：与其加名字白名单，不如让真实代码路径去报错）。
+- **不动 h2/h3 里那个 `.header(LOCATION, ..).unwrap()`**：第 10 条已在**值的来源**（`apply_simple`）
+  拦住了非法 Location，且配置期（`safe_header_value`）也拦一层。在没有第二处来源之前，
+  再加一层只增加改动面。
+
+#### 验证
+- **编译 + 全量单测**：`cargo test --release --features 'tls,tls_boring,go_shm_ipc,tls_nss,tls_tomcrypt'`
+  → **269 passed / 0 failed**（新增 7 个单测）。
+- **R4-1（FIFO 卡死）隔离实例**（loopback，`http_versions=["h1","h2"]`，docroot 里放一个 `mkfifo` 出来的 `pipe.html`）：
+  | 请求 | 结果 |
+  |---|---|
+  | `h1 /index.html` | 200，6.9ms |
+  | `h2 /index.html` | 200，7.8ms |
+  | `h1 /pipe.html` | 404，5.8ms |
+  | **`h2 /pipe.html`** | **404，6.3ms**（修前：挂到 curl 超时，且吃掉一个 tokio worker） |
+  | `h2 /index.html`（FIFO 之后） | 200，7.4ms ⇒ worker 没被占死 |
+- **R4-2（`data_dir` 负控）**，用**已部署**的二进制对临时配置跑 `--check-config`：
+  `data_dir="/"`、`"/crucible"`、`"/crucible/state"`、`"/crucible/www"` → **全部 RC=1**，报错正是
+  新增的两条（"是文件系统根 —— 该目录会被 chmod 0700…" / "落在配置目录里、又不在 state/ 之下…"）；
+  `"/var/tor/hs"`、`"state/tor-hs/hs"` → **RC=0**。生产配置（无 `[tor_hs]` 段）预检 **RC=0**、
+  `tls acceptors built=3`。
+- **发布**：`scripts/deploy/deploy_release.sh`（预检 → 快照 `20261003-064051` → 停 → 换 → 起 → 复验），
+  复验全部监听在、h1 `9095=200`、h3 `8443=200`。

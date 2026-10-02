@@ -940,7 +940,7 @@ async fn h2_tail(
         Ok(r) => r,
         Err(resp) => return tag(resp, "static"),
     };
-    if let Some(resp) = crate::server::apps::try_handle_simple(&req, &live, &lc, peer).await {
+    if let Some(resp) = crate::server::apps::try_handle_simple(&req, &lc, peer).await {
         return tag(resp, "app");
     }
     if would_proxy(&lc, &path) {

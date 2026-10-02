@@ -231,11 +231,13 @@ where
     let (start, total) = match req.headers().get(header::CONTENT_RANGE) {
         Some(v) => match v.to_str().ok().and_then(upload_resume::parse_content_range) {
             Some((s, _e, t)) => {
-                // `bytes N-M/*` = 总长未知：**不能**把首片当完整文件
-                wildcard_total = v
-                    .to_str()
-                    .map(|s| s.trim().ends_with("/*"))
-                    .unwrap_or(false);
+                // `bytes N-M/*` = 总长未知：**不能**把首片当完整文件。
+                // 判据必须直接用解析结果（`t` 为 None 就是 `*`），不要再去拿原始头做
+                // `ends_with("/*")` —— 那个写法对 `bytes 0-99/ *`（`/` 与 `*` 之间有空白，
+                // parse_content_range 用 `trim()` 容忍、这里却不认）会判成「有总长」，
+                // 于是唯一的首片直接 commit（**静默截断** + 会话被合并），
+                // 正是下面 ③ 要避免的那个 bug。
+                wildcard_total = t.is_none();
                 (s, t)
             }
             None => {

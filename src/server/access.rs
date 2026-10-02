@@ -66,8 +66,15 @@ pub fn cross_site_response() -> (http::StatusCode, &'static str) {
 
 fn cidr_or_exact(pattern: &str, ip: IpAddr) -> bool {
     let pattern = pattern.trim();
-    if pattern.is_empty() || pattern == "*" {
+    // 只有显式 `*` 才等于「匹配所有地址」。空串/纯空白**绝不能**走这条分支：
+    // `allow = [""]` 会因此变成「放行所有地址」（白名单被静默解除），
+    // 而配置期那道拦截一旦被绕过（例如以后新增一条直接构造 IpAccessConfig 的路径），
+    // 运行期就必须自己 fail-closed。与 config.rs 对「非法条目永不匹配」的说明保持一致。
+    if pattern == "*" {
         return true;
+    }
+    if pattern.is_empty() {
+        return false;
     }
     if let Some((net, bits)) = pattern.split_once('/') {
         let Ok(base) = net.parse::<IpAddr>() else {
@@ -139,6 +146,21 @@ mod tests {
         };
         assert!(!is_allowed(&cfg, "10.1.2.3:9".parse().unwrap()));
         assert!(is_allowed(&cfg, "192.168.0.1:9".parse().unwrap()));
+    }
+
+    /// 空/纯空白条目必须「永不匹配」而不是「匹配所有地址」：否则 `allow = [""]`
+    /// 等于白名单被静默解除（fail-open），`deny = [""]` 则等于自封全站。
+    #[test]
+    fn empty_entry_never_matches() {
+        assert!(!cidr_or_exact("", "10.0.0.1".parse().unwrap()));
+        assert!(!cidr_or_exact("   ", "10.0.0.1".parse().unwrap()));
+        assert!(cidr_or_exact("*", "10.0.0.1".parse().unwrap()));
+        let cfg = IpAccessConfig {
+            allow: vec!["".into()],
+            deny: vec![],
+        };
+        // allow 非空却没有任何条目匹配 ⇒ 拒绝（fail-closed），而不是放行所有人。
+        assert!(!is_allowed(&cfg, "10.0.0.1:9".parse().unwrap()));
     }
 
     /// 只拦 cross-site：同源/无该头（非浏览器客户端）一律放行。

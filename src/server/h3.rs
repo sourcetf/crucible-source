@@ -1360,7 +1360,7 @@ use chunked uploads (Content-Range) or HTTP/1.1 for larger bodies",
             Err(resp) => return tag(resp, "static"),
         };
         if apps::would_handle(&lc, path) {
-            if let Some(resp) = apps::try_handle_simple(&req, &live, &lc, peer).await {
+            if let Some(resp) = apps::try_handle_simple(&req, &lc, peer).await {
                 return tag(resp, "app");
             }
         }

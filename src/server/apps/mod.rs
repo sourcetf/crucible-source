@@ -65,7 +65,7 @@ pub async fn try_handle(
     // Clone app config for async moves; keep indices for php/native keys.
     let app = app.clone();
     // P1-1：deps 的 .env 变量随请求 extensions 下发（引擎侧按需读取），避免改所有引擎签名。
-    let deps_env = match deps::try_cached(live, &app).await {
+    let deps_env = match deps::try_cached(lc, &app).await {
         Ok(e) => e,
         Err(e) => {
             log::warn!("deps ensure failed: {e:#}");
@@ -93,7 +93,6 @@ pub fn would_handle(lc: &ListenerConfig, path: &str) -> bool {
 /// 一起交给引擎；deps 冷路径 ensure 失败不阻塞响应（记日志后用空环境继续）。
 pub async fn try_handle_simple(
     req: &Request<Bytes>,
-    live: &Arc<LiveConfig>,
     lc: &ListenerConfig,
     peer: SocketAddr,
 ) -> Option<Response<Bytes>> {
@@ -107,7 +106,7 @@ pub async fn try_handle_simple(
         return None;
     }
     let app = match_app(lc, path, ext)?;
-    let deps_env = match deps::try_cached(live, app).await {
+    let deps_env = match deps::try_cached(lc, app).await {
         Ok(e) => e,
         Err(e) => {
             log::warn!("deps ensure failed (simple path): {e:#}");
@@ -121,15 +120,16 @@ pub async fn try_handle_simple(
     // 是由 php-fpm 正常执行的）。这里改成与 h1 的 dispatch 一致：回 502。
     let outcome = match app_ffi::execute_simple(req, lc, app, peer, &deps_env).await {
         Ok(o) => o,
+        // 与 h1 的 dispatch 同一口径：`{e:#}` 只进**本地日志**，回给客户端的是固定文本
+        // —— 它是完整 anyhow 链，里面是 docroot/socket/被 spawn 的二进制绝对路径，而拿到它的
+        // 人只是任意一个能命中该路由的客户端（这是上一轮 15 处回显的漏网处）。
+        // 这里不能用 `engine_error()`：simple 路径的响应体是 `Bytes`（不是 `BoxBody`）。
         Err(e) => {
             log::warn!("app engine {} failed (simple path): {e:#}", app.engine);
             return Some(
                 Response::builder()
                     .status(StatusCode::BAD_GATEWAY)
-                    .body(Bytes::from(format!(
-                        "{} engine error: {e:#}",
-                        app.engine
-                    )))
+                    .body(Bytes::from_static(b"502 Bad Gateway (engine error)"))
                     .unwrap(),
             );
         }
@@ -273,12 +273,9 @@ async fn dispatch(
             } else if native_http::sidecar_available(app, lc) {
                 match native_http::try_handle(req, lc, app, peer, app_idx).await {
                     Ok(resp) => resp,
-                    Err(e) => Response::builder()
-                        .status(StatusCode::BAD_GATEWAY)
-                        .body(full(format!(
-                            "native sidecar error (no CGI fallback): {e:#}"
-                        )))
-                        .unwrap(),
+                    // 同 `engine_error`：sidecar 的错误链里有 socket 路径与后端文本，
+                    // 只进本地日志，不回显给客户端。
+                    Err(e) => engine_error("native sidecar", &e),
                 }
             } else {
                 Response::builder()

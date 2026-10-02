@@ -1,7 +1,6 @@
 //! App deps: init.sh + .env → deps/; hot path uses mtime-only try_cached.
 
-use crate::config::AppRouteConfig;
-use crate::server::live_config::LiveConfig;
+use crate::config::{AppRouteConfig, ListenerConfig};
 use anyhow::{Context, Result};
 use once_cell::sync::Lazy;
 use parking_lot::Mutex;
@@ -48,8 +47,8 @@ static DEPS_ENSURE_LOCKS: EnsureLocks = Lazy::new(|| Mutex::new(HashMap::new()))
 
 /// Hot path: compare mtimes only — never SHA256 / spawn_blocking per request.
 /// 命中时同时返回该 docroot 的 .env 变量（P1-1）。
-pub async fn try_cached(live: &Arc<LiveConfig>, app: &AppRouteConfig) -> Result<DepsEnv> {
-    let docroot = resolve_docroot(live, app)?;
+pub async fn try_cached(lc: &ListenerConfig, app: &AppRouteConfig) -> Result<DepsEnv> {
+    let docroot = resolve_docroot(lc, app);
     let init = docroot.join("init.sh");
     let envp = docroot.join(".env");
     let deps_dir = app
@@ -162,16 +161,15 @@ fn write_manifest(deps_dir: &Path, m: &Manifest) {
     let _ = fs::write(path, body);
 }
 
-fn resolve_docroot(live: &Arc<LiveConfig>, app: &AppRouteConfig) -> Result<PathBuf> {
-    if let Some(d) = &app.docroot {
-        return Ok(d.clone());
-    }
-    // Fall back to first listener root (core skeleton).
-    let cfg = live.snapshot();
-    cfg.listeners
-        .first()
-        .map(|l| l.root.clone())
-        .context("no docroot")
+/// 应用 docroot：配置优先，其次**当前 listener** 的 root。
+///
+/// 回落取的是 `lc.root` 而**不是** `live.listeners.first().root`。多 listener 部署下
+/// 后者会把「另一个站点」的 docroot 当成这个应用的根，于是它会读到**别人的 `.env`**
+/// （通常就是数据库口令、API key）并把它注入自己的执行环境 —— 跨站点/跨租户的凭据泄露，
+/// 而且只在多 listener 时出现，单站点测试永远发现不了。
+/// 与 `php::resolve_docroot(lc, app)` 同一套判据。
+fn resolve_docroot(lc: &ListenerConfig, app: &AppRouteConfig) -> PathBuf {
+    app.docroot.clone().unwrap_or_else(|| lc.root.clone())
 }
 
 
@@ -225,13 +223,23 @@ async fn ensure_app_deps(
     .await
     .with_context(|| format!("deps prep join {}", deps_dir.display()))??;
 
-    let mut child = tokio::process::Command::new("sh")
-        .arg(init)
+    let mut cmd = tokio::process::Command::new("sh");
+    cmd.arg(init)
         .current_dir(docroot)
         .env("DEPS_DIR", deps_dir)
-        .kill_on_drop(true)
+        .kill_on_drop(true);
+    // `init.sh` 干的通常就是 pip/npm/make —— 它们会再 fork 出孙进程。自成**进程组**后
+    // 超时才能整组杀掉：只杀 `sh` 本身时，孙进程会留下来继续跑（还占着 docroot，而失败后
+    // 下一次 ensure 又要 `remove_dir_all` 这个目录），CPU/磁盘/内存白占且没有任何人回收。
+    // 与 cgi_script.rs 是同一套做法（那里的注释记了实测：只杀壳会留下握着 stdout 的孙进程）。
+    #[cfg(unix)]
+    cmd.process_group(0);
+    let mut child = cmd
         .spawn()
         .with_context(|| format!("spawn {}", init.display()))?;
+    // 组长 pid == 子进程 pid（上面 process_group(0)）
+    #[cfg(unix)]
+    let pgid = child.id().map(|p| p as i32);
     let timeout = Duration::from_secs(timeout_secs.max(1));
     match tokio::time::timeout(timeout, child.wait()).await {
         Ok(status) => {
@@ -242,7 +250,14 @@ async fn ensure_app_deps(
             Ok(())
         }
         Err(_) => {
-            // 超时：杀掉 init.sh 并回收，随后锁随 guard 释放。
+            // 超时：**整组**杀掉（见 spawn 处的说明），再回收壳进程。
+            // 安全：pgid 就是紧接着 spawn 出来的那个子进程 pid，且此刻还没 wait 过它。
+            #[cfg(unix)]
+            if let Some(pgid) = pgid {
+                unsafe {
+                    libc::kill(-pgid, libc::SIGKILL);
+                }
+            }
             let _ = child.kill().await;
             anyhow::bail!(
                 "init.sh timed out after {}s: {}",

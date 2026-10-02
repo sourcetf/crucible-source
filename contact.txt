@@ -1220,4 +1220,63 @@ listener 更新指纹，所以删掉 h3 时 watch **永不触发**，端点照�
 
 **⚠️ 提交范围**：生产 `config.toml` 含**真实**口令哈希（文件自己写着「生产值不入库」），
 已**排除在本轮提交之外**并设 `--skip-worktree`。**请勿**用 `git checkout -- config.toml`
-「恢复」它（会用空哈希覆盖生产文件 ⇒ 管理面锁死）。
+「恢复」它（会用空哈希覆盖生产文件 ⇒ 管理面锁死）。### Session 1008 (2026-10-03) — 进展 38（第四轮并行审计：上传/文件面、准入/身份面、引擎 FFI/进程/Tor —— 修 19 处）
+
+**先说文件归属（按协作约定）**：本轮我（1008）独占编辑这 15 个文件，没有第二个人在改它们：
+`src/config.rs`、`src/server/{access,admin_files,basic_auth,h2,h3,page_rules,static_files,syncookie,tor_hs,upload_api,upload_resume}.rs`、
+`src/server/apps/{app_ffi,deps,mod}.rs`。下一轮谁要碰这些文件请先在 contact.txt 里认领。
+
+**为什么是这三片**：按前四轮的提交记录逐文件核对，`upload_api.rs`/`upload_resume.rs`/`admin_files.rs`/
+`access.rs`/`basic_auth.rs`/`password.rs`/`rate_limit.rs`/`syncookie.rs`/`ecn.rs`/`telemetry.rs`/
+`tor_hs.rs`/`onion_ca.rs`/`apps/{app_ffi,deps,env_lock}.rs` 以及 `libs/**` 的 C 引擎**一次都没被审过**
+（前四轮改的文件全部集中在 config/static/h1/proxy/apps-常见引擎/dns/tls/qmux/admin/geoip）。
+这一轮按「一个文件只由一个人改」切三片并行。
+
+**P1 三条**：
+1. `apps/app_ffi.rs` 给 c/go/rust 留了一条「同线程内联、**跳过 env 锁**」的快路（§7.3）。它当年的
+   前提是「.env 走 extra JSON 下发、不碰进程 env」，而 C 侧 `appengine_apply_extra` 的落地方式
+   就是 **setenv**（`libs/app-engines/common/appengine_common.c` + samples/{c,rust}-plugin）⇒ 这条
+   快路成了进程 env 唯一不受 `env_lock` 保护、**也从不恢复**的写者：既与别的引擎在锁内
+   install/restore 并发（`environ` realloc 时 `getenv` 踩已释放内存 = UB），又把上一个应用的
+   `.env`（常是数据库口令/API key）**永久留在进程环境**里给之后任何脚本读。已删掉这条快路。
+   ⚠️ **这条推翻了 OPERATOR-TODO J 的前提**（J 说「引擎写者都在锁内」，实际不是）。
+2. `static_files.rs`：h1 的 `serve` 有「必须是普通文件」判据，h2/h3 的 `serve_simple` **没有**
+   ⇒ docroot 里一个 FIFO 就能让 `fs::read` 永久阻塞、占死一个 tokio worker（本机只有 2 条），
+   两个这样的请求整站失去响应。同一 URL 在 h1 安全、h2/h3 死锁，而浏览器默认走 h2/h3。
+3. `tor_hs.rs`：`data_dir` 在 state 之外时对**父目录**做 `chown -R` —— `data_dir = "/onion"` ⇒
+   `parent()` 是 `/` ⇒ `chown -R / _tor`（tor 被攻破 = 交出整台主机）。
+   顺带（我自己补的）：`data_dir` **本身**也没任何校验，而它会被 `chmod 0700` + `chown -R`；
+   `data_dir = "/"` 就是 `chmod 0700 /`，`= "/crucible"` 则交出 config.toml 与 state/ 私钥。
+   新增 `check_tor_hs_data_dir`（11 负例 + 5 正例）。
+
+**其余 16 条（P2）**：上传闸门先建文件后判配额（被拒也留一个永不被 sweep 的 `.part`，磁盘/inode
+无界增长）；`commit` 不 fsync（rename 只保证目录项，崩溃后是「长度对、内容空洞」的文件）；
+wildcard `Content-Range` 判据与解析器不一致（`bytes 0-99/ *` 被判成有总长 ⇒ 首片直接 commit =
+静默截断）；`admin_files::write_file` 是截断后再写（失败即毁掉原文件）→ 改临时文件 + rename；
+`access::cidr_or_exact` 把**空串**当成「匹配所有地址」（`[ip_access]` 有配置期拦截，但同一函数被
+DNS 数据面复用，而 `[dns]` 没有条目级校验 ⇒ 一个多余的空元素把 DoT/递归白名单放宽到全世界）；
+`basic_auth` 失败表按原始 IP 分键（v4-mapped 与 v4 各算一份 ⇒ 换地址族就翻倍爆破预算）；
+`page_rules::apply_simple` 的返回值被 h2/h3 直接 `.unwrap()` 进 Location（坏 target = 每个命中
+请求 panic 掉连接，h1 早已降级、这两处漏了）；引擎声明的 `Content-Length` 原样透传（hyper 按
+真实长度成帧 ⇒ keep-alive 响应走私）；headers 块用 C 侧给的 `headers_len` 直接建 slice（越界读
+当响应头发出去）；「enabled 变 false → 停 tor」在 tokio worker 上同步做最长 7s（一次保存让服务
+7s 不响应）；tor 巡检与 `stop_on_shutdown` 都不会拉闸（异步那次读丢 pidfile 就永久挂着 .onion）；
+`init.sh` 超时只杀壳（pip/npm/make 孙进程留成孤儿）→ `process_group(0)` + `kill(-pgid)`；
+`deps::resolve_docroot` 回落 `listeners.first()`（多 listener 下拿到**别的站点**的 `.env`）；
+`apps/mod.rs` 还有两处回显完整 `{e:#}`（上一轮 15 处的漏网）；`syncookie` 评估循环在禁用期不推进
+窗口（重开开关时把累计 accept 当成假洪水）。
+
+**明确不做**（附理由，避免下一轮重复讨论）：
+- **不给 `[dns]` 的 ACL 加条目级校验**：空串那条（唯一的危险方向）已经 fail-closed 了，剩下的
+  只是「拼错的条目静默不生效」＝ fail-closed；而加校验就要维护 BIND 关键字白名单，本项目为此
+  **被误拒打过两次**（第二轮第 14 条已定调）。
+- **不动 h2/h3 里那个 `.header(LOCATION,..).unwrap()`**：值的来源（`apply_simple`）与配置期
+  （`safe_header_value`）已各拦一层，在没有第二处来源之前不再加层。
+
+**测试** 269 passed / 0 failed；生产已部署复验（见 WORKLOG §21.41）。新增 7 个单测（空 ACL 条目、v4-mapped 失败计数共享、
+非法 Location 跳过、`Content-Range` 空白容忍、被拒会话不留临时文件、原子覆盖写、
+tor_hs data_dir 校验）。
+
+**另外一条与本轮无关但**操作员必须知道的事**：生产 `config.toml` 含**真实**口令哈希（文件自己
+写着「生产值不入库」），所以它已被排除在提交之外并设了 `git update-index --skip-worktree`。
+**请勿**用 `git checkout -- config.toml`「恢复」它 —— 那会用空哈希覆盖生产文件、管理面锁死。

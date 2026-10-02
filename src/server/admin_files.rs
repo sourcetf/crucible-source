@@ -208,7 +208,25 @@ pub fn write_file(root: &Path, rel: &str, data: &[u8]) -> Result<()> {
         // 与 mkdir 同一套「逐级创建 + 复核」：别顺着符号链接把父目录建到 root 外。
         create_dir_all_within(&root_canon, parent)?;
     }
-    fs::write(&path, data).with_context(|| format!("write {}", path.display()))?;
+    // 原子写：旧实现直接 `fs::write`（= 先截断再写），写到一半失败（ENOSPC、被 OOM/强制退出
+    // 打断，本项目都有先例）会把**原本完好的文件**毁成一个半截文件 —— 面板报「保存失败」，
+    // 而磁盘上那份**旧文件已经被截断**，等于一次失败的保存造成永久数据丢失。
+    // 改为同目录临时文件 + rename（与 upload_resume / DNS 落盘同一套）；临时名带 pid + 单调
+    // 计数，不可预测（避免 docroot 里有写权限的应用预先放同名符号链接把我们重定向到 root 外）。
+    let tmp = path.with_file_name(temp_write_name(&path));
+    if let Err(e) = fs::write(&tmp, data) {
+        let _ = fs::remove_file(&tmp);
+        return Err(e).with_context(|| format!("write {}", tmp.display()));
+    }
+    // 内容持久化之后才让它以目标名出现（否则崩溃会留下「长度对、内容却是空洞」的目标文件）。
+    // 用**可写**句柄再 sync：只读句柄上的 FlushFileBuffers 在 Windows 上会直接失败。
+    if let Ok(f) = fs::OpenOptions::new().write(true).open(&tmp) {
+        let _ = f.sync_all();
+    }
+    if let Err(e) = fs::rename(&tmp, &path) {
+        let _ = fs::remove_file(&tmp);
+        return Err(e).with_context(|| format!("rename {}", path.display()));
+    }
     // TOCTOU: after write, canonicalize and re-check containment (symlink race).
     let written = fs::canonicalize(&path).with_context(|| format!("re-canon {}", path.display()))?;
     if !written.starts_with(&root_canon) {
@@ -216,6 +234,17 @@ pub fn write_file(root: &Path, rel: &str, data: &[u8]) -> Result<()> {
         anyhow::bail!("write escaped root after create (symlink race?)");
     }
     Ok(())
+}
+
+/// 同目录写盘临时名：以 `.` 开头 ⇒ 静态层与上传都不服务它、autoindex 也不列出。
+fn temp_write_name(path: &Path) -> String {
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let base = path.file_name().and_then(|n| n.to_str()).unwrap_or("f");
+    format!(
+        ".{base}.crucible-write.{}.{}",
+        std::process::id(),
+        SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    )
 }
 
 /// 在 root 下创建目录（含父目录）；已存在同名目录时报错。
@@ -503,6 +532,26 @@ mod tests {
         assert!(e.contains("write too large"), "unexpected: {e}");
         assert!(!root.join("big.bin").exists(), "must not leave a partial file");
         assert!(write_file(&root, "ok.txt", b"small").is_ok());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// 覆盖写要真正落盘（原子写回归），且目录里不留临时文件。
+    #[test]
+    fn write_file_overwrites_atomically() {
+        let root = std::env::temp_dir().join("crucible_admin_atomic_write_test");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        write_file(&root, "a.txt", b"first").unwrap();
+        assert_eq!(std::fs::read(root.join("a.txt")).unwrap(), b"first");
+        write_file(&root, "a.txt", b"second-longer").unwrap();
+        assert_eq!(std::fs::read(root.join("a.txt")).unwrap(), b"second-longer");
+        let leftovers: Vec<String> = std::fs::read_dir(&root)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.contains("crucible-write"))
+            .collect();
+        assert!(leftovers.is_empty(), "临时文件残留: {leftovers:?}");
         let _ = std::fs::remove_dir_all(&root);
     }
 

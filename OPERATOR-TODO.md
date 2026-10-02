@@ -368,3 +368,63 @@ SSH/同步小脚本）。本地快照仓库的基线提交（`caf3466`）还跟�
 6. **`headers_mod::append_security_headers` 是死代码**（无调用者）：全局的
    `X-Content-Type-Options`/`X-Frame-Options`/`Referrer-Policy` 因此只在少数路径出现。
    要不要全局加属于产品决策（会影响所有响应），先记。
+---
+
+## L. 第四轮的**更动**与**记录但未改**
+
+### L.1 J 项里「`env_lock` 进程环境并发污染」的前提是错的，且已在第四轮修掉
+J 项当时写的是「引擎写者都在锁内，只是进程 env 设计如此，需要操作员确认」。**事实不是**：
+`apps/app_ffi.rs` 给 c/go/rust 留了一条「同线程内联、**跳过 env 锁**」的快路（§7.3），而它
+拿 `.env` 变量的方式正是 C 侧 `appengine_apply_extra` 的 **setenv**
+（`libs/app-engines/common/appengine_common.c`、samples/{c,rust}-plugin 都这么写）。
+所以进程 env 有一个**完全不持锁、也从不恢复**的写者：
+① 与别的引擎在锁内 install/restore 并发 ⇒ `environ` realloc 时别人的 `getenv` 踩已释放内存（UB）；
+② 上一个应用的 `.env`（常含数据库口令/API key）会**永久留在进程环境**里，之后任何引擎的脚本
+   都能 getenv 读到（跨应用泄密）。
+
+第四轮删掉了这条快路：c/go/rust 现在与其它引擎同路（有界通用池 + `env_lock`）。
+⇒ **J 项剩下的三条不动**（h1/h2 长连接快照、h2 缺 header 读超时、`rate_limit` 按完整 IP 分桶），
+但「env_lock 并发污染」这条可以**划掉**了。
+
+### L.2 第四轮**记录但未改**（每条都附了「为什么没改」）
+1. **上传会话不校验属主**（`upload_resume.rs`：按 target 路径分键，`owner` 存了但**从不检查**）。
+   任何客户端都能对**同一个路径**的上传会话续传/追加，闲置 30s 后还能 reset 截断别人的上传。
+   没改的原因：这是**产品策略**——加属主校验会破坏「NAT 后换 IP」「多客户端协作上传」这两类
+   正常用法，而上传区本来就是匿名可写设计。
+2. **`commit` 只 fsync 文件、不 fsync 父目录**（`upload_resume.rs` 与 `admin_files.rs` 的 rename
+   都是这一档）。崩溃紧跟在 rename 之后仍可能丢目录项。没改的原因：目录 fsync 要 `cfg(unix)`
+   开目录再 fsync，且**是动到跨平台行为**（Windows 上会失败），需要单独一轮处理。
+3. **`metrics_public = true` 时 `/__metrics` 在**所有** listener（含明文 HTTP 端口）可达** ——
+   `[admin].listeners_allow` 只管 `is_admin_path`，指标路径不在其内。收紧会让现有抓取端断掉 ⇒
+   策略决定。
+4. **管理员用户名的存在性时间侧信道**（`basic_auth` / `check_admin_headers`）：字符串比较已经是
+   恒时的，但**只有用户名命中才跑一次 argon2/yescrypt** ⇒ 响应时间可区分「用户是否存在」。
+   抹平要在用户名不匹配时也跑一次假哈希（多用户时成本 ×N）⇒ 成本/策略取舍。
+5. **`rate_limit` 的 `per_path` 桶用原始请求路径**：`//x`、`/./x`、`/%78`、`/x?` 各算一个桶 ⇒
+   同一资源换写法就能倍增配额（尾斜杠已被 `trim_end_matches('/')` 处理）。修法是路径规范化，
+   会改变限流粒度 ⇒ 行为变更。
+6. **`type65_api` 只有内存表、没有任何消费者**：面板点「发布」得到 `published …`，但没有任何
+   东西被写进 DNS 应答，且重启即丢。是否接进 `[[dns.https_rr]]`/ECH 流程属产品决策。
+7. **`geoip_panel`/`dns::geoip` 的几条**（已在 K 项记过，第四轮复核仍然成立）：面板每次 lookup
+   重开 SQLite + 跑 DDL 且同步跑在 tokio worker 上；`anycast` 表每次 lookup 全表扫；
+   `ensure_synced`（含最长 120s 网络下载）在周期 async 任务里直接同步调用；
+   `admin_geoip::url_decode` 的 `byte as char` 会把百分号编码的多字节 UTF-8 解成 Latin-1。
+8. **C 引擎侧与 Rust 侧的环境过滤规则已经分叉**（报告，未改）：
+   `appengine_common.c` 的 `setenv(key, val, 1)` 对键值**不做任何校验**，而 Rust 侧的
+   `normalized()` 会滤掉空键/含 `=`/含 NUL 的项 —— 传给 C 的 extra JSON 用的是**未过滤**的
+   `env_vars`。目前 `.env` 解析器把键限制在 `[A-Za-z0-9_]`（`deps.rs`）所以够不到，
+   但两侧规则已经不一致，**任一侧放宽就是 `setenv` 拿到非法键名**。
+   同理 `\uXXXX` 只取低 8 位落地（`ch = (char)(v & 0xff)`），值里的 NUL 会让 setenv 静默截断；
+   Rust 侧 `parse_env_file` 不滤值中的 NUL。**改这里要动 vendored C 库并重新构建**，单独一轮做。
+9. **`headers_mod::append_security_headers` 是死代码**（无调用者）：全局的
+   `X-Content-Type-Options`/`X-Frame-Options`/`Referrer-Policy` 因此只在少数路径出现。
+   要不要全局加会影响**所有**响应 ⇒ 产品决策。
+
+### L.3 第四轮**明确不做**的两件（不要再提）
+- **不给 `[dns]` 的 `recursion_acl`/`axfr_out_acl`/`dot.allow` 加条目级校验**：空串（唯一的
+  **危险**方向，曾被当成「匹配所有地址」）已在第四轮改成 fail-closed；剩下的只是「拼错的条目
+  静默不生效」= fail-closed 方向。而加校验就要维护 BIND 关键字白名单，本项目为此**被误拒
+  打过两次**（第二轮第 14 条定调：与其加名字白名单，不如让真实代码路径报错）。
+- **不动 h2/h3 里那个 `.header(LOCATION, ..).unwrap()`**：值的来源（`page_rules::apply_simple`，
+  第四轮已加 `HeaderValue::from_str` 校验）与配置期（`safe_header_value`）已各拦一层。
+  在没有第二处来源之前不再加层。

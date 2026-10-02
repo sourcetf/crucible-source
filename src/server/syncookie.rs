@@ -41,14 +41,18 @@ pub fn spawn_evaluator(live: Arc<LiveConfig>) {
             let cfg = live.snapshot().syncookie.clone();
             let interval = Duration::from_millis(cfg.evaluate_interval_ms.max(500));
             tokio::time::sleep(interval).await;
+            // **无论是否启用都要推进 prev**：禁用期间 accept 计数仍在累加，
+            // 若把这段累计量留到「首次启用」的那个 tick 里一起算，rate 会被算成一个
+            // 巨大的假洪水 ⇒ 白写一次 value_on，动态评估的判据当场失真
+            // （对已有流量的部署重开该开关时立刻误动作）。
+            let now = SYN_COUNT.load(Ordering::Relaxed);
+            let delta = now.saturating_sub(prev);
+            prev = now;
             if !cfg.enabled {
                 continue;
             }
             #[cfg(all(target_os = "linux", feature = "linux_syncookie"))]
             {
-                let now = SYN_COUNT.load(Ordering::Relaxed);
-                let delta = now.saturating_sub(prev);
-                prev = now;
                 let secs = interval.as_secs_f64().max(0.001);
                 let rate = (delta as f64 / secs) as u64;
                 let target: u8 = if rate >= SYN_RATE_THRESHOLD {
@@ -64,7 +68,7 @@ pub fn spawn_evaluator(live: Arc<LiveConfig>) {
             #[cfg(not(all(target_os = "linux", feature = "linux_syncookie")))]
             {
                 // OpenBSD 等平台：内核自行管理 syncookies，评估循环保持 no-op。
-                let _ = (&cfg, &mut prev);
+                let _ = (cfg, delta);
                 log::trace!("syncookie evaluate no-op on this platform");
             }
         }

@@ -304,9 +304,11 @@ pub fn session_for(
         .parent()
         .ok_or_else(|| UploadErr::Io("upload target has no parent dir".into()))?;
     let tmp = parent.join(format!(".{name}.upload.part"));
-    if let Err(e) = std::fs::File::create(&tmp) {
-        return Err(UploadErr::Io(e.to_string()));
-    }
+    // 预算 / 每-IP 配额闸门必须在**创建临时文件之前**。
+    // 反过来（先建文件、再判闸门）时，被拒的请求会在 docroot 里留下一个**没有会话**的
+    // `.x.upload.part`：它不在 SESSIONS 里，`sweep_expired` 永远扫不到，于是磁盘/inode
+    // 只增不减 —— 攻击者先占满本 IP 的 16 个会话（或声明一个超大 total 把在飞预算顶满），
+    // 之后每次带不同文件名的 PUT 都会各留一份这种垃圾文件，可无限制造。
     {
         let mut b = BUDGET.lock();
         if b.inflight
@@ -321,6 +323,9 @@ pub fn session_for(
                 return Err(UploadErr::TooManySessions);
             }
         }
+    }
+    if let Err(e) = std::fs::File::create(&tmp) {
+        return Err(UploadErr::Io(e.to_string()));
     }
     let sess = Arc::new(Session {
         target: target.to_path_buf(),
@@ -392,6 +397,17 @@ pub fn append(sess: &Arc<Session>, offset: u64, data: &[u8]) -> Result<u64, Uplo
 pub fn commit(sess: &Arc<Session>) -> Result<(), UploadErr> {
     let mut map = SESSIONS.lock();
     let _g = sess.lock.lock();
+    // rename 只保证**目录项**的原子替换，不保证文件内容已经落盘：本项目有强制 exit/OOM
+    // 的历史，写盘页还没回刷就被杀时，会在目标名下留下一个**长度正确、内容却是空洞**
+    // （或半截）的文件 —— 比「没有文件」更坏（客户端收到 201、校验和却不符）。
+    // 先对临时文件 fsync：内容持久化之后才让它以目标名出现。
+    // 必须以**可写**句柄打开再 sync —— 只读句柄上的 FlushFileBuffers 在 Windows 上会
+    // 直接失败（ERROR_ACCESS_DENIED），那样这份「加固」在开发机上反而把 commit 弄挂。
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&sess.tmp)
+        .and_then(|f| f.sync_all())
+        .map_err(|e| UploadErr::Io(e.to_string()))?;
     std::fs::rename(&sess.tmp, &sess.target).map_err(|e| UploadErr::Io(e.to_string()))?;
     map.remove(&sess.target);
     release_budget(sess);
@@ -453,6 +469,17 @@ fn test_fs_has_room() -> bool {
         assert_eq!(parse_content_range("bytes a-b/c"), None);
     }
 
+    /// `/` 与 `*` 之间的空白必须容忍，且解析结果就是「总长未知」。
+    ///
+    /// `handle` 现在**直接**用解析结果（`total.is_none()`）判 wildcard，不再拿原始头做
+    /// `ends_with("/*")`。这条盯着解析端：万一有人把 `*` 的 trim 去掉，`bytes 0-99/ *`
+    /// 就会变成「有总长」→ 首片直接 commit（静默截断）。
+    #[test]
+    fn content_range_tolerates_space_before_wildcard() {
+        assert_eq!(parse_content_range("bytes 0-99/ *"), Some((0, 99, None)));
+        assert_eq!(parse_content_range("bytes 0-99/*"), Some((0, 99, None)));
+    }
+
     #[test]
     fn session_offset_semantics_and_atomic_commit() {
         if !test_fs_has_room() {
@@ -504,6 +531,40 @@ fn test_fs_has_room() -> bool {
         let other_ip: std::net::IpAddr = "203.0.113.8".parse().unwrap();
         assert!(session_for(&dir.join("ipv-other.bin"), 0, Some(1), Some(other_ip)).is_ok());
         // 清理（abort 会回收每 IP 计数与在飞字节）
+        for s in &opened {
+            abort(s);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 被闸门拒绝的会话**不得**在 docroot 留下临时文件。
+    ///
+    /// 旧实现的顺序是「先 `File::create(tmp)` 再判预算/每-IP 配额」⇒ 每次被拒都会留下一个
+    /// 无会话的 `.x.upload.part`，而 `sweep_expired` 只扫 SESSIONS 里的会话、永远碰不到它。
+    /// 攻击者占满每-IP 的 16 个会话后，用不同文件名反复 PUT 就能无限堆积这类文件。
+    #[test]
+    fn rejected_session_leaves_no_temp_file() {
+        if !test_fs_has_room() {
+            eprintln!("跳过：本机磁盘余量低于闸门阈值（{MIN_FREE_BYTES}），落盘用例无从验证");
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("crucible-up-leak-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let ip: std::net::IpAddr = "203.0.113.9".parse().unwrap();
+        let mut opened = Vec::new();
+        for i in 0..MAX_SESSIONS_PER_IP {
+            let t = dir.join(format!("leak{i}.bin"));
+            opened.push(session_for(&t, 0, Some(1), Some(ip)).expect("前 N 个应放行"));
+        }
+        let over = dir.join("leak-over.bin");
+        match session_for(&over, 0, Some(1), Some(ip)) {
+            Err(UploadErr::TooManySessions) => {}
+            other => panic!("第 N+1 个应回 TooManySessions，实际 {:?}", other.err()),
+        }
+        assert!(
+            !over.with_file_name(".leak-over.bin.upload.part").exists(),
+            "被拒的请求不得留下无会话的 .part 文件（永不被 sweep 回收 ⇒ 磁盘/inode 无界增长）"
+        );
         for s in &opened {
             abort(s);
         }

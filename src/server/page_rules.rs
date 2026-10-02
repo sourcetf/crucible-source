@@ -56,6 +56,18 @@ pub fn apply_simple(lc: &ListenerConfig, path: &str) -> Option<(StatusCode, Stri
                         Some(("308", u)) => (StatusCode::PERMANENT_REDIRECT, u.to_string()),
                         _ => (StatusCode::FOUND, target),
                     };
+                    // 这个 API 只能返回 `(StatusCode, String)`，而 h2/h3 的调用方是
+                    // `Response::builder().header(LOCATION, loc).body(..).unwrap()` 组装的
+                    // —— `loc` 含控制字符时 `HeaderValue` 构造失败、`.body()` 直接 panic，
+                    // **每个命中该规则的请求**都把连接打死（h1 那条路径早已降级为
+                    // 「不带 Location 的 302」，这里漏了）。降级成「跳过这条规则」是这套签名
+                    // 下唯一能表达「别写这个头」的方式，站点不会因为一个坏 target 全挂。
+                    if http::header::HeaderValue::from_str(&loc).is_err() {
+                        log::warn!(
+                            "page_rules redirect: target 不能作为 Location 响应头，跳过该规则: {loc:?}"
+                        );
+                        continue;
+                    }
                     return Some((status, loc));
                 }
                 _ => {}
@@ -270,6 +282,19 @@ mod tests {
     fn redirect_status_prefix() {
         let r = redirect_response("301:https://x/y".into());
         assert_eq!(r.status(), StatusCode::MOVED_PERMANENTLY);
+    }
+
+    /// h2/h3 用 `apply_simple` 的返回值直接构造 `Location`（`.unwrap()`）——
+    /// 含控制字符的 target 会让每个命中请求 panic，因此必须在这里被跳过。
+    #[test]
+    fn apply_simple_skips_unusable_location() {
+        let lc = lc_with(vec![rule("/bad", "redirect", Some("/a\r\nX-Evil: 1"))]);
+        assert_eq!(apply_simple(&lc, "/bad"), None, "非法 Location 必须跳过规则");
+        let ok = lc_with(vec![rule("/ok", "redirect", Some("301:https://x/y"))]);
+        assert_eq!(
+            apply_simple(&ok, "/ok"),
+            Some((StatusCode::MOVED_PERMANENTLY, "https://x/y".to_string()))
+        );
     }
 
     // P2-9：混合大小写品牌词也要清洗；非品牌内容原样保留。

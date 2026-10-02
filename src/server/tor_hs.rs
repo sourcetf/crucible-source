@@ -325,8 +325,13 @@ pub async fn ensure_hs(cfg: &TorHsConfig) -> Result<String> {
         let (uid, gid) = resolve_user(u)?;
         chown_tree(&dir, uid, gid)?;
         if dir != hs_dir {
-            let parent = hs_dir.parent().unwrap_or(&dir);
-            chown_tree(parent, uid, gid)?;
+            // `data_dir` 配在 state/tor-hs 之外时，只把 **HS 目录本身**交给该用户。
+            // **绝不能**去 chown 它的父目录：`data_dir = "/onion"` 时 `parent()` 就是 `/`，
+            // 那等于 `chown -R / _tor` —— tor 一旦被攻破，整个文件系统（config.toml、
+            // TLS/ECH 私钥、admin 口令哈希、/root）的属主都变成了这个低权账号；写
+            // `/var/tor/hs` 则会把父目录里**别的东西**的属主一并改掉。
+            // 父目录只需要路径可搜索（x 位），不需要归 tor 所有 —— 那是运维的目录策略。
+            chown_tree(&hs_dir, uid, gid)?;
         }
     } else if unsafe { libc::geteuid() } == 0 && !ROOT_WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
         // 只提示一次：巡检每 60s 也会走到这里，warn 每 60s 刷一条没人受得了。
@@ -493,12 +498,28 @@ pub fn spawn_from_config(hs: crate::config::TorHsConfig) {
     if !hs.enabled {
         // 热重载里把 enabled 改回 false，也必须**真的把 tor 停掉**：否则面板显示"未启用"，
         // 而 .onion 仍然挂着、对一个已经不该有入站入口的服务开放。
-        let dir = state_dir();
-        if tor_pid(&dir).is_some() {
-            log::info!("tor_hs: enabled 变成 false → 停止 tor");
-            if let Err(e) = stop_tor_blocking(&dir) {
-                log::warn!("tor_hs: 停止 tor 失败：{e:#}");
-            }
+        //
+        // 这一段**不能**在调用线程上同步做：`spawn_from_config` 是从
+        // `LiveConfig::reload()/replace()` 里调的，也就是跑在 tokio worker 上，而
+        // `tor_pid` 会 spawn 一个 `ps`、`stop_tor_blocking` 最长要 `thread::sleep` 7s
+        //（TERM 等 5s + KILL 等 2s）。本机只有 2 条 worker，一次「关掉 tor_hs」的配置保存
+        // 就足以让服务整整 7s 不响应任何请求。整段挪进阻塞池，并借 `hs_lock` 与正在
+        // `ensure_hs` 的那一侧串行（否则可能把它刚拉起来的 tor 又杀掉）。
+        //
+        // 但**必须先问一句「有没有 runtime」**：`tokio::spawn` 在没有 reactor 的线程上会
+        // 直接 panic（实测：`upload_api::tests::enabled_for_follows_live_config` 走
+        // `LiveConfig::replace()` 撞上这里）。没有 runtime 时（单测、离线工具）本来就
+        // 没有 worker 会被阻塞，同步做才是对的 —— 异步只是为了避免占用 worker。
+        if tokio::runtime::Handle::try_current().is_ok() {
+            tokio::spawn(async move {
+                let _g = hs_lock().lock().await;
+                let _ = tokio::task::spawn_blocking(|| {
+                    stop_tor_if_running("enabled 变成 false")
+                })
+                .await;
+            });
+        } else {
+            stop_tor_if_running("enabled 变成 false");
         }
         return;
     }
@@ -525,6 +546,17 @@ pub fn spawn_watchdog(live: std::sync::Arc<crate::server::live_config::LiveConfi
             tick.tick().await;
             let cfg = live.snapshot().tor_hs.clone();
             if !cfg.enabled {
+                // 巡检是「enabled = false 之后 tor 还挂着」的最后一道闸：热重载里那次停止是
+                // **异步**的（不能阻塞 worker，见 `spawn_from_config`），只要它在那一瞬间
+                // 读丢了 pidfile 或 kill 失败，.onion 就会一直挂在一个「已关闭」的服务上，
+                // 再没有任何东西来拉闸。这里每轮确认一次：只认 pidfile + `ps` 核对过的
+                // 那个 pid（别人的 tor 绝不会被误杀）；没在跑时 `tor_pid` 只读一个 pidfile
+                // 就返回，代价可忽略。
+                let _g = hs_lock().lock().await;
+                let _ = tokio::task::spawn_blocking(|| {
+                    stop_tor_if_running("巡检发现 enabled=false 但 tor 仍在")
+                })
+                .await;
                 continue;
             }
             if let Err(e) = ensure_hs(&cfg).await {
@@ -540,15 +572,28 @@ pub fn spawn_watchdog(live: std::sync::Arc<crate::server::live_config::LiveConfi
 /// 「服务已停但 .onion 仍然可解析、连进去必然是死连接」——既误导用户，也等于对外宣告
 /// 这台机器还在跑。只停 pidfile 指向且 `ps` 核对过的那个 pid（绝不误杀别人的 tor）。
 pub fn stop_on_shutdown(cfg: &TorHsConfig) {
-    if !cfg.enabled {
-        return;
-    }
+    // **不再**用 `cfg.enabled` 提前返回：`spawn_from_config` 的「enabled 变 false → 停 tor」
+    // 现在是异步的（不能阻塞只有 2 条的 tokio worker），进程完全可能在它跑完之前就退出；
+    // 那一刻内存里的配置已经是「未启用」，但那台 tor 是我们自己起的、.onion 还挂着。
+    // 停不停只认 pidfile + `ps` 命令行里有没有我们的 torrc（`tor_pid`），与 enabled 无关，
+    // 也绝不会误杀别人的 tor。
+    let _ = cfg;
+    stop_tor_if_running("进程退出");
+}
+
+/// 幂等停止：**只有** pidfile 指向且 `ps` 命令行里带着我们 torrc 的那个 pid 才会被动
+/// （`tor_pid` 的判据），所以别人的 tor 绝不会被误杀；没在跑时只读一个 pidfile 就返回。
+///
+/// `why` 只进日志（`&'static str` 是为了能直接塞进 `spawn_blocking`）。三处调用点
+/// （enabled 变 false、巡检、进程退出）共用一段代码，避免「改了一处忘了另一处」。
+fn stop_tor_if_running(why: &'static str) {
     let dir = state_dir();
     if tor_pid(&dir).is_none() {
         return;
     }
+    log::info!("tor_hs: {why} → 停止 tor");
     if let Err(e) = stop_tor_blocking(&dir) {
-        log::warn!("tor_hs: 退出时停止 tor 失败：{e:#}");
+        log::warn!("tor_hs: 停止 tor 失败（{why}）：{e:#}");
     }
 }
 

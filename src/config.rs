@@ -1080,6 +1080,7 @@ impl Config {
         // `"./"`、`".//"`、`"../"`、`"sub/.."`、绝对路径写成配置目录…… 全部绕过，
         // 而 `base.join("./")` 归一化后**正好是配置目录**。这里改成解析后比较。
         check_roots_do_not_expose_config(&cfg, &base)?;
+        check_tor_hs_data_dir(&cfg, &base)?;
         cfg.validate()?;
         Ok(cfg)
     }
@@ -1270,10 +1271,13 @@ cover 只用于「未使用 / 被拒 ECH」的连接，ECH 关闭时它会成为
         // 配置期一律拦住（见各自 validate 的注释）。
         crate::server::tor_hs::validate(&self.tor_hs)?;
 
-        // ip_access 的空条目：运行期 `access::cidr_or_exact("")` 把空串当成**匹配所有地址**
-        // （`pattern.is_empty() || pattern == "*" => true`），于是手写配置里一个空项
-        // （`allow = ["1.2.3.4", ""]`、deny 里多打一个逗号）会变成「整站 403」或「放行所有人」
-        // ——两种结果都不会有任何报错，只表现为「站点突然全 403 / 白名单形同虚设」。
+        // ip_access 的空条目：运行期 `access::cidr_or_exact("")` 现在**永不匹配**（fail-closed），
+        // 而历史上它曾等于「匹配所有地址」。两种语义下空项都是错的，所以配置期一律拒：
+        //   * 旧语义：`allow = ["1.2.3.4", ""]` 变成「放行所有人」（白名单静默失效），
+        //     `deny` 里多打一个逗号则变成「全站 403」；
+        //   * 现语义：`allow` 里一个空项会让其余条目失去意义？不会 —— 但 `deny = [""]`
+        //     会变成一个**永不生效**的封禁项（你以为封住了，实际没封）。
+        // 两种都不会有任何报错，只表现为「站点突然全 403 / 白名单形同虚设 / 封禁没生效」。
         // 面板保存路径（admin.rs::check_ip_access_entry）已经拒空串，这里补上配置期这一道。
         for (name, list) in [
             ("allow", &self.ip_access.allow),
@@ -1282,8 +1286,9 @@ cover 只用于「未使用 / 被拒 ECH」的连接，ECH 关闭时它会成为
             for (i, p) in list.iter().enumerate() {
                 if p.trim().is_empty() {
                     anyhow::bail!(
-                        "[ip_access].{name}[{i}] 是空串 —— 运行期空串等于「匹配所有地址」\
-（deny 会让全站 403、allow 会放行所有人），请删掉这一项或显式写 \"*\""
+                        "[ip_access].{name}[{i}] 是空串 —— 空项在任何一种语义下都是错的\
+（曾等于「匹配所有地址」：deny 让全站 403、allow 放行所有人；现在则永不匹配：封禁静默失效），\
+请删掉这一项或显式写 \"*\""
                     );
                 }
                 // 非法条目（拼错、前缀越界）在运行期**永不匹配**（`access::cidr_or_exact`
@@ -1681,20 +1686,92 @@ fn ip_access_entry_is_valid(p: &str) -> bool {
 ///
 /// 比较用「按组件消除 `..`/`.`」的字典序规范化（不要求目录存在，也不跟随符号链接）——
 /// 这是配置期就该拦住的形态问题；真实路径解析留给运行期的 canonicalize 一致性检查。
-fn check_roots_do_not_expose_config(cfg: &Config, config_dir: &Path) -> Result<()> {
-    let norm = |p: &Path| -> std::path::PathBuf {
-        let mut out = std::path::PathBuf::new();
-        for c in p.components() {
-            match c {
-                std::path::Component::ParentDir => {
-                    out.pop();
-                }
-                std::path::Component::CurDir => {}
-                other => out.push(other.as_os_str()),
+/// 词汇归一化（不碰文件系统）：去掉 `.`、用 `a/../` 抵消，`..` 冒到顶就停下。
+///
+/// 判据必须是「归一化后比较」而不是字面量比较：`"./"`、`".//"`、`"sub/.."`、`"/"` 这几种
+/// 写法在字面量上各不相同，归一化后却是同一个目录。
+fn norm_path(p: &Path) -> std::path::PathBuf {
+    let mut out = std::path::PathBuf::new();
+    for c in p.components() {
+        match c {
+            std::path::Component::ParentDir => {
+                out.pop();
             }
+            std::path::Component::CurDir => {}
+            other => out.push(other.as_os_str()),
         }
-        out
+    }
+    out
+}
+
+/// `[tor_hs].data_dir` 会被整棵树 `chmod 0700`，并在配了 `[tor_hs].user` 时 `chown -R`
+/// 给那个**低权**账号。所以它既不能是文件系统根，也不能是配置目录本身或它的祖先：
+///
+/// * `data_dir = "/"` ⇒ `chmod 0700 /` + `chown -R / _tor` —— tor 一旦被攻破，主机上
+///   **一切**（`/root`、`/etc`、别人的数据）的属主都归了它；
+/// * `data_dir = "/crucible"` ⇒ 把 `config.toml`（admin 口令哈希、MaxMind key）、
+///   `state/` 下的 TLS/ECH 私钥与 rndc 密钥一并交给它。
+///
+/// 这两条在运行期都**不会有任何报错**，只有事后审计才看得出来，所以在配置期就拒。
+/// 判据与 `check_roots_do_not_expose_config` 同一套（归一化后比较）。
+fn check_tor_hs_data_dir(cfg: &Config, config_dir: &Path) -> Result<()> {
+    let Some(raw) = cfg
+        .tor_hs
+        .data_dir
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    else {
+        return Ok(()); // 未配置：用 state/tor-hs/hs，我们自己的目录
     };
+    let d = norm_path(Path::new(raw));
+    if d.as_os_str().is_empty() {
+        anyhow::bail!(
+            "[tor_hs].data_dir = {raw:?} 归一化后为空（`.` / `..` / `sub/..` 这类）—— \
+它会被 chmod 0700 + chown -R 给 tor 账号，无法判断边界，请写明确的目录"
+        );
+    }
+    if d == Path::new("/") {
+        anyhow::bail!(
+            "[tor_hs].data_dir = {raw:?} 是文件系统根 —— 该目录会被 chmod 0700，并在配了 \
+[tor_hs].user 时 chown -R 给那个低权账号，等于把整台主机交出去。请指向一个专属目录（如 /var/tor/hs）"
+        );
+    }
+    let base = norm_path(config_dir);
+    // 允许的唯一「配置目录之内」的位置是 `<配置目录>/state` 的**真后代**（默认就是
+    // `state/tor-hs/hs`）。`state` 本身不能给出去 —— 那正是 ECH/TLS 私钥与 rndc 密钥所在。
+    // `state_root()` 是相对 cwd 的 `state/`，所以字面量 `state` 也要单独挡一次。
+    let state = base.join("state");
+    let state_rel = Path::new("state");
+    let is_our_state_subdir = (d.starts_with(&state) && d != state)
+        || (d.starts_with(state_rel) && d != state_rel);
+    if base.starts_with(&d) {
+        anyhow::bail!(
+            "[tor_hs].data_dir = {raw:?} 是配置目录 {} 本身或它的祖先 —— 该目录会被 chmod 0700 + \
+chown -R 给 tor 账号，config.toml（admin 口令哈希、MaxMind key）与 state/ 下的 TLS/ECH 私钥、\
+rndc 密钥都会落到它手里。请把 data_dir 指到配置目录之外",
+            base.display()
+        );
+    }
+    if d == state || d == state_rel {
+        anyhow::bail!(
+            "[tor_hs].data_dir = {raw:?} 就是 state/ 目录本身 —— state/ 下有 ECH/TLS 私钥与 \
+rndc 密钥，整棵树 chown -R 给 tor 账号等于把它们交出去。请指向 state/ 下的**子目录**（默认 state/tor-hs/hs）"
+        );
+    }
+    if d.starts_with(&base) && !is_our_state_subdir {
+        anyhow::bail!(
+            "[tor_hs].data_dir = {raw:?} 落在配置目录 {} 里、又不在 state/ 之下 —— 配置目录里是\
+源码与 www 文档根，整棵树 chmod 0700 + chown -R 给 tor 账号会把站点文件与私钥一并交出去。\
+请用 state/ 下的子目录，或配置目录之外的专属目录",
+            base.display()
+        );
+    }
+    Ok(())
+}
+
+fn check_roots_do_not_expose_config(cfg: &Config, config_dir: &Path) -> Result<()> {
+    let norm = norm_path;
     let base = norm(config_dir);
     for l in &cfg.listeners {
         let r = norm(&l.root);
@@ -1797,6 +1874,49 @@ root = {resolved:?}
                 "root={ok} 不该被拒"
             );
         }
+    }
+
+    /// `[tor_hs].data_dir` 会被 `chmod 0700` 并（配了 user 时）`chown -R` 给低权账号 ⇒
+    /// 文件系统根、配置目录本身、配置目录的祖先都必须拒绝；两者都不会有运行期报错，
+    /// 只有事后才看得出来（`chown -R / _tor` / config.toml 与 state/ 私钥归 tor）。
+    #[test]
+    fn tor_hs_data_dir_must_not_be_root_or_cover_config_dir() {
+        let cfg_dir = std::path::Path::new("/crucible");
+        let mk = |dir: &str| -> Config {
+            toml::from_str(&format!(
+                "[tor_hs]
+enabled = true
+data_dir = {dir:?}
+ports = [[80, 8080]]
+"
+            ))
+            .expect("parse")
+        };
+        for bad in [
+            "/", "//", "/.", "/..", ".", "..", "sub/..", "/crucible", "/crucible/",
+            "/crucible/state", "/crucible/www", "state",
+        ] {
+            let err = check_tor_hs_data_dir(&mk(bad), cfg_dir)
+                .err()
+                .unwrap_or_else(|| panic!("data_dir={bad} 必须被拒"));
+            eprintln!("[tor-hs-data-dir] {bad} -> {err}");
+        }
+        for ok in [
+            "/var/tor/hs",
+            "/onion",
+            "/srv/tor",
+            "state/tor-hs/hs",
+            "/crucible/state/tor-hs",
+        ] {
+            assert!(
+                check_tor_hs_data_dir(&mk(ok), cfg_dir).is_ok(),
+                "data_dir={ok} 不该被拒"
+            );
+        }
+        // 未配置：用 state/tor-hs/hs（我们自己的目录），必须放行。
+        let none: Config = toml::from_str("[tor_hs]\nenabled = true\nports = [[80, 8080]]\n")
+            .expect("parse");
+        assert!(check_tor_hs_data_dir(&none, cfg_dir).is_ok());
     }
 
     /// 第三/四批新增的几条配置期检查：写错就是**静默失效**，都必须在加载期拦下。

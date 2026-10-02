@@ -329,6 +329,20 @@ struct FailState {
     blocked_until: Instant,
 }
 
+/// 失败表的键必须与 `rate_limit`/`access` 用同一套归一化。
+///
+/// 双栈 listener 上的每个 IPv4 客户端都以 `::ffff:1.2.3.4` 出现，而单栈 v4 listener
+/// 上是 `1.2.3.4`；若不去归一化，同一来源的两副面孔就是两个键 —— 连续失败阈值与
+/// 「成功即清零」各自只作用在一半计数上，攻击者只要换一个监听口（或换地址族）发请求，
+/// 在线爆破的尝试次数就能翻倍，`blocked()` 也不会命中另一副面孔的封禁。
+/// （`rate_limit::normalize_ip` 与 `access::is_allowed` 早就统一了这件事，这里此前漏了。）
+fn fail_key(ip: IpAddr) -> IpAddr {
+    match ip {
+        IpAddr::V6(v6) => v6.to_ipv4_mapped().map(IpAddr::V4).unwrap_or(IpAddr::V6(v6)),
+        other => other,
+    }
+}
+
 /// 一张按 IP 记录的失败表。用 Mutex<HashMap> 而不是无锁结构：命中退避的请求本来
 /// 就应该被挡住、不该有吞吐，热路径上也只是加锁查一次 map。
 struct FailTable {
@@ -345,6 +359,7 @@ impl FailTable {
 
     /// 处于退避期则返回剩余时长；顺带把过窗口的记录清掉（惰性回收，无后台任务）。
     fn blocked(&self, ip: IpAddr) -> Option<Duration> {
+        let ip = fail_key(ip);
         let now = Instant::now();
         let mut map = self.map.lock();
         let (last, until) = match map.get(&ip) {
@@ -359,6 +374,7 @@ impl FailTable {
     }
 
     fn note_failure(&self, ip: IpAddr) {
+        let ip = fail_key(ip);
         let now = Instant::now();
         let mut map = self.map.lock();
         // 内存防护：满时淘汰最旧的一条，**绝不整表清空**——整表清空等于攻击者用
@@ -401,7 +417,7 @@ impl FailTable {
     }
 
     fn note_success(&self, ip: IpAddr) {
-        self.map.lock().remove(&ip);
+        self.map.lock().remove(&fail_key(ip));
     }
 }
 
@@ -590,6 +606,24 @@ mod tests {
         assert!(LISTENER_FAILS.blocked(ip).is_some());
         LISTENER_FAILS.note_success(ip);
         assert!(LISTENER_FAILS.blocked(ip).is_none());
+    }
+
+    /// v4-mapped v6 与原生 v4 必须共享同一份失败计数：否则同一来源换地址族/监听口
+    /// 就能把连续失败阈值（以及成功清零）劈成两半，在线爆破次数翻倍。
+    #[test]
+    fn fail_table_shares_counters_across_v4_mapped() {
+        let t = FailTable::new();
+        let mapped: IpAddr = "::ffff:10.0.0.7".parse().unwrap();
+        let plain: IpAddr = "10.0.0.7".parse().unwrap();
+        for _ in 0..FAIL_THRESHOLD {
+            t.note_failure(mapped);
+        }
+        assert!(
+            t.blocked(plain).is_some(),
+            "v4-mapped 的失败必须能封住原生 v4 的那副面孔"
+        );
+        t.note_success(plain);
+        assert!(t.blocked(mapped).is_none(), "成功清零必须对两副面孔同时生效");
     }
 
     /// 表满时淘汰最旧，而不是清空全表（否则攻击者刷满表即解除全部退避）。

@@ -361,6 +361,14 @@ pub async fn serve_simple<T>(req: &Request<T>, lc: &ListenerConfig) -> Result<Re
         }
         bail!("directory");
     }
+    // 只服务**普通文件**：docroot 里若有 FIFO / unix socket / 设备节点，open/read 会
+    // **永久阻塞**（`fs::read` 在 async 任务里是同步调用，直接占死一个 tokio worker；
+    // 本机只有 2 个 worker，两个这样的请求就能让服务整体失去响应）。
+    // h1 的 `serve` 早已有这道判据，h2/h3 这条路径此前漏了 —— 同一路径 h1 安全、
+    // h2/h3 被卡死（浏览器默认走 h2/h3）。
+    if !meta.is_file() {
+        bail!("not a regular file");
+    }
     // h2/h3 必须与 h1 用同一套 file_open 语义。
     // 此前 serve_simple 完全无视 file_open：管理员把 /uploads/x.html 配成
     // preview/download（强制 text/plain + inline/attachment + nosniff，防上传文件被

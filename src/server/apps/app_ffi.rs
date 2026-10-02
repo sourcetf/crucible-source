@@ -1,9 +1,16 @@
 //! dlopen-based app engine FFI (RTLD_GLOBAL).
 //!
-//! §7.3 最终态：c/go/rust 同线程内联 exec（跳过 env 锁）；其余引擎走专用
-//! 线程池（通用 clamp(2..=4)，rack/psgi 串行单线程）+ 按引擎分锁。
+//! §7.3 最终态：**所有**引擎都走有界线程池（通用 clamp(4..=8)，rack/psgi 串行单线程，
+//! cgi 独立窄池）+ 按内容分锁。
+//!
+//! 这里曾经给 c/go/rust 留了一条「同线程内联、跳过 env 锁」的快路。那条快路的前提是错的：
+//! 它以为这些引擎拿 `.env` 变量走的是「extra JSON 下发、不碰进程级 env」，而 C 侧的
+//! `appengine_apply_extra` 落地方式就是 **setenv**（libs/app-engines/common/appengine_common.c
+//! 与 samples/{c,rust}-plugin 都是）——于是这条快路成了进程 env 唯一不受 [`env_lock`] 保护、
+//! 也从不把值恢复回去的写者。现在 c/go/rust 与其它引擎同路（见 [`execute`]）。
 //! ABI 的 headers 块与请求 body/content_type 全量透传（旧实现把引擎设置
-//! 的响应头整体丢弃，导致 ngx.header / WSGI 自定义头失效、POST 空 body）。
+//! 的响应头整体丢弃，导致 ngx.header / WSGI 自定义头失效、POST 空 body）；
+//! 但定界头（Content-Length）不原样透传 —— 见 response_from_outcome 的说明。
 
 use crate::config::{AppRouteConfig, ListenerConfig};
 use crate::server::apps::env_lock;
@@ -100,8 +107,9 @@ pub async fn execute(
     app: &AppRouteConfig,
     peer: SocketAddr,
 ) -> Result<Response<BoxBody>> {
-    // P1-1：.env 变量由 apps::try_handle 注入 extensions——非内联引擎经 with_temp_env
-    // 进环境，内联 c/go/rust 经 extra JSON 下发（不污染进程级 env）。
+    // P1-1：.env 变量由 apps::try_handle 注入 extensions。所有引擎（含 c/go/rust）都经
+    // env_lock 把它们装进**进程环境**：C 侧的 appengine_apply_extra 就是 setenv，没有
+    // 哪条引擎路径是「只下发、不碰进程 env」的。
     let env_vars: Vec<(String, String)> = req
         .extensions()
         .get::<crate::server::apps::deps::DepsEnv>()
@@ -196,7 +204,6 @@ async fn exec_dispatch(
         .map_err(|e| anyhow::anyhow!("script path rejected: {e:#}"))?;
     let port = lc.port;
     let server_name = lc.server_name.clone().unwrap_or_else(|| "crucible".into());
-    let inline = matches!(engine.as_str(), "c" | "go" | "rust");
 
     let m = method.to_string();
     let p = path.to_string();
@@ -204,39 +211,31 @@ async fn exec_dispatch(
     let ct = content_type.to_string();
     let b = body.clone();
 
-    if inline {
-        // c/go/rust：同线程内联 exec，跳过 env 锁（§7.3）；.env 变量经 extra JSON 下发。
-        run_inline(
-            &engine, &lib_path, &script, &docroot, &m, &p, &q, &ct, &b, peer, port, &server_name,
-            env_vars,
-        )
+    let serial = serial_engine(&engine);
+    let engine_for_pool = engine.clone();
+    // P1-1：闭包必须持有 owned 环境变量（'static），在闭包内转 &[(&str,&str)]。
+    let env_vars_owned: Vec<(String, String)> = env_vars.to_vec();
+    let job = move || {
+        let vars: Vec<(&str, &str)> = env_vars_owned
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .collect();
+        env_lock::with_temp_env_named(&engine, &vars, || {
+            let lib = load_engine(&engine, &lib_path)?;
+            call_exec(
+                &lib, &engine, &script, &docroot, &m, &p, &q, &ct, &b, peer, port,
+                &server_name, &env_vars_owned,
+            )
+        })
+    };
+    if serial {
+        // rack/psgi：串行单线程池（解释器非线程安全）。
+        Ok(serial_pool(&engine_for_pool).run(job).await?)
+    } else if let Some(n) = dedicated_pool_threads(&engine_for_pool) {
+        // cgi：独立窄池（见 dedicated_pool_threads），不占通用池、也不被通用池拖累。
+        Ok(named_pool(&engine_for_pool, n).run(job).await?)
     } else {
-        let serial = serial_engine(&engine);
-        let engine_for_pool = engine.clone();
-        // P1-1：闭包必须持有 owned 环境变量（'static），在闭包内转 &[(&str,&str)]。
-        let env_vars_owned: Vec<(String, String)> = env_vars.to_vec();
-        let job = move || {
-            let vars: Vec<(&str, &str)> = env_vars_owned
-                .iter()
-                .map(|(k, v)| (k.as_str(), v.as_str()))
-                .collect();
-            env_lock::with_temp_env_named(&engine, &vars, || {
-                let lib = load_engine(&engine, &lib_path)?;
-                call_exec(
-                    &lib, &engine, &script, &docroot, &m, &p, &q, &ct, &b, peer, port,
-                    &server_name, &env_vars_owned,
-                )
-            })
-        };
-        if serial {
-            // rack/psgi：串行单线程池（解释器非线程安全）。
-            Ok(serial_pool(&engine_for_pool).run(job).await?)
-        } else if let Some(n) = dedicated_pool_threads(&engine_for_pool) {
-            // cgi：独立窄池（见 dedicated_pool_threads），不占通用池、也不被通用池拖累。
-            Ok(named_pool(&engine_for_pool, n).run(job).await?)
-        } else {
-            Ok(GENERIC_POOL.run(job).await?)
-        }
+        Ok(GENERIC_POOL.run(job).await?)
     }
 }
 
@@ -255,27 +254,6 @@ fn request_has_body(m: &http::Method, h: &http::HeaderMap) -> bool {
         > 0
 }
 
-fn run_inline(
-    engine: &str,
-    lib_path: &PathBuf,
-    script: &PathBuf,
-    docroot: &PathBuf,
-    method: &str,
-    path: &str,
-    query: &str,
-    content_type: &str,
-    body: &Bytes,
-    peer: SocketAddr,
-    port: u16,
-    server_name: &str,
-    env_vars: &[(String, String)],
-) -> Result<ExecOutcome> {
-    let lib = load_engine(engine, lib_path)?;
-    call_exec(
-        &lib, engine, script, docroot, method, path, query, content_type, body, peer, port,
-        server_name, env_vars,
-    )
-}
 
 /// §3.3：请求路径 → 引擎脚本相对路径。
 /// 剥掉命中的 app 前缀（前缀必须整体匹配，/ 边界对齐，避免 /phplint 命中 /php）；
@@ -591,11 +569,15 @@ fn parse_result_headers(ptr: *mut c_char, len: usize) -> Vec<(String, String)> {
         return Vec::new();
     }
     let text: String = unsafe {
-        if len > 0 {
-            String::from_utf8_lossy(std::slice::from_raw_parts(ptr as *const u8, len)).into_owned()
-        } else {
-            CStr::from_ptr(ptr).to_string_lossy().into_owned()
-        }
+        // ABI 契约里这个块是**以 NUL 结尾**的文本块（appengine_result_set_headers 用
+        // strlen 填 headers_len）。**不能**直接拿 len 去建 slice —— len 是 C 侧塞进来的：
+        // 引擎若直接把 out->headers 指向自己的缓冲却忘了填 headers_len（或填的是上一版
+        // 结果残留的长度），`from_raw_parts(ptr, len)` 就会读出一大段分配之外的内存，
+        // 而那些字节随后会被当作响应头发出去（堆内容泄露 + 可能 OOM）。
+        // 一律先按 NUL 定界取真实长度，len 只当上限用（`len == 0` 时与旧行为等价）。
+        let real = CStr::from_ptr(ptr).to_bytes().len();
+        let n = if len == 0 || len > real { real } else { len };
+        String::from_utf8_lossy(std::slice::from_raw_parts(ptr as *const u8, n)).into_owned()
     };
     let mut out = Vec::new();
     for line in text.lines() {
@@ -638,6 +620,20 @@ pub fn response_from_outcome(outcome: ExecOutcome) -> Response<BoxBody> {
         if k.eq_ignore_ascii_case("content-type") {
             has_ct = true;
         }
+        // 引擎声明的 Content-Length 只有**恰好等于真实 body 长度**时才透传。hyper 会
+        // 信任这个头的文本、却按 body 的实际长度成帧（hyper 1.x
+        // `proto::h1::role::Server::encode`：Known(known_len) 分支只把用户给的值原样写出，
+        // encoder 用 known_len）—— 两者不一致时 keep-alive 上就是「声明 N 字节、实发 M 字节」，
+        // 客户端把多出来的 M-N 字节当成**下一个响应**（响应走私）。脚本自己拼这个头
+        //（`header("Content-Length: " .. n)`、ngx.header）时很容易写错，且值可能来自请求参数。
+        // 与 proxy.rs 里「上游 Content-Length 透传导致响应走私」是同一条规则：让服务器按
+        // 真实长度自己写。一致时保留（HEAD 场景客户端仍能拿到实体长度）。
+        if k.eq_ignore_ascii_case("content-length") {
+            let declared = v.trim().parse::<u64>().ok();
+            if declared != Some(outcome.body.len() as u64) {
+                continue;
+            }
+        }
         builder = builder.header(k.as_str(), v.as_str());
     }
     if !has_ct {
@@ -658,6 +654,14 @@ pub fn simple_response_from_outcome(outcome: ExecOutcome) -> Response<Bytes> {
     for (k, v) in &outcome.headers {
         if k.eq_ignore_ascii_case("content-type") {
             has_ct = true;
+        }
+        // 同 `response_from_outcome`：与真实 body 长度不符的 Content-Length 一律丢弃
+        //（h1 上是响应走私，h2/h3 上会让对端判 CL 不符并 RST 该流）。
+        if k.eq_ignore_ascii_case("content-length") {
+            let declared = v.trim().parse::<u64>().ok();
+            if declared != Some(outcome.body.len() as u64) {
+                continue;
+            }
         }
         builder = builder.header(k.as_str(), v.as_str());
     }
