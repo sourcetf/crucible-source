@@ -428,3 +428,26 @@ J 项当时写的是「引擎写者都在锁内，只是进程 env 设计如此�
 - **不动 h2/h3 里那个 `.header(LOCATION, ..).unwrap()`**：值的来源（`page_rules::apply_simple`，
   第四轮已加 `HeaderValue::from_str` 校验）与配置期（`safe_header_value`）已各拦一层。
   在没有第二处来源之前不再加层。
+---
+
+## M. 回归扫发现的**引擎环境缺件**（不是代码缺陷，是这台机器上没建/没装）
+
+第四轮结束后的跨协议回归扫（`scripts/verify/regression_sweep.sh`）发现 `:9095` 上 18 个引擎路由里
+有 7 个返回 502。逐条查了本地日志（**不脱敏**，原因写得很清楚），**全部是环境缺件**：
+
+| 路由 | 日志里的原因 | 要可用需要做什么 |
+|---|---|---|
+| `/go/` | `libapp_go.so` 不存在 | `GO_ENGINE_MODE=shm bash scripts/build_app_engines.sh`（go 引擎走 shm 模式，与其它引擎不同一条构建路径） |
+| `/jsp/`、`/do/` | `native sidecar sock not ready: state/native/9095-7-jsp/app.sock` | JSP 是**常驻侧车**；目前只有验收脚本会起它，生产没起。需要把 `libs/jsp-sidecar/jsp_sidecar.sh` 做成常驻（rc.local 或面板里配 sidecar/socket） |
+| `/ruby/`、`/rack/` | `未嵌入 Ruby（not built with embedded MRI Ruby），且本机未安装 ruby/libruby` | 装 MRI + `rack` gem，然后带 `-DCRUCIBLE_HAVE_RUBY` 与 `pkg-config --cflags/--libs ruby` 重建 `libapp_ruby.so`/`libapp_rack.so` |
+| `/psgi/` | `本引擎构建时未嵌入 Perl` | 装 Perl + `perl -MExtUtils::Embed -e ccopts/-e ldopts`，带 `-DCRUCIBLE_HAVE_PERL` 重建 `libapp_psgi.so` |
+| `/tsx/` | `本机有 node 但没有 tsx` | tsx 的契约是「一键编译 + watch 部署」（编译产物交给静态路径或常驻 node 侧车），**不是**按请求执行 TypeScript。要可用得先编译并配侧车 |
+
+**为什么这是设计行为、不是回归**：项目规格明确**禁止**「每请求 spawn 解释器」的 popen 回退
+（理由在每个引擎的报错文本里都写了：每次请求起一个解释器既慢又不可控）。所以引擎不可用时
+它**明确拒绝**（502 + 一条说清原因的日志），而不是静默退化成一个假响应 —— 后者更糟：
+运维会以为引擎在跑。
+
+**建议**：如果短期不打算补齐，就把 `config.toml` 里这些不可用的 `[[listeners.apps]]` 路由
+**注释掉** —— 否则每次请求都会写一条 WARN 日志（`/go/` 之类被扫描时能刷得很快），
+而且对外宣称了一个不存在的功能。
