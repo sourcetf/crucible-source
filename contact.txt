@@ -1072,3 +1072,29 @@ panel.toml ⇒ 记录已发布（dig 查得到）却一直 warn「ECH 不会被�
 只提供 RSA 的客户端握手失败 —— 是**失败不是泄漏**。现代客户端普遍支持 ECDSA，影响面小。
 
 **测试**：258 passed / 0 failed（含新增的 ECH 类型一致性校验、方向 4 自检、`--ec` 产出 EC）。
+
+
+---
+
+### Session 1008 (2026-10-02) — 进展 34（C-24 日志轮转覆盖 named；`[[https_rr]]` 孤儿记录告警）
+
+**C-24 收口**：`/etc/daily.local` 之前只轮转 webserver 的日志，**漏了 named**。named 用 `-g`
+前台跑（BIND 的 `-g` 忽略 logging 的 file channel、强制所有日志走 stderr）⇒ 
+`state/dns/log/named.stderr.log` 是 DNS 的**唯一**日志出口且**无限增长**（实测一天 2.4MB，磁盘 95%）。
+现改为 `CRUCIBLE_LOGS` 列表（默认 webserver + named 两份，逻辑抽成 `rotate_one()`），已安装到
+`/etc/daily.local`。**实测**：2.4MB → 归档 150KB、文件归零、named 继续写、dig 正常；
+/tmp 里另验归档 200/200 行无丢失、代数封顶，以及 **copytruncate 不变量**（轮转前打开的 fd
+继续写落在**截断后的新文件**里，不是被改名的 inode）。
+
+**新发现并修复**：`[[https_rr]]` 的名字若**不属于任何已存在的 zone**，记录会被**静默丢弃**
+（`write_all` 的 `relative_owner` 过滤）——配置/面板/日志全正常，只有 dig 查不到。我在生产发布
+ECH 记录时正是踩了这个（先 NXDOMAIN）。两条都做了：① 新建 zone `crucible.local`；
+② 新增纯函数 `orphan_https_names` + `write_all` 去重告警 + 单测（含「只落在从区里也算孤儿」
+与正对照）。这是与 ECH 那两条**同一类**失败（「配置看着对、运行时什么都不发生」）。
+
+**顺带否掉一个候选**（避免过度设计）：想加「`ssl.ech_public_name` 必须等于 ECHConfigList 内嵌
+public_name」的校验，但 `ech_auto::ensure_material` 的**复用条件里就含名字相等**（不等即重新生成）
+⇒ 不一致不会持续，加了只会是噪声。
+
+**测试**：259 passed / 0 failed（+1 条孤儿检测）。生产复验：无孤儿误报、HTTPS 记录仍在
+（ech= 解码后与 ech_config_list.bin 逐字节相同）、递归正常、h1/h3 = 200。

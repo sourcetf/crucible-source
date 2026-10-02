@@ -173,6 +173,23 @@ pub fn auto_https_records(cfg: &DnsConfig) -> Vec<(String, String)> {
         .collect()
 }
 
+/// `[[https_rr]]` 里**不属于任何 master zone** 的名字。
+///
+/// 这些条目在 `write_all` 的落盘循环里会被 `relative_owner` 过滤掉 —— 即**静默不发布**：
+/// 配置、面板、日志都正常，只有 `dig` 查不到。实测踩过（ECH 的 HTTPS 记录先 NXDOMAIN，
+/// 因为缺同名 zone），所以单独算出来在启动期明确告警。
+fn orphan_https_names(auto_https: &[(String, String)], zones: &[ZoneRow]) -> Vec<String> {
+    auto_https
+        .iter()
+        .filter(|(n, _)| {
+            !zones
+                .iter()
+                .any(|z| z.kind == "master" && relative_owner(n, &z.name).is_some())
+        })
+        .map(|(n, _)| n.clone())
+        .collect()
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct DnsModes {
     /// 根服务器模式：服务 root zone（权威 "."）
@@ -1785,6 +1802,27 @@ pub fn write_all(cfg: &DnsConfig) -> Result<Vec<(String, PathBuf)>> {
     let mut written: Vec<(String, PathBuf)> = Vec::new();
     // 自动发布的 HTTPS 记录（ECH 发现路径）算一次，各 zone/各 view 复用。
     let auto_https = auto_https_records(cfg);
+    // `[[https_rr]]` 只有当名字落在**某个已存在的 zone** 里才会被发布（归属由
+    // `relative_owner` 决定）。名字不属于任何 zone 时记录会被**静默丢弃** ——
+    // 配置、日志、面板全都正常，只有 `dig` 查不到。实测踩过：ECH 的 HTTPS 记录
+    // 明明写进了 panel.toml，`dig crucible.local HTTPS` 却是 NXDOMAIN（缺 zone）。
+    if cfg.modes.authoritative {
+        let orphans = orphan_https_names(&auto_https, &zones);
+        if !orphans.is_empty() {
+            // 去重：write_all 在每次 reconcile 都会被调用，同一个列表不该反复刷屏。
+            static LAST: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+            let key = orphans.join(",");
+            let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
+            if last.as_deref() != Some(key.as_str()) {
+                log::warn!(
+                    "dns: [[https_rr]] 有 {} 条记录的名字不属于任何已存在的 zone，**不会被发布**（dig 查不到）：{}；请先建同名 zone（面板「DNS 分区」），或改掉这些名字",
+                    orphans.len(),
+                    orphans.join("、")
+                );
+                *last = Some(key);
+            }
+        }
+    }
     for (view_tag, line_tag) in &views {
         // 与 gen_named_conf 同步：权威关掉时不落用户 zone 文件
         // （否则盘上留着 orphan zone，且 named.conf 里已无引用，排障时极易误判）。
@@ -3015,7 +3053,7 @@ mod acl_primary_tests {
 
 #[cfg(test)]
 mod listen_lists_tests {
-    use super::listen_lists;
+    use super::{listen_lists, orphan_https_names, ZoneRow};
 
     /// 回归（生产事故）：named 9.20 对字面量 `0.0.0.0` **静默不建 socket**，所以
     /// `listen-on { 0.0.0.0; ... }` 会让 53 只在 loopback 上听、公网 IPv4 收不到查询。
@@ -3091,6 +3129,30 @@ mod listen_lists_tests {
     fn no_geo_lines_adds_no_forwarding_loopbacks() {
         assert_eq!(listen_lists("127.0.0.1", false, 0).0, "127.0.0.1;");
         assert_eq!(listen_lists("10.1.2.3", false, 0).0, "10.1.2.3; 127.0.0.1;");
+    }
+
+    /// `[[https_rr]]` 名字不属于任何 master zone ⇒ 必须被识别为「静默不发布」。
+    /// 这是真机踩过的坑：记录写进了 panel.toml，`dig` 却是 NXDOMAIN（缺 zone）。
+    #[test]
+    fn orphan_https_names_finds_records_without_a_zone() {
+        let z = |n: &str, k: &str| ZoneRow {
+            name: n.to_string(),
+            kind: k.to_string(),
+            primaries: vec![],
+            axfr_acl: vec![],
+            refresh_hours: 24,
+        };
+        let zones = vec![z("crucible.local", "master"), z("example.com", "master"), z("slave.test", "slave")];
+        let recs = vec![
+            ("crucible.local".to_string(), "rdata".to_string()),   // zone apex ⇒ 能发布
+            ("www.crucible.local".to_string(), "rdata".to_string()), // 落在 zone 内 ⇒ 能发布
+            ("other.net".to_string(), "rdata".to_string()),        // 没有 zone ⇒ 孤儿
+            ("in.slave.test".to_string(), "rdata".to_string()),    // 只有 slave zone ⇒ 孤儿（不落从区文件）
+        ];
+        let got = orphan_https_names(&recs, &zones);
+        assert_eq!(got, vec!["other.net".to_string(), "in.slave.test".to_string()], "{got:?}");
+        // 正对照：全部有归属时不该报任何孤儿（否则上面可能是「什么都说孤儿」）
+        assert!(orphan_https_names(&recs[..2], &zones).is_empty());
     }
 
     #[test]

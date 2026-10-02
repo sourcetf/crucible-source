@@ -2424,3 +2424,31 @@ daemon(8)，webserver 是 nohup 承接 stdout 的前台进程，rename 会让它
 **另记**（OPERATOR-TODO I）：本 BoringSSL 单 legacy credential 槽 ⇒ 同一 listener 里
 `cert`(RSA) 与 `cert_ec`(EC) 同时配时**只有最后设置的那张生效**（当前 EC），只提供 RSA 的
 客户端会握手失败 —— 是**失败不是泄漏**。生产只有 8443 配了 `cert_ec`，且已按 ECH 要求让两层同为 EC。
+
+### 21.36 `[[https_rr]]` 名字不属于任何 zone ⇒ 记录被静默丢弃（部署 ECH 时踩到，加告警 + 单测）
+
+**来源**：我在生产上发布 ECH 的 HTTPS 记录时，`dig @127.0.0.1 crucible.local HTTPS` 是
+**NXDOMAIN** —— 而配置、面板、日志全都正常，`[[https_rr]]` 也确实写进了 panel.toml。
+根因：`write_all` 的落盘循环用 `relative_owner(name, &z.name)` 决定记录归属**某个 zone**，
+名字不属于任何已存在 zone 时**直接被过滤掉**（`filter_map` 返回 None）。也就是说：
+**给一个还没有 zone 的域名配 https_rr，等于什么都没做，而且没有任何提示。**
+
+修法（两条都做，缺一不可）：
+1. **生产**：新建 zone `crucible.local`（面板 API `POST /api/dns/zones`），记录随即发布。
+   复验：`dig crucible.local HTTPS` → `1 . alpn="h2,h3" port=8443 ech=AEX+…`，且把 `ech=`
+   解码后与 `state/ech/ech_config_list.bin` **逐字节相同**（71 字节）。
+2. **代码**：新增纯函数 `orphan_https_names(auto_https, zones)` 找出这类条目，在 `write_all`
+   里对**生效配置**明确告警（带**去重**：write_all 每次 reconcile 都会被调用，同一个列表
+   不该反复刷屏）。单测 `orphan_https_names_finds_records_without_a_zone` 钉住四种情形：
+   zone apex、zone 内子域、完全无归属、**只落在从区（slave）里**（从区文件由 named 自己维护，
+   我们不会往里写记录 ⇒ 同样算孤儿）。含正对照（全部有归属时不该报）。
+
+**为什么值得单独写**：这与 ECH 那两条（没配 cover、cover 漏 EC）是**同一类失败** ——
+「配置面看起来完全正确、面板也显示已保存，运行时却什么都不发生」。这类问题只能靠
+「把两处配置放在一起比」的自检发现，所以对策固定是：**要么在配置期 fail-fast，
+要么在启动期用一条能读懂的中文告警说清楚**。
+
+**顺带否掉一个候选**（避免过度设计）：我一度想加「`ssl.ech_public_name` 与 ECHConfigList 内嵌
+public_name 必须一致」的校验，但读 `ech_auto::ensure_material` 后发现**复用条件里就含
+public_name 相等**（不一致即重新生成并落盘）⇒ 不一致状态不会持续存在，加这条只会是噪声。
+记在这里，免得以后有人重复这个念头。
