@@ -994,3 +994,35 @@ h1 9095/9081=200，h3 8443=200，8443/853/5349/9445/9446 均在听，ECH 探针 
 
 **待拍板（已记 OPERATOR-TODO E）**：`panel.toml` 的 `dot.allow = any` 表示面板想对所有人开 DoT，
 而 `recursion_acl` 只有 `127.0.0.1` ⇒ 公网 DoT 客户端只拿得到根区转交、拿不到递归答案。取哪边是策略。
+
+
+---
+
+### Session 1008 (2026-10-02) — 进展 32（审计 C-21/C-22 收尾：部署脚本的明文口令与「先删后传」；并更正 C-21）
+
+**C-21 更正**：审计说「`scripts/*.sh` 全被 `*.sh` 忽略、不在版本控制」（证据 `git ls-files scripts |
+grep -c '\.sh$'` → 0）。这条**对同步目标仓库不成立**：`/crucible` 上 `git ls-files 'scripts/*.sh' | wc -l`
+= **41**，且 `scripts/` 下无未跟踪文件。审计看到的是**本地快照仓库**（基线 `caf3466`，只有部分文件）。
+不过 `*.sh` + 单文件例外的写法容易被后人改坏，仍改成明确语义：`*.sh` → `!scripts/*.sh` →
+`!scripts/*/*.sh`（并注明例外必须在 `*.sh` 之后）。
+
+**C-22 修复**（两份部署脚本只在本地工作副本，不在版本控制）：
+- 明文 `REMOTE_PASSWORD="<旧-SSH-口令-已脱敏，见 OPERATOR-TODO G>"` → 改为只读 `CRUCIBLE_SSH_PASSWORD`，未设置则 fail-closed；
+  `deploy_to_remote.sh` 原本还会在 sshpass 缺失时**把口令打印到终端**，一并去掉。
+- 删掉生产机上的 `rm -rf src target *.rs Cargo.toml Cargo.lock` 后重建 —— 现在只做覆盖同名文件的
+  源码同步，不删远端文件。
+- tar 明确排除 `.git`/`state`/`*.pem`/`*.key`/构建产物/根目录脚手架（原本 `cp -r <项目>/*`
+  会把 `.git`、私钥、state（rndc key、ECH 私钥）一起传上去）。
+
+**新增入库**：`scripts/deploy/deploy_release.sh` —— 通用发布（可选构建 → 快照 → `--check-config`
+预检 → 停 → 同目录改名换二进制 → 起 → 复验），结尾打印回退命令。分工：DNS/监听类改动走
+`dns_listen_redeploy.sh`（额外显式重启 named），普通发布走本脚本。
+
+**顺带查出的真问题 → OPERATOR-TODO G**：明文口令还散在根目录**约 269 个一次性 Python 脚手架**
+（`api1.py`/`b1.py`/`axfr*.py` …），本地快照仓库的基线提交还跟踪过一部分。**被推送的仓库是干净的**
+（`git grep -l 'Yc4' HEAD` 在 sourcetf 上无命中）。缓解：`.gitignore` 现在整体忽略根目录
+`*.py`/`*.ps1`/`*.sh`。但已落盘的明文口令只能靠**轮换**消除，故记为 G 项（换口令或改密钥登录；
+先确认密钥能登再关口令登录）。
+
+**验证**：`bash -n`/`sh -n` 通过；`grep -c Yc4` 三份根脚本 = 0；不带 env 运行 → 指引 + `exit 1`
+（实测 rc=1，无副作用）；`git check-ignore` 抽查 scripts/ 下脚本可入库、根目录脚本仍忽略。

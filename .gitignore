@@ -90,12 +90,17 @@ contact.txt
 # 应用引擎运行期生成的依赖标记目录（只有 manifest/.ready 这类标记，没有源码）
 www-apps/*/deps/
 
-# 运维/验证脚本：*.sh 整体忽略，但这个要入库（ECH 内外层端到端演示）
-!scripts/ech_demo.sh
+# 运维/验证脚本：生产启动方式、部署流程、依赖构建必须可评审/可回滚/可重建（审计 C-21）。
+# `*.sh` 仍整体忽略（挡掉根目录与各处的一次性脚手架），只对 scripts/ 下的项目脚本开例外。
+# 注意顺序：gitignore 后来居上，例外必须写在 `*.sh` 之后。
+!scripts/*.sh
+!scripts/*/*.sh
+
+# 根目录的一次性 Python / PowerShell 脚手架同样不入库（注意是根目录限定 `/*.py`：
+# 项目的真实 python 在 scripts/ 与 bench/ 下，那些照常跟踪）。
+# 它们多是历史会话留下的 SSH/同步小脚本，其中相当一部分**内嵌生产 root 口令**。
+/*.py
+/*.ps1
 
 # 我的临时备份目录（agent 快照补丁，不属于项目）
 .agents-backups-*/
-
-# 运维/验证脚本：*.sh 整体忽略，但这个要入库（named 换监听配置后的重新部署流程：
-# 必须显式 kill named，否则 reconcile 认为 named「活着」不会重建 socket）
-!scripts/deploy/dns_listen_redeploy.sh

@@ -2274,3 +2274,39 @@ named 实际 socket（`fstat -p 91042`）：`127.0.0.1:53`、**`83.229.125.81:53
 **遗留（不是 bug，是待拍板的策略）**：`panel.toml` 里 `dot.allow = ["0.0.0.0/0","::/0"]`（面板意图是对
 所有人开 DoT），但 `recursion_acl` 只有 `127.0.0.1` ⇒ 公网 DoT 客户端只能拿到根区转交、拿不到递归答案。
 取哪边是策略问题（开放递归 = 放大攻击面），我按「外部递归关闭」处理，并记进 `OPERATOR-TODO.md` E 项。
+### 21.33 审计 C-21/C-22 收尾：部署脚本里的明文口令与「先删后传」；并更正 C-21（同步仓库其实早已入库）
+
+**C-21 更正**：审计报告说「所有 `scripts/*.sh` 被 `.gitignore:84` 的 `*.sh` 整体忽略 ⇒ 启动/部署脚本
+不在版本控制」，证据是 `git ls-files scripts | grep -c '\.sh$'` → 0。**这条对同步目标仓库不成立**：
+在 `/crucible` 上 `git ls-files 'scripts/*.sh' | wc -l` = **41**，`git ls-files --others scripts/` 为空
+（即全部已跟踪）。审计当时看到的是**本地快照仓库**（`C:\...\crucible`，基线提交 `caf3466`），
+那份本来就只有部分文件，`scripts/*.sh` 确实一个都没跟踪 —— 结论是对本地副本成立、对生产仓库不成立。
+不过 `.gitignore` 里 `*.sh` + 单文件例外的写法确实**易被后人改坏**，所以我把它改成语义明确的规则：
+`*.sh` 保留（挡住各处一次性脚手架），随后 `!scripts/*.sh` + `!scripts/*/*.sh` 开例外，
+并注明「gitignore 后来居上，例外必须写在 `*.sh` 之后」。
+
+**C-22 修复**（本地-only 的两份部署脚本，都不在版本控制里）：
+
+| 问题 | 处理 |
+|---|---|
+| `REMOTE_PASSWORD="<旧-SSH-口令-已脱敏，见 OPERATOR-TODO G>"` 明文硬编码（`deploy_remote.sh:7`、`deploy_to_remote.sh:9`），且 `deploy_to_remote.sh` 在 sshpass 缺失时**把口令打印到终端** | 改为只从 `CRUCIBLE_SSH_PASSWORD` 读；未设置则 fail-closed（打印指引 + `exit 1`，不做任何动作） |
+| `deploy_remote.sh:42` 在生产机上 `rm -rf src target *.rs Cargo.toml Cargo.lock` 后解包重建 | 删除该路径；现在只做「覆盖同名文件的源码同步」，**不删任何远端文件** |
+| `cp -r "$LOCAL_PROJECT"/*` 会把 `.git/`、`cert.pem`、`key.pem`、`state/`（rndc key、ECH 私钥、上传目录）一起打包上传 | tar 明确排除 `.git`、`target`、`bin`、`state`、`*.pem`、`*.key`、`*.log`、`*.zip` 与根目录脚手架 |
+
+**新增入库的正路**：`scripts/deploy/deploy_release.sh` —— 通用发布流程
+（可选构建 → 快照 → `--check-config` 预检 → 停 webserver → **同目录改名**换二进制 → 起 → 复验），
+每步可回退，并在结尾打印精确的回退命令。与 `dns_listen_redeploy.sh` 分工明确：
+后者用于 DNS/监听类改动（**额外显式重启 named**），本脚本只重启 webserver。
+
+**顺带查出的真问题（已升级为运维待办 G）**：明文口令不只在那两个脚本里，还散在**根目录约 269 个
+一次性 Python 脚手架**（`api1.py`、`b1.py`、`axfr*.py` …）中，且本地快照仓库的基线提交跟踪过
+其中一部分（`api1.py` 等）。**被推送的仓库是干净的** —— `git grep -l 'Yc4' HEAD` 在
+`sourcetf/crucible-source` 上无命中，口令从未进过远端仓库。缓解措施：
+`.gitignore` 现在整体忽略根目录 `*.py`/`*.ps1`/`*.sh`（项目的真实 python 在 `scripts/` 与 `bench/`，
+照常跟踪）。但**已落盘的明文口令只能靠轮换消除**，故记为 OPERATOR-TODO G 项
+（换口令或改密钥登录；并强调「先确认密钥能登再关口令登录」）。
+
+**验证**：`bash -n`/`sh -n` 两份新脚本通过；`grep -c Yc4` 三份根脚本均为 0；
+不带 `CRUCIBLE_SSH_PASSWORD` 直接运行 → 打印指引并 `exit 1`（实测退出码 1，未做任何动作）；
+`git check-ignore -v` 抽查：`scripts/start_server.sh`/`ech_demo.sh`/`deploy_release.sh` 均可入库，
+`deploy_remote.sh`（根目录）仍被忽略。
