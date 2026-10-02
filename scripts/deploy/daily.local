@@ -3,40 +3,53 @@
 # 部署钩子：OpenBSD /etc/daily.local —— Crucible 日志轮转（copytruncate）
 # ============================================================================
 # 安装：cp scripts/deploy/daily.local /etc/daily.local && chmod 755 /etc/daily.local
-# /etc/daily.local —— Crucible 日志轮转（每日 03:00 由 /etc/daily 调用）
 #
 # 为什么是「拷贝 + 清空」而不是 newsyslog：
-# 本机没有 daemon(8)，而 newsyslog 的轮转是 **rename** —— 我们的 webserver 是前台进程、
-# 由 nohup 承接 stdout，它**不会**在收信号后重开日志文件。rename 之后进程仍持有旧 inode，
-# 于是新文件永远是空的、真正的写入落在已改名的文件上，`Z` 压缩还会去压一个正在被写的 inode
-# （结果是日志静默丢失/损坏）。cp + 截断保持 inode 不变，进程的 fd 一直有效 —— 代价是
-# cp 与截断之间理论上可能丢掉几行（对访问日志可接受，且这台机器磁盘长期紧张，
-# 必须有个上限）。
+#   本机没有 daemon(8)，而 newsyslog 的轮转是 **rename** —— 我们的 webserver 是前台进程、
+#   由 nohup 承接 stdout，它**不会**在收信号后重开日志文件。rename 之后进程仍持有旧 inode，
+#   于是新文件永远是空的、真正的写入落在已改名的文件上，`Z` 压缩还会去压一个正在被写的
+#   inode（日志静默丢失/损坏）。cp + 截断保持 inode 不变，进程的 fd 一直有效 —— 代价是
+#   cp 与截断之间理论上可能丢掉几行（对日志可接受，且这台机器磁盘长期紧张，必须有上限）。
+#
+# **必须覆盖全部写者**（审计 C-24）：只轮转 webserver 那份时，named 的输出会无限增长。
+#   实测 named.stderr.log 一天就 2.4MB（named 用 `-g` 前台跑，BIND 的 -g 强制所有日志走
+#   stderr，所以这是 DNS 的**唯一**日志出口）。两份都是用 O_APPEND 打开的，copytruncate 都安全。
 #
 # 阈值 2MB / 保留 7 代（压缩后每代百 KB 级）。
+#
+# 可用环境变量覆盖（便于验证与运维调整）：
+#   CRUCIBLE_LOGS     空格分隔的日志列表
+#   CRUCIBLE_ROT_MAX  单文件轮转阈值（字节）
+#   CRUCIBLE_ROT_KEEP 保留代数
 
-# 可用环境变量覆盖（便于验证与运维调整）：CRUCIBLE_LOG / CRUCIBLE_ROT_MAX / CRUCIBLE_ROT_KEEP
-LOG=${CRUCIBLE_LOG:-/var/log/crucible-restart.log}
+LOGS=${CRUCIBLE_LOGS:-"/var/log/crucible-restart.log /crucible/state/dns/log/named.stderr.log"}
 MAX=${CRUCIBLE_ROT_MAX:-2097152}
 KEEP=${CRUCIBLE_ROT_KEEP:-7}
 
-[ -f "$LOG" ] || exit 0
-size=$(stat -f %z "$LOG" 2>/dev/null || echo 0)
-if [ "$size" -lt "$MAX" ]; then
-	exit 0
-fi
-
-# 依次后移：crucible-restart.log.(N-1).gz -> .N.gz
-i=$((KEEP - 1))
-while [ "$i" -gt 0 ]; do
-	prev=$((i - 1))
-	if [ -f "$LOG.$prev.gz" ]; then
-		mv -f "$LOG.$prev.gz" "$LOG.$i.gz"
+rotate_one() {
+	LOG=$1
+	[ -f "$LOG" ] || return 0
+	size=$(stat -f %z "$LOG" 2>/dev/null || echo 0)
+	if [ "$size" -lt "$MAX" ]; then
+		return 0
 	fi
-	i=$prev
-done
 
-cp -p "$LOG" "$LOG.0"
-: > "$LOG"
-gzip -f "$LOG.0"
-echo "crucible: rotated $LOG ($size bytes) -> $LOG.0.gz"
+	# 依次后移：<log>.(N-1).gz -> <log>.N.gz
+	i=$((KEEP - 1))
+	while [ "$i" -gt 0 ]; do
+		prev=$((i - 1))
+		if [ -f "$LOG.$prev.gz" ]; then
+			mv -f "$LOG.$prev.gz" "$LOG.$i.gz"
+		fi
+		i=$prev
+	done
+
+	cp -p "$LOG" "$LOG.0"
+	: > "$LOG"
+	gzip -f "$LOG.0"
+	echo "crucible: rotated $LOG ($size bytes) -> $LOG.0.gz"
+}
+
+for lg in $LOGS; do
+	rotate_one "$lg"
+done

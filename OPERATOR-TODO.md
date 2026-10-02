@@ -176,6 +176,38 @@ config.toml 的 `[dns]` 从此不生效（启动日志已明确报出这件事�
   这是「新校验误拒生产配置」两次事故后的固定流程。
 - **磁盘**：长期 95%，构建脚本末尾会回收 `cargo check` 的 dev 产物；日志轮转已设上限。
 
+## H. 日志轮转（审计 C-24：必须覆盖**全部写者**）—— 已修
+
+**原问题**：`/etc/daily.local` 只轮转 `/var/log/crucible-restart.log`，**漏了 named**。
+而 named 用 `-g` 前台跑（BIND 的 `-g` 会忽略 `logging` 配置的 file channel，强制所有日志走
+stderr）⇒ `state/dns/log/named.stderr.log` 是 DNS 的**唯一**日志出口，且**无限增长**
+（实测一天 2.4MB）。磁盘长期 95%，这是实打实的风险。
+
+**已修**：`scripts/deploy/daily.local` 改为支持**多个日志**（`CRUCIBLE_LOGS` 列表，
+默认含 webserver 与 named 两份），并已安装到 `/etc/daily.local`（与仓库版一致）。
+两份都用 `O_APPEND` 打开 ⇒ copytruncate 安全（已在真实日志上实测：2.4MB → 归档 150KB、
+文件归零、named 继续写、DNS 正常；归档 200/200 行无丢失、代数封顶 7）。
+
+**顺带**：`state/dns/log/` 下有 ~14MB **已废弃**的日志可回收 —— `named.log`(3.6MB)、
+`named.log.0`(5MB)、`named.log.1`(5MB)。它们是 BIND `logging` 的 file channel 产物，
+而 `-g` 模式下 BIND 根本不写它们（代码注释记录「自 9/9 起再没被写过」）。确认无人在读后可删：
+
+```sh
+rm -f /crucible/state/dns/log/named.log /crucible/state/dns/log/named.log.0 /crucible/state/dns/log/named.log.1
+```
+
+## I. 关于 `ssl.cert` + `ssl.cert_ec`（单证书槽的限制，改配置前先读）
+
+本 build 的 BoringSSL（boring 5.2.0）**只导出单个 legacy credential 槽**：
+`SSL_CTX_use_certificate` 是**覆盖**语义，未导出 `SSL_CREDENTIAL_*`。所以同一个 listener 里
+**同时配 `cert`（RSA）与 `cert_ec`（EC）时，只有最后设置的那张生效**（当前是 EC 生效），
+只提供 RSA 签名算法的客户端会握手失败（**失败，不是泄漏**）。
+
+现状：生产只有 8443 配了 `cert_ec`，且已按 ECH 要求让内/外层**同为 EC**（配置期强校验
+`ssl.cert_ec` 与 `ssl.ech_cover_cert_ec` 必须同时配或同时不配）。给其它 listener 加 `cert_ec`
+前请知道这一点 —— 现代客户端普遍支持 ECDSA，影响面很小；要彻底消除得等 boring 暴露
+`SSL_CREDENTIAL_*`。
+
 ---
 
 ## E. 53 端口对外服务（「把本机当根服务器」）—— **此前并未真正可用，现已修，只需你确认**

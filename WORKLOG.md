@@ -2398,3 +2398,29 @@ named 实际 socket（`fstat -p 91042`）：`127.0.0.1:53`、**`83.229.125.81:53
 把新口令哈希冲回了样例值（`admin:admin` 又变 200）。已用封存口令重新轮换并复验
 （旧口令 401 / 封存口令 200）。**教训**：改生产配置前必须**重新下载**当前文件，
 不能用早先的副本 —— 这与「部署脚本先删后传」是同一类错误。
+### 21.35 审计 C-24 收口：日志轮转漏了 named（DNS 的唯一日志出口在无限增长）
+
+**问题**：`/etc/daily.local` 只轮转 `/var/log/crucible-restart.log`，**漏了 named**。而 named 是用
+`-g` 前台跑的（BIND 的 `-g` 会**忽略** `logging` 配置里的 file channel、强制所有日志走 stderr），
+所以 `state/dns/log/named.stderr.log` 是 DNS 的**唯一**日志出口，而且没有任何上限 ——
+实测**一天 2.4MB**，而磁盘长期 95%。这既是「日志会撑爆盘」，也是「唯一的 DNS 日志会被自己撑爆」。
+
+**修复**：`scripts/deploy/daily.local` 改为支持**多个日志**（`CRUCIBLE_LOGS`，默认
+webserver + named 两份），逻辑抽成 `rotate_one()`；保留 copytruncate 的原始理由（本机没有
+daemon(8)，webserver 是 nohup 承接 stdout 的前台进程，rename 会让它继续写旧 inode）。
+已安装到 `/etc/daily.local`（`diff` 与仓库版一致）。
+
+**实测（真实日志）**：`named.stderr.log` 2 475 173 字节 → `named.stderr.log.0.gz` 150 575 字节，
+文件归零，named 继续写入，`dig example.org A` 仍正常。
+**另在 /tmp 用临时文件验证**（不动真实日志）：
+- 归档 **200/200 行无丢失**；代数封顶（`KEEP=3` → `.0/.1/.2.gz`，无 `.3.gz`）
+- **copytruncate 不变量**：轮转前用 `fd 3` 追加打开的日志，轮转后继续写，内容落在**已截断的新
+  文件**里（不是被改名的 inode）—— 这正是选 copytruncate 而非 rename 的原因，值得钉住。
+
+**顺带**（记入 OPERATOR-TODO H）：`state/dns/log/` 下有 ~14MB **已废弃**日志可回收
+（`named.log` 3.6MB + `.0` 5MB + `.1` 5MB）—— `-g` 模式下 BIND 根本不写 file channel
+（代码注释记录「自 9/9 起再没被写过」）。没删（运维动作），写进文档。
+
+**另记**（OPERATOR-TODO I）：本 BoringSSL 单 legacy credential 槽 ⇒ 同一 listener 里
+`cert`(RSA) 与 `cert_ec`(EC) 同时配时**只有最后设置的那张生效**（当前 EC），只提供 RSA 的
+客户端会握手失败 —— 是**失败不是泄漏**。生产只有 8443 配了 `cert_ec`，且已按 ECH 要求让两层同为 EC。
