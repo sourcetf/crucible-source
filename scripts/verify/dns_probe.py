@@ -29,6 +29,14 @@ authoritative answer (aa) from a recursive one (ra) and see REFUSED.
 """
 import socket, struct, sys
 
+# 管道被提前关闭（`... | head -2`）时默认的 SIGPIPE 处理会抛 BrokenPipeError 并打印一长串
+# traceback，看起来像「解析失败」。恢复成默认的「静默终止」，与 ech_probe 同一处理。
+try:
+    import signal
+    signal.signal(signal.SIGPIPE, signal.SIG_DFL)
+except (ImportError, AttributeError, ValueError):
+    pass
+
 TYPES = {"A": 1, "NS": 2, "CNAME": 5, "SOA": 6, "DS": 43, "RRSIG": 46,
          "DNSKEY": 48, "AAAA": 28, "NSEC": 47}
 RTYPES = {v: k for k, v in TYPES.items()}
