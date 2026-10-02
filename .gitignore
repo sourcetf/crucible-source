@@ -30,6 +30,12 @@ state/
 *.jbk
 *.jnl
 
+# deps/ 的 manifest 是**运行期写**的（deps::write_manifest 记 init.sh / .env 的 mtime 与 sha）：
+# 它一旦入库，任何一个引擎请求都会把它改写，于是「在生产机上 git status 永远不干净」——
+# 既让「提交前确认工作树干净」这道闸失效，也会被 git commit -a 把运行期 mtime 混进提交。
+# 只忽略 manifest 本身：deps/ 里的**构建产物**本来就不入库。
+www-apps/*/deps/.crucible_manifest
+
 # Secrets
 *.key
 *.pem
