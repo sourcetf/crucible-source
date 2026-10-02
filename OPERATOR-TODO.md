@@ -335,6 +335,11 @@ SSH/同步小脚本）。本地快照仓库的基线提交（`caf3466`）还跟�
    `getenv` 并发在 BSD/glibc 上是 UB**（`environ` 可能被 realloc）。模块里已经用
    `read_static_env` 把引擎热路径的读改掉了，但 admin/ACME/geoip 等请求路径仍在用
    `std::env::var`。彻底修法是给引擎改 `.env` 传递方式（架构级），不是一两行的事。
-3. **h1 长连接沿用「建连时」的 listener 快照**：改 `basic_auth` / `root` / `page_rules` 对**已建立**
+3. **h2 没有 header 读超时**（h1 有 30s，h3 有 QUIC idle 60s）：`h2.rs` 只在「读请求体」
+   阶段有超时，`conn.accept()` 可以永久等一个不完整的 HEADERS ⇒ 一条连接可长期占住最多 256 条
+   半开流（且不占在飞配额）。**h3 的同类问题**：全局在飞闸门在 `resolve_request()`（读 HEADERS）
+   之后才获取 ⇒ 停顿的 HEADERS 不占配额。两者都属于「慢速资源占用」，修法是给 header 阶段加
+   超时（h1 已有现成写法）。改动涉及 h2/h3 的连接生命周期，单独列出来做。
+4. **h1 长连接沿用「建连时」的 listener 快照**：改 `basic_auth` / `root` / `page_rules` 对**已建立**
    的长连接不生效（直到它断开重连）。这与已修的上传闸门（C-4，改读 live 配置）是同一类；
    h1 的请求路径要改成「每请求重取 live 配置」，改动面比上传大，单独列出来。

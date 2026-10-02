@@ -86,12 +86,35 @@ impl EchMaterial {
         let dir = state_dir();
         std::fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
         let pem = dir.join("ech_keys.pem");
-        std::fs::write(&pem, self.to_pem()).with_context(|| format!("write {}", pem.display()))?;
-        // 私钥文件：仅所有者可读（OpenBSD 上 0600）。
+        // **以 0600 创建**（不是「先 0644 再 chmod」）：这是 ECH 的 HPKE 私钥，
+        // 拿到它能解开 ECH 流量。原写法 `fs::write` 会用 umask 权限（通常 0644）建文件、
+        // 之后才 chmod，且 chmod 失败被 `let _ =` 吞掉 ⇒ 可能永久世界可读。
+        {
+            use std::io::Write;
+            #[cfg(unix)]
+            let mut f = {
+                use std::os::unix::fs::OpenOptionsExt;
+                std::fs::OpenOptions::new()
+                    .write(true)
+                    .create(true)
+                    .truncate(true)
+                    .mode(0o600)
+                    .custom_flags(libc::O_NOFOLLOW)
+                    .open(&pem)
+                    .with_context(|| format!("create {}", pem.display()))?
+            };
+            #[cfg(not(unix))]
+            let mut f = std::fs::File::create(&pem)
+                .with_context(|| format!("create {}", pem.display()))?;
+            f.write_all(self.to_pem().as_bytes())
+                .with_context(|| format!("write {}", pem.display()))?;
+        }
+        // 再显式定稿一次（老文件可能是 0644），这次**失败要报错**而不是吞掉。
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(&pem, std::fs::Permissions::from_mode(0o600));
+            std::fs::set_permissions(&pem, std::fs::Permissions::from_mode(0o600))
+                .with_context(|| format!("chmod 0600 {}", pem.display()))?;
         }
         let lst = dir.join("ech_config_list.bin");
         std::fs::write(&lst, &self.config_list)

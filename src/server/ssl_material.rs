@@ -23,8 +23,40 @@ pub fn write_pem_file(path: &Path, pem: &str) -> Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
-    fs::write(path, pem.as_bytes())
-        .with_context(|| format!("write {}", path.display()))
+    // 面板「粘贴 PEM」落盘的内容**可能是私钥**（cert/key 都走这里），所以创建时就 0600，
+    // 而不是 umask 权限（0644）。当前没有调用者，但留一个「默认 0644 写私钥」的 helper
+    // 迟早会被用上。
+    {
+        use std::io::Write;
+        #[cfg(unix)]
+        let mut f = {
+            use std::os::unix::fs::OpenOptionsExt;
+            fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .mode(0o600)
+                .custom_flags(libc::O_NOFOLLOW)
+                .open(path)
+                .with_context(|| format!("create {}", path.display()))?
+        };
+        #[cfg(not(unix))]
+        let mut f = fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(path)
+            .with_context(|| format!("create {}", path.display()))?;
+        f.write_all(pem.as_bytes())
+            .with_context(|| format!("write {}", path.display()))?;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600))
+            .with_context(|| format!("chmod 0600 {}", path.display()))?;
+    }
+    Ok(())
 }
 
 pub fn is_pem_body(s: &str) -> bool {

@@ -1457,6 +1457,10 @@ cover 只用于「未使用 / 被拒 ECH」的连接，ECH 关闭时它会成为
                     ("ssl.key", &ssl.key),
                     ("ssl.cert_ec", &ssl.cert_ec),
                     ("ssl.key_ec", &ssl.key_ec),
+                    // `ech_keys` 也必须存在：路径打错时配置加载通过，但那之后再无 ECH 密钥
+                    //（`apply_ech` 只 warn 后返回）⇒ 容器始终是 cover 证书，真实证书永不出现，
+                    // 客户端按真实身份校验必然失败。与「只写 cert 不写 key」同类，配置期拦。
+                    ("ssl.ech_keys", &ssl.ech_keys),
                     ("ssl.ech_cover_cert", &ssl.ech_cover_cert),
                     ("ssl.ech_cover_key", &ssl.ech_cover_key),
                     ("ssl.ech_cover_cert_ec", &ssl.ech_cover_cert_ec),

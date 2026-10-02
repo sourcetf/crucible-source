@@ -155,8 +155,14 @@ impl Conn {
                 continue;
             }
             if in_body > 0 && body.len() + enc.len() + varint_len(body.len() as u64) > max {
+                // **先把这一批帧的边界记下来再 take**：`try_push_record` 吃掉 body，
+                // 入队失败时那些帧已经不在手里了 —— 但它们在 `frames` 里还在，所以必须
+                // 连同后续帧一起还回去。旧写法只返回 `frames[idx..]`，于是这一批
+                // （frames[idx-in_body..idx]）被当成「已发送」丢掉：流上出现空洞，
+                // 对端按 offset 连续检查会发现，连接被我们自己以 PROTOCOL_VIOLATION 关掉。
+                let batch = in_body;
                 if self.try_push_record(std::mem::take(&mut body)).is_err() {
-                    return frames[idx..].to_vec();
+                    return frames[idx - batch..].to_vec();
                 }
                 in_body = 0;
                 continue; // 重新装这一帧
@@ -616,11 +622,11 @@ where
     Fut: std::future::Future<Output = ()> + Send + 'static,
 {
     loop {
-        // 入向记录上限跟着协商值走（§5.2 只允许调大）：对端可以在 QX_TRANSPORT_PARAMETERS
-        // 里要求更大的记录，`handle_frame` 把它存进 `peer_max_record`，这里每轮同步给 reader。
-        // 默认值（16382）在 reader 里；没有这一步，对端**合法**发来的大记录会被我们按默认
-        // 值拒掉，而**完全不设上限**则是旧实现的「按声明长度无界缓冲」。
-        reader.set_max_record_size(conn.peer_max_record.load(Ordering::Relaxed));
+        // 入向记录上限**固定为本端声明值**（reader 默认 16382），这里刻意不同步
+        // `peer_max_record`：§5.2 的 `max_record_size` 是「愿意接收」的上限，对端那一份
+        // 约束的是**我们发出去**的记录（用在 push_frames，正确）。曾经这里把 reader 上限
+        // 同步成对端声明值 ⇒ 未认证客户端声明 `max_record_size = 2^62` 就能让我们按该值
+        // 缓冲（把「先查上限再缓冲」那条修复直接绕过）。
         // 补发上一轮没送出去的窗口更新（出向队列空出来之后）。
         conn.flush_window_updates();
         let body = match reader.next_record() {

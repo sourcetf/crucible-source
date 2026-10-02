@@ -493,7 +493,15 @@ async fn persist_and_reconcile(dc: &DnsConfig) -> Result<(), String> {
     let etc = state_root().join("etc");
     std::fs::create_dir_all(&etc).map_err(|e| e.to_string())?;
     let text = toml::to_string_pretty(dc).map_err(|e| e.to_string())?;
-    std::fs::write(etc.join("panel.toml"), text).map_err(|e| e.to_string())?;
+    // panel.toml 是**整份 [dns] 的权威来源**（`effective()` 整体覆盖 config.toml），
+    // 里面有 recursion_acl / dot.allow / axfr_out_acl 这类安全项，还有 MaxMind 的
+    // license_key。原来直接 `fs::write` 原地截断且不设权限：
+    //   * 写到一半崩溃/满盘 ⇒ 留下截断的 TOML，`effective()` 解析失败**静默回退**到
+    //     config.toml 的 [dns]（安全项悄悄变回旧值）；
+    //   * 文件是 umask 权限（0644），本机任何用户可读 license_key。
+    // 改走与其它控制面文件同一条原子落盘（临时文件 0600 → 定稿 → rename）。
+    crate::server::dns::write_config_atomic(&etc.join("panel.toml"), text.as_bytes())
+        .map_err(|e| e.to_string())?;
     let d2 = dc.clone();
     tokio::task::spawn_blocking(move || reconcile(&d2))
         .await

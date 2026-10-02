@@ -60,11 +60,31 @@ fn main() -> Result<()> {
     // 有了这个开关，部署流程可以先用**新二进制**对着**当前生产配置**验一遍，通过再换二进制：
     //   ./bin/webserver.new --config /crucible/config.toml --check-config && 停 → 换 → 起
     if std::env::args().any(|a| a == "--check-config") {
+        // 不止校验配置：**真的为每个 SSL listener 构建一次 acceptor**。
+        //
+        // 为什么：`ssl.ciphers` / `ssl.groups` 这类字段没法在配置期用「名字白名单」校验
+        //（BoringSSL 的名字集合很大，硬编码白名单只会误拒合法名字 —— 本项目已经被
+        // 「新校验误拒生产配置」打过两次），而写错名字的后果是「配置加载通过、该端口每次
+        // 握手都被 soft-fail 丢弃、日志每个连接一行 warn」—— 正是那种「配置看着对、
+        // 端口实际下线」。这里跑一遍握手前的构建路径，让它**在预检阶段**就报错。
+        // 构建只读本地材料、不发网络请求（OCSP 取回在独立续期线程里），无副作用。
+        #[cfg(feature = "tls_boring")]
+        for l in &cfg.listeners {
+            if let Some(ssl) = l.ssl.as_ref() {
+                server::tls::boring_path::build_acceptor(ssl, l).with_context(|| {
+                    format!(
+                        "listener {}:{} 的 TLS acceptor 构建失败（证书/密钥/ECH/密码套件/群）",
+                        l.address, l.port
+                    )
+                })?;
+            }
+        }
         println!(
-            "config OK: {} (listeners={}, apps={})",
+            "config OK: {} (listeners={}, apps={}, tls acceptors built={})",
             config_path.display(),
             cfg.listeners.len(),
-            cfg.listeners.iter().map(|l| l.apps.len()).sum::<usize>()
+            cfg.listeners.iter().map(|l| l.apps.len()).sum::<usize>(),
+            cfg.listeners.iter().filter(|l| l.ssl.is_some()).count()
         );
         return Ok(());
     }

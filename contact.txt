@@ -1137,3 +1137,35 @@ ECH 内外层不同（`af6fca4d…`/`dbcc988e…`）、HTTPS 记录含 `ech=`、
 **暂缓/记录（不擅自改，需你确认）**：`env_lock` 的进程环境变量并发污染（架构级）；
 `rate_limit` 按完整地址分桶 ⇒ 持 /64 的 v6 客户端换地址可绕过（改成按 /64 聚合是行为变更）；
 `h1` 长连接沿用建连时的 listener 快照（与已修的上传闸门同类，但改动面更大）。
+
+
+---
+
+### Session 1008 (2026-10-03) — 进展 36（第二轮并行审计：h2/h3/qmux、TLS/OCSP、DNS 控制面 —— 修 14 处，含**两处我上轮没修完**）
+
+再派 3 个只读 agent 审三片新模块（镜像用刷新后的生产树）。无 P0。**两条直接打在上轮的修复上**：
+
+1. **QMux 入向记录上限方向搞反**：上轮我加了「先查上限再缓冲」，但上限取自**对端声明值**
+   （`reader.set_max_record_size(peer_max_record)`）——§5.2 里 `max_record_size` 是「愿意接收」
+   的上限、约束**对端发给我们的**记录；对端那份约束的是**我们发出去**的（用在 push_frames，
+   正确）。于是未认证客户端声明 `max_record_size = 2^62` 就让我们按该值缓冲，**把上轮那条
+   修复整个绕过**。现固定为本端声明值，并删掉可被抬高的 setter 防后人再踩。
+2. **acceptor 指纹漏了 cover-EC**：上轮我新加的 `ech_cover_cert_ec`/`ech_cover_key_ec`
+   没进指纹（字段哈希与 mtime/size 列表都漏）⇒ 原地轮换外层 EC 证书时指纹不变、继续用旧证书。
+
+其余 12 处：QMux `push_frames` 批次中途入队失败丢帧（流上出现空洞、连接被自己关掉）；
+**DoT 限速只在建连时查一次**（RFC7858 允许连接复用 ⇒「单 IP 20/s」实际「单连接不限」）；
+OCSP `register_target` 保留旧槽而回调拿新槽 ⇒ **staple 冻结**（到期后一直发旧的，must-staple 客户端
+失败；每次 config 改动都清 acceptor 缓存 ⇒ 反复发生）；ECH 两份 staple 构建期取快照 ⇒ 构建时
+缓存为空的部署**永不装订**；`write_atomic` 的 umask 权限窗口（named.conf/rndc.conf/session.key
+在 chmod 前本机可读，rndc 密钥泄露＝可控制 named，且临时名可预测无 O_EXCL）；`panel.toml`
+非原子写且 0644（含 license_key，写坏则 `effective()` 静默回退、安全项变回旧值）；
+config.toml 每次保存把权限从 0600 静默降级成 0644；ECH HPKE 私钥「先 0644 再 chmod 且忽略失败」；
+`write_pem_file` 无权限限制；**rndc 密钥生成 `let _ =` 静默退回全零常量**；
+`chown -R _bind <整个 state_root>`（数据面账号获得控制面写权）；`--check-config` 现**真的构建
+一次每个 SSL listener 的 acceptor**（把 cipher/group 拼错这类「配置过了、端口实际下线」提前到
+预检；比硬编码名字白名单更安全——本项目被「新校验误拒」打过两次）。
+
+**测试** 261 passed / 0 failed。生产待部署复验。**仍暂缓（OPERATOR-TODO J）**：h1/h2 长连接沿用
+建连时快照（h3 已由指纹+端点重启覆盖）、h2 缺 header 读超时、`rate_limit` 按完整 IP 分桶
+（v6 /64 可绕过）、`env_lock` 进程环境并发污染。

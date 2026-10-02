@@ -206,13 +206,17 @@ pub fn write_tree(live: &Arc<LiveConfig>, tree: &Toml) -> Result<()> {
     let out = toml::to_string_pretty(tree).context("serialize config.toml")?;
     let path = live.path().clone();
     // 唯一临时名：并发保存时固定名会互相覆盖（见 unique_tmp_path 的说明）。
+    // 先写临时文件通过校验，再用「保留权限」的原子写定稿（原来直接 fs::write + rename
+    // 会把 config.toml 的权限降级成 umask 值）。
     let tmp = crate::server::live_config::unique_tmp_path(&path, "tmp");
     std::fs::write(&tmp, &out).with_context(|| format!("write {}", tmp.display()))?;
     if let Err(e) = Config::load(&tmp) {
         let _ = std::fs::remove_file(&tmp);
         bail!("校验失败（未写盘）: {e:#}");
     }
-    std::fs::rename(&tmp, &path).with_context(|| format!("replace {}", path.display()))?;
+    let _ = std::fs::remove_file(&tmp);
+    crate::server::dns::write_config_atomic(&path, out.as_bytes())
+        .with_context(|| format!("replace {}", path.display()))?;
     live.reload().context("reload config")?;
     Ok(())
 }

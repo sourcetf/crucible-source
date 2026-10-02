@@ -256,16 +256,19 @@ public_name 校验证书，必然失败"
         let real_cert = cert.clone();
         let real_key = key.clone();
         let real_ec = ec_pair.as_ref().map(|(c, k)| (c.clone(), k.clone()));
-        // OCSP 是逐证书一份：把两份材料（可能为空=不装订）一起搬进回调
-        let ocsp_real = ocsp.real.as_ref().map(|s| s.bytes()).flatten();
-        let ocsp_cover = ocsp.cover.as_ref().map(|s| s.bytes()).flatten();
+        // OCSP 是逐证书一份：把两份材料搬进回调 —— 但**不能在这里取快照**。
+        // `StapleSource::bytes()` 对 Auto 是「读一次当前值」，而自动续期线程在构建之后
+        // 才把新响应写进槽 ⇒ 构建期为空的部署会**永远不装订**（即便续期早就成功），
+        // 有值的则冻结到下次 reload。改成搬「来源」，每次握手现读。
+        let ocsp_real = LiveStaple::from(&ocsp.real);
+        let ocsp_cover = LiveStaple::from(&ocsp.cover);
         builder.set_servername_callback(move |s, _alert| {
             if !s.ech_accepted() {
                 // 未接受 ECH：保持容器默认（cover）证书 —— 但 **staple 必须换成 cover 的**：
                 // 容器上装的是真实证书那份（apply_ocsp 的默认动作），装在 cover 上就是错配。
-                match &ocsp_cover {
+                match ocsp_cover.as_ref().and_then(|l| l.bytes()) {
                     Some(der) => {
-                        let _ = s.set_ocsp_status(der);
+                        let _ = s.set_ocsp_status(&der);
                     }
                     // cover 没有自己的 staple ⇒ **清空**：不装订是安全的（客户端自行查询），
                     // 留着真实证书那份才是错的。
@@ -275,9 +278,12 @@ public_name 校验证书，必然失败"
                 }
                 return Ok(());
             }
-            // ECH 被接受：换成真实证书，并把 staple 换成真实证书那份
-            if let Some(der) = &ocsp_real {
-                let _ = s.set_ocsp_status(der);
+            // ECH 被接受：换成真实证书，并把 staple 换成真实证书那份（**现读**，
+            // 这样续期线程一成功，后续握手立刻用上新响应）。
+            // 读不到就**什么都不做**：容器上装的正是 apply_ocsp 给真实证书装的那份
+            //（同一个来源），清空反而会把一份有效 staple 抹掉。
+            if let Some(der) = ocsp_real.as_ref().and_then(|l| l.bytes()) {
+                let _ = s.set_ocsp_status(&der);
             }
             if s.set_certificate(&real_cert).is_err() || s.set_private_key(&real_key).is_err() {
                 log::warn!("ech: ECH 已接受但切换真实证书失败（保持 cover）");
@@ -550,6 +556,32 @@ fn apply_ech_keys(builder: &mut SslAcceptorBuilder, pem: &[u8]) -> Result<()> {
 enum StapleSource {
     Static(Vec<u8>),
     Auto(std::sync::Arc<crate::server::ocsp_fetcher::StapleSlot>),
+}
+
+/// 可搬进握手回调的 staple 来源：`Static` 是配置里给的那份（内容不变），
+/// `Auto` 指向续期线程会持续更新的槽 —— 每次握手 `bytes()` 现读，所以续期一旦成功
+/// 后续握手立刻用上。
+#[derive(Clone)]
+enum LiveStaple {
+    Static(std::sync::Arc<Vec<u8>>),
+    Auto(std::sync::Arc<crate::server::ocsp_fetcher::StapleSlot>),
+}
+
+impl LiveStaple {
+    fn from(src: &Option<StapleSource>) -> Option<Self> {
+        match src {
+            Some(StapleSource::Static(b)) => Some(LiveStaple::Static(std::sync::Arc::new(b.clone()))),
+            Some(StapleSource::Auto(s)) => Some(LiveStaple::Auto(std::sync::Arc::clone(s))),
+            None => None,
+        }
+    }
+
+    fn bytes(&self) -> Option<Vec<u8>> {
+        match self {
+            LiveStaple::Static(b) => Some((**b).clone()),
+            LiveStaple::Auto(s) => s.current(),
+        }
+    }
 }
 
 impl StapleSource {
@@ -928,6 +960,13 @@ fn acceptor_fingerprint(ssl: &SslConfig, lc: &ListenerConfig) -> u64 {
     ssl.prefer_tls13.hash(&mut h);
     ssl.ech.hash(&mut h);
     ssl.ech_keys.hash(&mut h);
+    // cover-EC（外层备用 EC 证书）**必须进指纹**：路径不变、内容原地轮换时，
+    // 只哈希其它字段会让指纹不变 ⇒ 命中旧 acceptor ⇒ 继续出示**旧的外层 EC 证书**
+    // 直到 reload/重启。这是「材料 mtime/size 进指纹」那次修复漏掉的一个字段。
+    ssl.ech_cover_cert.hash(&mut h);
+    ssl.ech_cover_key.hash(&mut h);
+    ssl.ech_cover_cert_ec.hash(&mut h);
+    ssl.ech_cover_key_ec.hash(&mut h);
     ssl.psk.hash(&mut h);
     ssl.psk_identity.hash(&mut h);
     ssl.psk_key.hash(&mut h);
@@ -953,6 +992,8 @@ fn acceptor_fingerprint(ssl: &SslConfig, lc: &ListenerConfig) -> u64 {
         &ssl.ech_keys,
         &ssl.ech_cover_cert,
         &ssl.ech_cover_key,
+        &ssl.ech_cover_cert_ec,
+        &ssl.ech_cover_key_ec,
         &ssl.ocsp_der_path,
     ] {
         if let Some(path) = p.as_deref() {

@@ -2551,3 +2551,40 @@ dispatch 里**每一个**引擎的错误分支都把 `format!("<engine> error: {
 **这条值得单独记**：如果只有代码审阅（或只看「编译通过 + 单测通过」），我会把第一版当成修好了 ——
 是**隔离验证**把它证伪的。所以「杀子进程」这类修复必须用「脚本里带子命令」的用例验证，
 而不是「进程本身 sleep」。
+
+### 21.39 第二轮并行审计（h2/h3/qmux、TLS 栈、DNS 控制面）—— 又 12 处修复，含两处「我上轮的修复不完整」
+
+继续按用户要求派 3 个只读 agent（这次换三片模块：h2/h3/qmux、TLS/OCSP、DNS 控制面/面板）。
+镜像用**刷新后的**生产树（`srcsnap2`）。结论同样无 P0，但**抓到两处我自己上轮没修完的地方**：
+
+#### ⚠️ 我上轮的两处修复不完整（本轮补齐）
+1. **QMux 入向记录上限方向搞反了**（`conn.rs` `reader.set_max_record_size(peer_max_record)`）：
+   §5.2 的 `max_record_size` 是「本端**愿意接收**的上限」（约束对端发给我们的记录），
+   对端那一份约束的是**我们发给它**的（用在 `push_frames`，正确）。上轮我加的
+   「先查上限再缓冲」是对的，但上限**来源**取自对端 ⇒ 未认证客户端只要声明
+   `max_record_size = 2^62`，就能让我们按该值缓冲 —— **把上轮那条修复整个绕过**。
+   现在上限固定为本端声明值（`DEFAULT_MAX_RECORD_SIZE`），并删掉那个可被抬高的 setter
+   （防后人再踩），单测改为断言「超过本端上限必须报错」。
+2. **acceptor 指纹漏了 cover-EC**（我上轮新加的 `ech_cover_cert_ec`/`ech_cover_key_ec` 没进
+   指纹的字段哈希，也没进 mtime/size 列表）⇒ 原地轮换外层 EC 证书时指纹不变、继续用旧
+   acceptor 出示旧证书。已补进两处。
+
+#### 其余修复
+| # | 位置 | 问题 | 修法 |
+|---|---|---|---|
+| 3 | `qmux/conn.rs` `push_frames` | 批次中途入队失败时，`std::mem::take` 已把那一批帧交出去，失败即丢失，却只归还 `frames[idx..]` ⇒ 流上出现空洞、对端按 offset 连续性发现、连接被我们自己关掉 | 先记下批次边界，失败时返回 `frames[idx-batch..]`（整批+后续一起重试） |
+| 4 | `dns/dot_doh.rs` | DoT 限速**只在建连时查一次**，而 RFC7858 允许连接复用 ⇒ 面板写的「单 IP 20/s」实际是「单连接不限」，一个来源就能打满上游 | 每条查询再查一次，超限直接关连接 |
+| 5 | `ocsp_fetcher.rs` `register_target` | 按 host+leaf 去重时保留**第一个** Target（旧槽），而 `prepare_stapling` 每次冷构建都把**新槽**交给握手回调 ⇒ 续期线程写旧槽、回调读新槽，staple 冻结在构建时的磁盘值，过期后一直发旧的（must-staple 客户端失败）。每次 config 改动都会清 acceptor 缓存 ⇒ 这条会反复发生 | `register_target` 返回**权威槽**（已注册则返回已注册那个），调用方与续期线程恒用同一个槽 |
+| 6 | `tls/boring_path.rs` | ECH 的两份 OCSP staple 在**构建期取一次快照**搬进回调 ⇒ 构建时缓存为空的部署**永远不装订**（哪怕续期早已成功） | 搬「来源」而非快照（`LiveStaple`），每次握手现读 |
+| 7 | `dns/mod.rs` `write_atomic` | 先 `fs::write`（umask 通常 0644）再 chmod ⇒ `named.conf`/`rndc.conf`/`session.key` 的临时文件在 chmod 前**本机任何用户可读**（rndc HMAC 密钥泄露＝本机可控制 named）；临时名可预测且无 O_EXCL/O_NOFOLLOW | 改 `O_CREAT\|O_EXCL\|O_NOFOLLOW` + **0600 创建**，再定稿目标权限、再 rename（窗口只会「过严」） |
+| 8 | `dns/admin_api.rs` | `panel.toml`（**权威 [dns] 来源**，含 recursion_acl/dot.allow 与 MaxMind license_key）用 `fs::write` 原地截断且不设权限：写坏 ⇒ `effective()` 静默回退到 config.toml（安全项悄悄变回旧值）；文件 0644 可读 license_key | 走原子写（0600 临时 → rename） |
+| 9 | `live_config.rs` / `admin_config_edit.rs` | 每次保存 config.toml 都用 `fs::write`+rename ⇒ 把运维可能特意设过的 0600 **静默降级成 0644**（里面有口令哈希、MaxMind key、TLS/ECH 材料路径） | 新增 `write_config_atomic`：保留原权限（不存在则 0600），写入期间恒 0600 |
+| 10 | `ech_auto.rs` | ECH HPKE 私钥先按 umask(0644) 建、之后才 chmod，且 chmod 失败被 `let _ =` 吞掉 ⇒ 可能永久世界可读 | 创建即 0600（+O_NOFOLLOW），定稿 chmod 失败**报错** |
+| 11 | `ssl_material.rs` | `write_pem_file` 无任何权限限制（面板粘贴的 PEM 可能就是私钥） | 创建即 0600（当前无调用者，但留着这个 helper 迟早被用上） |
+| 12 | `dns/mod.rs` | 密钥生成 `let _ = read_exact` ⇒ `/dev/urandom` 失败时静默退回**全零 rndc 密钥**（常量！本机任何进程都能凭它控制 named） | 失败即带清晰信息 panic（函数签名是 `-> String`，调用点在 named.conf 生成路径上）；并 assert 非全零 |
+| 13 | `dns/mod.rs` | `chown -R _bind:_bind <整个 state_root>`：把 `etc/`（named.conf 含 rndc 密钥、panel.toml 权威配置）与 `db/dns.sqlite` 一并交给数据面账号 ⇒ 一个能影响 named 的漏洞就能改控制面 | 收窄为 named 真正需要写的 `zones/`、`log/`、`keys/` |
+| 14 | `main.rs` `--check-config` | 只校验配置 ⇒ `ssl.ciphers`/`ssl.groups` 写错名字这种「配置通过、端口每次握手被 soft-fail」的问题预检**看不见**（而硬编码名字白名单会误拒合法名字——本项目被误拒打过两次） | 预检时**真的构建一次每个 SSL listener 的 acceptor**（只读材料、不触网），把这类错误提前到预检阶段 |
+
+**为什么这批值得单独记**：第 1、2 条都是「上一轮声称修好、其实没修完」——
+一条是把语义方向搞反（修了「查上限」，但上限取自攻击者），一条是新字段漏进指纹。
+第 14 条则是**流程改进**：与其加更多名字白名单（有误拒风险），不如让预检跑真实代码路径。

@@ -1593,10 +1593,24 @@ fn load_or_make_secret() -> String {
         }
     }
     let mut buf = [0u8; 48];
-    let _ = std::fs::File::open("/dev/urandom").and_then(|mut f| {
+    // **不能忽略读取失败**：`let _ =` 时若 /dev/urandom 打不开（chroot、fd 耗尽），
+    // buf 保持全零，rndc 密钥就成了常量 `000…0`（96 个 0）而启动照常 —— 本机任何进程
+    // 都能凭它通过 rndc 控制 named。失败就换一个可预期的失败方式（全零是**不可接受**的）。
+    // 本函数签名是 `-> String`（调用点都在 named.conf 生成路径上），所以这里**大声失败**
+    // 而不是返回 Err：宁可启动期带着可读信息退出，也不能静默退回全零密钥。
+    // （OpenBSD 上 /dev/urandom 基本不可能失败；真失败说明环境异常，继续跑更危险。）
+    {
         use std::io::Read;
+        let mut f = std::fs::File::open("/dev/urandom").expect(
+            "dns: 打不开 /dev/urandom —— rndc 密钥必须来自 CSPRNG，用常量密钥等于本机任何人都能控制 named",
+        );
         f.read_exact(&mut buf)
-    });
+            .expect("dns: 读 /dev/urandom 失败 —— rndc 密钥必须来自 CSPRNG");
+    }
+    assert!(
+        buf.iter().any(|b| *b != 0),
+        "dns: /dev/urandom 返回全零（异常环境）—— 拒绝使用可预测的 rndc 密钥"
+    );
     let secret: String = buf.iter().map(|b| format!("{b:02x}")).collect();
     let _ = std::fs::create_dir_all(state_root().join("etc"));
     let _ = write_atomic(&p, format!("secret={secret}\n").as_bytes(), 0o600, None);
@@ -1621,11 +1635,19 @@ fn write_atomic(path: &Path, data: &[u8], mode: u32, owner: Option<&str>) -> Res
         .unwrap_or_else(|| std::ffi::OsString::from("dnsfile"));
     name.push(format!(".tmp{}", std::process::id()));
     let tmp = dir.join(name);
-    std::fs::write(&tmp, data).with_context(|| format!("write {}", tmp.display()))?;
+    // **先在 0600 下创建**：`std::fs::write` 会用 `0666 & ~umask`（通常 0644）建文件，
+    // 而 set_permissions 在**之后**才跑 ⇒ named.conf / rndc.conf / session.key 的临时文件
+    // 在 chmod 前是「本机任何用户可读」，而 rndc.conf/session.key 里是 rndc 的 HMAC 密钥
+    //（拿到它就能通过本机 rndc 控制 named）。改路径后：写入期间是**更严**的 0600，
+    // 定稿权限再改到目标值 —— 窗口只会「过严」，不会「过松」。
+    // 同时 create_new + O_NOFOLLOW：临时名可预测（`<file>.tmp<pid>`），能写该目录的人
+    // 可以预先放一个软链接让我们跟着写（findings 里那条 chown -R 已同时收窄）。
+    write_new_0600(&tmp, data)?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(mode));
+        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(mode))
+            .with_context(|| format!("chmod {:o} {}", mode, tmp.display()))?;
     }
     #[cfg(not(unix))]
     let _ = mode;
@@ -1634,6 +1656,62 @@ fn write_atomic(path: &Path, data: &[u8], mode: u32, owner: Option<&str>) -> Res
     }
     std::fs::rename(&tmp, path)
         .with_context(|| format!("rename {} -> {}", tmp.display(), path.display()))
+}
+
+/// 新建一个只允许所有者读写的文件并写入内容（`O_CREAT|O_EXCL|O_NOFOLLOW`，mode 0600）。
+///
+/// 用于**先写临时文件、再定稿权限、最后 rename** 的落盘路径：创建时就 0600，
+/// 保证「最终权限设定之前」的那段窗口是过严而非过松。
+fn write_new_0600(path: &Path, data: &[u8]) -> Result<()> {
+    use std::io::Write;
+    #[cfg(unix)]
+    let mut f = {
+        use std::os::unix::fs::OpenOptionsExt;
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(path)
+            .with_context(|| format!("create {}", path.display()))?
+    };
+    #[cfg(not(unix))]
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .with_context(|| format!("create {}", path.display()))?;
+    f.write_all(data).with_context(|| format!("write {}", path.display()))?;
+    f.sync_all().ok();
+    Ok(())
+}
+
+/// 原子写一份**配置文件**（config.toml）：保留原文件权限（不存在则 0600），
+/// 写入期间恒为 0600。config.toml 里有口令哈希、MaxMind key、TLS/ECH 材料路径，
+/// 而原来的写法用 `std::fs::write` + rename ⇒ 每保存一次就把运维可能特意设过的 0600
+/// 静默降级成 0644。
+pub fn write_config_atomic(path: &Path, data: &[u8]) -> Result<()> {
+    let dir = path.parent().unwrap_or_else(|| Path::new("."));
+    let mut name = path
+        .file_name()
+        .map(|n| n.to_os_string())
+        .unwrap_or_else(|| std::ffi::OsString::from("config.toml"));
+    name.push(format!(".tmp{}-{}", std::process::id(), chrono_now()));
+    let tmp = dir.join(name);
+    write_new_0600(&tmp, data)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(path)
+            .map(|m| m.permissions().mode() & 0o777)
+            .unwrap_or(0o600);
+        // 原文件是 0000 之类时也给个可读的兜底，避免把自己锁死
+        let mode = if mode == 0 { 0o600 } else { mode };
+        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(mode))
+            .with_context(|| format!("chmod {:o} {}", mode, tmp.display()))?;
+    }
+    std::fs::rename(&tmp, path).with_context(|| format!("rename {}", path.display()))?;
+    Ok(())
 }
 
 #[cfg(unix)]
@@ -2109,12 +2187,19 @@ pub fn reconcile(cfg: &DnsConfig) -> Result<()> {
             validate(cfg, false)?;
         }
         let conf = state_root().join("etc/named.conf");
-        // 权限：named 以 _bind 用户运行（root 绑端口后 drop）；zones/keys/log 需可写
-        let _ = std::process::Command::new("chown")
-            .arg("-R")
-            .arg("_bind:_bind")
-            .arg(state_root())
-            .status();
+        // 权限：named 以 _bind 用户运行（root 绑端口后 drop），它**只需要**能写
+        // zones/（zone 文件与 .jnl/.signed）、log/、keys/。
+        // 原来这里是 `chown -R _bind:_bind <整个 state_root>` —— 连 etc/（named.conf
+        // 含 rndc 密钥、session.key、panel.toml 这份**权威 [dns] 配置**）与 db/dns.sqlite
+        // 一起交给 _bind。那等于让数据面账号拥有自己的控制面：一个能影响 named 处理
+        // 不可信 DNS 数据的漏洞，就能顺手改掉控制面配置与分区数据库。
+        for sub in ["zones", "log", "keys"] {
+            let _ = std::process::Command::new("chown")
+                .arg("-R")
+                .arg("_bind:_bind")
+                .arg(state_root().join(sub))
+                .status();
+        }
         // OpenBSD lo0 默认只有 127.0.0.1/32——fwd view 的 127.0.0.(2+i) 目标需显式 alias
         if cfg.geo.enabled {
             for (i, _) in cfg.geo.lines.iter().enumerate().take(250) {

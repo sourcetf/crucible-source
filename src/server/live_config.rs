@@ -59,9 +59,10 @@ fn persist_admin_hash_structured(path: &Path, username: &str, hash: &str) -> any
     })?;
     let _ = std::fs::remove_file(&tmp_validate);
     parsed.validate()?;
-    let tmp = unique_tmp_path(path, "tmp");
-    std::fs::write(&tmp, text)?;
-    std::fs::rename(&tmp, path)?;
+    // 原子写 + **保留原权限**：config.toml 含口令哈希 / MaxMind key / TLS·ECH 材料路径，
+    // 原来是 `fs::write`（umask 0644）+ rename，每保存一次就把运维可能特意设过的 0600
+    // 静默降级成 0644。见 `crate::server::dns::write_config_atomic`。
+    crate::server::dns::write_config_atomic(path, text.as_bytes())?;
     Ok(())
 }
 

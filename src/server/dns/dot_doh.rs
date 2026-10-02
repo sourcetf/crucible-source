@@ -481,6 +481,13 @@ async fn run_dot(
                 if len == 0 || len > 65535 {
                     return;
                 }
+                // **每条查询**都要过限速：accept 时那次只限制「连接建立」，而一条 DoT 连接
+                // 可以串行灌无限条查询（RFC7858 允许复用）⇒ 面板上写的「单 IP 20/s」
+                // 实际变成「单连接不限」，一个来源就能把上游打满。超限直接关连接。
+                if !crate::server::rate_limit::allow(peer.ip(), dot_rate(&cfg), dot_burst(&cfg)) {
+                    log::warn!("dot: 单 IP 查询限速超限，关闭连接 from {peer}");
+                    return;
+                }
                 let mut msg = vec![0u8; len];
                 if tokio::io::AsyncReadExt::read_exact(&mut tls, &mut msg)
                     .await

@@ -866,27 +866,39 @@ pub fn prepare_stapling(host: &str, leaf: &X509, chain_pem: &[u8]) -> Option<Arc
         return None;
     }
     let slot = StapleSlot::from_disk(host, leaf);
-    register_target(host, leaf, chain_pem, &slot);
+    // `register_target` **返回权威槽**：若同 host+leaf 已注册过，返回的是**已注册那个**，
+    // 而不是我们刚建的新的。否则续期线程写旧槽、握手回调读新槽 ⇒ staple 冻结在
+    // 「构建时的磁盘缓存值」，过期后一直发旧的（must-staple 客户端直接失败）。
+    // 每次 `LiveConfig` 重载都会清空 acceptor 缓存 ⇒ 冷构建会反复发生，所以这条必须成立。
+    let slot = register_target(host, leaf, chain_pem, &slot);
     Some(slot)
 }
 
 /// 注册一个续期目标（按 host+leaf 去重）并确保续期线程已启动。
 /// 只应在 acceptor 冷构建路径调用。
-fn register_target(host: &str, leaf: &X509, chain_pem: &[u8], slot: &Arc<StapleSlot>) {
+fn register_target(
+    host: &str,
+    leaf: &X509,
+    chain_pem: &[u8],
+    slot: &Arc<StapleSlot>,
+) -> Arc<StapleSlot> {
     let key = cache_key_of(host, leaf);
     {
         let mut t = TARGETS.lock();
-        let dup = t.iter().any(|x| cache_key_of(&x.host, &x.leaf) == key);
-        if !dup {
-            t.push(Target {
-                host: host.to_string(),
-                leaf: leaf.to_owned(),
-                chain: chain_pem.to_vec(),
-                slot: Arc::clone(slot),
-            });
+        // 已注册 ⇒ 返回**已注册的那个槽**（调用方/握手回调必须与续期线程用同一个槽）。
+        // 并发冷构建时同理：先注册者胜出，后者拿到同一个槽，不会出现「两个槽一读一写」。
+        if let Some(existing) = t.iter().find(|x| cache_key_of(&x.host, &x.leaf) == key) {
+            return Arc::clone(&existing.slot);
         }
+        t.push(Target {
+            host: host.to_string(),
+            leaf: leaf.to_owned(),
+            chain: chain_pem.to_vec(),
+            slot: Arc::clone(slot),
+        });
     }
     ensure_renewal_loop();
+    Arc::clone(slot)
 }
 
 /// 启动后台续期线程（幂等）。线程先立刻扫一遍（补齐首次缺失），随后每
