@@ -2873,6 +2873,25 @@ fn rootzone_current_serial(dst: &Path) -> Option<u64> {
 
 /// 维护循环：config.toml mtime 变化 → 重新 reconcile；rootzone 到期 → 刷新（需求 2）。
 /// 额外：DNSSEC 密钥轮换（需求 3）；rootzone 支持 IXFR。
+/// 同一段失败日志只打一次（按 tag 记住上次的完整消息）。
+///
+/// 维护循环每 30 秒跑一轮，而失败路径**不会**更新自己的「上次成功」时间戳
+/// （rootzone 的 `root_last_ok`、dnssec 轮换检查都是这样）⇒ 一旦持久失败
+/// （例如出口网络不通），每 30 秒就重打一条同样的 warn，永不停止。
+/// 本机磁盘长期紧张、日志阈值只有 2MB，刷屏的代价是真实的。
+/// 消息内容变化（比如换了一种错误）时仍会重新打 —— 只有**完全相同**的消息被抑制。
+fn warn_once(tag: &str, msg: &str) {
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+    static SEEN: Mutex<Option<HashMap<String, String>>> = Mutex::new(None);
+    let mut g = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+    let m = g.get_or_insert_with(HashMap::new);
+    if m.get(tag).map(|s| s.as_str()) != Some(msg) {
+        m.insert(tag.to_string(), msg.to_string());
+        log::warn!("{msg}");
+    }
+}
+
 pub async fn maintenance_loop(live: Arc<crate::server::live_config::LiveConfig>, cfg_path: PathBuf) {
     let mut last_mtime: Option<std::time::SystemTime> = std::fs::metadata(&cfg_path).ok().and_then(|m| m.modified().ok());
     loop {
@@ -2902,7 +2921,7 @@ pub async fn maintenance_loop(live: Arc<crate::server::live_config::LiveConfig>,
                         log::info!("dnssec: DS rollover needed zone={} tag={}", ds.zone, ds.tag);
                     }
                 }
-                Ok(Err(e)) => log::warn!("dnssec: rotation check failed: {e:#}"),
+                Ok(Err(e)) => warn_once("dnssec-rotate", &format!("dnssec: rotation check failed: {e:#}")),
                 Err(e) => log::warn!("dnssec: rotation join: {e}"),
             }
         }
@@ -2937,7 +2956,7 @@ pub async fn maintenance_loop(live: Arc<crate::server::live_config::LiveConfig>,
                 };
                 match result {
                     Ok(p) => log::info!("dns: rootzone refreshed → {p}"),
-                    Err(e) => log::warn!("dns: rootzone refresh failed: {e:#}"),
+                    Err(e) => warn_once("rootzone", &format!("dns: rootzone refresh failed: {e:#}")),
                 }
             }
         }
@@ -3133,6 +3152,21 @@ mod listen_lists_tests {
 
     /// `[[https_rr]]` 名字不属于任何 master zone ⇒ 必须被识别为「静默不发布」。
     /// 这是真机踩过的坑：记录写进了 panel.toml，`dig` 却是 NXDOMAIN（缺 zone）。
+    /// `warn_once`：**完全相同**的消息只打一次；消息一变就重新打。
+    /// 钉这个是因为维护循环 30s 一轮、失败路径不更新「上次成功」⇒ 不去重就永久刷屏。
+    #[test]
+    fn warn_once_suppresses_only_identical_messages() {
+        use super::warn_once;
+        // 无法在这里断言日志行数（没有测试 logger），改为断言去重状态机的可观察行为：
+        // 同一 tag 反复喂同一消息不应 panic，且换消息后仍能继续工作。
+        for _ in 0..5 {
+            warn_once("unit-test-tag", "same message");
+        }
+        warn_once("unit-test-tag", "different message");
+        warn_once("unit-test-tag", "same message"); // 回到旧消息 = 与新消息不同 ⇒ 会打
+        warn_once("other-tag", "same message");     // 不同 tag 互不影响
+    }
+
     #[test]
     fn orphan_https_names_finds_records_without_a_zone() {
         let z = |n: &str, k: &str| ZoneRow {

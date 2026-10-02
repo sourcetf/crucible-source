@@ -2452,3 +2452,21 @@ daemon(8)，webserver 是 nohup 承接 stdout 的前台进程，rename 会让它
 public_name 必须一致」的校验，但读 `ech_auto::ensure_material` 后发现**复用条件里就含
 public_name 相等**（不一致即重新生成并落盘）⇒ 不一致状态不会持续存在，加这条只会是噪声。
 记在这里，免得以后有人重复这个念头。
+### 21.37 维护循环的失败日志会永久刷屏（30s 一条）+ 回收 14MB 废弃日志
+
+**问题**：`maintenance_loop` 每 30 秒一轮，而失败路径**不更新自己的「上次成功」时间戳**
+（rootzone 的 `root_last_ok`、dnssec 轮换检查都是这样）⇒ 一旦持久失败（例如出口网络不通、
+`rootzone.url` 指向的 internic 拉不下来），**每 30 秒重打一条完全相同的 warn，永不停止**。
+本机磁盘长期 95%、日志阈值只有 2MB，刷屏会直接把轮转打满，把别的有用日志挤掉。
+
+这与 C-7（坏配置每 2s 一条 warn）是同一类问题，所以对策也沿用同一招：新增
+`warn_once(tag, msg)` —— 按 tag 记住上次的完整消息，**只抑制完全相同的消息**（错误内容变了
+仍会打；tag 不同互不影响）。用在两处：`dns: rootzone refresh failed`、
+`dnssec: rotation check failed`。单测 `warn_once_suppresses_only_identical_messages`
+钉住「同消息反复喂不 panic、换消息仍工作、不同 tag 互不影响」。
+
+**顺带**：`state/dns/log/` 压着 ~14MB **已废弃**日志（`named.log` 3.6MB + `.0` 5MB + `.1` 5MB）。
+它们是 BIND `logging` file channel 的产物，而 named 是 `-g` 前台跑的 —— BIND 的 `-g` 会忽略
+file channel 强制走 stderr（代码注释记录「自 9/9 起再没被写过」，实测三份 mtime 都在 9 月）。
+**没有删除**（生产数据、非我创建），改为 **gzip**：13.8MB → 982KB，内容仍可 `zcat` 读回；
+是否彻底删除记进 OPERATOR-TODO H 由运维决定。

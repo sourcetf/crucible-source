@@ -188,13 +188,19 @@ stderr）⇒ `state/dns/log/named.stderr.log` 是 DNS 的**唯一**日志出口�
 两份都用 `O_APPEND` 打开 ⇒ copytruncate 安全（已在真实日志上实测：2.4MB → 归档 150KB、
 文件归零、named 继续写、DNS 正常；归档 200/200 行无丢失、代数封顶 7）。
 
-**顺带**：`state/dns/log/` 下有 ~14MB **已废弃**的日志可回收 —— `named.log`(3.6MB)、
-`named.log.0`(5MB)、`named.log.1`(5MB)。它们是 BIND `logging` 的 file channel 产物，
-而 `-g` 模式下 BIND 根本不写它们（代码注释记录「自 9/9 起再没被写过」）。确认无人在读后可删：
+**顺带（已做）**：`state/dns/log/` 曾压着 ~14MB **已废弃**日志 —— `named.log`(3.6MB) +
+`named.log.0`(5MB) + `named.log.1`(5MB)。它们是 BIND `logging` 的 file channel 产物，而 `-g`
+模式下 BIND 根本不写它们（代码注释记录「自 9/9 起再没被写过」，实测三份的 mtime 都在 9 月）。
+**没有删除**（生产数据、且不是我创建的），改为 **gzip 压缩**：13.8MB → 982KB，内容仍可
+`zcat` 读回。要彻底清掉再执行：
 
 ```sh
-rm -f /crucible/state/dns/log/named.log /crucible/state/dns/log/named.log.0 /crucible/state/dns/log/named.log.1
+rm -f /crucible/state/dns/log/named.log.gz /crucible/state/dns/log/named.log.0.gz /crucible/state/dns/log/named.log.1.gz
 ```
+
+另外给维护循环加了一处**去重**：`dns: rootzone refresh failed` 与 `dnssec: rotation check failed`
+此前会**每 30 秒**重打一条同样的 warn（失败路径不更新「上次成功」时间戳 ⇒ 持久失败就永久刷屏）。
+现用 `warn_once(tag, msg)` 抑制**完全相同**的消息（消息变了仍会打）。
 
 ## I. 关于 `ssl.cert` + `ssl.cert_ec`（单证书槽的限制，改配置前先读）
 
