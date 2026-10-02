@@ -2678,4 +2678,50 @@ rndc 密钥一并交出去。新增 `check_tor_hs_data_dir`：归一化后拒绝
   `"/var/tor/hs"`、`"state/tor-hs/hs"` → **RC=0**。生产配置（无 `[tor_hs]` 段）预检 **RC=0**、
   `tls acceptors built=3`。
 - **发布**：`scripts/deploy/deploy_release.sh`（预检 → 快照 `20261003-064051` → 停 → 换 → 起 → 复验），
-  复验全部监听在、h1 `9095=200`、h3 `8443=200`。
+  复验全部监听在、h1 `9095=200`、h3 `8443=200`。### 21.42 四轮改动后的**跨协议回归扫**（新增可复用的 `scripts/verify/regression_sweep.sh`）
+
+前四轮的验证都是**逐条针对性**的（每条修完单独验）。四轮共 60+ 处改动全部落盘部署之后，
+还没有一次「横向」确认。这一轮补上，并把扫查脚本固化进仓库（生产机上 `sh scripts/verify/regression_sweep.sh`，
+全部是 GET/HEAD/OPTIONS，**只读**，不改任何状态）。
+
+扫查覆盖面与结果（生产端口）：
+
+| 面 | 结果 |
+|---|---|
+| h1 明文 :9095 的 18 个引擎路径 | 11 个 200；7 个 502 见下（**全是本机环境缺件，非回归**） |
+| 静态面（9095 /、9081、9445 tls1.2、9446 tls1.3） | 全 200 |
+| h2（9445、8443）与 h3（8443） | 全 200 |
+| 管理面与指标（未认证） | `/__admin`、`/__admin/`、`/__admin/api/config`、`/__metrics` **全部 401** |
+| 穿越（`/../../etc/passwd`、`%2e%2e`、`..%2f`、`/__admin/../config.toml`） | **全部 404** |
+| 方法 | HEAD 200、OPTIONS 405 |
+| Range | `bytes=0-9` → **206 + `content-range: bytes 0-9/20971520`**；越界 → **416**；后缀 `bytes=-10` → 206；h2 同样 206 |
+| DNS/TCP | 权威 apex `crucible.local` 的 **type65(HTTPS, 带 ech=)** → rcode=0 ancount=1；递归 A/AAAA → rcode=0 ancount=2；不存在的名字 → rcode=3 |
+| DoT/853 | TLSv1.3 握手 OK，真查询 rcode=0 ancount=2 |
+| 进程 | webserver / named 均在 |
+
+#### 7 个 502 全部是环境缺件，逐条给出本地日志里的原因
+默认日志（`/var/log/crucible-restart.log`）里引擎失败**不脱敏**，所以原因一目了然：
+- `/go/`：`target/app-engines/libapp_go.so` **不存在**（go 引擎要走 `GO_ENGINE_MODE=shm bash scripts/build_app_engines.sh` 单独构建，本机没建过）。
+- `/jsp/`、`/do/`：`native sidecar sock not ready: state/native/9095-7-jsp/app.sock` —— JSP 侧车进程只有验收脚本会起，生产没起。
+- `/ruby/`、`/rack/`：`未嵌入 Ruby（not built with embedded MRI Ruby），且本机未安装 ruby/libruby`。
+- `/psgi/`：`本引擎构建时未嵌入 Perl`。
+- `/tsx/`：`本机有 node 但没有 tsx`；且 tsx 的契约是「编译 + watch 部署」，不按请求执行。
+
+这些**都不是本轮回归**：它们是「引擎不可用」时**明确拒绝**（502 + 一条说清原因的日志），
+而项目规格本来就**禁止**每请求 spawn 解释器的 popen 回退。要它们可用属于**运维补齐**
+（构建对应引擎 / 装解释器 / 配置侧车），不是代码缺陷。已记入 OPERATOR-TODO M 节。
+
+#### 扫查中一个**假警报**的排除过程（记下来避免下次重复怀疑）
+`9081 /` 上 `Range: bytes=0-9` 返回了 200 与**完整** 148 字节，看起来像「Range 被忽略」。
+实际是：该 listener 配了 `autoindex = true`，`/` 命中的是**动态生成的**目录列表（148 字节），
+而不是 127 字节的 `index.html`。生成的响应体根本没有对应文件，字节范围无从谈起，返回 200
+（非 206）是**正确**行为。改在真实文件上测（`www/big20.bin`，20MiB）就得到正确的 206/416。
+
+#### ECH 端到端复核（RFC 9849 不变量）
+跑 `scripts/ech_demo.sh`（自带四张证书、临时实例 127.0.0.1:18443，不碰生产）：
+- 探针 ① **ECH 被接受** ⇒ `PEER_CN=prod.crucible.local`，`PEER_SHA256=775b0951…`
+- 探针 ② 非 ECH（RSA sigalgs）⇒ `PEER_CN=crucible.local`，`PEER_SHA256=0e01ee8a…`
+- 探针 ③ 非 ECH（**只给 ECDSA**）⇒ 同 ②（`0e01ee8a…`）
+- ① ≠ ②③ ⇒ 内外层**是两张不同的证书**，且不做 ECH 的探测者只看到 `crucible.local`，
+  **学不到真实域名**。（④ 只给 RSA 的客户端握手失败 —— BoringSSL 单 credential 槽的既有限制，
+  已在 §21.34 记过；**失败 ≠ 泄漏**，故不作判据。）
