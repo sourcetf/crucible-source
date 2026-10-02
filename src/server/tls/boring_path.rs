@@ -101,8 +101,18 @@ fn load_identity(builder: &mut SslAcceptorBuilder, ssl: &SslConfig, ocsp: &OcspP
     let cert = X509::from_pem(&cert_pem)?;
     let key = PKey::private_key_from_pem(&key_pem)?;
 
-    // 备用 EC 证书（BoringSSL 按客户端 sigalgs 选）。**先加载好**，因为 cover 与真实
-    // 两套证书在切换时都要成对提供，否则 ECDSA 客户端会拿不到匹配的链。
+    // ⚠️ 本 BoringSSL 只有**一个** legacy credential 槽：
+    // `SSL_CTX_use_certificate` 的文档原文是 "Each of these functions configures the single
+    // "legacy credential"... To select between multiple certificates, use
+    // SSL_CREDENTIAL_new_x509"，而本 build 并未导出那套 API。所以**同一层里重复
+    // set_certificate 是覆盖、不是「按密钥类型各存一张」**（原注释写的「备用链」是错的）。
+    //
+    // 由此推出两条硬约束（配置期已 fail-fast，见 config.rs）：
+    //   * 内层与外层必须**配成同一组密钥类型**：每层实际生效的是最后设置的那张，两层类型
+    //     不一致时 ECH 接受前后会把证书类型换掉，只支持一种类型的客户端两条路径各失败一边。
+    //   * 因此下面「容器用 cover、回调换 real」在类型上天然一致（都被最后那张 EC 或都 RSA）。
+    //
+    // 备用 EC 证书（`ssl.cert_ec`）：与 `cert` 同层，后设置的生效。
     let ec_pair = match (&ssl.cert_ec, &ssl.key_ec) {
         (Some(c), Some(k)) => {
             let ec_x509 = X509::from_pem(&ssl_material::load_bytes(c)?)?;
@@ -119,6 +129,18 @@ fn load_identity(builder: &mut SslAcceptorBuilder, ssl: &SslConfig, ocsp: &OcspP
             let cc = X509::from_pem(&ssl_material::load_bytes(c)?)?;
             let ck = PKey::private_key_from_pem(&ssl_material::load_bytes(k)?)?;
             Some((cc, ck))
+        }
+        _ => None,
+    };
+
+    // 外层 cover 的**备用 EC 证书**。见上：本 BoringSSL 单 credential 槽，同层后设置的生效；
+    // 外层配 EC 是为了让「外层生效的那张」与「内层生效的那张」是同一种密钥类型
+    // —— 否则 ECH 接受前后证书类型会变，只支持一种类型的客户端必有一边失败。
+    let cover_ec = match (&ssl.ech_cover_cert_ec, &ssl.ech_cover_key_ec) {
+        (Some(c), Some(k)) => {
+            let x = X509::from_pem(&ssl_material::load_bytes(c)?)?;
+            let p = PKey::private_key_from_pem(&ssl_material::load_bytes(k)?)?;
+            Some((x, p))
         }
         _ => None,
     };
@@ -159,6 +181,38 @@ fn load_identity(builder: &mut SslAcceptorBuilder, ssl: &SslConfig, ocsp: &OcspP
 两套证书间切换必然有一边错配（严格客户端校验失败、宽松客户端撤回检查静默失效）。请二选一"
             );
         }
+        // ④ 内外层必须**配成同一组密钥类型**。理由见文件上方关于「单 credential 槽」的说明：
+        //    每层实际生效的是**最后设置的那张**，若内层有 EC 而外层没有（或反之），ECH 接受
+        //    前后证书类型会变（cover=RSA → real=EC），只提供单一类型的客户端会在两条路径里
+        //    各失败一边；更糟的是**内层可能因此被逼出来**（外层只有 RSA 时，容器里唯一的 EC
+        //    证书是内层那张 —— §21.34 在 127.0.0.1:18443 上实测复现过：ECH/非 ECH+RSA/
+        //    非 ECH+仅 ECDSA 三条探针拿到**完全相同**的内层指纹）。
+        if ec_pair.is_some() != cover_ec.is_some() {
+            anyhow::bail!(
+                "ECH: ssl.cert_ec 与 ssl.ech_cover_cert_ec 必须**同时配或同时不配** —— 本 BoringSSL\
+ 的 SSL_CTX_use_certificate 只有单个 credential 槽（是覆盖、不是按类型各存一张），每层生效的\
+是最后设置的那张。内外层密钥类型不一致时，ECH 接受前后证书类型会变：只支持一种类型的客户端在\
+「ECH / 非 ECH」两条路径里必有一边失败，且外层缺 EC 时容器里偏巧就是**内层**那张 EC 证书（\
+主动探测者换一组 sigalgs 即可确认真实域名）"
+            );
+        }
+        if let Some((cec, _)) = &cover_ec {
+            // 外层 EC 也必须覆盖 public_name（它是外层生效的那张）
+            if !cert_covers(cec, &public_name) {
+                anyhow::bail!(
+                    "ECH: ech_cover_cert_ec 不覆盖 ech_public_name={public_name} —— 外层按 \
+public_name 校验证书，必然失败"
+                );
+            }
+            // 与内层 EC 不能是同一张（同 ① 的理由，只是换成 EC 那一对）
+            if let Some((inner_ec, _)) = &ec_pair {
+                if inner_ec.to_der()? == cec.to_der()? {
+                    anyhow::bail!(
+                        "ECH: ech_cover_cert_ec 与 ssl.cert_ec 是**同一张** —— 内外层必须分离"
+                    );
+                }
+            }
+        }
     }
 
     match &cover {
@@ -173,9 +227,17 @@ fn load_identity(builder: &mut SslAcceptorBuilder, ssl: &SslConfig, ocsp: &OcspP
             builder.check_private_key()?;
         }
     }
-    if let Some((ec_x509, ec_pkey)) = &ec_pair {
-        // 同一密钥类型重复 set_certificate 会注册**备用链**（不能用 add_extra_chain_cert，
-        // 那只是中间证书，会破坏 EC 叶证书选择）。
+    // 容器上的证书（非 ECH 路径生效的那张）：配了 cover 时是**外层**，否则是内层。
+    // 单 credential 槽 ⇒ 同层「后设置者生效」，所以这里放的必须是外层那一组
+    // （把内层的 EC 放进来就是 §21.34 的内层泄漏）。
+    let container_ec = if cover.is_some() {
+        cover_ec.as_ref().or(ec_pair.as_ref())
+    } else {
+        ec_pair.as_ref()
+    };
+    if let Some((ec_x509, ec_pkey)) = container_ec {
+        // 同一层再 set 一次 = 覆盖（本 BoringSSL 单 credential 槽；`add_extra_chain_cert`
+        // 只是追加中间证书、不会成为叶证书，别用它）。
         builder.set_certificate(ec_x509)?;
         builder.set_private_key(ec_pkey)?;
         builder.check_private_key()?;

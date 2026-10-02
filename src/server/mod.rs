@@ -119,10 +119,13 @@ pub async fn run(live: Arc<LiveConfig>) -> Result<()> {
 
     // Initial listeners.
     let cfg = live.snapshot();
-    // ECH 启动期自检（三条方向互补的检查，见 `ech_selfcheck_problems`）：
-    // ① 要广告却没人发布 ② 启用了却内外层共用一张证书 ③ 发布了却没人服务。
-    // 三者共同点是「面板/日志看起来都正常」，只有把两处配置放在一起比才看得出来。
-    for problem in ech_selfcheck_problems(&cfg) {
+    // ECH 启动期自检（四条方向互补的检查，见 `ech_selfcheck_problems`）：
+    // ① 要广告却没人发布 ② 启用了却内外层共用一张证书 ③ 发布了却没人服务
+    // ④ 外层 cover 漏了 EC（内层会被逼出来）。
+    // 共同点是「面板/日志看起来都正常」，只有把两处配置放在一起比才看得出来。
+    // 注意 ①③ 读的是**生效**的 DNS 配置（panel.toml 会整体覆盖 config.toml 的 [dns]）。
+    let dns_effective = crate::server::dns::effective(&cfg);
+    for problem in ech_selfcheck_problems(&cfg, &dns_effective) {
         log::warn!("{problem}");
     }
     // B-F2：管理面默认对**所有** listener 开放（`listeners_allow` 为空 = 不限制），
@@ -447,16 +450,25 @@ fn served_public_name(ssl: &crate::config::SslConfig) -> Option<String> {
     None
 }
 
-/// 启动期自检：开了 ECH 广告、却没有对应的 `[[dns.https_rr]]` 发布条目。
+/// 启动期自检：ECH 的「配置面」与「发布面」是否自洽（四个方向，见函数内注释）。
 ///
 /// `ech_advertise` 的字面含义是「发布到 DNS」，但真正的发布动作在
 /// `[dns] [[dns.https_rr]]`（见 `dns::auto_https_records`）。少了这层检查，
 /// 「ECH 已启用」与「客户端拿不到 ECHConfig」可以同时成立而无人察觉。
-fn ech_selfcheck_problems(cfg: &crate::config::Config) -> Vec<String> {
+///
+/// `dns` 参数必须是**生效**的那份（`dns::effective(cfg)`）：`state/dns/etc/panel.toml`
+/// 存在时会整体覆盖 config.toml 的 `[dns]`，拿 `cfg.dns` 判断会产生假告警
+/// （生产实测：https_rr 写进 panel.toml 后 dig 已能查到 ech=，这里还在报「没发布」）。
+fn ech_selfcheck_problems(
+    cfg: &crate::config::Config,
+    dns: &crate::server::dns::DnsConfig,
+) -> Vec<String> {
     let mut out = Vec::new();
 
-    let published: Vec<String> = cfg
-        .dns
+    // 读**生效**的 DNS 配置：`state/dns/etc/panel.toml` 存在时会整体覆盖 config.toml 的
+    // `[dns]`（C-17），拿 cfg.dns 判断会得到「记录明明已发布却一直报没发布」的假告警
+    // —— 生产实测：https_rr 写进 panel.toml 后，dig 能查到 ech=，这里还在 warn。
+    let published: Vec<String> = dns
         .https_rr
         .iter()
         .filter(|r| r.ech)
@@ -544,6 +556,31 @@ fn ech_selfcheck_problems(cfg: &crate::config::Config) -> Vec<String> {
         }
     }
 
+    // 方向 4（§21.34）：外层 cover 漏了 EC 那一半。
+    //
+    // BoringSSL 按客户端 `signature_algorithms` 在 RSA/EC 里选，且**优先 ECDSA**。内层配了
+    // `cert_ec` 而外层没配 `ech_cover_cert_ec` 时，容器里唯一的 EC 证书是**内层**那张 ⇒
+    // 默认客户端（同时支持 RSA/ECDSA）与只提供 ECDSA 的探测者**都会拿到内层真实证书**，
+    // cover 等于不存在。配置期已 fail-fast 拦这一条，这里再报一次是为了那些**旧配置**
+    // （reload 前就已存在、或从面板改出来的）也能在启动日志里看见。
+    for lc in &cfg.listeners {
+        let Some(ssl) = lc.ssl.as_ref() else { continue };
+        if !ssl.ech || ssl.ech_cover_cert.is_none() {
+            continue;
+        }
+        let inner_ec = ssl.cert_ec.as_deref().map_or(false, |s| !s.trim().is_empty());
+        let cover_ec = ssl
+            .ech_cover_cert_ec
+            .as_deref()
+            .map_or(false, |s| !s.trim().is_empty());
+        if inner_ec && !cover_ec {
+            out.push(format!(
+                "ECH: listener {}:{} 配了 ssl.cert_ec（内层 EC）但没有 ssl.ech_cover_cert_ec —— BoringSSL 按客户端 sigalgs 在 RSA/EC 里选且优先 ECDSA，外层只有 RSA 时**非 ECH 客户端与主动探测者都会拿到内层真实证书**，cover 形同虚设。补上 ech_cover_cert_ec/ech_cover_key_ec（可用 `webserver --gen-cert <public_name> --ec` 生成）",
+                lc.address, lc.port
+            ));
+        }
+    }
+
     out
 }
 
@@ -569,7 +606,7 @@ root = "/tmp/echcheck"
         let cfg = cfg_of(
             "ssl = { cert = \"cert.pem\", key = \"key.pem\", ech = true, ech_public_name = \"v.example.com\" }\n",
         );
-        let problems = ech_selfcheck_problems(&cfg);
+        let problems = ech_selfcheck_problems(&cfg, &cfg.dns);
         assert!(
             problems.iter().any(|p| p.contains("ECH 不会被发布")),
             "应报告「要广告但没发布」: {problems:?}"
@@ -578,7 +615,7 @@ root = "/tmp/echcheck"
         let cfg2 = cfg_of(
             "ssl = { cert = \"cert.pem\", key = \"key.pem\", ech = true, ech_public_name = \"v.example.com\" }\n\n[[dns.https_rr]]\nname = \"v.example.com\"\nech = true\n",
         );
-        let p2 = ech_selfcheck_problems(&cfg2);
+        let p2 = ech_selfcheck_problems(&cfg2, &cfg2.dns);
         assert!(
             !p2.iter().any(|p| p.contains("ECH 不会被发布")),
             "记录了就不该再报方向 1: {p2:?}"
@@ -592,7 +629,7 @@ root = "/tmp/echcheck"
             "ssl = { cert = \"cert.pem\", key = \"key.pem\", ech = true, ech_keys = \"state/ech/ech_keys.pem\" }\n",
         );
         assert!(
-            ech_selfcheck_problems(&cfg)
+            ech_selfcheck_problems(&cfg, &cfg.dns)
                 .iter()
                 .any(|p| p.contains("没有配置 cover 证书")),
             "缺 cover 证书必须报"
@@ -601,7 +638,7 @@ root = "/tmp/echcheck"
             "ssl = { cert = \"cert.pem\", key = \"key.pem\", ech = true, ech_keys = \"state/ech/ech_keys.pem\", ech_cover_cert = \"cover.pem\", ech_cover_key = \"cover.key.pem\" }\n",
         );
         assert!(
-            !ech_selfcheck_problems(&cfg_ok)
+            !ech_selfcheck_problems(&cfg_ok, &cfg_ok.dns)
                 .iter()
                 .any(|p| p.contains("没有配置 cover 证书")),
             "配全 cover 后不该再报"
@@ -611,7 +648,7 @@ root = "/tmp/echcheck"
             "ssl = { cert = \"cert.pem\", key = \"key.pem\", ech = false, ech_public_name = \"v.example.com\" }\n",
         );
         assert!(
-            !ech_selfcheck_problems(&cfg_off)
+            !ech_selfcheck_problems(&cfg_off, &cfg_off.dns)
                 .iter()
                 .any(|p| p.contains("没有配置 cover 证书")),
             "ech = false 不该报 cover 证书问题"
@@ -623,7 +660,7 @@ root = "/tmp/echcheck"
     fn published_but_not_served_is_reported() {
         let cfg = cfg_of("\n[[dns.https_rr]]\nname = \"v.example.com\"\nech = true\n");
         assert!(
-            ech_selfcheck_problems(&cfg)
+            ech_selfcheck_problems(&cfg, &cfg.dns)
                 .iter()
                 .any(|p| p.contains("没有 listener 在服务")),
             "发布了却没人服务必须报"
@@ -632,10 +669,40 @@ root = "/tmp/echcheck"
             "ssl = { cert = \"cert.pem\", key = \"key.pem\", ech = true, ech_keys = \"state/ech/ech_keys.pem\", ech_public_name = \"v.example.com\" }\n\n[[dns.https_rr]]\nname = \"v.example.com\"\nech = true\n",
         );
         assert!(
-            !ech_selfcheck_problems(&cfg_ok)
+            !ech_selfcheck_problems(&cfg_ok, &cfg_ok.dns)
                 .iter()
                 .any(|p| p.contains("没有 listener 在服务")),
             "服务端就绪后不该再报方向 3"
+        );
+    }
+
+    /// 方向 4（§21.34）：内层有 EC、外层 cover 漏了 EC ⇒ 必须报 —— 这一条是**真机复现**过的
+    /// 内层泄漏：BoringSSL 优先 ECDSA，外层只有 RSA 时非 ECH 客户端拿到的是内层 EC 证书。
+    /// 补上 `ech_cover_cert_ec` 后必须不再报（否则「补了还报」会让运维忽略这条告警）。
+    #[test]
+    fn cover_ec_missing_while_inner_ec_is_reported() {
+        let bad = cfg_of(
+            "ssl = { cert = \"cert.pem\", key = \"key.pem\", cert_ec = \"cert_ec.pem\", key_ec = \"key_ec.pem\", \
+ech = true, ech_keys = \"state/ech/ech_keys.pem\", ech_public_name = \"v.example.com\", \
+ech_cover_cert = \"cover.pem\", ech_cover_key = \"cover.key.pem\" }\n",
+        );
+        assert!(
+            ech_selfcheck_problems(&bad, &bad.dns)
+                .iter()
+                .any(|p| p.contains("ech_cover_cert_ec")),
+            "内层 EC + 外层无 EC 必须报方向 4"
+        );
+        let ok = cfg_of(
+            "ssl = { cert = \"cert.pem\", key = \"key.pem\", cert_ec = \"cert_ec.pem\", key_ec = \"key_ec.pem\", \
+ech = true, ech_keys = \"state/ech/ech_keys.pem\", ech_public_name = \"v.example.com\", \
+ech_cover_cert = \"cover.pem\", ech_cover_key = \"cover.key.pem\", \
+ech_cover_cert_ec = \"cover_ec.pem\", ech_cover_key_ec = \"cover_ec.key.pem\" }\n",
+        );
+        assert!(
+            !ech_selfcheck_problems(&ok, &ok.dns)
+                .iter()
+                .any(|p| p.contains("ech_cover_cert_ec")),
+            "外层 EC 补齐后不该再报方向 4"
         );
     }
 }

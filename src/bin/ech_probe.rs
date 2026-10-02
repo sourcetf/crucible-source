@@ -9,10 +9,14 @@
 //!
 //! 用法：
 //! ```text
-//! ech_probe <host:port> <ech_config_list.bin> <inner_name> [--no-ech]
+//! ech_probe <host:port> <ech_config_list.bin> <inner_name> [--no-ech] [--sigalgs <list>]
 //! ```
 //! * `--no-ech`：故意**不带** ECHConfigList，只把内层真实名当 SNI 发出去
 //!   （探测场景：确认「猜域名」拿不到真实证书）。
+//! * `--sigalgs ecdsa_secp256r1_sha256`：只提供 ECDSA 签名算法。服务端会按客户端 sigalgs
+//!   在 RSA / EC 两张证书里选，所以**只提供 ECDSA 的非 ECH 探测**能得到「外层到底有几张证书」
+//!   这个答案 —— 若拿回来的是内层真实证书，说明外层泄漏（RFC 9849 的 cover 必须是完整的
+//!   一层，每种密钥类型各一张，否则主动探测者换一组 sigalgs 就能把内层逼出来）。
 //!
 //! 判据（对齐 RFC 9849 与本项目的验收标准）：
 //! 1. `ECH_ACCEPTED=true` 才算服务端成功解开了 ClientHelloInner；
@@ -33,15 +37,24 @@ fn main() {
     }
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 4 {
-        eprintln!("usage: ech_probe <host:port> <ech_config_list.bin> <inner_name> [--no-ech]");
+        eprintln!(
+            "usage: ech_probe <host:port> <ech_config_list.bin> <inner_name> \
+             [--no-ech] [--sigalgs <list>]"
+        );
         std::process::exit(2);
     }
     let addr = &args[1];
     let list_path = &args[2];
     let inner = &args[3];
     let no_ech = args.iter().any(|a| a == "--no-ech");
+    // `--sigalgs <list>`：取值同 BoringSSL 的 sigalgs 字符串（冒号分隔）。
+    let sigalgs = args
+        .iter()
+        .position(|a| a == "--sigalgs")
+        .and_then(|i| args.get(i + 1))
+        .cloned();
 
-    match probe(addr, list_path, inner, no_ech) {
+    match probe(addr, list_path, inner, no_ech, sigalgs.as_deref()) {
         Ok(()) => {}
         Err(e) => {
             eprintln!("PROBE_ERROR: {e}");
@@ -50,10 +63,21 @@ fn main() {
     }
 }
 
-fn probe(addr: &str, list_path: &str, inner: &str, no_ech: bool) -> Result<(), String> {
+fn probe(
+    addr: &str,
+    list_path: &str,
+    inner: &str,
+    no_ech: bool,
+    sigalgs: Option<&str>,
+) -> Result<(), String> {
     let mut b = SslContext::builder(SslMethod::tls()).map_err(|e| e.to_string())?;
     // 只验 ECH 行为，不做链校验（真实/外层证书由我们比对 CN/SAN 自行判定）
     b.set_verify(SslVerifyMode::NONE);
+    if let Some(s) = sigalgs {
+        // 限制客户端**提供**的签名算法 ⇒ 直接决定服务端在 RSA/EC 证书里的选择。
+        b.set_sigalgs_list(s)
+            .map_err(|e| format!("set_sigalgs_list({s}): {e}"))?;
+    }
     let ctx = b.build();
 
     let mut ssl = Ssl::new(&ctx).map_err(|e| e.to_string())?;
@@ -96,7 +120,20 @@ fn probe(addr: &str, list_path: &str, inner: &str, no_ech: bool) -> Result<(), S
             .digest(boring::hash::MessageDigest::sha256())
             .map(|d| d.to_vec())
             .unwrap_or_default();
-        println!("PEER_SHA256={}", sha.iter().map(|x| format!("{x:02x}")).collect::<String>());
+        print!("PEER_SHA256={}", sha.iter().map(|x| format!("{x:02x}")).collect::<String>());
+        // 密钥类型：区分服务端递来的是 RSA 还是 EC 那张 —— 外层泄漏时这一行最直观
+        // （只提供 ECDSA sigalgs 却拿回内层的 EC 证书 = 外层不完整）。
+        if let Ok(pk) = cert.public_key() {
+            let kind = if pk.rsa().is_ok() {
+                "RSA"
+            } else if pk.ec_key().is_ok() {
+                "EC"
+            } else {
+                "OTHER"
+            };
+            print!(" PEER_KEY_TYPE={kind}");
+        }
+        println!();
     }
 
     // 握手之后必须真的能收发：ECH 只影响握手，但「握手成功却传不了数据」同样是坏的。

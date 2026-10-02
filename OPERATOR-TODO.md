@@ -1,6 +1,7 @@
 # 投产前清单（Crucible）
 
-> 状态：生产 1 实例、h1/h2/h3 + DNS + ECH 均正常。下面三项是**需要你拍板**的，
+> 状态：生产 1 实例、h1/h2/h3 + DNS + ECH 均正常（ECH 已按 RFC 9849 真正落地，见 A）。
+> 下面几项是**需要你拍板**的，
 > 每项都给了可直接执行的步骤与复验判据（命令都在 `/crucible` 下跑）。
 > 最后更新：见 git log（本文档随代码一起版本化）。
 
@@ -8,10 +9,33 @@
 
 ## A. ECH 按 RFC 9849 部署（需要**两张不同的**证书）
 
-**现状**：8443 已开 `ech = true` + `ech_keys`（ECH 握手可用：探针 `ECH_ACCEPTED=true`），但
+> **✅ 2026-10-02 已按 RFC 部署完成**（§21.34）。生产实测：ECH 客户端拿到**内层**证书
+> （`prod.crucible.local`，指纹 `af6fca4d…`），非 ECH 客户端与只提供 ECDSA 的探测者只能拿到
+> **外层** cover（`crucible.local`，指纹 `dbcc988e…`），两者不同；`dig @127.0.0.1 crucible.local
+> HTTPS` 返回 `ech=`，且解码后与 `state/ech/ech_config_list.bin` **逐字节相同**。
+> 证书在 `state/ech/`（`state/` 与 `*.pem` 都被 gitignore，私钥不入库），外层 EC 字段为
+> `ssl.ech_cover_cert_ec`/`ech_cover_key_ec`（新增）。
+>
+> **你仍需做的只有一件事**：把占位域名换成真实域名（`*.crucible.local` 无法公网解析，
+> 也没有 CA 会给它签证书 ⇒ 这套 ECH 只在「自建 DNS + 自签证书」的场景里成立）。
+> 换的时候记得三处同名：`ssl.cert`/`cert_ec` 的 CN、`ssl.ech_public_name`、`[[https_rr]].name`，
+> 并且 cover 要覆盖 `ech_public_name`；换完 `--check-config` 预检再重启。
+>
+> **两个坑（已在文档/代码里固化为检查）**：
+> 1. `[[https_rr]]` 必须写进 **`state/dns/etc/panel.toml`**（它整体覆盖 `config.toml` 的 `[dns]`，
+>    C-17），而且**必须存在覆盖该名字的 zone**（生产为此新建了 zone `crucible.local`）——
+>    否则记录被静默丢弃（实测先 NXDOMAIN）。
+> 2. 本 BoringSSL 只有**一个** legacy credential 槽（`SSL_CTX_use_certificate` 是覆盖语义，
+>    `SSL_CREDENTIAL_*` 未导出）⇒ **每层只能服务一种密钥类型**。本部署两层都用 EC；只提供
+>    RSA 的客户端会握手失败（**是失败不是泄漏**）。内/外层必须配成同一组密钥类型，
+>    配置期已强制（`ssl.cert_ec` 与 `ssl.ech_cover_cert_ec` 同时配或同时不配）。
+
+**（以下为部署前的原始说明，保留作为背景）**
+
+**原现状**：8443 已开 `ech = true` + `ech_keys`（ECH 握手可用：探针 `ECH_ACCEPTED=true`），但
 **内外层共用同一张自签 `cert.pem`**（CN=`crucible.local`、无 SAN），而内层真实名
 `prod.crucible.local` 根本没有证书覆盖；DNS 里也没有 `[[dns.https_rr]]` 发布 `ech=`。
-⇒ 目前「ECH 能用」但**外层伪装不存在**，且客户端拿不到 ECHConfig。
+⇒ 「ECH 能用」但**外层伪装不存在**，且客户端拿不到 ECHConfig。
 
 **步骤 1：生成两张证书**（用我们自己的二进制；不需要 openssl / bssl）：
 
@@ -85,6 +109,11 @@ ech  = true                  # 值取自 state/ech/ech_config_list.bin（服务�
 
 **现状**：`config.toml` 里带着示例口令哈希（自述明文 `admin`），且 `[admin].listeners_allow` 未配置
 ⇒ 管理面在**所有** listener 上可达（含明文 HTTP 端口）。启动日志现在会告警。
+
+> **✅ 2026-10-02 口令已轮换**：走面板 `POST /api/password` 换成 28 位随机口令
+> （旧 `admin:admin` 实测 **401**、新口令 200），封存在 `/root/.crucible-admin-password`（0600）。
+> **`listeners_allow` 仍未配置**（下面「同时建议」那一步）—— 那会改变你访问面板的端口，
+> 属于工作流选择，留给你决定。
 
 **步骤**（任选其一）：
 

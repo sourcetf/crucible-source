@@ -703,6 +703,18 @@ pub struct SslConfig {
     /// 配合 [`Self::ech_cover_cert`] 的私钥（两者必须成对，缺失一个即配置错误）。
     #[serde(default)]
     pub ech_cover_key: Option<String>,
+    /// **cover 的备用 EC 证书**（P-256 等）。BoringSSL 按客户端的
+    /// `signature_algorithms` 在 RSA / EC 证书里选，所以外层必须是**完整的一层**：
+    /// 只配 RSA 的 cover 时，一个**只提供 ECDSA** 的*非 ECH* 客户端会落回内层那张 EC
+    /// 证书（`ssl.cert_ec`）⇒ 主动探测者换一组 sigalgs 就能确认真实域名，外层形同虚设。
+    ///
+    /// 因此：**配了 `ssl.cert_ec` 就必须同时配本项**（缺失会被配置期 fail-fast 拦下，
+    /// 不做静默降级）。未配 `ssl.cert_ec`（纯 RSA 部署）时本项可省。
+    #[serde(default)]
+    pub ech_cover_cert_ec: Option<String>,
+    /// 配合 [`Self::ech_cover_cert_ec`] 的私钥（两者必须成对）。
+    #[serde(default)]
+    pub ech_cover_key_ec: Option<String>,
     /// **cover 证书**的 OCSP staple（DER/PEM 路径）。OCSP 响应是**逐证书**的，而 ECH 会在
     /// 内外层证书间切换 ⇒ 两份 staple 必须分开给：`ssl.ocsp_der_path` 属于真实证书
     /// （`ssl.cert`），本项属于 cover。未配置时：cover 路径**不装订**
@@ -752,6 +764,8 @@ impl Default for SslConfig {
             ech_public_name: None,
             ech_cover_cert: None,
             ech_cover_key: None,
+            ech_cover_cert_ec: None,
+            ech_cover_key_ec: None,
             ech_cover_ocsp_der_path: None,
             ech_cipher_suite: None,
             ech_max_name_length: None,
@@ -1088,6 +1102,8 @@ impl Config {
                 resolve_ssl_material(&mut ssl.ech_keys, base);
                 resolve_ssl_material(&mut ssl.ech_cover_cert, base);
                 resolve_ssl_material(&mut ssl.ech_cover_key, base);
+                resolve_ssl_material(&mut ssl.ech_cover_cert_ec, base);
+                resolve_ssl_material(&mut ssl.ech_cover_key_ec, base);
                 resolve_ssl_material(&mut ssl.ocsp_der_path, base);
                 resolve_ssl_material(&mut ssl.ech_cover_ocsp_der_path, base);
             }
@@ -1171,6 +1187,37 @@ impl Config {
                 anyhow::bail!(
                     "listener {}:{}: 配了 ECH cover 证书但没有 ssl.ech_public_name —— \
 证书选择靠它区分「外层名」与「ECH 解密后的内层真实名」，缺了它必然选错证书",
+                    l.address,
+                    l.port
+                );
+            }
+            // 外层 EC 也必须成对（与上面 cover_cert/cover_key 同理）。
+            let cover_ec_cert =
+                ssl.ech_cover_cert_ec.as_deref().map_or(false, |s| !s.trim().is_empty());
+            let cover_ec_key =
+                ssl.ech_cover_key_ec.as_deref().map_or(false, |s| !s.trim().is_empty());
+            if cover_ec_cert != cover_ec_key {
+                anyhow::bail!(
+                    "listener {}:{}: ssl.ech_cover_cert_ec 与 ssl.ech_cover_key_ec 必须成对配置",
+                    l.address,
+                    l.port
+                );
+            }
+            // 内外层必须**配成同一组密钥类型**（要么都有 EC，要么都没有）。
+            //
+            // 依据：本 BoringSSL 的 `SSL_CTX_use_certificate` 只有**单个** legacy credential
+            // 槽（文档原文 "configures the single "legacy credential""，多证书要走未导出的
+            // `SSL_CREDENTIAL_*` API）。所以同一层里后设置的生效，两层类型不一致时
+            // ECH 接受前后证书类型会变；而且外层缺 EC 时，容器里唯一的 EC 证书正好是
+            // **内层**那张 —— 实测（127.0.0.1:18443）三条探针（ECH / 非 ECH+RSA /
+            // 非 ECH+仅 ECDSA）拿到的指纹**完全相同**，即内层真实证书被泄漏给非 ECH 客户端。
+            let inner_ec = ssl.cert_ec.as_deref().map_or(false, |s| !s.trim().is_empty());
+            if cover_cert && inner_ec != cover_ec_cert {
+                anyhow::bail!(
+                    "listener {}:{}: ssl.cert_ec 与 ssl.ech_cover_cert_ec 必须同时配或同时不配 —— \
+本 BoringSSL 每层只保留最后设置的那张证书（单 credential 槽），内外层密钥类型不一致时，\
+ECH 接受前后证书类型会变，且外层缺 EC 时容器里就是**内层**那张 EC 证书（非 ECH 客户端与\
+主动探测者都会拿到内层真实证书，cover 形同虚设）",
                     l.address,
                     l.port
                 );
@@ -1404,6 +1451,8 @@ cover 只用于「未使用 / 被拒 ECH」的连接，ECH 关闭时它会成为
                     ("ssl.key_ec", &ssl.key_ec),
                     ("ssl.ech_cover_cert", &ssl.ech_cover_cert),
                     ("ssl.ech_cover_key", &ssl.ech_cover_key),
+                    ("ssl.ech_cover_cert_ec", &ssl.ech_cover_cert_ec),
+                    ("ssl.ech_cover_key_ec", &ssl.ech_cover_key_ec),
                 ] {
                     let Some(v) = field.as_deref() else { continue };
                     let t = v.trim();
@@ -1790,6 +1839,94 @@ root = {q}/tmp/covercheck{q}
         ))
         .expect("parse");
         assert!(ok.validate().is_ok(), "配齐 cover/public_name/ech 时不该报错");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// §21.34：外层 cover 必须是**完整的一层** —— 配了内层 EC（`cert_ec`）就必须同时配
+    /// `ech_cover_cert_ec`/`ech_cover_key_ec`，否则配置期直接拒绝。
+    ///
+    /// 为什么（实测复现过）：BoringSSL 按客户端 `signature_algorithms` 在 RSA/EC 证书里选，
+    /// 且客户端同时支持两者时**优先 ECDSA**。外层只有 RSA 时，容器里的 EC 证书是**内层**那张
+    /// ⇒ 普通客户端（默认就带 ECDSA sigalgs）和只提供 ECDSA 的探测者**都会拿到内层真实证书**，
+    /// cover 完全失效、ECH 白做。这不是理论问题：在 127.0.0.1:18443 的临时实例上，三条探针
+    /// （ECH / 非 ECH+RSA / 非 ECH+仅 ECDSA）拿到的指纹**完全相同**。
+    #[test]
+    fn ech_cover_ec_required_when_inner_ec_configured() {
+        let dir = std::env::temp_dir().join(format!("crucible-cover-ec-cfg-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let q = '"';
+        let mk = |n: &str| -> String {
+            let p = dir.join(n);
+            std::fs::write(&p, b"x").expect("write");
+            p.display().to_string().replace('\\', "/")
+        };
+        let (cert, key) = (mk("cert.pem"), mk("key.pem"));
+        let (cert_ec, key_ec) = (mk("cert_ec.pem"), mk("key_ec.pem"));
+        let (cover, cover_key) = (mk("cover.pem"), mk("cover.key.pem"));
+        let (cover_ec, cover_ec_key) = (mk("cover_ec.pem"), mk("cover_ec.key.pem"));
+        let base = format!(
+            "
+[[listeners]]
+address = {q}127.0.0.1{q}
+port = 14444
+root = {q}/tmp/coverec{q}
+",
+            q = q
+        );
+
+        // ① 内层有 EC、外层只有 RSA ⇒ 必须报错（错误信息要指向新字段，而不是碰巧别的检查）
+        let bad: Config = toml::from_str(&format!(
+            "{base}ssl = {{ cert = {q}{cert}{q}, key = {q}{key}{q}, cert_ec = {q}{cert_ec}{q}, key_ec = {q}{key_ec}{q}, \
+ech = true, ech_public_name = {q}v.example.com{q}, ech_cover_cert = {q}{cover}{q}, ech_cover_key = {q}{cover_key}{q} }}
+",
+            q = q
+        ))
+        .expect("parse");
+        let err = bad.validate().err().expect("内层 EC + 外层无 EC 必须报错");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("ech_cover_cert_ec"),
+            "错误信息应指向 ssl.ech_cover_cert_ec: {msg}"
+        );
+
+        // ② 外层 EC 只给一半 ⇒ 报错（成对）
+        let half: Config = toml::from_str(&format!(
+            "{base}ssl = {{ cert = {q}{cert}{q}, key = {q}{key}{q}, cert_ec = {q}{cert_ec}{q}, key_ec = {q}{key_ec}{q}, \
+ech = true, ech_public_name = {q}v.example.com{q}, ech_cover_cert = {q}{cover}{q}, ech_cover_key = {q}{cover_key}{q}, \
+ech_cover_cert_ec = {q}{cover_ec}{q} }}
+",
+            q = q
+        ))
+        .expect("parse");
+        let msg2 = format!("{}", half.validate().err().expect("外层 EC 只给一半必须报错"));
+        assert!(msg2.contains("成对"), "错误信息应说明成对: {msg2}");
+
+        // ②b 反向不一致：外层给了 EC 而内层没有 ⇒ 同样拒绝（类型集合必须一致）
+        let rev: Config = toml::from_str(&format!(
+            "{base}ssl = {{ cert = {q}{cert}{q}, key = {q}{key}{q}, \
+ech = true, ech_public_name = {q}v.example.com{q}, ech_cover_cert = {q}{cover}{q}, ech_cover_key = {q}{cover_key}{q}, \
+ech_cover_cert_ec = {q}{cover_ec}{q}, ech_cover_key_ec = {q}{cover_ec_key}{q} }}
+",
+            q = q
+        ))
+        .expect("parse");
+        let msg2b = format!("{}", rev.validate().err().expect("外层 EC 而内层无 EC 必须报错"));
+        assert!(
+            msg2b.contains("同时配或同时不配"),
+            "错误信息应说明类型集合必须一致: {msg2b}"
+        );
+
+        // ③ 正对照：内/外层各自的 RSA+EC 都配齐 ⇒ 必须通过。
+        //    没有这条，上面两条可能只是「什么配置都报错」。
+        let ok: Config = toml::from_str(&format!(
+            "{base}ssl = {{ cert = {q}{cert}{q}, key = {q}{key}{q}, cert_ec = {q}{cert_ec}{q}, key_ec = {q}{key_ec}{q}, \
+ech = true, ech_public_name = {q}v.example.com{q}, ech_cover_cert = {q}{cover}{q}, ech_cover_key = {q}{cover_key}{q}, \
+ech_cover_cert_ec = {q}{cover_ec}{q}, ech_cover_key_ec = {q}{cover_ec_key}{q} }}
+",
+            q = q
+        ))
+        .expect("parse");
+        assert!(ok.validate().is_ok(), "内/外层 RSA+EC 配齐时不该报错");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

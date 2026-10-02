@@ -2310,3 +2310,91 @@ named 实际 socket（`fstat -p 91042`）：`127.0.0.1:53`、**`83.229.125.81:53
 不带 `CRUCIBLE_SSH_PASSWORD` 直接运行 → 打印指引并 `exit 1`（实测退出码 1，未做任何动作）；
 `git check-ignore -v` 抽查：`scripts/start_server.sh`/`ech_demo.sh`/`deploy_release.sh` 均可入库，
 `deploy_remote.sh`（根目录）仍被忽略。
+
+### 21.34 ECH 生产部署：外层 cover 从未生效（含「内外层共用一张证书」）+ BoringSSL 单证书槽的真面目
+
+**用户规则**：「必须按照 ech 的 rfc 标准部署……不能混用证书，不能出现 ech 外层和内层域名混用和用
+同一张 ssl 的情况，mitm 不能看得出来」。这一节是把这句话真正落地 —— 此前**生产上根本没做到**。
+
+#### 起点：两个「看起来配了、实际没生效」的状态（只读核实）
+1. `config.toml` 的 8443 只有 `ech = true` + `ech_keys`，**没有** `ech_cover_cert`/`ech_public_name`
+   ⇒ 外层回落到与内层**同一张** `cert.pem`（自检方向 2 一直在告警，而且它是真的）。
+2. 即使补上 cover，也还有第二个坑（下面详述）。
+
+#### 关键发现：BoringSSL 这里只有**一个** legacy credential 槽
+读 `boring` 的头文件原文：
+
+> "Each of these functions configures the **single "legacy credential"** on the SSL_CTX or SSL.
+> To select between multiple certificates, use `SSL_CREDENTIAL_new_x509` and other APIs…"
+
+而本 build（boring 5.2.0 + 该 BoringSSL）**没有导出** `SSL_CREDENTIAL_*` / `SSL_CTX_add_credential`。
+结论：`SSL_CTX_use_certificate` 是**覆盖**语义，同一层里调第二次会丢掉第一次 —— 原代码注释里
+「同一密钥类型重复 set_certificate 会注册**备用链**」是**错的**（那是 OpenSSL 老语义的误记）。
+
+于是「内层 RSA + 内层 EC」这种写法里，**后设置的 EC 生效、RSA 被丢弃**；而外层只配 RSA 时，
+容器里唯一的 EC 证书**恰好是内层那张** ⇒ 非 ECH 客户端拿到内层真实证书。
+
+#### 红/绿实测（临时实例 127.0.0.1:18443 + `scripts/ech_demo.sh`）
+`--gen-cert` 这次加了 `--ec`（P-256），`ech_probe` 加了 `--sigalgs <list>` 与 `PEER_KEY_TYPE`
+—— 否则「只提供 ECDSA 的探测者会拿到哪张证书」这件事根本测不出来（旧探针不认识 `--sigalgs`，
+探针 ③ 会静默退化成 ②，把真问题掩盖掉；我自己就踩了一次）。
+
+**红（修前，内/外层 RSA+EC 都配齐）**：三条探针（ECH / 非 ECH+默认 sigalgs / 非 ECH+仅 ECDSA）
+拿到的 `PEER_SHA256` **完全相同**（都是内层 EC 证书 `1341125a…`）⇒ **cover 完全没生效**，
+而且比预想更严重：**连默认客户端（同时支持 RSA/ECDSA）都拿到内层证书**，不只是「仅 ECDSA」那种。
+
+**绿（修后）**：① ECH → 内层 `d7827049…`（CN=prod.crucible.local）；② 非 ECH → 外层
+`c90a4ac3…`（CN=crucible.local）；③ 非 ECH+仅 ECDSA → 外层（同为 `c90a4ac3…`）。
+内外层指纹**不同** ⇒ 判据成立。
+
+#### 代码修改
+- `config.rs`：新增 `ssl.ech_cover_cert_ec` / `ech_cover_key_ec`（外层 EC），进 `resolve_paths`
+  与「TLS 材料存在性」校验；新增**类型集合一致性**校验：`ssl.cert_ec` 与
+  `ssl.ech_cover_cert_ec` **必须同时配或同时不配**（否则 ECH 接受前后证书类型会变，
+  且外层缺 EC 时容器里就是内层那张 ⇒ 实测过的泄漏）。
+- `boring_path.rs`：容器上的证书改为「配了 cover 就用**外层**那一组（含 EC）」，并修掉那段错误
+  注释，把「单 credential 槽 / 覆盖语义 / 为什么内外层必须同类型」写进注释。
+- `main.rs`：`--gen-cert` 加 `--ec`（P-256），输出带密钥类型；单测断言 `--ec` 真的产出 EC（私钥与
+  证书公钥都查）。
+- `ech_probe.rs`：加 `--sigalgs`、`PEER_KEY_TYPE`（判据要能区分「外层生效的是哪一张」）。
+- `mod.rs`：ECH 自检加**方向 4**（外层漏 EC）+ 单测。
+- `scripts/ech_demo.sh`：四张证书 + 三条判据探针（④「仅 RSA」标为信息性，理由见下）。
+
+#### 生产部署（备份 stamp `20261002-192714`）
+1. 生成四张证书到 `state/ech/`（`state/` 与 `*.pem` 都已被 gitignore ⇒ 私钥不会进仓库；
+   `ech_keys.pem` 本来就在这里）：`real.{pem,key.pem}`/`real_ec.*`（内层，CN=prod.crucible.local）、
+   `cover.{pem,key.pem}`/`cover_ec.*`（外层，CN=crucible.local）。
+   `ech_public_name` 取 **`state/ech/ech_config_list.bin` 里真实内嵌的值**（解析出来是
+   `crucible.local`，不是我猜的）。
+2. `config.toml` 8443 的 ssl 改为内层 real.* + 外层 cover.* + `ech_public_name = "crucible.local"`。
+3. `--check-config` 预检通过（rc=0）→ 换二进制重启。
+4. `panel.toml` 加 `[[https_rr]]`（**必须加在这里**：panel.toml 整体覆盖 `[dns]`，C-17）。
+   另**新建 zone `crucible.local`** —— `https_rr` 只在已存在的 zone 内发布（`relative_owner` 决定
+   归属），没有该 zone 时记录被静默丢弃（实测先 NXDOMAIN）。
+
+**真机复验**：
+| 判据 | 结果 |
+|---|---|
+| ① ECH 客户端（内层名） | `ECH_ACCEPTED=true`，`PEER_CN=prod.crucible.local`，指纹 `af6fca4d…`（= 生成的 `real_ec.pem`），HTTP 200 |
+| ② 非 ECH（外层名） | `PEER_CN=crucible.local`，指纹 `dbcc988e…`（= 生成的 `cover_ec.pem`），HTTP 200 |
+| ③ 非 ECH + 仅 ECDSA | 同 ② —— **不与内层混用** |
+| DNS 发布 | `dig @127.0.0.1 crucible.local HTTPS` → `1 . alpn="h2,h3" port=8443 ech=AEX+…` |
+| 发布的一致性 | 把 `ech=` 的 base64 解码后与 `state/ech/ech_config_list.bin` **逐字节相同**（71 字节） |
+| h1/h3 | 9095=200、8443=200；8443/853/5349/9445/9446 与 53 全在听 |
+
+#### 顺带修掉的一条**假告警**（我自己的代码）
+自检方向 1 原本读 `cfg.dns.https_rr`（= config.toml 的 `[dns]`），而生效的是 panel.toml ⇒
+**记录已经发布（dig 查得到）、日志却一直报「ECH 不会被发布」**。改为把**生效**的 `DnsConfig`
+（`dns::effective(cfg)`）作为参数传入；单测仍传 `cfg.dns` 保持封闭（不读真实 panel.toml）。
+
+#### 已知限制（写清楚，不粉饰）
+本 BoringSSL 单 credential 槽 ⇒ **每层只能服务一种密钥类型的证书**（本部署两层都用 EC，
+因为内外层都把 EC 配在后面）。只提供 RSA 的客户端会握手失败（探针 ④ 打印为信息性）——
+这是**失败、不是泄漏**（拿不到内层证书）。现代 TLS 客户端普遍支持 ECDSA，故影响面很小；
+要彻底消除得等 boring 暴露 `SSL_CREDENTIAL_*`。
+
+#### 我自己的一次失误（留档）
+轮换 admin 口令后，我为了改 ECH 配置又上传了一份**轮换前下载的 config.toml 副本**，
+把新口令哈希冲回了样例值（`admin:admin` 又变 200）。已用封存口令重新轮换并复验
+（旧口令 401 / 封存口令 200）。**教训**：改生产配置前必须**重新下载**当前文件，
+不能用早先的副本 —— 这与「部署脚本先删后传」是同一类错误。

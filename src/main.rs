@@ -32,14 +32,20 @@ fn main() -> Result<()> {
     // （见 WORKLOG §21.24/§21.27 的 ECH 自检），没有生成手段就只能手工凑。这个子命令用
     // 与测试同一条 BoringSSL 代码路径产出证书，运维一条命令即可，不引入任何外部工具。
     //
-    // 用法：webserver --gen-cert <CN> --out-cert <pem> --out-key <pem> [--days N]
+    // 用法：webserver --gen-cert <CN> --out-cert <pem> --out-key <pem> [--days N] [--ec]
+    //
+    // `--ec` 生成 P-256 证书。**ECH 部署必须两层都齐**：BoringSSL 按客户端 sigalgs 在
+    // RSA / EC 两张证书里选，所以内层（真实）与外层（cover）**各自都要有 RSA 和 EC 两张**；
+    // 只给外层一张 RSA，只提供 ECDSA 的客户端就会落回内层那张 EC 证书 —— 外层形同虚设
+    // （见 WORKLOG §21.34）。默认 RSA 2048（兼容性最好）。
     if let Some(cn) = arg_value("--gen-cert") {
         let out_cert = arg_value("--out-cert").context("--gen-cert 需要 --out-cert <path>")?;
         let out_key = arg_value("--out-key").context("--gen-cert 需要 --out-key <path>")?;
         let days: u32 = arg_value("--days")
             .and_then(|v| v.parse().ok())
             .unwrap_or(3650);
-        gen_self_signed(&cn, &out_cert, &out_key, days)?;
+        let ec = std::env::args().any(|a| a == "--ec");
+        gen_self_signed(&cn, &out_cert, &out_key, days, ec)?;
         return Ok(());
     }
 
@@ -166,9 +172,15 @@ fn arg_value(flag: &str) -> Option<String> {
     None
 }
 
-/// 生成自签证书（RSA 2048 + SHA-256 + SAN=CN），私钥文件权限 0600。
+/// 生成自签证书（RSA 2048 或 `--ec` 的 P-256，SHA-256 + SAN=CN），私钥文件权限 0600。
 #[cfg(feature = "tls_boring")]
-fn gen_self_signed(cn: &str, out_cert: &str, out_key: &str, days: u32) -> anyhow::Result<()> {
+fn gen_self_signed(
+    cn: &str,
+    out_cert: &str,
+    out_key: &str,
+    days: u32,
+    ec: bool,
+) -> anyhow::Result<()> {
     use anyhow::Context;
     use boring::asn1::Asn1Time;
     use boring::hash::MessageDigest;
@@ -180,8 +192,20 @@ fn gen_self_signed(cn: &str, out_cert: &str, out_key: &str, days: u32) -> anyhow
     if cn.trim().is_empty() {
         anyhow::bail!("--gen-cert 的 CN 不能为空");
     }
-    let rsa = boring::rsa::Rsa::generate(2048).context("生成 RSA 2048 失败")?;
-    let pkey = PKey::from_rsa(rsa).context("RSA → PKey 失败")?;
+    // 密钥类型：RSA 2048（默认，兼容性最好）或 P-256（`--ec`）。
+    // ECH 要求内/外层各备 RSA+EC 两张，所以两种类型都得能生成。
+    let (pkey, kind) = if ec {
+        let group = boring::ec::EcGroup::from_curve_name(Nid::X9_62_PRIME256V1)
+            .context("取 P-256 曲线失败")?;
+        let eck = boring::ec::EcKey::generate(&group).context("生成 P-256 密钥失败")?;
+        (
+            PKey::from_ec_key(eck).context("EC → PKey 失败")?,
+            "EC-P256",
+        )
+    } else {
+        let rsa = boring::rsa::Rsa::generate(2048).context("生成 RSA 2048 失败")?;
+        (PKey::from_rsa(rsa).context("RSA → PKey 失败")?, "RSA2048")
+    };
 
     let mut nb = X509NameBuilder::new().context("X509NameBuilder")?;
     nb.append_entry_by_nid(Nid::COMMONNAME, cn.trim())
@@ -231,13 +255,19 @@ fn gen_self_signed(cn: &str, out_cert: &str, out_key: &str, days: u32) -> anyhow
         })
         .unwrap_or_default();
     println!(
-        "OK: CN={cn} SAN={cn} 有效期={days}天 证书={out_cert} 私钥={out_key}(0600) sha256={fp}"
+        "OK: CN={cn} SAN={cn} 类型={kind} 有效期={days}天 证书={out_cert} 私钥={out_key}(0600) sha256={fp}"
     );
     Ok(())
 }
 
 #[cfg(not(feature = "tls_boring"))]
-fn gen_self_signed(_cn: &str, _out_cert: &str, _out_key: &str, _days: u32) -> anyhow::Result<()> {
+fn gen_self_signed(
+    _cn: &str,
+    _out_cert: &str,
+    _out_key: &str,
+    _days: u32,
+    _ec: bool,
+) -> anyhow::Result<()> {
     anyhow::bail!("--gen-cert 需要 tls_boring 特性（本二进制未编译 BoringSSL）")
 }
 
@@ -260,6 +290,7 @@ mod gen_cert_tests {
             &cert_p.display().to_string(),
             &key_p.display().to_string(),
             3650,
+            false,
         )
         .expect("gen");
 
@@ -292,6 +323,32 @@ mod gen_cert_tests {
             let mode = std::fs::metadata(&key_p).expect("meta").permissions().mode() & 0o777;
             assert_eq!(mode, 0o600, "私钥必须是 0600");
         }
+
+        // `--ec`（P-256）：ECH 部署要求内层与外层**各自**都有 RSA 与 EC 两张证书，
+        // 否则只提供 ECDSA 的客户端会落回另一层的 EC 证书（外层泄漏，见 WORKLOG §21.34）。
+        // 这条钉住「EC 分支真的产出 EC 密钥」，而不是又生成一张 RSA。
+        let ec_cert_p = dir.join("real-ec.pem");
+        let ec_key_p = dir.join("real-ec.key.pem");
+        super::gen_self_signed(
+            "prod.example.com",
+            &ec_cert_p.display().to_string(),
+            &ec_key_p.display().to_string(),
+            3650,
+            true,
+        )
+        .expect("gen ec");
+        let ec_pk =
+            boring::pkey::PKey::private_key_from_pem(&std::fs::read(&ec_key_p).expect("read ec key"))
+                .expect("parse ec key");
+        assert!(ec_pk.ec_key().is_ok(), "--ec 必须产出 EC 私钥（而不是 RSA）");
+        let ec_cert = boring::x509::X509::from_pem(&std::fs::read(&ec_cert_p).expect("read ec cert"))
+            .expect("parse ec cert");
+        // 证书公钥类型也必须跟着变（只看私钥文件会漏掉「证书里仍是 RSA 公钥」这种半改）
+        assert!(
+            ec_cert.public_key().expect("pubkey").ec_key().is_ok(),
+            "--ec 的证书公钥必须是 EC"
+        );
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

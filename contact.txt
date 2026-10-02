@@ -1026,3 +1026,49 @@ grep -c '\.sh$'` → 0）。这条**对同步目标仓库不成立**：`/crucibl
 
 **验证**：`bash -n`/`sh -n` 通过；`grep -c Yc4` 三份根脚本 = 0；不带 env 运行 → 指引 + `exit 1`
 （实测 rc=1，无副作用）；`git check-ignore` 抽查 scripts/ 下脚本可入库、根目录脚本仍忽略。
+
+---
+
+### Session 1008 (2026-10-02) — 进展 33（ECH 生产落地：外层 cover 从未生效；BoringSSL 单证书槽；admin 口令已轮换）
+
+**用户的 ECH 硬规则终于真正满足**（此前只是「本机自测看着像做了」）。
+
+**关键发现（读 BoringSSL 头文件原文）**：`SSL_CTX_use_certificate` 配置的是
+**单个 legacy credential**（"configures the single "legacy credential"… To select between multiple
+certificates, use `SSL_CREDENTIAL_new_x509`"），而本 build（boring 5.2.0 + 该 BoringSSL）**没有导出**
+那套 API。⇒ 同层重复 set_certificate 是**覆盖**，原注释「同密钥类型注册备用链」是错的；
+内层 RSA+EC 时**后设的 EC 生效、RSA 被丢**，而外层只配 RSA 时容器里唯一的 EC 证书**正是内层那张**。
+
+**红/绿实测**（`scripts/ech_demo.sh`，临时实例 127.0.0.1:18443）：
+- 修前：ECH / 非 ECH+默认 sigalgs / 非 ECH+仅 ECDSA 三条探针 `PEER_SHA256` **完全相同**
+  （都是内层 EC）⇒ cover 完全没生效，连**默认客户端**都拿到内层证书。
+- 修后：① 内层 `d7827049…`；②③ 外层 `c90a4ac3…`（内外层不同）。
+- 工具补齐：`--gen-cert --ec`（P-256）、`ech_probe --sigalgs/PEER_KEY_TYPE`
+  —— 旧探针不认识 `--sigalgs` 会让探针 ③ 静默退化成 ②，把真问题掩盖（我自己踩过）。
+
+**代码**：`config.rs` 加 `ech_cover_cert_ec/ech_cover_key_ec` + **类型集合一致性**校验
+（`cert_ec` 与 `ech_cover_cert_ec` 必须同时配或同时不配）；`boring_path.rs` 容器证书改用**外层**那一组
+并修掉错误注释；`mod.rs` 自检加方向 4；`main.rs` 加 `--ec`。
+
+**生产部署（stamp 20261002-192714）**：四张证书进 `state/ech/`（`state/`+`*.pem` 已 gitignore，
+私钥不入库）；`ech_public_name` 取自**解析** `ech_config_list.bin` 得到的真实内嵌值 `crucible.local`；
+8443 改内层 real.* + 外层 cover.*；panel.toml 加 `[[https_rr]]`（必须加在这里，C-17）；
+另**新建 zone `crucible.local`**（https_rr 只在已存在 zone 内发布，否则静默丢弃 → 实测先 NXDOMAIN）。
+
+**真机复验**：① ECH→`prod.crucible.local`（指纹 `af6fca4d…` = real_ec.pem）；②③ 非 ECH→
+`crucible.local`（指纹 `dbcc988e…` = cover_ec.pem）；`dig crucible.local HTTPS` → 含 `ech=`，
+且把 `ech=` 解码后与 `state/ech/ech_config_list.bin` **逐字节相同**（71 字节）；h1/h3 200。
+
+**顺带修掉一条我自己的假告警**：自检方向 1 读的是 `cfg.dns.https_rr`（config.toml），而生效的是
+panel.toml ⇒ 记录已发布（dig 查得到）却一直 warn「ECH 不会被发布」。改为传入**生效**的
+`DnsConfig`（`dns::effective(cfg)`），单测仍传 `cfg.dns` 保持封闭。
+
+**admin 口令已轮换**（审计 B 的第一半）：走面板 `POST /api/password`，旧 `admin:admin` → **401**，
+新口令 → 200；封存在 `/root/.crucible-admin-password`（0600）。**我犯过一次错**：轮换后又上传了一份
+轮换前下载的 config.toml 副本，把新哈希冲回样例值（`admin:admin` 又 200），已重新轮换并复验。
+教训：改生产配置前必须**重新下载**当前文件。`listeners_allow` 仍未配（B 的第二半，待拍板）。
+
+**已知限制（写清楚）**：单 credential 槽 ⇒ 每层只能服务一种密钥类型的证书（本部署两层都用 EC）；
+只提供 RSA 的客户端握手失败 —— 是**失败不是泄漏**。现代客户端普遍支持 ECDSA，影响面小。
+
+**测试**：258 passed / 0 failed（含新增的 ECH 类型一致性校验、方向 4 自检、`--ec` 产出 EC）。
