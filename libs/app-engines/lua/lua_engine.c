@@ -307,11 +307,20 @@ int appengine_execute(
             if (rc != LUA_OK) {
                 const char *err = lua_tostring(L, -1);
                 if (ctx.body_len == 0) {
+                    /* **响应体只给固定文本**：`err` 是 Lua 解释器原文，典型形如
+                     * `cannot open /crucible/www-apps/lua/x.lua: No such file or directory`
+                     * 或 `/abs/path/x.lua:1: syntax error near ...` —— 含**服务器绝对路径**
+                     * 与脚本行号，任意能命中该路由的客户端都能看到。本项目统一口径是
+                     * 「细节只进本地日志，客户端拿固定文本」（Rust 侧 engine_error；
+                     * cgi/cgi_script 早已如此）。原文改放 `out->error`，由 Rust 侧
+                     * **经节流**写进本地日志（`app_ffi` 现在 rc==0 时也会记录 error）。 */
+                    static const char k_lua_err_body[] = "lua: application error\n";
                     out->status = 500;
                     appengine_result_set_headers(
                         out, "Content-Type: text/plain; charset=utf-8\r\n");
-                    appengine_result_set_body(out, err ? err : "lua error",
-                                              err ? strlen(err) : 9);
+                    appengine_result_set_body(out, k_lua_err_body,
+                                              sizeof(k_lua_err_body) - 1);
+                    appengine_result_set_error(out, err ? err : "lua error");
                     lua_close(L);
                     free(ctx.body);
                     return 0;

@@ -61,14 +61,37 @@ pub async fn handle(
     let uri_path = req.uri().path().to_string();
     let script = resolve_script(&docroot, app, &uri_path)?;
     if !script.is_file() {
+        // **不要把路径发回客户端**：`script.display()` 是 `/crucible/www-apps/php/...` 这种
+        // **服务器绝对路径**（docroot 泄露），而请求者只是任意能命中该路由的客户端。
+        // 与其它引擎口径一致：细节进本地日志，客户端拿一句固定文本。
+        // 而这条日志本身是**客户端可驱动**的（反复请求不存在的 .php 即可）⇒ 走节流，
+        // 否则就是一个按请求速率计费的写入口（本机磁盘长期紧张）。
+        crate::server::log_throttle::warn_every(
+            "php-script-not-found",
+            std::time::Duration::from_secs(60),
+            &format!("php: script not found: {}", script.display()),
+        );
         return Ok(Response::builder()
             .status(StatusCode::NOT_FOUND)
-            .body(full(format!("php script not found: {}", script.display())))
+            .body(full("php: script not found"))
             .unwrap());
     }
 
     let method = req.method().as_str().to_string();
     let query = req.uri().query().unwrap_or("").to_string();
+    // **`.env`（deps）变量必须下发**。FastCGI 的请求 params **就是** CGI 环境：php-fpm
+    // 把每个 param 交给脚本（`$_SERVER` / `getenv()`），而 pool 的 `clear_env` 只影响**进程**
+    // 环境、不影响请求 params —— 所以放进 `extra_params` 就能让 PHP 看到。
+    // 此前这里是 `HashMap::new()`：`c`/`rust`/`cgi` 都拿得到 `.env`，**只有 php 拿不到** ⇒
+    // 依赖 `.env` 传数据库口令/密钥的 PHP 应用静默拿到空值（本项目最忌讳的那类故障）。
+    // 必须在 `req.into_body()` **之前**取（extensions 会随 req 一起被消耗）。
+    let extra_params: HashMap<String, String> = req
+        .extensions()
+        .get::<crate::server::apps::deps::DepsEnv>()
+        .map(|d| (*d.vars).clone())
+        .unwrap_or_default()
+        .into_iter()
+        .collect();
     let request_uri = req
         .uri()
         .path_and_query()
@@ -115,7 +138,7 @@ pub async fn handle(
         server_port: lc.port,
         https: lc.ssl.is_some(),
         body,
-        extra_params: HashMap::new(),
+        extra_params,
     };
 
     let resp = fastcgi::exchange(&addr, &fcgi)

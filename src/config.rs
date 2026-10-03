@@ -1824,6 +1824,55 @@ fn resolve_ssl_material(field: &mut Option<String>, base: &Path) {
 mod tests {
     use super::*;
 
+    /// **仓库自带的 `config-test.toml` 必须始终可加载。**
+    ///
+    /// 为什么要有这条：它是 `scripts/start_server_test.sh` 与 `scripts/acceptance_test_ports.sh`
+    /// 依赖的测试档。第 3 轮我给「listener 的 root 不许落在 `state/` 里」加了配置期校验后，
+    /// 它里面的 `root = "state/l4auto"` 让**整份配置加载失败** ⇒ 那两个脚本全部起不来，
+    /// 而**直到几轮之后**我为了做端到端测试去启动测试实例时才发现（也就是说那几轮里
+    /// 验收脚本一直是坏的）。加校验时只想到了生产配置，没人检查测试档。
+    ///
+    /// 这条把「仓库里的配置」与「校验代码」钉在一起：以后再加校验，只要它误伤了自带配置，
+    /// `cargo test` 当场就红。
+    ///
+    /// 依赖测试证书（`*.pem` 被 .gitignore 忽略、不入库）—— 缺件时按本仓库既有惯例
+    /// **明确跳过并说明原因**（与 upload 测试的 `test_fs_has_room()` 同一风格），
+    /// 而不是留下一个恒失败的测试。
+    #[test]
+    fn repo_test_config_still_loads() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let cfg_path = root.join("config-test.toml");
+        if !cfg_path.is_file() {
+            eprintln!("跳过：没有 {}（不在仓库里？）", cfg_path.display());
+            return;
+        }
+        // config-test.toml 引用了这些不入库的材料；缺任何一个都无法完整加载。
+        let need = [
+            "cert.pem",
+            "key.pem",
+            "cert_ec.pem",
+            "key_ec.pem",
+            "state/ech/ech_keys.pem",
+        ];
+        let missing: Vec<&str> = need
+            .iter()
+            .copied()
+            .filter(|p| !root.join(p).is_file())
+            .collect();
+        if !missing.is_empty() {
+            eprintln!(
+                "跳过：测试材料缺失 {missing:?}（先跑 sh scripts/generate_test_certs.sh）"
+            );
+            return;
+        }
+        if let Err(e) = Config::load(&cfg_path) {
+            panic!(
+                "仓库自带的 config-test.toml 必须可加载，实际失败：{e:#}\n\
+（如果这是新加的校验误伤了它，请改配置而不是放宽校验 —— 但先想清楚测试档为何要那样写）"
+            );
+        }
+    }
+
     /// cert 不给 key：必须加载失败（否则该 TLS 口会静默退化成明文 HTTP）。
     #[test]
     fn tls_cert_without_key_is_rejected() {

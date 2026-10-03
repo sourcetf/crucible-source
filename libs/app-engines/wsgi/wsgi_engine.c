@@ -8,7 +8,9 @@
  * 现在：CPython 通过 common/crucible_pyembed.h 在进程内嵌入（Py_Initialize 一次；
  * 该头文件解释了为什么用 dlopen+dlsym 绑定 CPython C API 而不是链接期符号）。
  * 每请求：构造 WSGI environ → 调用缓存的 application → 迭代返回值 → 填
- * AppEngineResult（状态行 / 响应头 / body）；应用抛异常 → 500 + traceback。
+ * AppEngineResult（状态行 / 响应头 / body）；应用抛异常 → 500 + **固定文本**
+ *（traceback 只进 `out->error`，由 Rust 侧节流写进本地日志，不回显给客户端 —— 见
+ * `crucible_py_serve_app_error` 的说明）。
  * 宿主没有 libpython 或脚本缺失 → 显式错误（rc != 0 + error），绝不返回假 hello。
  *
  * 构建期开关：CRUCIBLE_EMBED_PYTHON_OFF 可关闭嵌入（此时全部请求显式失败）。

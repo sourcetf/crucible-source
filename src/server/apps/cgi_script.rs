@@ -164,7 +164,12 @@ pub async fn handle(
         .map_err(|e| anyhow::anyhow!("cgi_script: 请求体超出 {} 字节上限: {e}", crate::server::h1::APP_BODY_CAP))?
         .to_bytes();
     let docroot = app.docroot.clone().unwrap_or_else(|| lc.root.clone());
-    let script = script_rel(&docroot, parts.uri.path().trim_start_matches('/'))
+    // **必须剥离应用的 `paths` 前缀**（与 `app_ffi` 同一条路径）：应用配了
+    // `paths = ["/cs"]`、脚本在 `docroot/slow.cgi` 时，裸用 `uri.path()` 会去找
+    // `docroot/cs/slow.cgi` —— 必然「script not found」，于是 `cgi_script` 根本无法
+    // 与 `paths` 一起使用（实测复现）。`rel_script_path` 同时也负责目录请求回落到 index。
+    let rel = crate::server::apps::app_ffi::rel_script_path(app, parts.uri.path());
+    let script = script_rel(&docroot, rel.trim_start_matches('/'))
         .context("cgi_script script path")?;
     if !script.is_file() {
         bail!("cgi_script: script not found {}", script.display());

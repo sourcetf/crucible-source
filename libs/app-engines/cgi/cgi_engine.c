@@ -183,6 +183,14 @@ static int cgi_spawn(const char *script, char **envp, cgi_proc *p)
         /* 子进程只做 dup2 + execve（不再 malloc/setenv，避免多线程 fork 后死锁）。 */
         char *argv[3];
 
+        /* **自成进程组**：否则超时只能杀掉这个直接子进程，而 CGI 脚本起的孙进程
+         * （`sleep 300 &`、`make`、`sh -c` 里的命令）会变成孤儿继续占 CPU/内存/进程表。
+         * 父进程也会再 setpgid 一次 —— 两边都设是**故意**的：谁先跑到谁生效，另一次
+         * 在已设置时返回 EACCES（子进程已 exec）或无害成功，这样就没有竞态窗口。
+         * 与 Rust 侧 cgi_script.rs / deps.rs 的 `process_group(0)` 同一套做法。
+         * 失败也不致命（最坏情况退回旧行为：只杀直接子进程）。 */
+        (void)setpgid(0, 0);
+
         close(inpipe[1]);
         close(outpipe[0]);
         close(errpipe[0]);
@@ -206,6 +214,8 @@ static int cgi_spawn(const char *script, char **envp, cgi_proc *p)
     close(inpipe[0]);
     close(outpipe[1]);
     close(errpipe[1]);
+    /* 与子进程里的 setpgid(0,0) 配对（见那里的说明）：谁先生效都行。 */
+    (void)setpgid(pid, pid);
     cgi_set_nonblock(inpipe[1]);
     cgi_set_nonblock(outpipe[0]);
     cgi_set_nonblock(errpipe[0]);
@@ -234,7 +244,15 @@ static void cgi_kill_reap(cgi_proc *p)
 
     cgi_close_pipes(p);
     if (p->pid > 0) {
+        /* 负 pid = 杀**整个进程组**（组长就是 p->pid，见 cgi_spawn 的 setpgid(0,0)）。
+         * 只杀直接子进程时，脚本起的孙进程仍活着（实测：`sleep 120` / `sleep 300 &`
+         * 在 502 之后仍在进程表里），反复请求就会无界堆积。*/
+        (void)kill(-p->pid, SIGKILL);
+        /* 兜底再直接杀一次子进程：万一两次 setpgid 都失败（子进程还留在**服务端自己的**
+         * 进程组里），上面那个负 pid 对应的组并不存在、返回 ESRCH，会**漏掉**直接子进程
+         * ——那就比修改前还差。多这一次 kill 无副作用（已死则 ESRCH）。 */
         (void)kill(p->pid, SIGKILL);
+        /* 组长可能已经退出（kill 返回 ESRCH），仍要 waitpid 回收它。 */
         while (waitpid(p->pid, &status, 0) < 0 && errno == EINTR)
             ;
         p->pid = 0;

@@ -836,15 +836,22 @@ static int crucible_py_serve_app_error(AppEngineResult *out, const char *label,
     if (out == NULL)
         return -1;
     memset(&b, 0, sizeof(b));
-    snprintf(head, sizeof(head), "%s: 应用抛出异常（script=%s）\n", label,
-             script != NULL ? script : "(none)");
+    /* **响应体只给固定文本，绝不回显 traceback。**
+     *
+     * 此前 body = "应用抛出异常（script=/绝对路径）" + 完整 traceback —— 任意能命中该路由的
+     * 客户端都能拿到**服务器绝对路径**、脚本行号与应用内部实现细节（异常消息含配置/凭据时
+     * 就直接泄密）。本项目统一口径是「细节只进本地日志，客户端拿固定文本」（见 Rust 侧
+     * `apps::engine_error`），`cgi`/`cgi_script` 早已如此。
+     * traceback 保留在 `out->error`：Rust 侧 `app_ffi` 会把它**经节流**写进本地日志，
+     * 排障能力不丢，只是不再发给客户端。 */
+    snprintf(head, sizeof(head), "%s: application error\n",
+             label != NULL ? label : "engine");
     (void)crucible_buf_puts(&b, head);
-    (void)crucible_buf_puts(&b, trace != NULL ? trace : "no traceback available\n");
+    (void)script; /* 路径不再进响应体，只留在 error 里给日志 */
     appengine_result_alloc(out);
     out->status = 500;
     appengine_result_set_headers(out, "Content-Type: text/plain; charset=utf-8\r\n");
     appengine_result_set_body(out, b.p != NULL ? b.p : "", b.len);
-    /* traceback 同时写进 error（rc==0 时 app_ffi 以 body 为准，error 供直接 ABI 调用方） */
     appengine_result_set_error(out, trace != NULL ? trace : "application error");
     crucible_buf_free(&b);
     return 0;

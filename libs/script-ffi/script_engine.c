@@ -224,7 +224,17 @@ static int run_python_inprocess(const char *script, const char *method, const ch
     fp = fopen(script, "r");
     if (fp == NULL)
         goto done;
-    (void)PyRun_SimpleFileEx(fp, script, 1); /* fp 由 CPython 关闭 */
+    /* `PyRun_SimpleFileEx` 的返回值此前被**丢掉**了：脚本抛异常时 CPython 把 traceback
+     * 打到 stderr（进本地日志），函数返回 -1，而这里继续往下读 StringIO —— 脚本既然
+     * 抛了异常通常什么都没打印，于是 `result` 是空串、`rc = 0`，调用方给出
+     * **200 OK + 空 body**。客户端无法区分「脚本崩了」与「脚本正常但没有输出」，
+     * 正是本项目最忌讳的静默失败（对比：lua 给 500 固定文本，ruby/perl 至少返回 -1）。
+     * 返回 -2 让调用方给出**准确**的错误文本（而不是误报「解释器不可用」）。*/
+    if (PyRun_SimpleFileEx(fp, script, 1) != 0) { /* fp 由 CPython 关闭 */
+        fp = NULL;
+        rc = -2;
+        goto done;
+    }
     fp = NULL;
 
     getvalue = PyObject_GetAttrString(buf, "getvalue");
@@ -380,8 +390,8 @@ static int run_perl_inprocess(const char *script, const char *method, const char
 #endif /* CRUCIBLE_HAVE_PERL */
 
 /*
- * 执行分派。任何"嵌入不可用 / 语言未知"都返回 -1 + 调用方写错误文本，
- * 不再有 popen 回退，也不再返回假 hello。
+ * 执行分派。返回 0 = 成功；-1 = 嵌入不可用 / 语言未知（调用方写错误文本，
+ * 不再有 popen 回退，也不再返回假 hello）；-2 = 脚本自身抛异常（仅 python 目前会返回）。
  */
 static int run_lang(const char *lang, const char *script, const char *method, const char *path,
                     const char *query, const char *remote, char **out_body, size_t *out_len,
@@ -481,17 +491,29 @@ int appengine_execute(
                                                                                  : "py"));
     }
 
-    if (run_lang(lang, resolved, method, path, query, remote, &result, &result_len,
-                 &mode) != 0) {
-        free(result);
-        return script_fail(out,
-                           "%s: 进程内解释器不可用（mode=%s，script=%s）。"
-                           "本引擎不做 popen 回退，也不返回假响应；"
-                           "请用 CRUCIBLE_HAVE_%s 重建 libapp_%s.so",
-                           lang, mode, resolved, strcmp(lang, "ruby") == 0 ? "RUBY"
-                                                     : (strcmp(lang, "perl") == 0 ? "PERL"
-                                                                                 : "PYTHON"),
-                           lang);
+    {
+        int rc = run_lang(lang, resolved, method, path, query, remote, &result, &result_len,
+                          &mode);
+        if (rc != 0) {
+            free(result);
+            /* -2 = 脚本**跑起来了但抛了异常**（python 侧约定，见 run_python_inprocess）。
+             * 与 -1「嵌入解释器不可用」区分开：否则日志会把「应用代码有 bug」误报成
+             * 「引擎没编好」，排障方向直接跑偏。traceback 已由解释器写进服务端日志。 */
+            if (rc == -2)
+                return script_fail(out,
+                                   "%s: 脚本执行失败（script=%s）；详细 traceback 见服务端日志",
+                                   lang, resolved);
+            return script_fail(out,
+                               "%s: 进程内解释器不可用（mode=%s，script=%s）。"
+                               "本引擎不做 popen 回退，也不返回假响应；"
+                               "请用 CRUCIBLE_HAVE_%s 重建 libapp_%s.so",
+                               lang, mode, resolved,
+                               strcmp(lang, "ruby") == 0 ? "RUBY"
+                                                         : (strcmp(lang, "perl") == 0
+                                                                ? "PERL"
+                                                                : "PYTHON"),
+                               lang);
+        }
     }
 
     appengine_result_alloc(out);

@@ -171,11 +171,42 @@ static size_t ae_json_string(const char *s, const char *end, char *out, size_t c
         }
         if (used + 1 >= cap)
             return 0;
+        /* 解码后含 NUL（`\u0000` 或字面 NUL）一律判为无效：
+         * 环境变量名/值里的 NUL 没有合法用途，而它会**在 NUL 处截断** —— 于是键
+         * `A\u0000B` 会静默变成设置变量 `A`（打到另一个名字上）。Rust 侧的
+         * `env_lock::normalized()` 已经滤掉含 NUL 的键，但传给本函数的是**未过滤**的
+         * env 集合 ⇒ 这里必须自己挡。 */
+        if (ch == '\0')
+            return 0;
         out[used++] = ch;
     }
     if (p >= end)
         return 0;
     out[used] = '\0';
+    return (size_t)(p - s + 1);
+}
+
+/* 跳过当前这个 JSON 字符串（不落地），返回消费的字符数；畸形返回 0。
+ *
+ * 用途：**值太长装不下时跳过这一项、继续解析后面的**，而不是中断整段 env
+ * —— 见 appengine_apply_extra 里调用点的说明。 */
+static size_t ae_json_skip_string(const char *s, const char *end)
+{
+    const char *p = s;
+
+    if (p >= end || *p != '"')
+        return 0;
+    p++;
+    while (p < end && *p != '"') {
+        if (*p == '\\') {
+            p++;
+            if (p >= end)
+                return 0;
+        }
+        p++;
+    }
+    if (p >= end)
+        return 0;
     return (size_t)(p - s + 1);
 }
 
@@ -211,18 +242,37 @@ int appengine_apply_extra(const char *extra)
         if (kq == NULL || kq >= end)
             break;
         n = ae_json_string(kq, end, key, sizeof(key));
-        if (n == 0)
-            break;
+        if (n == 0) {
+            /* 键太长/含 NUL 时**跳过这个键**、继续解析它后面的值（键超长不是「后面全不要了」）。
+             * 与值那条同一理由；键在实践里很短，这里是防御性对称处理。 */
+            n = ae_json_skip_string(kq, end);
+            if (n == 0)
+                break;
+            key[0] = '\0'; /* 标记为「本项不落地」，值仍会被跳过 */
+        }
         p = kq + n;
         while (p < end && (*p == ' ' || *p == ':'))
             p++;
         if (p >= end || *p != '"')
             break;
         n = ae_json_string(p, end, val, sizeof(val));
-        if (n == 0)
-            break;
+        if (n == 0) {
+            /* **不能 break**：`ae_json_string` 在「放不下」时返回 0，而这里最容易发生的
+             * 就是**值 ≥ sizeof(val)（2048 字节）** —— base64 密钥、长列表、内联 JSON 都很
+             * 容易超。原实现的 `break` 会把这之后**所有**变量一起丢掉：应用「莫名少了几
+             * 个环境变量」，而配置、日志、面板**全都正常**，没有任何一行线索（这是本项目
+             * 最忌讳的那类故障）。改为跳过这一项、继续解析后面的。
+             * 键也一样处理（键超长同样是「这一项不要了」，而不是「后面全不要了」）。 */
+            n = ae_json_skip_string(p, end);
+            if (n == 0)
+                break; /* 真的畸形了才停 */
+            p += n;
+            continue;
+        }
         p += n;
-        if (key[0] != '\0')
+        /* 键含 `=` 时 POSIX `setenv` 会失败（EINVAL）—— 显式跳过，别指望 libc 兜底
+         * （NUL 的情况已在 ae_json_string 里挡掉）。 */
+        if (key[0] != '\0' && strchr(key, '=') == NULL)
             setenv(key, val, 1);
     }
     return 0;

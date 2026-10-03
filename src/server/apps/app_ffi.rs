@@ -258,7 +258,7 @@ fn request_has_body(m: &http::Method, h: &http::HeaderMap) -> bool {
 /// §3.3：请求路径 → 引擎脚本相对路径。
 /// 剥掉命中的 app 前缀（前缀必须整体匹配，/ 边界对齐，避免 /phplint 命中 /php）；
 /// 目录/根请求回落 `app.index`，未配置时按引擎给默认首页。
-fn rel_script_path(app: &AppRouteConfig, path: &str) -> String {
+pub(crate) fn rel_script_path(app: &AppRouteConfig, path: &str) -> String {
     let mut p = path.to_string();
     for prefix in &app.paths {
         if prefix.is_empty() || prefix == "/" {
@@ -547,6 +547,16 @@ fn call_exec(
             (lib.free)(&mut out);
             bail!("{msg}");
         }
+        // rc == 0 表示「引擎服务过这个请求」，但引擎**仍可能**填了 error：典型是
+        // WSGI/ASGI/uWSGI 的「应用抛异常 → 500 + 固定文本」，traceback **只在 error 里**
+        // （不再回显给客户端 —— 那会泄露绝对路径与源码行）。这类细节必须进本地日志，
+        // 否则排障就断了；而它又是**每请求一条**、可被对端驱动（脚本总是抛异常即可）
+        // ⇒ 走同一套按引擎的时间节流。
+        let engine_reported = if out.error.is_null() {
+            None
+        } else {
+            Some(CStr::from_ptr(out.error).to_string_lossy().into_owned())
+        };
         let headers = parse_result_headers(out.headers, out.headers_len);
         let body_out = if out.body.is_null() || out.body_len == 0 {
             Bytes::new()
@@ -555,6 +565,13 @@ fn call_exec(
         };
         let status = out.status;
         (lib.free)(&mut out);
+        if let Some(msg) = engine_reported {
+            crate::server::log_throttle::warn_every(
+                &format!("engine-app-err::{engine}"),
+                std::time::Duration::from_secs(60),
+                &format!("{engine}: 应用级错误（客户端只收到固定文本，细节仅本地）: {msg}"),
+            );
+        }
         Ok(ExecOutcome {
             status,
             headers,
@@ -579,7 +596,9 @@ fn parse_result_headers(ptr: *mut c_char, len: usize) -> Vec<(String, String)> {
         let n = if len == 0 || len > real { real } else { len };
         String::from_utf8_lossy(std::slice::from_raw_parts(ptr as *const u8, n)).into_owned()
     };
-    let mut out = Vec::new();
+    // 显式标注：下面的 content-type 去重会先**读** `out`（`iter_mut().find()`）再决定是否
+    // push，元素类型无法从 push 反推，省略标注会 E0282。
+    let mut out: Vec<(String, String)> = Vec::new();
     for line in text.lines() {
         let line = line.trim_end_matches('\r').trim();
         if line.is_empty() {
@@ -589,6 +608,21 @@ fn parse_result_headers(ptr: *mut c_char, len: usize) -> Vec<(String, String)> {
             let k = k.trim();
             let v = v.trim();
             if valid_header_kv(k, v) {
+                // `Content-Type` 按 RFC 是**单值**头。脚本引擎（`ngx.header`、CGI 打印两行
+                // `Content-Type:`、WSGI 里手写 headers）很容易输出两份，而调用方是
+                // `builder.header(k, v)` —— hyper 会**追加**而不是替换 ⇒ 响应带两个
+                // content-type，缓存/代理与客户端可能各挑一个（实测 CGI 脚本可复现）。
+                // 这里统一去重：**后者胜出**（CGI 语义），且对**所有**引擎生效。
+                // 只针对 content-type —— `Set-Cookie` 等同名多头是合法的，不能一起合。
+                if k.eq_ignore_ascii_case("content-type") {
+                    if let Some(slot) = out
+                        .iter_mut()
+                        .find(|(ek, _)| ek.eq_ignore_ascii_case("content-type"))
+                    {
+                        *slot = (k.to_string(), v.to_string());
+                        continue;
+                    }
+                }
                 out.push((k.to_string(), v.to_string()));
             }
         }
