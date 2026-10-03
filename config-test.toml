@@ -436,7 +436,13 @@ address_v6 = "::"
 port_reuse = true
 http_versions = ["h1"]
 port = 55556
-root = "state/l4auto"
+# 这个 listener 是 L4 转发的**接收端**（55555 的 `l4_forward = "127.0.0.1:55556"`），
+# 测试只验 TCP 直通，不看内容。原先写 `state/l4auto` —— 而 `Config::load` 现在**拒绝**
+# 把 `state/` 当 docroot（那里有 ECH 私钥、rndc.conf 与 DNS 分区库，未认证公开等于交出密钥），
+# 于是整份 config-test.toml 加载失败 ⇒ 依赖它的 `start_server_test.sh` /
+# `acceptance_test_ports.sh` 全部起不来（这是一个自伤的回归：第 3 轮加了那道校验后
+# **从没跑过测试档**，所以一直没人发现）。改用一个普通 www 目录。
+root = "www-l4auto"
 
 [listeners.autoindex]
 enabled = true
