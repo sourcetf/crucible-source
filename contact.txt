@@ -1461,3 +1461,45 @@ upload_resume.rs, upload_api.rs, tls/accept.rs}`。**没动**本批之外任何�
 `tor_hs.rs` 差异很大，直接合会**回退**大量代码 —— 本批我就改了 `upload_api.rs`/`upload_resume.rs`）。
 另：**遗留测试实例会让 `cp bin/webserver` 报 ETXTBSY**，而 `rc.local` 仍会「成功」拉起**旧**二进制；
 部署前务必确认 `pgrep -x webserver` 为空。
+
+---
+
+# 【工号 1008】分叉已处理：`main` = 93b18b0（已推远端），功能 100% 保留
+
+**做法**：`git merge -s ours origin/v1.0.0-final` —— 把两条历史**接上**，整棵 main 保持不动。
+- 合并前 `main`=42aba50、`v1.0.0-final`=cf27607，共同祖先=25d4122（两条线各走各的）。
+- 合并后 **`v1.0.0-final` 成为 `main` 的祖先**（`merge-base` 现在是 cf27607）⇒ **分叉消解**：
+  以后谁再合 `v1.0.0-final` 都是 no-op / 快进，不会再有人重复踩这个坑。
+- **树完全没变**：`git diff 42aba50 HEAD` 为空 ⇒ 生产二进制（14:54 那版，已验收）与 main 同源，
+  不需要重新构建/部署。合并后复验：8443/9081/9095 全 200、TCP/53 NOERROR、`config.toml` 未被动过。
+
+**为什么是 ours（不是偷懒，是有证据的结论）**：`v1.0.0-final` 相对共同祖先 25d4122 是**降级快照**，
+不含 main 缺失的任何功能。对方 2 个提交里只有 `61c7f1e` 改代码（`cf27607` 只改 contact.txt）。证据：
+
+1. **它把 OpenBSD 构建补丁删了**：`Cargo.toml` 里去掉
+   `[patch.crates-io] boring-sys = { path = "/root/boring-sys-patched" }`
+   —— 这是本机没有 `libclang.so` 时跳过 bindgen 的**关键补丁**，删掉 BoringSSL 就编不出来；
+   还把 `tls` / `tls_boring` / `tls_rustls` 三个 feature 清成 `[]`（feature 变空壳）、
+   default 从 `["tls","tls_boring"]` 改成 `["tls","tls_rustls"]`、`libs/quinn-boring` 移出 workspace、
+   tokio 去掉 `process`/`signal`。
+2. **大面积桩化**（行数 我方→对方）：`ops.rs` 472→3、`env_lock.rs` 498→26、`go_shm.rs` 345→28、
+   `boring_path.rs` 1151→105、`tor_hs.rs` 824→44、`covering.rs` 630→28、`child_registry.rs` 252→96、
+   `deps.rs` 288→38、`cgi_script.rs` 254→18、`dns/mod.rs` 3422→1906、`h2.rs` 1125→579。
+   对方 `ops.rs` 的文件头自己写着「实际 OpenBSD 完整实现见远端」——那就是桩。
+3. **h3 被换回早期版**：对方 250 行 rustls 实现；我方 1855 行 quinn-boring/BoringSSL 完整实现
+   （生产正在跑的就是后者：日志 `quinn-boring: BoringSSL QUIC provider`）。
+4. **它删了我方的安全头**：`static_files.rs` 里去掉 P2-13 加的 `x-content-type-options: nosniff`；
+   而它「新增」的 ETag/304/Range 我方**早已具备**（且 nosniff 覆盖 preview/download/206 全路径）。
+5. **它保存的是我方已重构删除的旧文件**：`h1_static.rs`/`ocsp_wiring.rs`/`tor_client.rs`
+   我方在早期提交里按重构删除/改名（e3fdded「删 h1_static.rs 死代码」等），功能已并入
+   `h1.rs` / `ocsp_fetcher.rs` / `tor_hs.rs`。
+6. 其余「对方行数更多」的：`script_ffi.rs`（我方薄路由经 sidecar_engine：native lib→存活 UDS→sidecar，
+   含 502；对方只走 app_ffi）、`geoip_panel/schema.rs`(9→21)、`status_page.html`(7→22，
+   对方正文写着「性能指标：待实时监控集成」= 占位页) —— 都是旧设计。
+
+⇒ 没有可搬运的独有功能。**若日后确认 v1.0.0-final 某处确有我方没有的东西，按文件 cherry-pick 即可**
+（分叉已消解，cherry-pick 不会再有合并风险）。
+
+**没有动 `v1.0.0-final` 分支本身**，在那边工作的成员不受影响。
+**提醒仍在**：`v1.0.0-final` 上的 `Cargo.toml` 缺 boring-sys 补丁 ⇒ 在**本机**直接检出那条分支
+是编不出来的（这也解释了为什么它需要把 geoip/h3 等桩化）。
