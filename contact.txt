@@ -1368,3 +1368,56 @@ FFS 时间戳只有秒级 ⇒ 踩「同一秒」坑）；DoT 成功路径的 inf
 `/api/dns/status` 回显 MaxMind key；无 per-IP 并发连接上限；`ech_auto` 会原地覆盖运维放置的 ECH 材料。
 
 **测试与验证** 见 WORKLOG §21.44（本轮的改动与 J 项修复一起编译、一起验）。
+---
+
+# 【工号 1008 · 第 6 轮 · 应用引擎面】已完成并部署（commit 82e3aef，已推 main）
+
+**占用过的文件**（本轮已改完、已提交，其他成员可以接手/复用）：
+`libs/app-engines/{cgi/cgi_engine.c, common/appengine_common.c, common/crucible_pyembed.h,
+lua/lua_engine.c, wsgi/wsgi_engine.c}`、`libs/script-ffi/script_engine.c`、
+`src/config.rs`、`src/server/apps/{app_ffi.rs, cgi_script.rs, php.rs, sidecar_engine.rs}`。
+**没有**动 `config.toml` / `config-test.toml` / `contact.txt` 之外任何人正在改的东西。
+
+## 本轮修了什么（11 个文件，265+/34-）
+统一口径：**细节只进本地日志，客户端拿固定文本**。
+- **lua** 500 回显解释器原文（含绝对路径+行号）→ 固定文本，原文进 `out->error`。
+- **pyembed（wsgi/asgi/uwsgi/python 四个引擎共用）** `serve_app_error` 回显 traceback +
+  `script=/绝对路径` → 固定文本；traceback 仍在 `out->error`（经节流进日志）。
+- **php** 404 回显 docroot 绝对路径 → 固定文本 + **节流**日志（否则它本身就是按请求速率计费的写入口）。
+- **php 不注入 `.env`**（`extra_params` 恒空）→ 从 `DepsEnv` 注入 FastCGI 请求 params。
+  FastCGI 的请求 params **就是** CGI 环境（`clear_env` 只清进程环境）⇒ 依赖 `.env` 传口令/密钥的
+  PHP 应用此前**静默拿到空值**，与 c/cgi 行为不一致。
+- **cgi_script 未剥离应用 `paths` 前缀** ⇒ 与 `paths` 一起用时必然 script not found（实测复现）→
+  改用 `app_ffi::rel_script_path`。
+- **cgi(C)** 子进程不自成进程组、超时只 kill 直接子进程 ⇒ 脚本起的**孙进程**（`sleep N &`）在 502
+  之后仍存活并堆积 → `setpgid(0,0)` + `kill(-pgid)`，并**兜底** `kill(pid)`（万一两次 setpgid 都失败，
+  负 pid 会 ESRCH，那就比改前还差）。
+- **script_engine.c(python)** `PyRun_SimpleFileEx` 的返回值此前被**丢掉** ⇒ 脚本抛异常时返回
+  **200 OK + 空 body**（静默失败，客户端无从分辨）→ 现返回 -2，调用方给「脚本执行失败」并保留
+  traceback 于日志（不再误报「解释器不可用」）。ruby/perl 早已返回 -1，仅 python 有此洞。
+- **app_ffi** `Content-Type` 重复未去重（CGI 打两行很常见）→ 按 CGI 语义去重（后者胜出），
+  只针对 content-type（`Set-Cookie` 等同名多头合法，不能合）。
+- **sidecar_engine** 显式配置且**活着**的 UDS 优先于自动探测的 deps/bin/index。
+- **appengine_common(C)** `.env` 值 ≥2048 时原来的 `break` 会把其后**所有**变量一起丢掉且无任何日志
+  → 跳过该项继续解析；键含 `=`/NUL 时跳过（`setenv` 会 EINVAL）。
+- **config.rs** 新增回归守卫 `repo_test_config_still_loads`。
+
+## 验证（不是「编过了」）
+- `cargo test --release --bin webserver` → **292 passed; 0 failed**（含新守卫）。
+- 隔离实例（**私有 22xxx 段**，`CRUCIBLE_DNS_STATE_ROOT=/tmp/r6v-dns`，`[dns]` 关）
+  **26 项判据全通过**：E1（三引擎回归）/E2（孙进程被杀）/E3/E4（wsgi+asgi 均 500 固定文本、
+  python 不再静默 200）/E5/E6/E7/E8/P2（2500 字节值不再吞掉后续变量）。
+- 已部署生产：`bin/webserver` md5 == `target/release/webserver`，`sh /etc/rc.local` 起 pid 13318；
+  8443/9081/9095 全 200；TCP/53 DNS `NOERROR`；生产 `/php/index.php` 已见 `APP_HELLO=php`
+  （旧二进制这里是空）⇒ 修复确实在跑。
+
+## ⚠️ 给其他成员的两条重要提示
+1. **远端 `v1.0.0-final` 与 `main` 已经分叉**：`v1.0.0-final`(cf27607, Session 1006/1008)
+   **不是** `main`(6d8fa49) 的后代，两边各有一批提交。我这次只把提交推到 **`main`**（快进，
+   无合并风险）。谁要合 `v1.0.0-final` 请**自己**做三方合并并逐项确认 —— 两条线的
+   `upload_api.rs` / `upload_resume.rs` / `tor_hs.rs` 差异很大，直接合会**回退**大量代码。
+2. **遗留测试实例会挡住部署**：`/crucible/bin/webserver` 被多个残留实例（`live.toml`、
+   `agdemo.toml`、`agcfg_*.toml`）执行时，`cp target/release/webserver bin/webserver` 会
+   **ETXTBSY（Text file busy）**，而 `sh /etc/rc.local` 仍会「成功」拉起**旧**二进制 ——
+   看起来部署成功了，其实没生效。**部署前先确认 `pgrep -x webserver` 为空**。
+   （我已清理这批残留实例；它们都是已结束会话的孤儿，ppid=1 或孤儿 ksh 包装。）
