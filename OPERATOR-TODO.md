@@ -503,4 +503,53 @@ J 项当时写的是「引擎写者都在锁内，只是进程 env 设计如此�
 ### 顺带（更正一处历史记录）
 第四轮把 `access.rs::cidr_or_exact` 的空串改成「永不匹配」（fail-closed）时，`config.rs` 里那句
 描述运行期语义的注释也一并更正为「**任何**语义下空项都是错的」（旧语义：`allow` 放行所有人 /
-`deny` 全站 403；现语义：封禁项静默失效）—— 那处已在**第四轮**的提交里，此处只是把结论记全。
+`deny` 全站 403；现语义：封禁项静默失效）—— 那处已在**第四轮**的提交里，此处只是把结论记全。---
+
+## O. `--check-config` 仍有两个**副作用**（第 3 条已修，这两条要你定）
+
+第五轮收尾时把「`--check-config` 会杀遗留子进程」修掉了（那个调用现在只在**真正的启动路径**
+上），但预检路径**还有两条副作用**，都在 `build_acceptor` 内部、`main.rs` 关不掉：
+
+1. **ECH 材料会被重写**：`ssl.ech = true` 且未配 `ssl.ech_keys` 时走 `apply_ech` →
+   `ech_auto::ensure_material`；只要磁盘上 `state/ech/ech_keys.pem` 的 ECHConfig 与当前的
+   `ech_public_name` / `max_name_length` / 套件**不匹配（含解析失败）**，它就 `generate()` +
+   `persist()` **原地覆盖**。而按 RFC 9849 部署时 `ech_keys` 是**显式配置**的（本生产就是这么配的），
+   所以**当前不会触发**；一旦有人依赖「不配 ech_keys 让它自动生成」，那么拿生产配置跑预检就可能
+   把线上正在用的 ECH 私钥覆盖掉 —— 已缓存旧 ECHConfig 的客户端从此解不开。
+2. **会联网并写缓存**：配了带 AIA OCSP 的 CA 证书时，`ocsp_fetcher::prepare_stapling` 会启动
+   续期线程，它**立即**发一次抓取并写 `state/ocsp` 缓存。自签证书（ECH 现场部署用的那种）不触发。
+
+**为什么没修**：根治要给 `ech_auto` / `ocsp_fetcher` 各加一个 dry-run 开关，并由
+`boring_path::build_acceptor` 透传「我现在是在预检」——涉及三个模块的接口，属结构性改动。
+**建议**：按 A 节部署 ECH 时**始终显式配 `ssl.ech_keys`**（本生产已如此），那样第 1 条就不会触发；
+第 2 条只在用 ACME/公共 CA 且开 OCSP 装订时才有，届时预检前先备份 `state/ocsp`。
+
+---
+
+## P. 本轮（第五轮收尾）**记录但未改**
+
+1. **`admin_files` 的 delete/rename 作用于符号链接的**目标**而非链接本身**：`safe_join` 对已存在
+   的路径返回 `fs::canonicalize` 的结果，于是对 root 内一个指向目录的符号链接，`delete_path` 会
+   `remove_dir_all` **整棵目标子树**、只留下悬空的链接（`rename` 同理移动的是目标）。
+   不是越权（root 本身被挡、越界也被挡），但是「删掉一棵比预期大的树」的静默数据丢失。
+   **没改的原因**：任何用「非 canonical 的词法路径」去 unlink/rename 的方案，都会在中间段为指向
+   root 外的符号链接时重新打开 TOCTOU 逃逸窗口（`lnk2/child`，`lnk2`→root 外）—— 那正是这轮
+   加固要堵的。正确修法是「父目录 canonical + 只对最后一段用 link 语义」，属解析语义变更。
+2. **`upload_resume` 的会话不校验属主**（按 target 路径分键，`owner` 存了但从不用）：任何客户端
+   都能对**同一路径**的上传会话续传/追加，闲置后还能 reset 截断别人的上传。属产品策略
+   （加校验会破坏「NAT 后换 IP」「多客户端协作上传」）。
+3. **`commit` 只 fsync 文件、不 fsync 父目录**（`upload_resume` 与 `admin_files` 的 rename 都是）：
+   崩溃紧跟 rename 之后仍可能丢目录项。要 `cfg(unix)` 开目录再 fsync，跨平台行为不同。
+4. **`geoip_panel::db::open` 用 `Connection::open`（CREATE）**, db 路径来自配置且只校验长度 ⇒
+   管理员可让进程在任意可写处新建 SQLite 文件；`admin_geoip` 的错误体还会把服务端**绝对路径**
+   回显给前端（仅已鉴权管理员可见）。收紧属行为变更（后半归 `admin.rs` 那一侧）。
+5. **`admin_geoip` 各处理函数回显 `{e:#}`**（db::open 的 `open <path>`、sources 的 `stat <path>`、
+   `spawn_geoip_update` 的 `missing <path>`）⇒ 服务端绝对路径进响应体/浏览器缓存。同上，属产品取舍。
+6. **`type65_api` 只有内存表、无消费者**：面板点「发布」得到 `published …`，但没有任何东西被写进
+   DNS 应答，重启即丢。是否接进 `[[dns.https_rr]]`/ECH 流程属产品决策。
+7. **`geoip_panel` 每次 lookup 重开 SQLite + 跑 DDL，且同步跑在 tokio worker 上**；`anycast` 表
+   每次 lookup 全表扫；`ensure_synced`（含最长 120s 网络下载）在周期 async 任务里直接同步调用
+   （K 节已记，本轮复核仍然成立）。
+8. **`headers_mod::append_security_headers` 是死代码**（无调用者）：全局的
+   `X-Content-Type-Options`/`X-Frame-Options`/`Referrer-Policy` 因此只在少数路径出现。
+   要不要全局加会影响**所有**响应 ⇒ 产品决策。
