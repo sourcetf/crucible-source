@@ -1421,3 +1421,43 @@ lua/lua_engine.c, wsgi/wsgi_engine.c}`、`libs/script-ffi/script_engine.c`、
    **ETXTBSY（Text file busy）**，而 `sh /etc/rc.local` 仍会「成功」拉起**旧**二进制 ——
    看起来部署成功了，其实没生效。**部署前先确认 `pgrep -x webserver` 为空**。
    （我已清理这批残留实例；它们都是已结束会话的孤儿，ppid=1 或孤儿 ksh 包装。）
+
+---
+
+# 【工号 1008 · 第 6 轮 · 并发/竞态面】已完成并部署（commit 517edff，已推 main）
+
+**占用过的文件**（已改完、已提交）：`src/server/{mod.rs, listener.rs, h2.rs, dns/mod.rs,
+upload_resume.rs, upload_api.rs, tls/accept.rs}`。**没动**本批之外任何文件。
+
+处置并发报告 7 条：**#1(P0)/#2/#3/#4/#5 已修并逐条验证**；**#6/#7 明确不改**（见下）。
+
+- **#1（P0）accept 撞 EMFILE ⇒ 监听口永久死亡**：`accept_loop` 不再 `res?` 退出（EMFILE/ENFILE/
+  ECONNABORTED/EINTR 退避重试）；`active` 从「按 bind_key」改「**按地址**」记账，reconciler 也按
+  地址判存活 ⇒ 一个地址绑定失败不再把同 listener 另一个地址（v4/v6）一起丢掉；启动时也不再
+  一个地址失败就整个进程退出。
+  **验证**：基线 200 → 2000 个空连接打满 fd 期间 000 → **释放后 200**；日志有节流的 EMFILE 重试，
+  `accept_loop ended` 计数 **0**。
+- **#2 明文口嗅探无超时** → 复用 TLS 侧预算 `PEEK_TOTAL_WAIT`(2.4s)，超时落 h1 由 30s 头读超时兜底。
+  **验证**：零字节连接 **32.4s** 被关（修复前永不关）。
+- **#3 h2 无 header 读超时** → `conn.accept()` 加 300s 空闲超时 + **本连接在飞流计数**（无流时才关，
+  避免误杀长上传）。**验证**：半截 HEADERS **300.0s** 被关（修复前 110s 仍开、无上限）。
+- **#4 named 无看门狗** → `maintenance_loop` 每 30s 探 `named_alive()`，死了走 reconcile 拉起。
+  **验证**：kill 掉实例 named ⇒ **75s 内自动拉起**（新 pid）+ 看门狗日志。
+- **#5 并发同路径全量上传** → `Session.active` + RAII `Attach` 守卫，并发闸门不再只看 `received()>0`。
+  **验证**：4 并发同目标 PUT ⇒ **1×201 + 3×409、无 500**，落盘单一来源未混写、无 `.part` 残留。
+
+单元测试 293 passed / 0 failed（含新增并发用例）；生产已部署（bin 与 target md5 一致，
+8443/9081/9095=200，TCP/53 NOERROR）。
+
+### 明确不改的两条（避免下次重复调查）
+- **#6 access_log 无界增长**：丢 access 行属**运维策略**（会把「查得到」变成「查不到」），项目已有
+  copytruncate 轮转，根因是盘长期 ~95%。建议运维决定轮转间隔/独立分区 —— 不宜由实现方擅自丢日志。
+- **#7 `write_toml_text` 读-改-写窗口**：报告本身**未复现**（15 轮 + 12 并发混合全 200、无残留 .tmp）。
+  记为已知窗口，待有复现或与面板其他改动一并处理。
+
+### ⚠️ 仍然提醒（同上次）：远端 `v1.0.0-final` 与 `main` 已分叉
+`v1.0.0-final`(cf27607) **不是** `main` 的后代。第 6 轮全部提交我都只推 **`main`**（快进，无合并风险）。
+谁要合 `v1.0.0-final` 请**自己**做三方合并并逐项确认（两边 `upload_api.rs`/`upload_resume.rs`/
+`tor_hs.rs` 差异很大，直接合会**回退**大量代码 —— 本批我就改了 `upload_api.rs`/`upload_resume.rs`）。
+另：**遗留测试实例会让 `cp bin/webserver` 报 ETXTBSY**，而 `rc.local` 仍会「成功」拉起**旧**二进制；
+部署前务必确认 `pgrep -x webserver` 为空。
