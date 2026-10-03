@@ -20,12 +20,20 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-static LAST: Mutex<Option<HashMap<&'static str, Instant>>> = Mutex::new(None);
+static LAST: Mutex<Option<HashMap<String, Instant>>> = Mutex::new(None);
+
+/// 表的上限。tag 只应由**配置/常量**派生（引擎名、固定类别），所以正常情况下最多几十个；
+/// 这个上限纯粹是「万一有人把请求数据当 tag」时的兜底 —— 到顶就整表清空（节流表清空的
+/// 后果只是「下一次都放行」，不会漏掉日志、也不会影响正确性）。
+const MAX_TAGS: usize = 512;
 
 /// 同一 `tag` 最快每 `every` 打一条 warn；**首次一定打**（否则排障时看不到第一现场）。
 ///
-/// `every` 由调用点给：频繁且低信息量的（握手失败）给分钟级，罕见的给秒级。
-pub fn warn_every(tag: &'static str, every: Duration, msg: &str) {
+/// `every` 由调用点给：频繁且低信息量的（握手失败、引擎报错）给分钟级，罕见的给秒级。
+///
+/// **tag 不要用请求数据拼**（那会让表被撑大、节流失效）：用引擎名/类别这类**配置派生**
+/// 的字符串。
+pub fn warn_every(tag: &str, every: Duration, msg: &str) {
     if !due(tag, every) {
         return;
     }
@@ -33,7 +41,7 @@ pub fn warn_every(tag: &'static str, every: Duration, msg: &str) {
 }
 
 /// 同 [`warn_every`] 的 info 版本。
-pub fn info_every(tag: &'static str, every: Duration, msg: &str) {
+pub fn info_every(tag: &str, every: Duration, msg: &str) {
     if !due(tag, every) {
         return;
     }
@@ -44,14 +52,17 @@ pub fn info_every(tag: &'static str, every: Duration, msg: &str) {
 ///
 /// 先判定再放锁再 log：`log::warn!` 内部会拿 env_logger 的锁，把它放在本函数的锁里
 /// 会与「日志锁 → 本锁」的反向顺序构成死锁风险。
-fn due(tag: &'static str, every: Duration) -> bool {
+fn due(tag: &str, every: Duration) -> bool {
     let mut g = LAST.lock().unwrap_or_else(|e| e.into_inner());
     let m = g.get_or_insert_with(HashMap::new);
+    if m.len() >= MAX_TAGS {
+        m.clear();
+    }
     let now = Instant::now();
     match m.get(tag) {
         Some(t) if now.duration_since(*t) < every => false,
         _ => {
-            m.insert(tag, now);
+            m.insert(tag.to_string(), now);
             true
         }
     }

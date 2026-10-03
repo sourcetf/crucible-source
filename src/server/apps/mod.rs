@@ -10,7 +10,17 @@ pub mod aspnet;
 /// `proxy::try_proxy` 早就按这个口径处理（并写明了原因），本文件这十几处是漏网的。
 /// 细节只进本地日志（本项目明确要求「日志不要脱敏」，日志就是排障入口）。
 fn engine_error(engine: &str, e: &anyhow::Error) -> Response<BoxBody> {
-    log::warn!("{engine} engine error: {e:#}");
+    // **必须节流**：这条是**每个失败请求一条**，而引擎失败完全由客户端决定（请求一个
+    // 没构建/没嵌入解释器的引擎路由即可）。实测 40 次 `/tsx/` 写出 80 行 / 24KB
+    // （≈600 字节/请求）—— 1000 req/s 就是 ~50GB/天，而本机磁盘长期 95%、日志是
+    // copytruncate（两次轮转之间无上界）。access_log 那行仍在（那是审计线索，
+    // 而且它只有 ~120 字节）；这里折叠的是「同一条错误链」的重复。
+    // tag 用**引擎名**（配置派生，有界），不要用路径/错误文本（那是请求数据）。
+    crate::server::log_throttle::warn_every(
+        &format!("engine-err::{engine}"),
+        std::time::Duration::from_secs(60),
+        &format!("{engine} engine error: {e:#}"),
+    );
     Response::builder()
         .status(StatusCode::BAD_GATEWAY)
         .body(full("502 Bad Gateway (engine error)"))
@@ -68,7 +78,12 @@ pub async fn try_handle(
     let deps_env = match deps::try_cached(lc, &app).await {
         Ok(e) => e,
         Err(e) => {
-            log::warn!("deps ensure failed: {e:#}");
+            // 同 engine_error：deps 坏掉时这是**每个请求一条**（客户端可控）
+            crate::server::log_throttle::warn_every(
+                "deps-ensure",
+                std::time::Duration::from_secs(60),
+                &format!("deps ensure failed: {e:#}"),
+            );
             deps::DepsEnv::default()
         }
     };
@@ -109,7 +124,11 @@ pub async fn try_handle_simple(
     let deps_env = match deps::try_cached(lc, app).await {
         Ok(e) => e,
         Err(e) => {
-            log::warn!("deps ensure failed (simple path): {e:#}");
+            crate::server::log_throttle::warn_every(
+                "deps-ensure-simple",
+                std::time::Duration::from_secs(60),
+                &format!("deps ensure failed (simple path): {e:#}"),
+            );
             deps::DepsEnv::default()
         }
     };
@@ -125,7 +144,11 @@ pub async fn try_handle_simple(
         // 人只是任意一个能命中该路由的客户端（这是上一轮 15 处回显的漏网处）。
         // 这里不能用 `engine_error()`：simple 路径的响应体是 `Bytes`（不是 `BoxBody`）。
         Err(e) => {
-            log::warn!("app engine {} failed (simple path): {e:#}", app.engine);
+            crate::server::log_throttle::warn_every(
+                &format!("engine-err-simple::{}", app.engine),
+                std::time::Duration::from_secs(60),
+                &format!("app engine {} failed (simple path): {e:#}", app.engine),
+            );
             return Some(
                 Response::builder()
                     .status(StatusCode::BAD_GATEWAY)

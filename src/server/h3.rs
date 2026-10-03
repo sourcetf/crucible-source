@@ -225,7 +225,14 @@ mod imp {
             let lc_c = lc.clone();
             tokio::spawn(async move {
                 if let Err(e) = handle_incoming(incoming, live_c, lc_c).await {
-                    log::warn!("h3 connection: {e:#}");
+                    // 按**类别+时间**节流：这条是每条出错的 QUIC 连接一条，而 `{e:#}`
+                    // 是完整错误链（可能很长）。与 tls/accept.rs 的握手失败同一处理
+                    // （那里也是匿名对端可驱动）。
+                    crate::server::log_throttle::warn_every(
+                        "h3-conn",
+                        std::time::Duration::from_secs(60),
+                        &format!("h3 connection: {e:#}"),
+                    );
                 }
             });
         }
@@ -374,7 +381,11 @@ mod imp {
             Ok(s) => s,
             Err(e) => {
                 // Handshake / GOAWAY / reset during setup — log and drop connection.
-                log::warn!("h3 server connection peer={peer}: {e:#}");
+                crate::server::log_throttle::warn_every(
+                    "h3-server-conn",
+                    std::time::Duration::from_secs(60),
+                    &format!("h3 server connection peer={peer}: {e:#}"),
+                );
                 return Ok(());
             }
         };
@@ -417,7 +428,11 @@ mod imp {
                         // After a connection-level error, stop accepting on this conn.
                         break;
                     }
-                    log::warn!("h3 accept error peer={peer}: {msg}");
+                    crate::server::log_throttle::warn_every(
+                        "h3-accept",
+                        std::time::Duration::from_secs(60),
+                        &format!("h3 accept error peer={peer}: {msg}"),
+                    );
                     break;
                 }
             }
@@ -620,9 +635,15 @@ mod imp {
             let permit = match crate::server::qmux::stream_opened(&qmux) {
                 Ok(p) => p,
                 Err(rej) => {
-                    log::warn!(
-                        "h3 qmux budget peer={peer}: {rej} (process-wide {})",
-                        crate::server::qmux::QMUX_BUDGET.stats_line()
+                    // 流预算超限是**每条被拒的流**一条 —— 一条 h3 连接上可以开很多流，
+                    // 所以这是按流速率可驱动的路径 ⇒ 节流（两个调用点共用同一 tag）。
+                    crate::server::log_throttle::warn_every(
+                        "h3-qmux-budget",
+                        std::time::Duration::from_secs(60),
+                        &format!(
+                            "h3 qmux budget peer={peer}: {rej} (process-wide {})",
+                            crate::server::qmux::QMUX_BUDGET.stats_line()
+                        ),
                     );
                     let resp = Response::builder()
                         .status(StatusCode::SERVICE_UNAVAILABLE)
@@ -642,9 +663,14 @@ mod imp {
         let permit = match crate::server::qmux::stream_opened(&qmux) {
             Ok(p) => p,
             Err(rej) => {
-                log::warn!(
-                    "h3 qmux budget peer={peer}: {rej} (process-wide {})",
-                    crate::server::qmux::QMUX_BUDGET.stats_line()
+                // 同上面 CONNECT-UDP 分支：按流速率可驱动 ⇒ 节流，共用同一 tag。
+                crate::server::log_throttle::warn_every(
+                    "h3-qmux-budget",
+                    std::time::Duration::from_secs(60),
+                    &format!(
+                        "h3 qmux budget peer={peer}: {rej} (process-wide {})",
+                        crate::server::qmux::QMUX_BUDGET.stats_line()
+                    ),
                 );
                 let resp = Response::builder()
                     .status(StatusCode::SERVICE_UNAVAILABLE)
@@ -1006,7 +1032,11 @@ use chunked uploads (Content-Range) or HTTP/1.1 for larger bodies",
                         return;
                     }
                     Err(_) => {
-                        log::warn!("h3 body task idle timeout");
+                        crate::server::log_throttle::warn_every(
+                            "h3-body-idle",
+                            std::time::Duration::from_secs(60),
+                            "h3 body task idle timeout",
+                        );
                         return;
                     }
                 }
@@ -1068,7 +1098,11 @@ use chunked uploads (Content-Range) or HTTP/1.1 for larger bodies",
             {
                 Ok(n) => n,
                 Err(_) => {
-                    log::warn!("h3 body idle timeout peer={peer}");
+                    crate::server::log_throttle::warn_every(
+                        "h3-body-idle",
+                        std::time::Duration::from_secs(60),
+                        &format!("h3 body idle timeout peer={peer}"),
+                    );
                     return Err(H3BodyErr::Other);
                 }
             };
