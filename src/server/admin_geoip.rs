@@ -1,6 +1,6 @@
 //! Admin GeoIP API handlers (Rust-only; no Python bridge).
 
-use crate::server::geoip_panel::{aliases, covering, db, lookup, sources};
+use crate::server::geoip_panel::{aliases, covering, db, iputil, lookup, sources};
 use crate::server::h1::{full, BoxBody};
 use crate::server::live_config::LiveConfig;
 use http_body_util::BodyExt;
@@ -143,9 +143,15 @@ pub async fn handle_sources(_req: &Request<Full<Bytes>>) -> Response<BoxBody> {
         }
     }
     let sources_json = std::path::Path::new("data/geoip/current/SOURCES.json");
+    // `meta` 是**外部文件**（离线脚本产物）的内容，此前直接拼进 JSON 体。文件一旦不是
+    // 合法 JSON（半截写入、BOM、混入日志行），整个响应就不再是合法 JSON ⇒ 前端
+    // `JSON.parse` 抛错，GeoIP 数据源面板整块不可用。这里先解析再序列化：合法则原样
+    // 保形，非法则回落 `{}`，保证响应体永远是合法 JSON。
     let file_meta = if sources_json.is_file() {
         match sources::load_sources_json(sources_json) {
-            Ok(raw) => raw,
+            Ok(raw) => serde_json::from_str::<serde_json::Value>(&raw)
+                .map(|v| v.to_string())
+                .unwrap_or_else(|_| "{}".into()),
             Err(_) => "{}".into(),
         }
     } else {
@@ -464,15 +470,26 @@ fn form_field(body: &str, key: &str) -> Option<String> {
     for part in body.split('&') {
         if let Some((k, v)) = part.split_once('=') {
             if k == key {
-                return Some(
-                    percent_encoding::percent_decode_str(v)
-                        .decode_utf8_lossy()
-                        .into_owned(),
-                );
+                return Some(decode_component(v));
             }
         }
     }
     None
+}
+
+/// 解一个 `application/x-www-form-urlencoded` / query 组件。
+///
+/// 为什么不能直接 `percent_decode_str`：它只认 `%XX`，**不认 `+`**，而前端
+/// （`admin_ui.html` 的 `fpost` / 冲突裁决的 `URLSearchParams`）以及浏览器本身
+/// 都把空格编成 `+`。于是 "China Telecom" 到达服务端是 `China+Telecom`，被原样
+/// 存进 `panel_edits.value`（覆盖值被写坏）或拿去 LIKE 匹配（多词 ISP/Cloud
+/// 筛选恒空，表现为「库里没数据」）。顺序必须是先 `+`→空格再百分号解码：
+/// 编码器会把字面 `+` 编成 `%2B`，先解百分号再替换会把 `%2B` 错当空格。
+fn decode_component(v: &str) -> String {
+    let spaced = v.replace('+', " ");
+    percent_encoding::percent_decode_str(&spaced)
+        .decode_utf8_lossy()
+        .into_owned()
 }
 
 /// `GET /api/geoip/update/status?since=<bytes>` — 离线更新的进度。
@@ -594,6 +611,10 @@ fn lookup_json(ip_s: &str, db_path: Option<&std::path::Path>) -> Response<BoxBod
             json_str(ip_s)
         ));
     };
+    // v4-mapped（`::ffff:1.2.3.4`）折回 v4 再查：covering 按地址族分流，带着 `::ffff:`
+    // 前缀会被当成 v6 去查 ipv6 表，于是同一个地址在双栈入口下查不到任何 v4 数据
+    // （面板显示「无结果」）。与 rate_limit/access/basic_auth 的归一化口径一致。
+    let ip = iputil::unmap_v4_mapped(ip);
     let Some(db_path) = db_path else {
         return json_ok(format!(
             "{{\"ip\":{},\"status\":\"no_db\",\"country\":null,\"label\":null}}",
@@ -696,11 +717,7 @@ fn query_param(q: &str, key: &str) -> Option<String> {
     for part in q.split('&') {
         if let Some((k, v)) = part.split_once('=') {
             if k == key {
-                return Some(
-                    percent_encoding::percent_decode_str(v)
-                        .decode_utf8_lossy()
-                        .into_owned(),
-                );
+                return Some(decode_component(v));
             }
         }
     }
@@ -829,5 +846,28 @@ fn url_decode(s: &str) -> String {
         }
     }
     r
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 表单/查询解码：空格（前端编成 `+`）必须还原；`%2B` 是字面加号，不能被当成空格。
+    #[test]
+    fn form_and_query_decode_plus_as_space() {
+        // 前端 fpost/URLSearchParams 把 "China Telecom" 编成 "China+Telecom"
+        assert_eq!(form_field("value=China+Telecom", "value").unwrap(), "China Telecom");
+        assert_eq!(
+            query_param("isp=China+Telecom&limit=50", "isp").unwrap(),
+            "China Telecom"
+        );
+        // 字面加号：编码器产出 %2B —— 先替换 '+' 再百分号解码才不会误伤
+        assert_eq!(form_field("value=a%2Bb", "value").unwrap(), "a+b");
+        // UTF-8 百分号编码
+        assert_eq!(form_field("country=%E4%B8%AD%E5%9B%BD", "country").unwrap(), "中国");
+        // 缺失键
+        assert!(form_field("value=x", "other").is_none());
+        assert!(query_param("a=1", "b").is_none());
+    }
 }
 

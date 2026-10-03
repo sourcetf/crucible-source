@@ -2949,4 +2949,88 @@ TCP 查询 + **指定源地址**（`bind` 到本机另一张网卡的 `10.126.12
 与「DNS ACL 判据集」一起进下个构建批次。
 
 **注**：本节的脚本已提交（纯验证工具，无需构建）；去重那处代码改动要等下一个构建批次
-（与 agent 的产出合并成一次构建 + 一次部署，避免为了一个外观问题多重启一次生产）。
+（与 agent 的产出合并成一次构建 + 一次部署，避免为了一个外观问题多重启一次生产）。### 21.47 第五轮收尾：管理前端 / 入口 / GeoIP 面板（三片此前从未被审过的面）+ 递归 ACL 去重
+
+第五轮最后三片里，**第一个管理前端 agent 跑完是空结果**（那个文件几千行内联 JS），所以重派了
+两个更窄的 agent（一个只盯 DOM XSS、一个盯 `main.rs`/`admin_files`/`onion_ca` 等）。这三份
+产出与本轮我自己发现的「递归 ACL 重复」一起，做成**一次构建、一次部署**。
+
+#### A. 管理前端 DOM XSS（`admin_ui.html`）—— **无 P0/P1**
+面板里每个**字符串**字段在 HTML sink 处都已用现成的 `esc()`（该 helper 早已存在，第 650 行）。
+逐 sink 核对后，只剩「数字型 id/port 被**裸拼**进内联 `onclick=`/`id=`」这一类潜在问题：
+服务端类型是 `u16`/`i64` 时不可利用，但一旦配置结构变成字符串，引号就能逃出属性/事件、
+以管理员同源执行 JS。已给 8 处包上 `esc()`（`l.port` ×2、`x.id` ×4、`resolveConflict` 的两处）。
+`status_page.html` 查完（7 行静态 ASCII、无 `<script>`、无插值、`include_str!` 原样发出）**不需要改**。
+
+**JS 语法校验补上了**：agent 说本机没有 node/deno/bun 所以没法校验 —— 它说的是这台 Windows 机器
+（我确认确实都没有），但**生产机上有 node v22**。把这个文件传上去、抽出 `<script>` 体（71KB）
+跑 `node --check` → **语法 OK**。这个缺口关掉了。（顺带记一笔方法论：跨机的验证能力不一样，
+「这台机器上没有」不等于「没法验证」。）
+
+#### B. 入口与管理文件面（`main.rs` / `onion_ca.rs`）—— 3 条 P1
+| # | 位置 | 问题 | 修法 |
+|---|---|---|---|
+| 1 | `main.rs --gen-cert` | **无声覆盖**已存在的证书/私钥。按 RFC 9849 部署 ECH 时路径是固定的 `cover.key.pem`/`real.key.pem`，一次手滑或脚本重跑就**销毁在用私钥**，且没有备份（内层私钥丢了不可恢复） | 默认（无 `--force`）对 out-cert/out-key **任一存在即拒绝**；需要原地轮换时显式 `--force`。cert/key **任一**存在都拒（只写一半会留下「证书/私钥不匹配」的残局） |
+| 2 | `main.rs` 私钥落盘 | **先按 umask（通常 0644）落地再 chmod 0600** ⇒ 有「本机任何用户可读」的窗口。两张证书里有一张是内层真实证书，泄露等于交出真实身份。（同类问题此前在 `ech_auto::EchMaterial::persist` 与 DNS 的 `write_atomic` 已修过，`main.rs` 没被审过所以漏了） | 抽 `write_secret_key`：unix 上用 `OpenOptions::mode(0o600)` **创建即 0600**，再显式 chmod 定稿 |
+| 3 | `main.rs` 启动顺序 | **`--check-config` 并非无副作用**：它在任何分支之前就跑 `cleanup_orphans_at_startup()`（会跑 `ps`、并对匹配本仓库路径的遗留子进程发 SIGTERM/SIGKILL、还睡 300ms），与注释承诺的「只加载+校验、无副作用」矛盾；`--gen-cert` 同样平白杀进程 | 把该调用移到两个子命令的提前返回**之后**（只属真正启动路径），并把注释里两处错误声明更正 |
+
+第 3 条还**如实更正了注释里的一个错误声明**：原注释说构建 acceptor「只读本地材料、不发网络请求、
+无副作用」，而实际有两条反例 —— ① 配 ECH 且未配 `ech_keys` 时 `ech_auto::ensure_material` 会
+**重新生成并落盘** `state/ech/ech_keys.pem`（拿生产配置跑预检可能覆盖线上在用的 ECH 私钥）；
+② 配了带 AIA OCSP 的 CA 证书时会**立即联网抓取并写 `state/ocsp` 缓存**。根治要给它俩加 dry-run
+开关（那两个文件不在本片范围），已在注释里点明，并记入 OPERATOR-TODO N 节。
+
+`onion_ca.rs`（P2）：Ed25519 OID 检查是**子串**匹配（`alg.windows(3).any(|w| w == ED25519_OID)`）
+⇒ `SEQUENCE { OID rsa, OCTET STRING {2b 65 70} }` 也能通过 —— OID 根本不是 Ed25519，只是参数里
+**恰好含**那三个字节。改成整段相等（`ED25519_ALG_ID`，RFC 8410 要求 parameters 缺省）+ 对抗测试。
+（诚实评估：期望公钥是**公开**的，攻击者本来就能直接伪造合法 Ed25519 SPKI，真正防「取 RSA 尾巴」
+的是长度必须恰为 32 的检查 —— 所以这是纵深加固，不是可利用的假通过。）
+
+#### C. GeoIP 面板（14 个文件里 12 个此前从未被审过）—— 7 条
+- **P1** 表单/查询解码**不把 `+` 还原成空格**：`percent_decode_str` 只认 `%XX`，而前端
+  （`fpost` / 冲突裁决的 `URLSearchParams`）与浏览器都把空格编成 `+`。于是 "China Telecom" 到达
+  服务端是 `China+Telecom`，被原样存进 `panel_edits.value`（覆盖值被写坏、再喂给分线路 DNS），
+  同时多词 ISP/Cloud 筛选**恒空**（`LIKE '%china+telecom%'`）—— 运维看到的是「库里没数据」。
+  修法：先 `+`→空格再百分号解码（顺序关键：字面 `+` 会被编码器写成 `%2B`，反过来会误伤）。
+- **P2** `handle_sources` 把 SOURCES.json 的**原文**拼进 JSON 体 ⇒ 文件一旦不是合法 JSON
+  （半截写入/BOM/混入一行日志），整个响应就不再是合法 JSON，前端 `JSON.parse` 抛错、
+  GeoIP 数据源面板整块不可用 → 先解析再序列化，非法回落 `{}`。
+- **P2** 带 `::ffff:` 的 v4-mapped 地址查不到任何 v4 数据（covering 按地址族分流，`::ffff:1.2.3.4`
+  被当成 v6 去查 ipv6 表）→ 加 `iputil::unmap_v4_mapped` 归一（与 rate_limit/access/basic_auth 同一口径）。
+- **P2** anycast 前缀**未归一**：`add_anycast_prefix("10.0.0.1", 8)` 原样存 `"10.0.0.1"`。匹配时
+  两边都套掩码尚可，但该字符串经 `anycast_prefixes()` 外泄给下游后，一旦被当成区间起点就退化成
+  「隐式 /32」⇒ 覆盖查询静默漏行 → 新增 `iputil::normalize_v4_prefix`（清长度以下的位）。
+- **P3** `load_sources_json` 无界 `read_to_string`（离线管线产物，写坏成超大文件时按文件大小分配）
+  → 加 8MiB 上限（与 `ssl_material::load_bytes` 同一策略）。
+- **P3** `toml_store::save` 是**截断后写**（非原子）：95% 磁盘写满或中途崩溃会把已有 panel.toml
+  毁成空/半截，下次 load 解析失败即丢全部设置 → 同目录临时文件 + rename。
+- **P2 未改**（`db.rs`）：`geoip` 表缺数值范围索引，而 `covering.rs` 声称走 `idx_*_numeric` ⇒ 每次
+  v4 lookup 对百万级表**全表扫**。**没改的原因**：在此处补 `CREATE INDEX` 会在一次 GET lookup 上
+  触发大表一次性建索引，95% 磁盘下失败会让 `open()` 返回 Err、整个 lookup 通道报错。
+  正确归宿是「连接缓存 + 一次性建索引」（已记 K 节）。
+
+#### D. 顺带：`named.conf` 的递归 ACL 重复（我自己发现的）
+生产 `named.conf` 里是 `{ 127.0.0.1; 127.0.0.1; }` —— 根因是 `write_all` 里「**始终**把 127.0.0.1
+追加进递归白名单」那段（第二轮为修「DoT 转发被自己 REFUSED」加的）没有去重，而运维/面板本来就
+写了 127.0.0.1。对 BIND 无害（它会自己去重），但 `named.conf` 是运维读的那份「生效配置」，
+重复项会让人怀疑有两套来源、也误导排查。已改为「仅在缺失时追加」。
+
+#### 验证（本次全部实测）
+| 判据 | 结果 |
+|---|---|
+| `cargo test --release --features 'tls,tls_boring,go_shm_ipc,tls_nss,tls_tomcrypt'` | **291 passed / 0 failed**（比上批 +10，全部来自新增单测） |
+| `admin_ui.html` 内联 JS | 生产机 `node --check` → **语法 OK** |
+| `--gen-cert` 默认拒绝覆盖 | 第二次调用报「已存在 —— 拒绝覆盖」，且**私钥 md5 未变**；`--force` 才真的换新；私钥权限 `-rw-------`（0600） |
+| `--check-config` | RC=0，`config OK (listeners=5, apps=18, tls acceptors built=3)` |
+| **递归 ACL 去重** | 生成物为 `allow-recursion { 127.0.0.1; }`（修前两遍） |
+| **DNS 安全判据**（凭据无关，6 项） | 全 PASS：非回环源 AXFR REFUSED / 拿不到递归数据 / 根区 SOA 有应答 / 对外权威正常 / 非权威名无权威答案 |
+| **跨协议回归扫** | 与部署前**逐项一致**（11 引擎 200、7 环境缺件 502、静态/h2/h3 200、管理面与指标 401、穿越 404、Range、DNS、DoT） |
+| **J 项六条判据** | 全 PASS（含两条反向） |
+| **ECH 端到端** | 内层 `prod.crucible.local`（`3195f73d…`）≠ 外层 `crucible.local`（`72147ac1…`）；非 ECH 客户端只看到外层名 |
+| 发布 | `dns_listen_redeploy.sh`（**显式重启 named**，因为本批改了 named.conf 生成；reconcile 只判 named 活着与否）—— 快照 `20261003-095453`、`named-checkconf OK`、三张 :53 socket 全在（127.0.0.1 / 83.229.125.81 / 10.126.126.1） |
+
+#### 修 agent 代码时发现的一处编译错误（记下来）
+`main.rs` 里 `write_secret_key(out_key, pkey.private_key_to_pem_pkcs8()?.as_bytes())` ——
+`private_key_to_pem_pkcs8()` 返回的是 `Vec<u8>`，没有 `as_bytes()`（那是 `String`/`str` 的方法）。
+改成先绑定 `let key_pem = ...`，再传 `&key_pem`。**这条只能靠编译器发现** —— 也是为什么每批
+都要真编一次，而不能只看 diff 就合并。

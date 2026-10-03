@@ -50,15 +50,15 @@ const ANYCAST_V4: &[(&str, u32)] = &[
 static EXTRA_ANYCAST: Lazy<Mutex<Vec<(String, u32)>>> = Lazy::new(|| Mutex::new(Vec::new()));
 
 /// 面板追加 anycast 前缀（base=网络地址, bits=前缀长；v4）。
+///
+/// base 必须先归一到**网络地址**再存：`is_anycast` 现在两边都套掩码，匹配不受影响，
+/// 但存下的字符串会经 `anycast_prefixes()` 外泄给下游（面板展示 / 写回 anycast 表 /
+/// 生成视图）；原样存 `10.0.0.1/8` 一旦被当成区间起点就退化成「隐式 /32」，
+/// 覆盖查询静默漏行。归一化与校验都走 iputil，保证与查询侧同一套口径。
 pub fn add_anycast_prefix(base: &str, bits: u32) -> anyhow::Result<()> {
-    let b: std::net::Ipv4Addr = base
-        .trim()
-        .parse()
-        .map_err(|e| anyhow::anyhow!("invalid anycast base {base:?}: {e}"))?;
-    if bits > 32 {
-        anyhow::bail!("v4 prefix length must be <= 32");
-    }
-    EXTRA_ANYCAST.lock().push((b.to_string(), bits));
+    let net = crate::server::geoip_panel::iputil::normalize_v4_prefix(base, bits)
+        .ok_or_else(|| anyhow::anyhow!("invalid anycast prefix {base:?}/{bits}"))?;
+    EXTRA_ANYCAST.lock().push((net, bits));
     Ok(())
 }
 
@@ -113,4 +113,37 @@ pub fn is_anycast(ip: IpAddr) -> bool {
 /// When anycast or country conflict, suppress city-level fields.
 pub fn suppress_locality(country_conflict: bool, anycast: bool) -> bool {
     country_conflict || anycast
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::{IpAddr, Ipv4Addr};
+
+    /// 掩码边界：/0 匹配全部、/32 精确、中间左移；`>= 32` 不能触发移位溢出。
+    #[test]
+    fn v4_mask_boundaries() {
+        assert_eq!(v4_mask(0), 0);
+        assert_eq!(v4_mask(8), 0xff00_0000);
+        assert_eq!(v4_mask(24), 0xffff_ff00);
+        assert_eq!(v4_mask(32), u32::MAX);
+        assert_eq!(v4_mask(64), u32::MAX); // 越界不得 panic
+    }
+
+    #[test]
+    fn seed_prefixes_match() {
+        // 种子表内的地址命中，表外不命中。
+        assert!(is_anycast(IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1))));
+        assert!(is_anycast(IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8))));
+        assert!(!is_anycast(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1))));
+        // 目前不处理 v6（保持既有行为，不误报）。
+        assert!(!is_anycast("2001:db8::1".parse().unwrap()));
+    }
+
+    #[test]
+    fn suppress_rule() {
+        assert!(!suppress_locality(false, false));
+        assert!(suppress_locality(true, false));
+        assert!(suppress_locality(false, true));
+    }
 }

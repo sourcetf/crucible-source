@@ -1299,7 +1299,13 @@ pub fn gen_named_conf(cfg: &DnsConfig, zones: &[ZoneRow]) -> String {
         // 自定义递归白名单（如 "10.0.0.0/8"），面板上 DoT/DoH 开关看着正常，
         // 实际每个查询都被自己的 named 回 REFUSED。本机不在白名单之外。
         let mut rec_acl = cfg.recursion_acl.clone();
-        rec_acl.push("127.0.0.1".to_string());
+        // **去重**：运维（或面板）本来就把 127.0.0.1 写进白名单时，这里再 push 一次会得到
+        // `{ 127.0.0.1; 127.0.0.1; }` —— 对 BIND 无害（它自己会去重），但 named.conf 是
+        // 运维读的那份「生效配置」，重复项会让人怀疑是不是有两套来源、也误导排查。
+        // 本机实测确实出现过（生产 named.conf 里就是两遍）。
+        if !rec_acl.iter().any(|x| x.trim() == "127.0.0.1") {
+            rec_acl.push("127.0.0.1".to_string());
+        }
         let rec_acl = acl_or(&rec_acl, "127.0.0.1");
         s.push_str(&format!(
             "\n  allow-recursion {rec_acl}; allow-query-cache {rec_acl};"

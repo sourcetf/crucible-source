@@ -14,7 +14,26 @@ pub struct SourceRow {
     pub last_unix: i64,
 }
 
+/// SOURCES.json 体积上限（真实文件仅几 KB）。见 [`load_sources_json`] 的说明。
+const MAX_SOURCES_JSON: u64 = 8 * 1024 * 1024;
+
+/// 读 SOURCES.json 原文。
+///
+/// 上限不是为了对抗攻击者，而是防「无界读」把一次面板请求变成大内存分配：
+/// 这个文件是离线管线产物，写坏/被替换成超大文件时，`read_to_string` 会按需
+/// 分配整个文件大小（在 tokio worker 上）——本机 95% 磁盘、只有 2 条 worker，
+/// 一次大分配就可能拖垮整站。与 `ssl_material::load_bytes` 同一策略（先查大小）。
 pub fn load_sources_json(path: &Path) -> Result<String> {
+    let md = std::fs::metadata(path)
+        .with_context(|| format!("stat {}", path.display()))?;
+    if md.len() > MAX_SOURCES_JSON {
+        anyhow::bail!(
+            "SOURCES.json too large ({} bytes, cap {}): {}",
+            md.len(),
+            MAX_SOURCES_JSON,
+            path.display()
+        );
+    }
     Ok(std::fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?)
 }
 

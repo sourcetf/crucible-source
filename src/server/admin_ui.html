@@ -811,8 +811,10 @@ async function renderListeners(){
   CFG.listeners.forEach(l=>{
     h+='<tr><td>'+esc(l.port)+'</td><td>'+esc(l.address)+'</td><td>'+esc(l.root)+'</td><td>'+(l.ssl?'<span class="tag">ssl</span>':'—')+'</td>'
       +'<td>'+esc((l.http_versions||[]).join(','))+'</td><td>'+((l.apps||[]).length)+'</td><td>'+esc(l.server_name||'')+'</td>'
-      +'<td class="actions"><button class="act mini" onclick="editListener('+l.port+')">编辑</button>'
-      +'<button class="act mini danger" onclick="delListener('+l.port+')">删除</button></td></tr>';
+      // 端口当前是 u16，仍按外部数据 esc 后再拼进 onclick：内联事件里的值一旦变成字符串，
+      // 未转义会直接逃出引号注入 JS。
+      +'<td class="actions"><button class="act mini" onclick="editListener('+esc(l.port)+')">编辑</button>'
+      +'<button class="act mini danger" onclick="delListener('+esc(l.port)+')">删除</button></td></tr>';
   });
   h+='</table>';
   wrap.innerHTML=h; bindGeoipActionButtons(wrap);
@@ -1553,7 +1555,8 @@ async function loadGeoEdits(){
   let h='<table class="data"><tr><th>id</th><th>prefix</th><th>field</th><th>value</th><th>weight</th><th></th></tr>';
   rows.forEach(x=>{
     h+='<tr><td>'+esc(x.id)+'</td><td>'+esc(x.prefix)+'</td><td>'+esc(x.field)+'</td><td>'+esc(x.value)+'</td><td>'+esc(x.weight)+'</td>'
-      +'<td class="actions"><button class="act mini danger" onclick="delGeoEdit('+x.id+')">删除</button></td></tr>';
+      // id 也是服务端数据，拼进内联 onclick 必须转义（引号/分号可注入 JS）。
+      +'<td class="actions"><button class="act mini danger" onclick="delGeoEdit('+esc(x.id)+')">删除</button></td></tr>';
   });
   h+='</table>';
   el.innerHTML=h;
@@ -1574,7 +1577,7 @@ $('btnGeoConflicts').onclick=async()=>{
   rows.forEach(x=>{
     h+='<tr><td>'+esc(x.id)+'</td><td>'+esc(x.prefix)+'</td><td>'+esc(x.field)+'</td><td>'+esc(x.sources)+'</td>'
       +'<td class="actions"><button class="act mini conflict-use" data-id="'+esc(x.id)+'" data-prefix="'+esc(x.prefix)+'" data-field="'+esc(x.field)+'">以此为准(覆盖)</button>'
-      +'<button class="act mini ghost" onclick="resolveConflict('+x.id+')">已处理</button></td></tr>';
+      +'<button class="act mini ghost" onclick="resolveConflict('+esc(x.id)+')">已处理</button></td></tr>';
   });
   h+='</table>';
   el.innerHTML=h;
@@ -2121,15 +2124,17 @@ document.getElementById('btnGeoConflicts').onclick = async () => {
     const srcBtns = sources.map(s =>
       '<button class="act mini src-pick" data-id="'+esc(x.id)+'" data-prefix="'+esc(x.prefix)+'" data-field="'+esc(x.field)+'" data-src="'+esc(s)+'">'+esc(s)+'</button>'
     ).join(' ');
-    html += '<tr id="row-' + x.id + '">' +
+    // id 既是服务端数据，又同时出现在 id= 与内联 onclick= 里：两处都必须转义，
+    // 否则一旦它不再是纯数字，引号就能逃出属性/事件执行。
+    html += '<tr id="row-' + esc(x.id) + '">' +
       '<td>' + esc(x.id) + '</td>' +
       '<td><code>' + esc(x.prefix) + '</code></td>' +
       '<td>' + esc(x.field) + '</td>' +
-      '<td>' + srcBtns + ' <span class="hint" id="val-' + x.id + '">—</span></td>' +
-      '<td><span id="preview-' + x.id + '">—</span></td>' +
+      '<td>' + srcBtns + ' <span class="hint" id="val-' + esc(x.id) + '">—</span></td>' +
+      '<td><span id="preview-' + esc(x.id) + '">—</span></td>' +
       '<td class="actions">' +
         '<button class="act mini conflict-use" data-id="'+esc(x.id)+'" data-prefix="'+esc(x.prefix)+'" data-field="'+esc(x.field)+'">手动填值</button> ' +
-        '<button class="act mini ghost" onclick="resolveConflict(' + x.id + ',true)">跳过此冲突</button>' +
+        '<button class="act mini ghost" onclick="resolveConflict(' + esc(x.id) + ',true)">跳过此冲突</button>' +
       '</td>' +
     '</tr>';
   });

@@ -7,6 +7,23 @@ pub fn parse_ip(s: &str) -> Option<IpAddr> {
     s.trim().parse().ok()
 }
 
+/// 把 v4-mapped 的 IPv6（`::ffff:a.b.c.d`）折回 IPv4；其余原样返回。
+///
+/// 为什么必须做：`IpAddr::from_str("::ffff:1.2.3.4")` 得到的是 **V6**，其字符串形
+/// 也是 `::ffff:1.2.3.4`。covering 侧按地址族分流（v4 走 geoip/ipv4 表、v6 走 ipv6
+/// 表），于是同一个地址带上 `::ffff:` 前缀后查不到任何 v4 数据 —— 面板表现为
+/// 「库里有这个 IP，却查不出结果」。本项目其它入口（`rate_limit`/`access`/
+/// `basic_auth`）早就把 v4-mapped 归一成 v4，这里与它们保持一致。
+pub fn unmap_v4_mapped(ip: IpAddr) -> IpAddr {
+    match ip {
+        IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
+            Some(v4) => IpAddr::V4(v4),
+            None => IpAddr::V6(v6),
+        },
+        v4 => v4,
+    }
+}
+
 /// IPv4 → u32 host order for numeric range compares (TEXT lex order is wrong).
 pub fn ipv4_to_u32(s: &str) -> Option<u32> {
     s.trim().parse::<Ipv4Addr>().ok().map(u32::from)
@@ -56,6 +73,22 @@ pub fn ipv4_in_range(ip: &str, start: &str, end: &str) -> bool {
         (Some(i), Some(a), Some(b)) => i >= a && i <= b,
         _ => false,
     }
+}
+
+/// 把 IPv4 前缀 `base/bits` 归一成**网络地址**（长度以下的位清零）。
+///
+/// 为什么必须清位：`10.0.0.1/8` 的语义是 `10.0.0.0/8`。若把 base 原样存下（面板追加
+/// anycast 段就是这么做的），只要下游按「网络地址 ↔ 区间」用它（例如写成 start/end 行、
+/// 或与别的 /8 做字符串比较），主机位就会让 `10.0.0.1..10.0.0.1` 这种「隐式 /32」
+/// 生效，覆盖查询静默漏行。`bits > 32` 或 base 非法（含 `::ffff:..`、`fe80::1%eth0`
+/// 这类非纯 v4 写法）一律返回 None，由调用方决定报错。
+pub fn normalize_v4_prefix(base: &str, bits: u32) -> Option<String> {
+    if bits > 32 {
+        return None;
+    }
+    let v4: Ipv4Addr = base.trim().parse().ok()?;
+    let mask = if bits == 0 { 0 } else { u32::MAX << (32 - bits) };
+    Some(Ipv4Addr::from(u32::from(v4) & mask).to_string())
 }
 
 /// Normalize IPv6 to canonical compressed form; IPv4 unchanged.
@@ -109,6 +142,7 @@ fn canonical_ipv6(v6: Ipv6Addr) -> Ipv6Addr {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::net::{IpAddr, Ipv4Addr};
 
     #[test]
     fn ipv4_numeric_order() {
@@ -175,5 +209,37 @@ mod tests {
         for (ip, want) in cases {
             assert_eq!(range_numeric_key(ip), Some(*want), "range key mismatch for {ip}");
         }
+    }
+
+    /// v4-mapped 归一：带 `::ffff:` 的地址必须折回 v4，否则面板按地址族分流会漏掉 v4 数据。
+    #[test]
+    fn v4_mapped_unmaps_to_v4() {
+        let m = |s: &str| unmap_v4_mapped(parse_ip(s).unwrap());
+        assert_eq!(m("::ffff:1.2.3.4"), IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)));
+        // 纯 v4 / 纯 v6 不受影响。
+        assert_eq!(m("1.2.3.4"), IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)));
+        assert_eq!(m("2001:db8::1"), "2001:db8::1".parse::<IpAddr>().unwrap());
+        // 只是「看起来像」但不属于 v4-mapped 段的 v6 不能被折叠。
+        assert_eq!(m("::1"), "::1".parse::<IpAddr>().unwrap());
+        assert_eq!(m("::fffe:1.2.3.4"), "::fffe:1.2.3.4".parse::<IpAddr>().unwrap());
+    }
+
+    /// 前缀归一：长度以下的位必须清零；/0、/32 边界；/33、非法、非纯 v4 一律 None。
+    #[test]
+    fn v4_prefix_normalization() {
+        assert_eq!(normalize_v4_prefix("10.0.0.1", 8).as_deref(), Some("10.0.0.0"));
+        assert_eq!(normalize_v4_prefix("10.0.0.255", 24).as_deref(), Some("10.0.0.0"));
+        assert_eq!(normalize_v4_prefix("192.168.1.130", 25).as_deref(), Some("192.168.1.128"));
+        assert_eq!(normalize_v4_prefix("10.0.0.1", 0).as_deref(), Some("0.0.0.0"));
+        assert_eq!(normalize_v4_prefix("255.255.255.255", 32).as_deref(), Some("255.255.255.255"));
+        // 非网络地址在 /32 下保持不变（唯一合法主机位就是它本身）。
+        assert_eq!(normalize_v4_prefix("10.0.0.1", 32).as_deref(), Some("10.0.0.1"));
+        // 越界 / 非法 / 空 / 带空白 / v4-mapped / zone index ⇒ None
+        assert_eq!(normalize_v4_prefix("10.0.0.0", 33), None);
+        assert_eq!(normalize_v4_prefix("10.0.0.0/8", 8), None);
+        assert_eq!(normalize_v4_prefix("", 8), None);
+        assert_eq!(normalize_v4_prefix("not-an-ip", 8), None);
+        assert_eq!(normalize_v4_prefix("::ffff:1.2.3.4", 24), None);
+        assert_eq!(normalize_v4_prefix("fe80::1%eth0", 64), None);
     }
 }

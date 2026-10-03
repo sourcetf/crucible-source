@@ -25,15 +25,37 @@ pub fn load(path: &Path) -> Result<PanelConfig> {
 }
 
 /// Save panel settings to disk (creates parent dirs).
+///
+/// 原子写：先写同目录临时文件再 rename。直接 `fs::write` 是「先截断再写」——
+/// 磁盘写满（本机长期 95%）或进程在写到一半时挂掉，会把已有 panel.toml 毁成
+/// 空文件/半截文件，下次 load 解析失败即丢全部设置。rename 同目录是原子的，
+/// 失败时旧文件原样保留。
 pub fn save(path: &Path, cfg: &PanelConfig) -> Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)
             .with_context(|| format!("mkdir {}", parent.display()))?;
     }
     let text = serialize_panel_toml(cfg);
-    fs::write(path, text)
-        .with_context(|| format!("write geoip panel {}", path.display()))?;
+    // 同目录临时文件：rename 只有在同一文件系统内才是原子的。
+    let tmp = tmp_path(path);
+    if let Err(e) = fs::write(&tmp, text) {
+        let _ = fs::remove_file(&tmp);
+        return Err(e).with_context(|| format!("write geoip panel {}", tmp.display()));
+    }
+    if let Err(e) = fs::rename(&tmp, path) {
+        let _ = fs::remove_file(&tmp);
+        return Err(e).with_context(|| {
+            format!("rename {} -> {}", tmp.display(), path.display())
+        });
+    }
     Ok(())
+}
+
+/// 同名临时文件路径（`panel.toml` → `panel.toml.tmp`）。
+fn tmp_path(path: &Path) -> PathBuf {
+    let mut s = path.as_os_str().to_os_string();
+    s.push(".tmp");
+    PathBuf::from(s)
 }
 
 fn parse_panel_toml(text: &str) -> Result<PanelConfig> {
@@ -73,4 +95,38 @@ fn serialize_panel_toml(cfg: &PanelConfig) -> String {
         if cfg.enabled { "true" } else { "false" },
         db.replace('\\', "/")
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_roundtrip() {
+        let cfg = PanelConfig {
+            enabled: true,
+            db_path: Some(PathBuf::from("/data/geoip/current/geoip.sqlite")),
+        };
+        let text = serialize_panel_toml(&cfg);
+        let back = parse_panel_toml(&text).unwrap();
+        assert!(back.enabled);
+        assert_eq!(back.db_path, cfg.db_path);
+    }
+
+    /// save 后：文件内容正确、同目录临时文件不残留（原子写不该留下 .tmp）。
+    #[test]
+    fn save_is_atomic_and_leaves_no_tmp() {
+        let dir = std::env::temp_dir().join(format!("crucible_geoip_toml_{}", std::process::id()));
+        let _ = fs::create_dir_all(&dir);
+        let path = dir.join("panel.toml");
+        let cfg = PanelConfig {
+            enabled: true,
+            db_path: Some(PathBuf::from("data/geoip/panel.sqlite")),
+        };
+        save(&path, &cfg).unwrap();
+        assert!(path.is_file());
+        assert!(!tmp_path(&path).exists(), "临时文件不应残留");
+        assert_eq!(load(&path).unwrap().db_path, cfg.db_path);
+        let _ = fs::remove_dir_all(&dir);
+    }
 }

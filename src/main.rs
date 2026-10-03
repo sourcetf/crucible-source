@@ -13,9 +13,6 @@ use server::live_config::LiveConfig;
 fn main() -> Result<()> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
-    // 启动即清理上一代崩溃残留的引擎子进程（php-fpm / sidecar / go-shm-server）。
-    server::apps::child_registry::cleanup_orphans_at_startup();
-
     // QUIC/H3 (quinn) uses rustls even when TCP TLS is BoringSSL-primary.
     #[cfg(feature = "tls")]
     {
@@ -32,12 +29,14 @@ fn main() -> Result<()> {
     // （见 WORKLOG §21.24/§21.27 的 ECH 自检），没有生成手段就只能手工凑。这个子命令用
     // 与测试同一条 BoringSSL 代码路径产出证书，运维一条命令即可，不引入任何外部工具。
     //
-    // 用法：webserver --gen-cert <CN> --out-cert <pem> --out-key <pem> [--days N] [--ec]
+    // 用法：webserver --gen-cert <CN> --out-cert <pem> --out-key <pem> [--days N] [--ec] [--force]
     //
     // `--ec` 生成 P-256 证书。**ECH 部署必须两层都齐**：BoringSSL 按客户端 sigalgs 在
     // RSA / EC 两张证书里选，所以内层（真实）与外层（cover）**各自都要有 RSA 和 EC 两张**；
     // 只给外层一张 RSA，只提供 ECDSA 的客户端就会落回内层那张 EC 证书 —— 外层形同虚设
     // （见 WORKLOG §21.34）。默认 RSA 2048（兼容性最好）。
+    // `--force` 才允许覆盖已存在的 out-cert/out-key（默认拒绝，见 `gen_self_signed`：覆盖
+    // 一把在用私钥会无声毁掉对应证书，且没有备份）。
     if let Some(cn) = arg_value("--gen-cert") {
         let out_cert = arg_value("--out-cert").context("--gen-cert 需要 --out-cert <path>")?;
         let out_key = arg_value("--out-key").context("--gen-cert 需要 --out-key <path>")?;
@@ -45,7 +44,8 @@ fn main() -> Result<()> {
             .and_then(|v| v.parse().ok())
             .unwrap_or(3650);
         let ec = std::env::args().any(|a| a == "--ec");
-        gen_self_signed(&cn, &out_cert, &out_key, days, ec)?;
+        let force = std::env::args().any(|a| a == "--force");
+        gen_self_signed(&cn, &out_cert, &out_key, days, ec, force)?;
         return Ok(());
     }
 
@@ -67,7 +67,16 @@ fn main() -> Result<()> {
         // 「新校验误拒生产配置」打过两次），而写错名字的后果是「配置加载通过、该端口每次
         // 握手都被 soft-fail 丢弃、日志每个连接一行 warn」—— 正是那种「配置看着对、
         // 端口实际下线」。这里跑一遍握手前的构建路径，让它**在预检阶段**就报错。
-        // 构建只读本地材料、不发网络请求（OCSP 取回在独立续期线程里），无副作用。
+        // 构建并非「无副作用」——此注释早先声称「只读本地材料、不发网络请求」，是错的。
+        // 两条反例都在 `build_acceptor` 内、本文件关不掉：
+        //   ① `ssl.ech = true` 且未配 `ech_keys` 时走 ECH 自动配置：`apply_ech` →
+        //      `ech_auto::ensure_material` 在「磁盘无材料 / 材料与当前 public_name·套件不匹配」
+        //      时会**重新生成并落盘** `state/ech/ech_keys.pem` + `ech_config_list.bin`
+        //      —— 即：拿生产配置跑预检，可能把线上正在用的 ECH 私钥覆盖掉；
+        //   ② 配了带 AIA OCSP 的 CA 证书时，`ocsp_fetcher::prepare_stapling` 启动续期线程，
+        //      它**立即**发一次网络抓取并写 `state/ocsp` 缓存。
+        // 自签证书（ECH 现场部署用的那种）不触发 ②；① 只在材料缺失/不匹配时才写。
+        // 根治须给 `ech_auto`/`ocsp_fetcher` 加 dry-run 开关（这两个文件不在本次范围内，未改）。
         #[cfg(feature = "tls_boring")]
         for l in &cfg.listeners {
             if let Some(ssl) = l.ssl.as_ref() {
@@ -88,6 +97,14 @@ fn main() -> Result<()> {
         );
         return Ok(());
     }
+
+    // 启动即清理上一代崩溃残留的引擎子进程（php-fpm / sidecar / go-shm-server）。
+    //
+    // **必须放在上面两个子命令的提前返回之后**：`--check-config` 的契约是「加载 + 校验后
+    // 退出，不绑定端口、不起服务、**无副作用**」，而它会枚举进程并对匹配本仓库路径的遗留
+    // 子进程发 SIGTERM/SIGKILL（内部还跑 `ps`、睡 300ms）—— 预检时杀进程显然不是只读；
+    // `--gen-cert` 只是生成一张证书，更不该动进程。所以它只属于真正的启动路径。
+    server::apps::child_registry::cleanup_orphans_at_startup();
 
     log::info!(
         "Crucible starting; config={} listeners={}",
@@ -193,6 +210,8 @@ fn arg_value(flag: &str) -> Option<String> {
 }
 
 /// 生成自签证书（RSA 2048 或 `--ec` 的 P-256，SHA-256 + SAN=CN），私钥文件权限 0600。
+///
+/// `force = false` 时**拒绝覆盖**已存在的 out-cert/out-key（见下方 why）。
 #[cfg(feature = "tls_boring")]
 fn gen_self_signed(
     cn: &str,
@@ -200,6 +219,7 @@ fn gen_self_signed(
     out_key: &str,
     days: u32,
     ec: bool,
+    force: bool,
 ) -> anyhow::Result<()> {
     use anyhow::Context;
     use boring::asn1::Asn1Time;
@@ -211,6 +231,22 @@ fn gen_self_signed(
 
     if cn.trim().is_empty() {
         anyhow::bail!("--gen-cert 的 CN 不能为空");
+    }
+    // 拒绝覆盖已存在的输出文件（除非 `--force`）。
+    //
+    // 为什么：`--out-key` 完全可能指向一把**在用的私钥**（按 RFC 9849 部署 ECH 时 cover/real
+    // 两层各一张，路径就是固定的 cover.key.pem / real.key.pem，见 OPERATOR-TODO A）。旧实现
+    // 直接 `fs::write` 覆盖 —— 私钥被无声销毁、对应证书随即无法握手，且**没有任何备份**，
+    // 一次手滑就下线一层（内层私钥丢了不可恢复）。cert 与 key **任一**存在都拒绝：只写一半
+    // 会留下「证书/私钥不匹配」的残局，比不写更坏。需要原地轮换（如换有效期）时显式加 `--force`。
+    if !force {
+        for p in [out_cert, out_key] {
+            if std::path::Path::new(p).exists() {
+                anyhow::bail!(
+                    "{p} 已存在 —— 拒绝覆盖（会销毁在用的证书/私钥）。确认要覆盖请加 --force，或先删除/换路径"
+                );
+            }
+        }
     }
     // 密钥类型：RSA 2048（默认，兼容性最好）或 P-256（`--ec`）。
     // ECH 要求内/外层各备 RSA+EC 两张，所以两种类型都得能生成。
@@ -254,15 +290,17 @@ fn gen_self_signed(
 
     std::fs::write(out_cert, cert.to_pem().context("cert → PEM")?)
         .with_context(|| format!("写 {out_cert}"))?;
-    std::fs::write(
-        out_key,
-        pkey.private_key_to_pem_pkcs8().context("key → PEM")?,
-    )
-    .with_context(|| format!("写 {out_key}"))?;
+    // 私钥必须**创建即 0600**：旧实现先 `fs::write`（按 umask，通常 0644）再 chmod，
+    // 两者之间存在「私钥文件本机任何用户可读」的窗口 —— 而这两张证书里有一张是内层真实
+    // 证书，泄露等于把真实身份交出去。（ECH 的 HPKE 私钥此前也因同类「先 0644 再 chmod」
+    // 被修过，见 `ech_auto::EchMaterial::persist`；这里补齐同一处。）
+    let key_pem = pkey.private_key_to_pem_pkcs8().context("key → PEM")?;
+    write_secret_key(out_key, &key_pem)?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        // 私钥必须 0600：这两张证书里有一张是「内层真实证书」，泄露等于把真实身份交出去。
+        // 创建时的 mode(0o600) 只会被 umask 收得更紧（不可能更宽），这里再显式定稿成 0600；
+        // 失败要报错（旧实现同样 `?` —— 权限不可控就不能算成功）。
         std::fs::set_permissions(out_key, std::fs::Permissions::from_mode(0o600))
             .with_context(|| format!("chmod 600 {out_key}"))?;
     }
@@ -280,6 +318,33 @@ fn gen_self_signed(
     Ok(())
 }
 
+/// 以 0600 **创建**私钥文件（unix），非 unix 退回普通写。
+///
+/// 抽成独立函数，是为了让「创建权限」这件事本身可被单测钉住：若仍用 `fs::write`，
+/// 文件会先按 umask（通常 0644）出现，chmod 之前的窗口内本机任何用户都能读到私钥。
+#[cfg(feature = "tls_boring")]
+fn write_secret_key(path: &str, data: &[u8]) -> anyhow::Result<()> {
+    use anyhow::Context;
+    #[cfg(unix)]
+    {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(path)
+            .with_context(|| format!("创建 {path}"))?;
+        f.write_all(data).with_context(|| format!("写 {path}"))?;
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::write(path, data).with_context(|| format!("写 {path}"))
+    }
+}
+
 #[cfg(not(feature = "tls_boring"))]
 fn gen_self_signed(
     _cn: &str,
@@ -287,6 +352,7 @@ fn gen_self_signed(
     _out_key: &str,
     _days: u32,
     _ec: bool,
+    _force: bool,
 ) -> anyhow::Result<()> {
     anyhow::bail!("--gen-cert 需要 tls_boring 特性（本二进制未编译 BoringSSL）")
 }
@@ -302,6 +368,8 @@ mod gen_cert_tests {
     #[test]
     fn gen_self_signed_writes_usable_material() {
         let dir = std::env::temp_dir().join(format!("crucible-gencert-{}", std::process::id()));
+        // 先清空：`--gen-cert` 现在默认拒绝覆盖已存在文件，上一次失败的残留会让本条误失败。
+        let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("mkdir");
         let cert_p = dir.join("cover.pem");
         let key_p = dir.join("cover.key.pem");
@@ -310,6 +378,7 @@ mod gen_cert_tests {
             &cert_p.display().to_string(),
             &key_p.display().to_string(),
             3650,
+            false,
             false,
         )
         .expect("gen");
@@ -355,6 +424,7 @@ mod gen_cert_tests {
             &ec_key_p.display().to_string(),
             3650,
             true,
+            false,
         )
         .expect("gen ec");
         let ec_pk =
@@ -367,6 +437,49 @@ mod gen_cert_tests {
         assert!(
             ec_cert.public_key().expect("pubkey").ec_key().is_ok(),
             "--ec 的证书公钥必须是 EC"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 默认（force=false）必须**拒绝覆盖**已存在的证书/私钥，且不得改动磁盘上那把私钥。
+    ///
+    /// 为什么要这条：`--out-key` 常指向一把**在用**的私钥（ECH 的 cover/real 两层路径固定）。
+    /// 旧实现直接 `fs::write` 覆盖 —— 私钥被无声销毁、证书随即无法握手且无备份。这条钉住
+    /// 「默认不覆盖 + 内容未变」，并确认 `--force` 才真的换新。
+    #[test]
+    fn gen_self_signed_refuses_to_clobber_existing_key() {
+        let dir = std::env::temp_dir()
+            .join(format!("crucible-gencert-clobber-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let cert_p = dir.join("real.pem");
+        let key_p = dir.join("real.key.pem");
+        let cert_s = cert_p.display().to_string();
+        let key_s = key_p.display().to_string();
+
+        super::gen_self_signed("a.example.com", &cert_s, &key_s, 3650, false, false)
+            .expect("first gen");
+        let key_before = std::fs::read(&key_p).expect("read key");
+
+        // 第二次默认 force=false：必须报错，且私钥字节**分毫未动**。
+        let err = super::gen_self_signed("b.example.com", &cert_s, &key_s, 3650, false, false)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("已存在"), "unexpected error: {err}");
+        assert_eq!(
+            std::fs::read(&key_p).expect("read key 2"),
+            key_before,
+            "已存在的私钥不得被覆盖"
+        );
+
+        // `--force` 才允许覆盖：应当真的换了一把新私钥。
+        super::gen_self_signed("b.example.com", &cert_s, &key_s, 3650, false, true)
+            .expect("force overwrite");
+        assert_ne!(
+            std::fs::read(&key_p).expect("read key 3"),
+            key_before,
+            "force 应当真的生成并落盘一把新私钥"
         );
 
         let _ = std::fs::remove_dir_all(&dir);
