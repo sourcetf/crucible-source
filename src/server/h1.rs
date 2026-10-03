@@ -145,10 +145,27 @@ async fn serve_io_opts<IO>(
 where
     IO: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
+    // 建连时的 listener 代数。下面整条连接（keep-alive 上的每个请求）都用**这一份** `lc`
+    // —— 也就是说 `root`/`basic_auth`/`page_rules`/`file_open`/限流 这些 per-listener 策略
+    // 改了之后，对**已建立**的连接不会生效（只有新连接拿到新配置）。
+    // 改 `basic_auth` 的口令却「改了没生效」是安全相关的过期状态，所以这里做一件最小的事：
+    // 发现 listener 配置变过，就在响应上写 `Connection: close` —— 本请求仍按旧策略服务
+    // （不改变正在处理的语义），之后连接关闭，客户端下一次请求会走新的 accept 路径拿到新配置。
+    // 与 nginx reload 关掉 keepalive 同一语义；只在 listener 指纹真的变了时才触发。
+    let gen0 = live.listeners_generation();
     let svc = service_fn(move |req: Request<Incoming>| {
         let live = Arc::clone(&live);
         let lc = lc.clone();
-        async move { Ok::<_, std::convert::Infallible>(handle_request(req, live, lc, peer).await) }
+        async move {
+            let mut resp = handle_request(req, live.clone(), lc, peer).await;
+            if live.listeners_generation() != gen0 {
+                resp.headers_mut().insert(
+                    http::header::CONNECTION,
+                    http::HeaderValue::from_static("close"),
+                );
+            }
+            Ok::<_, std::convert::Infallible>(resp)
+        }
     });
     let mut builder = hyper::server::conn::http1::Builder::new();
     // 设了 header_read_timeout 就**必须**给 Timer：否则 hyper 在每个连接上

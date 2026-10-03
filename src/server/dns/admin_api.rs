@@ -490,6 +490,13 @@ fn json_strs(v: &Value) -> Vec<String> {
 }
 
 async fn persist_and_reconcile(dc: &DnsConfig) -> Result<(), String> {
+    // **先校验再写 panel.toml**：panel.toml 是 `effective()` 的权威来源，非法值
+    // （listen_addr 关键字/v6、geo 线路名带点、rpz 值不是 IP……）一旦先落进那份文件，
+    // 之后每一次 reconcile —— 包括**启动时**的那次 —— 都在 write_all 里失败：
+    // 旧 named 还在跑就继续用旧配置，重启后 DNS 直接起不来，面板自己也卡在错误上，
+    // 只能手工改文件恢复。这正是「面板保存看着 ok、一处格式错让整份配置失效」的来源。
+    // check_config_strings 与 write_all 里那一段是同一份判据（本来就要过一遍）。
+    super::check_config_strings(dc).map_err(|e| format!("{e:#}"))?;
     let etc = state_root().join("etc");
     std::fs::create_dir_all(&etc).map_err(|e| e.to_string())?;
     let text = toml::to_string_pretty(dc).map_err(|e| e.to_string())?;
@@ -582,7 +589,12 @@ fn acme_issue(c: &crate::server::dns::acme::AcmeCfg) -> Result<(), String> {
                 .arg("--force")
                 .status();
             if st.map(|x| x.success()).unwrap_or(false) {
-                return Ok(());
+                // `--issue` 只签不装：acme.sh 把产物留在 ~/.acme.sh/<domain>_ecc/，而 DoT
+                // 读的是 state/dns/acme/<domain>/fullchain.pem ⇒ 不装就等于「面板回 ok、
+                // 证书其实没到位」（DoT 静默回落 cert.pem/key.pem）。与 acme::issue 共用
+                // 同一个安装步骤，并确认文件真的落盘。
+                return crate::server::dns::acme::install_acme_sh(bin, &domain, &out_dir)
+                    .map_err(|e| e.to_string());
             }
         }
     }

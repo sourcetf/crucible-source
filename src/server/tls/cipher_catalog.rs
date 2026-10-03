@@ -79,12 +79,19 @@ const CANDIDATES: &[&str] = &[
 ];
 
 /// TLS1.3 套件（库内固定，不可经 set_cipher_list 配置；仅用于展示与校验合法性）。
+///
+/// **必须与配置期「剔除 TLS1.3 套件名」的那份名单逐项一致**（`boring_path::TLS13_SUITES`，
+/// 已比对 `ssl_cipher.cc` 的 kCiphers）。原因：`is_acceptable` 对这里的名字**短路放行**
+/// （不再问库），而 `apply_ciphers`/`split_tls13_suites` 只剔除**它自己那份**名单里的名字。
+/// 一旦这里多出库并不具备的名字 → 配置校验放行、该名字留在 `set_cipher_list` 的实参里、
+/// 而 BoringSSL 匹配不到任何条目：整条列表若只剩这种名字就报 `SSL_R_NO_CIPHER_MATCH`
+/// → build_acceptor 失败 → **该监听口每个握手都软失败**（面板还会把它当可选项列出来）。
+/// RFC 8446 有 5 条，本库只有下面 3 条；CCM 两条（TLS_AES_128_CCM_SHA256 / _8）不在
+/// kCiphers 里，故**不列**（列出来正是上面那个「配置过了、端口实际下线」的坑）。
 pub const TLS13_SUITES: &[&str] = &[
     "TLS_AES_128_GCM_SHA256",
     "TLS_AES_256_GCM_SHA384",
     "TLS_CHACHA20_POLY1305_SHA256",
-    "TLS_AES_128_CCM_SHA256",
-    "TLS_AES_128_CCM_8_SHA256",
 ];
 
 static SUPPORTED: OnceCell<Vec<String>> = OnceCell::new();
@@ -195,6 +202,23 @@ pub fn psk_suites() -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 这份名单必须与配置期剔除 TLS1.3 名字的名单（`boring_path::TLS13_SUITES`）相同。
+    ///
+    /// 多一条（例如 RFC 里那两条 CCM）就会：`is_acceptable` 放行 → 剔除逻辑不认 → 名字
+    /// 落进 `set_cipher_list` → 若列表只剩它则 `SSL_R_NO_CIPHER_MATCH`、端口每个握手都
+    /// 失败。这条断言就是对「有人凭 RFC 列表把 CCM 加回来」的闸门。
+    #[test]
+    fn tls13_suite_list_matches_the_strippable_set() {
+        assert_eq!(
+            TLS13_SUITES,
+            &[
+                "TLS_AES_128_GCM_SHA256",
+                "TLS_AES_256_GCM_SHA384",
+                "TLS_CHACHA20_POLY1305_SHA256",
+            ]
+        );
+    }
 
     /// 探测必须能拿到非空集合（否则说明探测方式失效，配置校验会退化成"不校验"）。
     // 探测本身要 BoringSSL 的 SslContextBuilder：只在 boring 构建下有意义（rustls 配置下 probe 返回空表 = 不武断拒绝）。

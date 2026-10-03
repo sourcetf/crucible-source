@@ -130,8 +130,21 @@ where
     // applied via CoalescingIo + BatchWriter above; logged so knobs are visible.
 
     let mut conn = builder.handshake(io).await?;
+    // 建连时的 listener 代数：h2 上与 h1 是同一个问题 —— 这一整条连接（多路复用上的每个流）
+    // 都用**建连时**那一份 `lc`，所以 per-listener 策略（root/basic_auth/page_rules/
+    // file_open/限流）改过之后对已建立的连接不生效。发现代数变了就发一次 GOAWAY：
+    // 正在跑的流照旧跑完（`graceful_shutdown` 的语义），客户端把后续请求换到新连接上。
+    // 为什么用 GOAWAY 而不是直接断开：h2 一条连接上可能有几十个在飞请求，直接 drop `conn`
+    // 会把它们全部打断。
+    let gen0 = live.listeners_generation();
+    let mut goaway_sent = false;
     while let Some(result) = conn.accept().await {
         let (request, mut respond) = result?;
+        if !goaway_sent && live.listeners_generation() != gen0 {
+            goaway_sent = true;
+            log::info!("h2 peer={peer}: listener 配置已变，发 GOAWAY 让后续请求换用新配置的连接");
+            conn.graceful_shutdown();
+        }
         let live = Arc::clone(&live);
         let lc = lc.clone();
         let sem = H2_INFLIGHT.clone();

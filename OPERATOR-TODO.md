@@ -451,3 +451,46 @@ J 项当时写的是「引擎写者都在锁内，只是进程 env 设计如此�
 **建议**：如果短期不打算补齐，就把 `config.toml` 里这些不可用的 `[[listeners.apps]]` 路由
 **注释掉** —— 否则每次请求都会写一条 WARN 日志（`/go/` 之类被扫描时能刷得很快），
 而且对外宣称了一个不存在的功能。
+---
+
+## N. 第五轮「记录但未改」（每条附理由；涉及行为变更或产品取舍）
+
+1. **DoH 是 fail-open，而且不止在 TLS 面**：`doh_host_allowed` 的 Host 白名单**为空即放行任意
+   Host**（`[dns.doh].hostnames` 缺省为空），而 h1/h2/h3 在**所有** listener（**含明文 HTTP 端口**）
+   上都会命中 DoH 路径 ⇒ 面板一开 DoH，就等于在任意 Host、任意明文口上提供一个**递归解析端点**
+   （RFC 8484 要求 DoH 走 HTTPS）。收紧 = 行为变更：会打断现在「空白名单也能用」的部署，
+   也会打断 `config-test` 里把 DoH 指到明文 19095 的用例。**需要你定**：是「空白名单 = 拒绝」
+   还是「保持放行但要求显式写 `*`」。
+2. **`dns::effective()` 在每一个 HTTP 请求上做一次磁盘读 + TOML 解析**（调用点在 h1/h2/h3 的
+   **每个**请求，不只是 DoH 请求）。要安全地缓存，失效判据只能是 panel.toml 的 mtime/size，
+   而 **OpenBSD FFS 的时间戳只有秒级粒度** ⇒ 保存后 1s 内可能仍读到旧配置（这正是本项目反复
+   踩过的「同一秒」坑）。所以宁可不缓存。真正的修法是「调用点先做廉价路径判断」或给 live 配置
+   加一份带失效语义的 DNS 快照 —— 属结构调整，单独一轮做。
+3. **DoT 成功路径的 info 日志**仍按事件写（握手 ok、每条查询的字节数）：完成握手的对端可以在
+   单 IP 20/s 的额度内、多 IP 无上界地驱动 info 行。没改的原因：需要**完成 TLS 握手**才可达，
+   且现场核对脚本可能 grep 这些行。要收口就降到 debug 或接同一套节流。
+4. **`https_rr[].target` 未转义**（`https_rdata`，非引号位）：`target` 含 `"`/空白同样会让记录非法
+   ⇒ 该 zone 被 named 拒载。**转义它没有合法语义**（TargetName 只能是域名或 `.`），只能二选一：
+   拒绝（有误拒风险 —— 本项目被「新校验误拒」打过两次）或静默替换成 `.`（违背「不静默」）。
+5. **`GET /api/dns/status` / `/api/dns/config` 回显 MaxMind `license_key`**：在 Basic 门之后，
+   不算越权，但把一把密钥放进了 HTTP 响应体/浏览器缓存。是否脱敏属产品取舍。
+6. **没有任何 per-IP / per-listener 并发连接上限**（`server/mod.rs` 的 accept 循环无界 spawn，
+   `accept.rs` 也没有）。加限流属策略（阈值定多少、超限是拒绝还是排队）。
+7. **`ech_auto::ensure_material` 会原地覆盖运维放置的 ECH 材料**：只要磁盘上
+   `state/ech/ech_keys.pem` 的 ECHConfig 与当前 `ech_public_name`/`max_name_length`/套件不匹配
+   （**包括解析失败**），就 `generate()` + `persist()` **原地覆盖**。若那份材料是运维放置且其
+   ECHConfigList 已发布到 DNS，私钥即被销毁 ⇒ 客户端缓存的 ECHConfig 再也无法解密。
+   改成「拒绝覆盖 / 覆盖前备份旧 key」会改变行为（ECH 从「静默重生」变成「报错不生效」），属策略。
+8. **多个 TLS listener 配**不同**的 `ech_public_name` 时共用同一份 `state/ech/ech_keys.pem`**：
+   每次 acceptor 构建都会互相覆盖（复用条件含名字相等 ⇒ 不同名就重生成），
+   `state/ech/ech_config_list.bin` 与 DNS 里发布的 `ech=` 只对「最后跑的那个」成立。
+   把 ECH public_name 定为**全局唯一**属策略决定。
+9. **`h1/h2` 的 `dns::effective()` 之外**：`h2` 缺 **header 读超时**（h1 有 30s），
+   `rate_limit` 按完整 IP 分桶（v6 /64 可绕过）—— 这三条是 J 项里剩下的，已在 J 节记录。
+   **J 项的「已建立连接沿用旧 listener 策略」本轮已修**（见 WORKLOG §21.44），
+   连同 `env_lock` 那条一起（第四轮已修），J 项现在只剩 h2 header 超时与 rate_limit 分桶两条。
+
+### 顺带（更正一处历史记录）
+第四轮把 `access.rs::cidr_or_exact` 的空串改成「永不匹配」（fail-closed）时，`config.rs` 里那句
+描述运行期语义的注释也一并更正为「**任何**语义下空项都是错的」（旧语义：`allow` 放行所有人 /
+`deny` 全站 403；现语义：封禁项静默失效）—— 那处已在**第四轮**的提交里，此处只是把结论记全。

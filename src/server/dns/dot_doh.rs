@@ -240,6 +240,36 @@ fn resp_text(st: StatusCode, msg: &str) -> Response<BoxBody> {
         .unwrap()
 }
 
+/// 高频失败日志的**时间节流**（同一类别最快 60s 一条）。
+///
+/// 为什么需要：DoT 的拒绝/握手失败判定全都在 **TLS 握手之前**，也就是完全由**未认证**
+/// 的对端驱动 —— 每个被拒的连接/查询各写一条 warn，用 `nc` 对着 853 猛连就能按自己的
+/// 速率写日志（几万条/秒 × 一条近百字节 = GB/天）。本机磁盘长期 95%、日志轮转阈值只有
+/// 2MB，这条路径足以把磁盘写满、并把真正有用的日志挤掉。
+/// 与 `dns::warn_once`（按 tag 记住**消息**）同一目的，但这里的消息天然带对端地址、
+/// 每条都不同 ⇒ 那条路去重不了；只能按「类别 + 时间」节流。
+/// 节流只作用于**失败/拒绝**（攻击者可控）的日志，成功的握手与每条查询的 info 仍在。
+#[cfg(feature = "tls_boring")]
+fn warn_throttled(tag: &str, msg: &str) {
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+    use std::time::{Duration, Instant};
+    static LAST: Mutex<Option<HashMap<String, Instant>>> = Mutex::new(None);
+    let mut g = LAST.lock().unwrap_or_else(|e| e.into_inner());
+    let m = g.get_or_insert_with(HashMap::new);
+    let now = Instant::now();
+    let due = m
+        .get(tag)
+        .map(|t| now.duration_since(*t) >= Duration::from_secs(60))
+        .unwrap_or(true);
+    if !due {
+        return;
+    }
+    m.insert(tag.to_string(), now);
+    drop(g);
+    log::warn!("{msg}");
+}
+
 fn b64url_decode(s: &str) -> Option<Vec<u8>> {
     const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let s = s.trim_end_matches('=');
@@ -434,19 +464,25 @@ async fn run_dot(
         // 三道准入（与 HTTP/DoH 侧同一套判定的思路）：ACL → 单 IP 限速 → 并发上限。
         // 都只做**无状态/轻量**判定，判定失败直接丢弃连接（不握手，避免白耗 TLS 握手 CPU）。
         if !dot_peer_allowed(&cfg, peer) {
-            log::warn!("dot: reject {peer}: 不在 DoT 白名单（见 [dns.dot] allow / [dns] recursion_acl）");
+            warn_throttled(
+                "dot-acl",
+                &format!("dot: reject {peer}: 不在 DoT 白名单（见 [dns.dot] allow / [dns] recursion_acl）"),
+            );
             continue;
         }
         if !crate::server::rate_limit::allow(peer.ip(), dot_rate(&cfg), dot_burst(&cfg)) {
-            log::warn!("dot: rate limit exceeded from {}", peer.ip());
+            warn_throttled("dot-rate-accept", &format!("dot: rate limit exceeded from {}", peer.ip()));
             continue;
         }
         let permit = match conns.clone().try_acquire_owned() {
             Ok(p) => p,
             Err(_) => {
-                log::warn!(
-                    "dot: 并发连接已达上限 {}，拒绝 {peer}",
-                    dot_max_conns(&cfg)
+                warn_throttled(
+                    "dot-conns",
+                    &format!(
+                        "dot: 并发连接已达上限 {}，拒绝 {peer}",
+                        dot_max_conns(&cfg)
+                    ),
                 );
                 continue;
             }
@@ -459,7 +495,7 @@ async fn run_dot(
             let mut tls = match tokio_boring::accept(&acc, sock).await {
                 Ok(s) => s,
                 Err(e) => {
-                    log::warn!("dot: tls accept failed from {peer}: {e}");
+                    warn_throttled("dot-tls", &format!("dot: tls accept failed from {peer}: {e}"));
                     return;
                 }
             };
@@ -485,7 +521,10 @@ async fn run_dot(
                 // 可以串行灌无限条查询（RFC7858 允许复用）⇒ 面板上写的「单 IP 20/s」
                 // 实际变成「单连接不限」，一个来源就能把上游打满。超限直接关连接。
                 if !crate::server::rate_limit::allow(peer.ip(), dot_rate(&cfg), dot_burst(&cfg)) {
-                    log::warn!("dot: 单 IP 查询限速超限，关闭连接 from {peer}");
+                    warn_throttled(
+                        "dot-rate-query",
+                        &format!("dot: 单 IP 查询限速超限，关闭连接 from {peer}"),
+                    );
                     return;
                 }
                 let mut msg = vec![0u8; len];

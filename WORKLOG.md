@@ -2724,4 +2724,127 @@ rndc 密钥一并交出去。新增 `check_tor_hs_data_dir`：归一化后拒绝
 - 探针 ③ 非 ECH（**只给 ECDSA**）⇒ 同 ②（`0e01ee8a…`）
 - ① ≠ ②③ ⇒ 内外层**是两张不同的证书**，且不做 ECH 的探测者只看到 `crucible.local`，
   **学不到真实域名**。（④ 只给 RSA 的客户端握手失败 —— BoringSSL 单 credential 槽的既有限制，
-  已在 §21.34 记过；**失败 ≠ 泄漏**，故不作判据。）
+  已在 §21.34 记过；**失败 ≠ 泄漏**，故不作判据。）### 21.43 第五轮并行审计（TLS 握手/ClientHello、DNS 控制面剩余、管理前端/入口）
+
+第五轮按「一个文件只由一个人改」切三片。**第一个管理前端 agent 跑完是空结果**（那个文件是
+几千行内联 JS，它没能产出结论），所以管理前端那一片**重派了两个更窄的 agent**（一个只盯
+DOM XSS，一个盯 main.rs/admin_files 等），结果见 §21.45。
+
+本轮覆盖此前**完全没审过**的面：`tls/{accept,client_hello,cipher_catalog,legacy_io,ech_pem,
+rustls_path,tls_nss,tls_tomcrypt,mod}.rs`、`ssl_material.rs`、`ech_auto.rs`、
+`dns/{acme,ecs}.rs`、`admin_ui.html`、`main.rs`。
+
+#### 5-A TLS 握手与 ClientHello 解析（三个人口里最危险的一片：**在任何 TLS 库之前**解析攻击者输入）
+
+| # | 位置 | 问题 | 修法 |
+|---|---|---|---|
+| 1 | `tls/cipher_catalog.rs` | **P1** 套件名单比「能剔除它的名单」多两条：RFC 8446 有 5 条 TLS1.3 套件，而 BoringSSL `kCiphers` 只有 3 条（**无 CCM**，已在本机核对 `boring-sys-5.2.0/deps/boringssl/ssl/ssl_cipher.cc`）。`is_acceptable` 对名单里的名字**短路放行**，而剔除逻辑只认它自己那份 3 条 ⇒ `ssl.ciphers=["TLS_AES_128_CCM_SHA256"]` 通过校验、名字落进 `set_cipher_list`、`SSL_R_NO_CIPHER_MATCH` ⇒ **该监听口无法构建 acceptor**。面板把这份名单当可选项列出 ⇒ 运维点一下就能造出这个故障 | 删掉两条 CCM；文档写明两份名单**必须逐项一致**；加回归测试锁死 3 条 |
+| 2 | `tls/accept.rs` `peek_first_record` | **P2** 首个字节的等待**没有任何超时**（旧代码是裸 `stream.readable().await.ok()`），只有后续「补齐 record」有 8×300ms 预算 ⇒ 对端 TCP 连上后一个字节不发，任务连同 fd/缓冲**永久挂住**（h1 有 30s 头读超时，这条在 TLS 之前跑的窥探路径反而没有）；且空 peek 会被交给 boring 的 `accept`，而它**没有握手指超时** | 给整个 peek 一个总预算并覆盖首字节；`readable()` 允许伪唤醒 ⇒ 预算内重试而非一次 WouldBlock 当空；**空 peek 直接丢弃**不交给 TLS 栈 |
+| 3 | `tls/accept.rs`（3 处）/ `tls/boring_path.rs` | **P2** 每条 TLS 连接一条 `info!`（路由/丢弃）＝**匿名可触发的日志洪泛**（发一个字节就命中，info 是默认级别；本机磁盘长期 95%、日志 copytruncate 两次轮转之间无上界） | 降到 debug（4 处），理由写进注释 |
+| 4 | `tls/tls_nss.rs` / `tls/tls_tomcrypt.rs` | **P2** 遗留栈初始化失败时**泄漏 relay fd**：`relay_*` 先 `into_raw_fd()` 造出裸 fd，之后才在 `spawn_blocking` 里 init，init 失败即 `?` 返回 ⇒ 裸 fd 无人持有。NSS 的 init 失败被 `OnceLock` 永久缓存，而 IE6 风格 hello 匿名可发 ⇒ **可把进程 fd 耗尽**（整站无法 accept） | init 提到创建 fd **之前**，失败路径就没有 fd 可漏 |
+| 5 | `tls/client_hello.rs` `parse_sni` | **P3** 原样返回攻击者字节（含 NUL/CR/LF）：消费方直接写进日志 ⇒ 一个换行即可**伪造日志行** | 只放行可打印 ASCII（`0x21..=0x7e`；真实 HostName 只可能是 ASCII，IDN 走 punycode），其余 `None`（消费方本就「取不到 SNI 即拒绝」= fail-closed）+ 单测 |
+| 6 | `ssl_material.rs` `load_bytes` | **P3** 无界 `fs::read`：运维可配路径指到 FIFO 会**永久阻塞**（只有 2 条 worker），指到 `/dev/zero` 会吃光内存 | 要求 `is_file()`（拒 FIFO/设备/目录；符号链接仍可，ACME 的 live/ 靠它）+ 8MiB 上限 + 3 个单测 |
+
+#### 我还做了两条**根因/补漏**（agent 报告里列为 OUT OF SCOPE 的）
+- **`boring_path.rs` 那份重复的 `TLS13_SUITES` 已删掉，改为别名 `cipher_catalog::TLS13_SUITES`**。
+  两份名单漂移正是第 1 条的**根因**：只修一份，下次有人凭 RFC 把 CCM 加回来就会重现。
+  现在真相源只有一个。
+- **`boring_path::accept_and_serve` 的握手加了截止时间**（30s，只约束握手）。`tokio_boring::accept`
+  自身没有任何超时：发一个**完整合法**的 ClientHello 然后在握手中途停下的匿名连接，会永久占住
+  任务/fd —— 第 2 条修的是「读第一个 record」，覆盖不到这里。
+
+#### 5-B DNS 控制面剩余（`acme.rs`/`ecs.rs` 首次被审）
+
+| # | 位置 | 问题 | 修法 |
+|---|---|---|---|
+| 1 | `dns/dot_doh.rs`（5 处） | **P1** DoT 的准入/限速/并发/握手失败判定**全在 TLS 握手之前**，每个被拒事件各写一条 `warn!`，且消息里带对端地址（每条都不同 ⇒ `warn_once` 按消息去重无效）。生产 `[dns.dot].allow = ["0.0.0.0/0","::/0"]` ⇒ **任何公网主机**对着 853 猛连就能按自己的速率刷日志（一条近百字节 × 每秒上万条） | 新增 `warn_throttled`（类别 + 时间，同一类最快 60s 一条，首次必打），5 处改走它 |
+| 2 | `dns/admin_api.rs` `persist_and_reconcile` | **P2** **先写 panel.toml 再校验**：panel.toml 是 `effective()` 的权威来源，非法值（listen_addr 关键字/v6、geo 线路名带点、rpz 值不是 IP…）一旦先落盘，此后**每一次** reconcile（含启动那次）都在 `write_all` 里失败 ⇒ 旧 named 继续跑旧配置，**重启后 DNS 直接起不来**，面板也卡在错误上，只能手工改文件 | 把 `write_all` 里那段用户可控字符串校验抽成 `check_config_strings`，面板在**写 panel.toml 之前**先调它（同一份判据，不新增误拒） |
+| 3 | `dns/acme.rs`（两条安装路径） | **P2** 安装步骤每次 `std::fs::copy` 都是 `let _ =` 吞错，随后**无条件 `Ok(())`**：于是「外部客户端签好了、安装却失败/源文件名不符」被当成成功 —— 日志打 `cert ready`/`renewed`，而 DoT 读的 `state/dns/acme/<domain>/fullchain.pem` 根本不存在，静默回落 `cert.pem` | 新增 `ensure_installed`（断言两个文件都在）并在两条路径上调用 + 单测（空目录/只有证书/两者都在） |
+| 4 | `dns/admin_api.rs` `acme_issue` | **P2** 面板「立即签发」只跑 `--issue`：acme.sh 把产物留在 `~/.acme.sh/<domain>_ecc/`，**不装**到 DoT 读的路径 ⇒ 面板回 `ok`、`GET /api/dns/acme` 仍报 `issued:false`（同一逻辑两份实现、只修了一份） | 成功后调用 `acme::install_acme_sh`（改为 `pub(crate)`），错误如实回传面板 |
+| 5 | `dns/mod.rs` `minimal_root_zone` | **P2** 只映射了 `""/0.0.0.0/any`，其余原样落盘：`listen_addr` 为 `::1`/`2001:db8::1`/`none`/`localhost`（`valid_listen_addr` 全都放行）时写出 `a.root-servers.crucible. … IN A ::1` ⇒ named 判为非法 A 而**拒载整个根区**：root 模式下 `.` 直接 SERVFAIL，而配置/面板/日志一切正常 | 只认真正的 v4 字面量，其余一律回落 `127.0.0.1` + 单测（8 负例 + 1 正对照） |
+| 6 | `dns/mod.rs` `https_rdata` | **P2** `alpn` 是**带引号**的字符串：值里的 `"`/`\` 不转义就提前闭合引号 ⇒ 该 HTTPS 记录非法 ⇒ named **拒载该 zone**（同分区里 ECH 的发现记录一起消失）。`alpn` 只被面板/配置写入，`write_all` 只校验了 `name` | 转义 `\` 与 `"`（`,` 是 alpn 的合法分隔符，保持原样）+ 单测 |
+| 7 | `dns/geoip.rs` `status()` | **P2** 第三轮把 `lock_city/lock_asn` 改成容忍 poisoning，但 `status()` 里内联的 `loaded()` 漏改，仍是 `.lock().unwrap()` ⇒ 两个 mmdb 缓存任一处持锁时 panic（`open_db` 的日志/mmap 失败路径），面板**每一个** GeoIP 请求都在这里 panic（分线路面板永久失效且无恢复） | 改成 `unwrap_or_else(\|e\| e.into_inner())`，与第三轮同一策略 |
+
+#### 第五轮**记录但未改**（写入 OPERATOR-TODO，附理由）
+- **DoH 是 fail-open 且不止在 TLS 面**：`doh_host_allowed` 白名单**为空即放行任意 Host**，而 h1/h2/h3
+  在**所有** listener（含明文 HTTP 口）上都会命中 DoH 路径 ⇒ 面板一开 DoH 就等于在任意 Host、
+  任意明文口上提供一个递归解析端点（RFC 8484 要求 HTTPS）。收紧 = 行为变更（会打断现在
+  「空白名单也能用」的部署与 config-test 里把 DoH 指到明文 19095 的用例）。
+- **`dns::effective()` 每个 HTTP 请求一次磁盘读 + TOML 解析**（调用点在 h1/h2/h3 的**每个**请求上，
+  不只是 DoH 请求）。要安全缓存需按 panel.toml 的 mtime/size 失效，而 OpenBSD FFS 时间戳只有
+  **秒级粒度** ⇒ 保存后 1s 内可能读到旧配置（本项目反复踩过的「同一秒」坑），故未动。
+- **DoT 成功路径的 info 日志**（握手 ok / 每条查询）与 **`https_rr[].target` 未转义**、
+  **`GET /api/dns/status` 回显 MaxMind `license_key`** —— 分别属「需完成握手才可达」「转义 target
+  没有合法语义（只能拒绝或静默替换）」「Basic 门之后的产品取舍」。
+- **无 per-IP / per-listener 并发连接上限**（`server/mod.rs` 的 accept 循环无界 spawn）。
+- **`ech_auto::ensure_material` 会原地覆盖运维放置的 ECH 材料**、**多个 TLS listener 配不同
+  `ech_public_name` 时共用同一份 `state/ech/ech_keys.pem`** —— 都会改变行为（ECH 从「静默重生」
+  变成「报错不生效」），属策略。
+
+#### 验证（本轮）
+- `cargo test --release` 全量 → 见 §21.44 的统一验证表（本轮的测试与 J 项修复一起编、一起验）。
+- **P1 已实测复现并确认可修**：用**当前生产二进制**跑
+  `--check-config`（它真的会构建 acceptor）配 `ssl.ciphers=["TLS_AES_128_CCM_SHA256"]`
+  → `Error: listener 127.0.0.1:18480 的 TLS acceptor 构建失败 … [NO_CIPHER_MATCH]`；
+  对照配 `TLS_AES_128_GCM_SHA256` → `config OK`（并打出「TLS1.3 套件无法配置…已剔除」的解释）。
+  即：修复前**一个面板提供给你的选项就能让监听口起不来**，修复后该名字在配置期被明确拒绝。### 21.44 J 项修复：**已建立**的 h1/h2 连接不再沿用建连时的 listener 策略
+
+这是 OPERATOR-TODO J 项里唯一没修、且有**安全含义**的一条，也是前几轮一再推迟的那条。
+
+#### 问题（h1/h2 两条路径）
+`serve_io_opts`/`serve_io` 在 **accept 时**拿走一份 `ListenerConfig`（`let lc = lc.clone()` 进
+`service_fn` 闭包），整条连接（keep-alive 上的**每个**请求）都用它；而 `live.snapshot()` 是每请求
+重取的。于是 `lc` 里的一切 —— `root`、`basic_auth`、`page_rules`、`file_open`、`rate_limit`、
+`server_name` —— 在**已建立**的连接上永远不会变，只有新连接拿到新配置。
+最要紧的后果：**改 `basic_auth` 的口令（撤销/轮换）对已有连接不生效**。面板保存后客户端还拿着
+旧凭据继续跑，直到那条连接自己关掉。
+
+#### 修法（最小、不改请求语义）
+1. `LiveConfig` 增加 `listeners_gen`：**只在「全部 listener 的配置指纹」真的变了**才推进。
+   指纹直接复用 `h3::h3_config_fingerprint`（它已经把整份 listener 配置的 Debug 形式 +
+   **证书/私钥文件的 mtime/size** 一起哈希了 —— 证书原地续期也能被发现）。
+   收集后用 `(address, port, fp)` 排序再哈希，所以**调换 listener 段落顺序不算变化**。
+2. `h1`：响应上写 `Connection: close`（本请求仍按旧策略服务，之后连接关闭）。
+3. `h2`：发一次 `graceful_shutdown()`（GOAWAY）。**为什么不像 h1 那样直接收尾**：h2 一条连接上
+   可能有几十个在飞请求，直接 drop `conn` 会把它们全部打断；GOAWAY 让在飞的流跑完、客户端把
+   后续请求换到新连接上。
+4. `h3` 不需要改 —— 第三轮已经用同一套指纹做了「关端点重启」。
+
+#### 为什么「只按指纹推进」是关键
+如果每次 reload 都推进，那么改一条 `[access_log]`、改一条 GeoIP 配置、甚至保存一次**内容相同**的
+文件（mtime 变了 → 触发 reload），都会把所有在线连接赶下线。所以两个方向都必须盯住 —— 判据因此
+写成了「三条正向 + 三条反向」。
+
+#### 判据（`scripts/verify/listener_staleness.sh`，六条；全程 loopback + 临时实例）
+| # | 场景 | 期望 | 结果 |
+|---|---|---|---|
+| h1 ① | 不改配置 | 反向：**不得** `Connection: close` | PASS |
+| h1 ② | 只加 `[access_log]`（root 不变） | 反向：**不得** `Connection: close` | PASS |
+| h1 ③ | 改 root | **必须** `Connection: close`，且**新**连接拿到新 root | PASS（close + 新连接 `BBB`） |
+| h2 ① | 不改配置 | 反向：**不得** GOAWAY | PASS |
+| h2 ② | 改 root | **必须** GOAWAY/关闭，且**新**会话拿到新 root | PASS（`goaway={code:0,lastStreamID:2147483647}` + 新会话 `BBB`） |
+
+h2 用 **node 自带 http2 模块**（curl 看不到 GOAWAY 帧，会误判成 PASS）。
+
+#### 负控：先在**未修**的二进制（当时的 `bin/webserver`）上跑了一遍同一份判据
+- 三条反向判据全 PASS、**两条正向判据全 FAIL**：旧连接照旧服务旧 root、不发 GOAWAY；
+- 而**新**连接能拿到新 root（说明 reload 本身是好的）。
+⇒ 判据精确地把「只有已建立连接过期」这一条隔离了出来，而不是笼统地测「配置生效了没有」。
+
+#### 判据自身被抓出来的一个错（值得记）
+第一版 `listener_staleness_h1.py` 的 `write_cfg` **硬编码写 `dir_b`**，于是「只改 access_log」
+那一条其实**同时改了 listener 的 root** —— 而 root 变了是货真价实的 listener 变化，收尾是**正确**
+行为。是**反向判据**把它暴露出来的（实现对、判据错）：把 root 固定回 `dir_a` 后六条全 PASS。
+（配套的单测 `only_listener_changes_bump_the_generation` 本来就已经覆盖了「access_log 变化不推进」，
+两个证据互相印证。）
+
+#### 本批次同时做的其他改动与验证
+| 项 | 结果 |
+|---|---|
+| `cargo test --release --features 'tls,tls_boring,go_shm_ipc,tls_nss,tls_tomcrypt'` | **281 passed / 0 failed** |
+| P1（CCM 套件名）修后行为 | `ssl.ciphers=["TLS_AES_128_CCM_SHA256"]` → **配置期**明确拒绝：`不是 BoringSSL 支持的套件名（可用目录见 /api/tls/ciphers 或面板）`（修前是 `[NO_CIPHER_MATCH]` 这种看不懂的 SSL 错误）；对照合法名字 → `config OK (tls acceptors built=1)` |
+| 跨协议回归扫（`scripts/verify/regression_sweep.sh`） | 与部署前**逐项一致**：11 个引擎 200 / 7 个环境缺件 502、4 个静态面 200、h2/h3 200、管理面与指标 401、穿越 404、OPTIONS 405、DNS(权威 type65 带 ech= + 递归 + NXDOMAIN)、DoT TLS1.3 握手 + 真查询 |
+| ECH 端到端（`scripts/ech_demo.sh`，临时实例） | ① ECH 被接受 → 内层 real（`prod.crucible.local`，`d45ec741…`）；② 非 ECH → 外层 cover（`crucible.local`，`e765bba8…`）；③ 非 ECH+只给 ECDSA → 同 ②。① ≠ ②③ ⇒ **内外层是两张不同证书、探测者学不到真实域名** |
+| 发布 | `scripts/deploy/deploy_release.sh`（快照 `20261003-082656`），预检 RC=0、全监听在、h1 9095=200、h3 8443=200 |
+| 修复的**根因** | `boring_path` 里重复的那份 `TLS13_SUITES` 已删掉、改为 `cipher_catalog::TLS13_SUITES` 的别名：两份名单漂移正是 P1 的根因，只修一份下次还会重现 |
+| 额外加固 | `boring_path::accept_and_serve` 的**握手加 30s 截止时间**（`tokio_boring::accept` 自身无超时：发一个完整合法 ClientHello 后在握手中途停下就能永久占住任务/fd）；新增 `server/log_throttle.rs` 并把 `accept.rs` 里两处「按连接」的 warn 接上（匿名可触发的日志洪泛） |

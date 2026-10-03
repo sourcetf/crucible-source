@@ -205,6 +205,7 @@ fn issue(cfg: &AcmeCfg) -> anyhow::Result<()> {
             let src = std::path::Path::new("/etc/acme").join(&cfg.domain);
             let _ = std::fs::copy(src.join("fullchain.pem"), out_dir.join("fullchain.pem"));
             let _ = std::fs::copy(src.join("privkey.pem"), out_dir.join("privkey.pem"));
+            ensure_installed(&out_dir, "acme-client")?;
             return Ok(());
         }
     }
@@ -232,7 +233,28 @@ fn issue(cfg: &AcmeCfg) -> anyhow::Result<()> {
     )
 }
 
-fn install_acme_sh(
+/// 确认证书与私钥**真的落到了** `out_dir`。
+///
+/// 为什么必须有这一步：安装路径上每一次 `std::fs::copy` 都是 `let _ =`（吞错），
+/// 而 `Ok(())` 无条件返回 —— 于是「外部客户端签好了、安装却失败/源文件名不符」会被
+/// 当成成功：启动日志打 `cert ready for <domain>`、续期循环打 `renewed <domain>`，
+/// 而 DoT 侧 `state/dns/acme/<domain>/fullchain.pem` 根本不存在，`build_tls_acceptor`
+/// 静默回落到 `cert.pem/key.pem`。这与项目里反复出现的假成功（面板 ok、服务里查不到）
+/// 是同一类，且掩盖的是「证书没续上」这种到期才会爆的问题。
+pub fn ensure_installed(out_dir: &std::path::Path, who: &str) -> anyhow::Result<()> {
+    let fc = out_dir.join("fullchain.pem");
+    let kp = out_dir.join("privkey.pem");
+    if !fc.is_file() || !kp.is_file() {
+        anyhow::bail!(
+            "{who}: 证书未落盘（缺 {} 或 {}）—— 安装步骤失败，DoT 会回落 cert.pem/key.pem",
+            fc.display(),
+            kp.display()
+        );
+    }
+    Ok(())
+}
+
+pub(crate) fn install_acme_sh(
     bin: &str,
     domain: &str,
     out_dir: &std::path::Path,
@@ -255,6 +277,7 @@ fn install_acme_sh(
         let _ = std::fs::copy(src.join("fullchain.cer"), out_dir.join("fullchain.pem"));
         let _ = std::fs::copy(src.join(format!("{domain}.key")), out_dir.join("privkey.pem"));
     }
+    ensure_installed(out_dir, "acme.sh")?;
     Ok(())
 }
 
@@ -361,7 +384,7 @@ fn _unused(_c: &Config) {}
 
 #[cfg(test)]
 mod tests {
-    use super::safe_domain_segment;
+    use super::{ensure_installed, safe_domain_segment};
 
     #[test]
     fn domain_ok() {
@@ -376,5 +399,23 @@ mod tests {
         assert!(safe_domain_segment("..").is_none());
         assert!(safe_domain_segment("").is_none());
         assert!(safe_domain_segment("evil.com/../../tmp").is_none());
+    }
+
+    /// 「签发成功」必须意味着证书真的在盘上：两个文件缺一（拷贝失败/源文件名不符）
+    /// 就要报错，而不是让调用方打一句 `cert ready` 然后 DoT 回落 cert.pem/key.pem。
+    #[test]
+    fn install_must_verify_files_exist() {
+        let dir = std::env::temp_dir().join(format!("crucible-acme-inst-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // 空目录 ⇒ 必须失败（旧实现在这里返回 Ok）
+        assert!(ensure_installed(&dir, "test").is_err());
+        std::fs::write(dir.join("fullchain.pem"), b"cert").unwrap();
+        // 只有证书、没有私钥 ⇒ 仍然失败
+        assert!(ensure_installed(&dir, "test").is_err());
+        std::fs::write(dir.join("privkey.pem"), b"key").unwrap();
+        // 两个都在 ⇒ 通过
+        assert!(ensure_installed(&dir, "test").is_ok());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

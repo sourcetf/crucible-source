@@ -166,6 +166,13 @@ async fn accept_and_serve_inner(
         "nss accept_and_serve peer={peer} peek_len={peek_len}"
     );
 
+    // **先**做进程级初始化，再创建 relay fd。原来 init 放在 `spawn_blocking` 闭包里、
+    // 晚于 `relay_with_peek`（后者 `into_raw_fd()` 了 relay 描述符）：一旦 init 失败就
+    // 直接 `?` 返回，那个裸 fd 再没有任何人持有 ⇒ **每条走 NSS 的连接泄漏一个 fd**。
+    // NSS_Init 失败是**永久性**的（`OnceLock` 缓存失败结果），而 IE6 风格的 hello 是
+    // 匿名可发的 ⇒ 可以拿它把进程 fd 耗尽。提到 fd 创建之前，失败路径就没有 fd 可漏。
+    global_init()?;
+
     let cert_pem = ssl_material::load_bytes(ssl.cert.as_deref().context("ssl.cert")?)
         .map_err(|e| {
             log::error!(target: "tls_nss", "nss: load cert failed peer={peer}: {e:#}");
@@ -185,7 +192,6 @@ async fn accept_and_serve_inner(
     let peer_log = peer;
 
     let shared = tokio::task::spawn_blocking(move || -> Result<Arc<NssShared>> {
-        global_init()?;
         let ptr = unsafe {
             ffi::crucible_nss_accept(
                 relay_fd,

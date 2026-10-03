@@ -380,7 +380,17 @@ pub fn parse_sni(buf: &[u8]) -> Option<String> {
                 // name_type == 0 (host_name)
                 let nlen = u16::from_be_bytes([list[3], list[4]]) as usize;
                 if nlen >= 1 && 5 + nlen <= list.len() {
-                    return Some(String::from_utf8_lossy(&list[5..5 + nlen]).into_owned());
+                    let raw = &list[5..5 + nlen];
+                    // SNI 是**攻击者可控**的字节串，且 parse_sni 的返回值会被上层直接
+                    // 写进日志（例如 port_reuse 的 `SNI={sni}`）。控制字符（NUL/CR/LF…）
+                    // 里一个换行就能在日志中**伪造整行**，所以这里只放行可打印 ASCII：
+                    // 真实 HostName 只可能是 ASCII（IDN 走 punycode）。非法即 None ——
+                    // 消费方（sni_only / port_reuse 分流）本来就把「取不到 SNI」当拒绝，
+                    // 因此这是 fail-closed，不改变这些场景的放行/丢弃结论。
+                    if raw.iter().all(|b| (0x21..=0x7e).contains(b)) {
+                        return Some(String::from_utf8_lossy(raw).into_owned());
+                    }
+                    return None;
                 }
             }
         }
@@ -458,5 +468,21 @@ mod sni_tests {
     #[test]
     fn sni_absent_returns_none() {
         assert_eq!(parse_sni(&build_client_hello(None, 0x01)), None);
+    }
+
+    /// SNI 里塞控制字符/非 ASCII 必须被拒（None）：这些字节会被上层写进日志，
+    /// 一个 `\n` 就能伪造日志行；真实 HostName 只可能是可打印 ASCII。
+    #[test]
+    fn sni_rejects_control_and_non_ascii() {
+        assert_eq!(parse_sni(&build_client_hello(Some("bad\nname"), 0x00)), None);
+        assert_eq!(parse_sni(&build_client_hello(Some("a\rb"), 0x00)), None);
+        assert_eq!(parse_sni(&build_client_hello(Some("nul\0byte"), 0x00)), None);
+        // 非 ASCII（UTF-8 多字节）同样拒绝：IDN 走 punycode，不会是裸 UTF-8。
+        assert_eq!(parse_sni(&build_client_hello(Some("café"), 0x00)), None);
+        // 正对照：正常主机名照旧解析。
+        assert_eq!(
+            parse_sni(&build_client_hello(Some("v.qq.com"), 0x00)).as_deref(),
+            Some("v.qq.com")
+        );
     }
 }

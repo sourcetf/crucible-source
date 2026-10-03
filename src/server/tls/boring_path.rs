@@ -348,13 +348,15 @@ fn cert_covers(cert: &X509Ref, name: &str) -> bool {
     false
 }
 
-/// BoringSSL 内置的 TLS1.3 套件名（`ssl_cipher.cc` 的 kCiphers 里 algorithm_mkey ==
-/// SSL_kGENERIC 的三条；除此之外没有任何 TLS1.3 套件）。
-const TLS13_SUITES: &[&str] = &[
-    "TLS_AES_128_GCM_SHA256",
-    "TLS_AES_256_GCM_SHA384",
-    "TLS_CHACHA20_POLY1305_SHA256",
-];
+/// BoringSSL 内置的 TLS1.3 套件名 —— **唯一真相源**是
+/// [`cipher_catalog::TLS13_SUITES`]，这里只做个别名，**不要再抄一份**。
+///
+/// 原来本文件自己抄了一份（3 条），而 `cipher_catalog` 那份是 5 条（多出 RFC 8446 有、
+/// 但 BoringSSL `kCiphers` 里没有的两条 CCM）：两份名单漂移的直接后果是**配置校验放行、
+/// 剔除逻辑不认**，那个名字落进 `set_cipher_list` 之后 `SSL_R_NO_CIPHER_MATCH` ⇒ 该监听口
+/// 无法构建 acceptor（已实测：`--check-config` 直接报 `[NO_CIPHER_MATCH]`）。
+/// 面板把这份名单当可选项列出，所以运维**点一下**就能造出这个故障。
+const TLS13_SUITES: &[&str] = crate::server::tls::cipher_catalog::TLS13_SUITES;
 
 
 /// psk=true 时追加的 PSK/ECDHE-PSK 套件族（早期规格 13）。
@@ -1044,7 +1046,9 @@ pub async fn accept_and_serve(
 ) -> Result<()> {
     // Incomplete SSLv2 probes are routed here to avoid TomCrypt abort — soft-close.
     if !peek.is_empty() && peek[0] & 0x80 != 0 {
-        log::info!(
+        // debug 而非 info：这是**匿名可触发**的廉价路径（发几个字节就命中），
+        // info 级别等于给磁盘开一个「按连接数计费」的写入口（本机磁盘长期紧张）。
+        log::debug!(
             "boringssl soft-drop non-TLS/incomplete SSLv2-framed peek peer={peer} len={}",
             peek.len()
         );
@@ -1053,11 +1057,29 @@ pub async fn accept_and_serve(
     }
     let acceptor = build_acceptor_cached(ssl, &lc)?;
     let io = PrefixedStream::new(stream, peek);
-    let tls = tokio_boring::accept(&acceptor, io)
-        .await
-        .map_err(|e| anyhow::anyhow!("boringssl accept failed: {e:?}"))?;
+    // 握手必须有**截止时间**。`tokio_boring::accept` 自己没有任何超时：一个匿名客户端
+    // 只要发一个**完整合法**的 ClientHello、然后在握手中途停下（不回 Finished），
+    // 这条连接的任务、fd 与缓冲就永久挂住 —— 前面 `peek_first_record` 的预算只覆盖
+    // 「读第一个 record」，覆盖不到这里。这类「发一半就不动」是扫描器/慢速攻击的常规手法，
+    // 所以握手阶段必须自己掐表。超时后直接丢弃连接（不握手、不占用后续资源）。
+    let tls = match tokio::time::timeout(HANDSHAKE_TIMEOUT, tokio_boring::accept(&acceptor, io)).await
+    {
+        Ok(Ok(t)) => t,
+        Ok(Err(e)) => return Err(anyhow::anyhow!("boringssl accept failed: {e:?}")),
+        Err(_) => {
+            log::debug!("tls 握手超时（{HANDSHAKE_TIMEOUT:?}）peer={peer}，丢弃连接");
+            return Ok(());
+        }
+    };
     dispatch_alpn(tls, live, lc, peer).await
 }
+
+/// TLS 握手的总预算。
+///
+/// 取值依据：真实客户端（含最慢的移动网络 + 后量子混合组）握手都在 1s 内完成；
+/// 30s 与 h1 的 header_read_timeout 同量级，足以覆盖极端情况而不会让「发一半就不动」
+/// 的连接长期占用资源。**只**约束握手，不约束握手之后的请求（那是各自的读超时管）。
+const HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 async fn dispatch_alpn(
     tls: SslStream<PrefixedStream>,

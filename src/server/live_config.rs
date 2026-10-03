@@ -12,6 +12,43 @@ pub struct LiveConfig {
     inner: RwLock<Arc<Config>>,
     path: PathBuf,
     last_mtime: RwLock<Option<SystemTime>>,
+    /// 上一次生效的「全部 listener 指纹」。
+    listeners_fp: RwLock<u64>,
+    /// listener 配置**变化**的次数（只在指纹真的变了时 +1）。
+    ///
+    /// 为什么需要它：h1/h2 的 **已建立连接** 在 accept 时就拿走了一份 `ListenerConfig`
+    /// 快照，之后整条连接的所有请求都用它 —— 也就是说 `root`/`basic_auth`/`page_rules`/
+    /// `file_open`/限流 这些 **per-listener 策略**改了之后，对**已建立**的连接永远不生效
+    /// （只有新连接拿到新配置）。改 `basic_auth` 的口令因此「改了但没生效」，这是安全相关的
+    /// 过期状态。用这个计数器让连接在**下一个请求**上主动收尾（h1 回 `Connection: close`、
+    /// h2 发 GOAWAY），客户端下次请求就走新的 accept 路径。
+    listeners_gen: std::sync::atomic::AtomicU64,
+}
+
+/// 全部 listener 的配置指纹（顺序无关）。
+///
+/// 直接复用 [`crate::server::h3::h3_config_fingerprint`]：它已经把整份 listener 配置
+/// （Debug 形式，含 ssl/early_data/root/autoindex/口令/限流等所有 per-listener 字段）
+/// 连同**证书文件的 mtime+size** 一起哈希了 —— 证书原地续期（配置字符串不变）也能被发现。
+/// 只在配置 reload/replace 时算一次，不在热路径上。
+fn listeners_fingerprint(cfg: &Config) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    let mut items: Vec<(String, u16, u64)> = cfg
+        .listeners
+        .iter()
+        .map(|l| {
+            (
+                l.address.clone(),
+                l.port,
+                crate::server::h3::h3_config_fingerprint(l),
+            )
+        })
+        .collect();
+    // 排序后再哈希：listener 在配置里的先后顺序变了不算「配置变了」。
+    items.sort();
+    items.hash(&mut h);
+    h.finish()
 }
 
 
@@ -97,10 +134,32 @@ impl LiveConfig {
         let mtime = std::fs::metadata(&path)
             .and_then(|m| m.modified())
             .ok();
+        let fp = listeners_fingerprint(&cfg);
         Self {
             inner: RwLock::new(Arc::new(cfg)),
             path,
             last_mtime: RwLock::new(mtime),
+            listeners_fp: RwLock::new(fp),
+            listeners_gen: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+
+    /// listener 配置的变化次数（见 [`Self::listeners_gen`] 的说明）。
+    pub fn listeners_generation(&self) -> u64 {
+        self.listeners_gen.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// 新配置生效前调用：listener 指纹真的变了才推进代数。
+    ///
+    /// 只在**指纹变化**时推进（而不是每次 reload 都推）—— 否则改一条 GeoIP/DNS 配置、
+    /// 甚至只是保存一次内容相同的文件，都会把所有已建立的 h1/h2 连接赶下线。
+    fn note_listeners(&self, cfg: &Config) {
+        let fp = listeners_fingerprint(cfg);
+        let mut cur = self.listeners_fp.write();
+        if *cur != fp {
+            *cur = fp;
+            self.listeners_gen
+                .fetch_add(1, std::sync::atomic::Ordering::Release);
         }
     }
 
@@ -136,6 +195,10 @@ impl LiveConfig {
         if let Ok(meta) = std::fs::metadata(&self.path) {
             *self.last_mtime.write() = meta.modified().ok();
         }
+        // 先推进 listener 代数再换快照：并发的请求若在新快照可见之后才读代数，会看到
+        // 「配置已新、代数已增」，于是它这一条连接会收尾 —— 这正是我们要的。
+        // 反过来（先换代后读指纹）也不需要额外同步：两者都在同一把 RwLock 的临界区里。
+        self.note_listeners(&cfg);
         *self.inner.write() = Arc::new(cfg);
         // acceptor 缓存的键只有配置**字符串**（证书/密钥路径），而缓存本身从不失效：
         // 同一路径上换了证书（certbot 续期、面板覆盖 ssl.cert）时指纹不变，
@@ -163,6 +226,7 @@ impl LiveConfig {
         if let Ok(m) = std::fs::metadata(&self.path).and_then(|m| m.modified()) {
             *self.last_mtime.write() = Some(m);
         }
+        self.note_listeners(&cfg);
         *self.inner.write() = Arc::new(cfg);
         // **与 reload 保持一致**（见上面的文档承诺）：漏掉这两步时，用 replace 做局部热更
         // 会静默保住旧的应用引擎进程与旧的 Hidden Service 状态（例如新配置把某个 app
@@ -263,4 +327,80 @@ pub fn spawn_mtime_watcher(live: Arc<LiveConfig>, interval: Duration) {
             }
         }
     });
+}
+
+#[cfg(test)]
+mod listeners_generation_tests {
+    use super::*;
+
+    fn cfg(extra: &str, listeners: &str) -> Config {
+        toml::from_str(&format!("{extra}\n{listeners}")).expect("parse")
+    }
+
+    fn one(root: &str) -> Config {
+        cfg(
+            "",
+            &format!("[[listeners]]\naddress = \"127.0.0.1\"\nport = 9095\nroot = {root:?}\n"),
+        )
+    }
+
+    /// **只**在 listener 配置变化时推进代数。
+    ///
+    /// 这是「h1/h2 已建立连接要不要收尾」的唯一判据，方向性必须两边都对：
+    /// 漏推 ⇒ 改 basic_auth 口令对已有连接不生效（安全相关）；多推 ⇒ 改一条 DNS/日志配置
+    /// 就把所有在线连接赶下线（可用性）。所以两个方向都要盯住。
+    #[test]
+    fn only_listener_changes_bump_the_generation() {
+        let path = PathBuf::from("/nonexistent/crucible-test.toml");
+        let lc = LiveConfig::new(one("www"), path);
+        assert_eq!(lc.listeners_generation(), 0, "初始为 0");
+
+        // 非 listener 字段变化：**不得**推进（否则改日志级别就会踢掉所有连接）。
+        lc.replace(cfg(
+            "[access_log]\nlevel = \"debug\"",
+            "[[listeners]]\naddress = \"127.0.0.1\"\nport = 9095\nroot = \"www\"\n",
+        ));
+        assert_eq!(
+            lc.listeners_generation(),
+            0,
+            "只改了 [access_log]，不能推进 listener 代数"
+        );
+
+        // listener 的 root 变了：必须推进（root 是 per-listener 策略）。
+        lc.replace(one("www-other"));
+        assert_eq!(
+            lc.listeners_generation(),
+            1,
+            "listener.root 变了必须推进（h1/h2 才会收尾换新配置）"
+        );
+
+        // 同样的配置再 replace 一次：指纹没变 ⇒ 不再推进（避免每次保存都踢连接）。
+        lc.replace(one("www-other"));
+        assert_eq!(lc.listeners_generation(), 1, "配置没变不该重复推进");
+    }
+
+    /// listener 在配置里的**先后顺序**变了不算变化：指纹收集后先排序再哈希。
+    /// 否则运维只是把两个 listener 段落调个位置，全体在线连接就会被踢下线。
+    #[test]
+    fn listener_order_does_not_count_as_a_change() {
+        let path = PathBuf::from("/nonexistent/crucible-test.toml");
+        let a = cfg(
+            "",
+            "[[listeners]]\naddress = \"127.0.0.1\"\nport = 9095\nroot = \"a\"\n\n\
+             [[listeners]]\naddress = \"127.0.0.1\"\nport = 9081\nroot = \"b\"\n",
+        );
+        let b = cfg(
+            "",
+            "[[listeners]]\naddress = \"127.0.0.1\"\nport = 9081\nroot = \"b\"\n\n\
+             [[listeners]]\naddress = \"127.0.0.1\"\nport = 9095\nroot = \"a\"\n",
+        );
+        let lc = LiveConfig::new(a, path);
+        assert_eq!(lc.listeners_generation(), 0);
+        lc.replace(b);
+        assert_eq!(
+            lc.listeners_generation(),
+            0,
+            "只是调换了 listener 段落顺序，不该推进"
+        );
+    }
 }

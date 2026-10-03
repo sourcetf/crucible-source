@@ -336,8 +336,13 @@ fn is_disallowed_ip(ip: &IpAddr) -> bool {
 /// 面板于是显示一个根本没打开的库（与「synced:true 但什么都没同步」同类假报告）。
 pub fn status() -> serde_json::Value {
     fn loaded(slot: &std::sync::Mutex<Option<(String, Option<ArcReader>)>>) -> bool {
+        // 与 lock_city/lock_asn 一样**容忍 poisoning**：本函数是面板请求路径
+        // （`GET /api/dns/geoip/status` / `/lines`）。此前这两个缓存里任一处
+        // 在持锁时 panic（open_db 的日志/mmap 失败路径），Mutex 永久 poisoned，
+        // 面板的每一个 GeoIP 请求就在这里 `.unwrap()` panic —— 缓存本身只是
+        // 一个 `Option`，被 poisoning 保护的数据并不需要「拒绝访问」语义。
         slot.lock()
-            .unwrap()
+            .unwrap_or_else(|e| e.into_inner())
             .as_ref()
             .map(|(_, db)| db.is_some())
             .unwrap_or(false)

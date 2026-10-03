@@ -24,9 +24,15 @@ pub async fn accept_connection(
             // 失败 Debug 里带着整个 ClientHello 字节（实测单条 ≈2KB），一次匿名请求就能写 2KB，
             // 是放大上万倍的远程日志洪泛（这台机器磁盘长期紧张）。短原因见
             // `handshake_failure_reason`，完整原文降级到 debug。
-            log::warn!(
-                "tls accept soft-fail peer={peer}: {}",
-                crate::server::tls::handshake_failure_reason(&e)
+            // **按时间节流**：这条同样由匿名对端驱动（任何畸形 ClientHello 都命中），
+            // 每条带不同 peer ⇒ 按消息去重无效，只能按类别掐表（否则可按连接速率刷日志）。
+            crate::server::log_throttle::warn_every(
+                "tls-accept-softfail",
+                std::time::Duration::from_secs(60),
+                &format!(
+                    "tls accept soft-fail peer={peer}: {}",
+                    crate::server::tls::handshake_failure_reason(&e)
+                ),
             );
             log::debug!("tls accept soft-fail peer={peer} 完整错误: {e:#}");
             Ok(())
@@ -47,21 +53,37 @@ async fn accept_connection_inner(
     // 客户端只能挂到超时。这里改为按明文 HTTP 服务（HSTS/301 由 h1 侧照常处理）。
     // 只判「未配置」：证书文件一时读不到（轮换中）不算未配置，那时仍走 TLS 失败重试。
     if ssl_cfg.cert.is_none() || ssl_cfg.key.is_none() {
-        log::warn!(
-            "tls listener :{} 未配置 ssl.cert/ssl.key —— 按规格以明文 HTTP 服务 peer={peer}",
-            lc.port
+        // 这是**配置状态**（不是每个对端的问题），但触发者是匿名对端（每条连接一次）
+        // ⇒ 按类别+端口节流，避免一个配错的口变成日志洪泛入口。
+        crate::server::log_throttle::warn_every(
+            "tls-listener-no-cert",
+            std::time::Duration::from_secs(60),
+            &format!(
+                "tls listener :{} 未配置 ssl.cert/ssl.key —— 按规格以明文 HTTP 服务 peer={peer}",
+                lc.port
+            ),
         );
         let peek = peek_first_record(&stream).await;
         return crate::server::h1::serve_with_prefix(stream, live, lc, peer, &peek).await;
     }
 
     let peek = peek_first_record(&stream).await;
+    // 空 peek = 总预算内一个字节都没收到（对端连上不发 ClientHello，或已 EOF）。
+    // **不能**把它交给 TLS 栈：boring 的握手没有超时，会对这条空流继续无限等
+    // ClientHello ⇒ 该连接的 fd/任务被永久挂住（这正是给 peek 加总预算要堵的洞）。
+    if peek.is_empty() {
+        log::debug!("tls peek 空（首字节超预算或已断开）peer={peer}，丢弃");
+        drop(stream);
+        return Ok(());
+    }
 
     // Defense-in-depth: never hand malformed SSLv2-framed garbage to any stack.
     if !peek.is_empty() && peek[0] & 0x80 != 0 {
         let wire = client_hello::route(&peek);
         if wire == HelloRoute::Boring {
-            log::info!(
+            // debug 而非 info：这是**匿名可触发**的路径（发几个字节就命中），
+            // info 级别等于给磁盘开一个「按连接数计费」的写入口（本机磁盘长期紧张）。
+            log::debug!(
                 "tls soft-drop incomplete/non-TLS SSLv2-framed peek peer={peer} len={}",
                 peek.len()
             );
@@ -94,7 +116,8 @@ async fn accept_connection_inner(
         let got = client_hello::parse_sni(&peek);
         let ok = got.as_deref().map(|g| sni_host_eq(g, &want)).unwrap_or(false);
         if !ok {
-            log::info!("tls sni_only: dropped peer={peer} (missing/mismatched SNI)");
+            // 匿名可触发（任何 SNI 不匹配的连接）⇒ debug，避免按连接数刷日志。
+            log::debug!("tls sni_only: dropped peer={peer} (missing/mismatched SNI)");
             drop(stream);
             return Ok(());
         }
@@ -105,7 +128,10 @@ async fn accept_connection_inner(
     // （本函数只在 ssl listener 上被调用；非 ssl 口的复用在 server::mod 分流。）
     let wire = client_hello::route(&peek);
     let route = client_hello::resolve(wire, &ssl_cfg);
-    log::info!(
+    // 这条是**每条** TLS 连接都会走的路径（哪怕对端只发一个字节）。info 级别 =
+    // 匿名客户端可按「连接速率」无限写日志（扫描器/洪水 → 磁盘被按字节数消耗，
+    // 本机曾因写满盘让 GeoIP merge 死在中途）。路由信息诊断价值不足以换这个风险。
+    log::debug!(
         "tls route peer={peer} wire={wire:?} stack={route:?} peek={} primary={} legacy={}",
         peek.len(),
         crate::server::tls::active_stack(),
@@ -160,6 +186,10 @@ async fn accept_connection_inner(
 const PEEK_CAP: usize = 4096;
 /// 补齐首个 record 时最多再等几轮（每轮上限 300ms），防慢速攻击。
 const PEEK_MAX_ROUNDS: u8 = 8;
+/// peek 的**总时间预算**：首字节 + 补齐首个 record 合计最多等这么久
+/// （与原来的「每轮 300ms × PEEK_MAX_ROUNDS」同量级，只是把首个字节也纳入预算）。
+const PEEK_TOTAL_WAIT: std::time::Duration =
+    std::time::Duration::from_millis(300 * PEEK_MAX_ROUNDS as u64);
 
 /// 读出**首个 TLS/SSLv2 record 的全部字节**。
 ///
@@ -170,16 +200,34 @@ const PEEK_MAX_ROUNDS: u8 = 8;
 /// 这里按 record 头声明的长度补齐；补齐不了（对端不再发送）就按现状返回，
 /// 后续判定依旧是 fail-closed。
 pub(crate) async fn peek_first_record(stream: &TcpStream) -> Vec<u8> {
+    let deadline = tokio::time::Instant::now() + PEEK_TOTAL_WAIT;
     let mut buf = vec![0u8; PEEK_CAP];
-    stream.readable().await.ok();
-    let mut n = match stream.try_read(&mut buf) {
-        Ok(n) => n,
-        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => 0,
-        Err(e) => {
-            log::debug!("peek ClientHello failed: {e}");
-            0
+    let mut n = 0usize;
+    // 首字节：必须有**超时**。旧实现是裸 `stream.readable().await.ok()`——对端 TCP
+    // 连上后一个字节都不发，就能让这个任务连同它的 fd/缓冲永久挂住（h1 有 30s 头读
+    // 超时，这条 TLS 窥探路径反而没有 ⇒ 匿名客户端可无限占用连接资源）。
+    // 另外 `readable()` 允许**伪唤醒**（返回时仍无数据可读），因此一次 `WouldBlock`
+    // 不能当作「对端没发」——在总预算内重试。
+    loop {
+        if tokio::time::timeout_at(deadline, stream.readable()).await.is_err() {
+            // 预算耗尽：对端没有发来 ClientHello。
+            return Vec::new();
         }
-    };
+        match stream.try_read(&mut buf[n..]) {
+            Ok(0) => return buf[..n].to_vec(), // EOF
+            Ok(m) => {
+                n += m;
+                break;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => continue,
+            Err(e) => {
+                log::debug!("peek ClientHello failed: {e}");
+                return buf[..n].to_vec();
+            }
+        }
+    }
+    // 补齐首个 record：按 record 头声明的长度收齐（分段的正常客户端不该被 sni_only
+    // 误杀），同样受同一个总预算约束。
     let mut rounds = 0u8;
     while let Some(want) = record_need(&buf[..n]) {
         let want = want.min(PEEK_CAP);
@@ -187,10 +235,9 @@ pub(crate) async fn peek_first_record(stream: &TcpStream) -> Vec<u8> {
             break;
         }
         rounds += 1;
-        match tokio::time::timeout(std::time::Duration::from_millis(300), stream.readable()).await {
-            Ok(Ok(())) => {}
-            // 超时/出错：对端不会再补齐这段 record，别再等。
-            _ => break,
+        // 超时/出错：对端不会再补齐这段 record，别再等。
+        if tokio::time::timeout_at(deadline, stream.readable()).await.is_err() {
+            break;
         }
         match stream.try_read(&mut buf[n..]) {
             Ok(m) if m > 0 => n += m,

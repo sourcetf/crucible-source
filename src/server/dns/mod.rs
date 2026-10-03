@@ -114,7 +114,13 @@ fn default_https_target() -> String {
 pub fn https_rdata(item: &HttpsRrCfg, ech_b64: Option<&str>) -> String {
     let mut params: Vec<String> = Vec::new();
     if !item.alpn.trim().is_empty() {
-        params.push(format!("alpn=\"{}\"", item.alpn.trim()));
+        // alpn 是**带引号的**字符串：值里的 `"` / `\` 不转义就会提前闭合引号，
+        // 让这条 HTTPS 记录的 rdata 变成非法 —— named 会**拒载整个 zone**
+        // （配置、面板、日志全正常，只有该分区 SERVFAIL，ECH 记录也随之消失）。
+        // `h2,h3` 里的逗号是合法分隔符，所以只转义引号与反斜杠
+        // （与 quoted_txt_rdata 同一处理顺序：先转义反斜杠，再转义引号）。
+        let alpn = item.alpn.trim().replace('\\', "\\\\").replace('"', "\\\"");
+        params.push(format!("alpn=\"{alpn}\""));
     }
     if let Some(p) = item.port {
         params.push(format!("port={p}"));
@@ -1171,10 +1177,18 @@ fn ensure_fq(n: &str) -> String {
 
 /// 根区最小占位（rootzone 未同步时的兜底，named 可加载）。
 fn minimal_root_zone(cfg: &DnsConfig) -> String {
-    // A 记录必须是合法点分地址——"any"/"0.0.0.0" 都不是（named 'bad dotted quad' 拒载根区）
-    let self_ip = match cfg.listen_addr.as_str() {
-        "" | "0.0.0.0" | "any" => "127.0.0.1".to_string(),
-        other => other.to_string(),
+    // A 记录的 rdata 必须是**合法点分四段**——"any"/"0.0.0.0" 都不是
+    // （named 'bad dotted quad' 拒载根区）。原先只映射了 ""/0.0.0.0/any，其余原样落盘：
+    // `listen_addr = "none"/"localhost"/"localnets"/"::1"`（`valid_listen_addr` 全都放行）
+    // 会写出 `a.root-servers.crucible. 86400 IN A ::1` —— named 判为非法 A 而**拒载根区**，
+    // root 模式下 "." 直接 SERVFAIL，而配置期、面板、日志一切正常（与「配置看着对、
+    // 运行时整区拒载」是同一类）。所以只认真正的 v4 字面量，其余一律回落 127.0.0.1。
+    let self_ip = match cfg.listen_addr.trim() {
+        "" | "0.0.0.0" => "127.0.0.1".to_string(),
+        other => match other.parse::<std::net::Ipv4Addr>() {
+            Ok(v4) => v4.to_string(),
+            Err(_) => "127.0.0.1".to_string(),
+        },
     };
     format!(
         "$ORIGIN .\n. 86400 IN SOA a.root-servers.crucible. noc.crucible. ( {serial} 1800 900 604800 86400 )\n. 518400 IN NS a.root-servers.crucible.\na.root-servers.crucible. 86400 IN A {self_ip}\n",
@@ -1731,13 +1745,18 @@ fn set_mode_0600(_p: &Path) -> std::io::Result<()> {
 
 // ---------------------------------------------------------------- 落盘 + 校验 + 生命周期
 
-/// 全量落盘：named.conf / rndc.conf / 各 zone 文件 / rpz / rootzone 占位。
-pub fn write_all(cfg: &DnsConfig) -> Result<Vec<(String, PathBuf)>> {
-    // 先校验所有进入文件名 / named.conf 的用户可控字符串，再落盘。
-    // validate() 会先调 write_all 再探活 named，所以检查必须放在这里，
-    // 否则恶意 name 已经在盘上了（路径穿越的写入发生在探活之前）。
-    // listen_addr / dnssec.algorithm / dnssec.keys[].role 与被校验的 name 一样，
-    // 都来自面板（POST /api/dns/config 反序列化整个 [dns]）并被拼进 named.conf。
+/// 所有会进入 **named.conf / zone 文件文本 / zone 文件名** 的用户可控字符串的校验。
+///
+/// `listen_addr` / `dnssec.algorithm` / `dnssec.keys[].role` / geo 线路名 / rpz 记录名与
+/// 值都来自面板（`POST /api/dns/config` 反序列化整个 `[dns]`），并被拼进 named.conf 或
+/// zone 文本；不校验就等于把这些文本面交给配置。
+///
+/// 为什么单独抽出来：`write_all` 会在**落盘前**调它；而面板的 `POST /api/dns/*` 必须
+/// 在**写 panel.toml 之前**也调一次 —— panel.toml 是 `effective()` 的权威来源，非法值
+/// 一旦先落进那份文件，此后**每一次** reconcile（含启动时的）都在 write_all 里失败：
+/// 重启后 DNS 直接起不来，面板自己也卡在错误上，只能手工改文件恢复。
+/// 顺序反了就是「一处格式错、全份配置失效」。
+pub(crate) fn check_config_strings(cfg: &DnsConfig) -> Result<()> {
     if !valid_listen_addr(&cfg.listen_addr) {
         bail!(
             "bad listen_addr {:?}（只接受 IP 字面量或 any/none/localhost/localnets）",
@@ -1823,6 +1842,14 @@ pub fn write_all(cfg: &DnsConfig) -> Result<Vec<(String, PathBuf)>> {
             _ => {}
         }
     }
+    Ok(())
+}
+
+/// 全量落盘：named.conf / rndc.conf / 各 zone 文件 / rpz / rootzone 占位。
+pub fn write_all(cfg: &DnsConfig) -> Result<Vec<(String, PathBuf)>> {
+    // 进入文件名 / named.conf 的用户可控字符串先全量校验（见 check_config_strings）；
+    // validate() 会先调 write_all 再探活 named，检查必须在落盘之前。
+    check_config_strings(cfg)?;
     let etc = state_root().join("etc");
     let zones_dir = state_root().join("zones");
     std::fs::create_dir_all(&etc)?;
@@ -3280,5 +3307,80 @@ mod listen_lists_tests {
             listen_lists("0.0.0.0", true, 0),
             ("127.0.0.1;".to_string(), "none;".to_string())
         );
+    }
+}
+
+#[cfg(test)]
+mod config_guard_tests {
+    use super::*;
+
+    /// `Default::default()` 的 listen_addr 是空串（`#[serde(default = ...)]` 只管反序列化），
+    /// 这里统一给一个合法值，免得测试被 `check_config_strings` 的 listen_addr 判据拦掉。
+    fn cfg_with(listen: &str) -> DnsConfig {
+        let mut c = DnsConfig::default();
+        c.listen_addr = listen.to_string();
+        c
+    }
+
+    /// 根区占位里的 A 记录必须是**合法点分四段**：`listen_addr` 是 named 关键字或 v6
+    /// 字面量时原样写进去（`valid_listen_addr` 全都放行），named 会判为非法 A 而拒载
+    /// **整个根区** —— root 模式下 "." 直接 SERVFAIL，而配置期/面板/日志一切正常。
+    #[test]
+    fn minimal_root_zone_never_writes_a_non_v4_a_record() {
+        for bad in ["", "any", "none", "localhost", "localnets", "0.0.0.0", "::1", "2001:db8::1"] {
+            let z = minimal_root_zone(&cfg_with(bad));
+            assert!(
+                z.contains("IN A 127.0.0.1"),
+                "listen_addr={bad:?} 会写出非法 A 记录: {z}"
+            );
+        }
+        // 正对照：真正的 v4 字面量照旧写进去（否则上面可能是「一律写 loopback」）
+        assert!(minimal_root_zone(&cfg_with("10.1.2.3")).contains("IN A 10.1.2.3"));
+    }
+
+    /// HTTPS 记录的 alpn 是**带引号**的字符串：值里的引号/反斜杠不转义就会提前闭合
+    /// 引号，让这条记录非法 ⇒ named 拒载该 zone（同分区里 ECH 的发现记录一起消失）。
+    #[test]
+    fn https_rdata_escapes_quotes_in_alpn() {
+        let item = HttpsRrCfg {
+            name: "example.com".into(),
+            alpn: "h2\"x\\".into(),
+            priority: 1,
+            ..Default::default()
+        };
+        assert_eq!(https_rdata(&item, None), "1 . alpn=\"h2\\\"x\\\\\"");
+        // `,` 是 alpn 的合法分隔符，不能被转义掉
+        let ok = HttpsRrCfg {
+            alpn: "h2,h3".into(),
+            priority: 1,
+            ..Default::default()
+        };
+        assert_eq!(https_rdata(&ok, None), "1 . alpn=\"h2,h3\"");
+    }
+
+    /// 面板保存前（写 panel.toml 之前）跑的校验必须拦住会注入 named.conf / 让 named
+    /// 拒载的值：否则非法值先落进 panel.toml（effective() 的权威来源），此后每次
+    /// reconcile（含启动）都失败 —— 重启后 DNS 起不来。
+    #[test]
+    fn check_config_strings_rejects_injection_and_bad_names() {
+        assert!(check_config_strings(&cfg_with("127.0.0.1")).is_ok());
+
+        let inject = cfg_with("0.0.0.0; }; zone \"evil\" { type primary; file \"x\";");
+        assert!(check_config_strings(&inject).is_err(), "listen_addr 注入必须被拒");
+
+        let mut geo = cfg_with("127.0.0.1");
+        geo.geo.lines.push(GeoLine {
+            name: "x\"\n};".into(),
+            cidrs: vec![],
+        });
+        assert!(check_config_strings(&geo).is_err(), "geo 线路名注入必须被拒");
+
+        let mut rpz = cfg_with("127.0.0.1");
+        rpz.rpz.push(RpzRule {
+            name: "bad..name".into(),
+            rtype: "nxdomain".into(),
+            value: String::new(),
+        });
+        assert!(check_config_strings(&rpz).is_err(), "rpz 名字带 .. 必须被拒");
     }
 }

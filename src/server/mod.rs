@@ -32,6 +32,7 @@ pub mod h3;
 pub mod l4;
 pub mod listener;
 pub mod live_config;
+pub mod log_throttle;
 pub mod options_catalog;
 pub mod page_rules;
 pub mod password;

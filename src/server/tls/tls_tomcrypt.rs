@@ -180,6 +180,14 @@ async fn accept_and_serve_inner(
         peek.len()
     );
 
+    // **先**初始化，再创建 relay fd。原来 init 在 `spawn_blocking` 闭包里、晚于
+    // `relay_bridge_only`（后者 `into_raw_fd()` 了 relay 描述符）：init 失败即 `?` 返回，
+    // 裸 fd 无人持有 ⇒ **每条连接泄漏一个 fd**（init 失败会永久失败，匿名可发的
+    // SSLv2 hello 就能把 fd 耗尽）。放到 fd 创建之前，失败路径就没有 fd 可漏。
+    if unsafe { ffi::crucible_tomcrypt_init() } != 0 {
+        anyhow::bail!("tomcrypt init failed");
+    }
+
     let cert_pem = ssl_material::load_bytes(ssl.cert.as_deref().context("ssl.cert")?)?;
     let key_pem = ssl_material::load_bytes(ssl.key.as_deref().context("ssl.key")?)?;
     // NUL-terminate for C PEM parsers (length-bounded, but keep CString as belt+suspenders).
@@ -192,9 +200,6 @@ async fn accept_and_serve_inner(
 
     let shared = tokio::task::spawn_blocking(move || -> Result<Arc<TomcryptShared>> {
         unsafe {
-            if ffi::crucible_tomcrypt_init() != 0 {
-                anyhow::bail!("tomcrypt init failed");
-            }
             let ptr = ffi::crucible_tomcrypt_accept(
                 relay_fd,
                 peek_copy.as_ptr(),
