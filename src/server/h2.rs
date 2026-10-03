@@ -50,6 +50,25 @@ pub const H2_INFLIGHT_WAIT: Duration = Duration::from_secs(5);
 pub const H2_BODY_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 static H2_INFLIGHT: once_cell::sync::Lazy<Arc<tokio::sync::Semaphore>> =
     once_cell::sync::Lazy::new(|| Arc::new(tokio::sync::Semaphore::new(H2_MAX_INFLIGHT)));
+
+/// 本连接在飞请求数守卫（配合 `serve_io` 的空闲超时）。
+///
+/// `H2_INFLIGHT` 是**全局**信号量，问不出「这条连接」还有没有流在跑 —— 而空闲超时
+/// 必须按连接判：有流在跑时绝不能因为「很久没有新请求头」就把连接关掉（会打断在飞的流）。
+struct ConnInflight(Arc<std::sync::atomic::AtomicUsize>);
+
+impl Drop for ConnInflight {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// h2 连接空闲超时（对应 nginx 的 `http2_idle_timeout` 语义）：`conn.accept()` 只在
+/// 「读到一个完整请求头」或连接关闭时返回，因此**半截 HEADERS 帧**（声明 len=1000 却只发
+/// 10 字节）能让 accept 循环**永久**挂住 —— 占 1 个 fd + 1 个任务，而
+/// `H2_BODY_IDLE_TIMEOUT` 盖不到它（那条管的是两次 `data()` 之间）。实测：110s 仍不关闭。
+/// 取 5 分钟：比任何正常 keep-alive 复用间隔都宽裕，同时把「永久」变成「有界」。
+const H2_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
 pub const H2_MAX_SEND_BUFFER: usize = 128 * 1024;
 pub const H2_COALESCE_WRITES: bool = COALESCE_WRITES_DEFAULT;
 /// Soft concurrent-stream hint applied when Builder supports it.
@@ -138,7 +157,28 @@ where
     // 会把它们全部打断。
     let gen0 = live.listeners_generation();
     let mut goaway_sent = false;
-    while let Some(result) = conn.accept().await {
+    // 本连接在飞请求计数（见 `ConnInflight` 与 `H2_IDLE_TIMEOUT` 的说明）。
+    let conn_inflight = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let mut idle = tokio::time::sleep(H2_IDLE_TIMEOUT);
+    tokio::pin!(idle);
+    loop {
+        let accepted = tokio::select! {
+            r = conn.accept() => r,
+            _ = &mut idle => {
+                // 只有**本连接没有在飞流**时才关：否则长请求（大文件代理/上传）会在
+                // 「很久没有新请求头」时被误杀。有流在跑就重置计时继续等。
+                if conn_inflight.load(std::sync::atomic::Ordering::Relaxed) == 0 {
+                    log::info!(
+                        "h2 peer={peer}: 空闲 {H2_IDLE_TIMEOUT:?} 未读到完整请求头，关闭连接"
+                    );
+                    break;
+                }
+                idle.as_mut().reset(tokio::time::Instant::now() + H2_IDLE_TIMEOUT);
+                continue;
+            }
+        };
+        idle.as_mut().reset(tokio::time::Instant::now() + H2_IDLE_TIMEOUT);
+        let Some(result) = accepted else { break };
         let (request, mut respond) = result?;
         if !goaway_sent && live.listeners_generation() != gen0 {
             goaway_sent = true;
@@ -148,7 +188,11 @@ where
         let live = Arc::clone(&live);
         let lc = lc.clone();
         let sem = H2_INFLIGHT.clone();
+        conn_inflight.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let conn_inflight_c = Arc::clone(&conn_inflight);
         tokio::spawn(async move {
+            // 守卫覆盖任务内**所有**返回路径（含提前 return），保证计数归还。
+            let _inflight = ConnInflight(conn_inflight_c);
             // P0（DoS）：配额**绝不能**在 accept 循环里 await —— await 期间 `conn` 不被
             // poll，连接驱动停摆（回应写不出、WINDOW_UPDATE 发不出、其他流全部卡住），
             // 一条恶意连接持满 256 个慢速流即可让**所有** h2 连接失去响应。

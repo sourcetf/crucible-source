@@ -77,6 +77,36 @@ pub struct Session {
     touched: Mutex<Instant>,
     /// 片写入串行化（4 片并发写同一文件时不能交错）。
     lock: Mutex<()>,
+    /// 当前**持有**这个会话的请求数（由 `session_for` 原子递增、调用方的
+    /// [`Attach`] 守卫递减）。
+    ///
+    /// 为什么不能只看 `received()`：两个「全量上传」请求可能在**写入任何字节之前**
+    /// 都拿到同一个会话（此时 `received() == 0`，旧的并发闸门 `received() > 0 && idle <
+    /// RESET_IDLE_GRACE` 判不出来），于是共享同一个 `.part`、各自 append；最后一个
+    /// `commit()` 把 `.part` rename 走，另一个 append 撞上 `Io(No such file)` ⇒ **500**，
+    /// 且**只有一方**的字节最终落盘（另一方静默丢数据却可能收到 201）。实测复现。
+    active: std::sync::atomic::AtomicUsize,
+}
+
+/// 会话持有守卫：`session_for` 已经把 `active` 加过 1，这个守卫负责在请求结束
+/// （含**所有**提前 return）时把它减回去。
+///
+/// 必须用 RAII 而不是手工配对：`upload_api` 的请求处理路径上有多个提前 return，
+/// 漏减一次就会让该目标名的后续「全量上传」**永久**收到 409（直到 1h 的 sweep 回收会话）。
+pub struct Attach {
+    sess: Arc<Session>,
+}
+
+impl Attach {
+    pub fn new(sess: Arc<Session>) -> Self {
+        Attach { sess }
+    }
+}
+
+impl Drop for Attach {
+    fn drop(&mut self) {
+        self.sess.active.fetch_sub(1, Ordering::Relaxed);
+    }
 }
 
 impl Session {
@@ -255,7 +285,15 @@ pub fn session_for(
             // 而前者下一帧用 `sess.received()` 取 offset 继续追加 ⇒
             // 两份数据混在一个文件里、received 是两者之和、**双方都可能收到 201**（损坏文件）。
             // 静默判定给「断线后重试」留了活路，同时把并发写挡在 409（客户端据此续传或稍后重试）。
-            if s.received() > 0 && idle < RESET_IDLE_GRACE {
+            //
+            // 再加一条 `active > 0`：**另一个请求正持有这个会话**时，即使它一个字节都还没写
+            // （`received() == 0`，上面那条判不出来）也必须拒绝 —— 否则两个全量上传共享同一个
+            // `.part`：各自 append、最后一个 commit 把文件 rename 走，另一个 append 撞
+            // `Io(No such file)` ⇒ 500，且**只有一方**的字节落盘（另一方静默丢数据）。
+            // 记账递增就在本函数返回前（SESSIONS 锁内）完成，因此这里读到的一定是最新值。
+            if s.active.load(Ordering::Relaxed) > 0
+                || (s.received() > 0 && idle < RESET_IDLE_GRACE)
+            {
                 return Err(UploadErr::OffsetMismatch(s.received()));
             }
             // 守卫必须限定在作用域内：否则 `return Ok(s)` 会在守卫析构前 move `s`（E0505）。
@@ -273,12 +311,15 @@ pub fn session_for(
                 }
             }
             *s.touched.lock() = Instant::now();
+            // 在 SESSIONS 锁内记账（与校验一起原子），调用方用 `Attach` 守卫递减。
+            s.active.fetch_add(1, Ordering::Relaxed);
             return Ok(s);
         }
         if start != s.received() {
             return Err(UploadErr::OffsetMismatch(s.received()));
         }
         *s.touched.lock() = Instant::now();
+        s.active.fetch_add(1, Ordering::Relaxed);
         return Ok(s);
     }
     if start != 0 {
@@ -336,6 +377,9 @@ pub fn session_for(
         wildcard_total: std::sync::atomic::AtomicBool::new(false),
         touched: Mutex::new(Instant::now()),
         lock: Mutex::new(()),
+        // 新会话：下面 `Ok(sess)` 返回前会加 1（与复用分支同一处），
+        // 保证「拿到会话」与「记账」在 SESSIONS 锁内是原子的。
+        active: std::sync::atomic::AtomicUsize::new(0),
     });
     map.insert(target.to_path_buf(), Arc::clone(&sess));
     // 计数在**插入成功之后**再加：上面任何一条提前 return 都不会漏计/多计。
@@ -346,6 +390,8 @@ pub fn session_for(
             *b.by_ip.entry(ip).or_insert(0) += 1;
         }
     }
+    // 新会话同样是「本请求正持有」：与复用分支一致地记账（调用方 `Attach` 递减）。
+    sess.active.fetch_add(1, Ordering::Relaxed);
     Ok(sess)
 }
 
@@ -507,6 +553,46 @@ fn test_fs_has_room() -> bool {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// 并发「全量上传」到同一目标必须被挡在 409（`session_for` 的 `active > 0` 判定）。
+    ///
+    /// 旧实现只在 `received() > 0` 时判并发，于是两个**都还没写任何字节**的全量上传会拿到
+    /// **同一个会话**：共享同一个 `.part`，各自 append；最后一个 `commit()` 把 `.part`
+    /// rename 走，另一个 append 撞 `Io(No such file)` ⇒ 500，且**只有一方**的字节落盘，
+    /// 另一方收到 201 却静默丢数据（第 6 轮并发报告 #5，实测复现）。
+    #[test]
+    fn concurrent_full_upload_to_same_target_is_rejected() {
+        if !test_fs_has_room() {
+            eprintln!("跳过：本机磁盘余量低于闸门阈值（{MIN_FREE_BYTES}）");
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("crucible-up-dup-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("dup.bin");
+        let _ = std::fs::remove_file(&target);
+        let _ = std::fs::remove_file(target.with_file_name(".dup.bin.upload.part"));
+
+        // 第一个请求持有时：第二个（同样 start=0、也一个字节没写）必须 409 而不是共享会话。
+        let a = session_for(&target, 0, Some(4), None).expect("第一个应放行");
+        match session_for(&target, 0, Some(4), None) {
+            Err(UploadErr::OffsetMismatch(cur)) => assert_eq!(cur, 0, "应报当前偏移 0"),
+            Err(other) => panic!("期望 OffsetMismatch(0)，实得 {other:?}"),
+            // 不要在 Ok 分支里格式化（Session 没有 Debug）：直接给一句能定位的断言文案。
+            Ok(_) => panic!("期望 OffsetMismatch(0)（409），实得 Ok —— 两个并发全量上传共享了会话"),
+        }
+        // 反向控制：守卫释放（请求结束）后同一目标必须能再次开全量上传，
+        // 否则「断线后重试」会被永久卡死 —— 这正是必须用 RAII 守卫的原因。
+        {
+            let g = Attach::new(Arc::clone(&a));
+            drop(g);
+        }
+        let b = session_for(&target, 0, Some(4), None).expect("释放后应可再开");
+        assert!(Arc::ptr_eq(&a, &b), "复用同一个会话对象");
+        // 归还预算：`BUDGET` 是进程级全局量，用例留垃圾会破坏其他「正好填满预算」的用例
+        //（实测：本用例留 4 字节就让 declared_total_reserves_inflight_budget 假失败）。
+        abort(&b);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// 每来源 IP 的并发会话上限必须真的生效（否则单机就能把会话表占满、把别人挤成 503）。
     #[test]
     fn per_ip_session_cap_is_enforced() {
@@ -585,7 +671,20 @@ fn test_fs_has_room() -> bool {
         let dir = std::env::temp_dir().join(format!("crucible-up-budget-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let chunk = 64 * 1024 * 1024u64;
-        let n = (MAX_INFLIGHT_BYTES / chunk) as usize; // 正好填满预算
+        // 用**当前剩余**预算算 n，而不是直接 `MAX/chunk`。
+        // `BUDGET` 是**进程级**全局量，同一测试进程里先跑过/并行跑的其他用例可能已占掉几个
+        // 字节（例如某个并发用例留了 4 字节）：按常数算会把「正好填满预算」变成「超出 4 字节」，
+        // 于是最后一个本应放行的会话被拒、断言假失败。实测：另一个用例只留 4 字节就复现了。
+        // 按剩余量算既保留「填满即拒」这一被测性质，又不再依赖测试执行的顺序与并行度。
+        let head = {
+            let b = BUDGET.lock();
+            MAX_INFLIGHT_BYTES.saturating_sub(b.inflight.saturating_add(b.reserved))
+        };
+        let n = (head / chunk) as usize; // 正好填满**剩余**预算
+        if n == 0 {
+            eprintln!("跳过：在飞预算已被同一进程内其他用例占满（head={head}）");
+            return;
+        }
         let mut open_sessions = Vec::new();
         for i in 0..n {
             let t = dir.join(format!("budget-{i}.bin"));

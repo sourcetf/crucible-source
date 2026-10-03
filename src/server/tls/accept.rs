@@ -188,7 +188,9 @@ const PEEK_CAP: usize = 4096;
 const PEEK_MAX_ROUNDS: u8 = 8;
 /// peek 的**总时间预算**：首字节 + 补齐首个 record 合计最多等这么久
 /// （与原来的「每轮 300ms × PEEK_MAX_ROUNDS」同量级，只是把首个字节也纳入预算）。
-const PEEK_TOTAL_WAIT: std::time::Duration =
+/// `pub(crate)`：明文分流 `listener::dispatch_plain` 的首字节嗅探复用同一个预算，
+/// 两处口径必须一致，否则「TLS 口 2.4s 回收、明文口永不回收」。
+pub(crate) const PEEK_TOTAL_WAIT: std::time::Duration =
     std::time::Duration::from_millis(300 * PEEK_MAX_ROUNDS as u64);
 
 /// 读出**首个 TLS/SSLv2 record 的全部字节**。

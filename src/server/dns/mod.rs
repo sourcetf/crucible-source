@@ -3028,6 +3028,36 @@ pub async fn maintenance_loop(live: Arc<crate::server::live_config::LiveConfig>,
                 }
             }
         }
+        // named 存活看门狗（第 6 轮并发报告 #4）。
+        //
+        // `reconcile()` 里确实有「named_alive → spawn」逻辑，但它**只在**启动、配置变更、
+        // 面板操作时被调用；此前 maintenance_loop 只做「mtime 变了才 reconcile」+ DNSSEC
+        // 轮换 + rootzone 刷新，**没有任何周期性的 liveness 检查**。后果：named 一旦 OOM/
+        // 崩溃，在下次改配置之前 **DNS 一直不可用**（生产里配置改动很稀疏 ⇒ 等于长期中断；
+        // 而且除了解析失败之外没有任何信号，是典型的静默故障）。
+        // 每 30s 探一次；确认没响应就走同一条 reconcile 把它拉起来。
+        // 不会重复 spawn：reconcile 内部先探活、且有串行化锁兜底。
+        {
+            let wd_cfg = effective(&live.snapshot());
+            if wd_cfg.enabled {
+                let probe = wd_cfg.clone();
+                let alive = tokio::task::spawn_blocking(move || named_alive(&probe))
+                    .await
+                    .unwrap_or(false);
+                if !alive {
+                    warn_once(
+                        "dns-named-down",
+                        "dns: named 未响应 rndc status ⇒ 看门狗触发 reconcile 拉起",
+                    );
+                    let d2 = wd_cfg.clone();
+                    let r = tokio::task::spawn_blocking(move || reconcile(&d2)).await;
+                    log::info!(
+                        "dns: named 看门狗 reconcile {:?}",
+                        r.as_ref().map(|_| "ok")
+                    );
+                }
+            }
+        }
         // DNSSEC 密钥轮换检查（需求 3）
         let cfg = effective(&live.snapshot());
         if cfg.enabled && cfg.dnssec.enabled && cfg.dnssec.rotation_enabled {

@@ -138,6 +138,8 @@ pub async fn run(live: Arc<LiveConfig>) -> Result<()> {
         );
     }
     for (idx, lc) in cfg.listeners.iter().enumerate() {
+        // 不再「任一地址绑定失败就整体退出」：部分可用也先服务起来，失败的地址由
+        // reconciler 每 2s 重试（此前一个绑不上的地址会让**整个进程**起不来）。
         if let Err(e) = spawn_listener_port(
             Arc::clone(&live),
             lc.clone(),
@@ -146,7 +148,9 @@ pub async fn run(live: Arc<LiveConfig>) -> Result<()> {
         )
         .await
         {
-            return Err(e);
+            log::warn!(
+                "listener[{idx}] 有地址未能绑定（其余地址照常服务，2s 后重试）: {e:#}"
+            );
         }
     }
     if active.lock().await.is_empty() {
@@ -178,7 +182,16 @@ pub async fn run(live: Arc<LiveConfig>) -> Result<()> {
                 }
                 for (idx, lc) in snap.listeners.iter().enumerate() {
                     let key = crate::server::bind_key(lc);
-                    if active_r.lock().await.contains(&key) {
+                    // 按**地址**判存活（见 `addr_key`）：只要还有地址没绑上就重建，
+                    // 已绑上的地址会在 spawn 里被跳过，不会被重复 bind。
+                    let need = match listener_addrs(lc) {
+                        Ok(addrs) => {
+                            let a = active_r.lock().await;
+                            addrs.iter().any(|ad| !a.contains(&addr_key(&key, ad)))
+                        }
+                        Err(_) => true,
+                    };
+                    if !need {
                         continue;
                     }
                     match spawn_listener_port(
@@ -240,6 +253,46 @@ pub fn bind_key(lc: &crate::config::ListenerConfig) -> String {
     )
 }
 
+/// 单个**地址**的存活键 = `bind_key` + 该地址。
+///
+/// 为什么必须按地址记账（而不是只按 `bind_key`）：一个 listener 可以同时绑 v4 与 v6
+/// **两个** socket，对应**两个独立** accept 任务。只按 `bind_key` 记存活时，其中一个
+/// 任务退出（例如某个 accept 撞上 EMFILE）就会把整个 key 从 `active` 抹掉，而另一个
+/// 任务**仍持有自己的 socket**；reconciler 于是重建整个 listener：v4 绑得上、v6 报
+/// EADDRINUSE，`spawn_listener_port` 返回 Err 并把**刚绑上的 v4 一起丢掉** —— 每 2s
+/// 重试、永远失败，该监听口的 v4 半边**永久**不可用，只能重启进程恢复。
+/// 按地址记账后，失败的地址单独重试，已经服务中的地址不受牵连。
+fn addr_key(key: &str, addr: &std::net::SocketAddr) -> String {
+    format!("{key}@{addr}")
+}
+
+/// 这个 listener 需要绑定的全部地址（与 `spawn_listener_port` 的绑定逻辑共用同一份构造，
+/// 避免两处各写一遍导致记账与绑定不一致）。
+fn listener_addrs(
+    lc: &crate::config::ListenerConfig,
+) -> Result<Vec<std::net::SocketAddr>> {
+    // OpenBSD: [::] 不含 v4-mapped，双栈需显式双 bind。
+    // address 默认 0.0.0.0（v4 全网卡），address_v6 可选 ::= 全网卡 v6。
+    let mut addrs: Vec<String> = vec![lc.address.clone()];
+    if let Some(v6) = lc.address_v6.as_deref() {
+        if !v6.is_empty() {
+            addrs.push(v6.to_string());
+        }
+    }
+    addrs
+        .into_iter()
+        .map(|a| {
+            let s = if a.contains(':') {
+                format!("[{a}]:{}", lc.port)
+            } else {
+                format!("{a}:{}", lc.port)
+            };
+            s.parse::<std::net::SocketAddr>()
+                .with_context(|| format!("parse listener {a}:{}", lc.port))
+        })
+        .collect()
+}
+
 async fn spawn_listener_port(
     live: Arc<LiveConfig>,
     lc: crate::config::ListenerConfig,
@@ -249,38 +302,34 @@ async fn spawn_listener_port(
     let port = lc.port;
     // 绑定键含地址：同端口不同地址是**两个** listener，改地址也能正确重建（C-2）。
     let key = bind_key(&lc);
-    {
-        let mut a = active.lock().await;
-        if !a.insert(key.clone()) {
-            return Ok(());
-        }
-    }
-    // OpenBSD: [::] 不含 v4-mapped，双栈需显式双 bind。
-    // address 默认 0.0.0.0（v4 全网卡），address_v6 可选 ::= 全网卡 v6。
-    let mut addrs: Vec<String> = vec![lc.address.clone()];
-    if let Some(v6) = lc.address_v6.as_deref() {
-        if !v6.is_empty() {
-            addrs.push(v6.to_string());
-        }
-    }
+    let addrs = listener_addrs(&lc)?;
+    // 逐地址登记 + 逐地址绑定：**部分失败不牵连已经绑上的地址**（见 `addr_key` 的说明）。
     let mut listeners: Vec<(SocketAddr, tokio::net::TcpListener)> = Vec::new();
-    for a in &addrs {
-        let addr: SocketAddr = if a.contains(':') {
-            // IPv6 字面量（含 "::"）—— 用 bracketed 形式解析
-            format!("[{a}]:{}", lc.port)
-        } else {
-            format!("{a}:{}", lc.port)
+    let mut first_err: Option<anyhow::Error> = None;
+    for addr in addrs {
+        let akey = addr_key(&key, &addr);
+        {
+            let mut a = active.lock().await;
+            if a.contains(&akey) {
+                continue; // 这个地址已有活着的 accept 任务
+            }
+            a.insert(akey.clone());
         }
-        .parse()
-        .with_context(|| format!("parse listener {a}:{}", lc.port))?;
         match TcpListener::bind(addr).await {
             Ok(l) => listeners.push((addr, l)),
             Err(e) => {
-                active.lock().await.remove(&key);
-                // 已绑定的要关闭（Drop 自动）
-                return Err(e).with_context(|| format!("bind {addr}"));
+                // 只注销**这个地址**的账，让 reconciler 2s 后单独重试它；
+                // 兄弟地址（例如已经绑上的 v4）不受影响。
+                active.lock().await.remove(&akey);
+                if first_err.is_none() {
+                    first_err = Some(anyhow::Error::new(e).context(format!("bind {addr}")));
+                }
             }
         }
+    }
+    if listeners.is_empty() {
+        return Err(first_err
+            .unwrap_or_else(|| anyhow::anyhow!("listener {key}: 没有可绑定的地址")));
     }
     let addr = listeners[0].0;
     maybe_set_busy_poll(&listeners[0].1);
@@ -290,13 +339,21 @@ async fn spawn_listener_port(
         let live_c = Arc::clone(&live);
         let active_c = Arc::clone(&active);
         let key_c = key.clone();
+        let akey_c = addr_key(&key, &a);
         tokio::spawn(async move {
             // 把**实际绑定的地址**（而不是配置里的字符串）交给连接分发：
             // 同端口不同地址的两个 listener 各自服务自己的站点（C-2）。
             let res = accept_loop(listener, live_c, key_c.clone(), a).await;
-            active_c.lock().await.remove(&key_c);
+            // 只注销**自己这个地址**的账 —— 抹掉整个 `key` 会让兄弟地址失去记账，
+            // 下次重建时兄弟地址被重复 bind（EADDRINUSE）并把已绑上的一起丢掉。
+            active_c.lock().await.remove(&akey_c);
             log::warn!("accept_loop {a} ended: {res:?}");
         });
+    }
+    // 有地址没绑上：把错误交回调用方（记日志 + 让 reconciler 重试该地址），
+    // 但**不要**因此丢掉上面已经起来的那些地址。
+    if let Some(e) = first_err {
+        return Err(e);
     }
 
     if lc.allows_h3() {
@@ -345,7 +402,7 @@ async fn accept_loop(
     local: std::net::SocketAddr,
 ) -> Result<()> {
     let port = local.port();
-    loop {
+    'accept: loop {
         // Hot-reload: if this port disappeared from config, stop accepting.
         {
             let snap = live.snapshot();
@@ -360,7 +417,28 @@ async fn accept_loop(
         tokio::pin!(accept);
         let (stream, peer) = loop {
             tokio::select! {
-                res = &mut accept => break res?,
+                res = &mut accept => match res {
+                    Ok(pair) => break pair,
+                    Err(e) => {
+                        // **绝不因为一次 accept 错误就终结监听口**（第 6 轮并发报告的 P0）。
+                        // EMFILE/ENFILE（fd 被瞬时打满 —— 例如大量零字节空连接就能做到）、
+                        // ECONNABORTED（对端在 accept 返回前 RST）、EINTR 全都是**可恢复**的。
+                        // 原实现是 `res?` 直接 return Err：该监听口此后**永久**不再 accept，
+                        // 站点半边消失，而运维侧只看到一条被折叠的 warn（实测复现：
+                        // 空连接打满 fd ⇒ 命中 EMFILE 的口永久下线，且重建也救不回来）。
+                        // 退避 100ms 后重建 accept future 重来 —— 监听口始终存活。
+                        // 日志按 30s 窗口折叠：这条路径是**匿名可触发**的，不能按请求速率刷日志。
+                        crate::server::log_throttle::warn_every(
+                            "accept-retry",
+                            std::time::Duration::from_secs(30),
+                            &format!(
+                                "accept_loop {local} accept 失败（退避重试，监听口保持存活）: {e}"
+                            ),
+                        );
+                        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                        continue 'accept; // 重建 accept future；旧的已出错不能再 poll
+                    }
+                },
                 _ = tokio::time::sleep(std::time::Duration::from_secs(2)) => {
                     let snap = live.snapshot();
                     if !snap.listeners.iter().any(|l| crate::server::bind_key(l) == key) {

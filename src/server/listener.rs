@@ -87,13 +87,26 @@ async fn dispatch_plain(
     // 被丢掉，客户端只会挂到超时；这也是「明文口 301/HSTS 重定向永远不生效」的原因。
     let mut plain_prefix: Vec<u8> = Vec::new();
     if lc.port_reuse && lc.ssl.is_none() {
-        stream.readable().await.ok();
+        // 同样必须带超时（理由见下面 `plain_prefix.is_empty()` 分支）：这里是
+        // port_reuse 明文口（例如 55555/55556 那对）的嗅探入口。
+        // 超时 ⇒ sniff_ready=false ⇒ n 保持 0 ⇒ 不做 TLS 分流，plain_prefix 仍为空，
+        // 交给下面的分支（它也有自己的超时）再判一次 —— 语义等同「对端没发字节」。
+        let sniff_ready = tokio::time::timeout(
+            crate::server::tls::accept::PEEK_TOTAL_WAIT,
+            stream.readable(),
+        )
+        .await
+        .is_ok();
         let mut peek = vec![0u8; 4096];
         // `mut`：下面补齐半个 ClientHello 时会继续往 peek 里写（并把 n 加上读到的字节数）
-        let mut n = match stream.try_read(&mut peek) {
-            Ok(m) => m,
-            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => 0,
-            Err(_) => 0,
+        let mut n = if sniff_ready {
+            match stream.try_read(&mut peek) {
+                Ok(m) => m,
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => 0,
+                Err(_) => 0,
+            }
+        } else {
+            0
         };
         if n > 0 {
             // 仅 TLS record header (0x16) 才走 SNI 分流；明文 HTTP 方法名留给下面。
@@ -180,10 +193,24 @@ async fn dispatch_plain(
 
     // 明文分发：port_reuse 分支若已读到字节就直接用，避免二次读取丢数据。
     if plain_prefix.is_empty() {
-        stream.readable().await.ok();
-        let mut buf = [0u8; 24];
-        let n = stream.try_read(&mut buf).unwrap_or(0);
-        plain_prefix = buf[..n].to_vec();
+        // **首字节必须有超时**（与 TLS 侧 `accept::PEEK_TOTAL_WAIT` 同一预算）。
+        // 旧实现是裸 `stream.readable().await`：明文口连上后**一个字节都不发**，就能把这个
+        // 任务连同它的 fd 永久挂住 —— h1 的 30s 头读超时**盖不到**这里（根本还没进 h1）。
+        // 叠加「无 per-IP/全局连接上限」，约 940 个零字节空连接即可打满 fd，进而让某个
+        // accept 循环撞上 EMFILE（第 6 轮并发报告 #1/#2，同一攻击链的两端）。
+        // 超时后 prefix 仍为空 ⇒ 落到下面的 `h1::serve`，由 h1 自己的头读超时兜底：
+        // 连接依然是**有界**的，只是分流判定延后，语义不变。
+        if tokio::time::timeout(
+            crate::server::tls::accept::PEEK_TOTAL_WAIT,
+            stream.readable(),
+        )
+        .await
+        .is_ok()
+        {
+            let mut buf = [0u8; 24];
+            let n = stream.try_read(&mut buf).unwrap_or(0);
+            plain_prefix = buf[..n].to_vec();
+        }
     }
     let prefix: &[u8] = plain_prefix.as_slice();
     // 草案 §10.1：非 TLS 时用首 8 字节的协议魔数识别 QMux（QX_TRANSPORT_PARAMETERS 的帧类型

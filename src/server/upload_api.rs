@@ -305,6 +305,12 @@ where
         }
     };
 
+    // 持有会话记账（`session_for` 已在 SESSIONS 锁内 +1）：守卫必须在**所有**提前 return
+    // 之前建立，靠 Drop 递减 —— 漏减会让该目标名的后续全量上传永久 409。
+    // 作用：另一个请求正持有同一会话时，`session_for` 会把并发全量上传挡在 409，
+    // 不再出现「共享 .part → 一方 500、另一方静默丢数据」。
+    let _attach = upload_resume::Attach::new(Arc::clone(&sess));
+
     // 流式读 body：逐帧 append。offset 用会话当前值 —— 因此并发分片必须带 Content-Range
     // 且服务端按顺序接纳（偏移不符会直接回 409，客户端据此校正重发）。
     let mut body = req.into_body();
