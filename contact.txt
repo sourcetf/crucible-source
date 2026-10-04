@@ -1645,3 +1645,35 @@ QMux 协议 / CONNECT-UDP（501）/ H3 ECN / TSX 内置编译 / JSP-ASP 需要�
 dns-encrypted（DoT 超时+ACL 快照+证书重载、ACME 首签）与部分 dns-geoip 项（覆盖权重等）
 未在本轮落地 —— 详见 `.agents/1009/reports/*.md` 与 `.agents/1009/fixes/*.md`（15 份报告 +
 5 份修复总结，含每条的文件:行号证据）。
+
+---
+
+# 【工号 1009 · 追加】[P0] 已修：`GET /rack/` 导致整个进程崩溃
+
+## 现象（本轮实测，务必记住）
+本地 OpenBSD VM 上：`curl http://127.0.0.1:9095/rack/` 返回 **200** 之后数秒~数十秒内，
+**整个 webserver 进程 SIGSEGV**，core 文件 456MB，**所有监听口（9081/9095/8443/9445/9446/DNS）
+一起下线**。gdb 栈顶：`#0 sigsegv () from /usr/local/lib/libruby34.so`。
+复现隔离：不碰 /rack/ 时跑 180s+ 稳定；请求过 /rack/ 之后必崩。
+
+## 已做的修复（commit b85a792）
+1. `src/server/apps/app_ffi.rs`：引擎 .so 用 `RTLD_NOW|RTLD_GLOBAL|RTLD_NODELETE` 加载
+   （OpenBSD `<dlfcn.h>` 有 `RTLD_NODELETE 0x400`，但 `libc` crate 没导出 → 自定义
+   `RTLD_NODELETE_EXT` 按平台取值）。热重载 `shutdown()` 照跑，但映射不再被解除。
+2. `scripts/build_script_ffi.sh` + `scripts/build_app_engines.sh`：rack 的
+   `-DCRUCIBLE_HAVE_RUBY` **默认关闭**（要启用设 `CRUCIBLE_ENABLE_RACK_EMBED=1`），
+   默认构建回「诚实失败」版（502 + 明确错误文本、不 spawn）。**代码保留在仓库里**，
+   两个脚本的注释写清了高置信度根因（MRI 的定时器/信号处理 + 从任意原生线程调用
+   Ruby API 没有把线程注册给 VM）与启用前提。
+3. 验证：rack 502（诚实失败）、ruby/psgi/php/rust/c/go/lua/cgi 全 200、**180s 后进程存活**。
+
+## 给接手者的提示
+- 若有人要重新启用 MRI 嵌入：先读 `build_script_ffi.sh` 里那段注释。核心是把
+  **所有** Ruby API 调用都放到「一个由 `ruby_init` 创建/注册过的线程」上
+  （或每次用 `rb_thread_call_with_gvl` 包裹），然后按注释里的验收标准测：
+  `/rack/` 之后至少 5 分钟不崩 + 连续 1000 次请求 + 与其它引擎混跑。
+- 同类风险：任何嵌入解释器的 .so 都可能在 dlclose 后崩溃；`RTLD_NODELETE` 现在对所有
+  引擎生效，这是一道通用防线（Python/Perl 嵌入目前实测稳定）。
+- `webfs: /crucible/webserver.core` 已删；若再出现 core，用
+  `/usr/bin/gdb -batch -ex "bt" /crucible/target/release/webserver /crucible/webserver.core`
+  （release 带符号名、无行号）。
