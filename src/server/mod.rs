@@ -451,6 +451,14 @@ async fn accept_loop(
             }
         };
         maybe_set_busy_poll_stream(&stream);
+        // TCP_NODELAY：**必须**开。默认（Nagle）下小响应会被攒着等 ACK，与对端
+        // 延迟 ACK 叠加后每个 keep-alive 请求白等 1–40ms —— 实测在本机把 p50 从
+        // ~0.3ms 抬到 2.2ms、吞吐从 ~110k 掉到 ~27k（同机 h2o 早就是默认开启）。
+        // 这不是"优化"而是**正确性级别**的默认值：HTTP 响应本来就不该等 Nagle 攒包。
+        // 失败只记日志（个别平台/套接字类型可能不支持），不影响连接。
+        if let Err(e) = stream.set_nodelay(true) {
+            log::debug!("set_nodelay({peer}): {e}");
+        }
         // P2-7：SYN 速率信号源——syncookie 评估器按 tick 差值估算速率并动态切换 sysctl。
         crate::server::syncookie::note_syn();
         let live_c = Arc::clone(&live);

@@ -1019,6 +1019,8 @@ async fn connect_upstream_inner(
             .await
             .with_context(|| format!("connect {host}:{port}"))?
     };
+    // 回源方向同样关掉 Nagle：否则每个上游请求的首包都要等延迟 ACK。
+    let _ = tcp.set_nodelay(true);
 
     let want_tls = scheme.eq_ignore_ascii_case("https")
         || (is_onion && mode != OnionSslMode::Off);
@@ -1563,6 +1565,7 @@ async fn connect_tor_socks(
         let tcp = TcpStream::connect(addr)
             .await
             .with_context(|| format!("tor socks connect {addr}"))?;
+        let _ = tcp.set_nodelay(true);
         return socks5_connect(tcp, host, port).await;
     }
     // 用缓存的读取器：env_lock 会在引擎请求期间写进程环境，直接 var() 有数据竞争（见其说明）
@@ -1608,6 +1611,7 @@ async fn connect_tor_socks(
     let tcp = TcpStream::connect(addr)
         .await
         .with_context(|| format!("tor socks connect {addr}"))?;
+    let _ = tcp.set_nodelay(true);
     socks5_connect(tcp, host, port).await
 }
 

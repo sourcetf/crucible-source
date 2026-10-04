@@ -32,7 +32,11 @@ pub async fn forward_guarded(
     prefix: &[u8],
 ) -> std::io::Result<()> {
     let mut up = match tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(upstream)).await {
-        Ok(Ok(s)) => s,
+        Ok(Ok(s)) => {
+            // 透传路径的小包（首字节/心跳）不该被 Nagle 攒着等 ACK。
+            let _ = s.set_nodelay(true);
+            s
+        }
         Ok(Err(e)) => return Err(e),
         Err(_) => {
             return Err(std::io::Error::new(
