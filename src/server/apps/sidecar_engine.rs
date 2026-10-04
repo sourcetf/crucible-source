@@ -81,11 +81,18 @@ pub async fn handle_with_fallback_simple(
     {
         if native_http::uds_socket_available(app) {
             let sock = native_http::uds_socket_path(app).context("apps[].socket missing")?;
-            return proxy_uds_simple(req, &sock, peer).await;
+            // 显式 socket 的 sidecar（JSP/do）：**剥掉路由前缀**再转发 —— Jetty 的
+            // WebAppContext 是 `/`，原样发 `/jsp/index.jsp` 会让它去 docroot/jsp/ 找文件，
+            // 恒 404（与 h1 侧 native_http::try_handle_uds 同一判据）。
+            let target = crate::server::apps::app_ffi::rel_script_path(app, req.uri().path());
+            return proxy_uds_simple(req, &sock, peer, Some(target)).await;
         }
         if native_http::sidecar_available(app, lc) {
             let sock = ensure_sidecar_simple(lc, app, app_idx).await?;
-            return proxy_uds_simple(req, &sock, peer).await;
+            // 与 h1 侧同语义：自动 sidecar 同样剥掉路由前缀（sidecar 挂在 /ruby、/go
+            // 这类前缀下，内部只认应用相对路径）。
+            let target = crate::server::apps::app_ffi::rel_script_path(app, req.uri().path());
+            return proxy_uds_simple(req, &sock, peer, Some(target)).await;
         }
     }
     #[cfg(not(unix))]
@@ -158,6 +165,7 @@ async fn proxy_uds_simple(
     req: &Request<Bytes>,
     sock: &std::path::Path,
     peer: SocketAddr,
+    path_override: Option<String>,
 ) -> Result<Response<Bytes>> {
     use hyper::client::conn::http1;
     use http_body_util::BodyExt as _;
@@ -179,11 +187,17 @@ async fn proxy_uds_simple(
     // h2/h3 的 URI 带 scheme+authority（:authority），而 UDS sidecar 是 origin server：
     // 目标一律改写为 origin-form（path?query），否则请求行会写成 absolute-form，sidecar
     // 可能解析失败/路由错。h2 也不保证有 Host 头 ⇒ authority 存在而 Host 缺失时补上。
-    let target = req
-        .uri()
-        .path_and_query()
-        .map(|pq| pq.as_str().to_string())
-        .unwrap_or_else(|| "/".to_string());
+    let target = match path_override {
+        Some(p) => match req.uri().query() {
+            Some(q) => format!("{p}?{q}"),
+            None => p,
+        },
+        None => req
+            .uri()
+            .path_and_query()
+            .map(|pq| pq.as_str().to_string())
+            .unwrap_or_else(|| "/".to_string()),
+    };
     let mut builder = Request::builder().method(req.method().clone()).uri(target);
     let mut has_host = false;
     for (k, v) in req.headers() {

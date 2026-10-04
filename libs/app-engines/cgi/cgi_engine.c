@@ -108,6 +108,10 @@ static int cgi_key_is_ours(const char *entry)
     if (eq == NULL)
         return 0;
     klen = (size_t)(eq - entry);
+    /* HTTP_* 是每请求动态键：继承 environ 里若有同名（旧实现的残留/宿主环境）
+     * 一律跳过，避免同一 envp 出现重复键（getenv 取首条，语义不确定）。 */
+    if (klen >= 5 && strncmp(entry, "HTTP_", 5) == 0)
+        return 1;
     for (i = 0; cgi_own_keys[i] != NULL; i++) {
         if (strlen(cgi_own_keys[i]) == klen &&
             strncmp(entry, cgi_own_keys[i], klen) == 0)
@@ -125,6 +129,53 @@ static char *cgi_kv(const char *k, const char *v)
         return NULL;
     snprintf(s, n, "%s=%s", k, v);
     return s;
+}
+
+/* ---- 请求头块（ABI headers）→ CGI 的 HTTP_* 环境条目 ---------------------- */
+
+struct cgi_hdr_list {
+    char **v;
+    size_t n;
+    size_t cap;
+    int oom;
+};
+
+static int cgi_header_cb(void *ctx, const char *name, size_t name_len,
+                         const char *value, size_t value_len)
+{
+    struct cgi_hdr_list *c = (struct cgi_hdr_list *)ctx;
+    char key[262], *val, *kv;
+
+    if (c == NULL)
+        return 1;
+    if (appengine_cgi_http_key(key, sizeof(key), name, name_len) == 0)
+        return 0;
+    if (c->n == c->cap) {
+        size_t nc = c->cap != 0 ? c->cap * 2 : 16;
+        char **nv = (char **)realloc(c->v, nc * sizeof(char *));
+
+        if (nv == NULL) {
+            c->oom = 1;
+            return 1;
+        }
+        c->v = nv;
+        c->cap = nc;
+    }
+    val = (char *)malloc(value_len + 1);
+    if (val == NULL) {
+        c->oom = 1;
+        return 1;
+    }
+    memcpy(val, value, value_len);
+    val[value_len] = '\0';
+    kv = cgi_kv(key, val);
+    free(val);
+    if (kv == NULL) {
+        c->oom = 1;
+        return 1;
+    }
+    c->v[c->n++] = kv;
+    return 0;
 }
 
 /* ---------------------------------------------------------------- 子进程 --- */
@@ -472,11 +523,12 @@ static void cgi_apply_output(AppEngineResult *out, crucible_buf *raw)
 static int cgi_execute(const char *script, const char *method, const char *path,
                        const char *query, const char *content_type, const char *body,
                        size_t body_len, const char *remote, const char *server_name,
-                       int server_port, AppEngineResult *out)
+                       int server_port, const char *headers, AppEngineResult *out)
 {
     crucible_buf raw, errbuf;
     char *own[12];
     size_t own_n = 0, nenv = 0, i;
+    struct cgi_hdr_list hdrs;
     char **envp = NULL;
     char portbuf[16];
     char lenbuf[32];
@@ -488,10 +540,18 @@ static int cgi_execute(const char *script, const char *method, const char *path,
     memset(&raw, 0, sizeof(raw));
     memset(&errbuf, 0, sizeof(errbuf));
     memset(&proc, 0, sizeof(proc));
+    memset(&hdrs, 0, sizeof(hdrs));
     proc.in_fd = proc.out_fd = proc.err_fd = -1;
     why[0] = '\0';
     if (body == NULL)
         body_len = 0;
+
+    /* 请求头 → HTTP_*（CGI/1.1 环境；Content-Type/Length 由专门形参处理）。 */
+    (void)appengine_headers_foreach(headers, cgi_header_cb, &hdrs);
+    if (hdrs.oom) {
+        rc = cgi_fail(out, "cgi: 内存不足（构造请求头环境）");
+        goto cleanup;
+    }
 
     snprintf(portbuf, sizeof(portbuf), "%d", server_port > 0 ? server_port : 80);
     snprintf(lenbuf, sizeof(lenbuf), "%lu", (unsigned long)body_len);
@@ -521,7 +581,7 @@ static int cgi_execute(const char *script, const char *method, const char *path,
         if (!cgi_key_is_ours(environ[i]))
             nenv++;
     }
-    envp = (char **)malloc(sizeof(char *) * (nenv + own_n + 1));
+    envp = (char **)malloc(sizeof(char *) * (nenv + own_n + hdrs.n + 1));
     if (envp == NULL) {
         rc = cgi_fail(out, "cgi: 内存不足（构造请求环境）");
         goto cleanup;
@@ -533,6 +593,8 @@ static int cgi_execute(const char *script, const char *method, const char *path,
     }
     for (i = 0; i < own_n; i++)
         envp[nenv++] = own[i];
+    for (i = 0; i < hdrs.n; i++)
+        envp[nenv++] = hdrs.v[i];
     envp[nenv] = NULL;
 
     if (cgi_spawn(script, envp, &proc) != 0) {
@@ -560,6 +622,9 @@ cleanup:
         cgi_kill_reap(&proc);
     for (i = 0; i < own_n; i++)
         free(own[i]);
+    for (i = 0; i < hdrs.n; i++)
+        free(hdrs.v[i]);
+    free(hdrs.v);
     free(envp);
     crucible_buf_free(&raw);
     crucible_buf_free(&errbuf);
@@ -587,6 +652,7 @@ int appengine_execute(
     const char *server_name,
     int server_port,
     const char *extra,
+    const char *headers,
     AppEngineResult *out)
 {
     char pathbuf[1024];
@@ -605,7 +671,7 @@ int appengine_execute(
                         script != NULL ? script : "(null)",
                         docroot != NULL ? docroot : "(null)");
     return cgi_execute(use, method, path, query, content_type, body, body_len, remote,
-                       server_name, server_port, out);
+                       server_name, server_port, headers, out);
 }
 
 void appengine_shutdown(void)

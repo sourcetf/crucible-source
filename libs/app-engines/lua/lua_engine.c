@@ -192,8 +192,43 @@ static int l_ngx_exit(lua_State *L) {
     return lua_error(L);
 }
 
+/* ngx.req.get_headers()：请求头表（键小写，与 nginx 同约定）。
+ * 同名头本实现取最后一条（nginx 返回数组），样例/路由场景够用。 */
+static int l_ngx_req_get_headers(lua_State *L) {
+    lua_pushvalue(L, lua_upvalueindex(1));
+    return 1;
+}
+
+struct lua_hdr_ctx {
+    lua_State *L;
+    int table_idx; /* 栈上 headers 表的绝对索引 */
+};
+
+static int lua_hdr_cb(void *ctx, const char *name, size_t name_len, const char *value,
+                      size_t value_len) {
+    struct lua_hdr_ctx *c = (struct lua_hdr_ctx *)ctx;
+    char key[262];
+    size_t i;
+
+    if (c == NULL || c->L == NULL)
+        return 1;
+    if (name_len >= sizeof(key))
+        return 0;
+    for (i = 0; i < name_len; i++) {
+        char ch = name[i];
+        if (ch >= 'A' && ch <= 'Z')
+            ch = (char)(ch - 'A' + 'a');
+        key[i] = ch;
+    }
+    key[name_len] = '\0';
+    lua_pushlstring(c->L, key, name_len);
+    lua_pushlstring(c->L, value, value_len);
+    lua_settable(c->L, c->table_idx);
+    return 0;
+}
+
 static void inject_ngx(lua_State *L, const char *method, const char *path,
-                       const char *query, const char *remote) {
+                       const char *query, const char *remote, const char *headers) {
     lua_newtable(L); /* ngx */
 
     lua_pushcfunction(L, l_ngx_say);
@@ -215,6 +250,22 @@ static void inject_ngx(lua_State *L, const char *method, const char *path,
     lua_setfield(L, -2, "__newindex");
     lua_setmetatable(L, -2);
     lua_setfield(L, -2, "header");
+
+    /* ngx.req.get_headers() */
+    lua_newtable(L); /* req */
+    lua_newtable(L); /* headers 表 */
+    {
+        struct lua_hdr_ctx hc;
+
+        hc.L = L;
+        hc.table_idx = lua_gettop(L);
+        (void)appengine_headers_foreach(headers, lua_hdr_cb, &hc);
+    }
+    lua_pushvalue(L, -1); /* 复制一份作 closure upvalue */
+    lua_pushcclosure(L, l_ngx_req_get_headers, 1);
+    lua_setfield(L, -3, "get_headers"); /* req.get_headers */
+    lua_pop(L, 1);                      /* 弹出 headers 表 */
+    lua_setfield(L, -2, "req");         /* ngx.req */
 
     lua_newtable(L); /* vars data */
     if (method)
@@ -272,6 +323,7 @@ int appengine_execute(
     const char *server_name,
     int server_port,
     const char *extra,
+    const char *headers,
     AppEngineResult *out)
 {
     (void)docroot;
@@ -300,7 +352,7 @@ int appengine_execute(
         }
         luaL_openlibs(L);
         ngx_ctx_bind(L, &ctx);
-        inject_ngx(L, method, path, query, remote);
+        inject_ngx(L, method, path, query, remote, headers);
 
         {
             int rc = luaL_dofile(L, script);
@@ -349,6 +401,7 @@ int appengine_execute(
 #else
     {
         char buf[640];
+        (void)headers;
         snprintf(buf, sizeof(buf),
                  "hello from lua engine (NO CRUCIBLE_HAVE_LUA — install lua "
                  "dev headers and rebuild) path=%s method=%s query=%s "

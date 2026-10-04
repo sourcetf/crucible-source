@@ -31,13 +31,22 @@ if [ ! -f state/ech/ech_keys.pem ]; then
   sh scripts/generate_ech.sh crucible.local 2>/dev/null || true
 fi
 
-# JSP sidecar on UDS for test listener
+# JSP sidecar on UDS for test listener（生产路径 = Java/Jetty jar，不用 Python 垫片）
 mkdir -p state/jsp
 pkill -f 'jsp_sidecar.py' 2>/dev/null || true
-nohup python3 libs/jsp-sidecar/jsp_sidecar.py \
-  --socket /crucible/state/jsp/test.sock \
-  --docroot /crucible/www-apps/jsp \
-  >>/tmp/jsp-sidecar.log 2>&1 &
+if [ -f libs/jsp-sidecar/target/jsp-sidecar.jar ]; then
+  pkill -f 'jsp-sidecar.jar' 2>/dev/null || true
+  sleep 1
+  nohup sh libs/jsp-sidecar/jsp_sidecar.sh \
+    /crucible/state/jsp/test.sock /crucible/www-apps/jsp \
+    >>/tmp/jsp-sidecar.log 2>&1 &
+else
+  echo "note: jsp-sidecar.jar missing; using Python UDS shim (demo only)" >&2
+  nohup python3 libs/jsp-sidecar/jsp_sidecar.py \
+    --socket /crucible/state/jsp/test.sock \
+    --docroot /crucible/www-apps/jsp \
+    >>/tmp/jsp-sidecar.log 2>&1 &
+fi
 
 # Kill only the previous test instance when possible (pidfile / config-test match).
 if [ -f /tmp/crucible-test.pid ]; then
@@ -56,7 +65,7 @@ sleep 1
 export CRUCIBLE_DNS_STATE_ROOT="/crucible/state/dns-test"
 mkdir -p "$CRUCIBLE_DNS_STATE_ROOT"
 
-nohup ./target/release/webserver --config "$CFG" >>"$LOG" 2>&1 &
+nohup ./target/release/webserver --config "$CFG" >>"$LOG" 2>&1 </dev/null &
 WPID=$!
 echo "$WPID" >/tmp/crucible-test.pid
 echo "pid $WPID config=$CFG ports=19095,19081,19445,19446,18443 log=$LOG"

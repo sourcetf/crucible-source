@@ -60,6 +60,14 @@ detect_python() {
 }
 
 detect_ruby() {
+  # **默认关闭**：嵌入式 MRI 在 OpenBSD + Ruby 3.4 上启动阶段就 rb_bug → SIGSEGV 整个
+  # webserver 进程（script_engine.c 里的专用 MRI 线程 + RUBY_INIT_STACK + 最小 prelude
+  # 都试过，core 栈一致：sigsegv → rb_bug_for_fatal_signal → ruby_default_signal）。
+  # 与 rack 引擎同款风险，因此同样做成显式开关；稳定的 /ruby/ 路径是常驻 Ruby sidecar。
+  if [[ "${CRUCIBLE_ENABLE_RUBY_EMBED:-0}" != "1" ]]; then
+    echo "    Ruby embed disabled by default (CRUCIBLE_ENABLE_RUBY_EMBED=1 to opt in) → embed-missing (no popen)"
+    return 1
+  fi
   if pkg-config --exists ruby 2>/dev/null; then
     EXTRA_CFLAGS="${EXTRA_CFLAGS} $(pkg-config --cflags ruby) -DCRUCIBLE_HAVE_RUBY"
     EXTRA_LIBS="${EXTRA_LIBS} $(pkg-config --libs ruby)"
@@ -156,6 +164,16 @@ for lang in python ruby perl; do
       "${COMMON}/appengine_common.c"
   fi
 done
+
+# Ruby embed 关闭时：**删掉**可能残留的 libapp_ruby.so。
+# 为什么删而不是留 stub：`native_http::lib_available()` 判的是「文件是否存在」，
+# 留一个「每次请求都报 embed-missing」的 .so 会让 /ruby/ 恒 502，并抢在持久 sidecar
+# （www-apps/ruby/deps/bin/index → sidecar.rb）之前把请求吃掉。删掉之后分派自动落到
+# sidecar：不崩、能用（sidecar 崩了也只是重启它，不影响 webserver 主进程）。
+if [[ "${CRUCIBLE_ENABLE_RUBY_EMBED:-0}" != "1" && -f "${OUT}/libapp_ruby.so" ]]; then
+  rm -f "${OUT}/libapp_ruby.so"
+  echo "removed ${OUT}/libapp_ruby.so (ruby embed disabled → persistent sidecar path)"
+fi
 
 # ---- psgi / rack：与 python/ruby/perl 同一套嵌入，只是引擎源文件不同 ----
 # 此前这两个 .so 只由 build_app_engines.sh 的 `build_stub_engine` 编译（不带 HAVE_* 标志），

@@ -33,6 +33,7 @@ pub unsafe extern "C" fn appengine_execute(
     _server_name: *const c_char,
     _server_port: c_int,
     extra: *const c_char,
+    _headers: *const c_char,
     out: *mut AppEngineResult,
 ) -> c_int {
     // P1-1：extra JSON {"engine":...,"env":{...}} → 注入进程环境（APP_HELLO 等）；

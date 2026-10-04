@@ -131,7 +131,19 @@ fn state_change_allowed<T>(req: &Request<T>) -> bool {
 
 /// P1-4：统一请求体类型为 Request<Full<Bytes>>——h1 在入口收齐（32MiB 上限），
 /// h2/h3 把已收集的 body 用 Full 重建后复用同一处理函数（admin API 不再只走 h1）。
+///
+/// 所有管理面响应（含 401/403 与 dns/admin_api 转发的 /api/dns/*）统一追加
+/// `Cache-Control: no-store`：口令哈希、MaxMind key 这类凭据材料不该被中间代理或
+/// 浏览器磁盘缓存留下副本（此前全树 grep 不到任何 Cache-Control）。TOML/JSON 读取
+/// 端点尤其如此。
 pub async fn handle(req: Request<Full<Bytes>>, live: Arc<LiveConfig>) -> Response<BoxBody> {
+    let mut resp = handle_inner(req, live).await;
+    resp.headers_mut()
+        .insert(header::CACHE_CONTROL, http::HeaderValue::from_static("no-store"));
+    resp
+}
+
+async fn handle_inner(req: Request<Full<Bytes>>, live: Arc<LiveConfig>) -> Response<BoxBody> {
     let cfg = live.snapshot();
     let admin_path = cfg.admin.path.trim_end_matches('/').to_string();
     let path = req.uri().path().to_string();
@@ -369,8 +381,20 @@ pub async fn handle(req: Request<Full<Bytes>>, live: Arc<LiveConfig>) -> Respons
 
     // ---------- 配置读取 ----------
     if path.ends_with("/api/config/json") && method == Method::GET {
-        return match serde_json::to_string_pretty(&*cfg) {
-            Ok(s) => json_ok(s),
+        // 面板每次切 tab 都拉全量配置：password_hash / MaxMind license_key 属于凭据
+        // 材料，不该随全量 JSON 常驻面板 JS 内存与输入框（任何一次前端 XSS 就能直接
+        // 读走；纵深防御）。这里只对**回显副本**打码，磁盘与 live 配置不受影响；
+        // 「配置源码」编辑器的 /api/config（TOML）仍显示原文 —— 那本来就是完整视图。
+        return match serde_json::to_value(&*cfg) {
+            Ok(mut val) => {
+                mask_secrets(&mut val);
+                match serde_json::to_string_pretty(&val) {
+                    Ok(s) => json_ok(s),
+                    Err(e) => {
+                        text_err(StatusCode::INTERNAL_SERVER_ERROR, format!("serialize: {e}"))
+                    }
+                }
+            }
             Err(e) => text_err(StatusCode::INTERNAL_SERVER_ERROR, format!("serialize: {e}")),
         };
     }
@@ -938,6 +962,29 @@ pub async fn handle(req: Request<Full<Bytes>>, live: Arc<LiveConfig>) -> Respons
         };
     }
 
+    // ---------- 账号：用户 CRUD（规格 §16.19 #11）----------
+    //
+    // 旧实现只有「改首个用户密码」，增删用户只能手改 config.toml。这里提供
+    // list(add/del/pass)，口令明文进、argon2id/yescrypt 盐哈希落盘；GET 只回用户名，
+    // 响应里永不出现哈希（与 /api/config/json 的打码口径一致）。
+    if path.ends_with("/api/admin/users") {
+        if method == Method::GET {
+            let mut s = String::from("{\"users\":[");
+            for (i, u) in cfg.admin.users.iter().enumerate() {
+                if i > 0 {
+                    s.push(',');
+                }
+                s.push_str(&format!("{{\"username\":{}}}", json_str(&u.username)));
+            }
+            s.push_str("]}");
+            return json_ok(s);
+        }
+        if method == Method::POST {
+            return with_json(req, |v| save_admin_user(&live, &v)).await;
+        }
+        return text_err(StatusCode::METHOD_NOT_ALLOWED, "GET/POST only");
+    }
+
     // ---------- 文件管理 ----------
     if path.ends_with("/api/files/mkdir") && method == Method::POST {
         return with_form(req, |port, path_rel| {
@@ -1092,6 +1139,111 @@ pub async fn handle(req: Request<Full<Bytes>>, live: Arc<LiveConfig>) -> Respons
 }
 
 // ---------- 保存端点实现 ----------
+
+/// `/api/admin/users` POST：body `{"action":"add|del|pass","username":...,"password":...}`。
+///
+/// 直接基于树里的 `[admin]` 表改（不能整表重建：realm/path/listeners_allow/
+/// metrics_public 都在同一张表里）。沿用 `/api/admin/save` 的口径：所有修改都经过
+/// `finish_write` 的校验 + 原子写盘 + 热重载，失败不会留下半份配置。
+fn save_admin_user(live: &Arc<LiveConfig>, v: &Json) -> Response<BoxBody> {
+    let action = v.get("action").and_then(|s| s.as_str()).unwrap_or("");
+    let username = v
+        .get("username")
+        .and_then(|s| s.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    if username.is_empty() {
+        return bad_request("username 不能为空");
+    }
+    if let Err(e) = check_str("username", &username, MAX_SHORT_STR) {
+        return bad_request(e);
+    }
+    // 用户名参与 Basic 鉴权的字符串比较：空白会让面板上「看起来一样」的用户名
+    // 永远登录不上（或者在 URL 编码后产生歧义），控制字符/引号则只会制造困惑。
+    if username
+        .chars()
+        .any(|c| c.is_control() || c.is_whitespace() || c == '"' || c == '\\')
+    {
+        return bad_request("username 不能含空白、控制字符、引号或反斜杠");
+    }
+    let password = v.get("password").and_then(|s| s.as_str());
+    if matches!(action, "add" | "pass") {
+        let Some(p) = password else {
+            return bad_request(format!("action={action} 需要 password（明文）"));
+        };
+        if p.is_empty() {
+            return bad_request("password 不能为空");
+        }
+        if p.len() > MAX_PASSWORD_BYTES {
+            return bad_request(format!(
+                "口令过长（{} > {MAX_PASSWORD_BYTES} 字节）",
+                p.len()
+            ));
+        }
+    }
+    let mut tree = match cfg_edit::load_tree(live.path()) {
+        Ok(t) => t,
+        Err(e) => return text_err(StatusCode::BAD_REQUEST, format!("{e:#}")),
+    };
+    let Some(admin) = tree.get_mut("admin").and_then(|a| a.as_table_mut()) else {
+        return text_err(StatusCode::INTERNAL_SERVER_ERROR, "config 里没有 [admin] 表");
+    };
+    let users = admin
+        .entry("users".to_string())
+        .or_insert_with(|| toml::Value::Array(Vec::new()));
+    let Some(arr) = users.as_array_mut() else {
+        return text_err(StatusCode::INTERNAL_SERVER_ERROR, "admin.users 不是数组");
+    };
+    let pos = arr.iter().position(|u| {
+        u.get("username").and_then(|x| x.as_str()) == Some(username.as_str())
+    });
+    match action {
+        "add" => {
+            if pos.is_some() {
+                return bad_request(format!("用户已存在: {username}"));
+            }
+            if arr.len() >= MAX_ADMIN_USERS {
+                return bad_request(format!("用户数已达上限 {MAX_ADMIN_USERS}"));
+            }
+            let hash = match password::hash_password(password.unwrap_or_default()) {
+                Ok(h) => h,
+                Err(e) => return text_err(StatusCode::BAD_REQUEST, format!("{e:#}")),
+            };
+            let mut t = toml::map::Map::new();
+            t.insert("username".into(), toml::Value::String(username.clone()));
+            t.insert("password_hash".into(), toml::Value::String(hash));
+            arr.push(toml::Value::Table(t));
+            finish_write(live, &tree, &format!("user {username} added"))
+        }
+        "del" => {
+            let Some(i) = pos else {
+                return bad_request(format!("用户不存在: {username}"));
+            };
+            // 删到一个不剩时 check_admin_headers 对一切请求 401 且没有任何有效 hash
+            // ⇒ 管理面永久锁死（只能手改 config.toml + 重启才能恢复）。保留最后一个。
+            if arr.len() <= 1 {
+                return bad_request("不能删除最后一个用户（否则管理面将永久 401 锁死）");
+            }
+            arr.remove(i);
+            finish_write(live, &tree, &format!("user {username} deleted"))
+        }
+        "pass" => {
+            let Some(i) = pos else {
+                return bad_request(format!("用户不存在: {username}"));
+            };
+            let hash = match password::hash_password(password.unwrap_or_default()) {
+                Ok(h) => h,
+                Err(e) => return text_err(StatusCode::BAD_REQUEST, format!("{e:#}")),
+            };
+            if let Some(t) = arr[i].as_table_mut() {
+                t.insert("password_hash".into(), toml::Value::String(hash));
+            }
+            finish_write(live, &tree, &format!("user {username} password updated"))
+        }
+        _ => bad_request("action 必须是 add/del/pass"),
+    }
+}
 
 /// 新增/整体替换 listener。body: {"orig_port": 旧端口(改名时用), "listener": {...}}
 fn save_listener(live: &Arc<LiveConfig>, v: &Json) -> Response<BoxBody> {
@@ -1643,6 +1795,9 @@ const MAX_IP_ACCESS_ITEMS: usize = 1024;
 /// 管理员口令长度上限。哈希成本随输入线性增长、面板输入框也没有千字符口令的用法；
 /// 不设上限时 32MiB 的请求体可以被当成口令送进 yescrypt/argon2。
 const MAX_PASSWORD_BYTES: usize = 1024;
+/// 管理员账号数上限。鉴权对用户表线性扫描，64 足够；也挡住一次请求往 config.toml
+/// 塞进大量用户条目（每条的哈希都要现算）。
+const MAX_ADMIN_USERS: usize = 64;
 /// HTTPS(type65) 记录名（DNS 名）与其标签上限，见 RFC 1035/9460。
 const MAX_DNS_NAME_LEN: usize = 253;
 const MAX_DNS_LABEL_LEN: usize = 63;
@@ -2460,6 +2615,29 @@ fn serde_json_array(items: &[String]) -> String {
     s
 }
 
+/// `/api/config/json` 回显副本的凭据打码（只改副本，不碰 live 配置与磁盘）。
+///
+/// - `admin.users[].password_hash`：口令哈希不回传面板（UI 只有明文密码入口，
+///   没有任何需要哈希的场景）。
+/// - `dns.geo.mmdb.license_key`：MaxMind 许可证密钥；DNS tab 从 /api/dns/status
+///   单独读取，全量 JSON 里不再扩散。
+fn mask_secrets(v: &mut Json) {
+    if let Some(users) = v.pointer_mut("/admin/users").and_then(|u| u.as_array_mut()) {
+        for u in users.iter_mut() {
+            if let Some(o) = u.as_object_mut() {
+                if o.contains_key("password_hash") {
+                    o.insert("password_hash".into(), Json::String("***".into()));
+                }
+            }
+        }
+    }
+    if let Some(o) = v.pointer_mut("/dns/geo/mmdb").and_then(|m| m.as_object_mut()) {
+        if o.contains_key("license_key") {
+            o.insert("license_key".into(), Json::String(String::new()));
+        }
+    }
+}
+
 #[derive(Clone, Copy, PartialEq)]
 enum RulesKind {
     Page,
@@ -2497,10 +2675,12 @@ async fn handle_rules_api(
                         .as_deref()
                         .map(|t| json_str(&crate::server::page_rules::scrub_brand(t)))
                         .unwrap_or_else(|| "null".into());
+                    // match_url 与 action/target 同一口径 scrub：旧配置/手写 toml 里的
+                    // 品牌词不得经 GET 回显扩散到面板（保存入口早已 scrub）。
                     s.push_str(&format!(
                         "{{\"idx\":{},\"match_url\":{},\"action\":{},\"target\":{}}}",
                         i,
-                        json_str(&r.match_url),
+                        json_str(&crate::server::page_rules::scrub_brand(&r.match_url)),
                         json_str(&crate::server::page_rules::scrub_brand(&r.action)),
                         target
                     ));

@@ -224,6 +224,7 @@ img.preview{max-width:100%;max-height:420px}
         <div><button class="act" id="btnAppsLoad">载入</button><button class="act ghost" id="btnAppAdd">加一行</button><button class="act" id="btnAppsSave">保存应用引擎</button></div>
       </div>
       <div id="appsOut"></div>
+      <pre id="appsSaveOut"></pre>
       <h3 class="sub">引擎选项目录（/api/catalog）</h3>
       <pre id="catalogOut" style="max-height:220px">加载中…</pre>
     </div>
@@ -262,6 +263,7 @@ img.preview{max-width:100%;max-height:420px}
         <div><button class="act" id="btnPrLoad">载入</button><button class="act ghost" id="btnPrAdd">加一行</button><button class="act" id="btnPrSave">保存规则</button></div>
       </div>
       <div id="prOut"></div>
+      <pre id="prSaveOut"></pre>
     </div>
   </section>
 
@@ -283,6 +285,7 @@ img.preview{max-width:100%;max-height:420px}
         <div><button class="act" id="btnPxLoad">载入</button><button class="act ghost" id="btnPxAdd">加一行</button><button class="act" id="btnPxSave">保存反代</button></div>
       </div>
       <div id="pxOut"></div>
+      <pre id="pxSaveOut"></pre>
     </div>
   </section>
 
@@ -411,7 +414,9 @@ img.preview{max-width:100%;max-height:420px}
 
     <div class="card">
       <h3 class="sub">离线合并 / 审计</h3>
-      <button class="act" id="btnGeoUpdate">触发离线更新（geoip_update.sh）</button>
+      <!-- id 必须唯一：此前这里与上方卡片重复用 id="btnGeoUpdate"，getElementById 只返回
+           文档里第一个，这个按钮点了没有任何反应。改为独立 id，并在下面绑定同一处理器。 -->
+      <button class="act" id="btnGeoUpdateAudit">触发离线更新（geoip_update.sh）</button>
       <button class="act ghost" id="btnGeoAudit">刷新审计日志</button>
       <pre id="geoAuditOut"></pre>
     </div>
@@ -619,6 +624,15 @@ img.preview{max-width:100%;max-height:420px}
     <div class="card">
       <h2>账号权限</h2>
       <p class="hint">服务端使用 argon2id / yescrypt <b>每哈希独立盐</b>存储；UI 只收集明文，<b>禁止手填哈希</b>。保存后写入 config.toml 并热重载。</p>
+      <h3 class="sub">用户列表（增删 / 改密）</h3>
+      <div id="usersOut"></div>
+      <div class="row">
+        <div><label>新用户名</label><input id="newUserName"/></div>
+        <div><label>新用户密码（明文）</label><input id="newUserPass" type="password" autocomplete="new-password"/></div>
+        <button class="act" id="btnUserAdd">添加用户</button>
+      </div>
+      <pre id="usersMsg"></pre>
+      <h3 class="sub">首个用户密码（兼容旧入口）</h3>
       <label>用户名</label><input id="adminUser" readonly/>
       <div class="row">
         <div><label>新密码</label><input id="adminPass" type="password" autocomplete="new-password"/></div>
@@ -629,7 +643,6 @@ img.preview{max-width:100%;max-height:420px}
     </div>
   </section>
 </main>
-<script src="hls.light.min.js"></script>
 <script>
 "use strict";
 /* ============ 基础设施 ============ */
@@ -650,6 +663,19 @@ function bindGeoipActionButtons(root){
 function esc(s){if(s==null)return '';return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;');}
 function scrubBrand(s){if(!s)return s;const BRAND='cloud'+'flare';return String(s).replace(new RegExp(BRAND,'gi'),'公开 CDN').replace(/\bCF\b/g,'公开 CDN')}
 const base=(location.pathname.replace(/\/+$/,'')||'/__admin');
+// 媒体预览脚本（hls.js）必须挂在**管理前缀**下加载：
+// 此前用裸相对路径 `<script src="hls.light.min.js">`，当面板以 `/__admin`（无尾斜杠，
+// 默认写法/收藏夹写法）打开时，浏览器按文档目录解析成站点根 `/hls.light.min.js` ——
+// 该路径不属于管理前缀，会落到站点静态/应用/反代上：轻则 404（window.CrucibleMedia
+// 未定义，媒体预览失效），重则 docroot 里有同名文件时被顶替执行（同源脚本注入，
+// 管理页带着缓存 Basic 凭据）。这里改为动态注入 `base+'/hls.light.min.js'`，
+// 后端对「以 /hls.light.min.js 结尾」的管理前缀路径都供 JS，无尾斜杠也不再落站点命名空间。
+(function(){
+  const s=document.createElement('script');
+  s.src=base+'/hls.light.min.js';
+  s.dataset.crucibleHls='1';
+  document.head.appendChild(s);
+})();
 // 传输层失败以前会**直接抛出**：fetch 一 reject，调用方的 `const r=await api(...)`
 // 就中断，而整个文件只有 2 处 try——结果是面板静默什么都不做：没有 toast、
 // 没有提示文字、表格空白，看起来就像「这个按钮坏了」或「这页没实现」。
@@ -793,7 +819,7 @@ async function ensureTab(name){
   if(name==='geoip')return initGeoTab();
   if(name==='dns')return initDnsTab();
   if(name==='toml')return loadToml();
-  if(name==='accounts')return;
+  if(name==='accounts')return loadUsers();
 }
 
 /* ============ 概览 ============ */
@@ -861,27 +887,21 @@ $('btnListenerSave').onclick=async()=>{
   if($('leH3').checked)versions.push('h3');
   if(!versions.length){toast('至少选择一个 HTTP 版本',true);return;}
   const aiPaths=$('leAutoindexPaths').value.split(',').map(s=>s.trim()).filter(Boolean);
+  // 以磁盘上的 listener 为底做「未渲染字段保留」：本表单只覆盖它渲染的字段，
+  // address_v6 / l4_forward / quic_ecn / qmux / connect_udp 等没有 UI 的项必须原样带回。
+  // 旧实现从零构造对象，而保存是整表替换 + serde 默认值 ⇒ 每保存一次就把这些
+  // 已配置的开关**静默重置**（与已修的 proxy_rules 少键问题是同一类）。
   const l=listenerByPort(EDIT_PORT)||{};
-  const body={
-    orig_port:EDIT_PORT,
-    listener:{
-      address:$('leAddress').value.trim()||'0.0.0.0',
-      port:port,
-      root:$('leRoot').value.trim(),
-      ssl:l.ssl||null,
-      apps:l.apps||[],
-      file_open:l.file_open||[],
-      autoindex:{enabled:$('leAutoindex').value==='true',paths:aiPaths.length?aiPaths:['/'],enable_upload:$('leAutoindexUpload').value==='true',upload_threads:parseInt($('leUploadThreads').value,10)||4},
-      http_versions:versions,
-      basic_auth:l.basic_auth||null,
-      proxy_rules:l.proxy_rules||[],
-      page_rules:l.page_rules||[],
-      server_name:$('leServerName').value.trim()||null,
-      status_path:$('leStatusPath').value.trim()||null,
-      port_reuse:!!l.port_reuse,
-      rate_limit:l.rate_limit||null
-    }
-  };
+  const listener=Object.assign({},l);
+  listener.address=$('leAddress').value.trim()||'0.0.0.0';
+  listener.port=port;
+  listener.root=$('leRoot').value.trim();
+  listener.ssl=l.ssl||null;
+  listener.autoindex={enabled:$('leAutoindex').value==='true',paths:aiPaths.length?aiPaths:['/'],enable_upload:$('leAutoindexUpload').value==='true',upload_threads:parseInt($('leUploadThreads').value,10)||4};
+  listener.http_versions=versions;
+  listener.server_name=$('leServerName').value.trim()||null;
+  listener.status_path=$('leStatusPath').value.trim()||null;
+  const body={orig_port:EDIT_PORT,listener:listener};
   const r=await api('/api/listener/save',jpost(body));
   out('listenerEditOut',r.text,r.ok);
   if(r.ok){toast('站点已保存并热重载');await loadCfg();renderListeners();fillAllPortSelects();}
@@ -1136,6 +1156,7 @@ function appRow(a){
     sel.title=((CATALOG||[]).find(x=>x.id===sel.value)||{}).help||'';
   };
   tr.querySelector('button.danger').onclick=()=>tr.remove();
+  tr._orig=a; // 保存时以原条目为底，保留本表未渲染的字段（source_dir/out_dir/entry/watch/...）
   return tr;
 }
 async function renderApps(){
@@ -1157,23 +1178,24 @@ async function renderApps(){
   $('btnAppsSave').onclick=async()=>{
     const apps=[];
     tbody.querySelectorAll('tr').forEach(tr=>{
-      apps.push({
-        enabled:tr.querySelector('.a-enabled').checked,
-        paths:tr.querySelector('.a-paths').value.split(',').map(s=>s.trim()).filter(Boolean),
-        engine:tr.querySelector('.a-engine').value,
-        extensions:tr.querySelector('.a-ext').value.split(',').map(s=>s.trim()),
-        workers:parseInt(tr.querySelector('.a-workers').value,10)||4,
-        index:tr.querySelector('.a-index').value||null,
-        socket:tr.querySelector('.a-socket').value||null,
-        lib:tr.querySelector('.a-lib').value||null,
-        docroot:tr.querySelector('.a-docroot').value||null,
-        php_bin:null,
-        source_dir:null,out_dir:null,entry:[],watch:false,
-        deps_dir:null,init_timeout_secs:120,libc:'auto'
-      });
+      // 以原 app 条目为底：php_bin/source_dir/out_dir/entry/watch/deps_dir/init_timeout_secs/
+      // libc 这些本表未渲染的字段原样带回。旧实现硬编码 null/[]/false ⇒ 整表替换后
+      // TSX/FFI 路由的编译目录、watch 开关等被静默重置。
+      const o=Object.assign({},tr._orig||{});
+      o.enabled=tr.querySelector('.a-enabled').checked;
+      o.paths=tr.querySelector('.a-paths').value.split(',').map(s=>s.trim()).filter(Boolean);
+      o.engine=tr.querySelector('.a-engine').value;
+      o.extensions=tr.querySelector('.a-ext').value.split(',').map(s=>s.trim());
+      o.workers=parseInt(tr.querySelector('.a-workers').value,10)||4;
+      o.index=tr.querySelector('.a-index').value||null;
+      o.socket=tr.querySelector('.a-socket').value||null;
+      o.lib=tr.querySelector('.a-lib').value||null;
+      o.docroot=tr.querySelector('.a-docroot').value||null;
+      apps.push(o);
     });
     const r=await api('/api/apps/save',jpost({port:parseInt(port,10),apps:apps}));
-    out('fileOut',r.text,r.ok);toast(r.text,!r.ok);
+    // 结果输出到本 tab 的 pre（#fileOut 在「文件管理」tab，这里看不到错误详情）。
+    out('appsSaveOut',r.text,r.ok);toast(r.text,!r.ok);
     if(r.ok)await loadCfg();
   };
 }
@@ -1277,6 +1299,20 @@ async function listFiles(){
       ext.href=previewUrl(port,full);ext.target='_blank';ext.style.color='var(--muted)';
       li.appendChild(ext);
     }
+    // §16.14 文件管理 action 表里的 rename：后端 /api/files/rename 早已实现，UI 此前
+    // 没有任何入口（只能手改 toml/文件系统）。表单 port/from/to，目标名仍受 webshell 闸门约束。
+    const rn=document.createElement('button');
+    rn.className='act mini ghost';rn.textContent='改名';
+    rn.onclick=async()=>{
+      const to=prompt('重命名为（相对站点根的路径，可含目录）',full);
+      if(to===null)return;
+      const t=to.trim();
+      if(!t||t===full)return;
+      const rr=await api('/api/files/rename',fpost({port:port,from:full,to:t}));
+      toast(rr.text,!rr.ok);
+      if(rr.ok)listFiles();
+    };
+    li.appendChild(rn);
     const del=document.createElement('button');
     del.className='act mini danger';del.textContent='删';
     del.onclick=async()=>{
@@ -1298,7 +1334,13 @@ function showPreview(port,full,name){
   if(!kind){pv.innerHTML='<p class="hint">该类型没有内置预览。</p>';return;}
   if(kind==='video'||kind==='hls'){
     pv.innerHTML='<video class="preview" controls></video>';
-    if(window.CrucibleMedia)window.CrucibleMedia.attach(pv.firstChild,url,kind);
+    const attach=()=>{ if(window.CrucibleMedia)window.CrucibleMedia.attach(pv.firstChild,url,kind); };
+    if(window.CrucibleMedia)attach();
+    else{
+      // 动态注入的 hls.js 可能还没加载完（用户点得够快）：等它 load 后补一次 attach。
+      const s=document.querySelector('script[data-crucible-hls]');
+      if(s)s.addEventListener('load',attach,{once:true});
+    }
     return;
   }
   if(kind==='audio'){pv.innerHTML='<audio class="preview" controls src="'+esc(url)+'"></audio>';return;}
@@ -1335,7 +1377,9 @@ function initPrTab(){fillPortSelect($('prPort'),$('prPort').value);$('prPort').o
 function prRow(r){
   r=r||{};
   const tr=document.createElement('tr');
-  tr.innerHTML='<td><input class="r-match" value="'+esc(r.match_url||'')+'" placeholder="/old/*"/></td>'
+  // match_url 也过 scrubBrand：GET 侧后端已 scrub，前端回显同一口径，
+  // 旧配置/手写 toml 里的品牌词不经面板扩散。
+  tr.innerHTML='<td><input class="r-match" value="'+esc(scrubBrand(r.match_url||''))+'" placeholder="/old/*"/></td>'
     +'<td><select class="r-action">'+PR_ACTIONS.map(a=>'<option'+(a===(r.action||'redirect')?' selected':'')+'>'+a+'</option>').join('')+'</select></td>'
     +'<td><input class="r-target" value="'+esc(r.target||'')+'" placeholder="/new 或 301:https://… 或 Cache 指令"/></td>'
     +'<td class="actions"><button class="act mini danger">删</button></td>';
@@ -1363,7 +1407,8 @@ function renderPr(){
       });
     });
     const r=await api('/api/page_rules/save',jpost({port:parseInt($('prPort').value,10),rules:rules}));
-    out('fileOut',r.text,r.ok);toast(r.text,!r.ok);
+    // 结果输出到本 tab 的 pre（#fileOut 在「文件管理」tab，这里看不到错误详情）。
+    out('prSaveOut',r.text,r.ok);toast(r.text,!r.ok);
     if(r.ok)await loadCfg();
   };
 }
@@ -1426,7 +1471,8 @@ function renderPx(){
       });
     });
     const r=await api('/api/proxy_rules/save',jpost({port:parseInt($('pxPort').value,10),rules:rules}));
-    out('fileOut',r.text,r.ok);toast(r.text,!r.ok);
+    // 结果输出到本 tab 的 pre（#fileOut 在「文件管理」tab，这里看不到错误详情）。
+    out('pxSaveOut',r.text,r.ok);toast(r.text,!r.ok);
     if(r.ok)await loadCfg();
   };
 }
@@ -1679,6 +1725,9 @@ $('btnGeoUpdate').onclick=async()=>{
     if(await tick()){ clearInterval(geoPoll); geoPoll=null; }
   },1500);
 };
+// 「离线合并 / 审计」卡片里的按钮用独立 id（此前重复 id 导致它永久无响应），
+// 复用同一个触发处理器；进度输出仍写上方卡片的日志框。
+{const b=$('btnGeoUpdateAudit'); if(b) b.onclick=$('btnGeoUpdate').onclick;}
 $('btnGeoAudit').onclick=async()=>{
   const r=await api('/api/geoip/audit?limit=100');
   out('geoAuditOut',scrubBrand(r.text),r.ok);
@@ -1707,6 +1756,58 @@ $('btnPass').onclick=async()=>{
   out('acctOut',r.text,r.ok);
   toast(r.text,!r.ok);
   if(r.ok){$('adminPass').value='';$('adminPass2').value='';}
+};
+/* 用户 CRUD（规格 §16.19 #11）：后端 /api/admin/users（list/add/del/pass）。
+   UI 只发明文口令，哈希只在服务端生成；删除最后一个用户会被后端拒绝（防锁死）。 */
+async function loadUsers(){
+  const el=$('usersOut');
+  if(!el)return;
+  const r=await apiJson('/api/admin/users');
+  if(!r.ok||!r.json){
+    el.innerHTML='<p class="hint">用户列表载入失败: '+esc(r.text)+'</p>';
+    return;
+  }
+  const users=r.json.users||[];
+  const t=document.createElement('table');t.className='data';
+  t.innerHTML='<thead><tr><th>用户名</th><th>操作</th></tr></thead>';
+  const tb=document.createElement('tbody');
+  users.forEach(u=>{
+    const tr=document.createElement('tr');
+    const td=document.createElement('td');td.textContent=u.username||'';
+    const ops=document.createElement('td');ops.className='actions';
+    const bp=document.createElement('button');
+    bp.className='act mini ghost';bp.textContent='改密码';
+    bp.onclick=()=>changeUserPass(u.username);
+    const bd=document.createElement('button');
+    bd.className='act mini danger';bd.textContent='删除';
+    bd.onclick=()=>deleteUser(u.username);
+    ops.appendChild(bp);ops.appendChild(bd);
+    tr.appendChild(td);tr.appendChild(ops);tb.appendChild(tr);
+  });
+  t.appendChild(tb);
+  el.innerHTML='';el.appendChild(t);
+}
+async function changeUserPass(name){
+  const p=prompt('为 '+name+' 设置新密码（明文，服务端加盐哈希）');
+  if(p===null)return;
+  if(!p){out('usersMsg','密码不能为空',false);return;}
+  const r=await api('/api/admin/users',jpost({action:'pass',username:name,password:p}));
+  out('usersMsg',r.text,r.ok);
+  if(r.ok)loadUsers();
+}
+async function deleteUser(name){
+  if(!confirm('删除用户 '+name+' ？'))return;
+  const r=await api('/api/admin/users',jpost({action:'del',username:name}));
+  out('usersMsg',r.text,r.ok);
+  if(r.ok){await loadCfg();refreshAccounts();loadUsers();}
+}
+$('btnUserAdd').onclick=async()=>{
+  const name=$('newUserName').value.trim();
+  const p=$('newUserPass').value;
+  if(!name||!p){out('usersMsg','用户名和密码都不能为空',false);return;}
+  const r=await api('/api/admin/users',jpost({action:'add',username:name,password:p}));
+  out('usersMsg',r.text,r.ok);
+  if(r.ok){$('newUserName').value='';$('newUserPass').value='';await loadCfg();refreshAccounts();loadUsers();}
 };
 
 /* ============ 通用 ============ */
@@ -2045,20 +2146,16 @@ async function initDnsTab(){
   await dnsStatus();
   // 分区列表懒加载：切到本 tab 就刷新一次，否则要手动点「刷新状态」才看得到新建的分区。
   await dnsRefreshZones();
-  // ACME 字段已在 dnsStatus 中从 /api/dns/status 返回（status_json 现包含 acme）
+  // ACME 字段已在 dnsStatus 中从 /api/dns/status 返回（status_json 现包含 acme）。
+  // 曾有一个 `else if(statusCache && statusCache.acme)` 分支引用**未声明**的
+  // statusCache —— 一旦 /api/dns/config 响应形状变化就会抛 ReferenceError 中断
+  // 本 tab 初始化；删掉这个死分支（局部变量 c.json 上面已判过）。
   const c=await apiJson('/api/dns/config');
   if(c.json&&c.json.acme){
     $('acmeEnabled').checked=!!c.json.acme.enabled;
     $('acmeDomain').value=c.json.acme.domain||'';
     $('acmeEmail').value=c.json.acme.email||'';
     $('acmeRenew').value=c.json.acme.renew_days||60;
-  } else if(statusCache && statusCache.acme){
-    // Fallback to status cache
-    const a=statusCache.acme;
-    $('acmeEnabled').checked=!!a.enabled;
-    $('acmeDomain').value=a.domain||'';
-    $('acmeEmail').value=a.email||'';
-    $('acmeRenew').value=a.renew_days||60;
   }
 }
 /* ===== 全局 tab（syncookie / telemetry / admin 暴露面） ===== */
@@ -2111,10 +2208,11 @@ $('btnAdminSave').onclick=async()=>{
 // 覆盖 btnGeoConflicts 的 onclick，改冲突表渲染逻辑
 document.getElementById('btnGeoConflicts').onclick = async () => {
   const el = document.getElementById('geoConflictsOut');
-  const r = await fetch('/__admin/api/geoip/conflicts');
-  const t = await r.text();
-  let json;
-  try { json = JSON.parse(t); } catch { el.innerHTML = '<pre class="err">' + esc(t) + '</pre>'; return; }
+  // 统一走 api()/apiJson()（内部用 base=location.pathname）：此前这里硬编码
+  // '/__admin'，[admin].path 非默认值时请求打到站点根，整块「多源冲突」不可用。
+  const r = await apiJson('/api/geoip/conflicts');
+  if (!r.json) { el.innerHTML = '<pre class="err">' + esc(r.text) + '</pre>'; return; }
+  const json = r.json;
   const rows = json.conflicts || [];
   if (!rows.length) { el.innerHTML = '<p class="hint">无未处理冲突。</p>'; return; }
 
@@ -2148,9 +2246,10 @@ document.getElementById('btnGeoConflicts').onclick = async () => {
       const preview = document.getElementById('preview-' + id);
       preview.textContent = '加载中…';
       try {
-        const r = await fetch('/__admin/api/geoip/conflicts/source?id=' + encodeURIComponent(id) +
+        const res = await apiJson('/api/geoip/conflicts/source?id=' + encodeURIComponent(id) +
           '&src=' + encodeURIComponent(src) + '&field=' + encodeURIComponent(field));
-        const j = await r.json();
+        const j = res.json;
+        if (!j) { preview.textContent = 'err:' + res.text; return; }
         if (j.error) { preview.textContent = 'err:' + j.error; return; }
         const v = j.value || '(空)';
         preview.textContent = v;
@@ -2190,22 +2289,13 @@ window.resolveConflict = async function(id, alsoWrite) {
       return;
     }
     const weight = document.getElementById('gepWeight').value.trim() || '200';
-    const r = await fetch('/__admin/api/geoip/edit', {
-      method: 'POST',
-      // 服务端要求非简单请求特征（见 adminHeaders）：表单编码是简单请求，必须带上自定义头。
-      headers: { 'Content-Type': 'application/x-www-form-urlencoded', 'X-Crucible-Admin': '1' },
-      body: new URLSearchParams({ prefix, field, value, weight }),
-    });
-    const t = await r.text();
+    // 同上：改走 api()/fpost()，路径前缀与 CSRF 头都由统一封装保证。
+    const r = await api('/api/geoip/edit', fpost({ prefix, field, value, weight }));
+    const t = r.text;
     showToast('覆盖已写入: ' + t, !r.ok);
   }
-  const r = await fetch('/__admin/api/geoip/conflicts/resolve', {
-    method: 'POST',
-    // 同上：这条不是走 api()，自定义头得自己带，否则缺 Origin 时会被 403。
-    headers: { 'Content-Type': 'application/x-www-form-urlencoded', 'X-Crucible-Admin': '1' },
-    body: new URLSearchParams({ id: String(id) }),
-  });
-  const t = await r.text();
+  const r = await api('/api/geoip/conflicts/resolve', fpost({ id: String(id) }));
+  const t = r.text;
   showToast(t, !r.ok);
   document.getElementById('btnGeoConflicts').click();
 };

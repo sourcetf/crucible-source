@@ -70,7 +70,11 @@ pub async fn try_handle(
                 .map(|s| s.sock.clone())
                 .context("sidecar missing")?
         };
-        proxy_unix(req, &sock, peer).await
+        // 两条分支必须同语义：显式 socket 与自动探测的 `deps/bin/index` 都剥掉应用
+        // 路由前缀（sidecar 挂在 `/jsp`、`/go` 这类前缀下，内部只认应用相对路径）。
+        // 样例应用（c/go/rust）不回读请求路径做路由，剥前缀同样安全。
+        let target = uds_target_uri(app, req.uri());
+        proxy_unix(req, &sock, peer, Some(target)).await
     }
 }
 
@@ -130,6 +134,8 @@ async fn ensure_sidecar(key: &str, lc: &ListenerConfig, app: &AppRouteConfig) ->
     let mut cmd = Command::new(&deps_bin);
     cmd.current_dir(&docroot)
         .env("WEBSERVER_LISTEN_UNIX", sock.display().to_string())
+        // 路由前缀：sidecar 自行决定是否剥离（JSP/Jetty 据此把 /jsp/x.jsp 映射到 docroot/x.jsp）。
+        .env("WEBSERVER_APP_PREFIXES", app.paths.join(","))
         .env("WEBSERVER_WORKERS", app.workers.max(1).to_string())
         .env("DOCUMENT_ROOT", docroot.display().to_string())
         .env("GATEWAY_INTERFACE", "CGI/1.1")
@@ -221,10 +227,30 @@ fn checkin_unix(sock: &Path, sender: hyper::client::conn::http1::SendRequest<Ful
 }
 
 #[cfg(unix)]
+/// 显式 `apps[].socket`（UDS sidecar）的目标路径：**剥掉应用路由前缀**。
+///
+/// 为什么必须剥：sidecar 是「挂在某个路径前缀下的应用」（JSP 挂在 `/jsp`、ActionBridge
+/// 挂在 `/do`），Jetty 侧的 WebAppContext 是 `/`，它期望的是**应用内相对路径**。
+/// 原样转发 `/jsp/index.jsp` 会让 Jetty 去 `<docroot>/jsp/index.jsp` 找文件 —— 不存在，
+/// 于是恒 404（实测：`curl /jsp/` 拿到的是 Jetty 自己的 404 页，`/do/` 同样）。
+/// 目录请求回落到 `index`（`/jsp/` → `/index.jsp`），与 FFI/cgi_script 同一套判据。
+///
+/// 只对**显式配置的 socket** 生效；自动探测的 `deps/bin/index` sidecar（c/go/rust 的
+/// 无 .so 回退）保持原路径语义不变（那些样例应用自己打印 `r.URL.Path`）。
+fn uds_target_uri(app: &AppRouteConfig, uri: &http::Uri) -> http::Uri {
+    let rel = crate::server::apps::app_ffi::rel_script_path(app, uri.path());
+    let s = match uri.query() {
+        Some(q) => format!("{rel}?{q}"),
+        None => rel,
+    };
+    s.parse::<http::Uri>().unwrap_or_else(|_| uri.clone())
+}
+
 async fn proxy_unix(
     req: Request<Incoming>,
     sock: &Path,
     peer: SocketAddr,
+    target: Option<http::Uri>,
 ) -> Result<Response<BoxBody>> {
     use hyper::client::conn::http1;
 
@@ -237,10 +263,11 @@ async fn proxy_unix(
     let bytes = collected.to_bytes();
     let peer_ip = peer.ip().to_string();
 
+    let target = target.unwrap_or_else(|| parts.uri.clone());
     let build = || -> Result<http::Request<Full<Bytes>>> {
         let mut builder = Request::builder()
             .method(parts.method.clone())
-            .uri(parts.uri.clone());
+            .uri(target.clone());
         for (k, v) in parts.headers.iter() {
             // **丢弃客户端自带的转发头**，否则客户端可以把任意 IP 放在最左边，
             // 后端拿它做日志/ACL 就是伪造点（proxy.rs 的 WS 路径早就是「跳过再写」，
@@ -369,7 +396,8 @@ pub async fn try_handle_uds(
     #[cfg(unix)]
     {
         let sock = uds_socket_path(app).context("apps[].socket missing")?;
-        proxy_unix(req, &sock, peer).await
+        let target = uds_target_uri(app, req.uri());
+        proxy_unix(req, &sock, peer, Some(target)).await
     }
 }
 

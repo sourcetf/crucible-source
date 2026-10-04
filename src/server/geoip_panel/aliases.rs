@@ -3,24 +3,27 @@
 use once_cell::sync::Lazy;
 use std::collections::HashMap;
 
-static ISP_ALIASES: Lazy<HashMap<&'static str, &'static str>> = Lazy::new(|| {
-    HashMap::from([
-        ("CHINANET", "China Telecom"),
-        ("CHINA UNICOM", "China Unicom"),
-        ("CHINA MOBILE", "China Mobile"),
-        ("AMAZON", "AWS"),
-        ("AMAZON.COM", "AWS"),
-        ("GOOGLE", "Google Cloud"),
-        ("MICROSOFT", "Microsoft Azure"),
-        ("DIGITALOCEAN", "DigitalOcean"),
-        ("CLOUDFLARE", "Cloudflare"),
-    ])
-});
+/// (匹配键, 显示别名)，**按 key 长度降序**存放：匹配取第一个命中 = 最长键优先。
+///
+/// 原实现是 `Lazy<HashMap>` 遍历（`RandomState` 迭代序随进程/运行变化）：org 名同时
+/// 包含多个键时（如 "AMAZON.COM" 同时含 AMAZON 与 AMAZON.COM、"GOOGLE AMAZON ..."）
+/// 同一输入可能得到不同别名，面板标签不稳定。等长键之间以本数组声明序为准（确定）。
+static ISP_ALIASES: &[(&str, &str)] = &[
+    ("CHINA MOBILE", "China Mobile"),
+    ("DIGITALOCEAN", "DigitalOcean"),
+    ("CHINA UNICOM", "China Unicom"),
+    ("AMAZON.COM", "AWS"),
+    ("CLOUDFLARE", "Cloudflare"),
+    ("CHINANET", "China Telecom"),
+    ("MICROSOFT", "Microsoft Azure"),
+    ("AMAZON", "AWS"),
+    ("GOOGLE", "Google Cloud"),
+];
 
 /// Resolve a display alias for an ISP name (case-insensitive substring match).
 pub fn resolve_isp_alias(name: &str) -> String {
     let upper = name.to_ascii_uppercase();
-    for (key, alias) in ISP_ALIASES.iter() {
+    for (key, alias) in ISP_ALIASES {
         if upper.contains(key) {
             return (*alias).to_string();
         }
@@ -97,5 +100,24 @@ mod tests {
         assert_eq!(resolve_country_alias("RUSSIA"), "RU");
         // 非别名原样保留（含子串陷阱：RUSSIA 不应被 US 吞掉）
         assert_eq!(resolve_country_alias("Someplace"), "Someplace");
+    }
+
+    /// ISP 别名必须确定：最长键优先，多键同现时结果不随 HashMap 随机序漂移。
+    #[test]
+    fn isp_alias_is_deterministic_longest_match() {
+        assert_eq!(resolve_isp_alias("AMAZON.COM"), "AWS");
+        assert_eq!(resolve_isp_alias("AMAZON-02"), "AWS");
+        assert_eq!(resolve_isp_alias("CLOUDFLARENET"), "Cloudflare");
+        assert_eq!(resolve_isp_alias("CHINANET-JS"), "China Telecom");
+        assert_eq!(resolve_isp_alias("CHINA UNICOM BACKBONE"), "China Unicom");
+        assert_eq!(resolve_isp_alias("GOOGLE CLOUD"), "Google Cloud");
+        assert_eq!(resolve_isp_alias("DIGITALOCEAN-ASN"), "DigitalOcean");
+        // 多键同现：同一输入重复 100 次结果必须一致（旧实现依赖 HashMap 迭代序）。
+        let first = resolve_isp_alias("GOOGLE AMAZON");
+        for _ in 0..100 {
+            assert_eq!(resolve_isp_alias("GOOGLE AMAZON"), first);
+        }
+        // 未命中任何键：原样返回（仅 trim）。
+        assert_eq!(resolve_isp_alias(" Level3 "), "Level3");
     }
 }

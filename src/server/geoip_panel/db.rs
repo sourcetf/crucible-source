@@ -4,6 +4,12 @@ use anyhow::{Context, Result};
 use rusqlite::Connection;
 use std::path::Path;
 
+/// 与 DNS 库（`dns/mod.rs` 的 5s）同口径：离线更新脚本（geoip_update.sh /
+/// geoip_merge.py）会并发写同一个库，面板 lookup/edit 撞上写锁时若不等待，
+/// 会立刻 SQLITE_BUSY —— merge_pipeline 里 `if let Ok(panel)` 会把整块手工覆盖
+/// 静默跳过（打开失败也不落日志），表现为「覆盖列表有、lookup 不生效」。
+const BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
 const MIGRATE_COLS: &[(&str, &str)] = &[
     ("prefix", "TEXT"),
     ("bits", "INTEGER DEFAULT 0"),
@@ -92,6 +98,8 @@ fn create_range_table(conn: &Connection, name: &str) -> Result<()> {
 
 pub fn open(path: &Path) -> Result<Connection> {
     let conn = Connection::open(path).with_context(|| format!("open {}", path.display()))?;
+    conn.busy_timeout(BUSY_TIMEOUT)
+        .context("set sqlite busy_timeout")?;
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS geoip (
             ip_start TEXT NOT NULL,
@@ -133,6 +141,13 @@ pub fn open(path: &Path) -> Result<Connection> {
     for (col, typ) in MIGRATE_COLS {
         let _ = conn.execute(&format!("ALTER TABLE geoip ADD COLUMN {col} {typ}"), []);
     }
+    // §23.8/G13：数值范围索引。covering.rs 的 `load_from_geoip` 用
+    // `start_i <= ? AND end_i >= ?` 预过滤，没有这个索引会退化成全表扫描。
+    // Python 侧（geoip_common.py）会建同名索引，但由 Rust 首次建库/迁移出来的
+    // 库此前没有 —— 与 ipv4/ipv6 两张 range 表的口径不一致。
+    conn.execute_batch(
+        "CREATE INDEX IF NOT EXISTS idx_geoip_numeric ON geoip(start_i, end_i);",
+    )?;
     create_range_table(&conn, "ipv4")?;
     create_range_table(&conn, "ipv6")?;
     Ok(conn)
@@ -141,6 +156,8 @@ pub fn open(path: &Path) -> Result<Connection> {
 /// Panel metadata DB (hand edits, conflicts, audit, sources, cron).
 pub fn open_panel(path: &Path) -> Result<Connection> {
     let conn = Connection::open(path).with_context(|| format!("open panel {}", path.display()))?;
+    conn.busy_timeout(BUSY_TIMEOUT)
+        .context("set sqlite busy_timeout")?;
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS panel_edits (
             id INTEGER PRIMARY KEY AUTOINCREMENT,

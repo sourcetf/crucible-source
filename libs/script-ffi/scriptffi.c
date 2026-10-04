@@ -13,10 +13,65 @@
 #include <string.h>
 
 #ifndef _WIN32
+#include <pthread.h>
 #include <unistd.h>
 #endif
 
 static int g_ready;
+
+/* ---------------------------------------------- 跨 .so 进程级初始化锁（F2） ---
+ * 本 .so 只被构建、不直接服务请求，但它是所有嵌入式 CPython 引擎（libapp_python /
+ * wsgi / asgi / uwsgi）的**共享初始化协调点**：这些 .so 各自嵌入同一份 libpython，
+ * 若各自用自己的 pthread_once 做 Py_Initialize，并发冷启动时后到线程会在 NULL
+ * tstate 上 PyEval_SaveThread → Py_FatalError(abort)。
+ *
+ * 调用方（见 libs/app-engines/common/crucible_pyinit.h）通过 dlopen 本 .so 并
+ * dlsym 本符号，把**自己已解析好的** Py_IsInitialized / Py_Initialize /
+ * PyEval_SaveThread 指针传进来——这样锁是进程内唯一的一份，而初始化的仍是调用方
+ * 自己的解释器实例。此处不引用任何链接期 Py_* 符号：本 .so 未链接 libpython 时
+ * 也必须能提供该符号。 */
+#ifndef _WIN32
+int crucible_py_ensure_init(int (*is_initialized)(void),
+                            void (*initialize)(void), void *(*save_thread)(void),
+                            char *err, size_t errsz)
+{
+    static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
+    static int state; /* 0 = 未尝试 1 = 就绪 -1 = 失败 */
+    static char failmsg[256];
+
+    if (err != NULL && errsz > 0)
+        err[0] = '\0';
+    pthread_mutex_lock(&lock);
+    if (state == 1) {
+        pthread_mutex_unlock(&lock);
+        return 0;
+    }
+    if (state == -1) {
+        if (err != NULL && errsz > 0)
+            snprintf(err, errsz, "%s", failmsg);
+        pthread_mutex_unlock(&lock);
+        return -1;
+    }
+    if (is_initialized == NULL || initialize == NULL) {
+        snprintf(failmsg, sizeof(failmsg), "Python 初始化 API 指针为空");
+        state = -1;
+        if (err != NULL && errsz > 0)
+            snprintf(err, errsz, "%s", failmsg);
+        pthread_mutex_unlock(&lock);
+        return -1;
+    }
+    if (!is_initialized()) {
+        initialize();
+        /* 只由初始化线程释放 GIL：这里刚从 Py_Initialize 返回，tstate 必然在
+         * 本线程。解释器已由别的 .so 初始化时不碰 GIL（那个 .so 已按契约释放）。 */
+        if (save_thread != NULL)
+            (void)save_thread();
+    }
+    state = 1;
+    pthread_mutex_unlock(&lock);
+    return 0;
+}
+#endif /* _WIN32 */
 
 static const char *interp_for(const char *lang)
 {
@@ -34,34 +89,41 @@ static const char *interp_for(const char *lang)
 #if defined(CRUCIBLE_HAVE_PYTHON)
 #include <Python.h>
 
-#ifndef _WIN32
-#include <pthread.h>
-static pthread_once_t g_py_once = PTHREAD_ONCE_INIT;
-#define PY_BOOT_ONCE() pthread_once(&g_py_once, crucible_scriptffi_py_boot)
-#else
-#define PY_BOOT_ONCE() crucible_scriptffi_py_boot()
-#endif
-
-/* 解释器启动一次；启动线程立刻释放 GIL（否则同进程另一 .so 的线程会死等 GIL）。 */
-static void crucible_scriptffi_py_boot(void)
+/* 解释器初始化：走共享锁（跨 .so 唯一）。本函数不释放 GIL —— 只有真正执行
+ * Py_Initialize 的线程才该释放，那由 crucible_py_ensure_init 内部保证。 */
+static int crucible_scriptffi_py_boot(char *err, size_t errsz)
 {
-    if (!Py_IsInitialized()) {
-        Py_Initialize();
-        (void)PyEval_SaveThread();
-    }
+    return crucible_py_ensure_init(Py_IsInitialized, Py_Initialize, PyEval_SaveThread,
+                                   err, errsz);
 }
+
+#ifndef _WIN32
+/* 本 .so 的 Python 执行锁：`sys.stdout` 全局替换 + 执行 + 取回必须原子。
+ * （本库当前无调用方，属 F2/P3 的顺手收口：保留功能但杜绝并发串写。） */
+static pthread_mutex_t g_scriptffi_py_lock = PTHREAD_MUTEX_INITIALIZER;
+#define SCRIPTFFI_PY_LOCK()   pthread_mutex_lock(&g_scriptffi_py_lock)
+#define SCRIPTFFI_PY_UNLOCK() pthread_mutex_unlock(&g_scriptffi_py_lock)
+#else
+#define SCRIPTFFI_PY_LOCK()   ((void)0)
+#define SCRIPTFFI_PY_UNLOCK() ((void)0)
+#endif
 
 static int run_python(const char *script_path, const char *method, const char *path,
                       const char *query, char *out, size_t out_len)
 {
     FILE *fp = NULL;
     PyObject *sys_mod = NULL, *stdout_obj = NULL, *io_mod = NULL, *buf = NULL;
-    PyObject *getvalue = NULL, *result = NULL;
+    PyObject *getvalue = NULL, *result = NULL, *globals = NULL;
     PyGILState_STATE gil;
+    char errbuf[256];
     int n = -1;
 
-    PY_BOOT_ONCE();
+    if (crucible_scriptffi_py_boot(errbuf, sizeof(errbuf)) != 0) {
+        fprintf(stderr, "scriptffi: CPython 初始化失败: %s\n", errbuf);
+        return -1;
+    }
     gil = PyGILState_Ensure();
+    SCRIPTFFI_PY_LOCK(); /* 全局 stdout 替换 + 执行 + 恢复 必须原子（F1 同类问题） */
 
     io_mod = PyImport_ImportModule("io");
     if (io_mod == NULL)
@@ -101,10 +163,18 @@ static int run_python(const char *script_path, const char *method, const char *p
                 kv[3].k = "SCRIPT_FILENAME";
                 kv[3].v = script_path;
                 for (i = 0; i < 4; i++) {
+                    PyObject *k = PyUnicode_FromString(kv[i].k);
                     PyObject *v = PyUnicode_FromString(kv[i].v);
-                    if (v == NULL)
+                    if (k == NULL || v == NULL) {
+                        Py_XDECREF(k);
+                        Py_XDECREF(v);
                         continue;
-                    (void)PyDict_SetItemString(environ, kv[i].k, v);
+                    }
+                    /* **不能用 PyDict_SetItemString**：os.environ 是 os._Environ
+                     * （MutableMapping），不是 dict —— PyDict_* 会抛 SystemError，
+                     * 返回值此前还被丢弃，导致请求环境静默不生效。 */
+                    (void)PyObject_SetItem(environ, k, v);
+                    Py_DECREF(k);
                     Py_DECREF(v);
                 }
                 Py_DECREF(environ);
@@ -117,16 +187,46 @@ static int run_python(const char *script_path, const char *method, const char *p
     fp = fopen(script_path, "r");
     if (fp == NULL)
         goto done;
-    (void)PyRun_SimpleFileEx(fp, script_path, 1); /* fp 由 CPython 关闭 */
-    fp = NULL;
+    /* 每请求独立命名空间（不再共享 __main__），并在执行前检查返回值：
+     * 旧实现丢弃 PyRun_SimpleFileEx 的返回值，脚本抛异常时给出假成功。 */
+    globals = PyDict_New();
+    if (globals == NULL)
+        goto done;
+    {
+        PyObject *name = PyUnicode_FromString("__main__");
+        PyObject *file = PyUnicode_FromString(script_path);
+        if (name != NULL)
+            (void)PyDict_SetItemString(globals, "__name__", name);
+        if (file != NULL)
+            (void)PyDict_SetItemString(globals, "__file__", file);
+        Py_XDECREF(name);
+        Py_XDECREF(file);
+    }
+    result = PyRun_FileExFlags(fp, script_path, Py_file_input, globals, globals, 1, NULL);
+    fp = NULL; /* 已由 CPython 关闭 */
+    if (result == NULL) {
+        if (PyErr_Occurred())
+            PyErr_Print(); /* traceback 进本地日志并清异常 */
+        PyErr_Clear();
+        goto done;
+    }
+    Py_CLEAR(result);
 
     getvalue = PyObject_GetAttrString(buf, "getvalue");
     result = getvalue != NULL ? PyObject_CallObject(getvalue, NULL) : NULL;
     if (result != NULL && PyUnicode_Check(result)) {
         const char *s = PyUnicode_AsUTF8(result);
         if (s != NULL) {
-            snprintf(out, out_len, "%s", s);
-            n = (int)strlen(out);
+            size_t m = strlen(s);
+            if (m + 1 > out_len) {
+                /* 旧实现静默截断超长输出。明确失败，让调用方报错而不是发半截 body。 */
+                fprintf(stderr,
+                        "scriptffi: 脚本输出 %lu 字节超过调用方缓冲 %lu，拒绝截断\n",
+                        (unsigned long)m, (unsigned long)out_len);
+            } else {
+                memcpy(out, s, m + 1);
+                n = (int)m;
+            }
         }
     }
 
@@ -135,6 +235,7 @@ done:
         fclose(fp);
     if (sys_mod != NULL && stdout_obj != NULL)
         (void)PyObject_SetAttrString(sys_mod, "stdout", stdout_obj);
+    Py_XDECREF(globals);
     Py_XDECREF(result);
     Py_XDECREF(getvalue);
     Py_XDECREF(stdout_obj);
@@ -142,6 +243,7 @@ done:
     Py_XDECREF(buf);
     Py_XDECREF(io_mod);
     PyErr_Clear();
+    SCRIPTFFI_PY_UNLOCK();
     PyGILState_Release(gil);
     return n;
 }
@@ -149,11 +251,22 @@ done:
 
 #if defined(CRUCIBLE_HAVE_RUBY)
 #include <ruby.h>
+#ifndef _WIN32
+static pthread_mutex_t g_scriptffi_ruby_lock = PTHREAD_MUTEX_INITIALIZER;
+#define SCRIPTFFI_RUBY_LOCK()   pthread_mutex_lock(&g_scriptffi_ruby_lock)
+#define SCRIPTFFI_RUBY_UNLOCK() pthread_mutex_unlock(&g_scriptffi_ruby_lock)
+#else
+#define SCRIPTFFI_RUBY_LOCK()   ((void)0)
+#define SCRIPTFFI_RUBY_UNLOCK() ((void)0)
+#endif
 static int run_ruby(const char *script_path, char *out, size_t out_len)
 {
     int state = 0;
     VALUE v;
     static int started;
+    size_t m;
+
+    SCRIPTFFI_RUBY_LOCK(); /* MRI 调用必须串行（F1 同组问题；见 rack 的崩溃记录） */
     if (!started) {
         ruby_init();
         ruby_init_loadpath();
@@ -166,9 +279,18 @@ static int run_ruby(const char *script_path, char *out, size_t out_len)
     rb_load_protect(rb_str_new_cstr(script_path), 0, &state);
     v = rb_eval_string_protect("$__c ? $__c.string : ''", &state);
     if (state == 0 && TYPE(v) == T_STRING) {
-        snprintf(out, out_len, "%.*s", (int)RSTRING_LEN(v), RSTRING_PTR(v));
-        return (int)strlen(out);
+        m = (size_t)RSTRING_LEN(v);
+        if (m + 1 > out_len) {
+            fprintf(stderr, "scriptffi: ruby 输出 %lu 字节超过调用方缓冲 %lu\n",
+                    (unsigned long)m, (unsigned long)out_len);
+        } else {
+            memcpy(out, RSTRING_PTR(v), m);
+            out[m] = '\0';
+            SCRIPTFFI_RUBY_UNLOCK();
+            return (int)m;
+        }
     }
+    SCRIPTFFI_RUBY_UNLOCK();
     return -1;
 }
 #endif
@@ -177,12 +299,22 @@ static int run_ruby(const char *script_path, char *out, size_t out_len)
 #include <EXTERN.h>
 #include <perl.h>
 static PerlInterpreter *g_perl;
+#ifndef _WIN32
+static pthread_mutex_t g_scriptffi_perl_lock = PTHREAD_MUTEX_INITIALIZER;
+#define SCRIPTFFI_PERL_LOCK()   pthread_mutex_lock(&g_scriptffi_perl_lock)
+#define SCRIPTFFI_PERL_UNLOCK() pthread_mutex_unlock(&g_scriptffi_perl_lock)
+#else
+#define SCRIPTFFI_PERL_LOCK()   ((void)0)
+#define SCRIPTFFI_PERL_UNLOCK() ((void)0)
+#endif
 static int run_perl(const char *script_path, char *out, size_t out_len)
 {
     SV *sv;
     STRLEN n;
     char *s;
     char *args[] = {"", (char *)script_path};
+
+    SCRIPTFFI_PERL_LOCK(); /* 单解释器被多线程调用必须串行（F1 同组问题） */
     if (!g_perl) {
         int argc = 1;
         char *a0 = "";
@@ -198,15 +330,24 @@ static int run_perl(const char *script_path, char *out, size_t out_len)
                  "close $f; open my $o,'>',\\(my $b=''); my $old=select $o; "
                  "eval $c; select $old; $b }",
                  0);
-    if (!sv || !SvOK(sv))
+    if (!sv || !SvOK(sv)) {
+        SCRIPTFFI_PERL_UNLOCK();
         return -1;
+    }
     s = SvPV(sv, n);
-    if (!s)
+    if (!s) {
+        SCRIPTFFI_PERL_UNLOCK();
         return -1;
-    if (n >= out_len)
-        n = out_len - 1;
+    }
+    if (n + 1 > out_len) { /* 旧实现静默截断 */
+        fprintf(stderr, "scriptffi: perl 输出 %lu 字节超过调用方缓冲 %lu\n",
+                (unsigned long)n, (unsigned long)out_len);
+        SCRIPTFFI_PERL_UNLOCK();
+        return -1;
+    }
     memcpy(out, s, n);
     out[n] = '\0';
+    SCRIPTFFI_PERL_UNLOCK();
     return (int)n;
 }
 #endif

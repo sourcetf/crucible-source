@@ -476,8 +476,14 @@ pub fn state_root() -> PathBuf {
 }
 
 /// 读取 `CRUCIBLE_DNS_STATE_ROOT`；空值视为未设置。相对路径按 cwd 绝对化。
+///
+/// **必须走 `env_lock::read_static_env`（缓存）**：本函数在**每个 HTTP 请求**上被执行
+/// （`effective()` → `state_root()`），而应用引擎（perl/python/ruby 的 ENV、`.env`
+/// 注入）会在请求期间 `setenv`，libc 的 `setenv` 可能 realloc `environ` —— 此时并发
+/// 线程里的 `getenv`（哪怕读的是别的键）会踩到已释放内存。实测：`/perl/` 120 并发把
+/// webserver 打成 SIGSEGV，core 栈顶正是 `_libc_getenv("CRUCIBLE_DNS_STATE_ROOT")`。
 fn env_state_root() -> Option<PathBuf> {
-    let raw = std::env::var("CRUCIBLE_DNS_STATE_ROOT").ok()?;
+    let raw = crate::server::apps::env_lock::read_static_env("CRUCIBLE_DNS_STATE_ROOT")?;
     let raw = raw.trim();
     if raw.is_empty() {
         return None;

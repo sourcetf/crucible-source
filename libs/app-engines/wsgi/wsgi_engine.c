@@ -107,6 +107,7 @@ int appengine_execute(
     const char *server_name,
     int server_port,
     const char *extra,
+    const char *headers,
     AppEngineResult *out)
 {
     char pathbuf[1024];
@@ -129,12 +130,13 @@ int appengine_execute(
                          docroot != NULL ? docroot : "(null)");
     return crucible_py_wsgi_request("wsgi", use, docroot, method, path, query,
                                     content_type, body, body_len, remote, server_name,
-                                    server_port, env_dirty, out);
+                                    server_port, env_dirty, headers, out);
 #else
     (void)script;
     (void)docroot;
     (void)pathbuf;
     (void)env_dirty;
+    (void)headers;
     return wsgi_fail(out,
                      "wsgi: 本引擎构建时未嵌入 CPython（-DCRUCIBLE_EMBED_PYTHON_OFF）。"
                      "wsgi 禁止每请求 spawn 解释器，故不提供 popen 回退");

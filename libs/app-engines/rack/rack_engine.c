@@ -271,7 +271,7 @@ static int rack_ruby_ensure_locked(char *err, size_t errsz)
 static int rack_request(const char *script, const char *method, const char *path,
                         const char *query, const char *content_type, const char *body,
                         size_t body_len, const char *remote, const char *server_name,
-                        int server_port, AppEngineResult *out)
+                        int server_port, const char *headers, AppEngineResult *out)
 {
     char portbuf[16];
     char lenbuf[32];
@@ -307,6 +307,9 @@ static int rack_request(const char *script, const char *method, const char *path
     /* body 二进制安全（rb_str_new 保留 NUL 字节），供 rack.input 使用。 */
     rb_hash_aset(req, rb_str_new_cstr("body"),
                  body != NULL ? rb_str_new(body, (long)body_len) : rb_str_new("", 0));
+    /* ABI 请求头块；shim 展开为 env 的 HTTP_*（Cookie/Authorization 等）。 */
+    rb_hash_aset(req, rb_str_new_cstr("headers"),
+                 headers != NULL ? rb_str_new_cstr(headers) : rb_str_new("", 0));
     rb_gv_set("$crucible_req", req);
 
     /* 全部加载/调用逻辑在 shim 的 CrucibleRack.dispatch 里（读 $crucible_req）。
@@ -390,6 +393,7 @@ int appengine_execute(
     const char *server_name,
     int server_port,
     const char *extra,
+    const char *headers,
     AppEngineResult *out)
 {
     char pathbuf[1024];
@@ -410,7 +414,7 @@ int appengine_execute(
 
 #ifdef CRUCIBLE_HAVE_RUBY
     return rack_request(use, method, path, query, content_type, body, body_len, remote,
-                        server_name, server_port, out);
+                        server_name, server_port, headers, out);
 #else
     (void)method;
     (void)path;
@@ -421,6 +425,7 @@ int appengine_execute(
     (void)remote;
     (void)server_name;
     (void)server_port;
+    (void)headers;
     /*
      * 显式失败，不 spawn、不假 hello：
      * spec 要求 Ruby 静态嵌入（禁止每请求 spawn 解释器），而构建时没有 ruby 头文件/

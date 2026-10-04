@@ -860,6 +860,34 @@ static int crucible_py_serve_app_error(AppEngineResult *out, const char *label,
 /* ---------------------------------------------------------- WSGI 执行 --- */
 
 /*
+ * ABI 请求头块 → WSGI environ 的 CGI 键（HTTP_*）：每行 `Name: Value`，
+ * 行间 \r\n。Content-Type/Content-Length 由 appengine_headers_foreach 跳过
+ * （它们走独立形参，environ 里已有 CONTENT_TYPE/CONTENT_LENGTH）。
+ * 必须持 GIL 调用（建 PyUnicode 对象）。
+ */
+static int crucible_py_wsgi_headers_cb(void *ctx, const char *name, size_t name_len,
+                                       const char *value, size_t value_len)
+{
+    char key[262];
+    void *environ = ctx;
+    void *o;
+
+    if (environ == NULL || g_py_state != 1)
+        return 1;
+    if (appengine_cgi_http_key(key, sizeof(key), name, name_len) == 0)
+        return 0;
+    o = g_py.unicode_from_string_and_size(value, (long)value_len);
+    if (o == NULL) {
+        /* 非法 UTF-8 的单个头（obs-text）只丢这一条，不影响其余头。 */
+        crucible_py_clear_error();
+        return 0;
+    }
+    (void)g_py.dict_set_item_string(environ, key, o);
+    g_py.dec_ref(o);
+    return 0;
+}
+
+/*
  * 一次 WSGI 请求：构造 environ → 调用 application(environ, start_response)
  * → 迭代返回值 → 填 AppEngineResult。
  * 返回 0：out 已填（应用异常 → 500 + traceback，仍是"服务过"的响应）。
@@ -871,7 +899,8 @@ static int crucible_py_wsgi_request(const char *label, const char *script,
                                     const char *content_type, const char *body,
                                     size_t body_len, const char *remote,
                                     const char *server_name, int server_port,
-                                    int env_dirty, AppEngineResult *out)
+                                    int env_dirty, const char *headers,
+                                    AppEngineResult *out)
 {
     crucible_buf hb, bb;
     char errbuf[512];
@@ -988,6 +1017,10 @@ static int crucible_py_wsgi_request(const char *label, const char *script,
         snprintf(lenbuf, sizeof(lenbuf), "%lu", (unsigned long)body_len);
         (void)crucible_py_dict_set_str(environ, "CONTENT_LENGTH", lenbuf);
     }
+    /* 请求头 → HTTP_*（CGI 语义）。放在 HTTP_HOST/CONTENT_* 之后：块里若带
+     * Host（Rust 侧不剔除），真实请求 Host 覆盖上面按 server_name 拼的合成值
+     * ——HTTP_HOST 的 CGI 语义就是请求的 Host 头。 */
+    (void)appengine_headers_foreach(headers, crucible_py_wsgi_headers_cb, environ);
     tmp = crucible_py_int_tuple(1, 0);
     if (tmp != NULL) {
         (void)g_py.dict_set_item_string(environ, "wsgi.version", tmp);
@@ -1138,7 +1171,8 @@ done:
  * 应用按 (script, mtime) 缓存：缓存在同解释器的 sys.modules 私有键下，语义与
  * WSGI 路径一致（import 一次的 ASGI 应用不会被每请求重新执行），脚本改动即重载。
  * 输入：__cr_script / __cr_method / __cr_path / __cr_query / __cr_body /
- *       __cr_ct / __cr_host / __cr_port / __cr_remote
+ *       __cr_ct / __cr_host / __cr_port / __cr_remote / __cr_headers
+ *       （__cr_headers 是 ABI 头块的 bytes，行间 \\r\\n）
  * 输出：__cr_result = {'status': str, 'headers': "K: V\r\n" 文本块, 'body': bytes}
  */
 static const char *g_py_asgi_driver =
@@ -1172,8 +1206,20 @@ static const char *g_py_asgi_driver =
     "        _headers[:] = list(message.get('headers') or [])\n"
     "    elif _t == 'http.response.body':\n"
     "        _body.extend(message.get('body') or b'')\n"
-    "_hdrs = [(b'host', __cr_host.encode('utf-8', 'surrogateescape'))]\n"
-    "if __cr_ct:\n"
+    "_hdrs = []\n"
+    "for _line in __cr_headers.split(b'\\r\\n'):\n"
+    "    if not _line:\n"
+    "        continue\n"
+    "    _k, _sep, _v = _line.partition(b':')\n"
+    "    if not _sep:\n"
+    "        continue\n"
+    "    _k = _k.strip().lower()\n"
+    "    _v = _v.strip()\n"
+    "    if _k:\n"
+    "        _hdrs.append((_k, _v))\n"
+    "if not any(_k == b'host' for _k, _ in _hdrs):\n"
+    "    _hdrs.insert(0, (b'host', __cr_host.encode('utf-8', 'surrogateescape')))\n"
+    "if __cr_ct and not any(_k == b'content-type' for _k, _ in _hdrs):\n"
     "    _hdrs.append((b'content-type', __cr_ct.encode('utf-8', 'surrogateescape')))\n"
     "_scope = {\n"
     "    'type': 'http',\n"
@@ -1230,7 +1276,8 @@ static int crucible_py_asgi_request(const char *label, const char *script,
                                     const char *content_type, const char *body,
                                     size_t body_len, const char *remote,
                                     const char *server_name, int server_port,
-                                    int env_dirty, AppEngineResult *out)
+                                    int env_dirty, const char *headers,
+                                    AppEngineResult *out)
 {
     crucible_buf hb, bb;
     char errbuf[512];
@@ -1239,7 +1286,7 @@ static int crucible_py_asgi_request(const char *label, const char *script,
     char *trace = NULL;
     int gil = 0, rc = -1, we_gil = 0;
     void *g = NULL, *res = NULL, *pybody = NULL, *drv = NULL, *st = NULL, *hd = NULL;
-    void *bdy = NULL, *portobj = NULL;
+    void *bdy = NULL, *portobj = NULL, *pyheaders = NULL;
     const char *srv = server_name != NULL && server_name[0] != '\0' ? server_name : "crucible";
     int port = server_port > 0 ? server_port : 80;
 
@@ -1253,6 +1300,8 @@ static int crucible_py_asgi_request(const char *label, const char *script,
         return crucible_py_fail(out, "%s: 未解析到脚本路径", label);
     if (body == NULL)
         body_len = 0;
+    if (headers == NULL)
+        headers = "";
 
     /* 步骤 1：初始化（首次调用，不需要 GIL）。 */
     pthread_mutex_lock(&g_py_lock);
@@ -1273,9 +1322,12 @@ static int crucible_py_asgi_request(const char *label, const char *script,
     else
         snprintf(hostbuf, sizeof(hostbuf), "%s:%d", srv, port);
     pybody = g_py.bytes_from_string_and_size(body, (long)body_len);
+    /* 头块以 bytes 传入：ASGI scope["headers"] 要求 (bytes, bytes)，且 bytes
+     * 不做 UTF-8 校验 —— obs-text（0x80-0xFF）的头值不会让整块丢失。 */
+    pyheaders = g_py.bytes_from_string_and_size(headers, (long)strlen(headers));
     portobj = g_py.long_from_long(port);
     g = g_py.dict_new();
-    if (pybody == NULL || portobj == NULL || g == NULL) {
+    if (pybody == NULL || pyheaders == NULL || portobj == NULL || g == NULL) {
         crucible_py_err_text(errbuf, sizeof(errbuf), "构造 ASGI 驱动参数失败");
         rc = crucible_py_fail(out, "%s: %s", label, errbuf);
         goto done;
@@ -1288,6 +1340,7 @@ static int crucible_py_asgi_request(const char *label, const char *script,
     (void)crucible_py_dict_set_str(g, "__cr_host", hostbuf);
     (void)crucible_py_dict_set_str(g, "__cr_remote", remote ? remote : "");
     (void)g_py.dict_set_item_string(g, "__cr_body", pybody);
+    (void)g_py.dict_set_item_string(g, "__cr_headers", pyheaders);
     (void)g_py.dict_set_item_string(g, "__cr_port", portobj);
 
     drv = crucible_py_exec_source(g_py_asgi_driver, "<crucible-asgi-driver>", g,
@@ -1342,6 +1395,7 @@ done:
     crucible_py_xdecref(drv);
     crucible_py_xdecref(pybody);
     crucible_py_xdecref(portobj);
+    crucible_py_xdecref(pyheaders);
     crucible_py_xdecref(g);
     if (we_gil)
         g_py.gil_release(gil);

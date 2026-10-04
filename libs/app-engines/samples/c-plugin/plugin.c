@@ -32,6 +32,7 @@ int appengine_execute(
     const char *server_name,
     int server_port,
     const char *extra,
+    const char *headers,
     AppEngineResult *out)
 {
     const char *hello;
@@ -46,6 +47,7 @@ int appengine_execute(
     (void)remote;
     (void)server_name;
     (void)server_port;
+    (void)headers;
 
     if (!g_inited || out == NULL)
         return -1;

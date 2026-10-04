@@ -28,34 +28,89 @@ pub fn rebuild_covering_conn(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
-/// Overlay manual panel edits onto merged lookup (higher weight wins).
-pub fn apply_panel_edits(panel: &Connection, merged: &mut MergedFields) -> Result<()> {
-    let prefix = &merged.prefix;
-    if prefix.is_empty() {
+/// 面板可编辑字段白名单（与 [`apply_field`] 一一对应）。落库前校验：
+/// 旧实现字段拼错照样入库、接口回 ok，但 `apply_field` 的 `_ => {}` 让它永远不生效。
+const EDIT_FIELDS: &[&str] = &[
+    "country",
+    "province",
+    "region",
+    "city",
+    "district",
+    "isp",
+    "asn",
+    "as_org",
+    "cloud_provider",
+    "cloud_region",
+    "cloud_service",
+    "hosting",
+    "division_code",
+    "dc",
+];
+
+/// 面板手工覆盖对融合结果有**最高优先级**（§23.5.7「手改（errata）：高优先级，防被
+/// 自动更新覆盖」）。命中判定用**真正的网络包含**（`iputil::ip_in_cidr`），不是字符串
+/// 前后缀 LIKE。
+///
+/// 旧实现把绝大多数人工勘误静默废掉，两处根因：
+/// 1. `w >= merged.weight`：`merged.weight` 是所有覆盖行源权重的 max（生产层
+///    300–990），而面板默认 200、冲突裁决流程 250 ⇒ 条件恒假，管理员写入的覆盖、
+///    接口回 `{"ok":true}`、lookup 却继续返回多源融合结果；
+/// 2. `?1 LIKE prefix || '%' OR prefix LIKE ?1 || '%'`：`10.0.0.0/8` 的段级编辑命中
+///    不了 `10.1.2.0/24` 的查询（漏），存 `1.2.3.4` 又会命中 `1.2.3.40/32`（误）。
+///
+/// 现在：命中即应用（空值不覆盖非空，见 [`apply_field`]）；同一字段多条命中时按
+/// weight、id 升序应用，**最后写入的**（权重最高、其次最晚录入）生效。
+pub fn apply_panel_edits(panel: &Connection, ip: &str, merged: &mut MergedFields) -> Result<()> {
+    // 没有任何源数据命中时不做「勘误」：覆盖的语义是修正融合结果，不是凭空造数据。
+    if merged.prefixes_merged == 0 {
         return Ok(());
     }
+    let Some(ip) = crate::server::geoip_panel::iputil::parse_ip(ip) else {
+        return Ok(());
+    };
     let mut stmt = panel.prepare(
-        "SELECT field, value, weight FROM panel_edits
-         WHERE ?1 LIKE prefix || '%' OR prefix LIKE ?1 || '%'
-         -- 必须升序：下面的 apply_field 是无条件覆盖，最后写入的那条生效。
-         -- 原来写 DESC，于是权重**最低**的那条最后被应用 —— 与「高权重胜出」
-         -- 的语义正好相反（上面那行 w >= merged.weight 的注释也这么写着）。
-         ORDER BY weight ASC",
+        "SELECT field, value, weight, prefix FROM panel_edits
+         -- 升序：同一字段多条命中时最后应用的那条生效（配合无条件写入 = 高权重胜出）。
+         -- 附带 id 使同权重时结果确定，不依赖行扫描顺序。
+         ORDER BY weight ASC, id ASC",
     )?;
-    let rows = stmt.query_map(rusqlite::params![prefix], |row| {
+    let rows = stmt.query_map([], |row| {
         Ok((
             row.get::<_, String>(0)?,
             row.get::<_, String>(1)?,
             row.get::<_, i64>(2)?,
+            row.get::<_, String>(3)?,
         ))
     })?;
     for row in rows {
-        let (field, value, w) = row?;
-        if w >= merged.weight {
+        let (field, value, _weight, prefix) = row?;
+        if edit_prefix_hits_ip(&prefix, ip) {
             apply_field(merged, &field, &value);
         }
     }
     Ok(())
+}
+
+/// 该条编辑是否命中查询 IP：CIDR / 单个 IP（`iputil::ip_in_cidr`，两侧都会折 v4-mapped），
+/// 兼容历史库里写成 `start-end` 区间的行。其它形态（包括旧 LIKE 语义的垃圾值）不命中。
+fn edit_prefix_hits_ip(prefix: &str, ip: std::net::IpAddr) -> bool {
+    use crate::server::geoip_panel::iputil;
+    let p = prefix.trim();
+    if p.is_empty() {
+        return false;
+    }
+    let ip = iputil::unmap_v4_mapped(ip);
+    if iputil::ip_in_cidr(p, ip) {
+        return true;
+    }
+    if let Some((s, e)) = p.split_once('-') {
+        let ip_s = ip.to_string();
+        return match ip {
+            std::net::IpAddr::V4(_) => iputil::ipv4_in_range(&ip_s, s.trim(), e.trim()),
+            std::net::IpAddr::V6(_) => iputil::ipv6_in_range(&ip_s, s.trim(), e.trim()),
+        };
+    }
+    false
 }
 
 fn apply_field(m: &mut MergedFields, field: &str, value: &str) {
@@ -66,7 +121,8 @@ fn apply_field(m: &mut MergedFields, field: &str, value: &str) {
         }
         *dst = value.to_string();
     };
-    match field {
+    // 字段名容忍历史数据里的空白/大小写；新写入由 [`upsert_edit`] 白名单把关。
+    match field.trim().to_ascii_lowercase().as_str() {
         "country" => set(&mut m.country),
         "province" => set(&mut m.province),
         "region" => set(&mut m.region),
@@ -86,6 +142,10 @@ fn apply_field(m: &mut MergedFields, field: &str, value: &str) {
 }
 
 /// Insert or update a hand edit and audit log entry (§23.6 UPSERT).
+///
+/// 落库前校验并归一：`prefix` 必须是合法 CIDR（单个 IP 等价 /32、/128，主机位清零，
+/// v4-mapped 折 v4）——旧实现不校验，`%`/`_` 直接入库后配合 LIKE 就是一条全局覆盖；
+/// `field` 必须在白名单内——拼错只入库不生效、面板却回 ok。
 pub fn upsert_edit(
     panel: &Connection,
     prefix: &str,
@@ -93,6 +153,17 @@ pub fn upsert_edit(
     value: &str,
     weight: i64,
 ) -> Result<()> {
+    let prefix = crate::server::geoip_panel::iputil::normalize_cidr_prefix(prefix)
+        .ok_or_else(|| anyhow::anyhow!("invalid edit prefix {prefix:?}（需要 CIDR 或单个 IP）"))?;
+    let field = field.trim().to_ascii_lowercase();
+    if !EDIT_FIELDS.contains(&field.as_str()) {
+        anyhow::bail!(
+            "invalid edit field {field:?}（可用字段：{}）",
+            EDIT_FIELDS.join(", ")
+        );
+    }
+    // 权重参与的只有「同字段多条编辑谁最后生效」；负值无意义，截到 0。
+    let weight = weight.max(0);
     // Ensure unique key for UPSERT (prefix, field).
     panel.execute_batch(
         "CREATE UNIQUE INDEX IF NOT EXISTS idx_panel_edits_pf ON panel_edits(prefix, field);",
@@ -330,6 +401,11 @@ fn like_escape(s: &str) -> String {
 }
 
 /// Filter geoip rows by country/isp/cloud（Admin 面板筛选；结果携带字段供表格渲染）。
+///
+/// 三张表都要查：`geoip`（主表）与 §23 双 schema 的 `ipv4`/`ipv6` range 表。
+/// 旧实现只 `FROM geoip` —— 写入 `ipv4`/`ipv6` 表的行（v6 demo/镜像数据）在面板里
+/// 永远筛不到，表现为「库里有数据、筛选结果为空」。列名差异（ip_start/ip_end vs
+/// start/end、缺 dc）在子查询里对齐。
 pub fn filter_prefixes(
     conn: &Connection,
     country: Option<&str>,
@@ -346,19 +422,33 @@ pub fn filter_prefixes(
     // （面板显示「没有结果」，其实数据存在）。这里的 LIMIT 作用在过滤后的结果集上。
     // 大小写：SQLite 的 LIKE 对 ASCII 不区分大小写（等价于原来的 to_ascii_lowercase
     // 包含匹配）；lower() 只为把意图写死，非 ASCII 与原来一样不做大小写折叠。
-    let mut stmt = conn.prepare(
-        "SELECT COALESCE(prefix, ip_start || '-' || ip_end),
-                COALESCE(country, ''), COALESCE(province, ''), COALESCE(city, ''),
-                COALESCE(isp, ''), COALESCE(cloud_provider, ''), COALESCE(weight, 0)
-         FROM geoip
-         WHERE (?1 = ''
+    let where_clause = "WHERE (?1 = ''
                  OR lower(COALESCE(country, '')) LIKE '%' || ?1 || '%' ESCAPE '\\'
                  OR lower(COALESCE(province, '')) LIKE '%' || ?1 || '%' ESCAPE '\\'
                  OR lower(COALESCE(city, '')) LIKE '%' || ?1 || '%' ESCAPE '\\')
            AND (?2 = '' OR lower(COALESCE(isp, '')) LIKE '%' || ?2 || '%' ESCAPE '\\')
-           AND (?3 = '' OR lower(COALESCE(cloud_provider, '')) LIKE '%' || ?3 || '%' ESCAPE '\\')
-         ORDER BY COALESCE(weight, 0) DESC LIMIT ?4",
-    )?;
+           AND (?3 = '' OR lower(COALESCE(cloud_provider, '')) LIKE '%' || ?3 || '%' ESCAPE '\\')";
+    let sql = format!(
+        "SELECT prefix, country, province, city, isp, cloud_provider, weight FROM (
+             SELECT COALESCE(prefix, ip_start || '-' || ip_end) AS prefix,
+                    COALESCE(country, '') AS country, COALESCE(province, '') AS province,
+                    COALESCE(city, '') AS city, COALESCE(isp, '') AS isp,
+                    COALESCE(cloud_provider, '') AS cloud_provider,
+                    COALESCE(weight, 0) AS weight
+               FROM geoip {where_clause}
+             UNION ALL
+             SELECT COALESCE(prefix, start || '-' || end), COALESCE(country, ''),
+                    COALESCE(province, ''), COALESCE(city, ''), COALESCE(isp, ''),
+                    COALESCE(cloud_provider, ''), COALESCE(weight, 0)
+               FROM ipv4 {where_clause}
+             UNION ALL
+             SELECT COALESCE(prefix, start || '-' || end), COALESCE(country, ''),
+                    COALESCE(province, ''), COALESCE(city, ''), COALESCE(isp, ''),
+                    COALESCE(cloud_provider, ''), COALESCE(weight, 0)
+               FROM ipv6 {where_clause}
+         ) ORDER BY weight DESC LIMIT ?4"
+    );
+    let mut stmt = conn.prepare(&sql)?;
     let rows = stmt.query_map(
         rusqlite::params![
             like_escape(&c),
@@ -470,3 +560,71 @@ pub fn resolve_conflict(panel: &Connection, id: i64) -> Result<bool> {
         Ok(val)
     }
 
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn panel_db() -> Connection {
+        crate::server::geoip_panel::db::open_panel(std::path::Path::new(":memory:")).unwrap()
+    }
+
+    /// prefix/field 落库前校验：通配符 prefix、非法 CIDR、白名单外字段一律拒绝；
+    /// 合法 prefix 归一后入库、负权重截 0、同键 UPSERT 不新增行。
+    #[test]
+    fn upsert_edit_validates_and_normalizes() {
+        let panel = panel_db();
+        assert!(upsert_edit(&panel, "%", "country", "US", 200).is_err(), "% 是 LIKE 通配符，必须拒绝");
+        assert!(upsert_edit(&panel, "_", "country", "US", 200).is_err());
+        assert!(upsert_edit(&panel, "10.0.0.0/33", "country", "US", 200).is_err());
+        assert!(upsert_edit(&panel, "10.0.0", "country", "US", 200).is_err());
+        assert!(upsert_edit(&panel, "10.0.0.0/8", "contry", "US", 200).is_err());
+        upsert_edit(&panel, "10.0.0.1/8", "  Country ", "US", -5).unwrap();
+        let (p, f, v, w): (String, String, String, i64) = panel
+            .query_row("SELECT prefix, field, value, weight FROM panel_edits", [], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+            })
+            .unwrap();
+        assert_eq!(p, "10.0.0.0/8", "主机位清零");
+        assert_eq!(f, "country", "字段名 trim + 小写");
+        assert_eq!(v, "US");
+        assert_eq!(w, 0, "负权重截到 0");
+        upsert_edit(&panel, "10.0.0.0/8", "country", "DE", 300).unwrap();
+        let n: i64 = panel
+            .query_row("SELECT count(*) FROM panel_edits", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 1, "同 (prefix, field) 是 UPSERT，不新增行");
+    }
+
+    /// 筛选必须覆盖 §23 双 schema 的 ipv4/ipv6 表（旧实现只查 geoip，v6 行永远筛不到）。
+    #[test]
+    fn filter_covers_ipv4_ipv6_tables() {
+        let conn = crate::server::geoip_panel::db::open(std::path::Path::new(":memory:")).unwrap();
+        conn.execute(
+            "INSERT INTO geoip(ip_start, ip_end, country, city, weight, prefix)
+             VALUES('1.2.4.0','1.2.4.255','CN','Beijing',80,'1.2.4.0/24')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO ipv4(start, end, country, city, weight, prefix)
+             VALUES('8.8.8.0','8.8.8.255','US','Mountain View',80,'8.8.8.0/24')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO ipv6(start, end, country, city, weight, prefix)
+             VALUES('2001:db8::','2001:db8::ffff','US','Documentation',50,'2001:db8::/112')",
+            [],
+        )
+        .unwrap();
+        let all = filter_prefixes(&conn, None, None, None, 100).unwrap();
+        assert!(all.iter().any(|r| r.prefix == "1.2.4.0/24"));
+        assert!(all.iter().any(|r| r.prefix == "8.8.8.0/24"), "ipv4 表行必须被筛到");
+        assert!(all.iter().any(|r| r.prefix == "2001:db8::/112"), "ipv6 表行必须被筛到");
+        let us = filter_prefixes(&conn, Some("us"), None, None, 100).unwrap();
+        assert!(us.iter().any(|r| r.city == "Mountain View"));
+        assert!(us.iter().any(|r| r.city == "Documentation"));
+        assert!(!us.iter().any(|r| r.country == "CN"));
+    }
+}

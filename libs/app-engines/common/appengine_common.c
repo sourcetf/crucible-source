@@ -210,6 +210,130 @@ static size_t ae_json_skip_string(const char *s, const char *end)
     return (size_t)(p - s + 1);
 }
 
+/* ------------------------------------------------------- request headers --- */
+
+/* 头部值上限（单条）。超长的行整体跳过：回调方的落地缓冲都是有界的
+ * （环境变量/ASCIIZ 键值），截断会产生「半条 Cookie」这类静默错误。 */
+#define AE_HEADER_VALUE_MAX 16384
+#define AE_HEADER_NAME_MAX  256
+
+/* 名字按 HTTP token 的实用子集校验：字母/数字/`-`/`_`/`.`。
+ * 其它字符（空格、控制字符、`:` 已在切分时排除）会让 CGI 环境键非法或歧义。 */
+static int ae_header_name_ok(const char *n, size_t len)
+{
+    size_t i;
+
+    for (i = 0; i < len; i++) {
+        unsigned char c = (unsigned char)n[i];
+
+        if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+            (c >= '0' && c <= '9') || c == '-' || c == '_' || c == '.')
+            continue;
+        return 0;
+    }
+    return 1;
+}
+
+/* 大小写不敏感比较 `a[0..n)` 与 NUL 结尾的 b；要求 strlen(b) == n。 */
+static int ae_ieq(const char *a, size_t n, const char *b)
+{
+    size_t i;
+
+    if (strlen(b) != n)
+        return 0;
+    for (i = 0; i < n; i++) {
+        unsigned char ca = (unsigned char)a[i];
+        unsigned char cb = (unsigned char)b[i];
+
+        if (ca >= 'A' && ca <= 'Z')
+            ca = (unsigned char)(ca - 'A' + 'a');
+        if (cb >= 'A' && cb <= 'Z')
+            cb = (unsigned char)(cb - 'A' + 'a');
+        if (ca != cb)
+            return 0;
+    }
+    return 1;
+}
+
+/* Content-Type/Content-Length 有独立形参，头块里不发、也不回调（防覆盖）。 */
+static int ae_header_is_body_meta(const char *n, size_t len)
+{
+    return ae_ieq(n, len, "content-type") || ae_ieq(n, len, "content-length");
+}
+
+int appengine_headers_foreach(
+    const char *headers,
+    int (*cb)(void *ctx, const char *name, size_t name_len,
+              const char *value, size_t value_len),
+    void *ctx)
+{
+    const char *p;
+    int count = 0;
+
+    if (headers == NULL || cb == NULL)
+        return 0;
+    p = headers;
+    while (*p != '\0') {
+        const char *line_end = p;
+        const char *colon;
+        size_t llen, name_len, value_len;
+        const char *value;
+
+        while (*line_end != '\0' && *line_end != '\r' && *line_end != '\n')
+            line_end++;
+        llen = (size_t)(line_end - p);
+        if (llen > 0) {
+            colon = (const char *)memchr(p, ':', llen);
+            if (colon != NULL) {
+                name_len = (size_t)(colon - p);
+                value = colon + 1;
+                while (value < line_end && (*value == ' ' || *value == '\t'))
+                    value++;
+                value_len = (size_t)(line_end - value);
+                if (name_len > 0 && name_len <= AE_HEADER_NAME_MAX &&
+                    value_len <= AE_HEADER_VALUE_MAX &&
+                    ae_header_name_ok(p, name_len) &&
+                    !ae_header_is_body_meta(p, name_len)) {
+                    int rc = cb(ctx, p, name_len, value, value_len);
+
+                    if (rc != 0)
+                        return rc;
+                    count++;
+                }
+            }
+        }
+        if (*line_end == '\r')
+            line_end++;
+        if (*line_end == '\n')
+            line_end++;
+        p = line_end;
+    }
+    return count;
+}
+
+size_t appengine_cgi_http_key(char *out, size_t out_sz, const char *name, size_t name_len)
+{
+    size_t i, n = 0;
+
+    if (out == NULL || out_sz == 0 || name == NULL)
+        return 0;
+    if (out_sz < name_len + 6)
+        return 0;
+    memcpy(out, "HTTP_", 5);
+    n = 5;
+    for (i = 0; i < name_len; i++) {
+        unsigned char c = (unsigned char)name[i];
+
+        if (c >= 'a' && c <= 'z')
+            c = (unsigned char)(c - 'a' + 'A');
+        else if (c == '-')
+            c = '_';
+        out[n++] = (char)c;
+    }
+    out[n] = '\0';
+    return n;
+}
+
 int appengine_apply_extra(const char *extra)
 {
     const char *p, *end, *envk;

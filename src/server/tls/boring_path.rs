@@ -940,8 +940,8 @@ fn apply_psk(builder: &mut SslAcceptorBuilder, ssl: &SslConfig) -> Result<()> {
     let secret: Vec<u8> = if let Some(k) = ssl.psk_key.as_deref() {
         psk_material(k)?
     } else {
-        match std::env::var("CRUCIBLE_TLS_PSK") {
-            Ok(s) if !s.is_empty() => s.into_bytes(),
+        match crate::server::apps::env_lock::read_static_env("CRUCIBLE_TLS_PSK") {
+            Some(s) if !s.is_empty() => s.into_bytes(),
             _ => {
                 log::warn!("ssl.psk=true 但未配置 ssl.psk_key / CRUCIBLE_TLS_PSK；不装 PSK 回调");
                 return Ok(());

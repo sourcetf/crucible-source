@@ -257,6 +257,29 @@ module CrucibleRack
       'rack.hijack?' => false
     }
 
+    # ABI 请求头块（每行 "Name: Value"，\r\n 分隔）→ env 的 HTTP_*（Rack/CGI 语义）。
+    # Content-Type/Length 已有独立 env 键，跳过防覆盖；HTTP_HOST 会被请求的真实
+    # Host 覆盖（上面的合成值只是缺 Host 时的回落）。
+    hdrs = req['headers'].to_s
+    unless hdrs.empty?
+      hdrs.split("\r\n").each do |line|
+        next if line.empty?
+
+        k, sep, v = line.partition(':')
+        next if sep.empty?
+
+        k = k.strip
+        v = v.strip
+        next if k.empty?
+        next if k.downcase == 'content-type' || k.downcase == 'content-length'
+
+        ek = k.upcase.tr('-', '_')
+        next unless ek.match?(/\A[A-Z0-9_.]+\z/)
+
+        env["HTTP_#{ek}"] = v
+      end
+    end
+
     r = app.call(env)
     r = r.to_a if !r.is_a?(Array) && r.respond_to?(:to_a)
     raise "rack: 应用返回 #{r.class}（需要 [status, headers, body]）" unless r.is_a?(Array) && r.size >= 3

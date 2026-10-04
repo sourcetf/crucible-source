@@ -31,6 +31,25 @@ int appengine_fill_hello(AppEngineResult *out, const char *engine_name, const ch
  * name) is a no-op. Returns 0 on success/no-op, -1 on bad arguments. */
 int appengine_apply_extra(const char *extra);
 
+/* ---------------------------------------------------------- request headers ---
+ * ABI 请求头块（appengine_execute 的 headers 参数）：
+ *   每行 `Name: Value`，行间 `\r\n`，可为 NULL/空。
+ * appengine_headers_foreach 逐条解析**有效**头并回调：
+ *   - 空行 / 无冒号行 / 名字含非法字符 / 名或值超长的行直接跳过（防御）；
+ *   - Content-Type / Content-Length 不回调：它们有独立形参，避免覆盖；
+ *   - name/value 指向块内，**不保证 NUL 结尾**，仅在回调期间有效。
+ * 返回回调过的头条数。cb 返回非 0 立即停止并返回该值。
+ */
+int appengine_headers_foreach(
+    const char *headers,
+    int (*cb)(void *ctx, const char *name, size_t name_len,
+              const char *value, size_t value_len),
+    void *ctx);
+
+/* CGI 环境键：`HTTP_` + 名字大写 + `-`→`_`（RFC 3875 惯例）。
+ * out 需 >= name_len + 6 字节；返回写入的键长（不含 NUL），0 = 参数非法。 */
+size_t appengine_cgi_http_key(char *out, size_t out_sz, const char *name, size_t name_len);
+
 #ifdef __cplusplus
 }
 #endif

@@ -1,0 +1,25 @@
+# 性能剖析专用实例（工号 1009）：单个明文 listener + 静态目录，其它全关，
+# 用来稳定复现「每请求 CPU 成本」而不受 DNS/应用/日志配置影响。
+[access_log]
+enable = true
+level = "info"
+
+[admin]
+path = "/__admin"
+realm = "prof"
+[[admin.users]]
+username = "admin"
+password_hash = "$argon2id$v=19$m=19456,t=2,p=1$2BEraDqSHm0CF6n4ZuUPdQ$nCniE+r1nkJGpbH33YHonhLYxemvjiycMqBBVV0tLxs"
+
+[dns]
+enabled = false
+
+[geoip]
+enabled = false
+
+[[listeners]]
+address = "127.0.0.1"
+port = 18200
+root = "www-static-fair"
+http_versions = ["h1", "h2"]
+server_name = "prof.local"

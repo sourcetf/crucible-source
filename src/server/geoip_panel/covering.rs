@@ -526,10 +526,28 @@ fn merge_pipeline(conn: &Connection, ip: &str, rows: &[CoveringPrefix]) -> Merge
             merged.district.clear();
         }
     }
-    if let Ok(panel) = super::db::open_panel(std::path::Path::new("data/geoip/panel.sqlite")) {
-        let _ = super::ops::apply_panel_edits(&panel, &mut merged);
+    // 面板覆盖失败必须留痕：旧实现 `let _ = ...` 静默吞掉 —— 库锁/表缺失时
+    // 手工勘误整体不生效，面板却一切正常（与「假成功」同类）。lookup 是热路径，
+    // 相同错误只告警一次（消息变化才再打），避免把日志刷爆。
+    match super::db::open_panel(std::path::Path::new("data/geoip/panel.sqlite")) {
+        Ok(panel) => {
+            if let Err(e) = super::ops::apply_panel_edits(&panel, ip, &mut merged) {
+                warn_once(&format!("geoip panel edits skipped: {e:#}"));
+            }
+        }
+        Err(e) => warn_once(&format!("geoip panel db unavailable: {e:#}")),
     }
     merged
+}
+
+/// 按消息去重的一次性告警（同一条只打一次；消息变了重新打）。
+fn warn_once(msg: &str) {
+    static LAST: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+    let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
+    if last.as_deref() != Some(msg) {
+        log::warn!("{msg}");
+        *last = Some(msg.to_string());
+    }
 }
 
 #[cfg(test)]
@@ -626,5 +644,130 @@ mod tests {
         assert_eq!(m.province, "California");
         assert_eq!(m.prefixes_merged, 1);
         assert_eq!(m.bits, 16);
+    }
+
+    fn panel_db() -> rusqlite::Connection {
+        crate::server::geoip_panel::db::open_panel(std::path::Path::new(":memory:")).unwrap()
+    }
+
+    /// P1 回归：面板手工覆盖必须压过高权源数据（lookup 真的返回覆盖值）。
+    ///
+    /// 旧实现 `w >= merged.weight`：merged.weight 是源权重 max（生产层 300–990），
+    /// 面板默认 200 ⇒ 条件恒假，覆盖静默失效；字符串 LIKE 又让 /8 的段级编辑命中
+    /// 不了 /24 的查询。现在两者都修：命中即应用、人工最高优先。
+    #[test]
+    fn panel_edit_overrides_high_weight_merged_row() {
+        let panel = panel_db();
+        panel
+            .execute(
+                "INSERT INTO panel_edits(prefix, field, value, weight)
+                 VALUES('10.0.0.0/8','country','XP',200)",
+                [],
+            )
+            .unwrap();
+        let rows = vec![CoveringPrefix {
+            country: "US".into(),
+            province: "California".into(),
+            city: "San Jose".into(),
+            weight: 990,
+            commit_unix: 100,
+            bits: 24,
+            prefix: "10.1.2.0/24".into(),
+            ..Default::default()
+        }];
+        let mut merged = merge_covering(&rows);
+        assert_eq!(merged.country, "US");
+        assert_eq!(merged.weight, 990, "源数据权重 990，远高于面板默认 200");
+        // 查询 10.1.2.3：merged.prefix=10.1.2.0/24，/8 的段级覆盖必须命中。
+        crate::server::geoip_panel::ops::apply_panel_edits(&panel, "10.1.2.3", &mut merged).unwrap();
+        assert_eq!(merged.country, "XP", "人工覆盖必须压过 990 权重的融合结果");
+    }
+
+    /// 旧 LIKE 语义的第二类错误：存 1.2.3.4 会误命中 1.2.3.40/32（`1.2.3.40/32`
+    /// LIKE `1.2.3.4%` 为真）。CIDR 包含下它只该命中 1.2.3.4 自己。
+    #[test]
+    fn panel_edit_host_does_not_leak_to_neighboring_host() {
+        let panel = panel_db();
+        panel
+            .execute(
+                "INSERT INTO panel_edits(prefix, field, value, weight)
+                 VALUES('1.2.3.4/32','country','XX',200)",
+                [],
+            )
+            .unwrap();
+        let rows = vec![CoveringPrefix {
+            country: "US".into(),
+            weight: 80,
+            bits: 32,
+            prefix: "1.2.3.40/32".into(),
+            ..Default::default()
+        }];
+        let mut merged = merge_covering(&rows);
+        crate::server::geoip_panel::ops::apply_panel_edits(&panel, "1.2.3.40", &mut merged).unwrap();
+        assert_eq!(merged.country, "US", "1.2.3.4 的编辑不得命中 1.2.3.40");
+        // 反向：1.2.3.4 自己的查询要命中。
+        let rows2 = vec![CoveringPrefix {
+            country: "US".into(),
+            weight: 80,
+            bits: 32,
+            prefix: "1.2.3.4/32".into(),
+            ..Default::default()
+        }];
+        let mut merged2 = merge_covering(&rows2);
+        crate::server::geoip_panel::ops::apply_panel_edits(&panel, "1.2.3.4", &mut merged2).unwrap();
+        assert_eq!(merged2.country, "XX");
+    }
+
+    /// 多条编辑命中同一字段：weight 高者胜；同权重取后录入（id）者，结果确定。
+    #[test]
+    fn panel_edits_resolve_by_weight_then_id() {
+        let panel = panel_db();
+        panel
+            .execute(
+                "INSERT INTO panel_edits(prefix, field, value, weight)
+                 VALUES('10.0.0.0/8','city','Low',100)",
+                [],
+            )
+            .unwrap();
+        panel
+            .execute(
+                "INSERT INTO panel_edits(prefix, field, value, weight)
+                 VALUES('10.1.0.0/16','city','High',300)",
+                [],
+            )
+            .unwrap();
+        panel
+            .execute(
+                "INSERT INTO panel_edits(prefix, field, value, weight)
+                 VALUES('10.1.2.0/24','city','High2',300)",
+                [],
+            )
+            .unwrap();
+        let rows = vec![CoveringPrefix {
+            city: "Src".into(),
+            weight: 990,
+            bits: 24,
+            prefix: "10.1.2.0/24".into(),
+            ..Default::default()
+        }];
+        let mut merged = merge_covering(&rows);
+        crate::server::geoip_panel::ops::apply_panel_edits(&panel, "10.1.2.3", &mut merged).unwrap();
+        assert_eq!(merged.city, "High2");
+    }
+
+    /// 没有源数据命中时不做「勘误」：面板覆盖只修正融合结果，不凭空造数据。
+    #[test]
+    fn panel_edit_not_applied_without_covering_rows() {
+        let panel = panel_db();
+        panel
+            .execute(
+                "INSERT INTO panel_edits(prefix, field, value, weight)
+                 VALUES('10.0.0.0/8','country','XP',200)",
+                [],
+            )
+            .unwrap();
+        let mut merged = MergedFields::default();
+        crate::server::geoip_panel::ops::apply_panel_edits(&panel, "10.1.2.3", &mut merged).unwrap();
+        assert_eq!(merged.country, "");
     }
 }

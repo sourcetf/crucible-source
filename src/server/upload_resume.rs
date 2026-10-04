@@ -198,9 +198,8 @@ fn min_free_bytes() -> u64 {
     static OVERRIDE: OnceLock<Option<u64>> = OnceLock::new();
     OVERRIDE
         .get_or_init(|| {
-            std::env::var("CRUCIBLE_MIN_FREE_BYTES")
-                .ok()
-                .and_then(|v| v.trim().parse::<u64>().ok())
+            crate::server::apps::env_lock::read_static_env("CRUCIBLE_MIN_FREE_BYTES")
+                .and_then(|v: String| v.trim().parse::<u64>().ok())
         })
         .unwrap_or(MIN_FREE_BYTES)
 }

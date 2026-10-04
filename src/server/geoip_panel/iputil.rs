@@ -91,6 +91,84 @@ pub fn normalize_v4_prefix(base: &str, bits: u32) -> Option<String> {
     Some(Ipv4Addr::from(u32::from(v4) & mask).to_string())
 }
 
+/// 解析 `a.b.c.d/N` 或 `x::y/N`：base 必须是 IP 字面量、N 在该族位宽内。
+/// 返回归一化后的 (地址, 前缀长)；v4-mapped 基址折回 v4。非法返回 None。
+pub fn parse_cidr(s: &str) -> Option<(IpAddr, u8)> {
+    let t = s.trim();
+    // 裸 IP（没有 `/nn`）按**单点**处理（/32、/128）。
+    // 为什么必须容忍：面板的手工覆盖里历史上存过裸 IP（旧 LIKE 语义时代），
+    // 而 `normalize_cidr_prefix` 只对新写入生效 —— 库里存的旧行仍是裸形式。
+    // 判成「非法 ⇒ 不匹配」会让那些覆盖静默失效（正是本轮要修的那类故障）。
+    let (base, bits) = match t.split_once('/') {
+        Some((b, p)) => (b.trim(), Some(p.trim().parse::<u8>().ok()?)),
+        None => (t, None),
+    };
+    let addr = unmap_v4_mapped(base.parse::<IpAddr>().ok()?);
+    let max = match addr {
+        IpAddr::V4(_) => 32,
+        IpAddr::V6(_) => 128,
+    };
+    let bits = bits.unwrap_or(max);
+    if bits > max {
+        return None;
+    }
+    Some((addr, bits))
+}
+
+/// 真·CIDR 包含判断（`ip` 是否落在 `cidr` 内）。
+///
+/// 为什么不能用字符串 LIKE：`10.0.0.0/8` 的编辑必须命中 `10.1.2.0/24` 的查询
+/// （段级 errata），而 `1.2.3.4` 绝不能命中 `1.2.3.40/32` —— 原来
+/// `?1 LIKE prefix || '%'` 两头都错（漏段、误命中更长的邻居）。
+/// 基址的主机位不要求为零（先掩码再比较）；v4-mapped 两侧都折回 v4。
+pub fn ip_in_cidr(cidr: &str, ip: IpAddr) -> bool {
+    let Some((base, bits)) = parse_cidr(cidr) else {
+        return false;
+    };
+    let ip = unmap_v4_mapped(ip);
+    match (base, ip) {
+        (IpAddr::V4(b), IpAddr::V4(i)) => {
+            let mask = if bits == 0 { 0 } else { u32::MAX << (32 - bits) };
+            (u32::from(b) & mask) == (u32::from(i) & mask)
+        }
+        (IpAddr::V6(b), IpAddr::V6(i)) => {
+            let mask = if bits == 0 { 0 } else { u128::MAX << (128 - bits) };
+            (u128::from(b) & mask) == (u128::from(i) & mask)
+        }
+        _ => false,
+    }
+}
+
+/// 把面板手工覆盖的 `prefix` 归一成 CIDR 字符串：单个 IP 补全长度（/32、/128），
+/// 主机位清零，v4-mapped 折回 v4，大小写/压缩形式统一。
+/// 非法（不是 IP、长度越界、带 `/` 但 base 不是纯 IP）返回 None —— 调用方必须拒绝落库。
+pub fn normalize_cidr_prefix(s: &str) -> Option<String> {
+    let t = s.trim();
+    let (base, bits) = match t.split_once('/') {
+        Some((b, p)) => (b.trim(), Some(p.trim().parse::<u8>().ok()?)),
+        None => (t, None),
+    };
+    let addr = unmap_v4_mapped(base.parse::<IpAddr>().ok()?);
+    match addr {
+        IpAddr::V4(v4) => {
+            let bits = bits.unwrap_or(32);
+            if bits > 32 {
+                return None;
+            }
+            let mask = if bits == 0 { 0 } else { u32::MAX << (32 - bits) };
+            Some(format!("{}/{}", Ipv4Addr::from(u32::from(v4) & mask), bits))
+        }
+        IpAddr::V6(v6) => {
+            let bits = bits.unwrap_or(128);
+            if bits > 128 {
+                return None;
+            }
+            let mask = if bits == 0 { 0 } else { u128::MAX << (128 - bits) };
+            Some(format!("{}/{}", Ipv6Addr::from(u128::from(v6) & mask), bits))
+        }
+    }
+}
+
 /// Normalize IPv6 to canonical compressed form; IPv4 unchanged.
 pub fn normalize_ip(addr: IpAddr) -> String {
     match addr {
@@ -241,5 +319,49 @@ mod tests {
         assert_eq!(normalize_v4_prefix("not-an-ip", 8), None);
         assert_eq!(normalize_v4_prefix("::ffff:1.2.3.4", 24), None);
         assert_eq!(normalize_v4_prefix("fe80::1%eth0", 64), None);
+    }
+
+    /// 面板覆盖用的 CIDR 包含：段级命中、邻居不误命中、v4-mapped 归一、v6 一样工作。
+    #[test]
+    fn cidr_containment_is_true_network_math() {
+        // 段级 errata：/8 的编辑必须命中 /24 里的查询点。
+        assert!(ip_in_cidr("10.0.0.0/8", "10.1.2.3".parse().unwrap()));
+        // 旧 LIKE 语义的两种错法都要被钉死：
+        // 1) 存更宽的 /8 时 `merged.prefix LIKE '10.0.0.0/8%'` 恒假（漏命中）；
+        assert!(!ip_in_cidr("1.2.3.4/32", "1.2.3.40".parse().unwrap()));
+        // 2) 存 1.2.3.4 时旧 LIKE 会误命中 1.2.3.40。
+        assert!(ip_in_cidr("1.2.3.4", "1.2.3.4".parse().unwrap()));
+        // 基址主机位非零也按网段语义处理。
+        assert!(ip_in_cidr("10.1.2.3/24", "10.1.2.200".parse().unwrap()));
+        // /0 全匹配；越界长度/垃圾输入不匹配。
+        assert!(ip_in_cidr("0.0.0.0/0", "203.0.113.9".parse().unwrap()));
+        assert!(!ip_in_cidr("10.0.0.0/33", "10.0.0.1".parse().unwrap()));
+        assert!(!ip_in_cidr("not-a-cidr", "10.0.0.1".parse().unwrap()));
+        // v4-mapped 客户端按 v4 口径命中 v4 段。
+        assert!(ip_in_cidr("10.0.0.0/8", "::ffff:10.1.2.3".parse().unwrap()));
+        // v6：/48 段命中、邻居不命中。
+        assert!(ip_in_cidr("2001:db8:1::/48", "2001:db8:1::5".parse().unwrap()));
+        assert!(!ip_in_cidr("2001:db8:1::/48", "2001:db8:2::5".parse().unwrap()));
+        // 不跨族匹配。
+        assert!(!ip_in_cidr("2001:db8::/32", "10.0.0.1".parse().unwrap()));
+    }
+
+    /// 面板 prefix 归一：单点补长度、主机位清零、v6 压缩、非法拒绝。
+    #[test]
+    fn panel_prefix_normalization() {
+        assert_eq!(normalize_cidr_prefix("10.0.0.1/8").as_deref(), Some("10.0.0.0/8"));
+        assert_eq!(normalize_cidr_prefix("1.2.3.4").as_deref(), Some("1.2.3.4/32"));
+        assert_eq!(normalize_cidr_prefix(" ::ffff:1.2.3.4 ").as_deref(), Some("1.2.3.4/32"));
+        assert_eq!(
+            normalize_cidr_prefix("2001:0db8::1/48").as_deref(),
+            Some("2001:db8::/48")
+        );
+        assert_eq!(normalize_cidr_prefix("0.0.0.0/0").as_deref(), Some("0.0.0.0/0"));
+        assert_eq!(normalize_cidr_prefix("10.0.0.0/33"), None);
+        assert_eq!(normalize_cidr_prefix("2001:db8::/129"), None);
+        assert_eq!(normalize_cidr_prefix("10.0.0.0/"), None);
+        assert_eq!(normalize_cidr_prefix("%"), None);
+        assert_eq!(normalize_cidr_prefix("10.0.0"), None);
+        assert_eq!(normalize_cidr_prefix(""), None);
     }
 }

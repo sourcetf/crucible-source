@@ -45,7 +45,9 @@ rotation_enabled = true
 
 [dns.doh]
 enabled = true
-hostnames = []
+# 白名单：空列表 = **拒绝一切**（fail-closed，工号 1009 修）；要启用 DoH 必须显式列出
+# 允许的 Host。测试实例用 18444 的 server_name。
+hostnames = ["crucible.local"]
 path = "/dns-query"
 
 [dns.dot]

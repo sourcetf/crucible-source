@@ -312,6 +312,7 @@ int appengine_execute(
     const char *server_name,
     int server_port,
     const char *extra,
+    const char *headers,
     AppEngineResult *out)
 {
     char *src = NULL;
@@ -327,6 +328,7 @@ int appengine_execute(
     (void)server_name;
     (void)server_port;
     (void)extra;
+    (void)headers;
 
     if (!g_ready || !out)
         return -1;

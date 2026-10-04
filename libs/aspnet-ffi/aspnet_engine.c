@@ -273,6 +273,7 @@ int appengine_execute(
     const char *server_name,
     int server_port,
     const char *extra,
+    const char *headers,
     AppEngineResult *out)
 {
     char filepath[1024];
@@ -287,6 +288,7 @@ int appengine_execute(
     (void)server_name;
     (void)server_port;
     (void)extra;
+    (void)headers;
     (void)method;
 
     if (!g_ready || !out)

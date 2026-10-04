@@ -53,6 +53,7 @@ type ExecFn = unsafe extern "C" fn(
     *const c_char,
     c_int,
     *const c_char,
+    *const c_char,
     *mut AppEngineResult,
 ) -> c_int;
 type FreeFn = unsafe extern "C" fn(*mut AppEngineResult);
@@ -145,6 +146,10 @@ pub async fn execute(
         .and_then(|v| v.to_str().ok())
         .unwrap_or("")
         .to_string();
+    // ABI 请求头块（Cookie/Authorization/User-Agent/X-Request-Id…）：
+    // 此前引擎侧**完全看不到任何请求头**，Flask session / Django 登录等真实应用
+    // 因此不可用。h1 路径从已解析的 parts.headers 直接构造。
+    let headers_block = request_headers_block(&parts.headers);
     // §7.10 热路径：GET/HEAD 无 body 时不 collect，保持 rust≈static 的延迟。
     // 任务 6（OOM 防护）：引擎请求体上限 32MiB，超限 413。
     let body_bytes = if request_has_body(&parts.method, &parts.headers) {
@@ -162,7 +167,16 @@ pub async fn execute(
         Bytes::new()
     };
     let outcome = exec_dispatch(
-        &method, &path, &query, &content_type, &body_bytes, lc, app, peer, &env_vars,
+        &method,
+        &path,
+        &query,
+        &content_type,
+        &body_bytes,
+        lc,
+        app,
+        peer,
+        &env_vars,
+        &headers_block,
     )
     .await?;
     Ok(response_from_outcome(outcome))
@@ -186,6 +200,8 @@ pub async fn execute_simple(
         .and_then(|v| v.to_str().ok())
         .unwrap_or("")
         .to_string();
+    // h2/h3 字节路径同样携带完整请求头（与 h1 同一数据流）。
+    let headers_block = request_headers_block(req.headers());
     exec_dispatch(
         &method,
         &path,
@@ -196,8 +212,59 @@ pub async fn execute_simple(
         app,
         peer,
         &deps.vars,
+        &headers_block,
     )
     .await
+}
+
+/// 构造引擎 ABI 的请求头块：每行 `Name: Value`、行间 `\r\n`（返回内容不含 NUL）。
+///
+/// * hop-by-hop 头（Connection/Keep-Alive/TE/Transfer-Encoding/Upgrade/Trailer/
+///   `Proxy-*`）按 RFC 7230 逐跳语义不透传给应用；`Content-Length`/
+///   `Content-Type` 有独立形参（CGI 环境里是 CONTENT_LENGTH/CONTENT_TYPE），
+///   不重复进块，避免引擎把同名头当 HTTP_* 再写一遍。
+/// * 名字非 token、值含 CR/LF/NUL 或其它控制字符的头一律跳过（头注入防线）。
+/// * 块总量 64KiB、单值 16KiB 封顶，与 C 侧解析器的上界一致。
+fn request_headers_block(headers: &http::HeaderMap) -> Vec<u8> {
+    const VALUE_CAP: usize = 16 * 1024;
+    const BLOCK_CAP: usize = 64 * 1024;
+    let mut out = Vec::new();
+    for (name, value) in headers.iter() {
+        let n = name.as_str();
+        let lower = n.to_ascii_lowercase();
+        let hop_by_hop = matches!(
+            lower.as_str(),
+            "connection"
+                | "keep-alive"
+                | "te"
+                | "transfer-encoding"
+                | "upgrade"
+                | "trailer"
+                | "content-length"
+                | "content-type"
+        ) || lower.starts_with("proxy-");
+        if hop_by_hop {
+            continue;
+        }
+        if !n.bytes().all(|b| b.is_ascii_graphic() && b != b':') {
+            continue;
+        }
+        let v = value.as_bytes();
+        if v.len() > VALUE_CAP
+            || v.iter()
+                .any(|&b| b == b'\r' || b == b'\n' || b == b'\0' || (b < 0x20 && b != b'\t') || b == 0x7f)
+        {
+            continue;
+        }
+        if out.len() + n.len() + v.len() + 4 > BLOCK_CAP {
+            break;
+        }
+        out.extend_from_slice(n.as_bytes());
+        out.extend_from_slice(b": ");
+        out.extend_from_slice(v);
+        out.extend_from_slice(b"\r\n");
+    }
+    out
 }
 
 async fn exec_dispatch(
@@ -210,6 +277,7 @@ async fn exec_dispatch(
     app: &AppRouteConfig,
     peer: SocketAddr,
     env_vars: &[(String, String)],
+    headers: &[u8],
 ) -> Result<ExecOutcome> {
     let engine = app.engine.to_ascii_lowercase();
     let lib_path = resolve_lib(app, &engine)?;
@@ -235,6 +303,7 @@ async fn exec_dispatch(
     let engine_for_pool = engine.clone();
     // P1-1：闭包必须持有 owned 环境变量（'static），在闭包内转 &[(&str,&str)]。
     let env_vars_owned: Vec<(String, String)> = env_vars.to_vec();
+    let headers_owned: Vec<u8> = headers.to_vec();
     let job = move || {
         let vars: Vec<(&str, &str)> = env_vars_owned
             .iter()
@@ -244,7 +313,7 @@ async fn exec_dispatch(
             let lib = load_engine(&engine, &lib_path)?;
             call_exec(
                 &lib, &engine, &script, &docroot, &m, &p, &q, &ct, &b, peer, port,
-                &server_name, &env_vars_owned,
+                &server_name, &env_vars_owned, &headers_owned,
             )
         })
     };
@@ -547,6 +616,7 @@ fn call_exec(
     port: u16,
     server_name: &str,
     env_vars: &[(String, String)],
+    headers: &[u8],
 ) -> Result<ExecOutcome> {
     let c_script = CString::new(script.to_string_lossy().as_bytes())?;
     let c_doc = CString::new(docroot.to_string_lossy().as_bytes())?;
@@ -570,6 +640,13 @@ fn call_exec(
             .to_string()
     };
     let c_extra = CString::new(extra_s)?;
+    // 请求头块：空块传 NULL（ABI 允许），否则 NUL 结尾的 "Name: Value\r\n" 块。
+    // request_headers_block 已滤掉 NUL/CR/LF，CString::new 不会失败。
+    let c_headers = if headers.is_empty() {
+        None
+    } else {
+        Some(CString::new(headers)?)
+    };
     let mut out = AppEngineResult {
         status: 500,
         headers: std::ptr::null_mut(),
@@ -597,6 +674,7 @@ fn call_exec(
             c_server.as_ptr(),
             port as c_int,
             c_extra.as_ptr(),
+            c_headers.as_ref().map_or(std::ptr::null(), |c| c.as_ptr()),
             &mut out,
         );
         if rc != 0 {
@@ -896,5 +974,56 @@ mod status_and_rel_tests {
         assert_eq!(rel_script_path(&app, "/php/index.php"), "/index.php");
         let app = app_with_paths(&["/lua/"]);
         assert_eq!(rel_script_path(&app, "/lua/main.lua"), "/main.lua");
+    }
+
+    /// ABI 头块：hop-by-hop 与 Content-Type/Length 不透传；其余头按
+    /// `Name: Value\r\n` 逐条落地（同名多头保留）。
+    #[test]
+    fn request_headers_block_filters_hop_by_hop_and_body_meta() {
+        let mut h = http::HeaderMap::new();
+        h.insert(http::header::HOST, "apps.example:9095".parse().unwrap());
+        h.insert("x-request-id", "task-1".parse().unwrap());
+        h.insert(http::header::COOKIE, "sid=abc".parse().unwrap());
+        h.insert(http::header::USER_AGENT, "crucible-test/1".parse().unwrap());
+        h.insert(http::header::CONNECTION, "keep-alive".parse().unwrap());
+        h.insert(http::header::TRANSFER_ENCODING, "chunked".parse().unwrap());
+        h.insert("proxy-connection", "1".parse().unwrap());
+        h.insert(http::header::CONTENT_TYPE, "text/plain".parse().unwrap());
+        h.insert(http::header::CONTENT_LENGTH, "3".parse().unwrap());
+        h.append(http::header::SET_COOKIE, "a=1".parse().unwrap());
+        h.append(http::header::SET_COOKIE, "b=2".parse().unwrap());
+        let s = String::from_utf8(request_headers_block(&h)).unwrap();
+        // http::HeaderMap 把名字规范化为小写，块里就是小写形态。
+        assert!(s.contains("host: apps.example:9095\r\n"), "{s}");
+        assert!(s.contains("x-request-id: task-1\r\n"), "{s}");
+        assert!(s.contains("cookie: sid=abc\r\n"), "{s}");
+        assert!(s.contains("user-agent: crucible-test/1\r\n"), "{s}");
+        // 同名多头保留两条（Set-Cookie 语义）
+        assert_eq!(s.matches("set-cookie: ").count(), 2, "{s}");
+        let low = s.to_ascii_lowercase();
+        for bad in [
+            "connection:",
+            "transfer-encoding",
+            "proxy-",
+            "content-type",
+            "content-length",
+        ] {
+            assert!(!low.contains(bad), "must skip {bad}: {s}");
+        }
+    }
+
+    /// obs-text（0x80-0xFF）头值合法且必须保留；块内不含 NUL（call_exec 依赖
+    /// 这一点才能安全地用 CString 包装）。
+    #[test]
+    fn request_headers_block_allows_obs_text_and_has_no_nul() {
+        let mut h = http::HeaderMap::new();
+        h.insert("x-latin1", http::HeaderValue::from_bytes(b"caf\xe9").unwrap());
+        h.insert("x-request-id", "task-1".parse().unwrap());
+        let raw = request_headers_block(&h);
+        assert!(
+            raw.windows(4).any(|w| w == b"caf\xe9"),
+            "obs-text value must survive: {raw:?}"
+        );
+        assert!(!raw.contains(&0u8));
     }
 }

@@ -54,6 +54,7 @@ func appengine_execute(
 	body *C.char, bodyLen C.size_t,
 	remote, serverName *C.char, serverPort C.int,
 	extra *C.char,
+	headers *C.char,
 	out *C.AppEngineResult,
 ) C.int {
 	if out == nil {
@@ -98,6 +99,7 @@ func appengine_execute(
 	_ = remote
 	_ = serverName
 	_ = serverPort
+	_ = headers
 	return 0
 }
 

@@ -100,7 +100,10 @@ static const char *resolve_script(const char *script, const char *docroot, char 
 /* perl.h 的嵌入 API 宏（aTHX 等）要求解释器变量就叫 my_perl。 */
 static PerlInterpreter *my_perl;
 
-/* 请求值经私有包哈希传入，不用 %ENV：不污染进程环境，也不与 Rust 侧 env_lock 竞争。 */
+/* 请求值经私有包哈希传入，不把普通请求参数写进 %ENV：不污染进程环境，也不与
+ * Rust 侧 env_lock 竞争。例外是 HTTP_*：驱动每请求先删旧 HTTP_* 再把本请求的
+ * 写进 $env 与 %ENV（PSGI 语义要求 $env->{HTTP_*}；CGI 风格脚本读 $ENV{}，
+ * 两者都可用）。 */
 #define PSGI_REQ_HV "Crucible::req"
 #define PSGI_RES_HV "Crucible::res"
 
@@ -154,6 +157,20 @@ static const char *psgi_driver =
     "        'psgi.input' => do { open my $in, '<', \\$Crucible::req{body}; $in },\n"
     "        'psgi.errors' => \\*STDERR,\n"
     "    };\n"
+    "    my $q = $Crucible::req{headers};\n"
+    "    if (defined $q && length $q) {\n"
+    "        for my $h (split /\\r\\n/, $q) {\n"
+    "            next unless length $h;\n"
+    "            my ($k, $v) = split /:\\s*/, $h, 2;\n"
+    "            next unless defined $v;\n"
+    "            next if $k =~ /^(?i:content-type|content-length)$/;\n"
+    "            (my $ek = uc $k) =~ tr/-/_/;\n"
+    "            next unless $ek =~ /^[A-Z0-9_.]+$/;\n"
+    "            $env->{\"HTTP_$ek\"} = $v;\n"
+    "        }\n"
+    "    }\n"
+    "    delete $ENV{$_} for grep { /^HTTP_/ } keys %ENV;\n"
+    "    $ENV{$_} = $env->{$_} for grep { /^HTTP_/ } keys %$env;\n"
     "    my $r = $Crucible::app->($env);\n"
     "    die \"psgi: 应用未返回 [status, headers, body] 数组引用\\n\"\n"
     "        unless ref($r) eq 'ARRAY';\n"
@@ -258,7 +275,7 @@ static void psgi_emit_headers(crucible_buf *out, SV *hsv)
 static int psgi_request(const char *script, const char *method, const char *path,
                         const char *query, const char *content_type, const char *body,
                         size_t body_len, const char *remote, const char *server_name,
-                        int server_port, AppEngineResult *out)
+                        int server_port, const char *headers, AppEngineResult *out)
 {
     crucible_buf hb;
     char errbuf[1024];
@@ -294,6 +311,8 @@ static int psgi_request(const char *script, const char *method, const char *path
                 server_name != NULL && server_name[0] != '\0' ? server_name : "crucible");
     psgi_hv_put(req, "server_port", portbuf);
     psgi_hv_put(req, "body", body != NULL ? body : "");
+    /* ABI 请求头块：驱动片段展开为 $env->{HTTP_*} 并同步 %ENV。 */
+    psgi_hv_put(req, "headers", headers != NULL ? headers : "");
 
     driver_ret = eval_pv(psgi_driver, 0);
     if (driver_ret == NULL || SvTRUE(ERRSV)) {
@@ -380,6 +399,7 @@ int appengine_execute(
     const char *server_name,
     int server_port,
     const char *extra,
+    const char *headers,
     AppEngineResult *out)
 {
     char pathbuf[1024];
@@ -399,7 +419,7 @@ int appengine_execute(
                             script != NULL ? script : "(null)",
                             docroot != NULL ? docroot : "(null)");
     return psgi_request(use, method, path, query, content_type, body, body_len, remote,
-                        server_name, server_port, out);
+                        server_name, server_port, headers, out);
 #else
     (void)script;
     (void)docroot;
@@ -412,6 +432,7 @@ int appengine_execute(
     (void)remote;
     (void)server_name;
     (void)server_port;
+    (void)headers;
     /*
      * 显式失败：不 spawn、不假装成功。
      * 本机 perl 与 CORE 头文件确实存在

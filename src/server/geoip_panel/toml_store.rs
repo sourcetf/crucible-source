@@ -8,10 +8,14 @@ use std::path::{Path, PathBuf};
 const DEFAULT_PANEL_PATH: &str = "data/geoip/panel.toml";
 
 /// Resolve panel TOML path (env override → default).
+///
+/// `read_static_env`（启动期缓存）而不是裸 `std::env::var`：本函数在**每个 GeoIP 请求**
+/// 上被调用，而应用引擎会在请求期间 `setenv`，libc 的 environ realloc 会让并发
+/// `getenv` 踩到已释放内存（见 `apps/env_lock` 的说明与 dns state_root 的实测崩溃）。
 pub fn panel_path() -> PathBuf {
-    std::env::var("CRUCIBLE_GEOIP_PANEL")
+    crate::server::apps::env_lock::read_static_env("CRUCIBLE_GEOIP_PANEL")
         .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from(DEFAULT_PANEL_PATH))
+        .unwrap_or_else(|| PathBuf::from(DEFAULT_PANEL_PATH))
 }
 
 /// Load panel settings from disk; missing file yields defaults.

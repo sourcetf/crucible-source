@@ -3,39 +3,49 @@
 use once_cell::sync::Lazy;
 use parking_lot::Mutex;
 use rusqlite::Connection;
-use std::net::IpAddr;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 /// §2.6：anycast 表（bgptools / RIPE anycast 提取写入）优先；无表/无命中回落内置种子。
+///
+/// 表里两类行都要判：v4 行按 u32 比较，v6 行按 u128 比较。旧实现只解析 v4，
+/// 表里的 IPv6 anycast 段**永远不会命中**（v6 客户端直接回落只含 4 条 v4 的内置种子）。
 pub fn is_anycast_conn(conn: &Connection, ip: IpAddr) -> bool {
-    let IpAddr::V4(v4) = ip else {
-        return is_anycast(ip);
-    };
-    let n = u32::from(v4);
-    let q = || -> rusqlite::Result<bool> {
-        let mut stmt = conn.prepare("SELECT start, end FROM anycast")?;
-        let rows = stmt.query_map([], |row| {
-            let s: String = row.get(0)?;
-            let e: String = row.get(1)?;
-            Ok((s, e))
-        })?;
-        for row in rows {
-            let (s, e) = row?;
-            let Ok(s) = s.parse::<std::net::Ipv4Addr>() else {
-                continue;
-            };
-            let Ok(e) = e.parse::<std::net::Ipv4Addr>() else {
-                continue;
-            };
-            if n >= u32::from(s) && n <= u32::from(e) {
-                return Ok(true);
-            }
-        }
-        Ok(false)
-    };
-    match q() {
+    // 与 rate_limit/access/basic_auth 同口径：v4-mapped 客户端先折回 v4，否则会被
+    // 当成纯 v6 去扫 v6 行，内置的 8.8.8.0/24 等永远不命中。
+    let ip = crate::server::geoip_panel::iputil::unmap_v4_mapped(ip);
+    match anycast_table_hit(conn, ip) {
         Ok(hit) => hit || is_anycast(ip),
         Err(_) => is_anycast(ip),
     }
+}
+
+/// 扫 anycast 表判断 ip 是否落在任一区间（v4 行与 v6 行分别按地址族解析）。
+///
+/// 全表扫描 + Rust 逐行解析：TEXT 起止地址在 SQLite 里没有可比数值列（表由 Python
+/// 侧建，只有 start/end TEXT + idx_anycast_range），推不了数值过滤 —— 要在 SQL 层
+/// 收窄需要 Python schema 增加 start_i/end_i（跨组，见修复总结）。
+fn anycast_table_hit(conn: &Connection, ip: IpAddr) -> rusqlite::Result<bool> {
+    let mut stmt = conn.prepare("SELECT start, end FROM anycast")?;
+    let rows = stmt.query_map([], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+    })?;
+    for row in rows {
+        let (s, e) = row?;
+        let hit = match ip {
+            IpAddr::V4(v4) => match (s.parse::<Ipv4Addr>(), e.parse::<Ipv4Addr>()) {
+                (Ok(a), Ok(b)) => u32::from(v4) >= u32::from(a) && u32::from(v4) <= u32::from(b),
+                _ => false,
+            },
+            IpAddr::V6(v6) => match (s.parse::<Ipv6Addr>(), e.parse::<Ipv6Addr>()) {
+                (Ok(a), Ok(b)) => u128::from(v6) >= u128::from(a) && u128::from(v6) <= u128::from(b),
+                _ => false,
+            },
+        };
+        if hit {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 /// Well-known anycast / CDN prefixes (RIR 提取集的内置种子).
@@ -145,5 +155,23 @@ mod tests {
         assert!(!suppress_locality(false, false));
         assert!(suppress_locality(true, false));
         assert!(suppress_locality(false, true));
+    }
+
+    /// 表里的 v6 行必须参与判定（旧实现 v6 直接回落内置 v4 种子 = 永不命中）；
+    /// v4-mapped 客户端折回 v4，既能命中表里的 v4 行、也能回落内置种子。
+    #[test]
+    fn anycast_table_v6_rows_match() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE anycast(start TEXT, end TEXT);
+             INSERT INTO anycast VALUES('2606:4700::','2606:4700:ffff:ffff:ffff:ffff:ffff:ffff');
+             INSERT INTO anycast VALUES('198.51.100.0','198.51.100.255');",
+        )
+        .unwrap();
+        assert!(is_anycast_conn(&conn, "2606:4700::1111".parse().unwrap()));
+        assert!(!is_anycast_conn(&conn, "2606:4701::1".parse().unwrap()));
+        assert!(is_anycast_conn(&conn, "198.51.100.7".parse().unwrap()));
+        assert!(is_anycast_conn(&conn, "::ffff:198.51.100.7".parse().unwrap()));
+        assert!(is_anycast_conn(&conn, "::ffff:8.8.8.8".parse().unwrap()));
     }
 }
