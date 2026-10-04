@@ -248,6 +248,17 @@ done
 # 就退回上面 build_stub_engine 的「诚实失败」构建（不 spawn、不假 hello）。
 # 若 build_script_ffi.sh 之后又补编失败，它会保留这里的产物（log: keeping previous artifact）。
 build_rack_engine() {
+  # 默认**关闭** MRI 嵌入：实测会周期性 SIGSEGV 整个进程（GET /rack/ 返回 200 后
+  # 数秒~数十秒内崩溃，core 456MB，gdb 栈顶在 libruby34.so 的 sigsegv 处理器，
+  # 所有监听口一起下线）。已在 build_script_ffi.sh 的 build_extra_engine rack 处
+  # 写明高置信度原因（MRI 定时器/信号 + 从任意原生线程调用 Ruby API 未注册线程）
+  # 与启用条件（所有 Ruby 调用经专用 Ruby 线程 / rb_thread_call_with_gvl + 5 分钟
+  # 不崩 + 1000 次请求压测）。设为 1 才会尝试嵌入。
+  if [[ "${CRUCIBLE_ENABLE_RACK_EMBED:-0}" != "1" ]]; then
+    echo "    rack: MRI 嵌入默认关闭（会崩进程；启用见 build_script_ffi.sh 注释）→ 构建诚实失败版"
+    build_stub_engine rack
+    return 0
+  fi
   local src="${ROOT}/libs/app-engines/rack/rack_engine.c"
   local rb="" cand="" hdr="" arch="" libs="" ver=""
   if [[ ! -f "${src}" ]]; then

@@ -58,6 +58,26 @@ type ExecFn = unsafe extern "C" fn(
 type FreeFn = unsafe extern "C" fn(*mut AppEngineResult);
 type ShutdownFn = unsafe extern "C" fn();
 
+/// `RTLD_NODELETE` 的平台值。
+///
+/// 为什么自己定义：OpenBSD 的 `<dlfcn.h>` 有它（0x400），但 `libc` crate 的 OpenBSD
+/// 绑定没有导出。各平台取值不同，按平台写死；未知平台取 0（退化为普通 dlclose，
+/// 至少在那些平台上不会因常数写错而误置其它 flag）。
+#[cfg(target_os = "openbsd")]
+const RTLD_NODELETE_EXT: libc::c_int = 0x400;
+#[cfg(any(target_os = "linux", target_os = "android", target_os = "freebsd"))]
+const RTLD_NODELETE_EXT: libc::c_int = 0x1000;
+#[cfg(target_os = "macos")]
+const RTLD_NODELETE_EXT: libc::c_int = 0x80;
+#[cfg(not(any(
+    target_os = "openbsd",
+    target_os = "linux",
+    target_os = "android",
+    target_os = "freebsd",
+    target_os = "macos"
+)))]
+const RTLD_NODELETE_EXT: libc::c_int = 0;
+
 struct EngineLib {
     engine: String,
     path: String,
@@ -460,7 +480,17 @@ fn load_engine(engine: &str, lib_path: &PathBuf) -> Result<Arc<EngineLib>> {
         let raw = unsafe {
             libloading::os::unix::Library::open(
                 Some(lib_path),
-                libc::RTLD_NOW | libc::RTLD_GLOBAL,
+                // RTLD_NODELETE：热重载卸载引擎时**不解除映射**。
+                //
+                // 为什么必须加：`reconcile` 在没有引用时会 `shutdown()` + dlclose。
+                // 但嵌入式解释器（本项目的 libapp_rack.so 嵌 MRI、libapp_python.so 嵌
+                // CPython、libapp_perl.so 嵌 Perl）会在 dlopen 时**创建后台线程/注册
+                // atexit 与 GC 定时器**，它们的代码/数据指针仍指向该 .so。dlclose 之后
+                // 这些线程一跑就 SIGSEGV —— 实测：`GET /rack/` 之后几十秒内**整个服务器
+                // 进程崩溃**（core 454MB），全部监听口一起下线。
+                // NODELETE 让映射常驻（每个引擎几百 KB，代价可忽略），shutdown 钩子照常
+                // 执行、符号解析与状态清理语义不变，只是不再有「代码被抽走」的窗口。
+                libc::RTLD_NOW | libc::RTLD_GLOBAL | RTLD_NODELETE_EXT,
             )
         }
         .map_err(|e| anyhow::anyhow!("dlopen {}: {e}", lib_path.display()))?;

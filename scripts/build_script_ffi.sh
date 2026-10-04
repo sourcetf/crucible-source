@@ -179,6 +179,22 @@ build_extra_engine() {
 }
 
 build_extra_engine psgi "${ROOT}/libs/app-engines/psgi/psgi_engine.c" "${PL_CFLAGS}${PL_CFLAGS:+-DCRUCIBLE_HAVE_PERL}" "${PL_LIBS}" "Perl"
-build_extra_engine rack "${ROOT}/libs/app-engines/rack/rack_engine.c" "${RB_CFLAGS}${RB_CFLAGS:+-DCRUCIBLE_HAVE_RUBY}" "${RB_LIBS}" "Ruby"
+
+# rack（嵌入式 MRI）：**默认不启用**，构建诚实失败版。
+#
+# 为什么：MRI 嵌入在本项目里会**周期性 SIGSEGV 整个进程**。实测（OpenBSD 7.9，
+# ruby 3.4.9）：`GET /rack/` 返回 200 之后数秒到数十秒内进程崩溃（core 456MB，
+# gdb: 信号 11，栈顶在 libruby34.so 的 sigsegv 处理器），**所有监听口一起下线**。
+# 已排除的假设：dlclose（RTLD_NODELETE 常驻映射后仍崩）、shutdown 销毁 VM
+# （appengine_shutdown 是 no-op）。剩下的高置信度原因：MRI 的定时器线程/信号处理
+# 与「从任意原生线程（tokio worker）调用 Ruby API」的组合 —— MRI 要求调用线程先
+# 注册到 VM（rb_thread_call_with_gvl / ruby_thread_init 一族），而 app_ffi 的线程池
+# 不保证「初始化 VM 的线程 == 执行请求的线程」。
+#
+# 启用条件（谁修谁验）：把引擎改成「所有 Ruby 调用都经过一个专用的 Ruby 线程」
+# （或每次调用用 rb_thread_call_with_gvl 包裹），并跑通
+# `curl /rack/` 之后至少 5 分钟不崩 + 连续 1000 次请求。届时把下面这行的参数换成
+# "${RB_CFLAGS}${RB_CFLAGS:+-DCRUCIBLE_HAVE_RUBY}" "${RB_LIBS}" "Ruby" 即可。
+build_extra_engine rack "${ROOT}/libs/app-engines/rack/rack_engine.c" "" "" "Ruby-disabled"
 
 echo "built ${OUT}/libscriptffi.so libapp_{python,ruby,perl,psgi,rack}.so"
