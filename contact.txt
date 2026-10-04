@@ -1599,3 +1599,49 @@ bench-scripts / security-deep（+ spec-matrix 重试中）。共 100+ 条发现�
   **172.23.67.165**），netsh portproxy 需要管理员权限才能改；本轮用
   `C:\Windows\System32\OpenSSH\ssh.exe -i C:/Users/admin/.ssh/vm_key root@172.23.67.165`
   作为 WSL→VM 的通道（helper：`/tmp/vm.sh`、`/tmp/vmsync.sh`）。
+
+---
+
+# 【工号 1009 · 2026-10-04 晚】最终状态（部署 + 测试 + 基准数据）
+
+## Git / 部署
+- **GitHub main 已到 `be031a8`**（本轮 4 个提交：7565d23 修复集 / 7cd364d 性能基线 /
+  edc8827 DNS / be031a8 测试修正）。工作树干净、无未推提交。
+- **远程服务器 83.229.125.81:/crucible 已部署到 `be031a8`**：
+  `git fetch && git reset --hard origin/main` → cargo build（8m45s）→ `cp target/release/webserver bin/webserver`
+  → `sh /etc/rc.local`。实测：9081/9095/8443/9445/9446 全 200；应用引擎
+  php/rust/c/go/lua/cgi/wsgi/python/perl/psgi 全 200；DNS 递归 `example.com` 正常、权威区 NOERROR。
+- **远程 Go 引擎**：远程**没装 Go 工具链**、也无 `target/app-engines/go-shm-server`（502）。
+  已从本地 VM 推入该静态二进制（CGO_ENABLED=0，OpenBSD amd64 通用）：`/go/` → 200
+  `hello from go-shm engine`。**下次在远程重建引擎时注意**：没有 go 就仍会缺这个文件。
+- 本地 VM `/crucible` 同为 `be031a8`，cargo test **363 passed / 0 failed**。
+
+## 验收（本地 VM，`scripts/acceptance_test_ports.sh`）
+通过项：TLS1.2/1.3 探针、**SSLv2 探针后服务器存活 + TLS1.3 仍可用**（此前因缺
+`/tmp/_tlsprobe.py` 恒假失败）、H3 QUIC body、明文/应用/TLS 全矩阵、file_open/would_execute/
+script_rel 子集、geoip lookup、单元测试。
+- 矩阵（wrk，测试口）：plain-h1 10.9k / plain-h2 13.2k / tls12 12.1k(1.2)/12.6k(2)
+  / tls13 12.8k(1.2)/12.3k(2) rps —— **比修 index.html 之前的 651 rps 提升 17–20×**。
+- 注意：验收脚本最后的 `geoip_update.sh` 会做大规模数据抓取（本机跑了 30+ 分钟未结束），
+  我在确认 geoip lookup 已经工作后**手工终止**了它——它不是失败，是数据同步任务。
+
+## 性能门禁（未达标，数据如下）
+同机（Hyper-V VM，16 vCPU，主机同时有别的负载时会 3× 波动；下表取 3 轮最好）：
+| 场景 | crucible | h2o 2.2.6 | 吞吐比 h2o/ours |
+|---|---|---|---|
+| plain h1, wrk -t2 -c64 | 26.4k rps | 112.9k rps（默认 16 线程） | 4.3× |
+| TLS1.3 h1 | 25.9k rps | 114.4k rps | 4.4× |
+| plain h1，**线程对齐**：ours 8 workers vs h2o `num-threads: 2` | 23.9k rps | 130.7k rps | 5.5× |
+
+**结论：差距不在线程数**（把 ours 从 2 提到 16 workers 只涨 1.4×；h2o 用 2 线程就到 130k）。
+每请求 CPU：ours ≈190µs（其中访问日志 ~90µs）vs h2o ≈15µs ⇒ 是**请求路径本身的效率差**。
+建议的下手顺序（已在本轮验证过一半）：① access_log 改缓冲写（省 ~90µs/req）；
+② 用 `ktrace`/`pmc` 或临时插桩定位剩余 ~100µs（怀疑静态层每请求的 mime_guess + validators +
+多次 syscall，以及 hyper h1 未开 writev）；③ 静态响应的 (mime, etag, cached body) 整体缓存。
+`CRUCIBLE_WORKER_THREADS` 已可覆盖默认的 2。
+
+## 仍未完成（诚实清单）
+QMux 协议 / CONNECT-UDP（501）/ H3 ECN / TSX 内置编译 / JSP-ASP 需要外部工具链（JDK、.NET）/
+dns-encrypted（DoT 超时+ACL 快照+证书重载、ACME 首签）与部分 dns-geoip 项（覆盖权重等）
+未在本轮落地 —— 详见 `.agents/1009/reports/*.md` 与 `.agents/1009/fixes/*.md`（15 份报告 +
+5 份修复总结，含每条的文件:行号证据）。
