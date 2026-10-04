@@ -187,7 +187,13 @@ fn parse_env_file(p: &Path) -> Vec<(String, String)> {
             continue;
         };
         let k = k.trim();
-        if k.is_empty() || !k.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'_') {
+        // 键必须是合法环境变量名 `[A-Za-z_][A-Za-z0-9_]*`。
+        // 数字开头的名字（`1BAD=x`）在 shell 里根本不是赋值语句，setenv 收下只会让下游
+        // 脚本行为诡异；dotenv 生态同样拒绝。首字符单独判，其余字符允许数字。
+        let mut bytes = k.bytes();
+        let head_ok = matches!(bytes.next(), Some(c) if c.is_ascii_alphabetic() || c == b'_');
+        let tail_ok = bytes.all(|c| c.is_ascii_alphanumeric() || c == b'_');
+        if !head_ok || !tail_ok {
             continue;
         }
         let mut v = v.trim();

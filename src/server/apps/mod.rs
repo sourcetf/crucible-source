@@ -734,6 +734,10 @@ mod script_rel_tests {
         let mut lc = listener_with_rust_app();
         lc.apps[0].paths = vec!["/php/".into()];
         lc.apps[0].engine = "php".into();
+        // 分发判据还看扩展名（fixture 是 rust app：extensions=["rs"]）。换 engine/paths 时
+        // 必须同步换 extensions，否则 would_handle 因扩展名不匹配而为假 —— 那测的就不是
+        // 尾斜杠归一化了。
+        lc.apps[0].extensions = vec!["php".into(), "".into()];
         assert!(super::would_handle(&lc, "/php/index.php"), "分发判据");
         assert!(super::under_app_prefix(&lc, "/php/init.sh"), "私有文件守门");
         assert!(super::under_app_prefix(&lc, "/php/app.sql"));

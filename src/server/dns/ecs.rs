@@ -521,13 +521,13 @@ mod tests {
 
     #[test]
     fn malformed_ecs_detects_duplicate_and_short_address() {
-        let mut dup = query_with_opt(minimal_query(), &ecs_option_bytes(1, 24, 0, &[1, 2, 3]));
-        // 再塞第二个 ECS option 到同一 OPT rdata 尾部（手工：把 rdlen 后追加）。
-        let extra = ecs_option_bytes(1, 24, 0, &[4, 5, 6]);
-        let n = dup.len();
-        dup[n - 1] += extra.len() as u8; // rdlen 低位（测试里 rdata 很小，不会进位）
-        dup.extend_from_slice(&extra);
-        assert!(malformed_ecs(&dup));
+        // 两个 ECS option 直接放进同一 OPT rdata（rdlen 按两段之和算）。
+        // 旧写法是"追加到包尾再把最后一个字节当 rdlen 加"——而包尾是 rdata 的**最后一个
+        // 地址字节**，rdlen 根本没变，多出来的字节在解析器看来是野数据 ⇒ 断言恒假。
+        let mut rdata = ecs_option_bytes(1, 24, 0, &[1, 2, 3]);
+        rdata.extend_from_slice(&ecs_option_bytes(1, 24, 0, &[4, 5, 6]));
+        let dup = query_with_opt(minimal_query(), &rdata);
+        assert!(malformed_ecs(&dup), "同一 OPT 里两个 ECS option 必须判畸形");
         // ADDRESS 少于 SOURCE 所需字节。
         let short = query_with_opt(minimal_query(), &ecs_option_bytes(1, 24, 0, &[1, 2]));
         assert!(malformed_ecs(&short));
