@@ -91,16 +91,38 @@ async fn handle_inner(
                 Ok(json!({"ok": true, "status": "reconciled"}))
             }
             p if p.ends_with("/api/dns/modes") => {
-                dc.modes.root = v["root"].as_bool().unwrap_or(dc.modes.root);
-                dc.modes.recursive = v["recursive"].as_bool().unwrap_or(dc.modes.recursive);
+                dc.modes.root = keep_or(&v, "root", dc.modes.root);
+                dc.modes.recursive = keep_or(&v, "recursive", dc.modes.recursive);
                 dc.modes.authoritative = v["authoritative"]
                     .as_bool()
                     .or_else(|| v["auth"].as_bool())
                     .unwrap_or(dc.modes.authoritative);
-                dc.enabled = v["enabled"].as_bool().unwrap_or(true);
-                dc.ecs = v["ecs"].as_bool().unwrap_or(dc.ecs);
+                // 缺字段时**保持现值**（旧实现兜底 true）：只想改 root/recursive 的调用
+                // 若没带 enabled，会把一个配置为关闭的部署就地打开并 spawn named。
+                dc.enabled = keep_or(&v, "enabled", dc.enabled);
+                dc.ecs = keep_or(&v, "ecs", dc.ecs);
                 persist_and_reconcile(&dc).await?;
                 Ok(json!({"ok": true, "modes": dc.modes}))
+            }
+            // 递归上游转发器：不配置时行为与之前完全一致（named 不做 forward）。
+            // forward_policy 只接受 first|only（check_config_strings 校验后再落盘）。
+            p if p.ends_with("/api/dns/forwarders") => {
+                if v["forwarders"].is_array() {
+                    dc.forwarders = json_strs(&v["forwarders"]);
+                }
+                if let Some(pol) = v["forward_policy"].as_str() {
+                    dc.forward_policy = if pol.trim().is_empty() {
+                        None
+                    } else {
+                        Some(pol.trim().to_string())
+                    };
+                }
+                persist_and_reconcile(&dc).await?;
+                Ok(json!({
+                    "ok": true,
+                    "forwarders": dc.forwarders,
+                    "forward_policy": dc.forward_policy,
+                }))
             }
             p if p.ends_with("/api/dns/zones") => {
                 let action = v["action"].as_str().unwrap_or("add");
@@ -114,7 +136,12 @@ async fn handle_inner(
                         if !valid_name(&name) {
                             return Err(format!("bad zone name {name:?}"));
                         }
-                        let recs = parse_zone_text(text, &name)?;
+                        let parsed = parse_zone_text(text, &name)?;
+                        // SOA 一律丢弃：它由 gen_zone_file_monotonic_ext 统一生成并保证
+                        // serial 单调。若把导入的 SOA 当普通记录存下来，serial 就被冻结成
+                        // 文件里的旧值（面板改动写进文件、BIND 判定未变不重载），
+                        // 再来一条还会双 SOA 让 named 拒载整个区。
+                        let (recs, dropped_soa) = drop_soa_records(parsed);
                         // 落库前把 add_record 的守卫（rdata 单行/长度上限）在**解析阶段**
                         // 全量跑一遍：mode=replace 会先清空本分区，若写到一半才失败，
                         // 旧记录已经没了、新记录只落一半 —— 与「不落半截数据」的承诺相悖。
@@ -138,7 +165,9 @@ async fn handle_inner(
                         }
                         // 本 match 各分支统一返回 ()（函数尾部回 {"ok":true}），
                         // 条数记日志；前端刷新记录表即可看到「共 N 条」。
-                        log::info!("dns import: zone={name} mode={mode} imported={n}");
+                        log::info!(
+                            "dns import: zone={name} mode={mode} imported={n} dropped_soa={dropped_soa}"
+                        );
                     }
                     "del" => {
                         let name = v["name"].as_str().ok_or("name?")?;
@@ -489,6 +518,14 @@ fn json_strs(v: &Value) -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// 面板/API 的布尔字段合并：字段缺失或类型不对时**保持现值**。
+///
+/// `enabled` 的旧兜底是 `true` —— 只想改 root/recursive 的调用若没带 enabled，
+/// 会把一个配置为关闭的部署就地打开并 spawn named（其它字段都用现值，唯独它不是）。
+fn keep_or(v: &Value, key: &str, cur: bool) -> bool {
+    v.get(key).and_then(|x| x.as_bool()).unwrap_or(cur)
+}
+
 async fn persist_and_reconcile(dc: &DnsConfig) -> Result<(), String> {
     // **先校验再写 panel.toml**：panel.toml 是 `effective()` 的权威来源，非法值
     // （listen_addr 关键字/v6、geo 线路名带点、rpz 值不是 IP……）一旦先落进那份文件，
@@ -559,6 +596,8 @@ fn status_json(dc: &DnsConfig) -> Result<Value, String> {
         "rootzone": dc.rootzone,
         "axfr_out_acl": dc.axfr_out_acl,
         "recursion_acl": dc.recursion_acl,
+        "forwarders": dc.forwarders,
+        "forward_policy": dc.forward_policy,
         "ecs": dc.ecs,
         "acme": dc.acme,
         "rootzone_last_ok": meta_get("root_last_ok").ok().flatten(),
@@ -637,7 +676,13 @@ pub async fn handle_zone_export(
     let Some(z) = zones.into_iter().find(|z| z.name == zone) else {
         return bad(StatusCode::NOT_FOUND, format!("zone {zone} 不存在"));
     };
-    let recs = match list_records(&zone) {
+    let recs = match if z.kind == "master" {
+        list_records(&zone)
+    } else {
+        // 从区记录不在 DB（named AXFR 后写自己的 zone 文件）——旧实现用 list_records
+        // 导出只有 $ORIGIN/$TTL 两行的空壳，与服务内容无关。
+        list_secondary_records(&zone)
+    } {
         Ok(r) => r,
         Err(e) => return bad(StatusCode::INTERNAL_SERVER_ERROR, format!("records: {e}")),
     };
@@ -674,11 +719,35 @@ pub(super) struct ZoneRec {
     pub(super) rdata: String,
 }
 
+/// 丢弃导入结果里的 SOA 行，返回 (剩余记录, 丢弃条数)。
+/// SOA 由 dns::gen_zone_file_monotonic_ext 统一生成（serial 单调、timers 统一），
+/// 存进 DB 会让 serial 冻结在文件里的旧值（BIND 判定分区未变、不重载）。
+fn drop_soa_records(recs: Vec<ZoneRec>) -> (Vec<ZoneRec>, usize) {
+    let before = recs.len();
+    let kept: Vec<ZoneRec> = recs
+        .into_iter()
+        .filter(|r| !r.rtype.eq_ignore_ascii_case("SOA"))
+        .collect();
+    let dropped = before - kept.len();
+    (kept, dropped)
+}
+
 fn strip_zone_comment(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let mut inq = false;
+    let mut esc = false;
     for ch in s.chars() {
+        if esc {
+            // 被 `\` 转义的下一个字符：原样保留，且不参与引号/注释判定
+            esc = false;
+            out.push(ch);
+            continue;
+        }
         match ch {
+            '\\' => {
+                esc = true;
+                out.push(ch);
+            }
             '"' => {
                 inq = !inq;
                 out.push(ch);
@@ -723,7 +792,25 @@ fn zone_tokens(s: &str) -> Vec<(usize, usize)> {
     let mut out = Vec::new();
     let mut start: Option<usize> = None;
     let mut inq = false;
+    let mut esc = false;
     for (i, c) in s.char_indices() {
+        if esc {
+            // 转义字符本身与它对应的字符都属于当前 token（`\ ` 不是分隔符，
+            // `\"` 不切换引号状态）——旧实现把 `\"` 当两个引号，含转义引号的
+            // TXT/SOA 会被错误切分、注释误判，内容带错入库。
+            esc = false;
+            if start.is_none() {
+                start = Some(i);
+            }
+            continue;
+        }
+        if c == '\\' {
+            esc = true;
+            if start.is_none() {
+                start = Some(i);
+            }
+            continue;
+        }
         if start.is_none() {
             if c.is_whitespace() {
                 continue;
@@ -893,4 +980,57 @@ pub(super) fn parse_zone_text(text: &str, origin: &str) -> Result<Vec<ZoneRec>, 
         return Err("没有解析到任何记录".to_string());
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod dns_admin_api_tests {
+    use super::{drop_soa_records, keep_or, parse_zone_text, strip_zone_comment, zone_tokens, ZoneRec};
+    use serde_json::json;
+
+    /// `enabled` 缺字段时必须保持现值：旧实现兜底 true，会把关闭的部署就地打开。
+    #[test]
+    fn missing_bool_field_keeps_current_value() {
+        assert!(!keep_or(&json!({}), "enabled", false));
+        assert!(keep_or(&json!({"enabled": true}), "enabled", false));
+        // 类型不对同样按缺省处理，不能把 false 变成 true
+        assert!(!keep_or(&json!({"enabled": "yes"}), "enabled", false));
+        assert!(!keep_or(&json!({"enabled": false}), "enabled", true));
+    }
+
+    /// 导入的 SOA 必须被丢弃（serial 单调由生成器保证），其它类型保留。
+    #[test]
+    fn import_drops_soa_records() {
+        let recs = vec![
+            ZoneRec { name: "@".into(), rtype: "SOA".into(), ttl: 3600, rdata: "ns1. host. 1 900 600 86400 300".into() },
+            ZoneRec { name: "@".into(), rtype: "NS".into(), ttl: 3600, rdata: "ns1.example.com.".into() },
+            ZoneRec { name: "www".into(), rtype: "a".into(), ttl: 300, rdata: "192.0.2.1".into() },
+        ];
+        let (kept, dropped) = drop_soa_records(recs);
+        assert_eq!(dropped, 1);
+        assert_eq!(kept.len(), 2);
+        assert!(kept.iter().all(|r| r.rtype != "SOA"));
+    }
+
+    /// 转义引号不能被当成引号边界：`\"` 后的 `;` 仍在字符串里，token 也不能被切碎。
+    #[test]
+    fn escaped_quotes_survive_comment_strip_and_tokenization() {
+        let line = r#"www 3600 IN TXT "a \"semi;colon\" b""#;
+        let cleaned = strip_zone_comment(line);
+        assert!(cleaned.contains("semi;colon"), "注释截断吃掉了引号内分号: {cleaned}");
+        let toks = zone_tokens(&cleaned);
+        let words: Vec<&str> = toks.iter().map(|(a, b)| &cleaned[*a..*b]).collect();
+        assert_eq!(words.len(), 5, "token 被转义引号切碎: {words:?}");
+        assert_eq!(words[4], r#""a \"semi;colon\" b""#);
+    }
+
+    /// 含转义引号的 TXT 整行导入后 rdata 必须保持完整（引号与分号都在）。
+    #[test]
+    fn parse_zone_text_keeps_escaped_quotes() {
+        let text = "$ORIGIN example.com.\n@ 3600 IN TXT \"a \\\"semi;colon\\\" b\"\n";
+        let recs = parse_zone_text(text, "example.com").expect("parse");
+        assert_eq!(recs.len(), 1);
+        assert_eq!(recs[0].rtype, "TXT");
+        assert!(recs[0].rdata.contains("semi;colon"), "rdata={:?}", recs[0].rdata);
+        assert!(recs[0].rdata.ends_with('"'), "rdata 收尾引号丢失: {:?}", recs[0].rdata);
+    }
 }

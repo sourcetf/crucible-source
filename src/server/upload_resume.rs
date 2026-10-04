@@ -503,6 +503,31 @@ fn test_fs_has_room() -> bool {
     }
 }
 
+/// 会话/预算类用例的**串行化锁**。
+///
+/// `BUDGET` 是**进程级全局量**（在飞字节 + 每 IP 会话数），而 cargo test 默认**并行**跑
+/// 同一个二进制里的所有用例：一个用例把预算填满时，另一个用例随后开新会话就会拿到
+/// `NoSpace`，于是断言以「本不该被拒」的形式随机失败（实测：`declared_total_*` 与
+/// `oversize_and_missing_*` 两个用例在整包运行时互踩，单独跑就过）。这些用例本来就是
+/// 微秒级，串行化没有代价。
+static TEST_SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// 取串行锁；中毒（前一个用例 panic）也继续，避免二次失败掩盖真因。
+fn serial() -> std::sync::MutexGuard<'static, ()> {
+    TEST_SERIAL.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// 上传目标的落盘位置必须**真的**有空间：`session_for` 的磁盘闸门走
+/// `free_bytes(target)`（沿父目录上溯），所以拿 `/nonexistent/x.bin` 当目标时它看的是
+/// **根文件系统**的余量 —— 根盘小到 512MiB 以下（本机 OpenBSD VM 的 `/` 只有 986MiB）
+/// 时，用例会以「应从 0 重来，实际 NoSpace」失败，看起来像产品 bug，其实是环境。
+/// 这里统一用 temp_dir 下的目标，并显式声明前置条件。
+fn upload_target(name: &str) -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join(format!("crucible-up-{}-{}", std::process::id(), name));
+    let _ = std::fs::create_dir_all(&dir);
+    dir.join("target.bin")
+}
+
 
     use super::*;
 
@@ -528,6 +553,7 @@ fn test_fs_has_room() -> bool {
 
     #[test]
     fn session_offset_semantics_and_atomic_commit() {
+        let _g = serial();
         if !test_fs_has_room() {
             eprintln!("跳过：本机磁盘余量低于闸门阈值（{MIN_FREE_BYTES}），落盘用例无从验证");
             return;
@@ -561,6 +587,7 @@ fn test_fs_has_room() -> bool {
     /// 另一方收到 201 却静默丢数据（第 6 轮并发报告 #5，实测复现）。
     #[test]
     fn concurrent_full_upload_to_same_target_is_rejected() {
+        let _g = serial();
         if !test_fs_has_room() {
             eprintln!("跳过：本机磁盘余量低于闸门阈值（{MIN_FREE_BYTES}）");
             return;
@@ -596,6 +623,7 @@ fn test_fs_has_room() -> bool {
     /// 每来源 IP 的并发会话上限必须真的生效（否则单机就能把会话表占满、把别人挤成 503）。
     #[test]
     fn per_ip_session_cap_is_enforced() {
+        let _g = serial();
         if !test_fs_has_room() {
             eprintln!("跳过：本机磁盘余量低于闸门阈值（{MIN_FREE_BYTES}），落盘用例无从验证");
             return;
@@ -630,6 +658,7 @@ fn test_fs_has_room() -> bool {
     /// 攻击者占满每-IP 的 16 个会话后，用不同文件名反复 PUT 就能无限堆积这类文件。
     #[test]
     fn rejected_session_leaves_no_temp_file() {
+        let _g = serial();
         if !test_fs_has_room() {
             eprintln!("跳过：本机磁盘余量低于闸门阈值（{MIN_FREE_BYTES}），落盘用例无从验证");
             return;
@@ -668,6 +697,7 @@ fn test_fs_has_room() -> bool {
             eprintln!("跳过：本机磁盘余量低于闸门阈值（{MIN_FREE_BYTES}），落盘用例无从验证");
             return;
         }
+        let _g = serial();
         let dir = std::env::temp_dir().join(format!("crucible-up-budget-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let chunk = 64 * 1024 * 1024u64;
@@ -711,6 +741,7 @@ fn test_fs_has_room() -> bool {
     /// 磁盘余量闸门：用一个**不可能满足**的余量要求反证闸门在（把 MIN_FREE_BYTES 当 want 放大）。
     #[test]
     fn disk_headroom_gate_rejects_when_free_is_tiny() {
+        let _g = serial();
         let dir = std::env::temp_dir();
         // 判据函数直测：want 取天文数字时必须为 false（与磁盘余量无关，恒成立）
         assert!(!space_ok(&dir.join("x.bin"), u64::MAX / 2));
@@ -727,11 +758,14 @@ fn test_fs_has_room() -> bool {
 
     #[test]
     fn oversize_and_missing_session_rejected() {
+        let _g = serial();
         if !test_fs_has_room() {
             eprintln!("跳过：本机磁盘余量低于闸门阈值（{MIN_FREE_BYTES}），落盘用例无从验证");
             return;
         }
-        let target = std::path::PathBuf::from("/nonexistent/x.bin");
+        // 目标放在 temp_dir 下（不是 `/nonexistent/...`）：磁盘闸门沿父目录上溯，
+        // 后者会把**根文件系统**的余量当成上传落盘位置的余量，根盘小的机器上必然误判。
+        let target = upload_target("oversize");
         // 不要在 `Result<Arc<Session>, _>` 上做 == ：Session 含 Mutex/Atomic 字段，
         // 既不可能（也不该）为它实现 PartialEq —— 断言错误**变体**即可
         //（此前这两条 assert_eq! 让整个测试目标编译不过，cargo test 形同虚设）。

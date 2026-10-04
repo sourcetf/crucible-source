@@ -51,8 +51,16 @@ pub async fn handle_connection(
         .cloned()
         .context("listener vanished")?;
 
-    // §16.18 L4 不透明转发：l4_forward 配置后整条连接双向透传，不做 HTTP/TLS 解析
+    // §16.18 L4 不透明转发：l4_forward 配置后整条连接双向透传，不做 HTTP/TLS 解析。
+    //
+    // **但服务器级 `[ip_access]` 必须先生效**：L4 路径不做任何 HTTP/TLS 层检查，
+    // 若把它放在 ACL 之前，一条 l4_forward 配置就等于给被 deny 的来源开了一个
+    // 直通内网目标的隧道（报告 P2「l4_forward 完全绕过 ip_access」实测正是如此）。
     if let Some(dest) = &lc.l4_forward {
+        if !crate::server::access::is_allowed(&cfg.ip_access, peer) {
+            log::debug!("l4: connection from {peer} denied by [ip_access]");
+            return Ok(());
+        }
         let addr: SocketAddr = dest
             .parse()
             .with_context(|| format!("l4_forward {dest:?} 无效，应为 ip:port"))?;

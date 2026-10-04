@@ -1503,3 +1503,30 @@ upload_resume.rs, upload_api.rs, tls/accept.rs}`。**没动**本批之外任何�
 **没有动 `v1.0.0-final` 分支本身**，在那边工作的成员不受影响。
 **提醒仍在**：`v1.0.0-final` 上的 `Cargo.toml` 缺 boring-sys 补丁 ⇒ 在**本机**直接检出那条分支
 是编不出来的（这也解释了为什么它需要把 geoip/h3 等桩化）。
+
+---
+
+# 【工号 1009 · 2026-10-04】开工登记（编辑前必读）
+
+## 环境（本地开发/测试环境已就绪）
+- **本地**：Hyper-V OpenBSD 7.9 VM `obsd79`（16 vCPU / 10GB RAM），`/crucible` = 59GB 独立分区 wd1a。
+  已装：rust 1.94.1、llvm19(libclang)、git、cmake、ninja、gmake、python3.13、php-8.4(+php-fpm-8.4)、
+  go、lua54、isc-bind(named/dig)、nghttp2(h2load)、nss+nspr、rsync、h2o（源码构建中）。
+  构建缓存已从远程同步（target/release + target/tls-libs），确保增量构建。
+- **本地 WSL 工作副本**：`/home/dev123/crucible-git`（GitHub clone，main@b6895b1）
+- **远程**：83.229.125.81:/crucible（部署目标，密钥登录），远程无 rsync → 用 tar over ssh。
+- VM 访问：`ssh -p 2222 root@172.18.240.1`（经 Windows portproxy → 172.26.77.69:22），密钥 ~/.ssh/crucible_ed25519。
+
+## 本轮正在做的事
+1. **16 个并行只读审计 agent**（h1-static / h2-h3 / tls-core / tls-legacy / dns-core / dns-dot-doh /
+   dns-geoip-ecs / apps-ffi / apps-php-jsp-asp / apps-script / admin-ui-api / proxy-subsystems /
+   config-live / bench-scripts / security-deep / spec-matrix），报告落在 `.agents/1009/reports/`。
+2. 修复阶段开始前**必须**在此登记占用文件；修复按 module 划分、互不重叠。
+
+## 我正在编辑的文件（登记）
+- `contact.txt`（本文件）
+- 暂无其他（审计阶段只读）。修复阶段开始前会补充。
+
+## 备注
+- 本机不能 `cargo check`（WSL 无 OpenBSD 工具链）；编译一律在本地 OpenBSD VM 上做。
+- 本地 VM 与远程同 rust 版本（1.94.1）⇒ target 缓存可复用，增量构建快。

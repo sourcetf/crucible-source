@@ -27,14 +27,27 @@ if [[ -f "${ROOT}/config.mk" ]]; then
 fi
 FEATURES="${CARGO_FEATURES:-tls,tls_boring}"
 echo "[build] FEATURES=${FEATURES}"
+# 绝不静默降级 feature：旧实现在首次构建失败时回退到 `--features tls,tls_boring`，
+# 丢掉 config.mk 声明的 go_shm_ipc / tls_nss / tls_tomcrypt —— 构建仍然打印 ok 并
+# `--restart` 安装，于是 Go 引擎与 NSS/TomCrypt 遗留 TLS **无声消失**（运维以为部署成功）。
+# 失败就失败：非零退出 + 明确提示怎么修。
 if ! cargo build --release --features "${FEATURES}"; then
-  echo "[build] retry with tls,tls_boring" >&2
-  cargo build --release --features "tls,tls_boring"
+  echo "[build] FAILED with FEATURES=${FEATURES}" >&2
+  echo "[build] 不自动降级 feature（降级会丢掉 go_shm_ipc/tls_nss/tls_tomcrypt 且看起来仍然成功）。" >&2
+  echo "[build] 若确实缺少某个 legacy 库，请显式修 config.mk 或改用 --features 传参后重跑。" >&2
+  exit 1
 fi
 
 BIN="${ROOT}/target/release/webserver"
 if [[ ! -x "$BIN" ]]; then
   echo "missing $BIN" >&2
+  exit 1
+fi
+# 产物新鲜度：cargo 成功但二进制没更新（例如被外部 CARGO_TARGET_DIR 污染）时，
+# 旧实现会照常安装旧二进制。这里要求二进制比 Cargo.toml/src 里最新文件都新。
+NEWEST_SRC="$(find "${ROOT}/src" "${ROOT}/Cargo.toml" "${ROOT}/build.rs" -type f -newer "$BIN" 2>/dev/null | head -1 || true)"
+if [[ -n "${NEWEST_SRC}" ]]; then
+  echo "[build] STALE: $BIN 比 $NEWEST_SRC 还旧 —— 构建没有真正更新产物，拒绝安装" >&2
   exit 1
 fi
 echo "[build] ok: $BIN"

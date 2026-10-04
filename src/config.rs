@@ -642,9 +642,12 @@ fn default_http_versions() -> Vec<String> {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SslConfig {
-    #[serde(default)]
+    // serde alias：规格 §18 的样例写作 `certificate` / `private_key`，
+    // 而内部字段名是 cert/key。没有别名时 serde 会**静默忽略**这两个键，
+    // 结果是「按规格书写了 TLS 配置，运行期却被当成未配置证书 → 明文 HTTP」。
+    #[serde(default, alias = "certificate")]
     pub cert: Option<String>,
-    #[serde(default)]
+    #[serde(default, alias = "private_key")]
     pub key: Option<String>,
     #[serde(default)]
     pub cert_ec: Option<String>,
@@ -652,6 +655,13 @@ pub struct SslConfig {
     pub key_ec: Option<String>,
     #[serde(default)]
     pub versions: Vec<String>,
+    /// §18 规格样例写法：`min_version = "1.2"`（与 `max_version = "1.3"` 组成版本区间）。
+    /// 与 `versions` 等价但更符合运维直觉；两者同时出现时以显式的 `versions` 为准。
+    #[serde(default)]
+    pub min_version: Option<String>,
+    /// §18：版本区间上界（含）。缺省表示不限制上界。
+    #[serde(default)]
+    pub max_version: Option<String>,
     #[serde(default)]
     pub ciphers: Vec<String>,
     #[serde(default)]
@@ -747,6 +757,8 @@ impl Default for SslConfig {
             cert_ec: None,
             key_ec: None,
             versions: Vec::new(),
+            min_version: None,
+            max_version: None,
             ciphers: Vec::new(),
             prefer_tls13: false,
             ech: false,
@@ -774,6 +786,27 @@ impl Default for SslConfig {
             ech_advertise: true,
             early_data: false,
         }
+    }
+}
+
+/// TLS 版本名 → 序号（0=TLS1.0 … 3=TLS1.3）。接受 `1.2` / `tls1.2` / `TLSv1.2` 等写法。
+fn tls_version_index(s: &str) -> Option<u8> {
+    match s.to_ascii_lowercase().replace(['.', '_', ' '], "").as_str() {
+        "1" | "10" | "tls1" | "tlsv1" | "tls10" | "tlsv10" | "sslv3" | "ssl3" => Some(0),
+        "11" | "tls11" | "tlsv11" => Some(1),
+        "12" | "tls12" | "tlsv12" => Some(2),
+        "13" | "tls13" | "tlsv13" => Some(3),
+        _ => None,
+    }
+}
+
+/// 序号 → 运行期 `parse_version` 认得的规范名（见 tls/boring_path.rs）。
+fn tls_version_name(i: u8) -> String {
+    match i {
+        0 => "tls1.0".to_string(),
+        1 => "tls1.1".to_string(),
+        3 => "tls1.3".to_string(),
+        _ => "tls1.2".to_string(),
     }
 }
 
@@ -1033,11 +1066,22 @@ struct AdminConfigRaw {
 
 impl Config {
     pub fn load(path: &Path) -> Result<Self> {
-        let base = path
-            .parent()
-            .filter(|p| !p.as_os_str().is_empty())
-            .unwrap_or_else(|| Path::new("."))
-            .to_path_buf();
+        // 基准目录必须**绝对化**：`--config config.toml`（规格 §0 的启动命令就是这种写法）
+        // 时 parent 为空 ⇒ 原来的 base 是 `"."`，于是 root/docroot/lib/deps_dir/证书路径
+        // 全部保持相对。相对路径在下面这些地方各自按不同 CWD 解析，必然错位：
+        //   * `deps::ensure_app_deps` 用 `current_dir(docroot)` 之后再执行
+        //     `<相对 docroot>/init.sh` ⇒ 子进程 CWD 下再拼一层，init.sh 永远 ENOENT，
+        //     deps/ 永不构建（实测：所有 app 都打 `sh: ./www-apps/x/init.sh: No such file`）；
+        //   * 任何运行期 chdir/降权之后，静态文件与证书路径也会跟着漂移。
+        // 这里统一取进程 CWD 与配置目录合成绝对基准（不要求文件存在，故不用 canonicalize）。
+        let base = match path.parent().filter(|p| !p.as_os_str().is_empty()) {
+            Some(p) if p.is_absolute() => p.to_path_buf(),
+            Some(p) => std::env::current_dir()
+                .with_context(|| "config: current_dir for relative --config path")?
+                .join(p),
+            None => std::env::current_dir()
+                .with_context(|| "config: current_dir for bare --config filename")?,
+        };
         let raw = fs::read_to_string(path)
             .with_context(|| format!("read {}", path.display()))?;
         let raw_cfg: ConfigRaw = toml::from_str(&raw).context("parse config.toml")?;
@@ -1081,8 +1125,56 @@ impl Config {
         // 而 `base.join("./")` 归一化后**正好是配置目录**。这里改成解析后比较。
         check_roots_do_not_expose_config(&cfg, &base)?;
         check_tor_hs_data_dir(&cfg, &base)?;
+        cfg.normalize_tls_version_ranges()?;
         cfg.validate()?;
         Ok(cfg)
+    }
+
+    /// §18：把 `min_version` / `max_version` 区间展开成 `versions` 列表。
+    ///
+    /// 运行期只读 `ssl.versions`（boring_path/client_hello 都是），所以这里做一次性归一化，
+    /// 避免每个消费点各写一遍区间逻辑。`versions` 显式非空时不动它（显式优先）。
+    fn normalize_tls_version_ranges(&mut self) -> Result<()> {
+        for l in &mut self.listeners {
+            let Some(ssl) = &mut l.ssl else { continue };
+            if !ssl.versions.is_empty() {
+                continue;
+            }
+            let Some(min) = ssl.min_version.as_deref().map(str::trim).filter(|s| !s.is_empty())
+            else {
+                continue;
+            };
+            let lo = tls_version_index(min).with_context(|| {
+                format!(
+                    "listener {}:{} 的 ssl.min_version {:?} 无法识别（支持 1.0/1.1/1.2/1.3 或 tls1.x 写法）",
+                    l.address, l.port, min
+                )
+            })?;
+            let hi = match ssl
+                .max_version
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            {
+                Some(max) => tls_version_index(max).with_context(|| {
+                    format!(
+                        "listener {}:{} 的 ssl.max_version {:?} 无法识别（支持 1.0/1.1/1.2/1.3 或 tls1.x 写法）",
+                        l.address, l.port, max
+                    )
+                })?,
+                None => 3, // 不写上界 = 到 TLS1.3
+            };
+            if lo > hi {
+                anyhow::bail!(
+                    "listener {}:{} 的 ssl.min_version={min:?} 高于 max_version={:?}（区间为空，该口无法完成任何握手）",
+                    l.address,
+                    l.port,
+                    ssl.max_version.as_deref().unwrap_or("")
+                );
+            }
+            ssl.versions = (lo..=hi).map(tls_version_name).collect();
+        }
+        Ok(())
     }
 
     fn resolve_paths(&mut self, base: &Path) -> Result<()> {
@@ -1550,6 +1642,36 @@ cover 只用于「未使用 / 被拒 ECH」的连接，ECH 关闭时它会成为
                             l.address, l.port
                         );
                     }
+                }
+            }
+            // ⑤c page_rules 的 match_url：只有**结尾**的 `*` 是受支持的通配
+            //     （page_rules::path_matches 用 strip_suffix('*') + starts_with）。
+            //     中间的 `*` 会被当普通字符比较 ⇒ 规则**永不匹配**，而面板里看起来
+            //     完全正常（保存成功、规则列表也在），只有请求打不上去才发现。
+            for (i, r) in l.page_rules.iter().enumerate() {
+                if let Some(pos) = r.match_url.find('*') {
+                    if pos != r.match_url.len() - 1 {
+                        anyhow::bail!(
+                            "listener {}:{}: page_rules[{i}].match_url {:?} 里的 `*` 只在结尾受支持（中间的 `*` 按字面比较，规则永不匹配）",
+                            l.address, l.port, r.match_url
+                        );
+                    }
+                }
+                if !r.match_url.starts_with('/') && !r.match_url.starts_with("http") {
+                    anyhow::bail!(
+                        "listener {}:{}: page_rules[{i}].match_url {:?} 必须以 `/` 开头（路径规则）",
+                        l.address, l.port, r.match_url
+                    );
+                }
+            }
+            // ⑤d l4_forward：必须能解析成 ip:port。否则每次连接才在 listener 里 parse 失败，
+            //     连接被静默丢弃（配置加载却是成功的）。
+            if let Some(dest) = &l.l4_forward {
+                if dest.parse::<std::net::SocketAddr>().is_err() {
+                    anyhow::bail!(
+                        "listener {}:{}: l4_forward {dest:?} 不是合法的 `ip:port`（该口会静默丢弃所有连接）",
+                        l.address, l.port
+                    );
                 }
             }
             // port_reuse 的 301 会把 server_name 拼进 Location（`https://<server_name>/…`），
@@ -2383,5 +2505,121 @@ versions = ["tls9.9"]
         );
         assert_eq!(admin.users.len(), 1);
         assert_eq!(admin.users[0].username, "legacy");
+    }
+
+    /// §18 样例字段名：`certificate` / `private_key` 必须被识别（无别名时 serde 静默丢弃，
+    /// 结果是「按规格配了证书却按明文 HTTP 服务」）。
+    #[test]
+    fn ssl_spec18_field_aliases_are_accepted() {
+        #[derive(Deserialize)]
+        struct Wrap {
+            ssl: SslConfig,
+        }
+        let w: Wrap = toml::from_str(
+            r#"
+            [ssl]
+            certificate = "-----BEGIN CERTIFICATE-----\nX\n-----END CERTIFICATE-----\n"
+            private_key = "-----BEGIN PRIVATE KEY-----\nY\n-----END PRIVATE KEY-----\n"
+        "#,
+        )
+        .unwrap();
+        assert!(w.ssl.cert.as_deref().unwrap().contains("BEGIN CERTIFICATE"));
+        assert!(w.ssl.key.as_deref().unwrap().contains("BEGIN PRIVATE KEY"));
+    }
+
+    /// §18：`min_version = "1.2"` 应展开成 tls1.2 + tls1.3 两条。
+    #[test]
+    fn tls_min_max_version_expand_to_versions() {
+        let mut cfg = Config::default();
+        cfg.listeners = vec![ListenerConfig {
+            ssl: Some(SslConfig {
+                min_version: Some("1.2".into()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }];
+        cfg.normalize_tls_version_ranges().unwrap();
+        let v = &cfg.listeners[0].ssl.as_ref().unwrap().versions;
+        assert_eq!(v, &vec!["tls1.2".to_string(), "tls1.3".to_string()]);
+
+        // 上下界同时给出 → 只要 1.2
+        let mut cfg = Config::default();
+        cfg.listeners = vec![ListenerConfig {
+            ssl: Some(SslConfig {
+                min_version: Some("TLSv1.2".into()),
+                max_version: Some("1.2".into()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }];
+        cfg.normalize_tls_version_ranges().unwrap();
+        assert_eq!(
+            &cfg.listeners[0].ssl.as_ref().unwrap().versions,
+            &vec!["tls1.2".to_string()]
+        );
+
+        // 显式 versions 优先，区间不覆盖它
+        let mut cfg = Config::default();
+        cfg.listeners = vec![ListenerConfig {
+            ssl: Some(SslConfig {
+                versions: vec!["tls1.3".into()],
+                min_version: Some("1.2".into()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }];
+        cfg.normalize_tls_version_ranges().unwrap();
+        assert_eq!(
+            &cfg.listeners[0].ssl.as_ref().unwrap().versions,
+            &vec!["tls1.3".to_string()]
+        );
+    }
+
+    #[test]
+    fn tls_min_version_above_max_is_rejected() {
+        let mut cfg = Config::default();
+        cfg.listeners = vec![ListenerConfig {
+            ssl: Some(SslConfig {
+                min_version: Some("1.3".into()),
+                max_version: Some("1.2".into()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }];
+        assert!(cfg.normalize_tls_version_ranges().is_err());
+    }
+
+    /// `--config config.toml`（无目录）时基准目录必须是**绝对**路径，否则 docroot/init.sh
+    /// 这些相对路径会在子进程 chdir 后错位（实测 deps/ 永不构建）。
+    #[test]
+    fn relative_config_path_resolves_to_absolute_base() {
+        let dir = std::env::temp_dir().join(format!("crucible-cfg-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("config.toml");
+        std::fs::write(
+            &path,
+            r#"
+[[listeners]]
+address = "127.0.0.1"
+port = 18081
+root = "www"
+"#,
+        )
+        .unwrap();
+        // 用「目录 + 文件名」形式，模拟 `--config <dir>/config.toml`
+        let cfg = Config::load(&path).unwrap();
+        assert!(cfg.listeners[0].root.is_absolute());
+        // 裸文件名形式（CWD = dir）——base 必须仍是绝对路径
+        let cwd = std::env::current_dir().unwrap();
+        std::env::set_current_dir(&dir).unwrap();
+        let cfg2 = Config::load(Path::new("config.toml"));
+        std::env::set_current_dir(&cwd).unwrap();
+        let cfg2 = cfg2.unwrap();
+        assert!(
+            cfg2.listeners[0].root.is_absolute(),
+            "relative --config must still yield absolute root: {:?}",
+            cfg2.listeners[0].root
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

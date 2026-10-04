@@ -32,7 +32,10 @@ restart_test() {
   pkill -f 'webserver --config .*config-test.toml' 2>/dev/null || true
   sleep 1
   cd "${ROOT}"
-  nohup env CRUCIBLE_BATCH_CAP="${cap}" ./target/release/webserver --config "${ROOT}/config-test.toml" \
+  # CRUCIBLE_DNS_STATE_ROOT：测试实例**必须**用独立的 DNS 状态根。否则 dns::effective()
+  # 会发现生产的 state/dns/etc/panel.toml 并**整体**返回它 ⇒ config-test.toml 的 [dns]
+  # 端口设置形同不存在（测试实例去绑生产 53/853），且测试建的 zone 直接写进生产 DNS 库。
+  nohup env CRUCIBLE_DNS_STATE_ROOT="${ROOT}/state/dns-test" CRUCIBLE_BATCH_CAP="${cap}" ./target/release/webserver --config "${ROOT}/config-test.toml" \
     >>/tmp/crucible-test.log 2>&1 &
   echo $! >/tmp/crucible-test.pid
   sleep 2

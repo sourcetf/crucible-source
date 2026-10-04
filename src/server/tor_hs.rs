@@ -61,15 +61,103 @@ pub fn state_dir() -> PathBuf {
 }
 
 /// 把目录设为 0700（tor 对 HiddenServiceDir 的硬要求，见文件头说明）。
+///
+/// **绝不跟随符号链接**：`state/tor-hs`（及 hs 子目录）在第一次 chown 后就归 `_tor`
+/// 所有，该账号可以把目录项换成指向 /etc 的链接；若这里用 `set_permissions`（跟随），
+/// root 下一次巡检就会替它执行 `chmod 0700 /etc`。用 O_NOFOLLOW 打开目录 fd 再 fchmod，
+/// 链接一律拒绝（ELOOP → 报错，不触碰目标）。
 fn set_mode_0700(p: &Path) -> Result<()> {
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
-        let perm = std::fs::Permissions::from_mode(0o700);
-        std::fs::set_permissions(p, perm).with_context(|| format!("chmod 0700 {}", p.display()))?;
+        use std::os::unix::ffi::OsStrExt;
+        let c = std::ffi::CString::new(p.as_os_str().as_bytes())
+            .with_context(|| format!("路径含 NUL: {}", p.display()))?;
+        let fd = unsafe {
+            libc::open(
+                c.as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        if fd < 0 {
+            let e = std::io::Error::last_os_error();
+            bail!("chmod 0700 {}: {e}（符号链接或不可打开）", p.display());
+        }
+        let rc = unsafe { libc::fchmod(fd, 0o700) };
+        let e = std::io::Error::last_os_error();
+        unsafe { libc::close(fd) };
+        if rc != 0 {
+            bail!("chmod 0700 {}: {e}", p.display());
+        }
     }
     let _ = p;
     Ok(())
+}
+
+/// 以 O_NOFOLLOW 写文件：目录归 `_tor` 后它可以把 `torrc` / `hostname.log` 换成符号链接，
+/// 诱使 root 把内容写到任意路径（例如用 torrc 文本覆盖 /etc/rc.conf）。这里的所有写入
+/// 都落在这个目录树里，必须拒绝链接；普通文件不存在则创建（0600）。
+fn write_file_nofollow(path: &Path, data: &[u8]) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::io::Write;
+        use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(path)
+            .with_context(|| format!("写 {}（O_NOFOLLOW）", path.display()))?;
+        // O_NOFOLLOW 挡不住**硬链接**：`_tor` 可把 /etc 下的 root 文件硬链成 torrc 的名字，
+        // 我们 O_TRUNC 的就是那个 root inode（是否能建硬链取决于内核策略，不能依赖）。
+        // 我们自己的文件链接数恒为 1，>1 一律拒绝。
+        if f.metadata()
+            .map(|m| m.nlink() > 1)
+            .unwrap_or(false)
+        {
+            bail!(
+                "拒绝写入 {}：链接数 > 1（疑似被硬链到其它文件，跳过而不是截断它）",
+                path.display()
+            );
+        }
+        f.write_all(data)
+            .with_context(|| format!("写 {}", path.display()))?;
+        return Ok(());
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::write(path, data).with_context(|| format!("写 {}", path.display()))
+    }
+}
+
+/// 以 O_NOFOLLOW 读文件（链接/不存在 → `None`）。
+///
+/// 与写入同理：`hostname`、`notice.log`、`pid` 都可能被 `_tor` 换成指向 root 文件的链接
+/// （读出来会被写进日志/面板 ⇒ 信息泄露）。读不到就当作没有，不跟随。
+fn read_to_string_nofollow(path: &Path) -> Option<String> {
+    #[cfg(unix)]
+    {
+        use std::io::Read;
+        use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+        let mut f = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(path)
+            .ok()?;
+        // 硬链接同样会绕过 O_NOFOLLOW：链接数 >1 时读到的可能是 root 文件的内容
+        // （会被写进日志/面板），一律当作不可读。
+        if f.metadata().map(|m| m.nlink() > 1).unwrap_or(true) {
+            return None;
+        }
+        let mut s = String::new();
+        f.read_to_string(&mut s).ok()?;
+        Some(s)
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::read_to_string(path).ok()
+    }
 }
 
 /// HS 的 HiddenServiceDir（配置优先，其次 `state/tor-hs/hs`）。
@@ -78,6 +166,23 @@ fn hs_data_dir(cfg: &TorHsConfig) -> PathBuf {
         .as_ref()
         .map(PathBuf::from)
         .unwrap_or_else(|| state_dir().join("hs"))
+}
+
+/// 运行期对 `[tor_hs].data_dir` 的兜底校验：**必须绝对**。
+///
+/// 相对 data_dir 会让 `ensure_hs` 按**进程 cwd** 解析，并把这棵树 chmod 0700 + chown 给
+/// `_tor` —— 正是 `config.rs::check_tor_hs_data_dir` 想拦住的场景（把 cwd 下已有目录整体
+/// 交给低权账号），而该校验对相对路径的两个 `starts_with` 都不成立。配置期修好之前，
+/// 运行期 fail-closed：要么配绝对路径（指向 HS 专用目录），要么用默认 state/tor-hs/hs。
+fn ensure_absolute_data_dir(p: &Path) -> Result<()> {
+    if p.is_absolute() {
+        return Ok(());
+    }
+    bail!(
+        "[tor_hs].data_dir = {:?} 是相对路径：会按进程 cwd 解析并把该目录整棵 chmod 0700 + \
+         chown 给 tor 账号；请改为绝对路径（默认 state/tor-hs/hs 由程序自己绝对化）",
+        p.display()
+    )
 }
 
 /// 读取已生成的 `.onion` 名（供面板显示）。`None` = 还没生成 / 未启用。
@@ -90,7 +195,7 @@ pub fn current_onion_name(cfg: &TorHsConfig) -> Option<String> {
     }
     let hs_dir = hs_data_dir(cfg);
     for p in [hs_dir.join("hostname"), state_dir().join("hostname.log")] {
-        if let Ok(s) = std::fs::read_to_string(&p) {
+        if let Some(s) = read_to_string_nofollow(&p) {
             let s = s.trim();
             if !s.is_empty() {
                 return Some(s.to_string());
@@ -134,8 +239,7 @@ fn torrc_text(cfg: &TorHsConfig, dir: &Path, hs_dir: &Path) -> String {
 /// 会按终端宽度截断（实测 80 列），而 torrc 路径就在命令行最前面，所以按「首词是 tor
 /// 且包含 torrc 路径」判断，而不是拿整串去相等比较。
 fn tor_pid(dir: &Path) -> Option<i32> {
-    let pid: i32 = std::fs::read_to_string(dir.join("pid"))
-        .ok()?
+    let pid: i32 = read_to_string_nofollow(&dir.join("pid"))?
         .trim()
         .parse()
         .ok()?;
@@ -249,33 +353,165 @@ fn restart_reason(hostname: Option<&str>, running: Option<i32>, torrc_same: bool
 ///
 /// 配了 `[tor_hs].user` 时必须在启动 tor 之前做完：tor 解析完配置就降权，之后它是以该用户
 /// 的身份去读 HiddenServiceDir 和写日志文件的，root 独占的目录会让它直接启动失败。
+///
+/// # 符号链接安全（P1）
+///
+/// 第一次 chown 之后目录属主就是低权的 tor 账号（或被攻破的 tor），它能在树里放**任意
+/// 符号链接**。任何跟随链接的实现（`Path::is_dir()` / `std::fs::chown` / `read_dir` 都跟随）
+/// 都会被利用：`ln -s / …/state/tor-hs/x` 后，root 会在 ≤60s 的巡检里把 `/etc`（或
+/// `/etc/master.passwd`、`/root/.ssh/authorized_keys`）的属主交给它 —— 本地提权直达 root。
+///
+/// 因此这里改成**基于目录 fd 的遍历**：
+/// * 顶层与每个子目录都用 `open/openat(O_NOFOLLOW|O_DIRECTORY)` 固定 inode，路径被换成
+///   链接时直接失败，绝不跟过去；
+/// * 逐项用 `fstatat(AT_SYMLINK_NOFOLLOW)` 判类型，**符号链接一律跳过并告警**；
+/// * 文件/目录本身用 `fchownat(..., AT_SYMLINK_NOFOLLOW)`（等价 lchown）改属主，不跟随；
+/// * 目录在子项改完后才 chown（先深后浅），顶层目录直接 fchown 它的 fd。
 fn chown_tree(path: &Path, uid: u32, gid: u32) -> Result<()> {
     #[cfg(unix)]
     {
-        use std::os::unix::fs::chown;
-        // 先深后浅：目录在子项改完后改（避免目录先变成别人的、我们反而下不去）。
-        let mut dirs: Vec<PathBuf> = Vec::new();
-        let mut stack = vec![path.to_path_buf()];
-        while let Some(d) = stack.pop() {
-            if let Ok(rd) = std::fs::read_dir(&d) {
-                for e in rd.flatten() {
-                    let p = e.path();
-                    if p.is_dir() {
-                        stack.push(p);
-                    } else {
-                        chown(&p, Some(uid), Some(gid))
-                            .with_context(|| format!("chown {}", p.display()))?;
-                    }
-                }
-            }
-            dirs.push(d);
+        use std::os::unix::ffi::OsStrExt;
+        let c = std::ffi::CString::new(path.as_os_str().as_bytes())
+            .with_context(|| format!("chown_tree: 路径含 NUL: {}", path.display()))?;
+        let dirfd = unsafe {
+            libc::open(
+                c.as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        if dirfd < 0 {
+            let e = std::io::Error::last_os_error();
+            bail!(
+                "chown_tree: 打开目录 {} 失败（符号链接 / 权限 / 不存在？）: {e}",
+                path.display()
+            );
         }
-        for d in dirs.into_iter().rev() {
-            chown(&d, Some(uid), Some(gid)).with_context(|| format!("chown {}", d.display()))?;
-        }
+        // 目录 fd 交给 chown_dir_fd 接管（成功由 closedir 关闭，失败路径它会自己关）。
+        chown_dir_fd(dirfd, uid, gid, path)?;
     }
     let _ = (path, uid, gid);
     Ok(())
+}
+
+/// 递归处理 `dirfd` 指向的目录：先子项（文件立即、目录递归后再改），**最后目录自身**。
+/// 接管 `dirfd` 的所有权。
+#[cfg(unix)]
+fn chown_dir_fd(dirfd: libc::c_int, uid: u32, gid: u32, path: &Path) -> Result<()> {
+    let dir = unsafe { libc::fdopendir(dirfd) };
+    if dir.is_null() {
+        let e = std::io::Error::last_os_error();
+        unsafe { libc::close(dirfd) };
+        bail!("chown_tree: fdopendir({}) 失败: {e}", path.display());
+    }
+    let children = chown_children(dir, dirfd, uid, gid, path);
+    // 子项全部改完（或中途失败）才改目录自身；失败时不改，避免「目录先成别人的、下不去」。
+    let self_result = if children.is_ok() {
+        let rc = unsafe { libc::fchown(dirfd, uid as libc::uid_t, gid as libc::gid_t) };
+        if rc == 0 {
+            Ok(())
+        } else {
+            Err(std::io::Error::last_os_error())
+        }
+    } else {
+        Ok(())
+    };
+    unsafe { libc::closedir(dir) };
+    children.with_context(|| format!("chown_tree 子项 {}", path.display()))?;
+    if let Err(e) = self_result {
+        bail!("chown {}: {e}", path.display());
+    }
+    Ok(())
+}
+
+/// `chown_dir_fd` 的子项遍历（不含目录自身）。参数 `dir`/`dirfd` 指向同一目录。
+#[cfg(unix)]
+fn chown_children(
+    dir: *mut libc::DIR,
+    dirfd: libc::c_int,
+    uid: u32,
+    gid: u32,
+    path: &Path,
+) -> Result<()> {
+    loop {
+        // readdir 的 EOF 与错误都以 NULL 返回；按 EOF 处理 —— 剩下的项下一轮巡检重做，
+        // 属于「晚一点恢复」而不是破坏。
+        let ent = unsafe { libc::readdir(dir) };
+        if ent.is_null() {
+            return Ok(());
+        }
+        let name = unsafe { std::ffi::CStr::from_ptr((*ent).d_name.as_ptr()) };
+        if name.to_bytes() == b"." || name.to_bytes() == b".." {
+            continue;
+        }
+        let mut st: libc::stat = unsafe { std::mem::zeroed() };
+        let rc = unsafe { libc::fstatat(dirfd, name.as_ptr(), &mut st, libc::AT_SYMLINK_NOFOLLOW) };
+        if rc != 0 {
+            bail!(
+                "fstatat {}/{}: {}",
+                path.display(),
+                name.to_string_lossy(),
+                std::io::Error::last_os_error()
+            );
+        }
+        let file_type = st.st_mode & libc::S_IFMT;
+        if file_type == libc::S_IFLNK {
+            // 符号链接：**跳过**，连链接自身的属主都不改（更不跟随目标）。
+            // `_tor` 拥有目录后可以放进任何链接，跟随一次就足以把 /etc 交出去。
+            log::warn!(
+                "tor_hs: chown_tree 跳过符号链接 {}/{}（绝不跟随、不改其目标属主）",
+                path.display(),
+                name.to_string_lossy()
+            );
+            continue;
+        }
+        if file_type != libc::S_IFDIR && st.st_nlink > 1 {
+            // 硬链接是同一个 inode 的第二个名字：fchownat 会改到「别处」那个文件的属主
+            // （符号链接保护挡不住它）。HS 目录里我们自己的文件链接数恒为 1，跳过并告警。
+            log::warn!(
+                "tor_hs: chown_tree 跳过硬链接 {}/{}（nlink={}，可能是对 root 文件的链接）",
+                path.display(),
+                name.to_string_lossy(),
+                st.st_nlink
+            );
+            continue;
+        }
+        let child_path = path.join(name.to_string_lossy().as_ref());
+        if file_type == libc::S_IFDIR {
+            // O_NOFOLLOW：检查（fstatat）与打开之间被换成链接时直接失败，绝不递归进目标。
+            let child_fd = unsafe {
+                libc::openat(
+                    dirfd,
+                    name.as_ptr(),
+                    libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                )
+            };
+            if child_fd < 0 {
+                let e = std::io::Error::last_os_error();
+                bail!(
+                    "chown_tree: openat {} 失败（是否被换成符号链接？）: {e}",
+                    child_path.display()
+                );
+            }
+            chown_dir_fd(child_fd, uid, gid, &child_path)?;
+        } else {
+            let rc = unsafe {
+                libc::fchownat(
+                    dirfd,
+                    name.as_ptr(),
+                    uid as libc::uid_t,
+                    gid as libc::gid_t,
+                    libc::AT_SYMLINK_NOFOLLOW,
+                )
+            };
+            if rc != 0 {
+                bail!(
+                    "chown {}: {}",
+                    child_path.display(),
+                    std::io::Error::last_os_error()
+                );
+            }
+        }
+    }
 }
 
 /// 查用户的 uid/gid（tor 的 `User` 只认名字，chown 要数字；两者都得有）。
@@ -312,6 +548,7 @@ pub async fn ensure_hs(cfg: &TorHsConfig) -> Result<String> {
     let _guard = hs_lock().lock().await;
     let dir = state_dir();
     let hs_dir = hs_data_dir(cfg);
+    ensure_absolute_data_dir(&hs_dir)?;
     std::fs::create_dir_all(&hs_dir).with_context(|| format!("create {}", hs_dir.display()))?;
     std::fs::create_dir_all(dir.join("data")).context("create tor-hs data dir")?;
     // **tor 硬要求 HiddenServiceDir 必须是 0700**：目录权限过宽时它直接
@@ -343,13 +580,12 @@ pub async fn ensure_hs(cfg: &TorHsConfig) -> Result<String> {
     }
 
     let hostname_file = hs_dir.join("hostname");
-    let existing = std::fs::read_to_string(&hostname_file)
-        .ok()
+    let existing = read_to_string_nofollow(&hostname_file)
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty());
     let torrc_path = dir.join("torrc");
     let wanted = torrc_text(cfg, &dir, &hs_dir);
-    let torrc_same = std::fs::read_to_string(&torrc_path)
+    let torrc_same = read_to_string_nofollow(&torrc_path)
         .map(|s| s == wanted)
         .unwrap_or(false);
     let running = tor_pid(&dir);
@@ -359,7 +595,7 @@ pub async fn ensure_hs(cfg: &TorHsConfig) -> Result<String> {
             let name = existing.clone().unwrap_or_default();
             // debug 级：巡检每 60s 调一次，info 会刷屏（"serving" 那条已经打过一次了）
             log::debug!("tor_hs: 复用已有 HS {name}（tor pid {}）", running.unwrap_or(0));
-            let _ = std::fs::write(dir.join("hostname.log"), format!("{name}\n"));
+            let _ = write_file_nofollow(&dir.join("hostname.log"), format!("{name}\n").as_bytes());
             return Ok(name);
         }
         Some(why) => {
@@ -376,7 +612,7 @@ pub async fn ensure_hs(cfg: &TorHsConfig) -> Result<String> {
         }
     }
 
-    std::fs::write(&torrc_path, &wanted).with_context(|| format!("write {}", torrc_path.display()))?;
+    write_file_nofollow(&torrc_path, wanted.as_bytes())?;
 
     let tor = cfg.tor_bin.clone().unwrap_or_else(|| "tor".into());
     let pidfile = dir.join("pid");
@@ -401,7 +637,7 @@ pub async fn ensure_hs(cfg: &TorHsConfig) -> Result<String> {
     if !status.success() {
         let said = tor_said(&dir, &out.stderr, &out.stdout);
         // 落盘一份，便于事后排查（面板/日志只看一行）
-        let _ = std::fs::write(dir.join("tor-error.log"), said.join("\n") + "\n");
+        let _ = write_file_nofollow(&dir.join("tor-error.log"), (said.join("\n") + "\n").as_bytes());
         bail!(
             "tor 以 {:?} 退出（torrc={}）。tor 说：{}",
             status.code(),
@@ -414,12 +650,13 @@ pub async fn ensure_hs(cfg: &TorHsConfig) -> Result<String> {
         );
     }
 
-    // 等待 onion 生成（首次建 HS 密钥可能 ~10-30s；重启已有密钥是秒级）
+    // 等待 onion 生成（首次建 HS 密钥可能 ~10-30s；重启已有密钥是秒级）。
+    // 读取用 O_NOFOLLOW：`hostname` 若被换成指向 root 文件的链接，内容会进日志/面板。
     for _ in 0..60 {
-        if hostname_file.is_file() {
-            let name = std::fs::read_to_string(&hostname_file)?.trim().to_string();
+        if let Some(name) = read_to_string_nofollow(&hostname_file) {
+            let name = name.trim().to_string();
             if !name.is_empty() {
-                std::fs::write(dir.join("hostname.log"), format!("{name}\n"))?;
+                write_file_nofollow(&dir.join("hostname.log"), format!("{name}\n").as_bytes())?;
                 log::info!("tor_hs: onion ready {name}");
                 return Ok(name);
             }
@@ -451,7 +688,7 @@ fn tor_said(dir: &Path, stderr: &[u8], stdout: &[u8]) -> Vec<String> {
         }
     }
     for p in [dir.join("notice.log"), dir.join("data").join("notice.log")] {
-        let Ok(log) = std::fs::read_to_string(&p) else {
+        let Some(log) = read_to_string_nofollow(&p) else {
             continue;
         };
         let tag = p
@@ -820,5 +1057,91 @@ Oct 01 03:04:09.000 [err] /dev/null can't be opened. Exiting.
             ..bad.clone()
         };
         assert!(validate(&blank).is_ok());
+    }
+
+    /// P1 回归：chown_tree **绝不跟随符号链接**。
+    ///
+    /// 被攻破的 `_tor` 账号在树里放 `ln -s /etc …` 后，巡检（≤60s）不得把 /etc 的
+    /// 属主交出去。测试用的链接指向 root 拥有的目录/文件：旧实现（`is_dir()` 跟随 +
+    /// `chown` 跟随）会 EPERM 报错，新实现跳过链接、正常返回。
+    #[cfg(unix)]
+    #[test]
+    fn chown_tree_skips_symlinks_without_following_targets() {
+        use std::os::unix::fs::{symlink, MetadataExt};
+        // 以 root 跑测试时跳过：万一实现有 bug，会真的把 /etc 的属主改掉（不可逆）。
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        let base = std::env::temp_dir().join(format!("crucible-torhs-chown-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(base.join("sub")).unwrap();
+        std::fs::write(base.join("sub/regular.txt"), b"x").unwrap();
+        symlink("/etc", base.join("escape_dir")).unwrap();
+        symlink("/etc/passwd", base.join("escape_file")).unwrap();
+        symlink("/nonexistent-crucible-target", base.join("dangling")).unwrap();
+        let uid = unsafe { libc::geteuid() } as u32;
+        let gid = unsafe { libc::getegid() } as u32;
+        chown_tree(&base, uid, gid).expect("符号链接必须被跳过，绝不 chown 链接目标");
+        for link in ["escape_dir", "escape_file", "dangling"] {
+            let md = std::fs::symlink_metadata(base.join(link)).unwrap();
+            assert!(md.file_type().is_symlink(), "{link} 应仍是符号链接");
+        }
+        // 普通项照常处理（同一 uid，chown 自身永远允许）
+        assert_eq!(
+            std::fs::metadata(base.join("sub/regular.txt")).unwrap().uid(),
+            uid
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// P1 同类：chmod / 写入也不得穿过符号链接（目录归 `_tor` 后它可以换掉目录项）。
+    #[cfg(unix)]
+    #[test]
+    fn nofollow_helpers_refuse_symlinks() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+        let base =
+            std::env::temp_dir().join(format!("crucible-torhs-nofollow-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(base.join("real_dir")).unwrap();
+        std::fs::set_permissions(
+            base.join("real_dir"),
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+        symlink(base.join("real_dir"), base.join("dir_link")).unwrap();
+        assert!(set_mode_0700(&base.join("dir_link")).is_err(), "chmod 不得跟随链接");
+        let mode = std::fs::metadata(base.join("real_dir"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o755, "链接目标权限不得被改");
+
+        std::fs::write(base.join("real_file"), b"keep").unwrap();
+        symlink(base.join("real_file"), base.join("file_link")).unwrap();
+        assert!(
+            write_file_nofollow(&base.join("file_link"), b"evil").is_err(),
+            "写不得跟随链接"
+        );
+        assert_eq!(
+            read_to_string_nofollow(&base.join("real_file")).as_deref(),
+            Some("keep"),
+            "链接目标内容不得被覆盖"
+        );
+        // 普通文件正常读/写
+        assert!(write_file_nofollow(&base.join("plain"), b"ok").is_ok());
+        assert_eq!(
+            read_to_string_nofollow(&base.join("plain")).as_deref(),
+            Some("ok")
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// P3 回归：相对 data_dir 运行期必须拒绝（否则整棵 cwd 目录会 chmod/chown 给 tor）。
+    #[test]
+    fn relative_data_dir_is_rejected_at_runtime() {
+        assert!(ensure_absolute_data_dir(Path::new("www")).is_err());
+        assert!(ensure_absolute_data_dir(Path::new("./state/hs")).is_err());
+        assert!(ensure_absolute_data_dir(Path::new("/var/tor/hs")).is_ok());
     }
 }

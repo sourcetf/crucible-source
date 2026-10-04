@@ -52,26 +52,80 @@ pub fn build_acceptor(ssl: &SslConfig, lc: &ListenerConfig) -> Result<SslAccepto
 fn apply_versions(builder: &mut SslAcceptorBuilder, ssl: &SslConfig) -> Result<()> {
     if ssl.versions.is_empty() {
         if ssl.prefer_tls13 {
+            // 与不设这两行的效果**完全相同**（mozilla_modern 已被清掉 NO_TLSV1_3，库内
+            // 范围就是 1.2–1.3）：BoringSSL 没有「偏好 1.3」的开关，协议版本偏好库内固定。
+            // 这个字段是兼容性的空开关；面板/配置写 true 不会产生可观测差异，写 false
+            // 也无法关闭 1.3（要限制 1.3 只能靠 ssl.versions 把 max 钉到 tls1.2）。
             builder.set_min_proto_version(Some(SslVersion::TLS1_2))?;
             builder.set_max_proto_version(Some(SslVersion::TLS1_3))?;
         }
         return Ok(());
     }
-    // BoringSSL path: TLS 1.2/1.3 only. TLS 1.0/1.1/SSLv3 route to NSS via ClientHello peek.
-    let mut min = SslVersion::TLS1_3;
-    let mut max = SslVersion::TLS1_2;
-    for v in &ssl.versions {
-        let ver = parse_version(v)?;
-        if version_rank(ver) < version_rank(min) {
-            min = ver;
-        }
-        if version_rank(ver) > version_rank(max) {
-            max = ver;
-        }
-    }
+    let (min, max, legacy) = plan_versions(&ssl.versions)?;
+    let (Some(min), Some(max)) = (min, max) else {
+        // 只配了 legacy 版本（tls1.0/tls1.1/tlsv1/...）：BoringSSL 一个都做不了。
+        // **绝不能**让构建失败 —— 旧实现遇到 legacy 条目直接 `?` bail ⇒ acceptor
+        // 构建失败 ⇒ 该监听口包括 TLS1.2/1.3 在内的**每条**连接都被 soft-fail 丢弃
+        //（热重载不构建 acceptor，所以配置能成功加载，端口却完全不再服务）。
+        // 这里回落到 BoringSSL 能给的最接近集合（1.2–1.3）并**大声告知降级**：
+        // 要真正服务 legacy 客户端请启用 NSS/TomCrypt（client_hello::resolve 分流）。
+        crate::server::log_throttle::warn_every(
+            "tls-versions-legacy-only",
+            std::time::Duration::from_secs(60),
+            &format!(
+                "ssl.versions 只含 BoringSSL 不支持的 legacy 版本 {:?} —— 为避免整个监听口失效，\
+BoringSSL 侧回落到 TLS1.2–1.3（这是一次降级，不是配置生效）；要服务 legacy 客户端请启用 \
+NSS/TomCrypt（enable_nss / enable_tomcrypt），它们按 ClientHello 分流",
+                legacy
+            ),
+        );
+        builder.set_min_proto_version(Some(SslVersion::TLS1_2))?;
+        builder.set_max_proto_version(Some(SslVersion::TLS1_3))?;
+        return Ok(());
+    };
     builder.set_min_proto_version(Some(min))?;
     builder.set_max_proto_version(Some(max))?;
+    if !legacy.is_empty() {
+        // 同时配了现代版本与 legacy 版本：legacy 条目对 BoringSSL 无意义（它是
+        // ClientHello 分流策略），忽略而不是报错；但要如实说明哪些被忽略了。
+        crate::server::log_throttle::warn_every(
+            "tls-versions-legacy-ignored",
+            std::time::Duration::from_secs(60),
+            &format!(
+                "ssl.versions 含 BoringSSL 不支持的 legacy 版本 {:?}（已忽略：仅由 NSS/TomCrypt \
+分流处理）；BoringSSL 实际协商范围 {:?}–{:?}",
+                legacy, min, max
+            ),
+        );
+    }
     Ok(())
+}
+
+/// 把 `ssl.versions` 拆成 (BoringSSL min, BoringSSL max, 被忽略的 legacy 条目)。
+///
+/// 规则：现代条目取 rank 最小/最大作为范围；legacy 条目只影响遗留栈分流，不参与
+/// BoringSSL 范围计算（旧实现为它 bail，直接毒死整个监听口）。只含 legacy 时返回
+/// `(None, None, legacy)`，由调用方决定回落策略。
+fn plan_versions(
+    versions: &[String],
+) -> Result<(Option<SslVersion>, Option<SslVersion>, Vec<String>)> {
+    let mut min: Option<SslVersion> = None;
+    let mut max: Option<SslVersion> = None;
+    let mut legacy: Vec<String> = Vec::new();
+    for v in versions {
+        match parse_version(v)? {
+            Some(ver) => {
+                if min.map_or(true, |m| version_rank(ver) < version_rank(m)) {
+                    min = Some(ver);
+                }
+                if max.map_or(true, |m| version_rank(ver) > version_rank(m)) {
+                    max = Some(ver);
+                }
+            }
+            None => legacy.push(v.clone()),
+        }
+    }
+    Ok((min, max, legacy))
 }
 
 fn version_rank(v: SslVersion) -> u8 {
@@ -82,15 +136,13 @@ fn version_rank(v: SslVersion) -> u8 {
     }
 }
 
-fn parse_version(s: &str) -> Result<SslVersion> {
+/// `Ok(Some(v))` = BoringSSL 支持的版本；`Ok(None)` = legacy 版本（BoringSSL 不做，
+/// 交给 NSS/TomCrypt 分流，不参与 min/max 计算）；`Err` = 无法识别的字符串。
+fn parse_version(s: &str) -> Result<Option<SslVersion>> {
     match s.to_ascii_uppercase().replace(['.', '_'], "").as_str() {
-        "TLSV13" | "TLS13" => Ok(SslVersion::TLS1_3),
-        "TLSV12" | "TLS12" => Ok(SslVersion::TLS1_2),
-        "TLSV11" | "TLS11" | "TLSV10" | "TLS10" | "TLSV1" | "TLS1" | "SSLV3" | "SSL3" => {
-            anyhow::bail!(
-                "{s}: legacy TLS versions are handled by NSS/TomCrypt, not BoringSSL"
-            )
-        }
+        "TLSV13" | "TLS13" => Ok(Some(SslVersion::TLS1_3)),
+        "TLSV12" | "TLS12" => Ok(Some(SslVersion::TLS1_2)),
+        "TLSV11" | "TLS11" | "TLSV10" | "TLS10" | "TLSV1" | "TLS1" | "SSLV3" | "SSL3" => Ok(None),
         other => anyhow::bail!("unsupported TLS version: {other}"),
     }
 }
@@ -463,6 +515,50 @@ mod ciphers_tests {
     }
 }
 
+#[cfg(test)]
+mod versions_tests {
+    use super::*;
+
+    fn v(list: &[&str]) -> Vec<String> {
+        list.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// 回归（P1）：`versions` 里包含 tls1.0/tls1.1 时，旧实现对 legacy 条目直接 bail
+    /// ⇒ build_acceptor 失败 ⇒ 整个监听口（包括 TLS1.2 客户端）全部 soft-fail。
+    /// 现在 legacy 条目被忽略并单独返回，现代范围仍正确计算。
+    #[test]
+    fn legacy_entries_do_not_poison_boring_range() {
+        let (min, max, legacy) = plan_versions(&v(&["tls1.0", "tls1.2"])).unwrap();
+        assert_eq!(min.map(version_rank), Some(2));
+        assert_eq!(max.map(version_rank), Some(2));
+        assert_eq!(legacy, vec!["tls1.0".to_string()]);
+
+        let (min, max, legacy) = plan_versions(&v(&["tls1.1", "tls1.3"])).unwrap();
+        assert_eq!(min.map(version_rank), Some(3));
+        assert_eq!(max.map(version_rank), Some(3));
+        assert_eq!(legacy.len(), 1);
+
+        let (min, max, legacy) = plan_versions(&v(&["TLSv1.2", "tlsv1.3"])).unwrap();
+        assert_eq!(min.map(version_rank), Some(2));
+        assert_eq!(max.map(version_rank), Some(3));
+        assert!(legacy.is_empty());
+    }
+
+    /// 只含 legacy 版本时返回空范围（调用方回落 1.2–1.3，而不是把端口配死）。
+    #[test]
+    fn legacy_only_yields_empty_modern_range() {
+        let (min, max, legacy) = plan_versions(&v(&["tls1.0", "tlsv1.1"])).unwrap();
+        assert!(min.is_none() && max.is_none());
+        assert_eq!(legacy, vec!["tls1.0".to_string(), "tlsv1.1".to_string()]);
+    }
+
+    /// 无法识别的版本串仍要报错（热重载路径不跑 config 校验，必须在这里拦）。
+    #[test]
+    fn unknown_version_string_errors() {
+        assert!(plan_versions(&v(&["tls9.9"])).is_err());
+    }
+}
+
 /// Post-quantum hybrid + explicit group list (BoringSSL `SSL_CTX_set1_groups_list`).
 fn apply_groups(builder: &mut SslAcceptorBuilder, ssl: &SslConfig) -> Result<()> {
     let list = if !ssl.groups.is_empty() {
@@ -472,7 +568,19 @@ fn apply_groups(builder: &mut SslAcceptorBuilder, ssl: &SslConfig) -> Result<()>
     } else {
         return Ok(());
     };
-    builder.set_curves_list(&list)?;
+    // 一个拼错的组名会让 `set_curves_list` 报错 ⇒ build_acceptor 失败 ⇒ 该监听口
+    // **每条**连接都在构建 acceptor 处 soft-fail（热重载/面板保存不跑校验，只有
+    // `--check-config` 能提前拦）。boring 的 ErrorStack 不指名是哪个条目，所以这里
+    // 把配置原样带进错误文本，让运维在日志里直接看到可疑名字。**不做白名单拒绝**：
+    // BoringSSL 的组名集合很大（别名多），硬编码白名单会误拒合法名字。
+    builder
+        .set_curves_list(&list)
+        .with_context(|| {
+            format!(
+                "ssl.groups 设置失败：{list:?} 含 BoringSSL 不认识的组名（一个错误组名会让整个监听口\
+无法构建 acceptor、所有连接被丢弃）；常用组名如 X25519MLKEM768/X25519/P-256/P-384"
+            )
+        })?;
     Ok(())
 }
 

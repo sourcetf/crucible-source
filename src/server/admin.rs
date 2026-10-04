@@ -1221,7 +1221,13 @@ fn save_ssl(live: &Arc<LiveConfig>, v: &Json) -> Response<BoxBody> {
             })
         }
     };
-    if let Err(e) = cfg_edit::set_listener_key(&mut tree, port, "ssl", ssl_val) {
+    // 字段级合并（不是整表替换）：面板表单里没有的 ssl 键（ECH cover 证书族、
+    // OCSP 路径等）必须保留，否则「保存 TLS」会把它们静默删掉。
+    let merged = match cfg_edit::merge_listener_table(&mut tree, port, "ssl", ssl_val) {
+        Ok(m) => m,
+        Err(e) => return text_err(StatusCode::BAD_REQUEST, format!("{e:#}")),
+    };
+    if let Err(e) = cfg_edit::set_listener_key(&mut tree, port, "ssl", merged) {
         return text_err(StatusCode::BAD_REQUEST, format!("{e:#}"));
     }
     finish_write(live, &tree, "ssl saved")

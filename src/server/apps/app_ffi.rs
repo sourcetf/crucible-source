@@ -261,10 +261,17 @@ fn request_has_body(m: &http::Method, h: &http::HeaderMap) -> bool {
 pub(crate) fn rel_script_path(app: &AppRouteConfig, path: &str) -> String {
     let mut p = path.to_string();
     for prefix in &app.paths {
-        if prefix.is_empty() || prefix == "/" {
+        if prefix.is_empty() {
             continue;
         }
-        if p == *prefix || p.starts_with(&format!("{prefix}/")) {
+        // 归一化尾斜杠：配置写 `/php/` 时不能拿 `/php//` 去比前缀，否则应用前缀
+        // 永远剥不掉（脚本路径变成 docroot/php/x.php → 404）。与 apps::match_app 同口径。
+        let prefix = prefix.trim_end_matches('/');
+        if prefix.is_empty() {
+            // "/"（或全斜杠）：整段路径原样，无前缀可剥。
+            continue;
+        }
+        if p == prefix || p.starts_with(&format!("{prefix}/")) {
             p = p[prefix.len()..].to_string();
             if !p.starts_with('/') {
                 p.insert(0, '/');
@@ -437,8 +444,32 @@ fn load_engine(engine: &str, lib_path: &PathBuf) -> Result<Arc<EngineLib>> {
         bail!("missing engine lib {}", lib_path.display());
     }
     // libloading 0.8 type-safe: Symbol<T> 在获取时校验符号类型与 T 签名，
-    // 杜绝 std::mem::transmute 的隐藏 UB。RTLD_NOW | RTLD_GLOBAL = 立即解析 + 跨 .so 共享。
-    let lib = unsafe { libloading::Library::new(lib_path) }
+    // 杜绝 std::mem::transmute 的隐藏 UB。
+    //
+    // 但 `Library::new` 在 unix 上等价于 `open(path, RTLD_LAZY | RTLD_LOCAL)`
+    //（libloading 0.8.9 `os/unix/mod.rs:135` 源码核对），与规格 §7.1 铁律 3 / §16.8
+    // 要求的 `RTLD_NOW | RTLD_GLOBAL` **相反**：
+    //   * LAZY ⇒ 引擎 .so 里缺失/未解析的符号不在装载时报错，而是拖到第一次
+    //     `appengine_execute` 跳到未解析 PLT —— 崩的是整个 webserver 进程，而不是
+    //     干净地回 502（NOW 正是为了「加载期失败」）；
+    //   * LOCAL ⇒ 引擎及其依赖不进全局作用域，多个 `.so` 之间靠
+    //     `dlsym(RTLD_DEFAULT)` 共享符号的用法失效。
+    // 因此这里显式用 os::unix::Library::open 传 flag，再转回安全包装（From 已实现）。
+    #[cfg(unix)]
+    let lib: libloading::Library = {
+        let raw = unsafe {
+            libloading::os::unix::Library::open(
+                Some(lib_path),
+                libc::RTLD_NOW | libc::RTLD_GLOBAL,
+            )
+        }
+        .map_err(|e| anyhow::anyhow!("dlopen {}: {e}", lib_path.display()))?;
+        raw.into()
+    };
+    // 非 unix 无 dlopen flags 可用（Windows 用 LOAD_WITH_ALTERED_SEARCH_PATH 语义），
+    // 保持 libloading 默认。
+    #[cfg(not(unix))]
+    let lib: libloading::Library = unsafe { libloading::Library::new(lib_path) }
         .map_err(|e| anyhow::anyhow!("dlopen {}: {e}", lib_path.display()))?;
     // type-safe: 编译期校验符号签名 (Symbol<T> 内部实现)
     macro_rules! sym {
@@ -558,8 +589,18 @@ fn call_exec(
             Some(CStr::from_ptr(out.error).to_string_lossy().into_owned())
         };
         let headers = parse_result_headers(out.headers, out.headers_len);
+        // ABI 没有 body 容量字段，宿主无法真正校验 `body_len`（引擎写错长度时
+        // `from_raw_parts` 会越界读堆内存并把内容发给客户端）。这里至少加一条
+        // 上界：超过上游响应上限的长度一定是 bug，宁可 502 也不能跳进越界读。
         let body_out = if out.body.is_null() || out.body_len == 0 {
             Bytes::new()
+        } else if out.body_len > crate::server::h1::UPSTREAM_BODY_CAP {
+            let n = out.body_len;
+            (lib.free)(&mut out);
+            bail!(
+                "engine {engine} returned body_len {n} > {} (ABI violation)",
+                crate::server::h1::UPSTREAM_BODY_CAP
+            );
         } else {
             Bytes::copy_from_slice(std::slice::from_raw_parts(out.body, out.body_len))
         };
@@ -642,8 +683,18 @@ pub fn valid_header_kv(k: &str, v: &str) -> bool {
         && v.bytes().all(|b| (0x20..=0x7e).contains(&b) || b == b'\t')
 }
 
+/// 引擎给的状态码 → hyper 状态码。
+///
+/// 只接受 **200..=599**：0/1xx 不能作为最终响应 —— hyper 1.x 服务端 encode 对
+/// `is_informational()` 的最终响应会改成 500 并返回 `user_unsupported_status_code`，
+/// 直接掐掉连接（客户端看到断连/重试，而不是一个干净的 5xx）。`from_u16` 对 3 位以外
+/// 的非法值也会失败，统一回 500。
 fn status_code(status: i32) -> StatusCode {
-    StatusCode::from_u16(status.clamp(100, 599) as u16).unwrap_or(StatusCode::OK)
+    if !(200..=599).contains(&status) {
+        log::debug!("app_ffi: engine returned invalid status {status}; using 500");
+        return StatusCode::INTERNAL_SERVER_ERROR;
+    }
+    StatusCode::from_u16(status as u16).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR)
 }
 
 /// FFI 结果 → 完整响应；引擎未给 Content-Type 时回退 text/plain。
@@ -713,40 +764,107 @@ pub fn simple_response_from_outcome(outcome: ExecOutcome) -> Response<Bytes> {
 /// 强制卸载指定引擎的全部 .so（admin / 配置清理入口）。
 #[allow(dead_code)]
 pub fn shutdown_engine(engine: &str) {
-    let mut map = LIBS.lock();
-    let keys: Vec<String> = map
-        .iter()
-        .filter(|(_, l)| l.engine == engine)
-        .map(|(k, _)| k.clone())
-        .collect();
-    for k in keys {
-        if let Some(lib) = map.remove(&k) {
-            drop(lib); // Drop → shutdown + dlclose
-        }
-    }
+    // 只把条目取出来，**释放 LIBS 锁后再 drop**：drop 会执行 C 侧
+    // `appengine_shutdown()` + dlclose，而外部 .so 的 shutdown 可能阻塞
+    //（等自己的线程/IO）。持锁执行会把所有 `load_engine` 快路径一起卡死。
+    let removed: Vec<Arc<EngineLib>> = {
+        let mut map = LIBS.lock();
+        let keys: Vec<String> = map
+            .iter()
+            .filter(|(_, l)| l.engine == engine)
+            .map(|(k, _)| k.clone())
+            .collect();
+        keys.into_iter().filter_map(|k| map.remove(&k)).collect()
+    };
+    drop(removed); // 锁外 Drop → shutdown + dlclose
 }
 
 /// §7.3 热卸载：配置不再引用、且无在途请求（强引用仅剩缓存表）的引擎 →
 /// shutdown + dlclose。有在途请求时仅出表，句柄随最后一个引用释放。
 pub fn reconcile_unload(active: &[(String, String)]) {
-    let mut map = LIBS.lock();
-    let stale: Vec<String> = map
-        .iter()
-        .filter(|(_, l)| !active.iter().any(|(e, p)| e == &l.engine && p == &l.path))
-        .map(|(k, _)| k.clone())
-        .collect();
-    for k in stale {
-        let lib = match map.remove(&k) {
-            Some(l) => l,
-            None => continue,
-        };
+    // 同上：先出表、放锁，再在锁外 drop（shutdown 可能阻塞）。
+    let stale: Vec<Arc<EngineLib>> = {
+        let mut map = LIBS.lock();
+        let keys: Vec<String> = map
+            .iter()
+            .filter(|(_, l)| !active.iter().any(|(e, p)| e == &l.engine && p == &l.path))
+            .map(|(k, _)| k.clone())
+            .collect();
+        keys.into_iter().filter_map(|k| map.remove(&k)).collect()
+    };
+    for lib in stale {
         if Arc::strong_count(&lib) == 1 {
             log::info!("app_ffi: unload engine {} ({})", lib.engine, lib.path);
-            // Drop impl performs shutdown+dlclose.
-            drop(lib);
         } else {
-            log::debug!("app_ffi: engine {} in-flight; defer dlclose via Drop", lib.engine);
-            // Leave Arc to drop when in-flight requests finish.
+            log::debug!(
+                "app_ffi: engine {} in-flight; defer dlclose via Drop",
+                lib.engine
+            );
         }
+        // Drop impl performs shutdown+dlclose（无在途请求时；否则最后一个引用 Drop 时执行）。
+        drop(lib);
+    }
+}
+
+#[cfg(test)]
+mod status_and_rel_tests {
+    use super::*;
+
+    fn app_with_paths(paths: &[&str]) -> AppRouteConfig {
+        AppRouteConfig {
+            paths: paths.iter().map(|s| s.to_string()).collect(),
+            enabled: true,
+            engine: "php".into(),
+            socket: None,
+            extensions: vec!["php".into()],
+            index: None,
+            php_bin: None,
+            workers: 1,
+            source_dir: None,
+            out_dir: None,
+            entry: vec![],
+            watch: false,
+            docroot: None,
+            lib: None,
+            deps_dir: None,
+            init_timeout_secs: None,
+            libc: None,
+        }
+    }
+
+    /// 0/1xx 不能变成合法最终响应（hyper 会掐连接）；非法/越界值回 500。
+    #[test]
+    fn invalid_statuses_map_to_500() {
+        assert_eq!(status_code(0), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(status_code(100), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(status_code(199), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(status_code(99), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(status_code(200), StatusCode::OK);
+        assert_eq!(status_code(204), StatusCode::NO_CONTENT);
+        assert_eq!(status_code(500), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(status_code(599), StatusCode::from_u16(599).unwrap());
+        assert_eq!(status_code(600), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(status_code(-1), StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    /// `paths = ["/php/"]` 与 `"/php"` 必须等价：脚本相对路径都要剥掉前缀。
+    #[test]
+    fn rel_script_path_normalizes_trailing_slash_prefix() {
+        let app = app_with_paths(&["/php/"]);
+        assert_eq!(rel_script_path(&app, "/php/index.php"), "/index.php");
+        assert_eq!(rel_script_path(&app, "/php/sub/a.php"), "/sub/a.php");
+        // 目录请求回落 index（这里只验证前缀已剥掉）
+        assert_eq!(rel_script_path(&app, "/php/"), "/index.php");
+        // 非前缀不误伤（/phplint 不属于 /php）
+        assert_eq!(rel_script_path(&app, "/phplint/x.php"), "/phplint/x.php");
+    }
+
+    /// 无尾斜杠写法保持原有行为（回归）。
+    #[test]
+    fn rel_script_path_plain_prefix() {
+        let app = app_with_paths(&["/php"]);
+        assert_eq!(rel_script_path(&app, "/php/index.php"), "/index.php");
+        let app = app_with_paths(&["/lua/"]);
+        assert_eq!(rel_script_path(&app, "/lua/main.lua"), "/main.lua");
     }
 }

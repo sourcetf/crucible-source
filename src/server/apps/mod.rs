@@ -47,6 +47,7 @@ use crate::server::h1::{full, BoxBody};
 use crate::server::live_config::LiveConfig;
 use bytes::Bytes;
 use http::{Request, Response, StatusCode};
+use http_body_util::BodyExt;
 use hyper::body::Incoming;
 use std::net::SocketAddr;
 use std::path::Path;
@@ -104,8 +105,13 @@ pub fn would_handle(lc: &ListenerConfig, path: &str) -> bool {
     match_app(lc, path, ext).is_some()
 }
 
-/// H2/H3 路径：请求体已在协议层收齐（Request<Bytes>），P1-9 连同 P1-1 的 .env 变量
-/// 一起交给引擎；deps 冷路径 ensure 失败不阻塞响应（记日志后用空环境继续）。
+/// H2/H3 路径：请求体已在协议层收齐（`Request<Bytes>`）。分发语义必须与 h1 的
+/// [`dispatch`] **完全一致**（规格 §4 第 4 步 / §16.3 是协议无关的统一管线）——
+/// 旧实现无条件 `app_ffi::execute_simple`，于是没有 `libapp_php.so` / `libapp_jsp.so`
+/// 的引擎（php/jsp/原生 sidecar…）在 HTTP/2、HTTP/3 上恒 502（h1 正常），
+/// 而浏览器默认 ALPN 选 h2 ⇒ 主协议上应用全不可用。
+///
+/// 入口签名保持不变（h2.rs / h3.rs 不需要改）；内部分发见 [`dispatch_simple`]。
 pub async fn try_handle_simple(
     req: &Request<Bytes>,
     lc: &ListenerConfig,
@@ -120,7 +126,7 @@ pub async fn try_handle_simple(
     if let FileOpenMode::Preview | FileOpenMode::Download = lc.file_open_mode(path) {
         return None;
     }
-    let app = match_app(lc, path, ext)?;
+    let (app_idx, app) = match_app_indexed(lc, path, ext)?;
     let deps_env = match deps::try_cached(lc, app).await {
         Ok(e) => e,
         Err(e) => {
@@ -132,32 +138,164 @@ pub async fn try_handle_simple(
             deps::DepsEnv::default()
         }
     };
-    // 引擎执行失败**不能**变成 None。原先是 `execute_simple(...).await.ok()?`：
-    // 路由已经匹配上（match_app 成功）、引擎却报错时，返回 None 会被 h2/h3 当成
-    // 「没有 app 命中」，于是一路落到 proxy/static —— `.php` 文件被当静态文件
-    // 原样回给客户端，**源码泄露**（h2/h3 上默认配置即可复现；同一 URL 在 h1 上
-    // 是由 php-fpm 正常执行的）。这里改成与 h1 的 dispatch 一致：回 502。
-    let outcome = match app_ffi::execute_simple(req, lc, app, peer, &deps_env).await {
-        Ok(o) => o,
-        // 与 h1 的 dispatch 同一口径：`{e:#}` 只进**本地日志**，回给客户端的是固定文本
-        // —— 它是完整 anyhow 链，里面是 docroot/socket/被 spawn 的二进制绝对路径，而拿到它的
-        // 人只是任意一个能命中该路由的客户端（这是上一轮 15 处回显的漏网处）。
-        // 这里不能用 `engine_error()`：simple 路径的响应体是 `Bytes`（不是 `BoxBody`）。
-        Err(e) => {
-            crate::server::log_throttle::warn_every(
-                &format!("engine-err-simple::{}", app.engine),
-                std::time::Duration::from_secs(60),
-                &format!("app engine {} failed (simple path): {e:#}", app.engine),
-            );
-            return Some(
-                Response::builder()
-                    .status(StatusCode::BAD_GATEWAY)
-                    .body(Bytes::from_static(b"502 Bad Gateway (engine error)"))
-                    .unwrap(),
-            );
+    // 引擎执行失败**不能**变成 None。路由已经匹配上（match_app 成功）、引擎却报错时，
+    // 返回 None 会被 h2/h3 当成「没有 app 命中」，于是一路落到 proxy/static ——
+    // `.php` 文件被当静态文件原样回给客户端，**源码泄露**。与 h1 的 dispatch 一致：回 502。
+    Some(dispatch_simple(req, lc, app, app_idx, peer, &deps_env).await)
+}
+
+/// [`try_handle_simple`] 的 h1 等价分发（按 `app.engine` 分支）。
+///
+/// 各分支的落点与 h1 [`dispatch`] 一一对应，只是把 `Request<Incoming>` 换成已收齐的
+/// `Request<Bytes>`：
+///   * 纯 FFI 引擎（cgi/wsgi/asgi/psgi/rack/uwsgi…）→ `app_ffi::execute_simple`；
+///   * c/rust/go/lua/jsp/do/asp/aspnet/tsx/python/ruby/perl → 与 h1 同一条
+///     `sidecar_engine` fallback 链（FFI .so → 存活 UDS → `deps/bin/index` sidecar → 502）
+///     的字节版；
+///   * cgi_script → `cgi_script::execute_binary`（CGI 语义，字节入口本来就有）；
+///   * php/fastcgi → php.rs 的字节入口（`handle_bytes`）由 apps-php 组提供；
+///     在那之前保持「FFI 可用则执行、否则 502」——**绝不返回 None**（源码泄露缺口）。
+async fn dispatch_simple(
+    req: &Request<Bytes>,
+    lc: &ListenerConfig,
+    app: &AppRouteConfig,
+    app_idx: usize,
+    peer: SocketAddr,
+    deps_env: &deps::DepsEnv,
+) -> Response<Bytes> {
+    let engine = app.engine.to_ascii_lowercase();
+    match engine.as_str() {
+        // 与 h1 的 php / fastcgi 分支对应。php.rs 的 `Request<Bytes>` 版入口
+        // （`php::handle_bytes` / `php::handle_external_bytes`，apps-php 组）落地后
+        // 在这里接线；当前只有显式 `lib=`（libapp_php.so）形态可用。
+        "php" | "fastcgi" => {
+            if native_http::lib_available(app, &engine) {
+                simple_ffi(req, lc, app, peer, deps_env, &engine).await
+            } else {
+                simple_unavailable(
+                    &engine,
+                    format!(
+                        "engine `{engine}`: h2/h3 byte dispatch pending (no libapp_{engine}.so)"
+                    ),
+                )
+            }
         }
-    };
-    Some(app_ffi::simple_response_from_outcome(outcome))
+        // 与 h1 的 c/rust 分支对应：有 .so → FFI；无 .so → deps/bin/index 持久 sidecar
+        //（§16.9 降级路径，旧实现只在 h1 生效）。
+        "c" | "rust" => {
+            simple_sidecar_dispatch(req, lc, app, app_idx, peer, deps_env, &engine).await
+        }
+        // 与 h1 的 go 分支对应（h1 侧同步补上 sidecar 降级，见 dispatch）。
+        "go" => simple_sidecar_dispatch(req, lc, app, app_idx, peer, deps_env, &engine).await,
+        "lua" | "jsp" | "do" | "asp" | "aspnet" | "aspx" | "tsx" | "python" | "ruby" | "perl" => {
+            simple_sidecar_dispatch(req, lc, app, app_idx, peer, deps_env, &engine).await
+        }
+        "cgi" | "wsgi" | "asgi" | "psgi" | "rack" | "uwsgi" => {
+            simple_ffi(req, lc, app, peer, deps_env, &engine).await
+        }
+        "cgi_script" => match cgi_script_simple(req, lc, app, peer).await {
+            Ok(resp) => resp,
+            Err(e) => simple_engine_error("cgi_script", &e),
+        },
+        other => Response::builder()
+            .status(StatusCode::NOT_IMPLEMENTED)
+            .body(Bytes::from(format!("engine `{other}` not implemented")))
+            .unwrap(),
+    }
+}
+
+/// FFI 引擎执行（字节版）；错误只进节流日志，客户端拿固定 502 文本。
+async fn simple_ffi(
+    req: &Request<Bytes>,
+    lc: &ListenerConfig,
+    app: &AppRouteConfig,
+    peer: SocketAddr,
+    deps_env: &deps::DepsEnv,
+    engine: &str,
+) -> Response<Bytes> {
+    match app_ffi::execute_simple(req, lc, app, peer, deps_env).await {
+        Ok(o) => app_ffi::simple_response_from_outcome(o),
+        Err(e) => simple_engine_error(engine, &e),
+    }
+}
+
+/// sidecar/UDS 类引擎：与 h1 同一条 `sidecar_engine` fallback 链的字节版。
+async fn simple_sidecar_dispatch(
+    req: &Request<Bytes>,
+    lc: &ListenerConfig,
+    app: &AppRouteConfig,
+    app_idx: usize,
+    peer: SocketAddr,
+    deps_env: &deps::DepsEnv,
+    engine: &str,
+) -> Response<Bytes> {
+    match sidecar_engine::handle_with_fallback_simple(
+        req, lc, app, peer, app_idx, engine, deps_env,
+    )
+    .await
+    {
+        Ok(resp) => resp,
+        // 502 文本已由 sidecar_engine 给出（引擎不可用）；执行错误走统一节流日志。
+        Err(e) => simple_engine_error(engine, &e),
+    }
+}
+
+/// `cgi_script` 的字节版：script 解析与 h1 `cgi_script::handle` 同一口径
+///（剥应用前缀 → `script_rel` 防穿越 → 必须存在），执行复用 `execute_binary`。
+async fn cgi_script_simple(
+    req: &Request<Bytes>,
+    lc: &ListenerConfig,
+    app: &AppRouteConfig,
+    peer: SocketAddr,
+) -> anyhow::Result<Response<Bytes>> {
+    let docroot = app.docroot.clone().unwrap_or_else(|| lc.root.clone());
+    let rel = app_ffi::rel_script_path(app, req.uri().path());
+    let script = crate::server::admin_files::script_rel(&docroot, rel.trim_start_matches('/'))
+        .map_err(|e| anyhow::anyhow!("cgi_script script path: {e:#}"))?;
+    if !script.is_file() {
+        anyhow::bail!("cgi_script: script not found {}", script.display());
+    }
+    let resp = cgi_script::execute_binary(
+        &script,
+        req.method(),
+        req.uri(),
+        req.body().clone(),
+        lc,
+        app,
+        peer,
+    )
+    .await?;
+    let (parts, body) = resp.into_parts();
+    let bytes = body.collect().await.map(|c| c.to_bytes()).unwrap_or_default();
+    Ok(Response::from_parts(parts, bytes))
+}
+
+/// 与 h1 `engine_error` 同一口径：`{e:#}`（绝对路径/后端文本）只进**本地节流日志**，
+/// 客户端拿固定 502 文本（simple 路径响应体是 `Bytes`）。
+fn simple_engine_error(engine: &str, e: &anyhow::Error) -> Response<Bytes> {
+    crate::server::log_throttle::warn_every(
+        &format!("engine-err-simple::{engine}"),
+        std::time::Duration::from_secs(60),
+        &format!("app engine {engine} failed (simple path): {e:#}"),
+    );
+    Response::builder()
+        .status(StatusCode::BAD_GATEWAY)
+        .body(Bytes::from_static(b"502 Bad Gateway (engine error)"))
+        .unwrap()
+}
+
+/// 引擎不可用的固定 502（不含任何服务器路径/后端文本）。
+fn simple_unavailable(engine: &str, msg: String) -> Response<Bytes> {
+    crate::server::log_throttle::warn_every(
+        &format!("engine-unavailable-simple::{engine}"),
+        std::time::Duration::from_secs(60),
+        &format!("app engine {engine} unavailable (simple path): {msg}"),
+    );
+    Response::builder()
+        .status(StatusCode::BAD_GATEWAY)
+        .header(http::header::CONTENT_TYPE, "text/plain; charset=utf-8")
+        .body(Bytes::from_static(b"502 Bad Gateway (engine unavailable)"))
+        .unwrap()
 }
 
 pub fn match_app<'a>(
@@ -185,6 +323,26 @@ fn has_hidden_segment(path: &str) -> bool {
     })
 }
 
+/// 应用前缀匹配（`/php`、`/php/` 必须**等价**；`/` = 全站），前缀必须落在 `/` 边界上
+/// （`/phplint` 不命中 `/php`）。
+///
+/// 三处判据（`match_app_indexed` / `under_app_prefix` / `route_owns_path`）共用同一个
+/// 实现：此前只有 match_app 做了尾斜杠归一化，另外两处拿字面量比较 —— 配置写
+/// `paths = ["/php/"]`（Admin 只校验「以 / 开头」，合法）时 `format!("{p}/")` 变成
+/// `/php//`，于是 `under_app_prefix` / `route_owns_path` 恒 false：
+///   1. `static_files::app_private_path` 早退 ⇒ `GET /php/init.sh`、`/php/app.sql`、
+///      `/php/Cargo.toml` 等**应用私有文件被静态层原样外发**；
+///   2. 引擎 `enabled=false` 排障期间，`route_owns_path` 恒 false ⇒ `/php/index.php`
+///      **源码**（含数据库口令）被当普通文件下载。
+fn prefix_matches(prefix: &str, path: &str) -> bool {
+    let p = prefix.trim_end_matches('/');
+    if p.is_empty() {
+        // "/" 表示全站；""/"///" 这类异常写法按不匹配处理（与旧行为一致）。
+        return prefix == "/";
+    }
+    path == p || path.starts_with(&format!("{p}/"))
+}
+
 fn match_app_indexed<'a>(
     lc: &'a ListenerConfig,
     path: &str,
@@ -203,11 +361,7 @@ fn match_app_indexed<'a>(
             // 前缀必须落在 '/' 边界上，避免 /phplint 命中 /php。
             // 同时**归一化尾斜杠**：配置里写 `/php/` 时 `format!("{p}/")` 会变成 `/php//`，
             // 前缀永远匹配不上 ⇒ 该 app 静默不生效（排查起来毫无线索）。
-            a.paths.iter().any(|p| {
-                let p = p.trim_end_matches('/');
-                let p = if p.is_empty() { "/" } else { p };
-                p == "/" || path == p || path.starts_with(&format!("{p}/"))
-            })
+            a.paths.iter().any(|p| prefix_matches(p, path))
         };
         if !path_ok {
             return false;
@@ -230,9 +384,7 @@ pub fn under_app_prefix(lc: &ListenerConfig, path: &str) -> bool {
             // paths 为空 = 该路由对所有路径生效（与 match_app 的语义一致）
             return true;
         }
-        a.paths
-            .iter()
-            .any(|p| p == "/" || path == p || path.starts_with(&format!("{p}/")))
+        a.paths.iter().any(|p| prefix_matches(p, path))
     })
 }
 
@@ -254,9 +406,7 @@ pub fn route_owns_path(lc: &ListenerConfig, path: &str) -> bool {
         let path_ok = if a.paths.is_empty() {
             true
         } else {
-            a.paths
-                .iter()
-                .any(|p| p == "/" || path == p || path.starts_with(&format!("{p}/")))
+            a.paths.iter().any(|p| prefix_matches(p, path))
         };
         if !path_ok {
             return false;
@@ -312,10 +462,18 @@ async fn dispatch(
         "go" => {
             // Spec §7.3: prefer in-process FFI libapp_go.so when present (Linux).
             // OpenBSD: c-shared unsupported; missing .so is OK if go_shm_ipc + go-shm-server.
+            // 与 c/rust 同一决策树（§16.3）：`init.sh` 产出的 `deps/bin/index` 原生
+            // sidecar 也是合法降级 —— reconcile_apps_runtime 早就按 sidecar_available
+            // 检查 go，dispatch 不认的话「reconcile 认为可用、请求恒 502」。
             if native_http::lib_available(app, "go") {
                 match app_ffi::execute(req, lc, app, peer).await {
                     Ok(resp) => resp,
                     Err(e) => engine_error("app ffi", &e),
+                }
+            } else if native_http::sidecar_available(app, lc) {
+                match native_http::try_handle(req, lc, app, peer, app_idx).await {
+                    Ok(resp) => resp,
+                    Err(e) => engine_error("native sidecar", &e),
                 }
             } else {
                 #[cfg(all(feature = "go_shm_ipc", unix))]
@@ -565,6 +723,44 @@ mod script_rel_tests {
         assert!(super::would_handle(&lc, "/rust/index.rs"));
         assert!(super::would_handle(&lc, "/rust/foo.rs"));
         assert!(!super::would_handle(&lc, "/static/hello.txt"));
+    }
+
+    /// P1 回归：配置写尾斜杠（`paths = ["/php/"]`，Admin 只校验「以 / 开头」，合法）时，
+    /// 静态层的两个判据必须与 match_app **同一口径**（此前字面比较恒 false）：
+    /// `/php/init.sh`、`/php/app.sql` 等私有文件不得被静态层外发；引擎停用时
+    /// `/php/index.php` 源码不得被下载。`/phplint` 这类边界不误伤。
+    #[test]
+    fn trailing_slash_paths_normalized_in_all_predicates() {
+        let mut lc = listener_with_rust_app();
+        lc.apps[0].paths = vec!["/php/".into()];
+        lc.apps[0].engine = "php".into();
+        assert!(super::would_handle(&lc, "/php/index.php"), "分发判据");
+        assert!(super::under_app_prefix(&lc, "/php/init.sh"), "私有文件守门");
+        assert!(super::under_app_prefix(&lc, "/php/app.sql"));
+        assert!(super::under_app_prefix(&lc, "/php/Cargo.toml"));
+        // 引擎 disabled 时源码不能变公开（route_owns_path 不看 enabled）
+        lc.apps[0].enabled = false;
+        assert!(!super::would_handle(&lc, "/php/index.php"));
+        assert!(super::route_owns_path(&lc, "/php/index.php"));
+        // 前缀边界
+        assert!(!super::under_app_prefix(&lc, "/phplint/x.php"));
+        assert!(!super::route_owns_path(&lc, "/phplint/x.php"));
+        // 无尾斜杠写法同样成立（回归）
+        lc.apps[0].paths = vec!["/php".into()];
+        assert!(super::under_app_prefix(&lc, "/php/index.php"));
+    }
+
+    /// "/"（全站应用）与空/全斜杠异常写法的语义。
+    #[test]
+    fn prefix_matches_slash_semantics() {
+        assert!(super::prefix_matches("/", "/anything/at/all"));
+        assert!(super::prefix_matches("/php", "/php"));
+        assert!(super::prefix_matches("/php", "/php/x"));
+        assert!(super::prefix_matches("/php/", "/php/x"));
+        assert!(super::prefix_matches("/php///", "/php/x"));
+        assert!(!super::prefix_matches("/php", "/phplint"));
+        assert!(!super::prefix_matches("", "/php/x"));
+        assert!(!super::prefix_matches("///", "/php/x"));
     }
 
     #[test]

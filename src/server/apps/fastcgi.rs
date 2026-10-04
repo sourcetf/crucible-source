@@ -57,9 +57,16 @@ pub struct FcgiRequest {
     pub query_string: String,
     pub content_type: String,
     pub remote_addr: String,
+    pub remote_port: u16,
     pub server_name: String,
     pub server_port: u16,
     pub https: bool,
+    /// CGI SCRIPT_NAME 语义：脚本相对文档根的路径（如 `/index.php`），**不是**客户端 URI。
+    pub script_name: String,
+    /// CGI PATH_INFO：脚本名之后的剩余路径段，无则为空串。
+    pub path_info: String,
+    /// 客户端请求头：按 CGI 语义转成 `HTTP_*` params（hop-by-hop 头除外）。
+    pub headers: HeaderMap,
     pub body: Bytes,
     pub extra_params: HashMap<String, String>,
 }
@@ -119,40 +126,7 @@ where
     write_record(&mut out, FCGI_BEGIN_REQUEST, request_id, &br);
 
     // PARAMS
-    let mut params = BytesMut::new();
-    write_nv(&mut params, "REQUEST_METHOD", &req.method);
-    write_nv(&mut params, "SCRIPT_FILENAME", &req.script_filename);
-    write_nv(&mut params, "DOCUMENT_ROOT", &req.document_root);
-    write_nv(&mut params, "REQUEST_URI", &req.request_uri);
-    write_nv(&mut params, "QUERY_STRING", &req.query_string);
-    write_nv(&mut params, "CONTENT_TYPE", &req.content_type);
-    write_nv(
-        &mut params,
-        "CONTENT_LENGTH",
-        &req.body.len().to_string(),
-    );
-    write_nv(&mut params, "REMOTE_ADDR", &req.remote_addr);
-    write_nv(&mut params, "SERVER_NAME", &req.server_name);
-    write_nv(&mut params, "SERVER_PORT", &req.server_port.to_string());
-    write_nv(&mut params, "SERVER_PROTOCOL", "HTTP/1.1");
-    write_nv(&mut params, "GATEWAY_INTERFACE", "CGI/1.1");
-    write_nv(
-        &mut params,
-        "HTTPS",
-        if req.https { "on" } else { "off" },
-    );
-    // SCRIPT_NAME / PATH_INFO 简化：整段 URI 当 SCRIPT_NAME
-    write_nv(
-        &mut params,
-        "SCRIPT_NAME",
-        req.request_uri
-            .split('?')
-            .next()
-            .unwrap_or(&req.request_uri),
-    );
-    for (k, v) in &req.extra_params {
-        write_nv(&mut params, k, v);
-    }
+    let params = build_params(req);
     // 分块写 PARAMS（避免超大记录）；最后空 PARAMS 结束
     for chunk in params.chunks(65528) {
         write_record(&mut out, FCGI_PARAMS, request_id, chunk);
@@ -325,6 +299,81 @@ fn parse_cgi_response(raw: Bytes) -> Result<FcgiResponse> {
         headers,
         body,
     })
+}
+
+/// 组装 FastCGI PARAMS —— 它就是 CGI 环境，php-fpm 把每个 param 交给脚本
+/// （`$_SERVER` / `getenv()`）。此前这里**一个 `HTTP_*` 都不发**：PHP 拿不到
+/// `Cookie` / `Host` / `Authorization` / `User-Agent` / `Accept`，`$_COOKIE` 恒空、
+/// 依赖会话与登录的应用直接不可用（.env 之外的请求头全部丢失）。
+///
+/// 规则（CGI/1.1）：
+///   * `Content-Type` → `CONTENT_TYPE`、`Content-Length` → `CONTENT_LENGTH`（单独变量）；
+///   * 其余客户端请求头 → `HTTP_<大写，- 变 _>`；同名头用 `", "` 连接（Cookie 常见）；
+///   * hop-by-hop 头不下发——它们只约束当前这条 HTTP 连接，转发给上游会破坏语义。
+fn build_params(req: &FcgiRequest) -> BytesMut {
+    let mut params = BytesMut::new();
+    write_nv(&mut params, "REQUEST_METHOD", &req.method);
+    write_nv(&mut params, "SCRIPT_FILENAME", &req.script_filename);
+    write_nv(&mut params, "DOCUMENT_ROOT", &req.document_root);
+    write_nv(&mut params, "REQUEST_URI", &req.request_uri);
+    write_nv(&mut params, "QUERY_STRING", &req.query_string);
+    write_nv(&mut params, "CONTENT_TYPE", &req.content_type);
+    write_nv(&mut params, "CONTENT_LENGTH", &req.body.len().to_string());
+    write_nv(&mut params, "REMOTE_ADDR", &req.remote_addr);
+    write_nv(&mut params, "REMOTE_PORT", &req.remote_port.to_string());
+    write_nv(&mut params, "SERVER_NAME", &req.server_name);
+    write_nv(&mut params, "SERVER_PORT", &req.server_port.to_string());
+    write_nv(&mut params, "SERVER_PROTOCOL", "HTTP/1.1");
+    write_nv(&mut params, "SERVER_SOFTWARE", "crucible");
+    write_nv(&mut params, "GATEWAY_INTERFACE", "CGI/1.1");
+    write_nv(&mut params, "REQUEST_SCHEME", if req.https { "https" } else { "http" });
+    write_nv(&mut params, "HTTPS", if req.https { "on" } else { "off" });
+    // SCRIPT_NAME 是「相对文档根的脚本路径」、PATH_INFO 是脚本名之后剩余的路径段
+    // （路由型框架靠它做 pretty URL）。调用方已算好，这里只负责下发。
+    write_nv(&mut params, "SCRIPT_NAME", &req.script_name);
+    if !req.path_info.is_empty() {
+        write_nv(&mut params, "PATH_INFO", &req.path_info);
+    }
+
+    // HTTP_*：保持首次出现顺序，同名合并（避免 HashMap 迭代顺序造成难复现的差异）。
+    let mut http_params: Vec<(String, String)> = Vec::new();
+    for (name, value) in req.headers.iter() {
+        let lower = name.as_str().to_ascii_lowercase();
+        if is_hop_by_hop(&lower) || lower == "content-length" || lower == "content-type" {
+            continue;
+        }
+        let key = format!("HTTP_{}", lower.to_ascii_uppercase().replace('-', "_"));
+        let val = String::from_utf8_lossy(value.as_bytes()).into_owned();
+        match http_params.iter_mut().find(|(k, _)| *k == key) {
+            Some((_, v)) => {
+                v.push_str(", ");
+                v.push_str(&val);
+            }
+            None => http_params.push((key, val)),
+        }
+    }
+    for (k, v) in &http_params {
+        write_nv(&mut params, k, v);
+    }
+    // .env（deps）变量放在最后：它们是运维给应用的环境约定，不能被请求头覆盖。
+    for (k, v) in &req.extra_params {
+        write_nv(&mut params, k, v);
+    }
+    params
+}
+
+/// hop-by-hop 头（RFC 9110 §7.6.1）：只为当前连接服务，不得转发给上游。
+fn is_hop_by_hop(lower: &str) -> bool {
+    matches!(
+        lower,
+        "connection"
+            | "keep-alive"
+            | "proxy-connection"
+            | "te"
+            | "trailer"
+            | "transfer-encoding"
+            | "upgrade"
+    )
 }
 
 fn find_header_sep(raw: &[u8]) -> Option<usize> {

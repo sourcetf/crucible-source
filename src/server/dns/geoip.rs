@@ -55,6 +55,28 @@ fn lock_asn() -> std::sync::MutexGuard<'static, Option<(String, Option<ArcReader
     ASN_DB.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// 缓存键：路径 + 文件 mtime/大小。
+///
+/// **只看路径的缓存永不失效**：`ensure_synced` 用 `rename` 换掉 mmdb 文件后路径不变
+/// （新 inode），槽里的 `Arc<Reader<Vec<u8>>>`（mmap 全量内存快照）仍指向旧数据 ——
+/// 周期同步/面板同步每次都报成功，分线路却一直按旧库匹配；文件一时打不开时缓存的
+/// `(path, None)` 也会永久粘住，恢复后不再重试。带 mtime+len 后，文件被替换（或从
+/// 缺失恢复）在下一次查询就会重载，无需任何调用方配合。
+fn db_fingerprint(path: &str) -> String {
+    match std::fs::metadata(path) {
+        Ok(md) => {
+            let mtime = md
+                .modified()
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_nanos())
+                .unwrap_or(0);
+            format!("{path}|{mtime}|{}", md.len())
+        }
+        Err(_) => format!("{path}|absent"),
+    }
+}
+
 fn open_db(path: &str) -> Option<ArcReader> {
     if !Path::new(path).exists() {
         return None;
@@ -74,13 +96,14 @@ fn open_db(path: &str) -> Option<ArcReader> {
 fn city_db(cfg: &GeoMmdbCfg) -> Option<ArcReader> {
     let mut slot = lock_city();
     let path = cfg.city_db();
+    let key = db_fingerprint(&path);
     let need = match slot.as_ref() {
         None => true,
-        Some((p, _)) => p != &path,
+        Some((k, _)) => k != &key,
     };
     if need {
         let db = open_db(&path);
-        *slot = Some((path, db));
+        *slot = Some((key, db));
     }
     slot.as_ref().and_then(|(_, db)| db.clone())
 }
@@ -88,13 +111,14 @@ fn city_db(cfg: &GeoMmdbCfg) -> Option<ArcReader> {
 fn asn_db(cfg: &GeoMmdbCfg) -> Option<ArcReader> {
     let mut slot = lock_asn();
     let path = cfg.asn_db();
+    let key = db_fingerprint(&path);
     let need = match slot.as_ref() {
         None => true,
-        Some((p, _)) => p != &path,
+        Some((k, _)) => k != &key,
     };
     if need {
         let db = open_db(&path);
-        *slot = Some((path, db));
+        *slot = Some((key, db));
     }
     slot.as_ref().and_then(|(_, db): &(_, _)| db.clone())
 }
@@ -127,6 +151,15 @@ fn lookup_asn(cfg: &GeoMmdbCfg, ip: IpAddr) -> Option<GeoInfo> {
     Some(info)
 }
 
+/// ASN 归一：去空白、去 `AS` 前缀（**大小写不敏感**）。
+///
+/// 配置里写 `as13335` 必须命中库里的 `AS13335`/`13335`；原先
+/// `trim_start_matches("AS")` 大小写敏感，小写键静默失效（规则不命中且无日志）。
+fn normalize_asn(s: &str) -> String {
+    let up = s.trim().to_ascii_uppercase();
+    up.strip_prefix("AS").unwrap_or(&up).to_string()
+}
+
 /// 根据 cfg + 客户端 IP 返回匹配线路名 (None = default)
 pub fn line_for(cfg: &GeoMmdbCfg, ip: IpAddr) -> Option<String> {
     // 必须**两个库都查**再做字段级合并。原先用 `or_else`：GeoLite2-City 覆盖了
@@ -146,10 +179,9 @@ pub fn line_for(cfg: &GeoMmdbCfg, ip: IpAddr) -> Option<String> {
     };
     // 优先 asn → isp_contains → country
     if let Some(asn) = &info.asn {
-        let asn_num = asn.trim_start_matches("AS");
+        let asn_num = normalize_asn(asn);
         for (k, v) in &cfg.asn_to_line {
-            let kk = k.trim_start_matches("AS");
-            if kk == asn_num {
+            if normalize_asn(k) == asn_num {
                 return Some(v.clone());
             }
         }
@@ -180,8 +212,12 @@ pub fn ensure_synced(cfg: &GeoMmdbCfg, force: bool) -> Result<()> {
     }
     let dir = super::state_root().join("geo");
     std::fs::create_dir_all(&dir).context("create geo dir")?;
-    let target_city = dir.join("GeoLite2-City.mmdb");
-    let target_asn = dir.join("GeoLite2-ASN.mmdb");
+    // 下载目标 = 查询实际读取的路径（`cfg.city_db()`/`cfg.asn_db()`）。
+    // 旧实现固定写 `state/geo/GeoLite2-*.mmdb`：运维配了 `db_path_city`/`db_path_asn`
+    // 时，同步写 A、查询读 B —— 面板回 synced:true、时间戳刷新，实际使用的库永不更新
+    // （自同步对这类部署完全失效）。
+    let target_city = std::path::PathBuf::from(cfg.city_db());
+    let target_asn = std::path::PathBuf::from(cfg.asn_db());
     let stamp = dir.join("last_sync.txt");
     if !force && cfg.sync_days > 0 && stamp.exists() {
         let now_day = std::time::SystemTime::now()
@@ -204,6 +240,10 @@ pub fn ensure_synced(cfg: &GeoMmdbCfg, force: bool) -> Result<()> {
     fetch_edition(&cfg.license_key, "GeoLite2-City", &target_city)?;
     fetch_edition(&cfg.license_key, "GeoLite2-ASN", &target_asn)?;
     std::fs::write(&stamp, current_day_stamp()?.to_string())?;
+    // 新库已落盘：立刻清 reader 缓存，本次同步在同进程的**下一次查询**就生效。
+    // （db_fingerprint 的 mtime 键也会发现 rename 后的变化，这里是让面板
+    // status/日志同步地反映「刚更新」，不依赖下一次 lookup 的时序。）
+    reset_cache();
     Ok(())
 }
 
@@ -214,28 +254,19 @@ fn current_day_stamp() -> Result<u64> {
         .unwrap_or(0))
 }
 
-/// Mimosa 注入约束：host 必须是 MaxMind 官方下载域；任何重定向也强制 re-validate。
+/// Mimosa 注入约束：host 必须是 MaxMind 官方下载域；**每一跳**重定向都先校验再访问。
 fn fetch_edition(license: &str, edition: &str, dst: &Path) -> Result<()> {
     // license key 不能出现在日志里
     let url = format!(
         "https://download.maxmind.com/app/geoip_download?edition_id={edition}&suffix=tar.gz&license_key={license}"
     );
     log::info!("geoip: downloading edition={edition} → {}", dst.display());
-    // 主动 host 白名单校验
-    if let Err(e) = validate_outbound_host("download.maxmind.com") {
-        bail!("geoip host rejected: {e}");
+    // 自同步目标已改为查询路径（可被配置成别的目录），先保证父目录存在。
+    if let Some(parent) = dst.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("mkdir {}", parent.display()))?;
     }
-    let resp = ureq::get(&url)
-        .timeout(std::time::Duration::from_secs(120))
-        .call()
-        .context("maxmind http")?;
-    if resp.get_url() != url {
-        // 重定向到非白名单域 — 拒绝
-        if let Some(host) = url_host(resp.get_url()) {
-            validate_outbound_host(&host)
-                .with_context(|| format!("redirect host {host} rejected"))?;
-        }
-    }
+    let resp = http_get_allowlisted(&url, 5).with_context(|| format!("maxmind {edition}"))?;
     let mut data = Vec::with_capacity(
         resp.header("Content-Length")
             .and_then(|s| s.parse().ok())

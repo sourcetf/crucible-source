@@ -218,6 +218,10 @@ pub async fn handle_request(
         .get::<crate::server::access_log::EngineTag>()
         .map(|t| t.0)
         .unwrap_or("http");
+    // 响应体字节数：`size_hint().exact()` 对已知长度的 body（Bytes/Full/文件）返回真实值，
+    // 流式/分块 body 返回 None（日志里显示 `-`）。此前这里硬编码 None，导致 h1 访问日志的
+    // bytes 字段**恒为 `-`**，而 h2/h3 两条路径都已经在记真实长度 —— 同一字段随协议而异。
+    let resp_bytes = hyper::body::Body::size_hint(resp.body()).exact();
     crate::server::access_log::log_response(
         &live,
         peer,
@@ -225,7 +229,7 @@ pub async fn handle_request(
         &method,
         &path0,
         resp.status().as_u16(),
-        None,
+        resp_bytes,
         t0.elapsed(),
         engine,
     );

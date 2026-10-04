@@ -9,7 +9,7 @@
 
 use crate::config::Config;
 use crate::server::live_config::LiveConfig;
-use anyhow::{bail, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use serde_json::Value as Json;
 use std::path::Path;
 use std::sync::Arc;
@@ -49,34 +49,50 @@ pub const MAX_ADMIN_PATH_LEN: usize = 128;
 /// 几 KB）。2MiB 是实际配置的百倍量级，够用。
 pub const MAX_TOML_TEXT_BYTES: usize = 2 * 1024 * 1024;
 
-/// JSON → TOML 值递归转换。null 一律拒绝（config 里没有合法的 null 形态）。
+/// JSON → TOML 值递归转换。
+///
+/// **null 的语义是「省略该键」**（对象里跳过、数组里跳过），顶层 null 才是错误。
+///
+/// 为什么这样定：TOML 没有 null 形态，而**面板对每个空选填项都会发 `null`**
+/// （前端 `v || null`，且从 `/api/config/json` 读回来的对象本身就带 null）。
+/// 此前这里对 null 一律 `bail!`，于是「保存站点 / 保存 TLS / 保存应用引擎」
+/// 三块核心能力**恒 400**——面板上点了就报错，运维只能手改 config.toml。
 pub fn json_to_toml(v: &Json) -> Result<Toml> {
+    json_to_toml_opt(v)?.ok_or_else(|| anyhow!("config 字段不接受 null（请省略该键）"))
+}
+
+/// 与 [`json_to_toml`] 同义，但把 null 表示为 `None`（供容器类型跳过该元素/键）。
+fn json_to_toml_opt(v: &Json) -> Result<Option<Toml>> {
     Ok(match v {
-        Json::Null => bail!("config 字段不接受 null（请省略该键）"),
-        Json::Bool(b) => Toml::Boolean(*b),
+        Json::Null => None,
+        Json::Bool(b) => Some(Toml::Boolean(*b)),
         Json::Number(n) => {
             if let Some(i) = n.as_i64() {
-                Toml::Integer(i)
+                Some(Toml::Integer(i))
             } else if let Some(f) = n.as_f64() {
-                Toml::Float(f)
+                Some(Toml::Float(f))
             } else {
                 bail!("数字字面量无法表示为 TOML 数值")
             }
         }
-        Json::String(s) => Toml::String(s.clone()),
+        Json::String(s) => Some(Toml::String(s.clone())),
         Json::Array(a) => {
             let mut out = Vec::with_capacity(a.len());
             for item in a {
-                out.push(json_to_toml(item)?);
+                if let Some(t) = json_to_toml_opt(item)? {
+                    out.push(t);
+                }
             }
-            Toml::Array(out)
+            Some(Toml::Array(out))
         }
         Json::Object(o) => {
             let mut t = toml::map::Map::new();
             for (k, val) in o {
-                t.insert(k.clone(), json_to_toml(val)?);
+                if let Some(tv) = json_to_toml_opt(val)? {
+                    t.insert(k.clone(), tv);
+                }
             }
-            Toml::Table(t)
+            Some(Toml::Table(t))
         }
     })
 }
@@ -392,6 +408,37 @@ pub fn set_listener_key(
     Ok(())
 }
 
+/// 字段级合并：以磁盘上该 listener 现有的 `key` 表为基底，用 `incoming` 覆盖/新增；
+/// **`incoming` 里没有的键保留原值**。返回合并后的表（`None` = 删除该节，保持旧语义）。
+///
+/// 为什么需要：面板的 TLS 表单只包含它认识的字段，而 `ech_cover_cert` / `ech_cover_key` /
+/// `ech_cover_cert_ec` / `ech_cover_key_ec` / `ech_cover_ocsp_der_path` / `ocsp_der_path`
+/// 等**不在表单里**。此前 `set_listener_key(..., "ssl", Some(表单表))` 是整表替换 ⇒
+/// 点一次「保存 TLS」就把这些字段静默删掉：ECH 外层（cover）证书消失，主动探测者
+/// 能拿到内层真实证书，且面板既看不到也无法重新录入。
+pub fn merge_listener_table(
+    tree: &mut Toml,
+    port: u16,
+    key: &str,
+    incoming: Option<Toml>,
+) -> Result<Option<Toml>> {
+    let Some(inc) = incoming else { return Ok(None) };
+    let inc_tbl = match inc.as_table() {
+        Some(t) => t.clone(),
+        // 非表类型：保持原样（调用方负责校验），不做合并
+        None => return Ok(Some(inc)),
+    };
+    let existing = {
+        let t = listener_table_mut(tree, port)?;
+        t.get(key).and_then(|v| v.as_table()).cloned()
+    };
+    let mut base = existing.unwrap_or_default();
+    for (k, v) in inc_tbl {
+        base.insert(k, v);
+    }
+    Ok(Some(Toml::Table(base)))
+}
+
 /// 顶层小节（access_log / ip_access / geoip）整体替换。
 pub fn set_top_level_table(tree: &mut Toml, key: &str, value: Toml) -> Result<()> {
     root_table_mut(tree)?.insert(key.into(), value);
@@ -442,6 +489,25 @@ mod tests {
     use super::*;
 
     #[test]
+    /// 面板对空选填项发 null：必须按「省略该键」处理（否则保存站点/TLS/引擎恒 400）。
+    #[test]
+    fn json_to_toml_skips_nulls_in_containers() {
+        let j: Json = serde_json::from_str(
+            r#"{"port":9095,"root":"www-apps","cert":null,"versions":["tls1.2",null],"ssl":{"key":null,"prefer_tls13":true},"apps":[null,{"engine":"php"}]}"#,
+        )
+        .unwrap();
+        let t = json_to_toml(&j).unwrap();
+        assert_eq!(t.get("port").unwrap().as_integer(), Some(9095));
+        assert!(t.get("cert").is_none(), "null 键必须被省略");
+        assert_eq!(t.get("versions").unwrap().as_array().unwrap().len(), 1);
+        let ssl = t.get("ssl").unwrap();
+        assert!(ssl.get("key").is_none());
+        assert_eq!(ssl.get("prefer_tls13").unwrap().as_bool(), Some(true));
+        assert_eq!(t.get("apps").unwrap().as_array().unwrap().len(), 1);
+        // 顶层 null 仍是错误（请求体本身不对）
+        assert!(json_to_toml(&Json::Null).is_err());
+    }
+
     fn json_to_toml_roundtrip_shapes() {
         let j: Json = serde_json::from_str(
             r#"{"port":9095,"root":"www-apps","ssl":{"prefer_tls13":true},"file_open":["/x=preview"],"apps":[{"engine":"php","paths":["/php"]}]}"#,

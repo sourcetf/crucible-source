@@ -240,6 +240,57 @@ for eng in wsgi asgi psgi rack cgi uwsgi tsx; do
   build_stub_engine "${eng}"
 done
 
+# ---- Rack：MRI Ruby 真嵌入（rack_engine.c 的 CRUCIBLE_HAVE_RUBY 分支）------
+# 为什么这里单独编一次：build_script_ffi.sh 的 build_extra_engine 也补编 rack，但它把
+# `-DCRUCIBLE_HAVE_RUBY` 直接拼在 RB_CFLAGS 末尾（缺空格），最后一个 -I（OpenBSD 的
+# arch 头文件目录）会被拼坏 → ruby.h 找不到 ruby/config.h，编译失败（实测见
+# /tmp/eng-rack.log）。按 Lua 的模式在这里探测并以显式分隔的参数构建；探测/编译失败
+# 就退回上面 build_stub_engine 的「诚实失败」构建（不 spawn、不假 hello）。
+# 若 build_script_ffi.sh 之后又补编失败，它会保留这里的产物（log: keeping previous artifact）。
+build_rack_engine() {
+  local src="${ROOT}/libs/app-engines/rack/rack_engine.c"
+  local rb="" cand="" hdr="" arch="" libs="" ver=""
+  if [[ ! -f "${src}" ]]; then
+    echo "WARN: missing ${src}" >&2
+    return 0
+  fi
+  for cand in ruby ruby34 ruby33 ruby32 ruby31; do
+    if command -v "${cand}" >/dev/null 2>&1; then
+      rb="${cand}"
+      break
+    fi
+  done
+  if [[ -n "${rb}" ]]; then
+    hdr="$(${rb} -rrbconfig -e 'print RbConfig::CONFIG["rubyhdrdir"]' 2>/dev/null || true)"
+    arch="$(${rb} -rrbconfig -e 'print RbConfig::CONFIG["rubyarchhdrdir"]' 2>/dev/null || true)"
+    libs="$(${rb} -rrbconfig -e 'print RbConfig::CONFIG["LIBRUBYARG_SHARED"]' 2>/dev/null || true)"
+  fi
+  if [[ -z "${hdr}" || ! -f "${hdr}/ruby.h" ]]; then
+    local d
+    for d in /usr/local/include/ruby-* /usr/include/ruby-*; do
+      if [[ -f "${d}/ruby.h" ]]; then
+        hdr="${d}"
+        break
+      fi
+    done
+  fi
+  if [[ -z "${hdr}" || ! -f "${hdr}/ruby.h" ]]; then
+    echo "    rack: 未找到 ruby.h → 保留诚实失败构建（不 spawn）"
+    return 0
+  fi
+  if [[ -z "${libs}" ]]; then
+    ver="$(basename "${hdr}" | sed -E 's/^ruby-([0-9]+)\.([0-9]+).*/\1\2/')"
+    libs="-lruby${ver}"
+  fi
+  echo "==> building libapp_rack.so (in-process Ruby: ${hdr})"
+  if ! ${CC} ${CFLAGS} -I"${hdr}" ${arch:+-I"${arch}"} -DCRUCIBLE_HAVE_RUBY ${LDFLAGS} \
+      -o "${OUT}/libapp_rack.so" "${src}" ${COMMON_SRC} ${libs}; then
+    echo "WARN: rack in-process 构建失败 → 回退诚实失败 stub" >&2
+    build_stub_engine rack
+  fi
+}
+build_rack_engine
+
 echo "==> building libapp_asp.so (AxonASP engine)"
 if [[ -f "${ROOT}/libs/axonasp-ffi/axonasp_engine.c" ]]; then
   ${CC} ${CFLAGS} ${LDFLAGS} \

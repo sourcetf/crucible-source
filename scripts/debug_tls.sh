@@ -38,6 +38,10 @@ fi
 pkill -f 'webserver --config .*config-test.toml' 2>/dev/null || true
 sleep 1
 
+# 独立 DNS 状态根：否则测试实例会读生产的 state/dns/etc/panel.toml（[dns] 端口改不动、
+# 且调试过程产生的 zone 会写进生产 DNS 库）。
+export CRUCIBLE_DNS_STATE_ROOT="${CRUCIBLE_DNS_STATE_ROOT:-/crucible/state/dns-test}"
+mkdir -p "$CRUCIBLE_DNS_STATE_ROOT"
 RUST_LOG="${RUST_LOG:-info}" ./target/release/webserver --config "$CFG" >"$LOG" 2>&1 &
 WPID=$!
 echo "$WPID" >/tmp/crucible-test.pid

@@ -15,6 +15,15 @@ CFG="${1:-config-test.toml}"
 BIN="./target/release/webserver"
 LOG="${CRUCIBLE_TEST_LOG:-/tmp/crucible-test.log}"
 
+# TLS 版本探针：仓库自带 scripts/tls_probe.py。硬编码 /tmp/_tlsprobe.py 的旧写法
+# 在**任何**机器上都不存在那个文件 ⇒ 硬门必然报 "TLS broken after sslv2"（假失败），
+# 而其它 TLS 冒烟全带 `|| true`（假通过）。两者一起把「TLS 到底行不行」掩盖掉了。
+TLSPROBE="${TLSPROBE:-/crucible/scripts/tls_probe.py}"
+if [ ! -f "$TLSPROBE" ]; then
+  echo "FAIL: TLS probe missing: $TLSPROBE (仓库应自带 scripts/tls_probe.py)"
+  exit 1
+fi
+
 echo "==> ensure certs"
 # 仓库自带测试证书。不再用 openssl 现场生成（用户要求项目不依赖 openssl）。
 if [ ! -f cert_ec.pem ] || [ ! -f key_ec.pem ]; then
@@ -106,11 +115,11 @@ curl -sS --max-time 5 -u admin:admin "http://127.0.0.1:19095/__metrics" 2>/dev/n
 echo
 
 echo "==> TLS 1.3 :18443"
-python3 /tmp/_tlsprobe.py 18443 TLSv1_3 || true
+python3 "$TLSPROBE" 18443 TLSv1_3
 echo "==> TLS 1.2 :19445"
-python3 /tmp/_tlsprobe.py 19445 TLSv1_2 || true
+python3 "$TLSPROBE" 19445 TLSv1_2
 echo "==> TLS 1.3 fair :19446"
-python3 /tmp/_tlsprobe.py 19446 TLSv1_3 || true
+python3 "$TLSPROBE" 19446 TLSv1_3
 
 echo "==> H3 QUIC :18443 (optional — body OK even if stream reset)"
 if command -v curl >/dev/null 2>&1 && curl --version 2>/dev/null | grep -qi http3; then
@@ -126,8 +135,9 @@ else
 fi
 echo
 echo "==> TLS 1.0 NSS path :18443"
-# TLS1.1 探针（python3 + 系统 LibreSSL；openssl 已从依赖中移除）
-python3 /tmp/_tlsprobe.py 18443 TLSv1_1 || true
+# TLS1.1 走 NSS 遗留栈（python3 + 系统 TLS 栈；openssl 已从依赖中移除）。
+# 平台安全级别可能直接拒绝钉死 TLS1.1 —— 那种情况下这不是服务端故障，故只提示不失败。
+python3 "$TLSPROBE" 18443 TLSv1_1 || echo "(TLS1.1 probe: platform/legacy stack not available — non-fatal)"
 
 echo "==> SSLv2 ClientHello probe (no crash) :18443"
 CRUCIBLE_TEST_PID="$WPID" python3 scripts/test_sslv2_probe.py --host 127.0.0.1 --port 18443 --settle-ms 1500 || {
@@ -137,7 +147,7 @@ if kill -0 "$WPID" 2>/dev/null; then echo "server still alive after sslv2 probe"
 
 # Post-sslv2: verify TLS still works (server not wedged)
 echo "==> post-sslv2 TLS1.3 still works :18443"
-python3 /tmp/_tlsprobe.py 18443 TLSv1_3 || {
+python3 "$TLSPROBE" 18443 TLSv1_3 || {
   echo "FAIL: TLS broken after sslv2"; exit 1
 }
 

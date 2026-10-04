@@ -59,7 +59,7 @@ pub async fn handle(
 
     let docroot = resolve_docroot(lc, app);
     let uri_path = req.uri().path().to_string();
-    let script = resolve_script(&docroot, app, &uri_path)?;
+    let (script, path_info) = resolve_script(&docroot, app, &uri_path)?;
     if !script.is_file() {
         // **不要把路径发回客户端**：`script.display()` 是 `/crucible/www-apps/php/...` 这种
         // **服务器绝对路径**（docroot 泄露），而请求者只是任意能命中该路由的客户端。
@@ -103,6 +103,9 @@ pub async fn handle(
         .and_then(|v| v.to_str().ok())
         .unwrap_or("")
         .to_string();
+    // CGI 环境需要客户端请求头（Cookie/Host/Authorization/UA…）——必须在 into_body 之前取，
+    // req 被消耗后就拿不到了。此前这条路径一个 HTTP_* 都不发，$_COOKIE 恒空。
+    let req_headers = req.headers().clone();
     // 任务 6（OOM 防护）：引擎请求体上限 32MiB，超限直接 413（不再无界缓冲）。
     let body = match http_body_util::Limited::new(
         req.into_body(),
@@ -122,6 +125,7 @@ pub async fn handle(
 
     let docroot_abs = canonicalize_display(&docroot);
     let script_abs = canonicalize_display(&script);
+    let script_name = script_name_from_uri(&uri_path, &path_info);
 
     let fcgi = FcgiRequest {
         method,
@@ -131,6 +135,10 @@ pub async fn handle(
         query_string: query,
         content_type,
         remote_addr: peer.ip().to_string(),
+        remote_port: peer.port(),
+        script_name,
+        path_info,
+        headers: req_headers,
         server_name: lc
             .server_name
             .clone()
@@ -166,7 +174,7 @@ pub async fn handle_external(
     let addr = FcgiAddr::parse(sock)?;
     let docroot = resolve_docroot(lc, app);
     let uri_path = req.uri().path().to_string();
-    let script = resolve_script(&docroot, app, &uri_path)?;
+    let (script, path_info) = resolve_script(&docroot, app, &uri_path)?;
     let method = req.method().as_str().to_string();
     let query = req.uri().query().unwrap_or("").to_string();
     let request_uri = req
@@ -180,6 +188,8 @@ pub async fn handle_external(
         .and_then(|v| v.to_str().ok())
         .unwrap_or("")
         .to_string();
+    // 同 php-fpm 路径：HTTP_* 需要请求头，必须在 into_body 之前克隆。
+    let req_headers = req.headers().clone();
     // 任务 6（OOM 防护）：同上，32MiB 上限。
     let body = match http_body_util::Limited::new(
         req.into_body(),
@@ -197,14 +207,21 @@ pub async fn handle_external(
         }
     };
 
+    let script_abs = canonicalize_display(&script);
+    let script_name = script_name_from_uri(&uri_path, &path_info);
+
     let fcgi = FcgiRequest {
         method,
-        script_filename: canonicalize_display(&script),
+        script_filename: script_abs,
         document_root: canonicalize_display(&docroot),
         request_uri,
         query_string: query,
         content_type,
         remote_addr: peer.ip().to_string(),
+        remote_port: peer.port(),
+        script_name,
+        path_info,
+        headers: req_headers,
         server_name: lc
             .server_name
             .clone()
@@ -559,7 +576,11 @@ fn check_docroot_perm(p: &std::path::Path) {
     }
 }
 
-fn resolve_script(docroot: &Path, app: &AppRouteConfig, uri_path: &str) -> Result<PathBuf> {
+fn resolve_script(
+    docroot: &Path,
+    app: &AppRouteConfig,
+    uri_path: &str,
+) -> Result<(PathBuf, String)> {
     let mut path = uri_path.to_string();
     // Strip app path prefix if configured (e.g. /php/index.php → index.php under docroot)
     // 必须匹配整段或 "/" 边界，避免 /phpfoo 命中 /php 前缀（与 mod.rs 一致）.
@@ -576,8 +597,34 @@ fn resolve_script(docroot: &Path, app: &AppRouteConfig, uri_path: &str) -> Resul
         let index = app.index.as_deref().unwrap_or("index.php");
         path = format!("/{index}");
     }
+    // 从最长候选开始逐级回退（nginx fastcgi_split_path_info 语义）：
+    //   /php/app.php/foo/bar → 脚本 <docroot>/app.php，PATH_INFO=/foo/bar
+    // 此前把整段路径当文件名 ⇒ 这类 URI 一律 404，而 pretty-URL 框架默认这么请求。
+    // `script_under_docroot` 自带穿越校验，回退不会放宽安全性。
+    let mut end = path.len();
+    loop {
+        if let Ok(p) = fastcgi::script_under_docroot(docroot, &path[..end]) {
+            if p.is_file() {
+                return Ok((p, path[end..].to_string()));
+            }
+        }
+        match path[..end].rfind('/') {
+            Some(0) | None => break,
+            Some(pos) => end = pos,
+        }
+    }
+    // 都找不到：返回整段路径（调用方负责 404 + 节流日志）。
     let script = fastcgi::script_under_docroot(docroot, &path)?;
-    Ok(script)
+    Ok((script, String::new()))
+}
+
+/// `SCRIPT_NAME` = 请求 URI 去掉 PATH_INFO 之后的部分（path_info 为空时就是整个 URI）。
+fn script_name_from_uri(uri_path: &str, path_info: &str) -> String {
+    if !path_info.is_empty() && uri_path.ends_with(path_info) {
+        uri_path[..uri_path.len() - path_info.len()].to_string()
+    } else {
+        uri_path.to_string()
+    }
 }
 
 fn runtime_key(port: u16, app_idx: usize) -> String {
@@ -603,4 +650,23 @@ fn canonicalize_display(p: &Path) -> String {
         .unwrap_or_else(|_| abs_path(p))
         .display()
         .to_string()
+}
+
+#[cfg(test)]
+mod cgi_names_tests {
+    use super::script_name_from_uri;
+
+    #[test]
+    fn script_name_follows_cgi_semantics() {
+        assert_eq!(
+            script_name_from_uri("/php/index.php", ""),
+            "/php/index.php"
+        );
+        assert_eq!(
+            script_name_from_uri("/php/index.php/foo/bar", "/foo/bar"),
+            "/php/index.php"
+        );
+        // path_info 为空（目录索引）→ SCRIPT_NAME 取整个 URI
+        assert_eq!(script_name_from_uri("/php/", ""), "/php/");
+    }
 }

@@ -1,0 +1,86 @@
+# config-features.toml — 功能验收用（工号 1009）
+# 覆盖：autoindex+上传+断点续传、file_open、页面规则、basic_auth、反向代理、端口复用（80）。
+# 端口：18100 功能口 / 18101 basic-auth / 18102 反代口 / 18191 反代后端 / 80 端口复用
+# 与 config.toml、config-test.toml 的端口**不冲突**。
+
+[access_log]
+enabled = true
+level = "info"
+
+[admin]
+path = "/__admin"
+realm = "Crucible Features"
+# 不给 listeners_allow：管理面在下述所有 listener 上可达（测试方便）
+[[admin.users]]
+username = "admin"
+password_hash = "$argon2id$v=19$m=19456,t=2,p=1$2BEraDqSHm0CF6n4ZuUPdQ$nCniE+r1nkJGpbH33YHonhLYxemvjiycMqBBVV0tLxs"
+
+[dns]
+enabled = false
+
+[geoip]
+enabled = false
+
+[ip_access]
+allow = []
+deny = []
+
+# ---- 反代后端（静态）----
+[[listeners]]
+address = "127.0.0.1"
+port = 18191
+root = "www-features-backend"
+http_versions = ["h1"]
+server_name = "backend.local"
+
+# ---- 功能口：autoindex + 上传 + file_open + 页面规则 ----
+[[listeners]]
+address = "127.0.0.1"
+port = 18100
+root = "www-features"
+http_versions = ["h1", "h2"]
+server_name = "features.local"
+autoindex = { enabled = true, paths = ["/"], enable_upload = true, upload_threads = 4 }
+file_open = [
+    "/secret.txt=download",
+    "/manual.pdf=preview",
+]
+page_rules = [
+    { match_url = "/old/*", action = "redirect", target = "/new/" },
+    { match_url = "/blocked/*", action = "block" },
+    { match_url = "/hdrs/*", action = "header", target = "X-Page-Rule: yes" },
+]
+
+# ---- basic_auth 口 ----
+[[listeners]]
+address = "127.0.0.1"
+port = 18101
+root = "www-features-auth"
+http_versions = ["h1"]
+server_name = "auth.local"
+basic_auth = { realm = "Restricted", username = "u1", password_hash = "$argon2id$v=19$m=19456,t=2,p=1$2BEraDqSHm0CF6n4ZuUPdQ$nCniE+r1nkJGpbH33YHonhLYxemvjiycMqBBVV0tLxs" }
+
+# ---- 反向代理口 ----
+[[listeners]]
+address = "127.0.0.1"
+port = 18102
+root = "www-features-proxy"
+http_versions = ["h1"]
+server_name = "proxy.local"
+
+[[listeners.proxy_rules]]
+path = "/api"
+upstream = "http://127.0.0.1:18191"
+ssl_mode = "off"
+modify_request_headers = { "X-From-Proxy" = "1" }
+modify_response_headers = { "X-Proxy-Resp" = "crucible" }
+
+# ---- 端口复用：80 上 HTTP 与 HTTPS 共存（规格 §5）----
+# 明文请求 → 301 + HSTS 到 sni-name 的 https；TLS 请求 → 按 SNI 直通到 TLS listener。
+[[listeners]]
+address = "0.0.0.0"
+port = 80
+root = "www-features-port80"
+port_reuse = true
+server_name = "fair-plain.crucible.local"
+http_versions = ["h1", "h2"]

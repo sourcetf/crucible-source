@@ -7,6 +7,10 @@
 //! - `pass`:     反向代理到 target(完整上游 URL;http:// → 不校验上游 TLS)
 //! - `cache`:    响应加 Cache-Control(target 为指令值,缺省 public, max-age=3600)
 //! - `header`:   响应加自定义响应头,target 为 "Name: value"
+//!
+//! **评估顺序三协议统一**（唯一入口 [`plan`]）：rewrite → redirect/block → pass →
+//! 响应头（`response_headers` 按改写后的路径求值）。rewrite 命中后的路径必须重新
+//! 经过 block/redirect，否则改写可以绕过安全规则（h2/h3 旧实现即如此）。
 
 use crate::config::ListenerConfig;
 use crate::server::h1::{full, BoxBody};
@@ -42,12 +46,56 @@ pub fn apply(lc: &ListenerConfig, req: &Request<Incoming>) -> Option<Response<Bo
     None
 }
 
-/// h2/h3 使用的简化版本:返回 (status, location, _) 三元组,由调用方组装响应。
-pub fn apply_simple(lc: &ListenerConfig, path: &str) -> Option<(StatusCode, String)> {
+/// 页面规则的**统一评估结果**（`plan` 的返回值）。
+///
+/// 顺序固定为 h1 的语义：**rewrite（先改写路径）→ redirect/block（在新路径上判定）
+/// → pass（也在新路径上判定）**。h2/h3 此前是「先 redirect/block 再 rewrite 且改写后
+/// 不再判定」，导致 `rewrite /secret/* → /admin` 的流量绕过 `block /admin*`（浏览器默认
+/// 走 h2/h3，安全规则整体失效）。
+#[derive(Debug, Default)]
+pub struct RulePlan {
+    /// 命中的 rewrite 之后的**新请求路径**（调用方需要用它更新 `req.uri()`，并用它
+    /// 调用 `response_headers`）。
+    pub rewritten: Option<String>,
+    /// 命中 redirect(状态码, Location) / block(403, None)：调用方立即返回响应。
+    /// Location 已通过 `HeaderValue` 校验（非法 target 跳过该规则，见 `scan_immediate`）。
+    pub immediate: Option<(StatusCode, Option<String>)>,
+    /// 命中 pass：返回 (match_url, upstream)。
+    pub pass: Option<(String, String)>,
+}
+
+/// 页面规则的**唯一评估入口**：一次给出 rewrite/immediate/pass 三项决策，
+/// 三者顺序与 h1 一致（见 [`RulePlan`]）。h2/h3 应改用它（其调用点不在本文件）。
+///
+/// 副作用为零：不改请求、不发响应、`pass`/`immediate` 只做判定。
+pub fn plan(lc: &ListenerConfig, path: &str) -> RulePlan {
+    // 1) rewrite 先行：后续所有判定都必须基于改写后的路径（与 h1 一致）。
+    let rewritten = rewrite_path(lc, path);
+    let effective = rewritten.as_deref().unwrap_or(path);
+    // 2) redirect/block 在**新路径**上判定。
+    let immediate = scan_immediate(lc, effective);
+    // 3) pass 同样基于新路径；命中 immediate 时 pass 不再有意义（调用方先返回 immediate）。
+    let pass = if immediate.is_some() {
+        None
+    } else {
+        pass_upstream(lc, effective)
+    };
+    RulePlan {
+        rewritten,
+        immediate,
+        pass,
+    }
+}
+
+/// 立即响应类动作（redirect/block）的扫描（不含 rewrite；调用方必须已把路径改写好）。
+fn scan_immediate(
+    lc: &ListenerConfig,
+    path: &str,
+) -> Option<(StatusCode, Option<String>)> {
     for rule in &lc.page_rules {
         if path_matches(&rule.match_url, path) {
             match rule.action.as_str() {
-                "block" => return Some((StatusCode::FORBIDDEN, String::new())),
+                "block" => return Some((StatusCode::FORBIDDEN, None)),
                 "redirect" => {
                     let target = rule.target.clone().unwrap_or_else(|| "/".into());
                     let (status, loc) = match target.split_once(':') {
@@ -56,7 +104,7 @@ pub fn apply_simple(lc: &ListenerConfig, path: &str) -> Option<(StatusCode, Stri
                         Some(("308", u)) => (StatusCode::PERMANENT_REDIRECT, u.to_string()),
                         _ => (StatusCode::FOUND, target),
                     };
-                    // 这个 API 只能返回 `(StatusCode, String)`，而 h2/h3 的调用方是
+                    // 这个 API 只能返回可选的 Location，而 h2/h3 的调用方是
                     // `Response::builder().header(LOCATION, loc).body(..).unwrap()` 组装的
                     // —— `loc` 含控制字符时 `HeaderValue` 构造失败、`.body()` 直接 panic，
                     // **每个命中该规则的请求**都把连接打死（h1 那条路径早已降级为
@@ -68,13 +116,25 @@ pub fn apply_simple(lc: &ListenerConfig, path: &str) -> Option<(StatusCode, Stri
                         );
                         continue;
                     }
-                    return Some((status, loc));
+                    return Some((status, Some(loc)));
                 }
                 _ => {}
             }
         }
     }
     None
+}
+
+/// h2/h3 使用的简化版本:返回 (status, location) 二元组,由调用方组装响应。
+///
+/// **rewrite 在判定之前**（走 `plan`）：h2/h3 的调用点保持「先调本函数、命中就返回；
+/// 否则再调 `rewrite_path` 更新请求」的形状即可，改写后的路径会先被 block/redirect
+/// 判定，不再绕过。
+pub fn apply_simple(lc: &ListenerConfig, path: &str) -> Option<(StatusCode, String)> {
+    let decision = plan(lc, path);
+    decision
+        .immediate
+        .map(|(status, loc)| (status, loc.unwrap_or_default()))
 }
 
 fn redirect_response(target: String) -> Response<BoxBody> {
@@ -186,6 +246,16 @@ pub fn response_headers(lc: &ListenerConfig, path: &str) -> Vec<(String, String)
                     {
                         continue;
                     }
+                    // 统一黑名单（headers_mod::response_header_injectable）：Content-Length /
+                    // Transfer-Encoding / Connection / Host 等定界与逐跳头一律拒绝。
+                    // 过滤放在**源头**（这里）意味着所有调用方——包括 h2/h3 直接对
+                    // response_headers 结果做 `.insert()` 的内联循环——都自动受保护。
+                    if !crate::server::headers_mod::response_header_injectable(name) {
+                        log::warn!(
+                            "page_rules header: 拒绝注入定界/逐跳响应头 {name:?}（CL/TE/Connection/Host 等）"
+                        );
+                        continue;
+                    }
                     out.push((name.to_string(), value.to_string()));
                 }
             }
@@ -294,6 +364,75 @@ mod tests {
         assert_eq!(
             apply_simple(&ok, "/ok"),
             Some((StatusCode::MOVED_PERMANENTLY, "https://x/y".to_string()))
+        );
+    }
+
+    /// P2 回归：h2/h3 的 `apply_simple` 必须先 rewrite 再判 block/redirect，
+    /// 否则 rewrite 到被 block 的路径会绕过 block（h1 一直是按新路径判定）。
+    #[test]
+    fn apply_simple_evaluates_after_rewrite_like_h1() {
+        let lc = lc_with(vec![
+            rule("/secret/*", "rewrite", Some("/admin")),
+            rule("/admin*", "block", None),
+        ]);
+        assert_eq!(
+            apply_simple(&lc, "/secret/x"),
+            Some((StatusCode::FORBIDDEN, String::new())),
+            "rewrite 之后的路径必须再经 block 判定"
+        );
+        assert_eq!(apply_simple(&lc, "/public/x"), None);
+
+        let lc2 = lc_with(vec![
+            rule("/old/*", "rewrite", Some("/new")),
+            rule("/new*", "redirect", Some("301:/moved")),
+        ]);
+        assert_eq!(
+            apply_simple(&lc2, "/old/a"),
+            Some((StatusCode::MOVED_PERMANENTLY, "/moved".to_string()))
+        );
+    }
+
+    /// `plan` 是单一入口：rewrite/immediate/pass 三项一次算出且顺序固定。
+    #[test]
+    fn plan_covers_rewrite_immediate_and_pass() {
+        let lc = lc_with(vec![
+            rule("/go/*", "rewrite", Some("/api")),
+            rule("/api/*", "pass", Some("http://127.0.0.1:8080")),
+        ]);
+        let p = plan(&lc, "/go/v1");
+        assert_eq!(p.rewritten.as_deref(), Some("/api/v1"));
+        assert!(p.immediate.is_none());
+        let (murl, up) = p.pass.unwrap();
+        assert_eq!(murl, "/api/*");
+        assert_eq!(up, "http://127.0.0.1:8080");
+
+        // immediate 命中时 pass 不再给出（调用方先返回 immediate）
+        let lc2 = lc_with(vec![
+            rule("/x/*", "rewrite", Some("/y")),
+            rule("/y*", "block", None),
+            rule("/y*", "pass", Some("http://127.0.0.1:1")),
+        ]);
+        let p2 = plan(&lc2, "/x/a");
+        assert_eq!(p2.immediate.as_ref().unwrap().0, StatusCode::FORBIDDEN);
+        assert!(p2.pass.is_none());
+    }
+
+    /// P2 回归：`header` 动作不得注入 Content-Length/Transfer-Encoding/Connection/Host
+    /// （h1 会原样写出错的 CL ⇒ 响应走私；h2/h3 走同一 `response_headers`，自动受保护）。
+    #[test]
+    fn response_headers_reject_framing_and_hop_headers() {
+        let lc = lc_with(vec![
+            rule("/a", "header", Some("Content-Length: 5")),
+            rule("/a", "header", Some("Transfer-Encoding: chunked")),
+            rule("/a", "header", Some("Connection: keep-alive")),
+            rule("/a", "header", Some("Host: evil.tld")),
+            rule("/a", "header", Some("X-Frame-Options: DENY")),
+        ]);
+        let hs = response_headers(&lc, "/a");
+        assert_eq!(
+            hs,
+            vec![("X-Frame-Options".to_string(), "DENY".to_string())],
+            "只有正常头能通过：{hs:?}"
         );
     }
 

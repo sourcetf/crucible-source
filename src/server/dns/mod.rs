@@ -49,6 +49,15 @@ pub struct DnsConfig {
     /// 全局 AXFR 传出白名单（IPv4/IPv6/CIDR；空 = none）
     #[serde(default)]
     pub axfr_out_acl: Vec<String>,
+    /// 递归上游转发器（IP 字面量）。空 = 不做 forward（按提示符做迭代查询）。
+    /// 屏蔽迭代查询、只放行递归查询的网络里（本机实测就是这种情况），public 递归
+    /// 不配这个完全不可用。仅 modes.recursive = true 时写进 named.conf。
+    #[serde(default)]
+    pub forwarders: Vec<String>,
+    /// `first` | `only`；仅 forwarders 非空时有意义。None/空 = BIND 默认 first
+    /// （only 时额外生成 `forward only;`：不向转发器之外的服务器做任何迭代查询）。
+    #[serde(default)]
+    pub forward_policy: Option<String>,
     #[serde(default)]
     pub dnssec: DnssecCfg,
     /// RPZ override 记录（public DNS 的记录覆盖，需求 7）
@@ -568,6 +577,75 @@ fn valid_name(n: &str) -> bool {
         })
 }
 
+/// zone 名的 DNS 语义校验（比记录名严格）。
+///
+/// `valid_name` 允许 `.example.com`（空 label）、超长 label、通配符等形态 —— 这些名字
+/// 会被 named 以「bad zone name」拒载该区：面板/DB 一切正常、只有那个分区永远
+/// SERVFAIL（静默失败）。在写库**之前**拦住。
+fn valid_zone_name(n: &str) -> bool {
+    if n.trim() != n || n.is_empty() || n.len() > 253 {
+        return false;
+    }
+    let body = n.trim_end_matches('.');
+    if body.is_empty() || body.len() > 253 || body.contains("..") {
+        return false;
+    }
+    body.split('.').all(|label| {
+        !label.is_empty()
+            && label.len() <= 63
+            && !label.starts_with('-')
+            && !label.ends_with('-')
+            && label.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_'))
+    })
+}
+
+/// zone 名的比较键：DNS 名大小写无关，尾点等价（`Example.com.` == `example.com`）。
+/// 根区 `.` 保持自身（不能把点全削掉变成空串）。
+fn canonical_zone_name(n: &str) -> String {
+    let t = n.trim();
+    if t == "." {
+        return ".".to_string();
+    }
+    t.trim_end_matches('.').to_ascii_lowercase()
+}
+
+/// 模块自建分区名（RPZ / answers / 根区），用户 zone 不得占用。
+fn is_reserved_zone_name(n: &str) -> bool {
+    matches!(
+        canonical_zone_name(n).as_str(),
+        "." | "crucible.rpz" | "crucible.answers"
+    )
+}
+
+/// 写库前的分区冲突检查（返回冲突原因）。
+///
+/// 1. DNS 名大小写无关：`Example.com` 与 `example.com` 是同一个区，SQLite 的 UNIQUE
+///    是 BINARY 比较拦不住，gen_named_conf 会生成两条同名 zone → named 以
+///    「zone already exists」拒载**整份** named.conf（所有分区一起失效，重启后起不来）。
+/// 2. kind 变更：AXFR 端点固定 kind=slave，INSERT OR REPLACE 会把已有 master 静默改成
+///    slave（原记录成孤儿）；同名不同 kind 直接拒绝，要求先删除。
+fn zone_conflict(name: &str, kind: &str, zones: &[ZoneRow]) -> Option<String> {
+    let key = canonical_zone_name(name);
+    for z in zones {
+        if canonical_zone_name(&z.name) != key {
+            continue;
+        }
+        if z.name != name {
+            return Some(format!(
+                "与已有分区 {:?} 大小写重名（DNS 名大小写无关，named 会拒载整份配置）",
+                z.name
+            ));
+        }
+        if z.kind != kind {
+            return Some(format!(
+                "已有同名分区 kind={}，不能用 kind={} 覆盖（先删除再重建）",
+                z.kind, kind
+            ));
+        }
+    }
+    None
+}
+
 /// named.conf ACL / allow-transfer 单项：仅关键字或 IP/CIDR，拒绝 `; { } "` 注入。
 fn valid_acl_item(s: &str) -> bool {
     let s = s.trim();
@@ -599,6 +677,13 @@ fn valid_acl_item(s: &str) -> bool {
         return true;
     }
     false
+}
+
+/// 递归上游转发器（`forwarders { ...; };`）的单项：只接受 IPv4/IPv6 字面量。
+/// BIND 的 forwarders 列表里没有主机名/端口写法，拼错会让 named 拒载整份配置。
+fn valid_forwarder(s: &str) -> bool {
+    let s = s.trim();
+    !s.is_empty() && s.parse::<std::net::IpAddr>().is_ok()
 }
 
 /// slave primaries：host 或 host:port / [ipv6]:port；拒绝 named.conf 元字符。
@@ -705,31 +790,34 @@ fn valid_listen_addr(s: &str) -> bool {
     s.parse::<std::net::IpAddr>().is_ok()
 }
 
-/// dnssec-policy `keys { ... algorithm <x>; }` 与 dnssec-keygen `-a <x>` 的白名单
-/// （同一取值空间：配置文件里允许写助记名或算法号）。
+/// dnssec-policy `keys { ... algorithm <x>; }` 与 dnssec-keygen `-a <x>` 的白名单。
 ///
-/// 同样直接来自面板，且被拼进 named.conf —— 一份带 `}; zone ...` 的算法名会让
-/// named 拒载整份配置（所有分区一起失效）。
+/// 收窄到 BIND 9.20 实际支持的集合：上游 `dns_secalg_fromtext` 同时接受助记名与
+/// 算法号（5/7/8/10/13/14/15/16），但 `kaspconf.c` / `dnssec-keygen.c` 随后都会用
+/// `dst_algorithm_supported()` 复核 —— RSAMD5(1)/DH(2)/DSA(3)/ECC-GOST(12) 等
+/// 不支持的值会让**整份配置**加载失败或 keygen 直接 fatal；而命名面板又会先落
+/// panel.toml ⇒ 重启后 DNS 起不来。这里只放行受支持算法的助记名与等价算法号。
 fn valid_dnssec_alg(s: &str) -> bool {
-    // 取值 = BIND 认的全部算法助记名（含历史别名）+ 算法号，避免把老配置判死。
     matches!(
         s,
-        "RSAMD5"
-            | "DH"
-            | "DSA"
-            | "ECC"
-            | "RSASHA1"
-            | "DSA-NSEC3-SHA1"
+        "RSASHA1"
             | "NSEC3RSASHA1"
-            | "RSASHA1-NSEC3-SHA1"
             | "RSASHA256"
             | "RSASHA512"
-            | "ECC-GOST"
             | "ECDSAP256SHA256"
             | "ECDSAP384SHA384"
             | "ED25519"
             | "ED448"
-    ) || (!s.is_empty() && s.len() <= 3 && s.bytes().all(|b| b.is_ascii_digit()) && s != "0")
+            // 等价算法号（老配置可能写数字）
+            | "5"
+            | "7"
+            | "8"
+            | "10"
+            | "13"
+            | "14"
+            | "15"
+            | "16"
+    )
 }
 
 /// dnssec-policy `keys { <role> lifetime ... }` 的角色名（也用于 dnssec-keygen `-f`）。
@@ -738,8 +826,14 @@ fn valid_key_role(s: &str) -> bool {
 }
 
 pub fn add_zone(kind: &str, name: &str, primaries: &[String], axfr_acl: &[String], refresh_hours: u64) -> Result<i64> {
-    if !valid_name(name) {
-        bail!("bad zone name {name:?}");
+    // **全部校验必须在写库之前**：分区名的保留名/重名问题若在 write_all 里才 bail，
+    // 毒行已经落进 SQLite，此后每一次 reconcile（含启动时）都失败 —— named 永远不会
+    // 被拉起，只能靠面板再删一次那个「没添加成功」的分区。
+    if is_reserved_zone_name(name) {
+        bail!("zone {name:?} 是 DNS 模块保留分区名（根区/RPZ/answers），不能作为普通分区");
+    }
+    if !valid_zone_name(name) {
+        bail!("bad zone name {name:?}（空 label/超长 label/非法字符会被 named 拒载该区）");
     }
     if let Some(bad) = primaries.iter().find(|p| !valid_primary(p)) {
         bail!("bad primary {bad:?}");
@@ -752,6 +846,22 @@ pub fn add_zone(kind: &str, name: &str, primaries: &[String], axfr_acl: &[String
         "slave" | "secondary" => "slave",
         _ => bail!("zone kind must be master|slave"),
     };
+    // slave 的附加约束（都在 list_zones/store 之前，纯参数校验）：
+    // - primaries 为空时 gen_named_conf 会 `continue`：面板显示分区存在、named.conf
+    //   里却没有 —— 又是「保存成功但没生效」。slave 必须有至少一个上游。
+    // - refresh_hours 会映射进 named.conf（min/max-refresh-time），0/荒谬值无意义。
+    if kind == "slave" {
+        if primaries.is_empty() {
+            bail!("slave 分区必须至少一个 primaries（否则 named.conf 不会声明该区，服务里查不到）");
+        }
+        if !(1..=8760).contains(&refresh_hours) {
+            bail!("refresh_hours 必须在 1..=8760（小时），收到 {refresh_hours}");
+        }
+    }
+    let existing = list_zones()?;
+    if let Some(why) = zone_conflict(name, kind, &existing) {
+        bail!("zone {name:?} {why}");
+    }
     let conn = store()?;
     conn.execute(
         "INSERT OR REPLACE INTO zones(name,kind,primaries,axfr_acl,refresh_hours) VALUES(?1,?2,?3,?4,?5)",
@@ -918,6 +1028,12 @@ pub fn add_record(zone: &str, line: &str, name: &str, rtype: &str, ttl: u32, rda
     if !RR_TYPES.contains(&rtype_u.as_str()) {
         bail!("unsupported record type {rtype_u}");
     }
+    // SOA 不能作为普通记录：serial 必须由 gen_zone_file_monotonic_ext 统一生成并保证
+    // 单调（否则面板改动写进文件但 BIND 判定 serial 未变、拒绝重载；两条 SOA 还会让
+    // named 拒载整个区）。导入路径在落库前丢弃 SOA 行（见 admin_api.rs）。
+    if rtype_u == "SOA" {
+        bail!("SOA 由 DNS 模块自动生成（serial 必须单调），不能作为普通记录添加");
+    }
     // 从区的记录由 named 的 AXFR/IXFR 维护，本地写入必被覆盖 —— 明确拒绝，
     // 免得出现「保存成功、服务里却查不到」的假成功（面板对从区是只读的）。
     let kind = zone_kind_of(zone)?;
@@ -1035,16 +1151,21 @@ pub fn gen_zone_file_monotonic_ext(
     };
     let ns1 = format!("ns1.{zone}.");
     if kind == "master" {
-        // 面板可能自带 SOA 记录（RR_TYPES 里允许）——自带则不重复插入
-        let has_soa = recs.iter().any(|r| r.rtype.eq_ignore_ascii_case("SOA"));
-        if !has_soa {
-            s.push_str(&format!(
-                "@ IN SOA {ns1} hostmaster.{zone}. (\n  {serial} ; serial\n  900 ; refresh\n  600 ; retry\n  1209600 ; expire\n  300 ; minimum\n)\n"
-            ));
-        }
+        // SOA 必须由本函数**始终**生成：serial 单调地板（文件/.signed/DB 高水位/named）
+        // 只喂给这一处。若数据库里存在历史 SOA 行（旧版本导入 / 面板手选留下），
+        // 一律跳过 —— 原实现见到 SOA 就整条跳过生成支路，serial 被冻结成导入时的旧值：
+        // 面板改动写进文件但 BIND 判定「serial 未变、不重载」，从区也永远不来拉新版本；
+        // 而面板再加一条 SOA 更会让 zone 文件出现两条 SOA、named 拒载整个区。
+        s.push_str(&format!(
+            "@ IN SOA {ns1} hostmaster.{zone}. (\n  {serial} ; serial\n  900 ; refresh\n  600 ; retry\n  1209600 ; expire\n  300 ; minimum\n)\n"
+        ));
         s.push_str(&format!("@ IN NS {ns1}\n{ns1} IN A 127.0.0.1\n"));
     }
     for r in recs {
+        // 见上：SOA 由本函数统一生成，DB 里的历史 SOA 行不再作为普通记录输出。
+        if kind == "master" && r.rtype.eq_ignore_ascii_case("SOA") {
+            continue;
+        }
         let name = if r.name == "@" || r.name.is_empty() { "@" } else { r.name.as_str() };
         // RFC1035：TXT/SPF 的 rdata 必须带引号且转义内部引号/反斜杠；
         // 旧实现裸写 "hello world" 会被解析成多条 rdata → zone 文件非法。
@@ -1066,14 +1187,41 @@ pub fn gen_zone_file_monotonic_ext(
     s
 }
 
-/// TXT/SPF rdata 规范化：已带引号原样；否则加引号并转义。
+/// rdata 是否已是「首尾配对引号、内部引号都已转义」的完整字符串字面量。
+///
+/// 只有这种形态才允许原样透传：旧实现只看 `starts_with('"')`，于是未闭合 / 多余引号
+/// 的值直接进入 zone 文本 —— 一条坏值让整个 answers 区/zone 变成非法 master file，
+/// named 拒载该区（该区全部记录 SERVFAIL，面板与日志毫无提示）。
+fn is_quoted_txt(s: &str) -> bool {
+    let b = s.as_bytes();
+    if b.len() < 2 || b[0] != b'"' || b[b.len() - 1] != b'"' {
+        return false;
+    }
+    let mut esc = false;
+    for &c in &b[1..b.len() - 1] {
+        if esc {
+            esc = false;
+            continue;
+        }
+        match c {
+            b'\\' => esc = true,
+            // 中间的未转义引号 ⇒ 不是单个完整字符串（不能原样输出）
+            b'"' => return false,
+            _ => {}
+        }
+    }
+    // 结尾反斜杠会吃掉收尾引号
+    !esc
+}
+
+/// TXT/SPF rdata 规范化：已带配对引号原样；否则加引号并转义。
 fn quoted_txt_rdata(rtype: &str, rdata: &str) -> String {
     let t = rtype.trim().to_ascii_uppercase();
     if t != "TXT" && t != "SPF" {
         return rdata.to_string();
     }
     let d = rdata.trim();
-    if d.starts_with('"') && d.ends_with('"') && d.len() >= 2 {
+    if is_quoted_txt(d) {
         return d.to_string();
     }
     let esc: String = d.replace('\\', "\\\\").replace('"', "\\\"");
@@ -1156,10 +1304,14 @@ fn gen_answers_file(rules: &[RpzRule], prev_serial: Option<u64>) -> String {
             let name = fq_trim(&ensure_fq(&r.name));
             let rdata = if t == "txt" {
                 let d = r.value.trim();
-                if d.starts_with('"') { d.to_string() } else {
-                    // 反斜杠必须先转义：只转义引号时，值以 `\` 结尾会吃掉收尾引号，
-                    // answers 区变成非法 master file，named 拒载该区（override 全失效）。
-                    // 与 gen_zone_file 的 quoted_txt_rdata 同一处理顺序。
+                // 只允许「首尾配对、内部引号已转义」的完整字符串原样透传；
+                // 旧实现只要以 `"` 开头就原样输出 —— `"a\"`、`"\"a\" b"` 这类值
+                // 会写出非法 master file 行，named 拒载整个 answers 区，
+                // 所有 a/aaaa/txt override 静默失效。其余一律转义（反斜杠先转义：
+                // 只转义引号时，值以 `\` 结尾会吃掉收尾引号）。
+                if is_quoted_txt(d) {
+                    d.to_string()
+                } else {
                     format!("\"{}\"", d.replace('\\', "\\\\").replace('"', "\\\""))
                 }
             } else {
@@ -1272,6 +1424,60 @@ fn listen_lists(addr: &str, test_mode: bool, geo_lines: usize) -> (String, Strin
     (v4s, v6s)
 }
 
+/// `forwarders { ... };`（+ `forward only;`）片段；未配置时返回空串（零行为变化）。
+///
+/// 只输出合法 IP 字面量（check_config_strings 在保存前已全量校验，这里是防历史
+/// panel.toml / 手改 config.toml 的兜底，与 ACL 的 fail-closed 处理一致）。
+fn forwarders_clause(cfg: &DnsConfig) -> String {
+    let items: Vec<String> = cfg
+        .forwarders
+        .iter()
+        .map(|s| s.trim())
+        .filter(|s| valid_forwarder(s))
+        .map(|s| format!("{s};"))
+        .collect();
+    if items.is_empty() {
+        return String::new();
+    }
+    let mut s = format!(" forwarders {{ {} }};", items.join(" "));
+    let only = cfg
+        .forward_policy
+        .as_deref()
+        .map(|p| p.trim().eq_ignore_ascii_case("only"))
+        .unwrap_or(false);
+    if only {
+        s.push_str(" forward only;");
+    }
+    s
+}
+
+/// secondary（slave）zone 语句的附加子句（需求 6 的「传入白名单」）：
+/// - `allow-notify`：谁可以给我们发 NOTIFY（AXFR 传入白名单的语义）
+/// - `allow-transfer`：谁能从这里 AXFR（同一份白名单，全局 axfr_out_acl 是兜底）
+/// - `refresh_hours` → `min/max-refresh-time`（此前该字段入库/展示但从不生效，
+///   named 只会按 SOA timers 刷新）
+fn secondary_clauses(z: &ZoneRow) -> String {
+    let acl: Vec<String> = z
+        .axfr_acl
+        .iter()
+        .map(|s| s.trim())
+        .filter(|s| valid_acl_item(s))
+        .map(|s| format!("{s};"))
+        .collect();
+    let mut s = String::new();
+    if !acl.is_empty() {
+        let list = acl.join(" ");
+        s.push_str(&format!(" allow-notify {{ {list} }}; allow-transfer {{ {list} }};"));
+    }
+    if (1..=8760).contains(&z.refresh_hours) {
+        s.push_str(&format!(
+            " min-refresh-time {}h; max-refresh-time {}h;",
+            z.refresh_hours, z.refresh_hours
+        ));
+    }
+    s
+}
+
 /// 生成 named.conf。
 /// - geo views（match-clients）承接直连 53 的外部客户端分线路
 /// - fwd views（match-destinations 127.0.0.2+i）承接 DoT/DoH 转发查询的分线路
@@ -1313,6 +1519,8 @@ pub fn gen_named_conf(cfg: &DnsConfig, zones: &[ZoneRow]) -> String {
         // ECS 上游传递由本进程 DoT/DoH 层注入（ecs.rs，/24 硬约束）——
         // bind 9.20 options 无 ecs-prefix-* 语句，写了 named 会拒载。
         s.push_str("\n  qname-minimization relaxed;");
+        // 上游转发（可选）：不配置时为空串 —— 行为与之前完全一致
+        s.push_str(&forwarders_clause(cfg));
         if !geo_on && !cfg.rpz.is_empty() {
             // 无 view 时 RPZ 声明放 options；有 view 时在每个 view 内（zone 也在 view 内）
             s.push_str(" response-policy { zone \"crucible.rpz\"; } break-dnssec yes;");
@@ -1412,10 +1620,13 @@ pub fn gen_named_conf(cfg: &DnsConfig, zones: &[ZoneRow]) -> String {
                     .map(|p| format!("{};", primary_for_named(p)))
                     .collect();
                 if prim.is_empty() { continue; }
+                // 传入白名单（allow-notify/allow-transfer）与刷新频率此前从不生效：
+                // 运维填的「AXFR传入白名单CIDR」是个假的安全控制。
                 s.push_str(&format!(
-                    "zone \"{}\" {{ type secondary; primaries {{ {} }}; file \"{f}\"; }};\n",
+                    "zone \"{}\" {{ type secondary; primaries {{ {} }}; file \"{f}\";{} }};\n",
                     z.name,
-                    prim.join(" ")
+                    prim.join(" "),
+                    secondary_clauses(z)
                 ));
             }
             }
@@ -1647,21 +1858,67 @@ fn load_or_make_secret() -> String {
 ///
 /// 权限与属主必须在 **rename 之前**设好：否则 rename 到 chmod 之间有个窗口，
 /// `named.conf`（内含 rndc 密钥，本该 0640）会以 umask 权限（0644）短暂暴露给本机用户。
-fn write_atomic(path: &Path, data: &[u8], mode: u32, owner: Option<&str>) -> Result<()> {
+/// 临时文件名：`<file>.tmp<pid>-<纳秒>-<进程内序号>`。
+///
+/// 旧实现是固定名 `<file>.tmp<pid>`：一次写失败（满盘 ENOSPC、chmod/rename 失败）
+/// 或进程被 kill 留下的同名文件会让下一次 `create_new` 永远 EEXIST —— 同一进程内
+/// 后续对同一目标的写盘全部失败（named.conf/zone/panel.toml 再也更新不出去），
+/// 直到重启进程。唯一名 + [`TmpCleanup`] 失败清理同时解决残留与撞名。
+fn tmp_path_for(path: &Path) -> PathBuf {
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let dir = path.parent().unwrap_or_else(|| Path::new("."));
-    let mut name = path
+    let stem = path
         .file_name()
         .map(|n| n.to_os_string())
         .unwrap_or_else(|| std::ffi::OsString::from("dnsfile"));
-    name.push(format!(".tmp{}", std::process::id()));
-    let tmp = dir.join(name);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.subsec_nanos())
+        .unwrap_or(0);
+    let mut name = stem;
+    name.push(format!(
+        ".tmp{}-{}-{}",
+        std::process::id(),
+        nanos,
+        SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
+    dir.join(name)
+}
+
+/// 失败路径清理临时文件（成功 rename 后 disarm）。没有它，任何写入/权限/rename
+/// 失败都会在目录里留下 `<file>.tmp...` 永久残留。
+struct TmpCleanup {
+    path: PathBuf,
+    armed: bool,
+}
+
+impl TmpCleanup {
+    fn new(path: PathBuf) -> Self {
+        TmpCleanup { path, armed: true }
+    }
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for TmpCleanup {
+    fn drop(&mut self) {
+        if self.armed {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+}
+
+fn write_atomic(path: &Path, data: &[u8], mode: u32, owner: Option<&str>) -> Result<()> {
+    let tmp = tmp_path_for(path);
+    let mut cleanup = TmpCleanup::new(tmp.clone());
     // **先在 0600 下创建**：`std::fs::write` 会用 `0666 & ~umask`（通常 0644）建文件，
     // 而 set_permissions 在**之后**才跑 ⇒ named.conf / rndc.conf / session.key 的临时文件
     // 在 chmod 前是「本机任何用户可读」，而 rndc.conf/session.key 里是 rndc 的 HMAC 密钥
     //（拿到它就能通过本机 rndc 控制 named）。改路径后：写入期间是**更严**的 0600，
     // 定稿权限再改到目标值 —— 窗口只会「过严」，不会「过松」。
-    // 同时 create_new + O_NOFOLLOW：临时名可预测（`<file>.tmp<pid>`），能写该目录的人
-    // 可以预先放一个软链接让我们跟着写（findings 里那条 chown -R 已同时收窄）。
+    // 同时 create_new + O_NOFOLLOW：临时名不可预测，且能写该目录的人
+    // 也无法预先放一个软链接让我们跟着写（findings 里那条 chown -R 已同时收窄）。
     write_new_0600(&tmp, data)?;
     #[cfg(unix)]
     {
@@ -1675,7 +1932,9 @@ fn write_atomic(path: &Path, data: &[u8], mode: u32, owner: Option<&str>) -> Res
         let _ = std::process::Command::new("chown").arg(u).arg(&tmp).status();
     }
     std::fs::rename(&tmp, path)
-        .with_context(|| format!("rename {} -> {}", tmp.display(), path.display()))
+        .with_context(|| format!("rename {} -> {}", tmp.display(), path.display()))?;
+    cleanup.disarm();
+    Ok(())
 }
 
 /// 新建一个只允许所有者读写的文件并写入内容（`O_CREAT|O_EXCL|O_NOFOLLOW`，mode 0600）。
@@ -1711,13 +1970,8 @@ pub(crate) fn write_new_0600(path: &Path, data: &[u8]) -> Result<()> {
 /// 而原来的写法用 `std::fs::write` + rename ⇒ 每保存一次就把运维可能特意设过的 0600
 /// 静默降级成 0644。
 pub fn write_config_atomic(path: &Path, data: &[u8]) -> Result<()> {
-    let dir = path.parent().unwrap_or_else(|| Path::new("."));
-    let mut name = path
-        .file_name()
-        .map(|n| n.to_os_string())
-        .unwrap_or_else(|| std::ffi::OsString::from("config.toml"));
-    name.push(format!(".tmp{}-{}", std::process::id(), chrono_now()));
-    let tmp = dir.join(name);
+    let tmp = tmp_path_for(path);
+    let mut cleanup = TmpCleanup::new(tmp.clone());
     write_new_0600(&tmp, data)?;
     #[cfg(unix)]
     {
@@ -1731,6 +1985,7 @@ pub fn write_config_atomic(path: &Path, data: &[u8]) -> Result<()> {
             .with_context(|| format!("chmod {:o} {}", mode, tmp.display()))?;
     }
     std::fs::rename(&tmp, path).with_context(|| format!("rename {}", path.display()))?;
+    cleanup.disarm();
     Ok(())
 }
 
@@ -1773,13 +2028,57 @@ pub(crate) fn check_config_strings(cfg: &DnsConfig) -> Result<()> {
     // 只在真正启用时校验，免得把「没开 DNSSEC 的部署里一个不用的字段」判死。
     if cfg.dnssec.enabled {
         if !valid_dnssec_alg(&cfg.dnssec.algorithm) {
-            bail!("bad dnssec algorithm {:?}", cfg.dnssec.algorithm);
+            bail!(
+                "bad dnssec algorithm {:?}（BIND 9.20 支持：RSASHA1/NSEC3RSASHA1/RSASHA256/RSASHA512/ECDSAP256SHA256/ECDSAP384SHA384/ED25519/ED448）",
+                cfg.dnssec.algorithm
+            );
         }
         for k in &cfg.dnssec.keys {
             if !valid_key_role(&k.role) {
                 bail!("bad dnssec key role {:?}（ksk|zsk|csk）", k.role);
             }
         }
+        // BIND 的 kaspconf 会拒绝「短于 rollover 所需时间」的 lifetime（整份配置
+        // 加载失败），按本模块固定值（14d validity - 3d refresh + 1d max-zone-ttl
+        // + 1h retire-safety + 传播延迟）约 12 天，< 30d 还会告警。下限取 30 天，
+        // 并且必须在**写 panel.toml 之前**执行（persist_and_reconcile 会先调本函数）：
+        // 否则非法值先落进面板文件，此后每次 reconcile（含启动）都失败。
+        const MIN_KEY_LIFETIME_DAYS: u64 = 30;
+        if cfg.dnssec.rotation_enabled {
+            if cfg.dnssec.rotation_days < MIN_KEY_LIFETIME_DAYS {
+                bail!(
+                    "dnssec rotation_days={} 太小（named 会以 key lifetime is shorter than the time it takes to do a rollover 拒载；下限 {} 天）",
+                    cfg.dnssec.rotation_days,
+                    MIN_KEY_LIFETIME_DAYS
+                );
+            }
+            if let Some(n) = cfg.dnssec.ksk_lifetime_days {
+                if n < MIN_KEY_LIFETIME_DAYS {
+                    bail!("dnssec ksk_lifetime_days={n} 太小（下限 {MIN_KEY_LIFETIME_DAYS} 天）");
+                }
+            }
+            for k in &cfg.dnssec.keys {
+                if let Some(n) = k.lifetime_days {
+                    if n < MIN_KEY_LIFETIME_DAYS {
+                        bail!(
+                            "dnssec keys[].lifetime_days={n}（role={}）太小（下限 {MIN_KEY_LIFETIME_DAYS} 天）",
+                            k.role
+                        );
+                    }
+                }
+            }
+        }
+    }
+    // 递归上游转发器：只允许 IP 字面量；forward_policy 只允许 first|only。
+    // 非法值会在 gen_named_conf 里拼进 named.conf，同样必须先拒于 panel.toml 之前。
+    if let Some(p) = cfg.forward_policy.as_deref() {
+        let p = p.trim();
+        if !p.is_empty() && !matches!(p.to_ascii_lowercase().as_str(), "first" | "only") {
+            bail!("bad forward_policy {:?}（first|only）", cfg.forward_policy);
+        }
+    }
+    if let Some(bad) = cfg.forwarders.iter().find(|f| !valid_forwarder(f)) {
+        bail!("bad forwarder {bad:?}（只接受 IPv4/IPv6 字面量）");
     }
     let mut seen_lines: std::collections::HashSet<String> = std::collections::HashSet::new();
     for l in &cfg.geo.lines {
@@ -1834,6 +2133,17 @@ pub(crate) fn check_config_strings(cfg: &DnsConfig) -> Result<()> {
                 if r.value.trim().is_empty() {
                     bail!("rpz TXT 记录的 value 不能为空: name={:?}", r.name);
                 }
+                // 以 `"` 开头但不是完整合法字符串（未配对/未转义）的值在旧实现里被
+                // 原样输出 ⇒ answers 区非法、named 拒载、全部 override 失效。
+                // 生成侧现在会转义，但那种值写进面板后显示与服务内容不一致；
+                // 保存前直接拒绝，让管理员修正。
+                if r.value.trim().starts_with('"') && !is_quoted_txt(r.value.trim()) {
+                    bail!(
+                        "rpz TXT 记录的 value 以引号开头但引号未正确配对/转义: name={:?} value={:?}",
+                        r.name,
+                        r.value
+                    );
+                }
             }
             "cname" => {
                 if !valid_name(r.value.trim().trim_end_matches('.')) {
@@ -1872,8 +2182,9 @@ pub fn write_all(cfg: &DnsConfig) -> Result<Vec<(String, PathBuf)>> {
     // 与模块自建分区重名时，同一个 view 里会出现两条同名 zone 声明（RPZ override /
     // answers 是本模块自己声明的，`.` 是 root 模式声明的），named 直接拒载**整份**
     // named.conf —— 表现是「加了一个分区，整个 DNS 全挂」。
+    // add_zone 已在写库前拦一道；这里对历史 DB 行兜底（大小写不敏感，DNS 名如此）。
     for z in &zones {
-        if z.name == "." || z.name == "crucible.rpz" || z.name == "crucible.answers" {
+        if is_reserved_zone_name(&z.name) {
             bail!("zone {:?} 与 DNS 模块保留分区名（RPZ/answers/根区）冲突", z.name);
         }
     }
@@ -2293,6 +2604,20 @@ pub fn reconcile(cfg: &DnsConfig) -> Result<()> {
     Ok(())
 }
 
+/// dnssec-keygen 的 `-f` 取值。
+///
+/// BIND 9.20 的 `dnssec-keygen -f` 只认 KSK/ZSK/REVOKE 的首字母；CSK 是 KASP 策略
+/// 角色、不是 keygen 的标志位 —— 旧实现传 `-f CSK` 会让工具 `fatal("unknown flag
+/// 'CSK'")`，需求 4 的「CSK 一键生成」100% 失败。CSK 用 `-f KSK` 生成，
+/// 由 dnssec-policy 把它当组合签名键使用。
+fn keygen_flag(role: &str) -> Option<&'static str> {
+    match role.to_ascii_lowercase().as_str() {
+        "ksk" | "csk" => Some("KSK"),
+        // zsk = 默认（不传 -f）
+        _ => None,
+    }
+}
+
 /// 一键生成 DNSSEC key（需求 4）。返回生成的 key 文件名。
 pub fn keygen(zone: &str, role: &str, alg: &str) -> Result<String> {
     // zone/role/alg 全来自面板（action=keygen），会变成 dnssec-keygen 的 argv：
@@ -2307,22 +2632,18 @@ pub fn keygen(zone: &str, role: &str, alg: &str) -> Result<String> {
     if !valid_dnssec_alg(alg) {
         bail!("bad dnssec algorithm {alg:?}");
     }
-    let role = role.to_ascii_lowercase();
     let keys = state_root().join("keys");
     std::fs::create_dir_all(&keys)?;
-    // ksk/csk 用 -f ROLE；zsk 默认
+    // ksk/csk 用 -f KSK；zsk 默认
     let mut args: Vec<String> = vec![
         "-K".into(),
         keys.to_string_lossy().into(),
         "-a".into(),
         alg.to_string(),
     ];
-    if role == "ksk" {
+    if let Some(flag) = keygen_flag(role) {
         args.push("-f".into());
-        args.push("KSK".into());
-    } else if role == "csk" {
-        args.push("-f".into());
-        args.push("CSK".into());
+        args.push(flag.into());
     }
     args.push("-L".into());
     args.push("3600".into());
@@ -2377,6 +2698,57 @@ fn b64_decode(s: &str) -> Result<Vec<u8>> {
 
 // ---------------------------------------------------------------- root zone（需求 2）
 
+/// 把一份 zone 文本原子装到目标路径：唯一临时文件（`O_CREAT|O_EXCL|O_NOFOLLOW`，
+/// 0644 —— named 以 _bind 运行必须能读）→ 目标不是符号链接 → rename。
+///
+/// rootzone 此前用 `curl -o root.zone.tmp` / `fs::write` 到**固定名**并跟随符号链接，
+/// 而 `zones/` 归 _bind：被攻破的 named 可预置软链让 root 写穿任意路径、再 rename
+/// 成 root.zone；固定 tmp 名在失败后残留还会让后续刷新一直失败。
+fn install_zone_file(dst: &Path, data: &[u8]) -> Result<()> {
+    let tmp = tmp_path_for(dst);
+    let mut cleanup = TmpCleanup::new(tmp.clone());
+    write_new_0600(&tmp, data)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o644))
+            .with_context(|| format!("chmod 0644 {}", tmp.display()))?;
+    }
+    if let Ok(md) = std::fs::symlink_metadata(dst) {
+        if md.file_type().is_symlink() {
+            bail!("拒绝覆盖符号链接 {}（root zone 安装只接受普通文件）", dst.display());
+        }
+    }
+    std::fs::rename(&tmp, dst)
+        .with_context(|| format!("rename {} -> {}", tmp.display(), dst.display()))?;
+    cleanup.disarm();
+    Ok(())
+}
+
+/// root zone 的全部落盘目标：默认 `root.zone`；配了 geo 多 view 时 named.conf 给每个
+/// view 声明的是 `root.<view>.zone`，只刷新 root.zone 会让分线路 view 永远服务占位根区。
+fn rootzone_targets(cfg: &DnsConfig) -> Vec<PathBuf> {
+    let zones = state_root().join("zones");
+    let mut v = vec![zones.join("root.zone")];
+    let geo_on = cfg.geo.enabled && (!cfg.geo.lines.is_empty() || cfg.geo.mmdb.is_active());
+    if geo_on {
+        for l in &cfg.geo.lines {
+            v.push(zones.join(format!("root.{}.zone", l.name)));
+            v.push(zones.join(format!("root.fwd-{}.zone", l.name)));
+        }
+        v.push(zones.join("root.default.zone"));
+    }
+    v
+}
+
+/// 把同一份 root zone 文本装到 [`rootzone_targets`] 的所有目标。
+fn install_rootzone(cfg: &DnsConfig, data: &[u8]) -> Result<()> {
+    for p in rootzone_targets(cfg) {
+        install_zone_file(&p, data)?;
+    }
+    Ok(())
+}
+
 /// 拉取 root.zone（curl）→ 安装 → reload（合法性由 named 加载日志 + dig 兜底）。
 /// 根服务器不开放 AXFR，用整区替换等价实现 IXFR 的增量目的（报告已注明）。
 pub fn rootzone_refresh(cfg: &DnsConfig) -> Result<String> {
@@ -2389,27 +2761,34 @@ pub fn rootzone_refresh(cfg: &DnsConfig) -> Result<String> {
     }
     let zones = state_root().join("zones");
     std::fs::create_dir_all(&zones)?;
-    let tmp = zones.join("root.zone.tmp");
     // url 来自配置/面板，是 curl 的**最后一个 argv**：以 '-' 开头的值会被 curl 当选项
     // 解析（如 `-o/etc/cron.d/x`、`--config=...`），等于把外部工具的参数面交给配置。
     // 这个字段本来就是 URL，限定 http(s) 即可，顺带挡掉 file:// 本地读取。
     if !(cfg.rootzone.url.starts_with("http://") || cfg.rootzone.url.starts_with("https://")) {
         bail!("rootzone.url 必须是 http(s):// URL（收到 {:?}）", cfg.rootzone.url);
     }
+    // 不再用 `curl -o <固定临时名>`：那会跟随预置软链接、且失败残留会让后续刷新
+    // 一直失败。下载到内存（root zone ≈2MB）→ 校验内容 → 由 install_zone_file
+    // 以 O_NOFOLLOW|O_EXCL 落盘。
     let out = std::process::Command::new("curl")
-        .args(["-fsSL", "--max-time", "120", "-o"])
-        .arg(&tmp)
+        .args(["-fsSL", "--max-time", "120"])
         .arg(&cfg.rootzone.url)
         .output()
         .context("spawn curl")?;
     if !out.status.success() {
         bail!("rootzone fetch failed: {}", String::from_utf8_lossy(&out.stderr).trim());
     }
-    let dst = zones.join("root.zone");
-    std::fs::rename(&tmp, &dst)?;
+    // 内容校验：任何 HTTP 200 响应体（门户劫持页 / CDN 错误页 / 被投毒的镜像）都不能
+    // 直接替换 root.zone —— 否则 rndc reload 失败后根区 SERVFAIL 到下个刷新周期。
+    // AXFR 分支本来就有这个检查，HTTPS 分支此前漏了。
+    let text = String::from_utf8_lossy(&out.stdout);
+    if !text.lines().any(is_soa_record) {
+        bail!("rootzone 下载内容里没有 SOA 记录；拒绝覆盖 root.zone");
+    }
+    install_rootzone(cfg, &out.stdout)?;
     meta_set("root_last_ok", &chrono_now().to_string())?;
     let _ = rndc(cfg, &["reload", "."]);
-    Ok(dst.to_string_lossy().into())
+    Ok(rootzone_targets(cfg)[0].to_string_lossy().into())
 }
 
 fn meta_set(k: &str, v: &str) -> Result<()> {
@@ -2653,10 +3032,22 @@ pub fn dnssec_check_and_rotate(cfg: &DnsConfig, dc: &DnsConfig) -> Result<Vec<Ds
         if role == "KSK" {
             let ksk_threshold = lifetime_secs.saturating_sub(14 * 86400);
             if age_secs > ksk_threshold {
-                log::info!(
-                    "dnssec: KSK tag={} nearing end of life (age {}s, threshold {}s), will rollover",
-                    key.tag, age_secs, ksk_threshold
-                );
+                // KSK 分支只提示 DS 提交、不自行生成新 key（KASP 策略负责切换）。
+                // 但这个条件在新 key 生效前每轮都成立，而 maintenance_loop 每 30s
+                // 调一次 —— 不节流就是 2880 条/天刷 info。按 (zone,tag) 每天最多一条。
+                let notice_key = format!("dnssec_ksk_notice:{}:{}", key.zone, key.tag);
+                let last_notice = meta_get(&notice_key)
+                    .ok()
+                    .flatten()
+                    .and_then(|v| v.parse::<u64>().ok())
+                    .unwrap_or(0);
+                if now.saturating_sub(last_notice) >= 86_400 {
+                    log::info!(
+                        "dnssec: KSK tag={} nearing end of life (age {}s, threshold {}s), will rollover",
+                        key.tag, age_secs, ksk_threshold
+                    );
+                    let _ = meta_set(&notice_key, &now.to_string());
+                }
                 need_ds.push(DsPublishInfo {
                     zone: key.zone.clone(),
                     tag: key.tag.clone(),
@@ -2684,9 +3075,17 @@ pub fn dnssec_check_and_rotate(cfg: &DnsConfig, dc: &DnsConfig) -> Result<Vec<Ds
                     "dnssec: {} tag={} nearing end of life, generating replacement",
                     role, key.tag
                 );
-                match keygen(&key.zone, "zsk", &dc.dnssec.algorithm) {
+                // 角色必须与当前 key 一致：旧实现对 CSK 也生成 ZSK，与多 key 结构脱节。
+                // keygen 会把 csk 映射成 `-f KSK`（dnssec-keygen 不认 CSK 标志）。
+                let gen_role = if role == "CSK" { "csk" } else { "zsk" };
+                match keygen(&key.zone, gen_role, &dc.dnssec.algorithm) {
                     Ok(new_name) => {
-                        log::info!("dnssec: generated new ZSK for {}: {}", key.zone, new_name);
+                        log::info!("dnssec: generated new {} for {}: {}", role, key.zone, new_name);
+                        // 需求 4 明文要求「落 key-dir + rndc loadkeys」：不通知 named，
+                        // 新 key 何时被 KASP 采纳不可控。best-effort（named 没跑时跳过）。
+                        if let Err(e) = rndc(cfg, &["loadkeys", &key.zone]) {
+                            log::debug!("dnssec: rndc loadkeys {} 失败（按 best-effort 忽略）: {e:#}", key.zone);
+                        }
                         if let Err(e) = meta_set(&throttle_key, &now.to_string()) {
                             log::warn!("dnssec: 记录轮换节流失败 {e:#}");
                         }
@@ -2749,6 +3148,13 @@ pub fn rootzone_ixfr(cfg: &DnsConfig) -> Result<String> {
     // 先尝试 IXFR 差异应用（就地改 dst，成功后 atomic 替换）。
     match try_ixfr_apply(server, &dst, current_serial) {
         Ok(true) => {
+            // IXFR 只就地改了 root.zone；配了 geo 多 view 时各 view 的 root.<view>.zone
+            // 也要同步分发，否则分线路 view 一直服务占位根区。
+            if let Ok(data) = std::fs::read(&dst) {
+                if let Err(e) = install_rootzone(cfg, &data) {
+                    log::warn!("dns: rootzone view 分发失败: {e:#}");
+                }
+            }
             meta_set("root_last_ok", &chrono_now().to_string())?;
             let _ = rndc(cfg, &["reload", "."]);
             return Ok(dst.to_string_lossy().into());
@@ -2767,15 +3173,93 @@ pub fn rootzone_ixfr(cfg: &DnsConfig) -> Result<String> {
     }
     // 校验拿到的确实是完整 zone（至少要有 SOA），避免把错误文本写进 zone 文件。
     let text = String::from_utf8_lossy(&out.stdout);
-    if !text.contains("IN\tSOA") && !text.contains("IN SOA") {
+    if !text.lines().any(is_soa_record) {
         bail!("dig axfr output has no SOA; refusing to overwrite zone");
     }
-    let tmp = zones.join("root.zone.tmp");
-    std::fs::write(&tmp, &out.stdout)?;
-    std::fs::rename(&tmp, &dst)?;
+    install_rootzone(cfg, &out.stdout)?;
     meta_set("root_last_ok", &chrono_now().to_string())?;
     let _ = rndc(cfg, &["reload", "."]);
-    Ok(dst.to_string_lossy().into())
+    Ok(rootzone_targets(cfg)[0].to_string_lossy().into())
+}
+
+/// 行里的 RR 类型是不是 SOA（token 级判断，避免把 rdata 里含 SOA 的 RRSIG 等误判）。
+/// dig 输出带 class（`name TTL IN SOA ...`），internic root.zone 不带（`name TTL SOA ...`），两种都认。
+fn is_soa_record(line: &str) -> bool {
+    let toks: Vec<&str> = line.split_whitespace().take(4).collect();
+    if toks.len() < 3 {
+        return false;
+    }
+    if toks[2].eq_ignore_ascii_case("SOA") {
+        return true;
+    }
+    toks.len() >= 4
+        && toks[3].eq_ignore_ascii_case("SOA")
+        && matches!(
+            toks[2].to_ascii_uppercase().as_str(),
+            "IN" | "CH" | "HS"
+        )
+}
+
+/// 从 dig `+noall +answer` 的 IXFR 差异流里切出 (删除段, 新增段)。
+///
+/// RFC1995 / BIND `xfrout.c` 的实际应答形态：前导 SOA(current)，随后每段
+///   SOA(old) 删除记录… SOA(new) 新增记录…
+/// 交替出现，最后再跟一份 SOA(current)。所有 SOA 行都只是段标记，**不进集合**：
+/// 旧实现把 SOA 当作「分隔符」直接丢弃、且段序理解颠倒（先删除段再 SOA(old)），
+/// 于是本地旧 SOA 永远替换不掉、差异也应用错位，serial 校验必然失败 ——
+/// IXFR 实际从未成功过一次，每次都静默回落全量下载。
+///
+/// 返回 None = 行数不足以构成差异流（单个 SOA 是「无变化 / AXFR 式应答」，
+/// 全部记录会被误当删除段，调用方必须回退全量）。
+fn split_ixfr_diff<'a>(records: &[&'a str]) -> Option<(Vec<&'a str>, Vec<&'a str>)> {
+    let markers = records.iter().filter(|l| is_soa_record(l)).count();
+    // 前导 + old + new = 3 是单段差异流的最小值（BIND 还会再追加一份尾 SOA）
+    if records.is_empty() || markers < 3 {
+        return None;
+    }
+    let mut deletions: Vec<&'a str> = Vec::new();
+    let mut additions: Vec<&'a str> = Vec::new();
+    let mut in_add = false;
+    let mut marker_seen = false;
+    for line in &records[1..] {
+        if is_soa_record(line) {
+            // 第一个标记是 SOA(old)（其后为删除段），之后 old/new 交替
+            in_add = marker_seen && !in_add;
+            marker_seen = true;
+            continue;
+        }
+        if in_add {
+            additions.push(line);
+        } else {
+            deletions.push(line);
+        }
+    }
+    Some((deletions, additions))
+}
+
+/// SOA 记录从 `start` 行起占用到哪一行（括号平衡；无括号 = 单行）。
+/// internic 的 root.zone SOA 是多行括号形态，只按行增删永远替换不掉。
+fn soa_block_end(lines: &[String], start: usize) -> Option<usize> {
+    let mut depth: i32 = 0;
+    let mut opened = false;
+    for (i, l) in lines.iter().enumerate().skip(start) {
+        for c in l.chars() {
+            match c {
+                '(' => {
+                    depth += 1;
+                    opened = true;
+                }
+                ')' => depth -= 1,
+                // 行内注释之后的括号不算
+                ';' => break,
+                _ => {}
+            }
+        }
+        if !opened || depth <= 0 {
+            return Some(i);
+        }
+    }
+    None
 }
 
 /// 把 IXFR 差异应用到现有 zone。
@@ -2787,14 +3271,16 @@ fn try_ixfr_apply(server: &str, dst: &Path, current_serial: u64) -> Result<bool>
     if current_serial == 0 || !dst.exists() {
         return Ok(false); // 没有本地 zone 可比对，直接走全量
     }
-    // 正确的写法是单个 `@server` 参数；旧代码拆成 "@" + server 两个 argv，
-    // dig 会把 server 当成第二个查询名。
+    // dig 只接受 `ixfr=<serial>` 这**一个** token：裸 `ixfr` 会被打印
+    // "Warning, ixfr requires a serial number" 后忽略（不设置查询类型），
+    // 紧随其后的数字变成查询名 —— 实际发出的是 A 查询，应答为空、永远回落全量。
+    // +tcp：IXFR 的差异流只能走 TCP（UDP 只回单个 SOA）。
     let out = std::process::Command::new("dig")
         .args([
             "+noall",
             "+answer",
-            "ixfr",
-            &current_serial.to_string(),
+            "+tcp",
+            &format!("ixfr={current_serial}"),
             &format!("@{server}"),
             ".",
         ])
@@ -2809,75 +3295,67 @@ fn try_ixfr_apply(server: &str, dst: &Path, current_serial: u64) -> Result<bool>
         .map(|l| l.trim())
         .filter(|l| !l.is_empty())
         .collect();
-    let soa_idx: Vec<usize> = records
-        .iter()
-        .enumerate()
-        .filter(|(_, l)| l.contains("SOA"))
-        .map(|(i, _)| i)
-        .collect();
-    if soa_idx.is_empty() {
+    let soa_cnt = records.iter().filter(|l| is_soa_record(l)).count();
+    if soa_cnt == 0 {
         return Ok(false);
     }
     // 单个 SOA：要么「无变化」，要么不是完整区。按 serial 判定，绝不写文件。
-    if soa_idx.len() == 1 {
-        let new_serial = soa_serial_from_line(records[soa_idx[0]]);
+    if soa_cnt == 1 {
+        let new_serial = soa_serial_from_line(records[0]);
         if new_serial == Some(current_serial) {
             log::info!("dns: rootzone already at serial {current_serial}");
             return Ok(true);
         }
         return Ok(false);
     }
-
-    // 多 SOA → 标准 IXFR 差异流。逐段应用：SOA(new) → 删除段 → SOA(old) →
-    // 新增段 → SOA(new) …
-    let target_serial = soa_serial_from_line(records[soa_idx[0]]);
-    let original = std::fs::read_to_string(dst).context("read current zone")?;
-    let mut lines: Vec<String> = original.lines().map(|l| l.to_string()).collect();
-
-    let mut i = 1usize;
-    let mut applied_segments = 0usize;
-    while i < records.len() {
-        // 删除段：直到下一个 SOA
-        let del_start = i;
-        while i < records.len() && !records[i].contains("SOA") {
-            i += 1;
-        }
-        let deletions = &records[del_start..i];
-        if i >= records.len() {
-            break; // 没有配对的 SOA(old)，差异流不完整
-        }
-        i += 1; // 跳过 SOA(old)
-        // 新增段：直到下一个 SOA
-        let add_start = i;
-        while i < records.len() && !records[i].contains("SOA") {
-            i += 1;
-        }
-        let additions = &records[add_start..i];
-        if i < records.len() {
-            i += 1; // 跳过 SOA(new)，继续下一段
-        }
-
-        // 先删后加。记录按规范化文本比对（dig 与 zone 文件的 TTL/空白格式可能不同）。
-        for d in deletions {
-            let key = normalize_rr(d);
-            if let Some(pos) = lines.iter().position(|l| normalize_rr(l) == key) {
-                lines.remove(pos);
-            }
-        }
-        for a in additions {
-            lines.push((*a).to_string());
-        }
-        applied_segments += 1;
-    }
-
-    if applied_segments == 0 {
+    // 差异流切段（段标记 = SOA 行；整个差异流里的 SOA 都不作为记录应用）
+    let Some((deletions, additions)) = split_ixfr_diff(&records) else {
+        return Ok(false);
+    };
+    let target_serial = soa_serial_from_line(records[0]);
+    if target_serial.is_none() {
         return Ok(false);
     }
 
-    // 校验：应用后的 zone 必须能解析出目标 serial，否则回退全量。
+    let original = std::fs::read_to_string(dst).context("read current zone")?;
+    let mut lines: Vec<String> = original.lines().map(|l| l.to_string()).collect();
+    // 1) 用 records[0]（新 SOA，dig 单行形态）整体替换本地 SOA 块。
+    //    本地 SOA 可能是多行括号形态，逐行匹配旧 serial 是永远删不掉的。
+    let Some(soa_start) = lines.iter().position(|l| is_soa_record(l)) else {
+        return Ok(false);
+    };
+    let Some(soa_end) = soa_block_end(&lines, soa_start) else {
+        return Ok(false);
+    };
+    lines.splice(soa_start..=soa_end, std::iter::once(records[0].to_string()));
+
+    // 2) 先删后加。删除必须**全部命中**：少一条就是「serial 已更新、内容却是旧的」
+    //    半应用 zone，宁可回退全量（AXFR 结果正确但流量大）。
+    for d in &deletions {
+        let key = normalize_rr(d);
+        match lines.iter().position(|l| normalize_rr(l) == key) {
+            Some(pos) => {
+                lines.remove(pos);
+            }
+            None => {
+                log::warn!(
+                    "dns: IXFR 删除项在本地 zone 里找不到（{d}）；回退全量 AXFR"
+                );
+                return Ok(false);
+            }
+        }
+    }
+    for a in &additions {
+        let key = normalize_rr(a);
+        if !lines.iter().any(|l| normalize_rr(l) == key) {
+            lines.push((*a).to_string());
+        }
+    }
+
+    // 3) 校验：应用后的 zone 必须能解析出目标 serial，否则回退全量。
     let new_text = lines.join("\n") + "\n";
     let got_serial = serial_from_zone_text(&new_text);
-    if target_serial.is_none() || got_serial != target_serial {
+    if got_serial != target_serial {
         log::warn!(
             "dns: IXFR apply serial check failed (want {target_serial:?} got {got_serial:?}); \
              falling back to full AXFR"
@@ -2885,20 +3363,27 @@ fn try_ixfr_apply(server: &str, dst: &Path, current_serial: u64) -> Result<bool>
         return Ok(false);
     }
 
-    let tmp = dst.with_extension("zone.tmp");
-    std::fs::write(&tmp, new_text.as_bytes())?;
-    std::fs::rename(&tmp, dst)?;
+    install_zone_file(dst, new_text.as_bytes())?;
     log::info!(
-        "dns: rootzone IXFR applied {applied_segments} segment(s) → serial {:?}",
+        "dns: rootzone IXFR applied ({} deletions / {} additions) → serial {:?}",
+        deletions.len(),
+        additions.len(),
         target_serial
     );
     Ok(true)
 }
 
-/// 规范化一条 RR 文本用于比对：去掉注释、压缩空白、去尾点差异。
+/// 规范化一条 RR 文本用于比对：去掉注释、压缩空白、忽略 class、大小写不敏感。
+/// （dig 输出是 `name TTL IN TYPE rdata`，internic root.zone 是 `name TTL TYPE rdata`，
+/// 不看掉 class 的话删除段一条都对不上，IXFR 每次都回退全量。）
 fn normalize_rr(line: &str) -> String {
     let no_comment = line.split(';').next().unwrap_or("");
-    no_comment.split_whitespace().collect::<Vec<_>>().join(" ").to_lowercase()
+    no_comment
+        .split_whitespace()
+        .filter(|t| !matches!(t.to_ascii_uppercase().as_str(), "IN" | "CH" | "HS"))
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase()
 }
 
 /// 从 `... SOA mname rname SERIAL ...` 行里取 serial。
@@ -2998,6 +3483,16 @@ fn rootzone_current_serial(dst: &Path) -> Option<u64> {
 /// （例如出口网络不通），每 30 秒就重打一条同样的 warn，永不停止。
 /// 本机磁盘长期紧张、日志阈值只有 2MB，刷屏的代价是真实的。
 /// 消息内容变化（比如换了一种错误）时仍会重新打 —— 只有**完全相同**的消息被抑制。
+/// rootzone 是否到期刷新。
+/// `refresh_hours` 来自面板且无上限：`t + h*3600` 在 release 下回绕、在
+/// overflow-checks/debug 下 panic（维护任务会死，连带看门狗一起消失），必须饱和运算。
+fn rootzone_due(last_ok: Option<&str>, refresh_hours: u64, now: u64) -> bool {
+    match last_ok.and_then(|t| t.trim().parse::<u64>().ok()) {
+        Some(t) => now > t.saturating_add(refresh_hours.saturating_mul(3600)),
+        None => true,
+    }
+}
+
 fn warn_once(tag: &str, msg: &str) {
     use std::collections::HashMap;
     use std::sync::Mutex;
@@ -3065,8 +3560,13 @@ pub async fn maintenance_loop(live: Arc<crate::server::live_config::LiveConfig>,
             let rotate = tokio::task::spawn_blocking(move || dnssec_check_and_rotate(&dc, &dc)).await;
             match rotate {
                 Ok(Ok(ds_info)) => {
+                    // 同一 DS 提示每 30s 重复一次没有意义（dnssec_check_and_rotate 内部
+                    // 已对 KSK 生成侧节流；这里用 warn_once 抑制完全相同的消息）。
                     for ds in &ds_info {
-                        log::info!("dnssec: DS rollover needed zone={} tag={}", ds.zone, ds.tag);
+                        warn_once(
+                            &format!("dnssec-ds:{}:{}", ds.zone, ds.tag),
+                            &format!("dnssec: DS rollover needed zone={} tag={}", ds.zone, ds.tag),
+                        );
                     }
                 }
                 Ok(Err(e)) => warn_once("dnssec-rotate", &format!("dnssec: rotation check failed: {e:#}")),
@@ -3079,13 +3579,8 @@ pub async fn maintenance_loop(live: Arc<crate::server::live_config::LiveConfig>,
         // 管理员只托管一个静态 root.zone 而不自动去 AXFR/下载。
         // 旧代码从不读这个字段，等于开关失效。
         if cfg.enabled && cfg.modes.root && cfg.rootzone.enabled {
-            let due = match meta_get("root_last_ok") {
-                Ok(Some(t)) => t
-                    .parse::<u64>()
-                    .map(|t| chrono_now() > t + cfg.rootzone.refresh_hours * 3600)
-                    .unwrap_or(true),
-                _ => true,
-            };
+            let last_ok = meta_get("root_last_ok").ok().flatten();
+            let due = rootzone_due(last_ok.as_deref(), cfg.rootzone.refresh_hours, chrono_now());
             if due {
                 let c2 = cfg.clone();
                 let use_axfr = !cfg.rootzone.axfr_servers.is_empty();
@@ -3139,6 +3634,29 @@ mod dns_atomic_write_tests {
             .filter(|n| n.contains(".tmp"))
             .collect();
         assert!(leftovers.is_empty(), "残留临时文件: {leftovers:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 失败路径（rename 到目录必然失败）不得留下临时文件：旧实现失败即残留，
+    /// 固定 tmp 名会让同一进程内后续写盘全部 EEXIST（配置再也更新不出去）。
+    #[test]
+    fn write_atomic_cleans_tmp_on_failure() {
+        let dir = std::env::temp_dir().join(format!("crucible-dns-aw-fail-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("target-is-a-dir");
+        std::fs::create_dir_all(&target).unwrap();
+
+        let err = write_atomic(&target, b"x", 0o644, None);
+        assert!(err.is_err(), "rename(file -> dir) 应失败");
+
+        let leftovers: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.contains(".tmp"))
+            .collect();
+        assert!(leftovers.is_empty(), "失败后残留临时文件: {leftovers:?}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
@@ -3418,5 +3936,320 @@ mod config_guard_tests {
             value: String::new(),
         });
         assert!(check_config_strings(&rpz).is_err(), "rpz 名字带 .. 必须被拒");
+    }
+}
+
+#[cfg(test)]
+mod dns_hardening_tests {
+    use super::*;
+
+    fn test_cfg() -> DnsConfig {
+        let mut c = DnsConfig::default();
+        c.listen_addr = "127.0.0.1".to_string();
+        c
+    }
+
+    fn zone_row(name: &str, kind: &str) -> ZoneRow {
+        ZoneRow {
+            name: name.to_string(),
+            kind: kind.to_string(),
+            primaries: vec![],
+            axfr_acl: vec![],
+            refresh_hours: 24,
+        }
+    }
+
+    /// P1-1：数据库里有历史 SOA 行（旧版本导入/面板手选留下）时，生成器也必须
+    /// 始终输出**一份**自动 SOA，且 serial 严格大于传入的旧值。
+    /// 旧实现 has_soa=true 就跳过生成支路、原样输出旧 SOA ⇒ serial 永久冻结。
+    #[test]
+    fn gen_zone_file_always_emits_monotonic_soa() {
+        let recs = vec![RecordRow {
+            id: 1,
+            zone: "example.com".into(),
+            line: String::new(),
+            name: "@".into(),
+            rtype: "SOA".into(),
+            ttl: 3600,
+            rdata: "ns1.example.com. hostmaster.example.com. 111 900 600 1209600 300".into(),
+        }];
+        let out = gen_zone_file_monotonic_ext("example.com", "master", &recs, Some(4_000_000_000), &[]);
+        assert_eq!(out.matches(" IN SOA ").count(), 1, "必须只有一份 SOA: {out}");
+        assert_eq!(serial_from_zone_text(&out), Some(4_000_000_001), "{out}");
+        assert!(!out.contains(" 111 "), "旧 serial 不得残留: {out}");
+    }
+
+    /// P1-2：分区名的 DNS 语义/保留名校验（写库之前执行 —— add_zone 里调用）。
+    #[test]
+    fn zone_name_validation_rejects_broken_and_reserved_names() {
+        assert!(valid_zone_name("example.com"));
+        assert!(valid_zone_name("_tcp.example.com"));
+        assert!(valid_zone_name("example.com."));
+        assert!(!valid_zone_name("."));
+        assert!(!valid_zone_name(".example.com"));
+        assert!(!valid_zone_name("example..com"));
+        assert!(!valid_zone_name("-bad.example.com"));
+        assert!(!valid_zone_name("bad-.example.com"));
+        assert!(!valid_zone_name("bad name.example.com"));
+        assert!(!valid_zone_name("*.example.com"));
+        assert!(!valid_zone_name(&format!("{}.com", "a".repeat(64))));
+        assert!(!valid_zone_name(""));
+        assert!(is_reserved_zone_name("."));
+        assert!(is_reserved_zone_name("Crucible.RPZ"));
+        assert!(is_reserved_zone_name("crucible.answers"));
+        assert!(!is_reserved_zone_name("rpz.example.com"));
+    }
+
+    /// P1-2 / P3：写库前的冲突检查 —— 大小写重名（named 会拒载整份配置）与
+    /// kind 静默覆盖（master 被 AXFR 端点改成 slave）。
+    #[test]
+    fn zone_conflict_detects_case_duplicate_and_kind_change() {
+        let zones = vec![zone_row("example.com", "master")];
+        assert!(zone_conflict("example.com", "master", &zones).is_none(), "同名同 kind = 更新");
+        assert!(zone_conflict("Example.com", "master", &zones).is_some(), "大小写重名必须拒");
+        assert!(zone_conflict("example.com.", "master", &zones).is_some(), "尾点等价也必须拒");
+        assert!(zone_conflict("example.com", "slave", &zones).is_some(), "kind 变更必须拒");
+        assert!(zone_conflict("other.com", "master", &zones).is_none());
+    }
+
+    /// P1-2 / P3：slave 参数校验与保留名在**碰数据库之前**完成（这些调用不落库）。
+    #[test]
+    fn add_zone_guards_bail_before_db_write() {
+        // 空 primaries 的 slave：named.conf 不会声明该区（面板显示成功、服务里没有）
+        assert!(add_zone("slave", "s.test", &[], &[], 24).is_err());
+        assert!(add_zone("slave", "s.test", &["192.0.2.1".into()], &[], 0).is_err());
+        assert!(add_zone("slave", "s.test", &["192.0.2.1".into()], &[], 8761).is_err());
+        // 保留名 / 非法名同样在写库前被拒
+        assert!(add_zone("master", "crucible.rpz", &[], &[], 24).is_err());
+        assert!(add_zone("master", ".example.com", &[], &[], 24).is_err());
+    }
+
+    /// P1-3：算法白名单收窄 + lifetime 下限（都必须在写 panel.toml 之前拒掉）。
+    #[test]
+    fn check_config_rejects_unsupported_dnssec_and_short_lifetimes() {
+        let mut c = test_cfg();
+        c.dnssec.enabled = true;
+        c.dnssec.algorithm = "RSAMD5".into();
+        assert!(check_config_strings(&c).is_err(), "RSAMD5 在 BIND 9.20 不受支持");
+        c.dnssec.algorithm = "ECC-GOST".into();
+        assert!(check_config_strings(&c).is_err());
+        c.dnssec.algorithm = "1".into();
+        assert!(check_config_strings(&c).is_err(), "算法号 1=RSAMD5 不受支持");
+        c.dnssec.algorithm = "12".into();
+        assert!(check_config_strings(&c).is_err(), "算法号 12=ECC-GOST 不受支持");
+        c.dnssec.algorithm = "252".into();
+        assert!(check_config_strings(&c).is_err());
+        c.dnssec.algorithm = "13".into();
+        assert!(check_config_strings(&c).is_ok(), "13=ECDSAP256SHA256 合法");
+        c.dnssec.algorithm = "ECDSAP256SHA256".into();
+        assert!(check_config_strings(&c).is_ok());
+
+        c.dnssec.rotation_enabled = true;
+        c.dnssec.rotation_days = 1;
+        assert!(check_config_strings(&c).is_err(), "rotation_days=1 会让 named 拒载");
+        c.dnssec.rotation_days = 30;
+        assert!(check_config_strings(&c).is_ok());
+        c.dnssec.keys.push(DnsKeyCfg { role: "zsk".into(), lifetime_days: Some(3) });
+        assert!(check_config_strings(&c).is_err(), "keys[].lifetime_days=3 必须拒");
+        c.dnssec.keys[0].lifetime_days = Some(30);
+        assert!(check_config_strings(&c).is_ok());
+    }
+
+    /// [实测] 递归转发器：不配置时零输出（行为完全不变）；配置时生成
+    /// `forwarders { ... };`，only 追加 `forward only;`；非法值保存前被拒。
+    #[test]
+    fn forwarders_clause_and_validation() {
+        let mut c = test_cfg();
+        assert_eq!(forwarders_clause(&c), "");
+        c.forwarders = vec![
+            "8.8.8.8".into(),
+            "2001:4860:4860::8888".into(),
+            "not-an-ip".into(),
+        ];
+        assert_eq!(
+            forwarders_clause(&c),
+            " forwarders { 8.8.8.8; 2001:4860:4860::8888; };"
+        );
+        c.forward_policy = Some("only".into());
+        assert!(forwarders_clause(&c).ends_with(" forward only;"));
+        assert!(check_config_strings(&c).is_err(), "含非法 forwarder 必须保存前被拒");
+
+        c.forwarders = vec!["8.8.8.8".into()];
+        assert!(check_config_strings(&c).is_ok());
+        c.forward_policy = Some("sometimes".into());
+        assert!(check_config_strings(&c).is_err(), "forward_policy 只允许 first|only");
+        c.forward_policy = Some("first".into());
+        assert!(!forwarders_clause(&c).contains("forward only"));
+    }
+
+    /// P2：slave 的传入白名单与刷新频率必须进 named.conf；非法 ACL 项 fail-closed。
+    #[test]
+    fn secondary_clauses_writes_acl_and_refresh() {
+        let mut z = zone_row("slave.test", "slave");
+        z.axfr_acl = vec![
+            "10.0.0.0/8".into(),
+            "2001:db8::/32".into(),
+            "bad;};".into(),
+        ];
+        z.refresh_hours = 6;
+        let c = secondary_clauses(&z);
+        assert!(c.contains("allow-notify { 10.0.0.0/8; 2001:db8::/32; };"), "{c}");
+        assert!(c.contains("allow-transfer { 10.0.0.0/8; 2001:db8::/32; };"), "{c}");
+        assert!(c.contains("min-refresh-time 6h; max-refresh-time 6h;"), "{c}");
+        assert!(!c.contains("bad"), "非法 ACL 项不得输出: {c}");
+        let mut z2 = zone_row("slave2.test", "slave");
+        z2.refresh_hours = 0;
+        assert!(secondary_clauses(&z2).is_empty());
+    }
+
+    /// P2：IXFR 差异流切段 —— SOA 行只是段标记，不是记录；删除段/新增段不能颠倒。
+    #[test]
+    fn split_ixfr_diff_maps_segments() {
+        let soa = |s: u64| format!(". 86400 IN SOA a.root-servers.net. nstld.example. {s} 1800 900 604800 86400");
+        let owned: Vec<String> = vec![
+            soa(3),
+            soa(1),
+            "deleted.example. 300 IN A 10.0.0.1".into(),
+            soa(3),
+            "added.example. 300 IN A 10.0.0.2".into(),
+            soa(3),
+        ];
+        let records: Vec<&str> = owned.iter().map(|s| s.as_str()).collect();
+        let (del, add) = split_ixfr_diff(&records).expect("标准差异流");
+        assert_eq!(del, vec!["deleted.example. 300 IN A 10.0.0.1"]);
+        assert_eq!(add, vec!["added.example. 300 IN A 10.0.0.2"]);
+        // 单个 SOA（无变化 / AXFR 式应答）绝不能按「全部删除」处理
+        let single = vec![records[0]];
+        assert!(split_ixfr_diff(&single).is_none());
+        // RRSIG 覆盖 SOA 的行不是 SOA 记录标记
+        assert!(!is_soa_record(
+            ". 86400 IN RRSIG SOA 8 0 86400 20260101000000 20250101000000 12345 . abcdef=="
+        ));
+        assert!(is_soa_record(". 3600000 SOA a.root-servers.net. nstld.example. ("));
+    }
+
+    /// P2：SOA 块替换必须认多行括号形态（internic root.zone 就是这种）。
+    #[test]
+    fn soa_block_end_handles_multiline() {
+        let lines: Vec<String> = vec![
+            "$TTL 86400".into(),
+            ". 3600000 IN SOA a.root-servers.net. nstld.example. (".into(),
+            "  2024100400 ; serial".into(),
+            "  1800 900 604800 86400 )".into(),
+            ". 3600000 IN NS a.root-servers.net.".into(),
+        ];
+        assert_eq!(soa_block_end(&lines, 1), Some(3));
+        let single = vec!["x 300 IN SOA m. r. 1 2 3 4 5".to_string()];
+        assert_eq!(soa_block_end(&single, 0), Some(0));
+    }
+
+    /// P2：dig（带 IN class）与 internic（不带）的记录归一后必须能匹配。
+    #[test]
+    fn normalize_rr_ignores_class() {
+        assert_eq!(
+            normalize_rr("A.ROOT-SERVERS.NET. 3600000 IN A 198.41.0.4"),
+            normalize_rr("a.root-servers.net. 3600000 A 198.41.0.4")
+        );
+    }
+
+    /// P3：refresh_hours 无上限，到期计算必须饱和（debug 下 panic / release 下回绕）。
+    #[test]
+    fn rootzone_due_saturates() {
+        assert!(rootzone_due(None, 24, 1000));
+        assert!(!rootzone_due(Some("1000"), 24, 1000 + 24 * 3600));
+        assert!(rootzone_due(Some("1000"), 24, 1000 + 24 * 3600 + 1));
+        assert!(!rootzone_due(Some("1000"), u64::MAX, u64::MAX - 1));
+    }
+
+    /// P3：geo 多 view 时 rootzone 要分发到每个 view 的 root.<view>.zone。
+    #[test]
+    fn rootzone_targets_cover_geo_views() {
+        let mut c = test_cfg();
+        assert_eq!(rootzone_targets(&c), vec![state_root().join("zones").join("root.zone")]);
+        c.geo.enabled = true;
+        c.geo.lines.push(GeoLine { name: "cn".into(), cidrs: vec![] });
+        let t = rootzone_targets(&c);
+        assert!(t.iter().any(|p| p.ends_with("root.zone")), "{t:?}");
+        assert!(t.iter().any(|p| p.ends_with("root.cn.zone")), "{t:?}");
+        assert!(t.iter().any(|p| p.ends_with("root.fwd-cn.zone")), "{t:?}");
+        assert!(t.iter().any(|p| p.ends_with("root.default.zone")), "{t:?}");
+    }
+
+    /// P2：root zone 安装拒绝符号链接目标且失败不留 tmp（zones/ 归 _bind 的纵深防御）。
+    #[test]
+    fn root_zone_install_refuses_symlink_and_cleans_tmp() {
+        let dir = std::env::temp_dir().join(format!("crucible-dns-install-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let victim = dir.join("victim");
+        std::fs::write(&victim, b"do-not-touch").unwrap();
+        let target = dir.join("root.zone");
+        std::os::unix::fs::symlink(&victim, &target).unwrap();
+
+        let err = install_zone_file(&target, b". 86400 IN SOA a. b. 1 2 3 4 5\n");
+        assert!(err.is_err(), "符号链接目标必须被拒");
+        assert_eq!(std::fs::read(&victim).unwrap(), b"do-not-touch");
+        assert!(std::fs::symlink_metadata(&target).unwrap().file_type().is_symlink());
+        let leftovers: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.contains(".tmp"))
+            .collect();
+        assert!(leftovers.is_empty(), "失败后残留临时文件: {leftovers:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// P2：RPZ TXT 值以 `"` 开头时不能绕过转义（未闭合引号会让 answers 区非法、
+    /// 全部 override 静默失效）；合法配对引号保留原样。
+    #[test]
+    fn rpz_txt_leading_quote_is_escaped_or_preserved() {
+        assert!(is_quoted_txt("\"hello\""));
+        assert!(is_quoted_txt("\"a \\\"b\\\"\""));
+        assert!(!is_quoted_txt("\"unterminated"));
+        assert!(!is_quoted_txt("\"a\" b\""));
+        assert!(!is_quoted_txt("\"trailing\\\""));
+
+        let rules = vec![
+            RpzRule { name: "bad.test".into(), rtype: "txt".into(), value: "\"unterminated".into() },
+            RpzRule { name: "good.test".into(), rtype: "txt".into(), value: "\"hello\"".into() },
+        ];
+        let f = gen_answers_file(&rules, Some(1));
+        assert!(
+            f.contains("bad.test IN TXT \"\\\"unterminated\""),
+            "未闭合引号必须被转义: {f}"
+        );
+        assert!(f.contains("good.test IN TXT \"hello\""), "{f}");
+    }
+
+    /// P2：quoted_txt_rdata 与 answers 走同一判据（只保留完整合法字符串字面量）。
+    #[test]
+    fn quoted_txt_rdata_only_passes_complete_literals() {
+        assert_eq!(quoted_txt_rdata("TXT", "\"ok\""), "\"ok\"");
+        assert_eq!(quoted_txt_rdata("TXT", "\"bad"), "\"\\\"bad\"");
+        assert_eq!(quoted_txt_rdata("TXT", "plain text"), "\"plain text\"");
+    }
+
+    /// P2：check_config_strings 拒绝「以引号开头但未配对」的 RPZ TXT 值。
+    #[test]
+    fn check_config_rejects_unbalanced_rpz_txt_quote() {
+        let mut c = test_cfg();
+        c.rpz.push(RpzRule {
+            name: "x.test".into(),
+            rtype: "txt".into(),
+            value: "\"oops".into(),
+        });
+        assert!(check_config_strings(&c).is_err());
+        c.rpz[0].value = "\"ok\"".into();
+        assert!(check_config_strings(&c).is_ok());
+    }
+
+    /// P2：dnssec-keygen 的 `-f` 映射 —— CSK 必须落成 KSK（工具不认 CSK 标志）。
+    #[test]
+    fn keygen_flag_maps_csk_to_ksk() {
+        assert_eq!(keygen_flag("csk"), Some("KSK"));
+        assert_eq!(keygen_flag("CSK"), Some("KSK"));
+        assert_eq!(keygen_flag("ksk"), Some("KSK"));
+        assert_eq!(keygen_flag("zsk"), None);
     }
 }

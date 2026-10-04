@@ -56,6 +56,75 @@ const UPSTREAM_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_
 const UPSTREAM_CONNECT_TIMEOUT_TOR: std::time::Duration = std::time::Duration::from_secs(45);
 const UPSTREAM_HEAD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 const UPSTREAM_BODY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+/// WebSocket 隧道的**每方向空闲上限**：101 升级后 h1/h2 的空闲/头读超时都不再适用，
+/// 客户端（或只回 101 后静默的恶意上游）只要保持安静就能永久占住两个 socket、任务
+/// 与转发缓冲。取 10min：WS 正常 ping/pong 远小于此，长时间无业务数据也不会被误杀。
+const WS_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600);
+/// WebSocket 隧道全局并发上限：项目没有 per-IP/全局连接上限，反代隧道必须自带一个，
+/// 否则批量 101 即可耗尽 fd/内存（隧道结束/失败即释放 permit）。
+const WS_MAX_TUNNELS: usize = 256;
+static WS_TUNNELS: Lazy<tokio::sync::Semaphore> =
+    Lazy::new(|| tokio::sync::Semaphore::new(WS_MAX_TUNNELS));
+/// 反代**响应全量缓冲**的全局预算（单请求上限 64MiB，此前没有全局上限 ⇒ N 个并发请求
+/// 就是 N×64MiB 常驻）。按每请求上限从预算里预留，超限快速失败（503），把 OOM 向量从
+/// 「随并发线性增长」变成有界。彻底修法是响应流式转发（见总结的跨文件需求：BoxBody 的
+/// 错误类型是 Infallible，流式需要改 h1/h2/h3 的公共类型）。
+const PROXY_BUFFER_BUDGET: usize = 1024 * 1024 * 1024; // 1 GiB
+static PROXY_BUFFER_RESERVED: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+/// `trust_self_signed` 当前没有自定义根证书可配、实际等价 `no_verify`，只警告一次。
+static TRUST_SELF_SIGNED_WARNED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// 响应缓冲预算的 RAII 预留（drop 即归还；随 [`Response`] extensions 一起活到响应被
+/// hyper 消费完，覆盖「已缓冲但还没写给客户端」的那段内存）。
+struct BufferReservation {
+    bytes: usize,
+}
+
+impl BufferReservation {
+    fn try_acquire(bytes: usize) -> Option<Self> {
+        use std::sync::atomic::Ordering;
+        let mut cur = PROXY_BUFFER_RESERVED.load(Ordering::Relaxed);
+        loop {
+            let next = cur.checked_add(bytes)?;
+            if next > PROXY_BUFFER_BUDGET {
+                return None;
+            }
+            match PROXY_BUFFER_RESERVED.compare_exchange_weak(
+                cur,
+                next,
+                Ordering::AcqRel,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return Some(Self { bytes }),
+                Err(actual) => cur = actual,
+            }
+        }
+    }
+}
+
+impl Drop for BufferReservation {
+    fn drop(&mut self) {
+        PROXY_BUFFER_RESERVED.fetch_sub(self.bytes, std::sync::atomic::Ordering::AcqRel);
+    }
+}
+
+/// 缓冲预算耗尽（与上游故障区分开：调用方回 503 而不是 502）。
+#[derive(Debug)]
+struct BufferBudgetExhausted;
+
+impl std::fmt::Display for BufferBudgetExhausted {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "proxy response buffering budget exhausted ({} MiB global)",
+            PROXY_BUFFER_BUDGET / (1024 * 1024)
+        )
+    }
+}
+
+impl std::error::Error for BufferBudgetExhausted {}
 
 /// 连接池键：把每个决定「这条请求能复用到哪条连接」的维度**原样**放进结构体，
 /// 由字段比较/字段哈希定相等，**不做 64 位哈希截断**。
@@ -134,7 +203,7 @@ use crate::server::onion_ca::{
     is_onion_host, onion_cert_matches_host, validate_onion_upstream, OnionSslMode,
 };
 use anyhow::{bail, Context, Result};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use bytes::Bytes;
 use http::header::{CONNECTION, HOST, UPGRADE};
 use http::{HeaderMap, HeaderName, HeaderValue, Request, Response, StatusCode, Uri};
@@ -304,7 +373,9 @@ fn apply_response_header_rules(
 /// （缺了握手不成立），但报文定界相关的头一律不转发 —— 否则客户端可以同时带上
 /// `Transfer-Encoding: chunked`，而我们会自己追加 `Content-Length`，
 /// 上游就会同时看到 TE 与 CL，这正是 TE.CL 请求走私的形态。
-/// 另外客户端自带的 X-Forwarded-* 也不转发，避免来源被伪造。
+/// 客户端自带的转发头族不在本名单里：`write_raw_request` 另用
+/// [`is_client_forwarded_header`] 按「`forwarded` / `x-forwarded-*` / `x-real-ip`」
+/// 整族剥离并注入权威值。
 const WS_SKIP: &[&str] = &[
     "keep-alive",
     "proxy-authenticate",
@@ -314,9 +385,26 @@ const WS_SKIP: &[&str] = &[
     "trailer",
     "transfer-encoding",
     "content-length",
-    "x-forwarded-for",
-    "x-forwarded-proto",
 ];
+
+/// 客户端提供的**转发头族**是否要剥离：`Forwarded`（RFC 7239）、整族 `X-Forwarded-*`、
+/// `X-Real-IP`。这些头描述的是「客户端自认为的来源链」，未认证客户端可以随意伪造
+/// （来源 IP/Host/协议）；此前只剥了 XFF/XFP 两个名字，`Forwarded`/`X-Forwarded-Host`/
+/// `X-Real-IP` 等仍原样进上游 —— 依赖它们的后端（Django USE_X_FORWARDED_HOST、按
+/// X-Real-IP 做 ACL/限流的网关）就会被伪造。权威值由代理自己注入。
+fn is_client_forwarded_header(name_lower: &str) -> bool {
+    name_lower == "forwarded" || name_lower == "x-real-ip" || name_lower.starts_with("x-forwarded-")
+}
+
+/// 代理注入的 `Forwarded`（RFC 7239）值：只写我们自己看到的对端地址。
+/// IPv6 按 §6 要求用引号包裹的方括号形式。
+fn forwarded_value(peer: IpAddr, client_https: bool) -> String {
+    let proto = if client_https { "https" } else { "http" };
+    match peer {
+        IpAddr::V4(v4) => format!("for={v4};proto={proto}"),
+        IpAddr::V6(v6) => format!("for=\"[{v6}]\";proto={proto}"),
+    }
+}
 
 pub async fn try_proxy(
     lc: &ListenerConfig,
@@ -334,11 +422,17 @@ pub async fn try_proxy(
                     // unix socket 路径、TLS 后端与库错误文本、超时预算等内网布局信息，
                     // 而拿到它的人只是任意一个能命中该规则的客户端。细节进本地日志。
                     log::warn!("proxy: 规则 {} 处理 {path} 失败: {e:#}", rule.path);
+                    // 缓冲预算耗尽不是上游故障：503（可重试）而不是 502。
+                    let (status, msg) = if e.downcast_ref::<BufferBudgetExhausted>().is_some() {
+                        (StatusCode::SERVICE_UNAVAILABLE, "503 Service Unavailable")
+                    } else {
+                        (StatusCode::BAD_GATEWAY, "502 Bad Gateway")
+                    };
                     return Some((
                         true,
                         Response::builder()
-                            .status(StatusCode::BAD_GATEWAY)
-                            .body(full("502 Bad Gateway"))
+                            .status(status)
+                            .body(full(msg))
                             .unwrap(),
                     ));
                 }
@@ -435,7 +529,7 @@ async fn proxy_once(
     client_https: bool,
 ) -> Result<Response<BoxBody>> {
     if is_websocket_upgrade(&req) {
-        return proxy_websocket(req, rule).await;
+        return proxy_websocket(req, rule, peer_ip, client_https).await;
     }
 
     let upstream = rule.upstream.trim_end_matches('/');
@@ -535,10 +629,11 @@ async fn proxy_once(
         if k == HOST || HOP_BY_HOP.contains(&kl.as_str()) || conn_tokens.iter().any(|t| *t == kl) {
             continue;
         }
-        // XFF/XFP 由下面自行计算后注入。这里若把客户端那份也转发，
-        // builder.header 是**追加**语义，上游会同时收到两份且客户端的排在前面 ——
-        // 后端按「取第一个」解析时就被伪造了（例如明文口上谎称 X-Forwarded-Proto: https）。
-        if kl == "x-forwarded-for" || kl == "x-forwarded-proto" {
+        // 整个转发头族（Forwarded / X-Forwarded-* / X-Real-IP）由下面自行计算后注入。
+        // 这里若把客户端那份也转发，builder.header 是**追加**语义，上游会同时收到两份
+        // 且客户端的排在前面 —— 后端按「取第一个」解析时就被伪造了（例如明文口上谎称
+        // X-Forwarded-Proto: https、X-Forwarded-Host 投毒密码重置链接、X-Real-IP 骗 ACL）。
+        if is_client_forwarded_header(&kl) {
             continue;
         }
         // 规则里 modify_request_headers 指定的头同理：交给下面统一注入，
@@ -565,6 +660,8 @@ async fn proxy_once(
         "x-forwarded-proto",
         if client_https { "https" } else { "http" },
     );
+    // RFC 7239 的 Forwarded 同样只写权威值（客户端那份已在上面剥离）。
+    builder = builder.header("forwarded", forwarded_value(peer_ip, client_https));
     for (k, v) in &rule.modify_request_headers {
         // 与响应方向（response_header_injectable）对称：报文定界头与 authority 头不得由规则
         // 注入。`builder.header` 是**追加**语义，于是 `{"Host": "evil.tld"}` 会发出**两个**
@@ -598,6 +695,11 @@ async fn proxy_once(
         })?
         .context("upstream send")?;
     let (rparts, rbody) = resp.into_parts();
+    // P2：全量缓冲的全局预算。单请求 64MiB、没有全局上限时，并发请求会把常驻内存拉到
+    // N×64MiB；这里在开始缓冲前按上限预留，超限快速失败（走 BufferBudgetExhausted →
+    // 调用方 503），而不是让内存随并发线性增长。
+    let buffer_guard = BufferReservation::try_acquire(crate::server::h1::UPSTREAM_BODY_CAP)
+        .ok_or_else(|| anyhow::Error::new(BufferBudgetExhausted))?;
     // 任务 6（OOM 防护）：上游响应体上限 64MiB。
     // 超时与上限互补：上限管「发太多」，超时管「一个字节都不发」（僵死上游）。
     // 已超时/出错的连接不还池（提前 return，sender 随作用域析构）。
@@ -659,6 +761,15 @@ async fn proxy_once(
         }
         apply_response_header_rules(out_headers, rule, &conn_tokens);
     }
+    // 预算随响应一起活到被 hyper 消费完（extensions 在 Response drop 时才释放），
+    // 覆盖「body 已缓冲、还没写完给客户端」的那段内存。
+    //
+    // `http::Extensions::insert` 要求 `T: Clone`（http 1.5），而这是 RAII 预算守卫 ——
+    // 直接 Clone 会让同一笔预留被归还两次（计数器下溢/提前放行）。用 `Arc` 包一层：
+    // Arc 的 Clone 只加引用计数，Drop 在最后一个引用消失时归还预算，语义与
+    // 「预算跟着响应走」完全一致。
+    out.extensions_mut()
+        .insert(std::sync::Arc::new(buffer_guard));
     // 连接池：响应体已完整读完（H1 复用的前提），连接仍可用就放回池中。
     if rule.connection_pool && sender.is_ready() {
         pool_give(pool_key, sender);
@@ -669,6 +780,8 @@ async fn proxy_once(
 async fn proxy_websocket(
     req: Request<Full<Bytes>>,
     rule: &ProxyRuleConfig,
+    peer_ip: IpAddr,
+    client_https: bool,
 ) -> Result<Response<BoxBody>> {
     let (parts, body) = req.into_parts();
     let body_bytes = body.collect().await?.to_bytes();
@@ -682,7 +795,17 @@ async fn proxy_websocket(
     // 上游若收下升级请求后不回包，这个任务会一直挂在这里（连接与两端口都被占住）。
     let (status, headers) =
         tokio::time::timeout(UPSTREAM_HEAD_TIMEOUT, async {
-            write_raw_request(&mut upstream, &parts, &body_bytes, &host_hdr, &target_uri, rule).await?;
+            write_raw_request(
+                &mut upstream,
+                &parts,
+                &body_bytes,
+                &host_hdr,
+                &target_uri,
+                rule,
+                peer_ip,
+                client_https,
+            )
+            .await?;
             read_http_head(&mut upstream).await
         })
         .await
@@ -705,10 +828,30 @@ async fn proxy_websocket(
         return Ok(out);
     }
 
+    // 隧道并发上限：101 之前就取 permit，取不到直接 503（不进入升级），
+    // permit 随隧道任务结束释放（static 上的借用是 'static，可直接 move 进任务）。
+    let permit = match WS_TUNNELS.try_acquire() {
+        Ok(p) => p,
+        Err(_) => {
+            log::warn!("proxy: WebSocket 隧道并发已达上限 {WS_MAX_TUNNELS}，拒绝升级");
+            return Response::builder()
+                .status(StatusCode::SERVICE_UNAVAILABLE)
+                .body(full("websocket tunnels exhausted"))
+                .context("build websocket limit response");
+        }
+    };
     tokio::spawn(async move {
+        let _permit = permit;
         if let Ok(upgraded) = upgrade.await {
-            let mut client = TokioIo::new(upgraded);
-            let _ = tokio::io::copy_bidirectional(&mut client, &mut upstream).await;
+            let client = TokioIo::new(upgraded);
+            // 每方向独立空闲超时（复用 l4::copy_idle）：没有它时，客户端或只回 101 的
+            // 恶意上游保持静默即可永久占住两个 socket + 任务 + 缓冲。
+            let (mut client_read, mut client_write) = tokio::io::split(client);
+            let (mut up_read, mut up_write) = tokio::io::split(upstream);
+            let _ = tokio::try_join!(
+                crate::server::l4::copy_idle(&mut client_read, &mut up_write, WS_IDLE_TIMEOUT),
+                crate::server::l4::copy_idle(&mut up_read, &mut client_write, WS_IDLE_TIMEOUT),
+            );
         }
     });
 
@@ -934,14 +1077,24 @@ async fn wrap_upstream_tls(
     tls_version: Option<&str>,
     alpn: UpstreamAlpn,
 ) -> Result<UpstreamIo> {
+    // P2：`trust_self_signed` 目前没有自定义根证书可配，实现上与 `no_verify` 一样落到
+    // 「接受任意证书」—— 与面板/规格给人的印象（只多信任自签）不符，警告一次。
+    // 语义修正需要 `upstream_ca_file`（已写 config-requests/proxy-subsys.md）。
+    if mode == OnionSslMode::TrustSelfSigned
+        && !TRUST_SELF_SIGNED_WARNED.swap(true, std::sync::atomic::Ordering::Relaxed)
+    {
+        log::warn!(
+            "proxy: ssl_mode=trust_self_signed 当前等价于 no_verify（接受任意证书，无证书绑定）——\
+             自定义根证书（upstream_ca_file）尚未实现；需要真正校验的上游请用 verify"
+        );
+    }
     #[cfg(feature = "tls_boring")]
     {
         return wrap_upstream_tls_boring(tcp, host, mode, tls_version, alpn).await;
     }
     #[cfg(all(feature = "tls_rustls", not(feature = "tls_boring")))]
     {
-        let _ = alpn;
-        return wrap_upstream_tls_rustls(tcp, host, mode, tls_version).await;
+        return wrap_upstream_tls_rustls(tcp, host, mode, tls_version, alpn).await;
     }
     #[cfg(not(any(feature = "tls_boring", feature = "tls_rustls")))]
     {
@@ -1055,7 +1208,8 @@ async fn wrap_upstream_tls_rustls(
     tcp: TcpStream,
     host: &str,
     mode: OnionSslMode,
-    _tls_version: Option<&str>,
+    tls_version: Option<&str>,
+    alpn: UpstreamAlpn,
 ) -> Result<UpstreamIo> {
     use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
     use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
@@ -1196,17 +1350,46 @@ async fn wrap_upstream_tls_rustls(
             Arc::new(AcceptAll)
         };
 
-    let config = rustls::ClientConfig::builder()
+    // 回源 TLS 版本：此前参数被整个忽略（`_tls_version`）⇒ 配置静默无效。
+    // 归一化与 boring 分支一致（tls1.2 / tls12 / tlsv1.3 …）。
+    let versions: &[&'static rustls::SupportedProtocolVersion] =
+        match tls_version.map(|v| v.to_ascii_lowercase().replace(['.', '_'], "")) {
+            Some(ref v) if v == "tls12" || v == "tlsv12" => &[&rustls::version::TLS12],
+            Some(ref v) if v == "tls13" || v == "tlsv13" => &[&rustls::version::TLS13],
+            _ => rustls::DEFAULT_VERSIONS,
+        };
+    let mut config = rustls::ClientConfig::builder_with_protocol_versions(versions)
         .dangerous()
         .with_custom_certificate_verifier(verifier)
         .with_no_client_auth();
+    // ALPN：与 boring 分支同一策略。此前 rustls 构建完全不发 ALPN，
+    // `upstream_http_version = "h2"` 必然 502（上游按 h1 回话、我们按 h2 前奏讲话）。
+    match alpn {
+        UpstreamAlpn::Auto => {
+            config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+        }
+        UpstreamAlpn::H2Only => {
+            config.alpn_protocols = vec![b"h2".to_vec()];
+        }
+        UpstreamAlpn::Off => {}
+    }
     let connector = TlsConnector::from(Arc::new(config));
     let server_name = ServerName::try_from(host.to_string()).context("TLS server name")?;
     let tls = connector
         .connect(server_name, tcp)
         .await
         .with_context(|| format!("rustls TLS connect to {host}"))?;
-    Ok(UpstreamIo::from_tls(tls))
+    // 与 boring 路径一致：把 ALPN 协商结果带回去，未显式配 upstream_http_version 时
+    // 据此选 h2/h1 的 client conn。
+    let negotiated_h2 = tls
+        .get_ref()
+        .1
+        .alpn_protocol()
+        .map(|p| p == b"h2")
+        .unwrap_or(false);
+    let mut io = UpstreamIo::from_tls(tls);
+    io.negotiated_h2 = negotiated_h2;
+    Ok(io)
 }
 
 async fn write_raw_request(
@@ -1216,6 +1399,8 @@ async fn write_raw_request(
     host_hdr: &str,
     upstream_uri: &Uri,
     rule: &ProxyRuleConfig,
+    peer_ip: IpAddr,
+    client_https: bool,
 ) -> Result<()> {
     let path_q = upstream_uri
         .path_and_query()
@@ -1228,7 +1413,9 @@ async fn write_raw_request(
             continue;
         }
         let kl = k.as_str().to_ascii_lowercase();
-        if WS_SKIP.contains(&kl.as_str()) {
+        // WS 路径同样剥掉客户端转发头族（此前只剥了 XFF/XFP 两个名字），
+        // 权威值在下面注入。
+        if WS_SKIP.contains(&kl.as_str()) || is_client_forwarded_header(&kl) {
             continue;
         }
         if rule
@@ -1242,6 +1429,16 @@ async fn write_raw_request(
             lines.push_str(&format!("{k}: {vs}\r\n"));
         }
     }
+    // 标准代理头注入：只写我们自己看到的对端地址（与 proxy_once 同一口径）。
+    lines.push_str(&format!("X-Forwarded-For: {peer_ip}\r\n"));
+    lines.push_str(&format!(
+        "X-Forwarded-Proto: {}\r\n",
+        if client_https { "https" } else { "http" }
+    ));
+    lines.push_str(&format!(
+        "Forwarded: {}\r\n",
+        forwarded_value(peer_ip, client_https)
+    ));
     for (k, v) in &rule.modify_request_headers {
         // 这一路是**直接拼报文**（非 WS 的 h1/h2 路径会先经 HeaderName/HeaderValue 校验，
         // 非法值让 builder 报错、整条请求 502）。不校验就等于让规则的名字/值里塞 CR/LF
@@ -1389,7 +1586,7 @@ async fn connect_tor_socks(
     //   与本项目「BoringSSL 为主、不引入第二套 TLS 栈」的取向相冲。config 的文档已同步改成
     //   与实现一致，不再留下不存在的承诺。）
     for cand in default_tor_uds_candidates() {
-        if cand.is_socket() {
+        if uds_socket_trusted(&cand) {
             match UnixStream::connect(&cand).await {
                 Ok(unix) => {
                     log::debug!(
@@ -1415,23 +1612,41 @@ async fn connect_tor_socks(
 }
 
 
-/// `Path::is_socket()` 需要 `std::os::unix::fs::FileTypeExt`（仅 unix）。
-trait SocketPath {
-    fn is_socket(&self) -> bool;
-}
-impl SocketPath for PathBuf {
-    fn is_socket(&self) -> bool {
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::FileTypeExt;
-            return std::fs::metadata(self)
-                .map(|m| m.file_type().is_socket())
-                .unwrap_or(false);
+/// 默认候选 UDS 是否可信：候选本身必须是 socket（**不是符号链接**），且它到根之间的
+/// 每一级目录都必须是真实目录、**不可被 group/other 写**。
+///
+/// 为什么需要：未配置 SOCKS 时第一条候选是 cwd 下的 `state/tor-client/socks.sock`。
+/// 进程若从可写目录（/tmp、可写部署目录）启动，同机其他账号可以预先放一个同名 socket，
+/// 所有 `.onion` 出站都会连到它（窥知访问目标、DoS；no_verify/off 下可中间人）。
+/// 原实现只 `is_socket()`（还跟随符号链接）。逐级目录不可被他人改写时，攻击者无法在
+/// 这条路径上放置自己的 socket —— 此时才信任；否则跳过、继续下一个候选（系统路径）。
+fn uds_socket_trusted(p: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{FileTypeExt, MetadataExt};
+        // symlink_metadata：符号链接拿到的是链接本身（file_type 不是 socket）⇒ 拒绝。
+        let Ok(md) = std::fs::symlink_metadata(p) else {
+            return false;
+        };
+        if !md.file_type().is_socket() {
+            return false;
         }
-        #[cfg(not(unix))]
-        {
-            false
+        let mut cur = p.parent();
+        while let Some(d) = cur {
+            let Ok(dm) = std::fs::symlink_metadata(d) else {
+                return false;
+            };
+            if !dm.is_dir() || dm.mode() & 0o022 != 0 {
+                return false;
+            }
+            cur = d.parent();
         }
+        true
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = p;
+        false
     }
 }
 
@@ -1566,18 +1781,19 @@ async fn socks5_unix_bridge(mut unix: UnixStream, host: &str, port: u16) -> Resu
     let client = TcpStream::connect(addr)
         .await
         .context("tor bridge client")?;
+    // 比**完整 SocketAddr**（地址 + 端口）：只比端口时，同机攻击者可以从另一个回环地址
+    // （如 127.0.0.2）绑定相同源端口抢在 accept 窗口里连上，接管这条已建立的 Tor 隧道。
     let mine = client
         .local_addr()
-        .context("tor bridge client local_addr")?
-        .port();
-    // 只接受端口号等于本连接的那个；别的（同机抢占/扫描）一律立刻关闭
+        .context("tor bridge client local_addr")?;
+    // 只接受与本连接本地地址完全相同的那个；别的（同机抢占/扫描）一律立刻关闭
     let mut server = loop {
         let (sock, peer) = listener.accept().await.context("tor bridge accept")?;
-        if peer.port() == mine {
+        if peer == mine {
             break sock;
         }
         log::warn!(
-            "tor bridge: 丢弃非预期连接 peer={peer}（期望端口 {mine}）—— 疑似同机抢占"
+            "tor bridge: 丢弃非预期连接 peer={peer}（期望 {mine}）—— 疑似同机抢占"
         );
         drop(sock);
     };
@@ -1641,6 +1857,22 @@ where
 
 /// page_rules `pass` 动作入口:复用反代机制,把 match_url 前缀流量转发到 target。
 /// 上游 TLS 校验按 URL scheme 决定(http:// → off,https:// → verify)。
+/// page rule `pass` 的上游 TLS 档位：按**解析后的 scheme** 判定（大小写不敏感）。
+///
+/// 此前是 `upstream.starts_with("https://")` 的字面前缀比较，而 `http::Uri` 会把
+/// scheme 归一化：页面规则 target 写 `HTTPS://backend/` 能通过配置校验并存盘，
+/// 运行期却被判成 `off`（boring 下不设置 verify，rustls 下直接 AcceptAll）——
+/// 同一份配置因大小写得到不同的 TLS 安全档。
+fn page_rule_pass_ssl_mode(upstream: &str) -> &'static str {
+    match Uri::from_str(upstream.trim())
+        .ok()
+        .and_then(|u| u.scheme_str().map(str::to_ascii_lowercase))
+    {
+        Some(s) if s == "https" => "verify",
+        _ => "off",
+    }
+}
+
 pub async fn proxy_page_rule(
     req: Request<Full<Bytes>>,
     match_url: &str,
@@ -1648,11 +1880,7 @@ pub async fn proxy_page_rule(
     peer_ip: IpAddr,
     client_https: bool,
 ) -> Response<BoxBody> {
-    let ssl_mode = if upstream.starts_with("https://") {
-        "verify"
-    } else {
-        "off"
-    };
+    let ssl_mode = page_rule_pass_ssl_mode(upstream);
     let rule = ProxyRuleConfig {
         path: match_url.trim_end_matches('*').to_string(),
         upstream: upstream.to_string(),
@@ -1672,9 +1900,14 @@ pub async fn proxy_page_rule(
             // 与端口、tor 的 unix socket 路径、TLS 后端错误文本、超时预算等内网布局信息，
             // 而能拿到它的人只是任意一个命中该 page rule 的客户端。细节只进本地日志。
             log::warn!("proxy: page rule pass 处理失败: {e:#}");
+            let (status, msg) = if e.downcast_ref::<BufferBudgetExhausted>().is_some() {
+                (StatusCode::SERVICE_UNAVAILABLE, "503 Service Unavailable")
+            } else {
+                (StatusCode::BAD_GATEWAY, "502 Bad Gateway")
+            };
             Response::builder()
-                .status(StatusCode::BAD_GATEWAY)
-                .body(full("502 Bad Gateway"))
+                .status(status)
+                .body(full(msg))
                 .unwrap()
         }
     }
@@ -1840,6 +2073,90 @@ mod tor_socks_tests {
             connect_budget(true).as_secs() >= 30,
             "冷电路实测可超 10s，预算不该压回十几秒"
         );
+    }
+
+    /// P2：转发头族必须整体剥离（不只是 XFF/XFP 两个名字）。
+    #[test]
+    fn forwarded_header_family_is_stripped() {
+        for h in [
+            "forwarded",
+            "x-forwarded-for",
+            "x-forwarded-proto",
+            "x-forwarded-host",
+            "x-forwarded-port",
+            "x-forwarded-ssl",
+            "x-real-ip",
+        ] {
+            assert!(is_client_forwarded_header(h), "{h} 必须剥离");
+        }
+        for h in ["x-custom", "forwarded-by", "x-real", "host", "x-forwardeds"] {
+            assert!(!is_client_forwarded_header(h), "{h} 不应被误剥");
+        }
+    }
+
+    /// Forwarded 注入值：IPv4 裸值、IPv6 加引号方括号（RFC 7239 §6）。
+    #[test]
+    fn forwarded_value_formats_ipv6_quoted() {
+        let v4: IpAddr = "203.0.113.7".parse().unwrap();
+        assert_eq!(forwarded_value(v4, false), "for=203.0.113.7;proto=http");
+        assert_eq!(forwarded_value(v4, true), "for=203.0.113.7;proto=https");
+        let v6: IpAddr = "2001:db8::1".parse().unwrap();
+        assert_eq!(forwarded_value(v6, false), "for=\"[2001:db8::1]\";proto=http");
+    }
+
+    /// P3：page rule `pass` 的 https 判定必须大小写不敏感
+    /// （此前 `HTTPS://` 被判成 off，同一配置因大小写落到不同 TLS 安全档）。
+    #[test]
+    fn page_rule_pass_ssl_mode_is_case_insensitive() {
+        assert_eq!(page_rule_pass_ssl_mode("https://backend/"), "verify");
+        assert_eq!(page_rule_pass_ssl_mode("HTTPS://backend/"), "verify");
+        assert_eq!(page_rule_pass_ssl_mode("HtTpS://backend"), "verify");
+        assert_eq!(page_rule_pass_ssl_mode("http://backend/"), "off");
+        assert_eq!(page_rule_pass_ssl_mode("backend:8080"), "off");
+    }
+
+    /// P2：全局缓冲预算——整份预算只能被预留一次，drop 后归还（OOM 向量的硬上限）。
+    #[test]
+    fn buffer_budget_is_global_and_released_on_drop() {
+        let all =
+            BufferReservation::try_acquire(PROXY_BUFFER_BUDGET).expect("整份预算可预留一次");
+        assert!(
+            BufferReservation::try_acquire(1).is_none(),
+            "已耗尽时不得再预留"
+        );
+        drop(all);
+        assert!(
+            BufferReservation::try_acquire(PROXY_BUFFER_BUDGET).is_some(),
+            "drop 后应归还"
+        );
+    }
+
+    /// P3：默认候选 UDS 只信任「真实 socket + 路径全程不可被他人改写」；
+    /// 符号链接一律拒绝（此前用 `metadata()` 跟随链接 + 只查 is_socket）。
+    #[cfg(unix)]
+    #[test]
+    fn uds_trust_rejects_symlinks_and_non_sockets() {
+        use std::os::unix::fs::symlink;
+        let base = std::env::temp_dir().join(format!("crucible-uds-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let sock = base.join("s.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+        assert!(!uds_socket_trusted(std::path::Path::new(
+            "/nonexistent-crucible.sock"
+        )));
+        symlink(&sock, base.join("link.sock")).unwrap();
+        assert!(
+            !uds_socket_trusted(&base.join("link.sock")),
+            "符号链接必须拒绝"
+        );
+        std::fs::write(base.join("plain"), b"x").unwrap();
+        assert!(
+            !uds_socket_trusted(&base.join("plain")),
+            "非 socket 必须拒绝"
+        );
+        drop(listener);
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     /// 默认 UDS 候选链里必须包含 orig 规格 A 列出的那几个路径。

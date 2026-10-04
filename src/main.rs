@@ -117,8 +117,18 @@ fn main() -> Result<()> {
     // 退出路径要用（见文件尾）：Arc 会被 move 进下面的 async 块，这里留一份句柄。
     let live_for_shutdown = live.clone();
 
+    // worker 线程数：默认 2（规格 §5 的最终 benchmark 形态 —— 原机器上再往上加没有收益），
+    // 但允许用 `CRUCIBLE_WORKER_THREADS` 覆盖：
+    //   * 多核机器上做公平对比（两侧线程数对齐）或压测时需要显式调大；
+    //   * 容器里 CPU 配额很小的时候可以调小。
+    // 注意这不是热重载项（runtime 只在启动时建一次），改它要重启进程。
+    let worker_threads = std::env::var("CRUCIBLE_WORKER_THREADS")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(2);
     let rt = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(2)
+        .worker_threads(worker_threads)
         .enable_all()
         .build()
         .context("build tokio runtime")?;

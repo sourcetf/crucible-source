@@ -72,6 +72,15 @@ pub async fn serve(req: &Request<Incoming>, lc: &ListenerConfig) -> Result<Respo
     let fs_path = resolve_path(&lc.root, path)?;
     let meta = fs::metadata(&fs_path)?;
     if meta.is_dir() {
+        // 目录索引优先（h2o/nginx 默认）：docroot 带 index.html 时根路径必须返回它，
+        // 而不是目录列表或 404。索引文件走与普通文件**完全相同**的闸门
+        // （file_open/engine_owns/app_private_path），不放宽任何安全判定。
+        if let Some((idx, idx_meta)) = directory_index(&fs_path) {
+            let mode = lc.file_open_mode(path);
+            if !engine_owns(lc, path, mode) && !app_private_path(lc, path, mode) {
+                return serve_file(req, &idx, &idx_meta, mode).await;
+            }
+        }
         if lc.autoindex.allows(path) {
             return Ok(autoindex(&fs_path, path, lc.autoindex.enabled && lc.autoindex.enable_upload)?);
         }
@@ -348,8 +357,15 @@ pub async fn serve_simple<T>(req: &Request<T>, lc: &ListenerConfig) -> Result<Re
             .unwrap());
     }
     let path = req.uri().path();
-    let fs_path = resolve_path(&lc.root, path)?;
-    let meta = fs::metadata(&fs_path)?;
+    let mut fs_path = resolve_path(&lc.root, path)?;
+    let mut meta = fs::metadata(&fs_path)?;
+    if meta.is_dir() {
+        // 与 h1 相同：index.html/index.htm 优先（否则 h1 与 h2/h3 行为不一致）。
+        if let Some((idx, idx_meta)) = directory_index(&fs_path) {
+            fs_path = idx;
+            meta = idx_meta;
+        }
+    }
     if meta.is_dir() {
         if lc.autoindex.allows(path) {
             let html = autoindex_html(&fs_path, path, lc.autoindex.enabled && lc.autoindex.enable_upload)?;
@@ -917,6 +933,27 @@ fn autoindex(dir: &Path, url: &str, enable_upload: bool) -> Result<Response<BoxB
         .unwrap())
 }
 
+/// 目录索引文件名（按顺序探测），与 h2o/nginx 默认一致。
+///
+/// 为什么必须有：此前 h1 与 h2/h3 两条静态路径在 `meta.is_dir()` 时只有
+/// 「autoindex 列表」或「404」两种结果 —— **从不服务 index.html**。而仓库自带的
+/// `www/index.html`、`www-static-fair/index.html` 都是入口文件：既不 list（autoindex 关时）
+/// 也不 serve，根路径直接 404；开着 autoindex 时则返回目录列表，而 `bench/h2o-fair.conf`
+/// 让 h2o 服务同一目录的 index.html —— 公平基准比的不是同一个响应体（规格 §22）。
+const INDEX_FILES: &[&str] = &["index.html", "index.htm"];
+
+fn directory_index(dir: &Path) -> Option<(PathBuf, fs::Metadata)> {
+    for name in INDEX_FILES {
+        let p = dir.join(name);
+        if let Ok(m) = fs::metadata(&p) {
+            if m.is_file() {
+                return Some((p, m));
+            }
+        }
+    }
+    None
+}
+
 fn autoindex_html(dir: &Path, url: &str, enable_upload: bool) -> Result<String> {
     // 只编码路径段内的不安全字符；目录的 `/` 在编码之外拼接，
     // 避免 `test%2F` 这类整段被错误编码的子目录链接（规格 §8）。
@@ -1026,7 +1063,21 @@ document.getElementById('upb').onclick=crucibleUpload;
 mod tests {
     use super::*;
 
+    /// 目录索引：index.html 存在时必须优先返回它（此前只有列表/404 两条路）。
     #[test]
+    fn directory_index_prefers_index_html() {
+        let dir = std::env::temp_dir().join(format!("crucible-idx-{}", std::process::id()));
+        let _ = fs::create_dir_all(&dir);
+        assert!(directory_index(&dir).is_none());
+        fs::write(dir.join("index.htm"), b"htm").unwrap();
+        assert!(directory_index(&dir).unwrap().0.ends_with("index.htm"));
+        fs::write(dir.join("index.html"), b"html").unwrap();
+        let (p, m) = directory_index(&dir).unwrap();
+        assert!(p.ends_with("index.html"));
+        assert_eq!(m.len(), 4);
+        let _ = fs::remove_dir_all(&dir);
+    }
+        #[test]
     fn parse_range_basic_suffix_and_open_end() {
         assert_eq!(parse_range("bytes=0-9", 100), RangeSpec::Slice { start: 0, end: 9 });
         assert_eq!(parse_range("bytes=5-", 100), RangeSpec::Slice { start: 5, end: 99 });

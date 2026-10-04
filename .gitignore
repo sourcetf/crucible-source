@@ -40,6 +40,13 @@ www-apps/*/deps/.crucible_manifest
 *.key
 *.pem
 *.crt
+# 例外：规格 §1 要求仓库自带这 4 个**测试**证书（自签名、仅供本地/验收使用）。
+# 验收脚本 scripts/acceptance_test_ports.sh 与 scripts/generate_test_certs.sh 都假定
+# 「仓库自带」它们；没有例外规则时新克隆会缺证书，TLS 端口全部起不来。
+!cert.pem
+!key.pem
+!cert_ec.pem
+!key_ec.pem
 config/secrets.*
 .env
 .env.*

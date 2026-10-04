@@ -24,7 +24,9 @@ restart_with_cap() {
   pkill -f 'webserver --config .*config-test.toml' 2>/dev/null || true
   sleep 1
   cd "${ROOT}"
-  nohup env CRUCIBLE_BATCH_CAP="${cap}" ./target/release/webserver --config "${CFG}" \
+  # 独立 DNS 状态根（同 overnight_loop.sh）：否则测试实例读生产 state/dns/etc/panel.toml，
+  # 端口改不动且会污染生产 DNS 库。
+  nohup env CRUCIBLE_DNS_STATE_ROOT="${ROOT:-/crucible}/state/dns-test" CRUCIBLE_BATCH_CAP="${cap}" ./target/release/webserver --config "${CFG}" \
     >>/tmp/crucible-test.log 2>&1 &
   echo $! >/tmp/crucible-test.pid
   sleep 2

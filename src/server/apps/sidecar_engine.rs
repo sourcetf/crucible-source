@@ -1,12 +1,19 @@
 //! Shared FFI / Unix sidecar dispatch for optional app engines.
 
 use crate::config::{AppRouteConfig, ListenerConfig};
+use crate::server::apps::deps::DepsEnv;
 use crate::server::apps::{app_ffi, native_http};
 use crate::server::h1::{full, BoxBody};
-use anyhow::Result;
+use anyhow::{bail, Context, Result};
+use bytes::Bytes;
 use http::{Request, Response, StatusCode};
 use hyper::body::Incoming;
 use std::net::SocketAddr;
+
+/// h2/h3 字节路径的 sidecar 墙钟上限：整段（发送 + 收集响应体）共用一个 deadline。
+/// sidecar 接受连接后不回包（应用卡死/死锁）时，请求任务与 UDS fd 不能永久挂着 ——
+/// 此前这条路径完全裸奔（proxy/fastcgi/CGI 都有各自超时）。
+const SIDECAR_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 pub async fn handle_with_fallback(
     req: Request<Incoming>,
@@ -47,4 +54,373 @@ pub async fn handle_with_fallback(
             "502 Bad Gateway: engine `{engine}` unavailable (no libapp_{engine}.so, sidecar, or socket)\n"
         )))
         .unwrap())
+}
+
+/// [`handle_with_fallback`] 的**字节版**（h2/h3 simple 路径）：请求体已在协议层收齐为
+/// `Bytes`，与 h1 走同一条 fallback 链（FFI .so → 显式且存活的 UDS → `deps/bin/index`
+/// 持久 sidecar → 502），只是传输层按 `Bytes` 收发。
+///
+/// 为什么不直接复用 `handle_with_fallback`：它的入参是 `Request<Incoming>`，而
+/// `hyper::body::Incoming` 没有公开构造函数（hyper 1.9 `pub(crate) fn new_channel`），
+/// 字节路径无法把已收齐的 body 包回 `Incoming`。
+pub async fn handle_with_fallback_simple(
+    req: &Request<Bytes>,
+    lc: &ListenerConfig,
+    app: &AppRouteConfig,
+    peer: SocketAddr,
+    app_idx: usize,
+    engine: &str,
+    deps: &DepsEnv,
+) -> Result<Response<Bytes>> {
+    if native_http::lib_available(app, engine) {
+        let outcome = app_ffi::execute_simple(req, lc, app, peer, deps).await?;
+        return Ok(app_ffi::simple_response_from_outcome(outcome));
+    }
+    // 与 h1 同序：显式配置的 socket（活着才算）优先，其次自动探测的 sidecar。
+    #[cfg(unix)]
+    {
+        if native_http::uds_socket_available(app) {
+            let sock = native_http::uds_socket_path(app).context("apps[].socket missing")?;
+            return proxy_uds_simple(req, &sock, peer).await;
+        }
+        if native_http::sidecar_available(app, lc) {
+            let sock = ensure_sidecar_simple(lc, app, app_idx).await?;
+            return proxy_uds_simple(req, &sock, peer).await;
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (req, lc, app, peer, app_idx, deps);
+    }
+    bail!(
+        "502 Bad Gateway: engine `{engine}` unavailable (no libapp_{engine}.so, sidecar, or socket)\n"
+    )
+}
+
+/// 客户端转发头：只能由本代理重写，透传等于让客户端伪造来源。
+fn is_client_forward_header(lower: &str) -> bool {
+    matches!(
+        lower,
+        "x-forwarded-for" | "x-forwarded-proto" | "x-forwarded-host" | "x-real-ip"
+    )
+}
+
+/// hop-by-hop 头（RFC 9110 §7.6.1）：只为当前这条连接服务，不能带进响应/请求的另一端。
+fn is_hop_by_hop(lower: &str) -> bool {
+    matches!(
+        lower,
+        "connection"
+            | "keep-alive"
+            | "proxy-connection"
+            | "proxy-authenticate"
+            | "proxy-authorization"
+            | "te"
+            | "trailer"
+            | "transfer-encoding"
+            | "upgrade"
+    )
+}
+
+/// 上游响应 → 下游响应（字节版）：过滤 hop-by-hop（含 `Connection` 点名的头）与
+/// 和真实 body 长度不符的 `Content-Length`（否则 h1 keep-alive 上是响应走私，
+/// h2/h3 上对端判 CL 不符直接 RST 流）。与 proxy.rs 对同一天花板同一口径。
+fn upstream_response(rparts: http::response::Parts, body: Bytes) -> Result<Response<Bytes>> {
+    let conn_tokens: Vec<String> = rparts
+        .headers
+        .get_all(http::header::CONNECTION)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .flat_map(|s| s.split(','))
+        .map(|t| t.trim().to_ascii_lowercase())
+        .filter(|t| !t.is_empty())
+        .collect();
+    let mut builder = Response::builder().status(rparts.status);
+    for (k, v) in rparts.headers.iter() {
+        let lower = k.as_str().to_ascii_lowercase();
+        if is_hop_by_hop(&lower) || conn_tokens.iter().any(|t| t == &lower) {
+            continue;
+        }
+        if lower == "content-length" {
+            let declared = v.to_str().ok().and_then(|s| s.trim().parse::<u64>().ok());
+            if declared != Some(body.len() as u64) {
+                continue;
+            }
+        }
+        builder = builder.header(k, v);
+    }
+    builder
+        .body(body)
+        .context("build native sidecar response (simple)")
+}
+
+#[cfg(unix)]
+async fn proxy_uds_simple(
+    req: &Request<Bytes>,
+    sock: &std::path::Path,
+    peer: SocketAddr,
+) -> Result<Response<Bytes>> {
+    use hyper::client::conn::http1;
+    use http_body_util::BodyExt as _;
+    use hyper_util::rt::TokioIo;
+    use tokio::net::UnixStream;
+
+    let stream = UnixStream::connect(sock)
+        .await
+        .with_context(|| format!("connect {}", sock.display()))?;
+    let (mut sender, conn) = http1::handshake(TokioIo::new(stream))
+        .await
+        .context("h1 handshake")?;
+    tokio::spawn(async move {
+        if let Err(e) = conn.await {
+            log::debug!("native_http simple conn: {e}");
+        }
+    });
+
+    // h2/h3 的 URI 带 scheme+authority（:authority），而 UDS sidecar 是 origin server：
+    // 目标一律改写为 origin-form（path?query），否则请求行会写成 absolute-form，sidecar
+    // 可能解析失败/路由错。h2 也不保证有 Host 头 ⇒ authority 存在而 Host 缺失时补上。
+    let target = req
+        .uri()
+        .path_and_query()
+        .map(|pq| pq.as_str().to_string())
+        .unwrap_or_else(|| "/".to_string());
+    let mut builder = Request::builder().method(req.method().clone()).uri(target);
+    let mut has_host = false;
+    for (k, v) in req.headers() {
+        let lower = k.as_str().to_ascii_lowercase();
+        if lower == "host" {
+            has_host = true;
+        }
+        if is_client_forward_header(&lower) || is_hop_by_hop(&lower) {
+            continue;
+        }
+        builder = builder.header(k, v);
+    }
+    if !has_host {
+        if let Some(auth) = req.uri().authority() {
+            builder = builder.header(http::header::HOST, auth.as_str());
+        }
+    }
+    builder = builder.header("x-forwarded-for", peer.ip().to_string());
+    let upstream = builder
+        .body(http_body_util::Full::new(req.body().clone()))
+        .context("build upstream req")?;
+
+    // 整段一个 deadline：发送、响应头、响应体收集都算在内。
+    let (rparts, rbytes) = tokio::time::timeout(SIDECAR_TIMEOUT, async {
+        let resp = sender
+            .send_request(upstream)
+            .await
+            .context("sidecar request")?;
+        let (rparts, rbody) = resp.into_parts();
+        let rbytes = http_body_util::Limited::new(rbody, crate::server::h1::UPSTREAM_BODY_CAP)
+            .collect()
+            .await
+            .map_err(|e| anyhow::anyhow!("collect upstream body: {e}"))?
+            .to_bytes();
+        Ok::<_, anyhow::Error>((rparts, rbytes))
+    })
+    .await
+    .map_err(|_| anyhow::anyhow!("sidecar timeout after {SIDECAR_TIMEOUT:?}"))??;
+    upstream_response(rparts, rbytes)
+}
+
+#[cfg(unix)]
+fn sock_alive(sock: &std::path::Path) -> bool {
+    std::os::unix::net::UnixStream::connect(sock).is_ok()
+}
+
+#[cfg(unix)]
+struct SimpleSidecar {
+    sock: std::path::PathBuf,
+    child: std::process::Child,
+}
+
+/// h2/h3 字节路径的 sidecar 注册表（键与 native_http 相同：port-app_idx-engine）。
+///
+/// 与 native_http 的注册表并存：两边用**同一个 sock 路径**（`state/native/{key}/app.sock`），
+/// 且 spawn 前先 `sock_alive` 探测，所以一条协议先起的 sidecar 会被另一条复用；
+/// 只有「两条协议首次请求同时到达」的窄窗口可能各 spawn 一个（后启动的赢下 socket）。
+/// 彻底消除重复需要 native_http 暴露字节入口（跨组项，见工单总结）。
+#[cfg(unix)]
+static SIDECARS_SIMPLE: once_cell::sync::Lazy<
+    parking_lot::Mutex<std::collections::HashMap<String, SimpleSidecar>>,
+> = once_cell::sync::Lazy::new(|| parking_lot::Mutex::new(std::collections::HashMap::new()));
+
+#[cfg(unix)]
+static SIMPLE_SPAWN_LOCKS: once_cell::sync::Lazy<
+    parking_lot::Mutex<std::collections::HashMap<String, std::sync::Arc<tokio::sync::Mutex<()>>>>,
+> = once_cell::sync::Lazy::new(|| parking_lot::Mutex::new(std::collections::HashMap::new()));
+
+/// 确保 `deps/bin/index` 持久 sidecar 已启动，返回其 UDS 路径。
+/// 与 native_http::ensure_sidecar 同一套约定（env、state 目录、5s 就绪等待、
+/// 失败 kill 子进程），保证 h1/h2/h3 起出来的是同一种进程。
+#[cfg(unix)]
+async fn ensure_sidecar_simple(
+    lc: &ListenerConfig,
+    app: &AppRouteConfig,
+    app_idx: usize,
+) -> Result<std::path::PathBuf> {
+    use std::process::{Command, Stdio};
+    use std::time::{Duration, Instant};
+
+    let key = format!("{}-{}-{}", lc.port, app_idx, app.engine);
+    let state = abs_path(&std::path::PathBuf::from(format!("state/native/{key}")));
+    std::fs::create_dir_all(&state).context("mkdir native state")?;
+    let sock = abs_canon(&state.join("app.sock"));
+
+    // 别的协议（h1）或本注册表之外的实例已经把这个 socket 起好了：直接复用，
+    // 绝不能 remove_file 抢走它。
+    if sock_alive(&sock) {
+        return Ok(sock);
+    }
+    {
+        let map = SIDECARS_SIMPLE.lock();
+        if let Some(s) = map.get(&key) {
+            if sock_alive(&s.sock) {
+                return Ok(s.sock.clone());
+            }
+        }
+    }
+
+    let lock = SIMPLE_SPAWN_LOCKS
+        .lock()
+        .entry(key.clone())
+        .or_insert_with(|| std::sync::Arc::new(tokio::sync::Mutex::new(())))
+        .clone();
+    let _guard = lock.lock().await;
+    // 等锁期间可能已被别人建好（或已由另一协议拉起）。
+    if sock_alive(&sock) {
+        return Ok(sock);
+    }
+    {
+        let map = SIDECARS_SIMPLE.lock();
+        if let Some(s) = map.get(&key) {
+            if sock_alive(&s.sock) {
+                return Ok(s.sock.clone());
+            }
+        }
+    }
+    // 死条目：杀进程再摘除（只删表会留下孤儿）。
+    if let Some(mut dead) = SIDECARS_SIMPLE.lock().remove(&key) {
+        crate::server::apps::child_registry::kill_child(&mut dead.child);
+    }
+
+    let deps_bin = native_http::sidecar_binary(app, lc)
+        .context("native sidecar binary missing: deps/bin/index (no CGI fallback)")?;
+    let docroot = abs_canon(&app.docroot.clone().unwrap_or_else(|| lc.root.clone()));
+    let _ = std::fs::remove_file(&sock);
+    let log_path = state.join("sidecar.log");
+    let log_file = std::fs::File::create(&log_path).context("sidecar.log")?;
+
+    let mut cmd = Command::new(&deps_bin);
+    cmd.current_dir(&docroot)
+        .env("WEBSERVER_LISTEN_UNIX", sock.display().to_string())
+        .env("WEBSERVER_WORKERS", app.workers.max(1).to_string())
+        .env("DOCUMENT_ROOT", docroot.display().to_string())
+        .env("GATEWAY_INTERFACE", "CGI/1.1")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::from(log_file));
+    let mut child = crate::server::apps::child_registry::spawn_tracked(
+        &mut cmd,
+        &format!("native sidecar {key} (simple)"),
+    )
+    .with_context(|| format!("spawn sidecar {}", deps_bin.display()))?;
+
+    let start = Instant::now();
+    while start.elapsed() < Duration::from_secs(5) {
+        if sock_alive(&sock) {
+            SIDECARS_SIMPLE.lock().insert(
+                key,
+                SimpleSidecar {
+                    sock: sock.clone(),
+                    child,
+                },
+            );
+            return Ok(sock);
+        }
+        tokio::time::sleep(Duration::from_millis(40)).await;
+    }
+    // 超时必须收拾刚拉起的子进程（Child 被 drop 不会终止进程）。
+    crate::server::apps::child_registry::kill_child(&mut child);
+    bail!(
+        "native sidecar sock not ready: {} (see {}; spawned child killed)",
+        sock.display(),
+        log_path.display()
+    )
+}
+
+#[cfg(unix)]
+fn abs_path(p: &std::path::Path) -> std::path::PathBuf {
+    if p.is_absolute() {
+        p.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .unwrap_or_else(|_| std::path::PathBuf::from("."))
+            .join(p)
+    }
+}
+
+#[cfg(unix)]
+fn abs_canon(p: &std::path::Path) -> std::path::PathBuf {
+    let a = abs_path(p);
+    std::fs::canonicalize(&a).unwrap_or(a)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 上游响应必须过滤 hop-by-hop/Connection 点名的头，并丢弃与实际 body 不符的
+    /// Content-Length；其余头（Set-Cookie 等）原样保留。
+    #[test]
+    fn upstream_response_filters_hop_by_hop_and_bad_cl() {
+        let (parts, _) = Response::builder()
+            .status(200)
+            .header("transfer-encoding", "chunked")
+            .header("connection", "keep-alive, x-internal")
+            .header("keep-alive", "timeout=5")
+            .header("x-internal", "secret")
+            .header("content-length", "999")
+            .header("set-cookie", "a=1")
+            .body(())
+            .unwrap()
+            .into_parts();
+        let r = upstream_response(parts, Bytes::from_static(b"hello")).unwrap();
+        assert!(r.headers().get("transfer-encoding").is_none());
+        assert!(r.headers().get("connection").is_none());
+        assert!(r.headers().get("keep-alive").is_none());
+        assert!(r.headers().get("x-internal").is_none(), "Connection 点名的头必须过滤");
+        assert!(r.headers().get("content-length").is_none());
+        assert_eq!(r.headers().get("set-cookie").unwrap(), "a=1");
+
+        // CL 恰等于真实长度时保留（HEAD 场景仍能给出实体长度）。
+        let (parts, _) = Response::builder()
+            .status(200)
+            .header("content-length", "5")
+            .body(())
+            .unwrap()
+            .into_parts();
+        let r = upstream_response(parts, Bytes::from_static(b"hello")).unwrap();
+        assert_eq!(r.headers().get("content-length").unwrap(), "5");
+    }
+
+    #[test]
+    fn hop_by_hop_list_is_complete() {
+        for h in [
+            "connection",
+            "keep-alive",
+            "proxy-connection",
+            "te",
+            "trailer",
+            "transfer-encoding",
+            "upgrade",
+        ] {
+            assert!(is_hop_by_hop(h), "{h} 应为 hop-by-hop");
+        }
+        assert!(!is_hop_by_hop("content-type"));
+        assert!(is_client_forward_header("x-forwarded-for"));
+        assert!(!is_client_forward_header("x-custom"));
+    }
 }
