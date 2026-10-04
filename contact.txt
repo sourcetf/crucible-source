@@ -1724,3 +1724,29 @@ dns-encrypted（DoT 超时+ACL 快照+证书重载、ACME 首签）与部分 dns
 - 性能门禁仍差 ~3-4×（工效/分配器/调度争用的分析见上一节），本轮没动。
 - `spec-matrix.md` 只写到 §6，剩余章节没逐条填（时间给了引擎/崩溃修复）。
 - ACME 真机签发、ECH/OCSP 端到端仍需外网+真实域名，只有代码级审查。
+
+---
+
+# 【工号 1009 · 追加】远程部署记录（83.229.125.81，commit 1603852）
+
+部署流程（下次照做）：
+```
+ssh root@83.229.125.81            # 密钥 C:/Users/admin/.ssh/remgr_ed25519（从 WSL 经 Windows ssh.exe）
+cd /crucible && git fetch origin main && git reset --hard origin/main
+CARGO_BUILD_JOBS=1 cargo build --release          # 1 vCPU，全量 ~9.5min；磁盘只剩 ~900MB，先删 target/debug
+sh scripts/build_app_engines.sh && sh scripts/build_script_ffi.sh   # ★ ABI 改过就必须重建 .so
+kill -TERM $(pgrep -f bin/webserver) && cp -p target/release/webserver bin/webserver
+sh /etc/rc.local
+```
+注意：`cp` 覆盖运行中的二进制会报 "Text file busy" —— **必须先停进程再换**。
+
+远程实测（2026-10-05）：
+- 监听：9081/9095 (h1+h2c)、9445 (TLS1.2)、9446 (TLS1.3)、8443 (生产 TLS)、853 (DoT)、53 (DNS) → 全 200。
+- 引擎 15 个全 200：php c rust go lua python perl wsgi asgi psgi cgi uwsgi tsx asp aspnet。
+  - `/go/` 用 `www-apps/go/prebuilt/index`（8.3MB 静态二进制，从本地 VM 经 base64 通道送过去；
+    远程无 Go 工具链）。这个二进制**不在库里**，重新部署时要重传或在那台机器上装 Go。
+- 诚实 502：`/jsp/` `/do/`（远程无 JDK）、`/ruby/`（远程无 ruby34）、`/rack/`（MRI 嵌入默认关）。
+- admin `/__admin` → 401（config.toml 里 password_hash 为空是**故意**的：仓库公开，不存生产哈希。
+  要登录就 POST /__admin/api/password 设一个）。
+- DoH `/dns-query` → 404 是**正确行为**：`[dns.doh] hostnames = []` 为空即 fail-closed（本机同样验证过）。
+- dig @127.0.0.1 递归解析正常；DoT 853 TLS1.3 握手正常。
