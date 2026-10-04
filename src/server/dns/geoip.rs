@@ -254,6 +254,64 @@ fn current_day_stamp() -> Result<u64> {
         .unwrap_or(0))
 }
 
+/// MaxMind 官方下载域白名单（含子域）。不在表里的 host 一律拒绝。
+const MMDB_ALLOWED_HOSTS: &[&str] = &[
+    "download.maxmind.com",
+    "maxmind.com",
+    "www.maxmind.com",
+    "geolite.maxmind.com",
+];
+
+/// host 是否在白名单内（精确匹配或 `.` 后缀匹配；大小写不敏感）。
+fn host_allowlisted(host: &str) -> bool {
+    let h = host.trim_end_matches('.').to_ascii_lowercase();
+    MMDB_ALLOWED_HOSTS
+        .iter()
+        .any(|a| h == *a || h.ends_with(&format!(".{a}")))
+}
+
+/// 受限 HTTPS GET：只访问白名单主机，且**每一跳重定向都重新校验**。
+///
+/// 为什么必须逐跳校验：`license_key` 在 URL 查询串里（MaxMind 的下载接口就是这样）。
+/// 若允许自动跟随重定向，攻击者只要让上游回一个 302 到自己的域名（或一个开放重定向），
+/// 就能把 license key 带走，甚至把本机当成 SSRF 跳板去打内网。
+///
+/// `timeout_secs` 同时约束连接与整体读取（ureq 的 `timeout` 覆盖两者），
+/// 避免一个不响应的对端把同步任务永久挂住（本模块跑在周期任务里）。
+fn http_get_allowlisted(url: &str, timeout_secs: u64) -> Result<ureq::Response> {
+    let agent = ureq::AgentBuilder::new()
+        .timeout(std::time::Duration::from_secs(timeout_secs))
+        // 自己处理重定向（默认会跟 5 跳），这样才能逐跳做白名单校验。
+        .redirects(0)
+        .build();
+    let mut current = url.to_string();
+    for _hop in 0..6 {
+        let parsed = url::Url::parse(&current).with_context(|| format!("bad url {current}"))?;
+        let host = parsed.host_str().unwrap_or("").to_string();
+        if !host_allowlisted(&host) {
+            bail!("geoip: refusing non-allowlisted host {host:?}（只允许 MaxMind 官方下载域）");
+        }
+        match agent.get(&current).call() {
+            Ok(resp) => return Ok(resp),
+            Err(ureq::Error::Status(code, resp)) if (300..400).contains(&code) => {
+                let loc = resp
+                    .header("Location")
+                    .context("geoip: redirect without Location")?
+                    .to_string();
+                // 相对 Location 也要能跟（用 URL join），跟完下一轮再校验 host。
+                current = parsed
+                    .join(&loc)
+                    .with_context(|| format!("geoip: bad redirect Location {loc:?}"))?
+                    .to_string();
+                continue;
+            }
+            Err(ureq::Error::Status(code, _)) => bail!("geoip: HTTP {code} for {current}"),
+            Err(e) => return Err(anyhow::Error::new(e).context(format!("geoip: GET {current}"))),
+        }
+    }
+    bail!("geoip: too many redirects (>{})", 5)
+}
+
 /// Mimosa 注入约束：host 必须是 MaxMind 官方下载域；**每一跳**重定向都先校验再访问。
 fn fetch_edition(license: &str, edition: &str, dst: &Path) -> Result<()> {
     // license key 不能出现在日志里
@@ -382,4 +440,22 @@ pub fn status() -> serde_json::Value {
         "city_loaded": loaded(&CITY_DB),
         "asn_loaded": loaded(&ASN_DB),
     })
+}
+
+
+#[cfg(test)]
+mod allowlist_tests {
+    use super::host_allowlisted;
+
+    #[test]
+    fn only_maxmind_hosts_pass() {
+        assert!(host_allowlisted("download.maxmind.com"));
+        assert!(host_allowlisted("Download.MaxMind.com"));
+        assert!(host_allowlisted("maxmind.com"));
+        assert!(host_allowlisted("a.maxmind.com"));
+        assert!(!host_allowlisted("evil.com"));
+        assert!(!host_allowlisted("maxmind.com.evil.com"));
+        assert!(!host_allowlisted("notmaxmind.com"));
+        assert!(!host_allowlisted(""));
+    }
 }
