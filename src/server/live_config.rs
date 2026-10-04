@@ -172,6 +172,9 @@ impl LiveConfig {
     }
 
     pub fn reload(&self) -> anyhow::Result<()> {
+        // 配置重载后 DNS 的「生效配置」也可能变（config.toml 的 [dns] 在无 panel.toml 时
+        // 就是权威来源）—— 让 effective() 的缓存失效，避免继续用旧快照。
+        crate::server::dns::invalidate_effective();
         let cfg = Config::load(&self.path)?;
         let old_binds: std::collections::BTreeSet<(String, u16)> = {
             let cur = self.inner.read();

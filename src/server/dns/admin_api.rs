@@ -544,7 +544,12 @@ async fn persist_and_reconcile(dc: &DnsConfig) -> Result<(), String> {
     //     config.toml 的 [dns]（安全项悄悄变回旧值）；
     //   * 文件是 umask 权限（0644），本机任何用户可读 license_key。
     // 改走与其它控制面文件同一条原子落盘（临时文件 0600 → 定稿 → rename）。
-    crate::server::dns::write_config_atomic(&etc.join("panel.toml"), text.as_bytes())
+    let r = crate::server::dns::write_config_atomic(&etc.join("panel.toml"), text.as_bytes());
+    // panel.toml 是 effective() 的权威来源；写完之后**必须**让缓存失效，
+    // 否则在「同一秒内改写且大小相同」时（FFS 秒级 mtime）新配置要等下一次
+    // mtime/size 变化才生效 —— 表现为「面板保存成功但行为没变」。
+    crate::server::dns::invalidate_effective();
+    r
         .map_err(|e| e.to_string())?;
     let d2 = dc.clone();
     tokio::task::spawn_blocking(move || reconcile(&d2))

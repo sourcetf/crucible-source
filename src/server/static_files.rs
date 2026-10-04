@@ -48,6 +48,30 @@ struct CacheEntry {
 
 static SMALL_CACHE: Lazy<Mutex<HashMap<PathBuf, CacheEntry>>> =
     Lazy::new(|| Mutex::new(HashMap::new()));
+/// 解析结果缓存：`(root, 解码后的相对路径) → 已验证的 canonical 绝对路径`。
+///
+/// 为什么需要：`resolve_path` 每个请求都要 `realpath`（root 一次 + 目标一次，未命中的
+/// 路径还要逐级向上 `exists()`），而 realpath 内部是**逐段 lstat/readlink**。
+/// gdb 采样（10 次采样、wrk -c32）显示 `realpath`/`stat`/`resolve_path` 合计占了
+/// 请求路径上的最大一块 CPU —— 每请求约 5~10 个 syscall 只为了把同一个路径
+/// 反复验证一遍。
+///
+/// 安全性：只有**通过 containment 校验**的结果才会入缓存，因此缓存永远不可能返回
+/// root 之外的真实路径；条目带 TTL（默认 2s）且有容量上限，符号链接被改动后最坏
+/// 情况下多服务 2 秒「曾经验证过的真实路径」（不可能是新指向的外部文件）。
+/// 命中后调用方仍会 `fs::metadata` 取 mtime/etag，文件被删会正常 404。
+struct CanonEntry {
+    canon: PathBuf,
+    at: std::time::Instant,
+}
+
+static CANON_CACHE: Lazy<Mutex<HashMap<(PathBuf, String), CanonEntry>>> =
+    Lazy::new(|| Mutex::new(HashMap::new()));
+
+/// 解析缓存 TTL 与容量（超过容量时整表清空，代价可忽略）。
+const CANON_TTL: std::time::Duration = std::time::Duration::from_secs(2);
+const CANON_CAP: usize = 4096;
+
 
 
 fn read_file_capped(path: &Path) -> Result<Vec<u8>> {
@@ -574,8 +598,19 @@ fn resolve_path(root: &Path, url_path: &str) -> Result<PathBuf> {
         }
         bail!("hidden path is not served");
     }
+    // 解析缓存：命中即返回（跳过 realpath/stat 链）。
+    let ckey = (root.to_path_buf(), decoded.clone());
+    {
+        let now = std::time::Instant::now();
+        let cache = CANON_CACHE.lock();
+        if let Some(e) = cache.get(&ckey) {
+            if now.duration_since(e.at) < CANON_TTL {
+                return Ok(e.canon.clone());
+            }
+        }
+    }
     let joined = root.join(&decoded);
-    let canon_root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+    let canon_root = canon_root_cached(root);
     // P2-1：symlink 经 canonicalize 解析后强制 containment——指向 root 外的符号链接
     // 一律拒绝；root 内互链允许（web 服务器惯例）。未存在路径按最深存在的父目录
     // canonicalize 后拼回剩余段（旧实现的 unwrap_or(joined) 会跳过 containment 校验）。
@@ -601,7 +636,38 @@ fn resolve_path(root: &Path, url_path: &str) -> Result<PathBuf> {
     if !canon.starts_with(&canon_root) {
         bail!("path escape");
     }
+    // 只有通过 containment 的结果才入缓存。
+    {
+        let mut cache = CANON_CACHE.lock();
+        if cache.len() >= CANON_CAP {
+            cache.clear();
+        }
+        cache.insert(
+            ckey,
+            CanonEntry {
+                canon: canon.clone(),
+                at: std::time::Instant::now(),
+            },
+        );
+    }
     Ok(canon)
+}
+
+/// docroot 自身的 canonical 路径（缓存 + TTL；失败时退回原路径）。
+fn canon_root_cached(root: &Path) -> PathBuf {
+    static ROOT_CACHE: Lazy<Mutex<HashMap<PathBuf, (PathBuf, std::time::Instant)>>> =
+        Lazy::new(|| Mutex::new(HashMap::new()));
+    let now = std::time::Instant::now();
+    if let Some((c, at)) = ROOT_CACHE.lock().get(root).cloned() {
+        if now.duration_since(at) < CANON_TTL {
+            return c;
+        }
+    }
+    let c = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+    ROOT_CACHE
+        .lock()
+        .insert(root.to_path_buf(), (c.clone(), now));
+    c
 }
 
 /// P1-12（§16.2）：脚本/源码扩展——file_open=preview 命中时强制 text/plain 展示源码

@@ -462,10 +462,17 @@ pub fn state_root() -> PathBuf {
     if rel.is_absolute() {
         return rel;
     }
-    match std::env::current_dir() {
-        Ok(cwd) => cwd.join(rel),
-        Err(_) => rel,
-    }
+    // cwd 拼接结果缓存：`state_root()` 在**每个 HTTP 请求**上被 `effective()` 调用，
+    // 而 `std::env::current_dir()` 是一次 `getcwd(2)` 系统调用（gdb 采样里
+    // `_libc_getcwd`/`__getcwd` 各占 8/12 采样）。进程的 cwd 在启动后不会变
+    // （引擎子进程各自 chdir，不影响本进程）。
+    static CWD_ROOT: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+    CWD_ROOT
+        .get_or_init(|| match std::env::current_dir() {
+            Ok(cwd) => cwd.join("state/dns"),
+            Err(_) => PathBuf::from("state/dns"),
+        })
+        .clone()
 }
 
 /// 读取 `CRUCIBLE_DNS_STATE_ROOT`；空值视为未设置。相对路径按 cwd 绝对化。
@@ -483,9 +490,97 @@ fn env_state_root() -> Option<PathBuf> {
 }
 
 /// 生效配置：config.toml [dns] 为基底，panel.toml（面板编辑）存在则整体覆盖。
+/// `effective()` 的缓存世代号：任何「我们自己的写入/重载」都 +1，让下一次调用重读。
+static EFFECTIVE_GEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// 显式让 `effective()` 缓存失效（面板写 panel.toml、live 配置重载之后必须调用）。
+///
+/// 为什么需要世代号而不是只看 mtime/size：OpenBSD FFS 的秒级时间戳 + 「同一秒内改写成
+/// 同样字节数」会让 (mtime,size) 完全不变，而内容已经不同 —— 那是「改了不生效」类
+/// 故障里最难查的一种。世代号由我们自己的写入路径显式推进，与 stat 判据互补。
+pub fn invalidate_effective() {
+    EFFECTIVE_GEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+struct EffectiveCache {
+    gen: u64,
+    path: PathBuf,
+    /// 上次 stat 的时间（用于 1s 节流；不是缓存有效期 —— 世代号/内容变化仍是即时的）。
+    checked_at: std::time::Instant,
+    /// (mtime, size, inode)——inode 变化覆盖「删了重建同名文件且 mtime/size 恰好相同」。
+    key: (Option<std::time::SystemTime>, u64, u64),
+    cfg: Arc<DnsConfig>,
+}
+
+static EFFECTIVE_CACHE: once_cell::sync::Lazy<parking_lot::Mutex<Option<EffectiveCache>>> =
+    once_cell::sync::Lazy::new(|| parking_lot::Mutex::new(None));
+
+fn panel_key(m: Option<&std::fs::Metadata>) -> (Option<std::time::SystemTime>, u64, u64) {
+    use std::os::unix::fs::MetadataExt;
+    match m {
+        Some(md) => (md.modified().ok(), md.len(), md.ino()),
+        None => (None, 0, 0),
+    }
+}
+
+/// 生效的 DNS 配置：`panel.toml` 存在且可解析时**整体覆盖** config.toml 的 `[dns]`。
+///
+/// ⚠️ 这个函数在**每个 HTTP 请求**上被调用（h1 的 DoH 分流在 `h1_try_handle` 最开头、
+/// h2/h3 各自的请求路径），所以它必须便宜。原先它每次都 `read_to_string` + 整份 TOML
+/// 反序列化 —— 同步磁盘读 + 解析直接落在 async 请求路径上：实测（wrk）每请求 CPU
+/// 122µs，其中最大一块就在这里；高并发下所有 worker 一起等同一份文件读，
+/// 吞吐卡在 ~20k rps 不再随并发上升（2→16 workers 只涨 1.4×），而 h2o 同机 100k+。
+/// 现在快路径只做一次 `stat`（~1µs），内容一变（mtime/size/ino 或世代号）立刻重读。
 pub fn effective(cfg: &Config) -> DnsConfig {
     let panel = state_root().join("etc/panel.toml");
-    if let Ok(text) = std::fs::read_to_string(&panel) {
+    let gen = EFFECTIVE_GEN.load(std::sync::atomic::Ordering::Relaxed);
+    // 外部改动（手改 panel.toml）的检测节流：≤1s 内不重复 stat。
+    // 我们自己的写入（面板保存 / live 重载）会 bump 世代号，因此**立即**生效；
+    // 只有绕过面板直接改文件这种情况会有 ≤1s 延迟 —— 那个窗口换掉的是每请求一次
+    // 系统调用（stat 在采样里 14/12，是请求路径上最后一块明显的固定开销）。
+    let now = std::time::Instant::now();
+    const STAT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
+    let key = {
+        let c = EFFECTIVE_CACHE.lock();
+        match c.as_ref() {
+            Some(e)
+                if e.gen == gen
+                    && e.path == panel
+                    && now.duration_since(e.checked_at) < STAT_INTERVAL =>
+            {
+                // 世代号与路径都没变、且刚查过：直接命中
+                return (*e.cfg).clone();
+            }
+            _ => {}
+        }
+        drop(c);
+        panel_key(std::fs::metadata(&panel).ok().as_ref())
+    };
+    {
+        let mut c = EFFECTIVE_CACHE.lock();
+        if let Some(e) = c.as_mut() {
+            if e.gen == gen && e.path == panel && e.key == key {
+                // 内容没变：刷新节流时间戳，**避免下一个请求又来一次 stat**
+                // （否则 1s 之后每个请求都会 stat，节流形同虚设）。
+                e.checked_at = now;
+                return (*e.cfg).clone();
+            }
+        }
+    }
+    let parsed = effective_slow(cfg, &panel);
+    *EFFECTIVE_CACHE.lock() = Some(EffectiveCache {
+        gen,
+        path: panel,
+        checked_at: std::time::Instant::now(),
+        key,
+        cfg: Arc::new(parsed.clone()),
+    });
+    parsed
+}
+
+/// 慢路径：真的读文件 + 解析（含各种一次性告警）。
+fn effective_slow(cfg: &Config, panel: &Path) -> DnsConfig {
+    if let Ok(text) = std::fs::read_to_string(panel) {
         // Ignore empty / whitespace-only panel files (would deserialize to all-defaults
         // and silently disable DNS that is enabled in config.toml).
         if !text.trim().is_empty() {

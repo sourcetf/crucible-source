@@ -141,6 +141,9 @@ fn main() -> Result<()> {
             _ = shutdown_signal() => Ok(()),
         }
     });
+    // 访问日志是**批量写**的（见 access_log 的说明）：退出前必须刷一次，
+    // 否则最后 ≤250ms 的行会随进程一起丢掉（排查现场时最想看的就是最后几行）。
+    server::access_log::flush_now();
     // 退出路径：终止注册的引擎子进程，防止孤儿 fpm / sidecar 堆积。
     server::apps::child_registry::kill_all();
     // tor（Hidden Service）是 `--RunAsDaemon` 的独立进程，不在 child_registry 里：
