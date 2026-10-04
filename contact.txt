@@ -1530,3 +1530,72 @@ upload_resume.rs, upload_api.rs, tls/accept.rs}`。**没动**本批之外任何�
 ## 备注
 - 本机不能 `cargo check`（WSL 无 OpenBSD 工具链）；编译一律在本地 OpenBSD VM 上做。
 - 本地 VM 与远程同 rust 版本（1.94.1）⇒ target 缓存可复用，增量构建快。
+
+---
+
+# 【工号 1009 · 2026-10-04】收尾登记（本轮完成）
+
+## 本轮我改了什么（已推 GitHub main：7565d23 + 7cd364d）
+**审计（16 个并行 agent，15 份报告落在 `.agents/1009/reports/`）**
+h1-static / h2-h3 / tls-core / tls-legacy / dns-core / dns-dot-doh / dns-geoip-ecs /
+apps-ffi / apps-php-jsp-asp / apps-script / admin-ui-api / proxy-subsystems / config-live /
+bench-scripts / security-deep（+ spec-matrix 重试中）。共 100+ 条发现，P0=0、P1 数十条。
+
+**已修（我本人 + 5 个 fixer agent，全部带证据与单测）**
+- `src/config.rs`（我）：§18 `certificate`/`private_key` 别名；`min_version`/`max_version`
+  区间展开；**`--config config.toml`（无目录）时基准目录绝对化** —— 这是 deps/init.sh
+  永不执行的根因（规格 §0 的启动命令正是这种写法，实测所有 app 都打
+  `sh: ./www-apps/x/init.sh: No such file`）；page_rules 中间 `*`/l4_forward 校验。
+- `src/server/admin*.rs`（我）：`json_to_toml` 跳过 null —— 修「保存站点/TLS/应用引擎」
+  **恒 400**（面板每个空选填项都发 null）；保存 TLS 改**字段级合并**，不再静默删掉
+  ECH cover 证书族（实测：保存前后 `ech_cover_*` 完整保留）。
+- `src/server/static_files.rs`（我）：**目录 index.html/index.htm 支持**（h1 与 h2/h3 两条
+  路径一致）。此前目录只有「autoindex 列表」或 404：`www/`、`www-static-fair/` 的根路径
+  都不可用，且公平基准里 h2o 服务 index.html(127B) 而我们返回目录列表 —— 比的不是同一个
+  响应体。
+- `src/server/apps/{php,fastcgi}.rs`（我 + apps-php agent）：FastCGI 补 `HTTP_*` params
+  （此前 PHP **拿不到 Cookie/Host/Authorization**，`$_COOKIE` 恒空）+ `SCRIPT_NAME`/
+  `PATH_INFO`（`/php/app.php/foo` 这类 pretty URL 此前 404）；上游 `Content-Length` 不再
+  原样透传（响应走私面）。
+- `src/server/upload_resume.rs`（我）：两个用例在整包 `cargo test` 下互相踩全局预算 +
+  依赖 `/` 余量 ⇒ 串行化锁 + 目标改到 temp_dir（根盘小的机器不再假失败）。
+- `src/server/mod.rs`/`l4.rs`/`proxy.rs`（我）：**TCP_NODELAY**（accept + 上游 + L4）。
+- `src/main.rs`（我）：worker 线程数默认仍 2，可用 `CRUCIBLE_WORKER_THREADS` 覆盖。
+- `scripts/*`、`bench/*`（我）：`scripts/tls_probe.py`（验收脚本此前依赖**不存在**的
+  `/tmp/_tlsprobe.py`：硬门必然假失败、TLS 探针全部假通过）；bench/sweep/debug 脚本补
+  `CRUCIBLE_DNS_STATE_ROOT`（否则测试实例读生产 DNS 状态、绑生产 53/853）；
+  `build_release.sh` 不再静默降级 feature + 产物新鲜度校验；`bench/h2o-fair.conf` 可用的
+  真实配置；`bench/h2bench`（Go h2/h2c 压测，OpenBSD 的 nghttp2 包不含 h2load）。
+- `libs/app-engines/rack/*` + `scripts/build_*`（apps-rack agent）：**Rack 引擎补成真 MRI
+  嵌入**（此前是诚实失败桩，永远 502）；psgi/rack 的 `-DCRUCIBLE_HAVE_PERL/RUBY` 与
+  OpenBSD 的 `ruby34` 探测（`command -v ruby` 在目标机恒失败 → 一直是 embed-missing）。
+  实测 `/psgi/`、`/ruby/`、`/rack/` 全部 200。
+- `src/server/{dns/mod.rs,dns/admin_api.rs}`（dns-core agent）：SOA 存在时 serial 冻结、
+  分区名校验晚于写库（一次误操作永久 reconcile 失败）、KASP 白名单过宽、`[dns] forwarders`
+  支持（本机实测：本地 NAT 屏蔽迭代查询，递归必须有 forwarders 才能工作）。
+- `src/server/{tor_hs,proxy,page_rules,headers_mod,l4}.rs`（proxy-subsys agent）：tor
+  `chown_tree` 符号链接提权（**直达 root**）修复、页面规则头注入 CL/TE/Connection 过滤、
+  rewrite 绕过 block/redirect、转发头族、WS 超时/并发上限、L4 bypass `[ip_access]`（我在
+  listener.rs 落地）。
+- 仓库自带 4 个测试证书（规格 §1；`.gitignore` 放行）—— 此前新克隆缺证书，TLS 端口全挂。
+
+## 未完成 / 交给下一位
+- **性能门禁未达标**：本机 Hyper-V VM（16 vCPU）上 wrk -t2 -c64：我们 ~17–23k rps，
+  h2o 2.2.6（同机、同 docroot、同 index.html）~71–110k rps ⇒ **吞吐比 ~3–4×**，
+  延迟比数倍。已确认与 CPU 线程数无关（worker=2→16 只提升 1.4×），
+  **每请求 CPU 成本 ~190µs（h2o ~83µs）**，且访问日志占其中 ~90µs。
+  下一步建议（按性价比）：① 给 access_log 做缓冲写（避免每请求 write+flush）：
+  ② 用 OpenBSD `ktrace`/`pmc` 或临时插桩定位剩余 ~100µs；③ hyper h1 builder 开
+  `writev`、调 `max_buf_size`；④ 静态层把「路径→(mime, etag, 缓存 body)」的
+  解析结果整体缓存（现在每请求都要 mime_guess + validators + 若干 syscall）。
+  **注意基准环境噪声极大**（主机上还有别的负载时同配置能差 3 倍），比较时务必交替多轮取最优。
+- 两个 DNS 修复 agent（dns-encrypted：DoT 挂死连接 DoS/证书不重载/ACME 首签必失败；
+  dns-geoip：ECS 前缀违规/覆盖权重/响应侧 ECS）在本轮结束前仍在跑，**其文件未并入**
+  （`src/server/dns/{dot_doh,acme,geoip,ecs}.rs` 与 `geoip_panel/**`）——接手后先 `git status`
+  确认它们是否留下改动。
+- `spec-matrix`（逐条规格符合性矩阵）重试 agent 仍在跑，产出在
+  `.agents/1009/reports/spec-matrix.md`（未完成时以现有 15 份报告为准）。
+- 本地 VM 的网络：主机重启后 Default Switch 网段从 172.26.x 变成 172.23.x（VM 新地址
+  **172.23.67.165**），netsh portproxy 需要管理员权限才能改；本轮用
+  `C:\Windows\System32\OpenSSH\ssh.exe -i C:/Users/admin/.ssh/vm_key root@172.23.67.165`
+  作为 WSL→VM 的通道（helper：`/tmp/vm.sh`、`/tmp/vmsync.sh`）。
