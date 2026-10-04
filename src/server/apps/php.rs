@@ -39,7 +39,13 @@ enum PhpKind {
     Cgi,
 }
 
-/// Handle a PHP / FastCGI app request.
+/// h1/h2/h3 共用的执行结果：脚本不存在 → 404；否则上游响应。
+enum PhpOutcome {
+    NotFound,
+    Upstream(fastcgi::FcgiResponse),
+}
+
+/// Handle a PHP / FastCGI app request (h1)。
 pub async fn handle(
     req: Request<Incoming>,
     lc: &ListenerConfig,
@@ -47,51 +53,10 @@ pub async fn handle(
     peer: SocketAddr,
     app_idx: usize,
 ) -> Result<Response<BoxBody>> {
-    let key = runtime_key(lc.port, app_idx);
-    ensure_runtime(&key, lc, app, app_idx).await?;
-
-    let addr = {
-        let map = PHP_RUNTIME.lock();
-        map.get(&key)
-            .map(|r| r.addr.clone())
-            .context("php runtime missing after ensure")?
-    };
-
-    let docroot = resolve_docroot(lc, app);
-    let uri_path = req.uri().path().to_string();
-    let (script, path_info) = resolve_script(&docroot, app, &uri_path)?;
-    if !script.is_file() {
-        // **不要把路径发回客户端**：`script.display()` 是 `/crucible/www-apps/php/...` 这种
-        // **服务器绝对路径**（docroot 泄露），而请求者只是任意能命中该路由的客户端。
-        // 与其它引擎口径一致：细节进本地日志，客户端拿一句固定文本。
-        // 而这条日志本身是**客户端可驱动**的（反复请求不存在的 .php 即可）⇒ 走节流，
-        // 否则就是一个按请求速率计费的写入口（本机磁盘长期紧张）。
-        crate::server::log_throttle::warn_every(
-            "php-script-not-found",
-            std::time::Duration::from_secs(60),
-            &format!("php: script not found: {}", script.display()),
-        );
-        return Ok(Response::builder()
-            .status(StatusCode::NOT_FOUND)
-            .body(full("php: script not found"))
-            .unwrap());
-    }
-
+    // 所有需要的东西必须在 `into_body()` 之前取（extensions/headers 会随 req 一起被消耗）。
     let method = req.method().as_str().to_string();
+    let uri_path = req.uri().path().to_string();
     let query = req.uri().query().unwrap_or("").to_string();
-    // **`.env`（deps）变量必须下发**。FastCGI 的请求 params **就是** CGI 环境：php-fpm
-    // 把每个 param 交给脚本（`$_SERVER` / `getenv()`），而 pool 的 `clear_env` 只影响**进程**
-    // 环境、不影响请求 params —— 所以放进 `extra_params` 就能让 PHP 看到。
-    // 此前这里是 `HashMap::new()`：`c`/`rust`/`cgi` 都拿得到 `.env`，**只有 php 拿不到** ⇒
-    // 依赖 `.env` 传数据库口令/密钥的 PHP 应用静默拿到空值（本项目最忌讳的那类故障）。
-    // 必须在 `req.into_body()` **之前**取（extensions 会随 req 一起被消耗）。
-    let extra_params: HashMap<String, String> = req
-        .extensions()
-        .get::<crate::server::apps::deps::DepsEnv>()
-        .map(|d| (*d.vars).clone())
-        .unwrap_or_default()
-        .into_iter()
-        .collect();
     let request_uri = req
         .uri()
         .path_and_query()
@@ -103,9 +68,14 @@ pub async fn handle(
         .and_then(|v| v.to_str().ok())
         .unwrap_or("")
         .to_string();
-    // CGI 环境需要客户端请求头（Cookie/Host/Authorization/UA…）——必须在 into_body 之前取，
-    // req 被消耗后就拿不到了。此前这条路径一个 HTTP_* 都不发，$_COOKIE 恒空。
     let req_headers = req.headers().clone();
+    let extra_params: HashMap<String, String> = req
+        .extensions()
+        .get::<crate::server::apps::deps::DepsEnv>()
+        .map(|d| (*d.vars).clone())
+        .unwrap_or_default()
+        .into_iter()
+        .collect();
     // 任务 6（OOM 防护）：引擎请求体上限 32MiB，超限直接 413（不再无界缓冲）。
     let body = match http_body_util::Limited::new(
         req.into_body(),
@@ -122,6 +92,138 @@ pub async fn handle(
                 .unwrap())
         }
     };
+
+    match php_exchange(
+        lc,
+        app,
+        app_idx,
+        method,
+        &uri_path,
+        request_uri,
+        query,
+        content_type,
+        req_headers,
+        extra_params,
+        body,
+        peer,
+    )
+    .await?
+    {
+        PhpOutcome::NotFound => Ok(Response::builder()
+            .status(StatusCode::NOT_FOUND)
+            .body(full("php: script not found"))
+            .unwrap()),
+        PhpOutcome::Upstream(resp) => {
+            let mut builder = Response::builder().status(resp.status);
+            for (k, v) in resp.headers.iter() {
+                builder = builder.header(k, v);
+            }
+            Ok(builder.body(full(resp.body)).unwrap())
+        }
+    }
+}
+
+/// h2/h3 字节入口：与 [`handle`] 同一核心，只是 body 已在协议层收齐为 `Bytes`。
+pub async fn handle_bytes(
+    req: &Request<bytes::Bytes>,
+    lc: &ListenerConfig,
+    app: &AppRouteConfig,
+    peer: SocketAddr,
+    app_idx: usize,
+    deps_env: &crate::server::apps::deps::DepsEnv,
+) -> Result<Response<bytes::Bytes>> {
+    let method = req.method().as_str().to_string();
+    let uri_path = req.uri().path().to_string();
+    let query = req.uri().query().unwrap_or("").to_string();
+    let request_uri = req
+        .uri()
+        .path_and_query()
+        .map(|pq| pq.as_str().to_string())
+        .unwrap_or_else(|| uri_path.clone());
+    let content_type = req
+        .headers()
+        .get(http::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+    let req_headers = req.headers().clone();
+    // simple 路径的 `.env`（deps）不是请求 extension 而是实参（h1 走 extension）——
+    // 不接上的话 /php/ 在 h2/h3 上拿不到 .env（h1 能拿到），又是一处版本间不一致。
+    let extra_params: HashMap<String, String> = (*deps_env.vars).clone().into_iter().collect();
+    let body = req.body().clone();
+
+    match php_exchange(
+        lc,
+        app,
+        app_idx,
+        method,
+        &uri_path,
+        request_uri,
+        query,
+        content_type,
+        req_headers,
+        extra_params,
+        body,
+        peer,
+    )
+    .await?
+    {
+        PhpOutcome::NotFound => Ok(Response::builder()
+            .status(StatusCode::NOT_FOUND)
+            .body(bytes::Bytes::from_static(b"php: script not found"))
+            .unwrap()),
+        PhpOutcome::Upstream(resp) => {
+            let mut builder = Response::builder().status(resp.status);
+            for (k, v) in resp.headers.iter() {
+                builder = builder.header(k, v);
+            }
+            Ok(builder.body(resp.body).unwrap())
+        }
+    }
+}
+
+/// FastCGI 执行核心（h1/h2/h3 共用）。
+#[allow(clippy::too_many_arguments)]
+async fn php_exchange(
+    lc: &ListenerConfig,
+    app: &AppRouteConfig,
+    app_idx: usize,
+    method: String,
+    uri_path: &str,
+    request_uri: String,
+    query: String,
+    content_type: String,
+    req_headers: http::HeaderMap,
+    extra_params: HashMap<String, String>,
+    body: bytes::Bytes,
+    peer: SocketAddr,
+) -> Result<PhpOutcome> {
+    let key = runtime_key(lc.port, app_idx);
+    ensure_runtime(&key, lc, app, app_idx).await?;
+
+    let addr = {
+        let map = PHP_RUNTIME.lock();
+        map.get(&key)
+            .map(|r| r.addr.clone())
+            .context("php runtime missing after ensure")?
+    };
+
+    let docroot = resolve_docroot(lc, app);
+    let uri_path = uri_path.to_string();
+    let (script, path_info) = resolve_script(&docroot, app, &uri_path)?;
+    if !script.is_file() {
+        // **不要把路径发回客户端**：`script.display()` 是 `/crucible/www-apps/php/...` 这种
+        // **服务器绝对路径**（docroot 泄露），而请求者只是任意能命中该路由的客户端。
+        // 与其它引擎口径一致：细节进本地日志，客户端拿一句固定文本。
+        // 而这条日志本身是**客户端可驱动**的（反复请求不存在的 .php 即可）⇒ 走节流，
+        // 否则就是一个按请求速率计费的写入口（本机磁盘长期紧张）。
+        crate::server::log_throttle::warn_every(
+            "php-script-not-found",
+            std::time::Duration::from_secs(60),
+            &format!("php: script not found: {}", script.display()),
+        );
+        return Ok(PhpOutcome::NotFound);
+    }
 
     let docroot_abs = canonicalize_display(&docroot);
     let script_abs = canonicalize_display(&script);
@@ -153,11 +255,7 @@ pub async fn handle(
         .await
         .with_context(|| format!("fastcgi to {:?}", addr))?;
 
-    let mut builder = Response::builder().status(resp.status);
-    for (k, v) in resp.headers.iter() {
-        builder = builder.header(k, v);
-    }
-    Ok(builder.body(full(resp.body)).unwrap())
+    Ok(PhpOutcome::Upstream(resp))
 }
 
 /// External FastCGI upstream (`engine = "fastcgi"`)，要求 `socket=`。
@@ -167,15 +265,8 @@ pub async fn handle_external(
     app: &AppRouteConfig,
     peer: SocketAddr,
 ) -> Result<Response<BoxBody>> {
-    let sock = app
-        .socket
-        .as_deref()
-        .context("fastcgi engine requires socket= (unix:/path or host:port)")?;
-    let addr = FcgiAddr::parse(sock)?;
-    let docroot = resolve_docroot(lc, app);
-    let uri_path = req.uri().path().to_string();
-    let (script, path_info) = resolve_script(&docroot, app, &uri_path)?;
     let method = req.method().as_str().to_string();
+    let uri_path = req.uri().path().to_string();
     let query = req.uri().query().unwrap_or("").to_string();
     let request_uri = req
         .uri()
@@ -207,6 +298,112 @@ pub async fn handle_external(
         }
     };
 
+    match external_exchange(
+        lc,
+        app,
+        peer,
+        method,
+        &uri_path,
+        request_uri,
+        query,
+        content_type,
+        req_headers,
+        body,
+    )
+    .await?
+    {
+        PhpOutcome::NotFound => Ok(Response::builder()
+            .status(StatusCode::NOT_FOUND)
+            .body(full("php: script not found"))
+            .unwrap()),
+        PhpOutcome::Upstream(resp) => {
+            let mut builder = Response::builder().status(resp.status);
+            for (k, v) in resp.headers.iter() {
+                builder = builder.header(k, v);
+            }
+            Ok(builder.body(full(resp.body)).unwrap())
+        }
+    }
+}
+
+/// h2/h3 字节入口（`engine = "fastcgi"`，外部 socket）：与 [`handle_external`] 同一核心。
+pub async fn handle_external_bytes(
+    req: &Request<bytes::Bytes>,
+    lc: &ListenerConfig,
+    app: &AppRouteConfig,
+    peer: SocketAddr,
+) -> Result<Response<bytes::Bytes>> {
+    let method = req.method().as_str().to_string();
+    let uri_path = req.uri().path().to_string();
+    let query = req.uri().query().unwrap_or("").to_string();
+    let request_uri = req
+        .uri()
+        .path_and_query()
+        .map(|pq| pq.as_str().to_string())
+        .unwrap_or_else(|| uri_path.clone());
+    let content_type = req
+        .headers()
+        .get(http::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+    let req_headers = req.headers().clone();
+    let body = req.body().clone();
+
+    match external_exchange(
+        lc,
+        app,
+        peer,
+        method,
+        &uri_path,
+        request_uri,
+        query,
+        content_type,
+        req_headers,
+        body,
+    )
+    .await?
+    {
+        PhpOutcome::NotFound => Ok(Response::builder()
+            .status(StatusCode::NOT_FOUND)
+            .body(bytes::Bytes::from_static(b"php: script not found"))
+            .unwrap()),
+        PhpOutcome::Upstream(resp) => {
+            let mut builder = Response::builder().status(resp.status);
+            for (k, v) in resp.headers.iter() {
+                builder = builder.header(k, v);
+            }
+            Ok(builder.body(resp.body).unwrap())
+        }
+    }
+}
+
+/// 外部 FastCGI socket 的执行核心（h1/h2/h3 共用）。
+#[allow(clippy::too_many_arguments)]
+async fn external_exchange(
+    lc: &ListenerConfig,
+    app: &AppRouteConfig,
+    peer: SocketAddr,
+    method: String,
+    uri_path: &str,
+    request_uri: String,
+    query: String,
+    content_type: String,
+    req_headers: http::HeaderMap,
+    body: bytes::Bytes,
+) -> Result<PhpOutcome> {
+    let sock = app
+        .socket
+        .as_deref()
+        .context("fastcgi engine requires socket= (unix:/path or host:port)")?;
+    let addr = FcgiAddr::parse(sock)?;
+    let docroot = resolve_docroot(lc, app);
+    let uri_path = uri_path.to_string();
+    let (script, path_info) = resolve_script(&docroot, app, &uri_path)?;
+    if !script.is_file() {
+        return Ok(PhpOutcome::NotFound);
+    }
+
     let script_abs = canonicalize_display(&script);
     let script_name = script_name_from_uri(&uri_path, &path_info);
 
@@ -232,11 +429,7 @@ pub async fn handle_external(
         extra_params: HashMap::new(),
     };
     let resp = fastcgi::exchange(&addr, &fcgi).await?;
-    let mut builder = Response::builder().status(resp.status);
-    for (k, v) in resp.headers.iter() {
-        builder = builder.header(k, v);
-    }
-    Ok(builder.body(full(resp.body)).unwrap())
+    Ok(PhpOutcome::Upstream(resp))
 }
 
 pub fn reconcile(lc: &ListenerConfig, apps: &[(usize, &AppRouteConfig)]) {

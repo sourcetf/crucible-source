@@ -1677,3 +1677,50 @@ dns-encrypted（DoT 超时+ACL 快照+证书重载、ACME 首签）与部分 dns
 - `webfs: /crucible/webserver.core` 已删；若再出现 core，用
   `/usr/bin/gdb -batch -ex "bt" /crucible/target/release/webserver /crucible/webserver.core`
   （release 带符号名、无行号）。
+
+---
+
+# 【工号 1009 · 追加】遗留问题收尾（commit 9dc7e52，本轮）
+
+完整版在 `.agents/1009/fixes/leftover-issues.md`（.agents/ 按 .gitignore 不入库）。
+四个要点，接手者按这个顺序读：
+
+## 1) [P0] 请求路径 getenv 与引擎 setenv 竞争 → SIGSEGV（本轮新发现并修复）
+- 触发：`/perl/`（python/ruby 同理）120 并发唯一 id 压测 → 进程崩。core 栈顶
+  `_libc_getenv("CRUCIBLE_DNS_STATE_ROOT") ← dns::state_root ← dns::effective ← h1 每请求`。
+- 机理：嵌入引擎按 CGI 语义**每请求**写 ENV（`.env` 注入同理）→ libc `setenv` 可能
+  realloc `environ` → 另一线程的 `getenv`（哪怕读别的键）踩已释放内存。
+- 修复：热路径 env 读取全部改走 `env_lock::read_static_env`（启动期缓存，启动时由
+  `dns::startup → effective()` 预热，此后请求路径零 getenv）：
+  dns/mod.rs、geoip_panel/toml_store.rs、apps/tsx.rs(PATH/ALLOW_NPX)、
+  tls/boring_path.rs(PSK)、upload_resume.rs(MIN_FREE_BYTES)。
+- **警戒**：以后往请求路径加 `std::env::var` 前先想这条；`env_lock.rs` 顶部有完整说明。
+
+## 2) 引擎请求头（ABI 第 13 参 headers）+ JSP + Ruby 全部真机可用
+- `appengine_execute(..., headers, out)` 已在 h1/h2/h3 全链路 + 13 个引擎 + 3 个插件样例打通。
+- 验证脚本（可复用，已入库）：
+  - `scripts/engine_check.py`：19 条路由 smoke（/rack/ 预期 502 标 502-ok）。
+  - `scripts/engine_headers_check.sh`：临时回显应用 → 5 语言 × 120 并发唯一 id → 0 串台 →
+    自动还原样例（备份名带路径，别改回 basename：三个 index.py 会互相覆盖）。
+- JSP：两条 sidecar 分支统一剥路由前缀（Jetty 只能看应用相对路径），`/jsp/` `/do/`
+  `/jsp/index.jsp` `/do/index.jsp` 全 200（X-Crucible-Engine: jsp-jetty）。
+  `scripts/start_server_test.sh` 现在起 Java jar（生产路径无 Python 垫片）。
+- Ruby：MRI 嵌入在 OpenBSD+Ruby3.4 上 boot 阶段必崩（专用线程/RUBY_INIT_STACK/最小
+  prelude 都试过），已按 rack 同款处理：`CRUCIBLE_ENABLE_RUBY_EMBED=1` 才编译嵌入，
+  默认**删除** libapp_ruby.so 并走新增的常驻 sidecar `www-apps/ruby/sidecar.rb`
+  （UNIXServer、一次拉起、CGI ENV、keep-alive、防穿越）。/ruby/ 实测 200（首请求含
+  spawn 443ms，后续 9.5ms）。rack 仍是诚实 502。
+- 单测：`cargo test --release --bin webserver` → **388 passed / 0 failed**（VM 实跑）。
+
+## 3) 环境坑（省得下次再踩）
+- `sh scripts/start_server_test.sh` 里的 webserver 必须 `</dev/null`（已加）：从
+  `sh -s` heredoc 启动时 stdin 是脚本流，脚本一结束 stdin EOF 就被会话清理带走。
+- 无 tty 的 `ssh host 'sh -s' < script` 里跑 `ps aux | grep` 不可靠（截断/空），
+  判活用 `ps -p $PID`（pid 取自 `/tmp/crucible-test.pid`）。
+- 调试崩溃：core 会落在**当前工作目录**（/crucible/webserver.core）。gdb 6.3 也能出栈：
+  `printf 'bt\nquit\n' > /tmp/gdbcmd && gdb -q -batch -x /tmp/gdbcmd ./target/release/webserver /crucible/webserver.core | head -25`。
+
+## 4) 本轮明确未做（有意留着）
+- 性能门禁仍差 ~3-4×（工效/分配器/调度争用的分析见上一节），本轮没动。
+- `spec-matrix.md` 只写到 §6，剩余章节没逐条填（时间给了引擎/崩溃修复）。
+- ACME 真机签发、ECH/OCSP 端到端仍需外网+真实域名，只有代码级审查。

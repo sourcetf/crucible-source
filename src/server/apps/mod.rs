@@ -165,19 +165,28 @@ async fn dispatch_simple(
 ) -> Response<Bytes> {
     let engine = app.engine.to_ascii_lowercase();
     match engine.as_str() {
-        // 与 h1 的 php / fastcgi 分支对应。php.rs 的 `Request<Bytes>` 版入口
-        // （`php::handle_bytes` / `php::handle_external_bytes`，apps-php 组）落地后
-        // 在这里接线；当前只有显式 `lib=`（libapp_php.so）形态可用。
-        "php" | "fastcgi" => {
-            if native_http::lib_available(app, &engine) {
-                simple_ffi(req, lc, app, peer, deps_env, &engine).await
+        // 与 h1 的 php / fastcgi 分支对应：直接走 php.rs 的字节入口（`handle_bytes`），
+        // 与 h1 共用同一套 FastCGI 客户端 / 脚本解析 / .env 注入。此前这里只认
+        // `libapp_php.so`（不存在）⇒ **/php/ 在 HTTP/2、HTTP/3 上恒 502 而 h1 正常** ——
+        // 同一个应用在不同协议版本上行为不一致本身就是缺陷。
+        "php" => {
+            if native_http::lib_available(app, "php") {
+                simple_ffi(req, lc, app, peer, deps_env, "php").await
             } else {
-                simple_unavailable(
-                    &engine,
-                    format!(
-                        "engine `{engine}`: h2/h3 byte dispatch pending (no libapp_{engine}.so)"
-                    ),
-                )
+                match php::handle_bytes(req, lc, app, peer, app_idx, deps_env).await {
+                    Ok(r) => r,
+                    Err(e) => simple_engine_error("php", &e),
+                }
+            }
+        }
+        "fastcgi" => {
+            if native_http::lib_available(app, "fastcgi") {
+                simple_ffi(req, lc, app, peer, deps_env, "fastcgi").await
+            } else {
+                match php::handle_external_bytes(req, lc, app, peer).await {
+                    Ok(r) => r,
+                    Err(e) => simple_engine_error("fastcgi", &e),
+                }
             }
         }
         // 与 h1 的 c/rust 分支对应：有 .so → FFI；无 .so → deps/bin/index 持久 sidecar
