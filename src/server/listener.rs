@@ -134,7 +134,19 @@ async fn dispatch_plain(
                         if need <= n || need > peek.len() {
                             break;
                         }
-                        stream.readable().await.ok();
+                        // `readable().await` **必须带超时**：客户端发 `16 03 01 01 00`
+                        // （声明长度 > 已收字节）后停住时，无超时的 readable 会永久挂起
+                        // 这条任务与 fd（tls-core P2 邻接项，第 6 轮只给首字节嗅探套了
+                        // 超时，这处补齐循环漏了）。超时即按「SNI 不可得」放弃补齐。
+                        if tokio::time::timeout(
+                            std::time::Duration::from_millis(300),
+                            stream.readable(),
+                        )
+                        .await
+                        .is_err()
+                        {
+                            break;
+                        }
                         match stream.try_read(&mut peek[n..need]) {
                             Ok(k) if k > 0 => n += k,
                             _ => break,
@@ -216,7 +228,36 @@ async fn dispatch_plain(
         .is_ok()
         {
             let mut buf = [0u8; 24];
-            let n = stream.try_read(&mut buf).unwrap_or(0);
+            let mut n = stream.try_read(&mut buf).unwrap_or(0);
+            // h2c prior-knowledge 前奏是 **24 字节固定串**，可能被 TCP 分段到达：
+            // `readable()` 只保证 ≥1 字节可读，单次 `try_read` 完全可能只拿到前几个字节。
+            // 只要已读到的字节仍是该前奏的**真前缀**，就继续读到满 24 字节或预算耗尽 ——
+            // 否则半个前奏会被判成 h1，连接被 400/关闭（实测：把 24 字节前奏分两段发
+            // 必失败）。非前奏前缀（普通 h1 请求、QMux 魔数等）不进入此循环，
+            // 因此不会给正常请求增加等待。
+            const H2_PREFACE: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
+            if n > 0 && n < buf.len() && H2_PREFACE.starts_with(&buf[..n]) {
+                let deadline =
+                    std::time::Instant::now() + crate::server::tls::accept::PEEK_TOTAL_WAIT;
+                while n < buf.len() {
+                    let now = std::time::Instant::now();
+                    if now >= deadline {
+                        break;
+                    }
+                    if tokio::time::timeout(deadline - now, stream.readable())
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+                    match stream.try_read(&mut buf[n..]) {
+                        Ok(0) => break,
+                        Ok(k) => n += k,
+                        Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => continue,
+                        Err(_) => break,
+                    }
+                }
+            }
             plain_prefix = buf[..n].to_vec();
         }
     }
@@ -246,10 +287,11 @@ async fn dispatch_plain(
     }
 }
 
-pub fn hsts_header_value() -> &'static str {
-    "max-age=31536000; includeSubDomains"
-}
-
+// 已删除：`hsts_header_value()` —— 无任何调用者（死代码），且其值
+// `max-age=31536000; includeSubDomains` 与 HSTS 的唯一权威来源 `h1::hsts_header()`
+// （`max-age=31536000`，h1/h2/h3 三协议都调它）**分叉**。留着它只会让下一个改 HSTS 的人
+// 改错地方。选择「删除」而不是「让 h1 复用」：h1.rs 不在本 agent 的 scope 内，且 h1 侧
+// 的值已是三协议共用的单一来源，没有理由把一个在 listener.rs 里、语义更宽的副本提升为权威。
 pub fn should_redirect_http_to_https(lc: &ListenerConfig) -> bool {
     lc.ssl.is_some()
 }

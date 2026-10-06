@@ -11,6 +11,14 @@ pub struct AppEngineResult {
     pub error: *mut c_char,
 }
 
+/// Must match APPENGINE_ABI_VERSION in libs/app-engines/include/appengine.h.
+const APPENGINE_ABI_VERSION: c_int = 2;
+
+#[no_mangle]
+pub extern "C" fn appengine_abi_version() -> c_int {
+    APPENGINE_ABI_VERSION
+}
+
 #[no_mangle]
 pub unsafe extern "C" fn appengine_init(
     _engine: *const c_char,

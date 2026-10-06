@@ -1483,6 +1483,36 @@ cover 只用于「未使用 / 被拒 ECH」的连接，ECH 关闭时它会成为
             }
         }
 
+        // 应用路由 `paths` 必须是以 `/` 开头的绝对前缀（空串/相对前缀都永不匹配）。
+        //
+        // 依据：`apps::prefix_matches` 做的是**字面前缀比较**（`path == p || path.starts_with(p+"/")`，
+        // 且 `prefix_matches("")` 恒假）。`paths = ["php"]`（缺前导斜杠）或 `paths = [""]`
+        // 都不会匹配任何请求 ⇒ 该路由**静默不生效**：面板/手写 toml 看起来都正常，只有请求
+        // 打不上去才发现。面板保存路径（`admin.rs::check_app_route`）已拒，但**原始 TOML 编辑器**
+        // （`/api/config/toml`）与手写 config.toml 只过 `validate()` —— 这里补上配置期这一道。
+        // 空 `paths` 数组（= 整站）仍合法，故只逐项检查已有元素。
+        for l in &self.listeners {
+            for (ai, app) in l.apps.iter().enumerate() {
+                for (pi, p) in app.paths.iter().enumerate() {
+                    let t = p.trim();
+                    if t.is_empty() {
+                        anyhow::bail!(
+                            "listener {}:{}: apps[{ai}].paths[{pi}] 是空串 —— `prefix_matches(\"\")` 恒不匹配，该路由永不生效（要整站请把 paths 留成空数组或写 \"/\"）",
+                            l.address,
+                            l.port
+                        );
+                    }
+                    if !t.starts_with('/') {
+                        anyhow::bail!(
+                            "listener {}:{}: apps[{ai}].paths[{pi}] = {p:?} 必须以 `/` 开头 —— 相对前缀永不匹配请求（路由静默不生效）",
+                            l.address,
+                            l.port
+                        );
+                    }
+                }
+            }
+        }
+
         // ── 管理面 / 限流 / proxy / autoindex / TLS 材料 的成组校验 ──
         //
         // 这一组的共同点：**写错时配置合法、服务也起得来**，但运行期要么静默失效、

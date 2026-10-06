@@ -77,10 +77,24 @@ where
     let mut total = 0u64;
     loop {
         let n = match tokio::time::timeout(idle, r.read(&mut buf)).await {
-            Ok(Ok(0)) => return Ok(total), // EOF
+            Ok(Ok(0)) => {
+                // EOF：对端关掉了它的**写方向**。必须把 FIN 传播给另一侧的写半部
+                // （半关闭），否则依赖「读到 EOF 才回包」的协议（不少私有 TCP 协议、
+                // TLS close_notify、以及先发后关的客户端）会永远等不到回应。
+                // 只关写方向：反向数据仍可继续流，直到它自己也 EOF/空闲超时。
+                // 真机复现：L4 目标 `read-until-EOF-then-reply`，客户端 `sendall + shutdown(WR)`
+                // 后旧实现永远收不到回包（客户端 8s 超时）；补 shutdown 后立即收到 `GOT:n`。
+                let _ = w.shutdown().await;
+                return Ok(total);
+            }
             Ok(Ok(n)) => n,
             Ok(Err(e)) => return Err(e),
-            Err(_) => return Ok(total), // 空闲超时：正常收尾（对端可在其它方向继续）
+            Err(_) => {
+                // 空闲超时：正常收尾（对端可在其它方向继续）。也顺手关掉本方向写，
+                // 免得对端一直等我们这侧不再会有数据的 FIN。
+                let _ = w.shutdown().await;
+                return Ok(total);
+            }
         };
         w.write_all(&buf[..n]).await?;
         total += n as u64;
@@ -128,5 +142,31 @@ mod tests {
         assert_eq!(n, 5);
         assert_eq!(out, b"hello");
         assert!(t0.elapsed() < Duration::from_secs(5), "不得等到对端关闭");
+    }
+
+    /// 读方向 EOF 必须把 FIN（半关闭）传播给写方向的另一端：否则依赖
+    /// 「读到 EOF 才回包」的协议会永远挂住（真机 L4 半关闭复现过）。
+    #[tokio::test]
+    async fn copy_idle_propagates_half_close_on_eof() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        // 源：写 5 字节后 drop（EOF）。
+        let (mut src_w, mut src_r) = tokio::io::duplex(64);
+        // 汇：copy 写入这半部；它的对端应在数据之后读到 EOF。
+        let (mut sink_w, mut sink_r) = tokio::io::duplex(64);
+        let writer = tokio::spawn(async move {
+            let _ = src_w.write_all(b"hello").await;
+            drop(src_w); // 关写方向 → 读侧 EOF
+        });
+        let n = copy_idle(&mut src_r, &mut sink_w, Duration::from_secs(5))
+            .await
+            .unwrap();
+        assert_eq!(n, 5);
+        writer.await.unwrap();
+        // 关键：copy 返回后 sink 的写方向必须已 shutdown，对端才能读到 EOF。
+        // 未 shutdown 时这里会一直挂着 —— 用超时把「挂住」变成断言失败。
+        let mut got: Vec<u8> = Vec::new();
+        let r = tokio::time::timeout(Duration::from_secs(2), sink_r.read_to_end(&mut got)).await;
+        assert!(r.is_ok(), "半关闭未传播：sink 侧一直读不到 EOF");
+        assert_eq!(got, b"hello");
     }
 }

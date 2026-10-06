@@ -15,10 +15,31 @@ use std::fs;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::Arc;
 use std::time::Duration;
 
 static PHP_RUNTIME: Lazy<Mutex<HashMap<String, PhpRuntime>>> =
     Lazy::new(|| Mutex::new(HashMap::new()));
+
+/// 每个 key（port-app_idx）一把「冷启动中」锁：并发首次请求只允许一个真正 spawn。
+///
+/// 没有它时 N 个并发首请求会各自走完 ensure 流程 —— 每个都 `remove_file(sock)` + spawn
+/// 一个 php-fpm/php-cgi，**只有最后一个被登记进 PHP_RUNTIME**，前面几个变成没人管、也不再
+/// 被复用的孤儿（且共用同一个 sock 路径，后 spawn 的会把先 spawn 的 socket 覆盖掉）。
+/// 实测（OpenBSD，本仓库）：16 个并发首请求 `/php/` → 9 个 php-fpm master 同时存活
+/// （每个还带 16 个 pool worker ≈ 144 个多余进程），进程表被瞬间堆满。
+/// `native_http::ensure_sidecar` / `sidecar_engine::ensure_sidecar_simple` 早有同款 per-key 锁。
+/// key 的集合由配置决定（port-app_idx），数量有界，无需淘汰。
+static SPAWN_LOCKS: Lazy<Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>> =
+    Lazy::new(|| Mutex::new(HashMap::new()));
+
+fn spawn_lock(key: &str) -> Arc<tokio::sync::Mutex<()>> {
+    SPAWN_LOCKS
+        .lock()
+        .entry(key.to_string())
+        .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+        .clone()
+}
 
 #[cfg(not(unix))]
 static TCP_PORT_SEQ: std::sync::atomic::AtomicU16 =
@@ -54,6 +75,7 @@ pub async fn handle(
     app_idx: usize,
 ) -> Result<Response<BoxBody>> {
     // 所有需要的东西必须在 `into_body()` 之前取（extensions/headers 会随 req 一起被消耗）。
+    let is_head = req.method() == http::Method::HEAD;
     let method = req.method().as_str().to_string();
     let uri_path = req.uri().path().to_string();
     let query = req.uri().query().unwrap_or("").to_string();
@@ -68,7 +90,7 @@ pub async fn handle(
         .and_then(|v| v.to_str().ok())
         .unwrap_or("")
         .to_string();
-    let req_headers = req.headers().clone();
+    let req_headers = headers_with_host(req.headers().clone(), req.uri());
     let extra_params: HashMap<String, String> = req
         .extensions()
         .get::<crate::server::apps::deps::DepsEnv>()
@@ -114,8 +136,12 @@ pub async fn handle(
             .body(full("php: script not found"))
             .unwrap()),
         PhpOutcome::Upstream(resp) => {
+            // 上游响应头必须净化后再透传：否则 `Content-Length`/`Transfer-Encoding`
+            // 与重建后的 body 不符会造成响应走私（详见 fastcgi::sanitize_response_headers）。
+            let headers =
+                fastcgi::sanitize_response_headers(resp.headers, resp.body.len(), is_head);
             let mut builder = Response::builder().status(resp.status);
-            for (k, v) in resp.headers.iter() {
+            for (k, v) in headers.iter() {
                 builder = builder.header(k, v);
             }
             Ok(builder.body(full(resp.body)).unwrap())
@@ -132,6 +158,7 @@ pub async fn handle_bytes(
     app_idx: usize,
     deps_env: &crate::server::apps::deps::DepsEnv,
 ) -> Result<Response<bytes::Bytes>> {
+    let is_head = req.method() == http::Method::HEAD;
     let method = req.method().as_str().to_string();
     let uri_path = req.uri().path().to_string();
     let query = req.uri().query().unwrap_or("").to_string();
@@ -146,7 +173,7 @@ pub async fn handle_bytes(
         .and_then(|v| v.to_str().ok())
         .unwrap_or("")
         .to_string();
-    let req_headers = req.headers().clone();
+    let req_headers = headers_with_host(req.headers().clone(), req.uri());
     // simple 路径的 `.env`（deps）不是请求 extension 而是实参（h1 走 extension）——
     // 不接上的话 /php/ 在 h2/h3 上拿不到 .env（h1 能拿到），又是一处版本间不一致。
     let extra_params: HashMap<String, String> = (*deps_env.vars).clone().into_iter().collect();
@@ -173,8 +200,11 @@ pub async fn handle_bytes(
             .body(bytes::Bytes::from_static(b"php: script not found"))
             .unwrap()),
         PhpOutcome::Upstream(resp) => {
+            // 上游响应头净化（同 handle）：防 Content-Length/TE 与 body 不符的响应走私。
+            let headers =
+                fastcgi::sanitize_response_headers(resp.headers, resp.body.len(), is_head);
             let mut builder = Response::builder().status(resp.status);
-            for (k, v) in resp.headers.iter() {
+            for (k, v) in headers.iter() {
                 builder = builder.header(k, v);
             }
             Ok(builder.body(resp.body).unwrap())
@@ -265,6 +295,7 @@ pub async fn handle_external(
     app: &AppRouteConfig,
     peer: SocketAddr,
 ) -> Result<Response<BoxBody>> {
+    let is_head = req.method() == http::Method::HEAD;
     let method = req.method().as_str().to_string();
     let uri_path = req.uri().path().to_string();
     let query = req.uri().query().unwrap_or("").to_string();
@@ -280,7 +311,16 @@ pub async fn handle_external(
         .unwrap_or("")
         .to_string();
     // 同 php-fpm 路径：HTTP_* 需要请求头，必须在 into_body 之前克隆。
-    let req_headers = req.headers().clone();
+    let req_headers = headers_with_host(req.headers().clone(), req.uri());
+    // `.env`（deps）注入：`engine = "php"` 从 extensions 取，`engine = "fastcgi"` 此前
+    // 恒空 —— 同一份 .env 在 php 引擎下能到 PHP、在 fastcgi 引擎下拿不到（行为分叉）。
+    let extra_params: HashMap<String, String> = req
+        .extensions()
+        .get::<crate::server::apps::deps::DepsEnv>()
+        .map(|d| (*d.vars).clone())
+        .unwrap_or_default()
+        .into_iter()
+        .collect();
     // 任务 6（OOM 防护）：同上，32MiB 上限。
     let body = match http_body_util::Limited::new(
         req.into_body(),
@@ -308,6 +348,7 @@ pub async fn handle_external(
         query,
         content_type,
         req_headers,
+        extra_params,
         body,
     )
     .await?
@@ -317,8 +358,11 @@ pub async fn handle_external(
             .body(full("php: script not found"))
             .unwrap()),
         PhpOutcome::Upstream(resp) => {
+            // 上游响应头净化（同 handle_external）。
+            let headers =
+                fastcgi::sanitize_response_headers(resp.headers, resp.body.len(), is_head);
             let mut builder = Response::builder().status(resp.status);
-            for (k, v) in resp.headers.iter() {
+            for (k, v) in headers.iter() {
                 builder = builder.header(k, v);
             }
             Ok(builder.body(full(resp.body)).unwrap())
@@ -332,7 +376,9 @@ pub async fn handle_external_bytes(
     lc: &ListenerConfig,
     app: &AppRouteConfig,
     peer: SocketAddr,
+    deps_env: &crate::server::apps::deps::DepsEnv,
 ) -> Result<Response<bytes::Bytes>> {
+    let is_head = req.method() == http::Method::HEAD;
     let method = req.method().as_str().to_string();
     let uri_path = req.uri().path().to_string();
     let query = req.uri().query().unwrap_or("").to_string();
@@ -347,7 +393,9 @@ pub async fn handle_external_bytes(
         .and_then(|v| v.to_str().ok())
         .unwrap_or("")
         .to_string();
-    let req_headers = req.headers().clone();
+    let req_headers = headers_with_host(req.headers().clone(), req.uri());
+    // 与 h1 `handle_external` 同一份 .env 注入（simple 路径是实参而非 extension）。
+    let extra_params: HashMap<String, String> = (*deps_env.vars).clone().into_iter().collect();
     let body = req.body().clone();
 
     match external_exchange(
@@ -360,6 +408,7 @@ pub async fn handle_external_bytes(
         query,
         content_type,
         req_headers,
+        extra_params,
         body,
     )
     .await?
@@ -369,8 +418,11 @@ pub async fn handle_external_bytes(
             .body(bytes::Bytes::from_static(b"php: script not found"))
             .unwrap()),
         PhpOutcome::Upstream(resp) => {
+            // 上游响应头净化（同 handle_external）。
+            let headers =
+                fastcgi::sanitize_response_headers(resp.headers, resp.body.len(), is_head);
             let mut builder = Response::builder().status(resp.status);
-            for (k, v) in resp.headers.iter() {
+            for (k, v) in headers.iter() {
                 builder = builder.header(k, v);
             }
             Ok(builder.body(resp.body).unwrap())
@@ -390,6 +442,7 @@ async fn external_exchange(
     query: String,
     content_type: String,
     req_headers: http::HeaderMap,
+    extra_params: HashMap<String, String>,
     body: bytes::Bytes,
 ) -> Result<PhpOutcome> {
     let sock = app
@@ -426,7 +479,7 @@ async fn external_exchange(
         server_port: lc.port,
         https: lc.ssl.is_some(),
         body,
-        extra_params: HashMap::new(),
+        extra_params,
     };
     let resp = fastcgi::exchange(&addr, &fcgi).await?;
     Ok(PhpOutcome::Upstream(resp))
@@ -462,23 +515,37 @@ async fn ensure_runtime(
     app: &AppRouteConfig,
     app_idx: usize,
 ) -> Result<()> {
-    let cached_addr = {
-        let map = PHP_RUNTIME.lock();
-        map.get(key).map(|rt| rt.addr.clone())
-    };
-    if let Some(addr) = cached_addr {
-        if fastcgi::probe(&addr).await {
-            return Ok(());
-        }
-        log::warn!("php sock dead, restarting {key}");
-        // **先杀并注销**旧子进程再摘除：`Child` 被 drop 不会终止进程（child_registry
-        // 的文档明写），此前这里只做 `remove` ⇒ 每重启一次就泄漏一个 php-fpm/php-cgi，
-        // 而且它的 pid 永久留在 REGISTRY 里（退出时可能误杀复用了该 pid 的无关进程）。
-        let old = PHP_RUNTIME.lock().remove(key);
-        if let Some(mut rt) = old {
-            if let Some(mut c) = rt.child.take() {
-                crate::server::apps::child_registry::kill_child(&mut c);
+    // 快路径（不拿锁）：已在表里且探活通过 → 直接返回。
+    {
+        let cached_addr = PHP_RUNTIME.lock().get(key).map(|rt| rt.addr.clone());
+        if let Some(addr) = cached_addr {
+            if fastcgi::probe(&addr).await {
+                return Ok(());
             }
+        }
+    }
+
+    // 冷启动/重启串行化：并发首请求只允许一个真正 spawn（见 SPAWN_LOCKS 的说明）。
+    let lock = spawn_lock(key);
+    let _guard = lock.lock().await;
+
+    // 拿锁后重查：等锁期间别人可能已经起好（或已重启好）。
+    {
+        let cached_addr = PHP_RUNTIME.lock().get(key).map(|rt| rt.addr.clone());
+        if let Some(addr) = cached_addr {
+            if fastcgi::probe(&addr).await {
+                return Ok(());
+            }
+        }
+    }
+
+    // 到这里确定需要（重新）起：先摘除并杀掉旧的死 runtime（若有）。
+    // `Child` 被 drop 不会终止进程（child_registry 的文档明写），此前只做 `remove` ⇒ 每
+    // 重启一次就泄漏一个 php-fpm/php-cgi，而且它的 pid 永久留在 REGISTRY 里。
+    if let Some(mut rt) = PHP_RUNTIME.lock().remove(key) {
+        log::warn!("php sock dead, restarting {key}");
+        if let Some(mut c) = rt.child.take() {
+            crate::server::apps::child_registry::kill_child(&mut c);
         }
     }
 
@@ -550,6 +617,15 @@ pm = static
 pm.max_children = {workers}
 chdir = /tmp
 catch_workers_output = yes
+; 只允许 .php 被当作 PHP 解析：路由的 extensions 含 ""（目录/无扩展名兜底），
+; 若不过滤，docroot 里任意无扩展名文件（deps/bin/index 等）会被当 PHP 脚本执行/回显
+; 源码，绕过静态层「应用 docroot 私密文件 → 404」的策略。
+security.limit_extensions = .php
+; PHP 的 max_execution_time 只计 CPU 时间（sleep/等 IO 不计）。没有这条时，客户端
+; 已 60s 超时（FCGI_TIMEOUT）后 sleep/阻塞的脚本仍永久占住一个 worker；pm=static 下
+; N 个慢请求即可让 PHP 全站排队到超时。设成略大于 FCGI_TIMEOUT 让 fpm 自行回收。
+request_terminate_timeout = 65s
+pm.max_requests = 10000
 "#,
         err = abs_path(&err_path).display(),
         pid = abs_path(&pid_path).display(),
@@ -566,14 +642,20 @@ catch_workers_output = yes
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
-    let child = crate::server::apps::child_registry::spawn_tracked(
+    let mut child = crate::server::apps::child_registry::spawn_tracked(
         &mut cmd,
         &format!("php-fpm {key}"),
     )
     .with_context(|| format!("spawn {fpm_bin}"))?;
 
     let addr = FcgiAddr::Unix(abs_path(&sock_path));
-    wait_ready(&addr, Duration::from_secs(5)).await?;
+    // 就绪超时/失败必须**收拾掉刚拉起的子进程**：只 `?` 的话 child 被 drop 但不终止
+    // （child_registry 注释明写 Drop 不会杀进程），于是每次「sock 未就绪」都会留下一个
+    // 活着却永远不被复用的 php-fpm（反复失败即可把进程堆起来）。与 native_http 同一修法。
+    if let Err(e) = wait_ready(&addr, Duration::from_secs(5)).await {
+        crate::server::apps::child_registry::kill_child(&mut child);
+        return Err(e);
+    }
     Ok(PhpRuntime {
         addr,
         child: Some(child),
@@ -610,13 +692,26 @@ async fn start_cgi(key: &str, app: &AppRouteConfig, state_dir: &Path) -> Result<
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
-        let child = crate::server::apps::child_registry::spawn_tracked(
+        let mut child = crate::server::apps::child_registry::spawn_tracked(
             &mut cmd,
             &format!("php-cgi {key}"),
         )
         .with_context(|| format!("spawn {cgi_bin}"))?;
         let addr = FcgiAddr::Unix(abs_sock);
-        wait_ready(&addr, Duration::from_secs(5)).await?;
+        if let Err(e) = wait_ready(&addr, Duration::from_secs(5)).await {
+            crate::server::apps::child_registry::kill_child(&mut child);
+            return Err(e);
+        }
+        // php-cgi 的 `-b <sock>` 用 bind() 建 socket，权限 = 0777 & ~umask。umask 宽松
+        // （0/002）或服务以 root 运行时，本地任意用户可直连该 FastCGI socket —— 而 FastCGI
+        // 协议无鉴权，socket 权限是**唯一**防线：攻击者能执行 SCRIPT_FILENAME 指向的任意
+        // PHP 文件（本机提权）。fpm 路径用 `listen.mode = 0660` + owner nobody 兜住了，
+        // 这里显式收到 0600（与「只给 webserver 自己用」的口径一致）。
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = fs::set_permissions(&sock_path, fs::Permissions::from_mode(0o600));
+        }
         return Ok(PhpRuntime {
             addr,
             child: Some(child),
@@ -637,13 +732,16 @@ async fn start_cgi(key: &str, app: &AppRouteConfig, state_dir: &Path) -> Result<
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
-        let child = crate::server::apps::child_registry::spawn_tracked(
+        let mut child = crate::server::apps::child_registry::spawn_tracked(
             &mut cmd,
             &format!("php-cgi {key}"),
         )
         .with_context(|| format!("spawn {cgi_bin}"))?;
         let addr = FcgiAddr::Tcp(bind);
-        wait_ready(&addr, Duration::from_secs(5)).await?;
+        if let Err(e) = wait_ready(&addr, Duration::from_secs(5)).await {
+            crate::server::apps::child_registry::kill_child(&mut child);
+            return Err(e);
+        }
         Ok(PhpRuntime {
             addr,
             child: Some(child),
@@ -665,8 +763,7 @@ async fn wait_ready(addr: &FcgiAddr, timeout: Duration) -> Result<()> {
 
 fn resolve_php_bin(app: &AppRouteConfig, want_fpm: bool) -> Result<String> {
     if let Some(bin) = &app.php_bin {
-        let b = remap_cli_php(bin);
-        return Ok(b);
+        return Ok(remap_cli_php(bin, want_fpm));
     }
     if want_fpm {
         for cand in [
@@ -717,7 +814,7 @@ fn resolve_php_bin(app: &AppRouteConfig, want_fpm: bool) -> Result<String> {
     }
     // 禁止把 php CLI 当 FastCGI；若仅有 php，尝试 remap 名
     if which_ok("php") {
-        let remapped = remap_cli_php("php");
+        let remapped = remap_cli_php("php", want_fpm);
         if remapped != "php" && which_ok(&remapped) {
             return Ok(remapped);
         }
@@ -725,15 +822,47 @@ fn resolve_php_bin(app: &AppRouteConfig, want_fpm: bool) -> Result<String> {
     bail!("php-cgi not found in PATH");
 }
 
-fn remap_cli_php(bin: &str) -> String {
-    let base = Path::new(bin)
-        .file_name()
-        .and_then(|s| s.to_str())
-        .unwrap_or(bin);
-    if base == "php" || base.starts_with("php.") {
-        return "php-cgi".into();
+/// 把 CLI `php` 名字映射到同目录的 `php-fpm` / `php-cgi` 候选（§7.4：禁止把 CLI php
+/// 当 FastCGI）。
+///
+/// 旧实现只认 basename == `php` 或 `starts_with("php.")`，且命中时返回**裸**
+/// `"php-cgi"`。两个问题：
+///   1. `php_bin = "php8.3"` / `"php83"` / `"php-cli"` 原样传入 —— fpm 用 `-y conf -F`
+///      起 CLI php（立即失败），cgi 回退又用同一 CLI 二进制 `-b sock`（也失败）⇒ 每个
+///      请求 5s+5s 双 spawn 双失败（进程泄漏叠加成按请求计费的 DoS）。
+///   2. 命中时丢掉原目录（PATH 里多个 PHP 版本会换到另一个构建）。
+///
+/// 现在：识别 `php`/`php8.3`/`php83`/`php-cli` 等 CLI 名（**排除** `php-fpm`/`php-cgi`
+/// 本身），返回**同目录**下的 `php-fpm`（want_fpm）或 `php-cgi` 名字。
+fn remap_cli_php(bin: &str, want_fpm: bool) -> String {
+    let path = Path::new(bin);
+    let base = path.file_name().and_then(|s| s.to_str()).unwrap_or(bin);
+    let lower = base.to_ascii_lowercase();
+    let is_cli = if lower == "php" || lower == "php-cli" || lower == "phpcli" {
+        true
+    } else if let Some(rest) = lower.strip_prefix("php") {
+        // `php<版本>`：php8.3 / php83 / php-8.3 / php_8；排除 php-fpm* / php-cgi*。
+        !rest.is_empty()
+            && !rest.starts_with("-fpm")
+            && !rest.starts_with("fpm")
+            && !rest.starts_with("-cgi")
+            && !rest.starts_with("cgi")
+            && rest
+                .bytes()
+                .all(|b| b.is_ascii_digit() || b == b'.' || b == b'-' || b == b'_')
+    } else {
+        false
+    };
+    if !is_cli {
+        return bin.to_string();
     }
-    bin.to_string()
+    let target = if want_fpm { "php-fpm" } else { "php-cgi" };
+    match path.parent() {
+        Some(dir) if !dir.as_os_str().is_empty() => {
+            dir.join(target).to_string_lossy().into_owned()
+        }
+        _ => target.to_string(),
+    }
 }
 
 fn which_ok(bin: &str) -> bool {
@@ -777,8 +906,13 @@ fn resolve_script(
     let mut path = uri_path.to_string();
     // Strip app path prefix if configured (e.g. /php/index.php → index.php under docroot)
     // 必须匹配整段或 "/" 边界，避免 /phpfoo 命中 /php 前缀（与 mod.rs 一致）.
+    // **并归一化尾斜杠**：配置写 `paths = ["/php/"]`（Admin 只校验「以 / 开头」，合法）时
+    // 旧代码拿 `/php//` 去比前缀 ⇒ 前缀永远剥不掉 ⇒ 脚本路径变成 docroot/php/x.php → 404。
+    // mod.rs / app_ffi::rel_script_path / cgi_script / native_http / tsx 都已归一化，只有
+    // 这里漏了 —— 于是同一个 app 在 php 引擎下「配尾斜杠就 404」，其余引擎正常。
     for p in &app.paths {
-        if !p.is_empty() && (path == *p || path.starts_with(&format!("{p}/"))) {
+        let p = p.trim_end_matches('/');
+        if !p.is_empty() && (path == p || path.starts_with(&format!("{p}/"))) {
             path = path[p.len()..].to_string();
             if !path.starts_with('/') {
                 path = format!("/{path}");
@@ -820,6 +954,22 @@ fn script_name_from_uri(uri_path: &str, path_info: &str) -> String {
     }
 }
 
+/// 请求头补齐 `Host`：HTTP/2、HTTP/3 的权威信息在 `:authority` 伪头（hyper 映射到
+/// `uri.authority()`），**没有**字面 `Host` 头。而 CGI/FastCGI 语义里 `HTTP_HOST` 就是
+/// 请求的 Host —— 缺了它，PHP 应用（`$_SERVER['HTTP_HOST']`、按域名路由、生成绝对 URL）
+/// 在 h2/h3 上与 h1 行为不一致（实测 h1 有 `HTTP_HOST`、h2c 无）。缺 `Host` 时用 URI
+/// authority 补一条，使三种协议的 `HTTP_HOST` 一致。
+fn headers_with_host(mut h: http::HeaderMap, uri: &http::Uri) -> http::HeaderMap {
+    if !h.contains_key(http::header::HOST) {
+        if let Some(a) = uri.authority() {
+            if let Ok(v) = http::HeaderValue::from_str(a.as_str()) {
+                h.insert(http::header::HOST, v);
+            }
+        }
+    }
+    h
+}
+
 fn runtime_key(port: u16, app_idx: usize) -> String {
     format!("{port}-{app_idx}")
 }
@@ -848,7 +998,6 @@ fn canonicalize_display(p: &Path) -> String {
 #[cfg(test)]
 mod cgi_names_tests {
     use super::script_name_from_uri;
-
     #[test]
     fn script_name_follows_cgi_semantics() {
         assert_eq!(
@@ -861,5 +1010,85 @@ mod cgi_names_tests {
         );
         // path_info 为空（目录索引）→ SCRIPT_NAME 取整个 URI
         assert_eq!(script_name_from_uri("/php/", ""), "/php/");
+    }
+}
+
+#[cfg(test)]
+mod spawn_lock_tests {
+    use super::spawn_lock;
+    use std::sync::Arc;
+
+    /// 冷启动串行化的关键不变量：**同一个 key 必须始终拿到同一把锁**（否则并发首请求
+    /// 各拿一把锁，等于没锁 —— 就是「16 并发首请求拉起 9 个 php-fpm」那个缺陷），
+    /// 不同 key 必须是不同的锁（不同应用的冷启动互不阻塞）。
+    #[test]
+    fn spawn_lock_is_per_key() {
+        let a = spawn_lock("22095-0");
+        let b = spawn_lock("22095-0");
+        let c = spawn_lock("22095-1");
+        assert!(Arc::ptr_eq(&a, &b), "同一 key 必须拿到同一把锁");
+        assert!(!Arc::ptr_eq(&a, &c), "不同 key 必须是不同的锁");
+    }
+}
+
+#[cfg(test)]
+mod resolve_script_tests {
+    use super::resolve_script;
+    use crate::config::AppRouteConfig;
+    use std::path::PathBuf;
+
+    fn app(paths: &[&str]) -> AppRouteConfig {
+        AppRouteConfig {
+            paths: paths.iter().map(|s| s.to_string()).collect(),
+            enabled: true,
+            engine: "php".into(),
+            socket: None,
+            extensions: vec!["php".into(), "".into()],
+            index: Some("index.php".into()),
+            php_bin: None,
+            workers: 1,
+            source_dir: None,
+            out_dir: None,
+            entry: vec![],
+            watch: false,
+            docroot: None,
+            lib: None,
+            deps_dir: None,
+            init_timeout_secs: None,
+            libc: None,
+        }
+    }
+
+    /// `paths = ["/php/"]`（尾斜杠）与 `["/php"]` 必须等价：前缀都要剥掉。
+    /// 旧代码拿字面量 `/php/` 去比 `/php/index.php` ⇒ 剥不掉 ⇒ 找 docroot/php/index.php
+    /// ⇒ 404（同一 app 只在 php 引擎上因尾斜杠配置失效，其余引擎走 rel_script_path 正常）。
+    #[test]
+    fn trailing_slash_prefix_is_stripped() {
+        let dir = std::env::temp_dir().join("crucible_php_resolve_slash");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("index.php"), b"<?php echo 1;").unwrap();
+
+        for paths in [vec!["/php/"], vec!["/php"]] {
+            let a = app(&paths);
+            let (script, pi) = resolve_script(&dir, &a, "/php/index.php").unwrap();
+            assert_eq!(script, dir.join("index.php"), "paths={paths:?}");
+            assert_eq!(pi, "");
+            // 目录请求回落 index.php
+            let (s2, _) = resolve_script(&dir, &a, "/php/").unwrap();
+            assert_eq!(s2, dir.join("index.php"), "paths={paths:?}");
+        }
+
+        // PATH_INFO 回退（pretty URL）：脚本存在，其余段作为 PATH_INFO
+        let a = app(&["/php/"]);
+        let (s3, pi3) = resolve_script(&dir, &a, "/php/index.php/foo/bar").unwrap();
+        assert_eq!(s3, dir.join("index.php"));
+        assert_eq!(pi3, "/foo/bar");
+
+        // 非前缀不误伤（/phplint 不属于 /php）
+        let (s4, _) = resolve_script(&dir, &a, "/phplint/x.php").unwrap();
+        assert_eq!(s4, PathBuf::from(dir.join("phplint/x.php")));
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

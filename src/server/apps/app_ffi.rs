@@ -58,6 +58,22 @@ type ExecFn = unsafe extern "C" fn(
 ) -> c_int;
 type FreeFn = unsafe extern "C" fn(*mut AppEngineResult);
 type ShutdownFn = unsafe extern "C" fn();
+type AbiVersionFn = unsafe extern "C" fn() -> c_int;
+
+/// Host-side ABI version. **Must** equal `APPENGINE_ABI_VERSION` in
+/// `libs/app-engines/include/appengine.h` (and in the go/rust plugin samples).
+///
+/// Why this check is load-bearing (measured P0): C gives the loader no arity
+/// information, so a `.so` built against an **older** `appengine_execute`
+/// signature is happily dlopen'd (all symbols resolve, `RTLD_NOW` passes) and
+/// then called with the host's argument list. A `.so` built before the
+/// `headers` parameter existed reads `out` from the `headers` argument slot —
+/// `appengine_result_alloc()` then memsets 48 bytes over the request-header
+/// heap string, and the resulting glibc `sysmalloc` assertion aborted the
+/// **whole webserver** (all listeners down), with every `/c/` request returning
+/// a bogus 500. Requiring the version symbol turns this silent corruption into
+/// a clean "rebuild engines" 502.
+const APPENGINE_ABI_VERSION: c_int = 2;
 
 /// `RTLD_NODELETE` 的平台值。
 ///
@@ -149,7 +165,7 @@ pub async fn execute(
     // ABI 请求头块（Cookie/Authorization/User-Agent/X-Request-Id…）：
     // 此前引擎侧**完全看不到任何请求头**，Flask session / Django 登录等真实应用
     // 因此不可用。h1 路径从已解析的 parts.headers 直接构造。
-    let headers_block = request_headers_block(&parts.headers);
+    let headers_block = request_headers_block(&parts.headers, parts.uri.authority());
     // §7.10 热路径：GET/HEAD 无 body 时不 collect，保持 rust≈static 的延迟。
     // 任务 6（OOM 防护）：引擎请求体上限 32MiB，超限 413。
     let body_bytes = if request_has_body(&parts.method, &parts.headers) {
@@ -201,7 +217,7 @@ pub async fn execute_simple(
         .unwrap_or("")
         .to_string();
     // h2/h3 字节路径同样携带完整请求头（与 h1 同一数据流）。
-    let headers_block = request_headers_block(req.headers());
+    let headers_block = request_headers_block(req.headers(), req.uri().authority());
     exec_dispatch(
         &method,
         &path,
@@ -225,13 +241,17 @@ pub async fn execute_simple(
 ///   不重复进块，避免引擎把同名头当 HTTP_* 再写一遍。
 /// * 名字非 token、值含 CR/LF/NUL 或其它控制字符的头一律跳过（头注入防线）。
 /// * 块总量 64KiB、单值 16KiB 封顶，与 C 侧解析器的上界一致。
-fn request_headers_block(headers: &http::HeaderMap) -> Vec<u8> {
+fn request_headers_block(headers: &http::HeaderMap, authority: Option<&http::uri::Authority>) -> Vec<u8> {
     const VALUE_CAP: usize = 16 * 1024;
     const BLOCK_CAP: usize = 64 * 1024;
     let mut out = Vec::new();
+    let mut has_host = false;
     for (name, value) in headers.iter() {
         let n = name.as_str();
         let lower = n.to_ascii_lowercase();
+        if lower == "host" {
+            has_host = true;
+        }
         let hop_by_hop = matches!(
             lower.as_str(),
             "connection"
@@ -263,6 +283,23 @@ fn request_headers_block(headers: &http::HeaderMap) -> Vec<u8> {
         out.extend_from_slice(b": ");
         out.extend_from_slice(v);
         out.extend_from_slice(b"\r\n");
+    }
+    // HTTP/2、HTTP/3 的权威信息在 `:authority` 伪头（hyper 映射到 `uri.authority()`），
+    // **没有**字面 `Host` 头。CGI 语义里 `HTTP_HOST` 就是请求的 Host —— 缺了它，引擎在
+    // h2/h3 上拿不到 `HTTP_HOST`（h1 有），Flask/Django/内容协商等按 Host 判定的应用
+    // 行为跨协议不一致。缺 `Host` 时用 authority 补一条。
+    if !has_host {
+        if let Some(a) = authority {
+            let s = a.as_str();
+            if !s.is_empty()
+                && s.bytes().all(|b| b.is_ascii_graphic())
+                && out.len() + s.len() + 8 <= BLOCK_CAP
+            {
+                out.extend_from_slice(b"host: ");
+                out.extend_from_slice(s.as_bytes());
+                out.extend_from_slice(b"\r\n");
+            }
+        }
     }
     out
 }
@@ -577,6 +614,22 @@ fn load_engine(engine: &str, lib_path: &PathBuf) -> Result<Arc<EngineLib>> {
                 .map_err(|e| anyhow::anyhow!("missing symbol {}: {e}", $name))?
         };
     }
+    // ABI 校验必须在 dlsym `appengine_execute` 之后、调用它之前完成 —— 见
+    // `APPENGINE_ABI_VERSION` 的说明：签名不匹配的陈旧 .so 会以**堆破坏**的形式
+    // 崩掉整个进程，而不是干净地报错。
+    //   * 缺符号 = 该 .so 早于 ABI 版本符号的引入（陈旧构建）→ 拒绝加载；
+    //   * 版本不等 = 签名/结构布局已变 → 拒绝加载。
+    // 两者都回「重建引擎」的明确错误（客户端 502，日志有细节），绝不调用它。
+    let abi: AbiVersionFn = *sym!(AbiVersionFn, "appengine_abi_version");
+    let found_abi = unsafe { abi() };
+    if found_abi != APPENGINE_ABI_VERSION {
+        bail!(
+            "engine ABI mismatch for {}: .so reports {found_abi}, host expects {} \
+             (stale/foreign .so) — rebuild app engines (`make engines`)",
+            lib_path.display(),
+            APPENGINE_ABI_VERSION
+        );
+    }
     let init: InitFn = *sym!(InitFn, "appengine_init");
     let exec: ExecFn = *sym!(ExecFn, "appengine_execute");
     let free: FreeFn = *sym!(FreeFn, "appengine_result_free");
@@ -807,26 +860,9 @@ fn status_code(status: i32) -> StatusCode {
 
 /// FFI 结果 → 完整响应；引擎未给 Content-Type 时回退 text/plain。
 pub fn response_from_outcome(outcome: ExecOutcome) -> Response<BoxBody> {
+    let (headers, has_ct) = sanitize_engine_headers(&outcome.headers, outcome.body.len());
     let mut builder = Response::builder().status(status_code(outcome.status));
-    let mut has_ct = false;
-    for (k, v) in &outcome.headers {
-        if k.eq_ignore_ascii_case("content-type") {
-            has_ct = true;
-        }
-        // 引擎声明的 Content-Length 只有**恰好等于真实 body 长度**时才透传。hyper 会
-        // 信任这个头的文本、却按 body 的实际长度成帧（hyper 1.x
-        // `proto::h1::role::Server::encode`：Known(known_len) 分支只把用户给的值原样写出，
-        // encoder 用 known_len）—— 两者不一致时 keep-alive 上就是「声明 N 字节、实发 M 字节」，
-        // 客户端把多出来的 M-N 字节当成**下一个响应**（响应走私）。脚本自己拼这个头
-        //（`header("Content-Length: " .. n)`、ngx.header）时很容易写错，且值可能来自请求参数。
-        // 与 proxy.rs 里「上游 Content-Length 透传导致响应走私」是同一条规则：让服务器按
-        // 真实长度自己写。一致时保留（HEAD 场景客户端仍能拿到实体长度）。
-        if k.eq_ignore_ascii_case("content-length") {
-            let declared = v.trim().parse::<u64>().ok();
-            if declared != Some(outcome.body.len() as u64) {
-                continue;
-            }
-        }
+    for (k, v) in &headers {
         builder = builder.header(k.as_str(), v.as_str());
     }
     if !has_ct {
@@ -840,22 +876,72 @@ pub fn response_from_outcome(outcome: ExecOutcome) -> Response<BoxBody> {
     })
 }
 
-/// `Response<Bytes>` 变体（H2/H3 simple 路径）。
-pub fn simple_response_from_outcome(outcome: ExecOutcome) -> Response<Bytes> {
-    let mut builder = Response::builder().status(status_code(outcome.status));
+/// 逐跳头（RFC 9110 §7.6.1）：只为当前连接服务，不得从引擎响应泄漏给客户端。
+fn is_engine_hop_by_hop(lower: &str) -> bool {
+    matches!(
+        lower,
+        "connection"
+            | "keep-alive"
+            | "proxy-authenticate"
+            | "proxy-authorization"
+            | "proxy-connection"
+            | "te"
+            | "trailer"
+            | "transfer-encoding"
+            | "upgrade"
+    )
+}
+
+/// 引擎返回的响应头净化。返回 `(保留的头, 是否已有 Content-Type)`。
+///
+/// 规则（与 `proxy.rs` / `fastcgi::sanitize_response_headers` / `sidecar_engine`
+/// 同一套口径）：
+///   * 丢弃逐跳头（`Connection`/`Keep-Alive`/`TE`/`Transfer-Encoding`/`Upgrade`/
+///     `Trailer`/`Proxy-*`）与 `Connection:` **点名**的头；
+///   * `Content-Length` 只有恰好等于真实 body 长度时才透传（否则响应走私/连接失步，
+///     见本文件 response_from_outcome 的历史注释）。
+///
+/// 为什么 FFI 引擎也要做：引擎是进程内可信代码，但它给的头块会被原样写进最终响应。
+/// `Transfer-Encoding: chunked`（或 `Connection: close`）与重建后的 `Full<Bytes>`
+/// body 语义不符时，hyper 服务端会按 TE 分支重排/与 CL 冲突掐连接，且把逐跳语义
+/// 泄漏给客户端 —— 此前 app_ffi 只处理了 Content-Length（agent-9 遗留项）。
+fn sanitize_engine_headers(
+    headers: &[(String, String)],
+    body_len: usize,
+) -> (Vec<(String, String)>, bool) {
+    let conn_tokens: Vec<String> = headers
+        .iter()
+        .filter(|(k, _)| k.eq_ignore_ascii_case("connection"))
+        .flat_map(|(_, v)| v.split(','))
+        .map(|t| t.trim().to_ascii_lowercase())
+        .filter(|t| !t.is_empty())
+        .collect();
+    let mut out: Vec<(String, String)> = Vec::with_capacity(headers.len());
     let mut has_ct = false;
-    for (k, v) in &outcome.headers {
+    for (k, v) in headers {
+        let lower = k.to_ascii_lowercase();
+        if is_engine_hop_by_hop(&lower) || conn_tokens.iter().any(|t| t == &lower) {
+            continue;
+        }
         if k.eq_ignore_ascii_case("content-type") {
             has_ct = true;
         }
-        // 同 `response_from_outcome`：与真实 body 长度不符的 Content-Length 一律丢弃
-        //（h1 上是响应走私，h2/h3 上会让对端判 CL 不符并 RST 该流）。
-        if k.eq_ignore_ascii_case("content-length") {
+        if lower == "content-length" {
             let declared = v.trim().parse::<u64>().ok();
-            if declared != Some(outcome.body.len() as u64) {
+            if declared != Some(body_len as u64) {
                 continue;
             }
         }
+        out.push((k.clone(), v.clone()));
+    }
+    (out, has_ct)
+}
+
+/// `Response<Bytes>` 变体（H2/H3 simple 路径）。
+pub fn simple_response_from_outcome(outcome: ExecOutcome) -> Response<Bytes> {
+    let (headers, has_ct) = sanitize_engine_headers(&outcome.headers, outcome.body.len());
+    let mut builder = Response::builder().status(status_code(outcome.status));
+    for (k, v) in &headers {
         builder = builder.header(k.as_str(), v.as_str());
     }
     if !has_ct {
@@ -940,10 +1026,37 @@ mod status_and_rel_tests {
         }
     }
 
+    /// 引擎响应头净化：逐跳头 + `Connection:` 点名的头必须剥掉；与真实 body 不符的
+    /// Content-Length 丢弃、相符的保留；其余头（Set-Cookie 等）原样保留。
+    #[test]
+    fn sanitize_engine_headers_drops_hop_by_hop_and_bad_cl() {
+        let h = vec![
+            ("Content-Type".to_string(), "text/plain".to_string()),
+            ("Transfer-Encoding".to_string(), "chunked".to_string()),
+            ("Connection".to_string(), "close, x-internal".to_string()),
+            ("Keep-Alive".to_string(), "timeout=5".to_string()),
+            ("x-internal".to_string(), "secret".to_string()),
+            ("Set-Cookie".to_string(), "a=1".to_string()),
+            ("Content-Length".to_string(), "999".to_string()),
+        ];
+        let (out, has_ct) = sanitize_engine_headers(&h, 5);
+        assert!(has_ct);
+        let names: Vec<&str> = out.iter().map(|(k, _)| k.as_str()).collect();
+        assert!(!names.iter().any(|n| n.eq_ignore_ascii_case("transfer-encoding")));
+        assert!(!names.iter().any(|n| n.eq_ignore_ascii_case("connection")));
+        assert!(!names.iter().any(|n| n.eq_ignore_ascii_case("keep-alive")));
+        assert!(!names.iter().any(|n| n.eq_ignore_ascii_case("x-internal")), "Connection 点名的头也要剥");
+        assert!(!names.iter().any(|n| n.eq_ignore_ascii_case("content-length")), "不符的 CL 丢弃");
+        assert!(names.iter().any(|n| n.eq_ignore_ascii_case("set-cookie")));
+        // CL 恰好等于真实长度 → 保留
+        let h2 = vec![("Content-Length".to_string(), "5".to_string())];
+        let (out2, _) = sanitize_engine_headers(&h2, 5);
+        assert_eq!(out2.len(), 1);
+    }
+
     /// 0/1xx 不能变成合法最终响应（hyper 会掐连接）；非法/越界值回 500。
     #[test]
-    fn invalid_statuses_map_to_500() {
-        assert_eq!(status_code(0), StatusCode::INTERNAL_SERVER_ERROR);
+    fn invalid_statuses_map_to_500() {        assert_eq!(status_code(0), StatusCode::INTERNAL_SERVER_ERROR);
         assert_eq!(status_code(100), StatusCode::INTERNAL_SERVER_ERROR);
         assert_eq!(status_code(199), StatusCode::INTERNAL_SERVER_ERROR);
         assert_eq!(status_code(99), StatusCode::INTERNAL_SERVER_ERROR);
@@ -992,7 +1105,7 @@ mod status_and_rel_tests {
         h.insert(http::header::CONTENT_LENGTH, "3".parse().unwrap());
         h.append(http::header::SET_COOKIE, "a=1".parse().unwrap());
         h.append(http::header::SET_COOKIE, "b=2".parse().unwrap());
-        let s = String::from_utf8(request_headers_block(&h)).unwrap();
+        let s = String::from_utf8(request_headers_block(&h, None)).unwrap();
         // http::HeaderMap 把名字规范化为小写，块里就是小写形态。
         assert!(s.contains("host: apps.example:9095\r\n"), "{s}");
         assert!(s.contains("x-request-id: task-1\r\n"), "{s}");
@@ -1012,6 +1125,25 @@ mod status_and_rel_tests {
         }
     }
 
+    /// h2/h3 没有字面 `Host` 头（权威在 `:authority`）：请求头块必须用 authority 补出
+    /// `host:`，否则引擎在 h2/h3 上拿不到 HTTP_HOST（h1 有），跨协议不一致。
+    #[test]
+    fn request_headers_block_synthesizes_host_from_authority() {
+        let auth: http::uri::Authority = "apps.example:9095".parse().unwrap();
+        let s = String::from_utf8(request_headers_block(&http::HeaderMap::new(), Some(&auth)))
+            .unwrap();
+        assert!(s.contains("host: apps.example:9095\r\n"), "{s}");
+        // 已有 Host → 不重复
+        let mut h2 = http::HeaderMap::new();
+        h2.insert(http::header::HOST, "x.example".parse().unwrap());
+        let s2 = String::from_utf8(request_headers_block(&h2, Some(&auth))).unwrap();
+        assert_eq!(s2.matches("host:").count(), 1, "{s2}");
+        assert!(s2.contains("x.example"), "{s2}");
+        // 无 authority 且无 Host → 空块
+        let s3 = String::from_utf8(request_headers_block(&http::HeaderMap::new(), None)).unwrap();
+        assert!(s3.is_empty(), "{s3}");
+    }
+
     /// obs-text（0x80-0xFF）头值合法且必须保留；块内不含 NUL（call_exec 依赖
     /// 这一点才能安全地用 CString 包装）。
     #[test]
@@ -1019,7 +1151,7 @@ mod status_and_rel_tests {
         let mut h = http::HeaderMap::new();
         h.insert("x-latin1", http::HeaderValue::from_bytes(b"caf\xe9").unwrap());
         h.insert("x-request-id", "task-1".parse().unwrap());
-        let raw = request_headers_block(&h);
+        let raw = request_headers_block(&h, None);
         assert!(
             raw.windows(4).any(|w| w == b"caf\xe9"),
             "obs-text value must survive: {raw:?}"

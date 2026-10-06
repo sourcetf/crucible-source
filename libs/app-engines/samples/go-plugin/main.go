@@ -21,6 +21,14 @@ import (
 	"unsafe"
 )
 
+// Must match APPENGINE_ABI_VERSION in libs/app-engines/include/appengine.h.
+const appengineABIVersion = 2
+
+//export appengine_abi_version
+func appengine_abi_version() C.int {
+	return C.int(appengineABIVersion)
+}
+
 //export appengine_init
 func appengine_init(engine, libHint *C.char) C.int {
 	return 0

@@ -1083,6 +1083,20 @@ fn plain(status: StatusCode, body: &'static str) -> Response<BoxBody> {
         })
 }
 
+/// 字节版固定文本响应（h2/h3 简单路径用；body 是 `Bytes`）。
+fn plain_bytes(status: StatusCode, body: &'static str) -> Response<Bytes> {
+    Response::builder()
+        .status(status)
+        .header(header::CONTENT_TYPE, "text/plain; charset=utf-8")
+        .body(Bytes::from_static(body.as_bytes()))
+        .unwrap_or_else(|_| {
+            Response::builder()
+                .status(StatusCode::INTERNAL_SERVER_ERROR)
+                .body(Bytes::from_static(b"response build error"))
+                .unwrap()
+        })
+}
+
 fn build_error_response(e: &BuildErr) -> Response<BoxBody> {
     // 固定文本：不含服务器路径/编译器 stderr（那些只进日志与 status_json）。
     match e {
@@ -1097,12 +1111,33 @@ fn build_error_response(e: &BuildErr) -> Response<BoxBody> {
     }
 }
 
-async fn serve_product(
-    req: &Request<Incoming>,
+fn build_error_response_bytes(e: &BuildErr) -> Response<Bytes> {
+    match e {
+        BuildErr::NoTool(_) => plain_bytes(
+            StatusCode::BAD_GATEWAY,
+            "502 Bad Gateway: tsx: no TypeScript transpiler found (install node + esbuild/tsc; see server log)\n",
+        ),
+        BuildErr::Failed(_) => plain_bytes(
+            StatusCode::BAD_GATEWAY,
+            "502 Bad Gateway: tsx build failed (see server log)\n",
+        ),
+    }
+}
+
+/// 产物托管核心（h1/h2/h3 共用）：只依赖请求的 **path + method**，因此对
+/// `Request<Incoming>`（h1）与 `Request<Bytes>`（h2/h3）都能复用。
+///
+/// 为什么必须共用：此前只有 h1 走这条编译管线，h2/h3 的 `dispatch_simple` 把 tsx 送到
+/// `sidecar_engine` → `libapp_tsx.so`；那个 .so 只按产物目录回文件、**忽略请求路径**，
+/// 于是 `/tsx/<不存在的源>` 在 h1 是 404、在 h2 却回 `dist/index.js`（内容伪装/软 404）——
+/// 同一个 URL 在两个协议版本上给出不同资源。
+fn serve_product_bytes(
+    path: &str,
+    method: &Method,
     app: &AppRouteConfig,
     paths: &Paths,
-) -> Result<Response<BoxBody>> {
-    let rest_raw = app_remainder(app, req.uri().path());
+) -> Response<Bytes> {
+    let rest_raw = app_remainder(app, path);
     // URL 里可能是 %20/%E4%B8%AD 这类转义；先解码再按段校验（`%2e%2e` 解出 `..`
     // 会被 join_under 拒绝）。
     let rest = percent_encoding::percent_decode_str(rest_raw)
@@ -1122,7 +1157,7 @@ async fn serve_product(
                 Duration::from_secs(60),
                 &format!("tsx: 产物过大，拒绝服务: {} ({} 字节)", p.display(), md.len()),
             );
-            return Ok(plain(StatusCode::PAYLOAD_TOO_LARGE, "413 Payload Too Large\n"));
+            return plain_bytes(StatusCode::PAYLOAD_TOO_LARGE, "413 Payload Too Large\n");
         }
         let bytes = match fs::read(&p) {
             Ok(b) => b,
@@ -1132,27 +1167,39 @@ async fn serve_product(
                     Duration::from_secs(60),
                     &format!("tsx: 读产物失败 {}: {e}", p.display()),
                 );
-                return Ok(plain(
+                return plain_bytes(
                     StatusCode::INTERNAL_SERVER_ERROR,
                     "500 Internal Server Error (tsx product read)\n",
-                ));
+                );
             }
         };
-        let body = if req.method() == Method::HEAD {
+        let body = if *method == Method::HEAD {
             Bytes::new()
         } else {
             Bytes::from(bytes)
         };
-        return Ok(Response::builder()
+        return Response::builder()
             .status(StatusCode::OK)
             .header(header::CONTENT_TYPE, content_type_of(&p))
             // watch 部署期间不要被中间层/浏览器缓存住旧产物。
             .header(header::CACHE_CONTROL, "no-cache")
             .header("x-content-type-options", "nosniff")
-            .body(full(body))
-            .unwrap_or_else(|_| plain(StatusCode::INTERNAL_SERVER_ERROR, "response build error")));
+            .body(body)
+            .unwrap_or_else(|_| {
+                plain_bytes(StatusCode::INTERNAL_SERVER_ERROR, "response build error")
+            });
     }
-    Ok(plain(StatusCode::NOT_FOUND, "404 Not Found\n"))
+    plain_bytes(StatusCode::NOT_FOUND, "404 Not Found\n")
+}
+
+async fn serve_product(
+    req: &Request<Incoming>,
+    app: &AppRouteConfig,
+    paths: &Paths,
+) -> Result<Response<BoxBody>> {
+    let r = serve_product_bytes(req.uri().path(), req.method(), app, paths);
+    let (parts, body) = r.into_parts();
+    Ok(Response::from_parts(parts, full(body)))
 }
 
 // ---------------------------------------------------------------------------
@@ -1218,6 +1265,84 @@ pub async fn handle(
             // spawn_blocking 任务 panic（理论上不该发生）：同样只回固定文本。
             log::error!("tsx [{}] 编译任务异常退出: {join_err}", state.key);
             Ok(plain(
+                StatusCode::BAD_GATEWAY,
+                "502 Bad Gateway: tsx build task failed (see server log)\n",
+            ))
+        }
+    }
+}
+
+/// h2/h3 字节入口：与 [`handle`] 同一编译管线 / 产物托管，只是请求体已在协议层收齐。
+///
+/// 修复版本间不一致：此前 h2/h3 的 tsx 被 `dispatch_simple` 送到 `libapp_tsx.so`
+/// （忽略请求路径的 stub），`/tsx/<不存在的源>` 在 h1 是 404、在 h2 却回 `dist/index.js`
+/// （内容伪装）。socket 分支与 h1 同判据（显式配置且存活的 socket 优先，编译管线不抢占）。
+pub async fn handle_bytes(
+    req: &Request<Bytes>,
+    lc: &ListenerConfig,
+    app: &AppRouteConfig,
+    peer: SocketAddr,
+    app_idx: usize,
+) -> Result<Response<Bytes>> {
+    // 1) 显式配置且**活着**的 socket：与 h1 `handle` 同判据。
+    #[cfg(unix)]
+    {
+        let socket_configured = app
+            .socket
+            .as_deref()
+            .map(|s| !s.trim().is_empty())
+            .unwrap_or(false);
+        if socket_configured && native_http::uds_socket_available(app) {
+            let sock = native_http::uds_socket_path(app)
+                .ok_or_else(|| anyhow::anyhow!("apps[].socket missing"))?;
+            let target = crate::server::apps::app_ffi::rel_script_path(app, req.uri().path());
+            return crate::server::apps::sidecar_engine::proxy_uds_simple(
+                req,
+                &sock,
+                peer,
+                Some(target),
+            )
+            .await;
+        }
+    }
+    let _ = peer;
+
+    // 2) 编译管线产出静态产物：只服务 GET/HEAD。
+    if req.method() != Method::GET && req.method() != Method::HEAD {
+        return Ok(Response::builder()
+            .status(StatusCode::METHOD_NOT_ALLOWED)
+            .header(header::ALLOW, "GET, HEAD")
+            .header(header::CONTENT_TYPE, "text/plain; charset=utf-8")
+            .body(Bytes::from_static(b"405 Method Not Allowed\n"))
+            .unwrap());
+    }
+
+    let docroot = app.docroot.clone().unwrap_or_else(|| lc.root.clone());
+    // 键含 docroot：配置热重载换了目录不会被旧状态串台（与 h1 同一构造）。
+    let key = format!(
+        "{}:{}:{}:{}",
+        lc.port,
+        app_idx,
+        app.engine.to_ascii_lowercase(),
+        docroot.display()
+    );
+    let state = app_state(&key, lc.port, &app.engine);
+    if app.watch {
+        register_watch(&key, state.clone(), app, &docroot);
+    }
+
+    let built = {
+        let st = state.clone();
+        let a = app.clone();
+        let d = docroot.clone();
+        tokio::task::spawn_blocking(move || ensure_built(&st, &a, &d)).await
+    };
+    match built {
+        Ok(Ok(paths)) => Ok(serve_product_bytes(req.uri().path(), req.method(), app, &paths)),
+        Ok(Err(e)) => Ok(build_error_response_bytes(&e)),
+        Err(join_err) => {
+            log::error!("tsx [{}] 编译任务异常退出: {join_err}", state.key);
+            Ok(plain_bytes(
                 StatusCode::BAD_GATEWAY,
                 "502 Bad Gateway: tsx build task failed (see server log)\n",
             ))

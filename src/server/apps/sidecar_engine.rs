@@ -99,9 +99,17 @@ pub async fn handle_with_fallback_simple(
     {
         let _ = (req, lc, app, peer, app_idx, deps);
     }
-    bail!(
-        "502 Bad Gateway: engine `{engine}` unavailable (no libapp_{engine}.so, sidecar, or socket)\n"
-    )
+    // 「无后端可用」是**引擎不可用**（配置/构建问题），与 h1 `handle_with_fallback` 同口径：
+    // 返回一个固定的 502 **响应**（而不是 Err）—— Err 会被 `simple_engine_error` 换成通用
+    // 文本「502 Bad Gateway (engine error)」，于是同一个 URL 的 502 错误体在 h1 与 h2/h3
+    // 上不同（跨协议不一致）。这里给出与 h1 逐字相同的 502 文本。
+    Ok(Response::builder()
+        .status(StatusCode::BAD_GATEWAY)
+        .header(http::header::CONTENT_TYPE, "text/plain; charset=utf-8")
+        .body(Bytes::from(format!(
+            "502 Bad Gateway: engine `{engine}` unavailable (no libapp_{engine}.so, sidecar, or socket)\n"
+        )))
+        .unwrap())
 }
 
 /// 客户端转发头：只能由本代理重写，透传等于让客户端伪造来源。
@@ -161,7 +169,7 @@ fn upstream_response(rparts: http::response::Parts, body: Bytes) -> Result<Respo
 }
 
 #[cfg(unix)]
-async fn proxy_uds_simple(
+pub(crate) async fn proxy_uds_simple(
     req: &Request<Bytes>,
     sock: &std::path::Path,
     peer: SocketAddr,
@@ -330,6 +338,10 @@ async fn ensure_sidecar_simple(
     let mut cmd = Command::new(&deps_bin);
     cmd.current_dir(&docroot)
         .env("WEBSERVER_LISTEN_UNIX", sock.display().to_string())
+        // 与 h1 `native_http::ensure_sidecar` 同一套 env：sidecar（ruby 等）据此
+        // 兜底剥离路由前缀。此前 h2/h3 这条 spawn 路径漏了它，同一 sidecar 由 h1 起
+        // 与由 h2 起拿到的环境不同（版本间不一致）。
+        .env("WEBSERVER_APP_PREFIXES", app.paths.join(","))
         .env("WEBSERVER_WORKERS", app.workers.max(1).to_string())
         .env("DOCUMENT_ROOT", docroot.display().to_string())
         .env("GATEWAY_INTERFACE", "CGI/1.1")

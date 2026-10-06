@@ -525,6 +525,24 @@ mod imp {
         // 「发完 HEADERS 就等 200」的客户端会一直阻塞在 `recv_data()` 上：
         // CONNECT-UDP 的负载本来就要等 200 之后才发，于是隧道还没建就先卡死。
         if req.method() == http::Method::CONNECT {
+            // RFC 9114 §4.3.1：CONNECT 的 `:authority` / Host 值同样必须校验。
+            // 这条分支在 `handle_h3` **之前**分流（见下），不在这里补判就会绕过
+            // 权威名校验（h2 的 CONNECT 走 `handle_h2`，已被同判据覆盖）。
+            if let Err(why) = crate::server::h2::request_authority_ok(req.uri(), req.headers()) {
+                let path = req.uri().path().to_string();
+                let t0 = std::time::Instant::now();
+                connect_reject(
+                    &mut stream,
+                    &live,
+                    peer,
+                    &path,
+                    StatusCode::BAD_REQUEST,
+                    t0,
+                    why,
+                )
+                .await;
+                return Ok(());
+            }
             // 开关（默认关）：CONNECT-UDP 是**公网 UDP 中继**（RFC 9298），
             // 反向代理与上传都要显式配置才开，它此前却默认可用 —— 不配任何东西就
             // 得到一条到任意公网 IP/端口的隧道（内网地址已被 `connect_udp` 拒绝，
@@ -1008,7 +1026,12 @@ use chunked uploads (Content-Range) or HTTP/1.1 for larger bodies",
         // h3-quinn 的 RecvStream 持有连接的 Arc，因此满足 ✓
         R: ::h3::quic::RecvStream + Send + 'static,
     {
-        let (tx, rx) = tokio::sync::mpsc::channel::<Bytes>(2);
+        // 通道里带 `Result`：**空闲超时/读错必须让 body 侧看到 Err**，而不是干净 EOF。
+        // 否则 h3 与 h2 行为分叉：h2 的 `H2RecvBody` 在空闲超时时返回 `Err`，
+        // upload_api 据此回 400、**不 commit**；而 h3 若把超时当成 EOF，
+        // upload_api 的 `Ok(None) => break` 会把**半截文件 commit 成完整文件**
+        // （数据损坏）。两者都是 60s 超时 ⇒ 谁先触发是竞态，不能靠运气。
+        let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, String>>(2);
         tokio::spawn(async move {
             loop {
                 match tokio::time::timeout(
@@ -1022,13 +1045,15 @@ use chunked uploads (Content-Range) or HTTP/1.1 for larger bodies",
                         if b.is_empty() {
                             continue;
                         }
-                        if tx.send(b).await.is_err() {
+                        if tx.send(Ok(b)).await.is_err() {
                             return; // 接收端已丢弃（客户端断开或分支提前返回）
                         }
                     }
+                    // 流正常结束（FIN）：干净 EOF，交给消费方。
                     Ok(Ok(None)) => return,
                     Ok(Err(e)) => {
                         log::debug!("h3 body task recv_data: {e:#}");
+                        let _ = tx.send(Err(format!("h3 request body read failed: {e:#}"))).await;
                         return;
                     }
                     Err(_) => {
@@ -1037,6 +1062,10 @@ use chunked uploads (Content-Range) or HTTP/1.1 for larger bodies",
                             std::time::Duration::from_secs(60),
                             "h3 body task idle timeout",
                         );
+                        // 超时是**错误**，不是 EOF：如实告诉消费方（见上方注释）。
+                        let _ = tx
+                            .send(Err("h3 request body idle timeout".to_string()))
+                            .await;
                         return;
                     }
                 }
@@ -1051,7 +1080,7 @@ use chunked uploads (Content-Range) or HTTP/1.1 for larger bodies",
 
     /// [`h3_body_from_recv`] 的 body 侧：把通道里的块当 DATA 帧交给消费方。
     struct H3RecvChan {
-        rx: parking_lot::Mutex<tokio::sync::mpsc::Receiver<Bytes>>,
+        rx: parking_lot::Mutex<tokio::sync::mpsc::Receiver<Result<Bytes, String>>>,
     }
 
     impl hyper::body::Body for H3RecvChan {
@@ -1063,8 +1092,11 @@ use chunked uploads (Content-Range) or HTTP/1.1 for larger bodies",
             cx: &mut std::task::Context<'_>,
         ) -> std::task::Poll<Option<Result<hyper::body::Frame<Bytes>, Self::Error>>> {
             match self.get_mut().rx.lock().poll_recv(cx) {
-                std::task::Poll::Ready(Some(b)) => {
+                std::task::Poll::Ready(Some(Ok(b))) => {
                     std::task::Poll::Ready(Some(Ok(hyper::body::Frame::data(b))))
+                }
+                std::task::Poll::Ready(Some(Err(e))) => {
+                    std::task::Poll::Ready(Some(Err(e.into())))
                 }
                 std::task::Poll::Ready(None) => std::task::Poll::Ready(None),
                 std::task::Poll::Pending => std::task::Poll::Pending,
@@ -1131,6 +1163,19 @@ use chunked uploads (Content-Range) or HTTP/1.1 for larger bodies",
         peer: SocketAddr,
     ) -> Response<Bytes> {
         let mut req = req;
+        // RFC 9114 §4.3.1：`:authority` / `Host` 的值必须在**任何路由判定之前**校验。
+        // h3 crate 只校验「两者一致 / 非空」，不校验值的语义（`..`、`host:99999`、
+        // `user@host` 等畸形值会被放行），而 h1 早已 400 —— 三协议必须同判。
+        // 判据复用 h2 的同名函数（h1::is_valid_host_value 的等价副本）。
+        if let Err(why) = crate::server::h2::request_authority_ok(req.uri(), req.headers()) {
+            return tag(
+                Response::builder()
+                    .status(StatusCode::BAD_REQUEST)
+                    .body(Bytes::from(format!("bad request: {why}")))
+                    .unwrap(),
+                "h3",
+            );
+        }
         let path = req.uri().path().to_string();
 
         let snap = live.snapshot();
@@ -1190,12 +1235,11 @@ use chunked uploads (Content-Range) or HTTP/1.1 for larger bodies",
             if dns_eff.enabled && dns_eff.doh.enabled {
                 // 只有「确实是 DoH 请求」才收 body —— 否则会给普通上传白白套上 8MiB 上限
                 //（判定条件与 doh_prepared 的前几个早退分支一致）。
-                let host = req.headers().get(http::header::HOST).cloned();
-                if crate::server::dns::dot_doh::is_doh_request(
-                    &dns_eff,
-                    req.uri().path(),
-                    host.as_ref(),
-                ) {
+                //
+                // 同 h2：HTTP/3 的权威字段是伪头 `:authority`（crate 放进 `uri().authority()`），
+                // `HeaderMap` 里没有 `Host`。用 uri 形态的判据，否则配了 hostnames 白名单的
+                // 部署在 h3 下 DoH 恒 404。
+                if crate::server::dns::dot_doh::is_doh_request_uri(&dns_eff, req.uri()) {
                     let collected = match h3_collect_bytes(req, REQUEST_BODY_CAP).await {
                         Ok(r) => r,
                         Err(resp) => return tag(resp, "dns-doh"),
@@ -1225,45 +1269,54 @@ use chunked uploads (Content-Range) or HTTP/1.1 for larger bodies",
         }
 
         // P0-1：listener 级 Basic Auth（§16.1）——与 h1/h2 对齐，堵住 h3 绕过。
+        //
+        // P2（与 h1/h2 同语义）：**admin 路径跳过 listener 级 basic_auth**。管理面由
+        // admin 门单独把关（上面的 admin 前置门 + admin::handle 里的 admin_gate）。
+        // 否则同端口既开站点口令又开面板时，一组 `Authorization` 头要同时过站点口令
+        // 与管理员口令两道 Basic 门 ⇒ 面板在该端口不可达。admin 路径的鉴权不会变松：
+        // admin_gate 对未配置用户/无凭据一律 fail-closed。
+        let admin_path = crate::server::access::is_admin_path(&snap.admin.path, &path);
         if let Some(ba) = &lc.basic_auth {
-            match crate::server::basic_auth::check_listener_headers_at(
-                req.headers(),
-                ba,
-                peer.ip(),
-            ) {
-                crate::server::basic_auth::BasicCheck::Ok => {}
-                crate::server::basic_auth::BasicCheck::Unauthorized => {
-                    return tag(
-                        Response::builder()
-                            .status(StatusCode::UNAUTHORIZED)
-                            .header(
-                                http::header::WWW_AUTHENTICATE,
-                                format!("Basic realm=\"{}\"", ba.realm),
-                            )
-                            .body(Bytes::from_static(b"unauthorized"))
-                            .unwrap(),
-                        "acl",
-                    )
-                }
-                // 失败退避（与 h1/h2 同一张表、同一响应语义）。
-                crate::server::basic_auth::BasicCheck::Throttled(d) => {
-                    return tag(
-                        Response::builder()
-                            .status(StatusCode::TOO_MANY_REQUESTS)
-                            .header(
-                                http::header::RETRY_AFTER,
-                                crate::server::basic_auth::retry_after_secs(d).to_string(),
-                            )
-                            .body(Bytes::from_static(b"too many failed authentication attempts"))
-                            .unwrap(),
-                        "acl",
-                    )
+            if !admin_path {
+                match crate::server::basic_auth::check_listener_headers_at(
+                    req.headers(),
+                    ba,
+                    peer.ip(),
+                ) {
+                    crate::server::basic_auth::BasicCheck::Ok => {}
+                    crate::server::basic_auth::BasicCheck::Unauthorized => {
+                        return tag(
+                            Response::builder()
+                                .status(StatusCode::UNAUTHORIZED)
+                                .header(
+                                    http::header::WWW_AUTHENTICATE,
+                                    format!("Basic realm=\"{}\"", ba.realm),
+                                )
+                                .body(Bytes::from_static(b"unauthorized"))
+                                .unwrap(),
+                            "acl",
+                        )
+                    }
+                    // 失败退避（与 h1/h2 同一张表、同一响应语义）。
+                    crate::server::basic_auth::BasicCheck::Throttled(d) => {
+                        return tag(
+                            Response::builder()
+                                .status(StatusCode::TOO_MANY_REQUESTS)
+                                .header(
+                                    http::header::RETRY_AFTER,
+                                    crate::server::basic_auth::retry_after_secs(d).to_string(),
+                                )
+                                .body(Bytes::from_static(b"too many failed authentication attempts"))
+                                .unwrap(),
+                            "acl",
+                        )
+                    }
                 }
             }
         }
 
         // P2-21（任务 4）：admin 暴露面——[admin].listeners_allow 非空时仅列出的端口可达。
-    if crate::server::access::is_admin_path(&snap.admin.path, &path) && !snap.admin.listener_allowed(lc.port) {
+    if admin_path && !snap.admin.listener_allowed(lc.port) {
         return tag(
             Response::builder()
                 .status(StatusCode::NOT_FOUND)
@@ -1851,5 +1904,33 @@ mod inflight_tests {
     fn h3_inflight_limit_matches_h2() {
         assert_eq!(H3_MAX_INFLIGHT, 256);
         assert_eq!(H3_MAX_INFLIGHT, crate::server::h2::H2_MAX_INFLIGHT);
+    }
+
+    /// P2 回归：admin 路径必须跳过 listener 级 basic_auth（否则同端口「站点口令 + 面板」
+    /// 时面板不可达）。判据：handle_h3 里 `check_listener_headers` 被 `if !admin_path` 包住。
+    #[test]
+    fn h3_admin_path_skips_listener_basic_auth() {
+        let src = include_str!("h3.rs");
+        let pos = src.find("async fn handle_h3").expect("handle_h3");
+        let tail = &src[pos..];
+        let guard = tail.find("if !admin_path {").expect("admin_path guard");
+        let ba = tail.find("check_listener_headers").expect("basic_auth check");
+        assert!(
+            guard < ba,
+            "check_listener_headers 必须被 if !admin_path 包住（guard={guard} ba={ba}）"
+        );
+    }
+
+    /// P1 回归：handle_h3 必须在任何路由判定之前校验权威名（调用 h2 的同判据函数）。
+    #[test]
+    fn h3_validates_authority_before_routing() {
+        let src = include_str!("h3.rs");
+        let pos = src.find("async fn handle_h3").expect("handle_h3");
+        let tail = &src[pos..];
+        let check = tail
+            .find("request_authority_ok")
+            .expect("authority check in handle_h3");
+        let acl = tail.find("is_allowed").expect("ip_access");
+        assert!(check < acl, "权威名校验必须在 ACL/路由之前");
     }
 }

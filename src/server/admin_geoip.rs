@@ -54,8 +54,7 @@ pub async fn handle_lookup(req: &Request<Full<Bytes>>) -> Response<BoxBody> {
         return method_not_allowed();
     }
     let ip_s = query_param(req.uri().query().unwrap_or(""), "ip").unwrap_or_default();
-    let db_path = std::env::var("CRUCIBLE_GEOIP_DB")
-        .ok()
+    let db_path = crate::server::apps::env_lock::read_static_env("CRUCIBLE_GEOIP_DB")
         .map(PathBuf::from)
         .or_else(|| Some(PathBuf::from("data/geoip/current/geoip.sqlite")));
     lookup_json(&ip_s, db_path.as_deref())
@@ -571,8 +570,8 @@ pub async fn handle_update_status(req: &Request<Full<Bytes>>) -> Response<BoxBod
 
 /// `GET /api/geoip/status` — standalone env path.
 pub async fn handle_status(_req: &Request<Full<Bytes>>) -> Response<BoxBody> {
-    let db_path = std::env::var("CRUCIBLE_GEOIP_DB")
-        .unwrap_or_else(|_| "data/geoip/current/geoip.sqlite".into());
+    let db_path = crate::server::apps::env_lock::read_static_env("CRUCIBLE_GEOIP_DB")
+        .unwrap_or_else(|| "data/geoip/current/geoip.sqlite".into());
     let exists = std::path::Path::new(&db_path).is_file();
     json_ok(format!(
         "{{\"enabled\":{},\"db_path\":{},\"message\":\"rust geoip panel\"}}",
@@ -597,7 +596,9 @@ fn resolve_db_path(live: &Arc<LiveConfig>) -> Option<PathBuf> {
     snap.geoip
         .db_path
         .clone()
-        .or_else(|| std::env::var("CRUCIBLE_GEOIP_DB").ok().map(PathBuf::from))
+        .or_else(|| {
+            crate::server::apps::env_lock::read_static_env("CRUCIBLE_GEOIP_DB").map(PathBuf::from)
+        })
         .or_else(|| Some(PathBuf::from("data/geoip/current/geoip.sqlite")))
 }
 

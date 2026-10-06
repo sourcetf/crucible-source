@@ -117,9 +117,49 @@ impl EchMaterial {
                 .with_context(|| format!("chmod 0600 {}", pem.display()))?;
         }
         let lst = dir.join("ech_config_list.bin");
-        std::fs::write(&lst, &self.config_list)
+        write_config_list_atomic(&lst, &self.config_list)
             .with_context(|| format!("write {}", lst.display()))?;
         Ok(pem)
+    }
+}
+
+/// 原子写 ECHConfigList（同目录 tmp + rename）。
+///
+/// DNS/面板发布读的就是这个文件：`fs::write` 写到一半崩溃会留下**半截** config list，
+/// 下次启动会被当成有效配置发布出去（客户端拿到无法使用的 ECHConfig）。
+fn write_config_list_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    let tmp = path.with_extension("tmp");
+    std::fs::write(&tmp, bytes)?;
+    match std::fs::rename(&tmp, path) {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            let _ = std::fs::remove_file(&tmp);
+            Err(e)
+        }
+    }
+}
+
+/// 确保磁盘上的 `state/ech/ech_config_list.bin` 与给定 ECHConfig **逐字节一致**。
+///
+/// 复用分支（`ensure_material` 命中已有 pem）旧实现只算内存 `config_list`、**不落盘**：
+/// 一旦 `.bin` 因崩溃/两文件非原子写而缺失或来自另一把钥匙，DNS 会一直发布错的
+/// ECHConfig，而服务端用的是另一份私钥 ⇒ ECH 静默失效且**永不自愈**（tls-core P2）。
+/// 返回 true 表示实际发生了重写。
+pub fn ensure_config_list_file(config: &[u8]) -> bool {
+    let list = encode_config_list(config);
+    let path = state_dir().join("ech_config_list.bin");
+    if std::fs::read(&path).ok().as_deref() == Some(list.as_slice()) {
+        return false;
+    }
+    match write_config_list_atomic(&path, &list) {
+        Ok(()) => {
+            log::info!("ech: 重写 ech_config_list.bin 以匹配当前 ECHConfig（与磁盘不一致）");
+            true
+        }
+        Err(e) => {
+            log::warn!("ech: 重写 ech_config_list.bin 失败: {e}");
+            false
+        }
     }
 }
 
@@ -389,6 +429,9 @@ pub fn ensure_material(spec: &EchSpec) -> Result<EchMaterial> {
                         "ech: 复用已有配置 (public_name={name} max_name_length={mlen} suites={})",
                         suites.len()
                     );
+                    // 复用也要保证 .bin 与这份 config 一致（见 ensure_config_list_file）：
+                    // 否则 DNS 可能长期发布另一把钥匙的 ECHConfig。
+                    ensure_config_list_file(&config);
                     let config_list = encode_config_list(&config);
                     return Ok(EchMaterial { config, key, config_list, reused: true });
                 }
@@ -416,6 +459,42 @@ pub fn ensure_from_config(
 ) -> Result<EchMaterial> {
     let spec = EchSpec::from_config(public_name, cipher_suite, max_name_length)?;
     ensure_material(&spec)
+}
+
+/// 启动期：对**显式配置** `ssl.ech_keys` 的 listener，把该 PEM 里的 ECHConfig 派生出的
+/// ECHConfigList 落盘到 DNS/面板读取的固定路径 `state/ech/ech_config_list.bin`。
+///
+/// 为什么必须在**启动期**做：`auto_https_records` 读的就是这个固定路径，而显式
+/// `ech_keys` 形态下该文件历史上**从不**由服务端生成（靠部署时手工 `generate_ech.sh`），
+/// 于是 DNS 发布的要么缺失、要么是**另一把钥匙**的配置（tls-core P2）。`apply_ech`
+/// 里的派生只在 acceptor 冷构建（首个连接）时触发，早于 DNS 生成则发布不到。这里在
+/// 启动时就派生一次，保证「发布的 = 实际在用的」。返回实际写入/重写的 listener 数。
+pub fn sync_explicit_keys_for_listeners(
+    listeners: &[crate::config::ListenerConfig],
+) -> usize {
+    let mut written = 0;
+    for lc in listeners {
+        let Some(ssl) = lc.ssl.as_ref() else { continue };
+        if !ssl.ech {
+            continue;
+        }
+        let Some(path) = ssl.ech_keys.as_deref() else {
+            continue;
+        };
+        let Ok(pem) = crate::server::ssl_material::load_bytes(path) else {
+            continue;
+        };
+        if let Some(cfg) = crate::server::tls::ech_pem::first_config(&pem) {
+            if ensure_config_list_file(&cfg) {
+                written += 1;
+            }
+        } else {
+            log::warn!(
+                "ech: 显式 ech_keys={path} 解析不出 ECH CONFIG 块，DNS 无法发布对应配置"
+            );
+        }
+    }
+    written
 }
 
 /// 读回已落盘的 ECHConfigList（type65 记录用）。

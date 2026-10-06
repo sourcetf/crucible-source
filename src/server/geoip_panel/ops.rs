@@ -266,23 +266,35 @@ pub fn upsert_cron(
 }
 
 /// Toggle / set source weight+enabled.
+///
+/// 校验：既没给 enabled 也没给 weight ⇒ 无事可做（报错，别假成功）；给了值但
+/// `panel_sources` 里没有该 name（面板/表单拼错）⇒ 0 行受影响，报错而不是回 ok。
+/// 旧实现只 `UPDATE ... WHERE name=?` 后无条件 `Ok(())`，于是改一个不存在的源名
+/// 面板回 `{"ok":true}`、审计也记了，实际什么都没发生（与「覆盖假成功」同类）。
 pub fn set_source(
     panel: &Connection,
     name: &str,
     enabled: Option<bool>,
     weight: Option<i64>,
 ) -> Result<()> {
+    if enabled.is_none() && weight.is_none() {
+        anyhow::bail!("nothing to update for source {name:?}（enabled/weight 都为空）");
+    }
+    let mut affected = 0usize;
     if let Some(en) = enabled {
-        panel.execute(
+        affected += panel.execute(
             "UPDATE panel_sources SET enabled = ?1 WHERE name = ?2",
             rusqlite::params![if en { 1 } else { 0 }, name],
         )?;
     }
     if let Some(w) = weight {
-        panel.execute(
+        affected += panel.execute(
             "UPDATE panel_sources SET weight = ?1 WHERE name = ?2",
             rusqlite::params![w, name],
         )?;
+    }
+    if affected == 0 {
+        anyhow::bail!("unknown geoip source {name:?}（panel_sources 无此行）");
     }
     panel.execute(
         "INSERT INTO panel_audit(action, detail) VALUES('source', ?1)",
@@ -626,5 +638,29 @@ mod tests {
         assert!(us.iter().any(|r| r.city == "Mountain View"));
         assert!(us.iter().any(|r| r.city == "Documentation"));
         assert!(!us.iter().any(|r| r.country == "CN"));
+    }
+
+    /// 源管理不得假成功：无字段可改、或源名不存在，都必须报错（旧实现无条件回 ok）。
+    #[test]
+    fn set_source_rejects_unknown_and_noop() {
+        let panel = panel_db();
+        assert!(set_source(&panel, "x", None, None).is_err(), "无事可做应报错");
+        assert!(set_source(&panel, "nope", Some(true), None).is_err(), "未知源名应报错");
+        panel
+            .execute(
+                "INSERT INTO panel_sources(name, weight, enabled) VALUES('demo', 50, 1)",
+                [],
+            )
+            .unwrap();
+        set_source(&panel, "demo", Some(false), Some(80)).unwrap();
+        let (en, w): (i64, i64) = panel
+            .query_row(
+                "SELECT enabled, weight FROM panel_sources WHERE name='demo'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(en, 0);
+        assert_eq!(w, 80);
     }
 }

@@ -144,6 +144,10 @@ where
 
     let mut stdout = BytesMut::new();
     let mut stderr = BytesMut::new();
+    // FCGI_END_REQUEST 的 protocolStatus：0 = REQUEST_COMPLETE；非 0（OVERLOADED /
+    // UNKNOWN_ROLE / CANT_MPX_CONN…）表示上游**没有正常完成**这个请求。旧实现直接 break
+    // 不看，把已收内容按 200 返回 —— 对第三方 `engine="fastcgi"` 上游是误导性成功。
+    let mut protocol_status: u8 = 0;
     loop {
         let (rtype, rid, content) = read_record(stream).await?;
         if rid != request_id && rid != 0 {
@@ -164,7 +168,13 @@ where
             FCGI_STDERR => {
                 stderr.extend_from_slice(&content);
             }
-            FCGI_END_REQUEST => break,
+            FCGI_END_REQUEST => {
+                // body: appStatus(4) + protocolStatus(1) + reserved(3)
+                if content.len() >= 5 {
+                    protocol_status = content[4];
+                }
+                break;
+            }
             _ => {}
         }
     }
@@ -174,6 +184,11 @@ where
             "fcgi stderr: {}",
             String::from_utf8_lossy(&stderr)
         );
+    }
+
+    if protocol_status != 0 {
+        // 上游明确失败（非 REQUEST_COMPLETE）：回 502，而不是把残缺内容当 200。
+        bail!("fastcgi: 上游 END_REQUEST protocolStatus={protocol_status}（请求未正常完成）");
     }
 
     parse_cgi_response(stdout.freeze())
@@ -362,12 +377,14 @@ fn build_params(req: &FcgiRequest) -> BytesMut {
     params
 }
 
-/// hop-by-hop 头（RFC 9110 §7.6.1）：只为当前连接服务，不得转发给上游。
+/// hop-by-hop 头（RFC 9110 §7.6.1）：只为当前连接服务，不得转发给上游/下游。
 fn is_hop_by_hop(lower: &str) -> bool {
     matches!(
         lower,
         "connection"
             | "keep-alive"
+            | "proxy-authenticate"
+            | "proxy-authorization"
             | "proxy-connection"
             | "te"
             | "trailer"
@@ -376,23 +393,158 @@ fn is_hop_by_hop(lower: &str) -> bool {
     )
 }
 
+/// 上游（FastCGI/php-fpm）响应头净化：丢弃逐跳头、`Connection:` 点名的头，以及
+/// 与**真实 body 长度不符**的 `Content-Length`。
+///
+/// 为什么必须做：这些头会被原样写回客户端，而响应体是我们重新缓冲出来的。hyper 按
+/// **body 的实际长度**成帧、却把这里给的 `Content-Length` **原样写出**（长度一致性
+/// 检查只在 debug_assertions 下）—— 上游回一个 `Content-Length: 5` + 10 字节 body，
+/// 客户端与中间缓存就会把多出来的 5 字节当成**下一条响应**（响应走私/连接失步）；上游
+/// 还能用 `Transfer-Encoding: chunked` 改变定界方式。proxy.rs（`proxy_once`）与
+/// sidecar_engine.rs 早已对「上游响应头」做同一套净化，php/fastcgi 这条路径此前漏了。
+/// HEAD 例外：`Content-Length` 描述的是对应 GET 的体大小、body 本就不上线，保留原值。
+pub fn sanitize_response_headers(
+    mut headers: HeaderMap,
+    body_len: usize,
+    is_head: bool,
+) -> HeaderMap {
+    let conn_tokens: Vec<String> = headers
+        .get(header::CONNECTION)
+        .and_then(|v| v.to_str().ok())
+        .map(|v| {
+            v.split(',')
+                .map(|s| s.trim().to_ascii_lowercase())
+                .collect()
+        })
+        .unwrap_or_default();
+    let names: Vec<HeaderName> = headers.keys().cloned().collect();
+    for name in names {
+        let l = name.as_str();
+        if is_hop_by_hop(l) || conn_tokens.iter().any(|t| t == l) {
+            headers.remove(&name);
+            continue;
+        }
+        if l == "content-length" {
+            let declared = headers
+                .get(&name)
+                .and_then(|v| v.to_str().ok())
+                .and_then(|s| s.trim().parse::<usize>().ok());
+            if !is_head && declared != Some(body_len) {
+                log::debug!(
+                    "fastcgi: 丢弃上游 Content-Length（声明 {:?}，实际 {body_len} 字节）",
+                    declared
+                );
+                headers.remove(&name);
+            }
+        }
+    }
+    headers
+}
+
+/// 头/体分隔：取 `\r\n\r\n` 与 `\n\n` 两个候选中**较早**的那个。
+///
+/// 旧实现先用 `windows(4)` 在**整个**响应里找 `\r\n\r\n`，只在找不到时才退回 `\n\n`。
+/// 上游用 LF 分隔头部（非 php-fpm 的 FastCGI 应用、Python/Perl 实现很常见）而 body 里
+/// 恰好含 `\r\n\r\n` 时，分隔点会落在 body 中：真头部 + body 前段被当成头块，body 前段
+/// 里形如 `Name: value` 的行会被 `parse_cgi_response` 当响应头发出（**body 内容注入头**），
+/// 且 body 被截去一段。取较小位置即「第一个出现的分隔符」。
 fn find_header_sep(raw: &[u8]) -> Option<usize> {
-    raw.windows(4)
-        .position(|w| w == b"\r\n\r\n")
-        .or_else(|| raw.windows(2).position(|w| w == b"\n\n"))
+    let crlf = raw.windows(4).position(|w| w == b"\r\n\r\n");
+    let lf = raw.windows(2).position(|w| w == b"\n\n");
+    match (crlf, lf) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (Some(a), None) => Some(a),
+        (None, Some(b)) => Some(b),
+        (None, None) => None,
+    }
 }
 
 /// Health-check：尝试连接 socket。
+///
+/// **必须带超时**：这条在 `php::ensure_runtime` 的**每个请求**快路径上。UDS `connect`
+/// 在 listen backlog 打满时会阻塞等待（fpm conf `listen.backlog=4096`，pm.static=16；
+/// 大量慢请求占满 worker 后队列可满），TCP 黑洞地址则要等内核超时（约 2 分钟）——
+/// 结果是每个请求在发 FastCGI 之前就可能无限期挂住一条连接/任务（fastcgi.rs 的
+/// `exchange` 有 60s 总超时，但 probe 不在其内）。2s 足够本地 fpm/sidecar 应答。
 pub async fn probe(addr: &FcgiAddr) -> bool {
-    match addr {
-        #[cfg(unix)]
-        FcgiAddr::Unix(path) => UnixStream::connect(path).await.is_ok(),
-        FcgiAddr::Tcp(a) => TcpStream::connect(a).await.is_ok(),
-    }
+    const PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+    let fut = async {
+        match addr {
+            #[cfg(unix)]
+            FcgiAddr::Unix(path) => UnixStream::connect(path).await.is_ok(),
+            FcgiAddr::Tcp(a) => TcpStream::connect(a).await.is_ok(),
+        }
+    };
+    tokio::time::timeout(PROBE_TIMEOUT, fut).await.unwrap_or(false)
 }
 
 pub fn script_under_docroot(docroot: &Path, uri_path: &str) -> anyhow::Result<std::path::PathBuf> {
     let rel = uri_path.trim_start_matches('/');
     // 防穿越：script 必须留在 docroot 下（旧实现裸 join，可 /php/../../ 执行 docroot 外脚本）。
     crate::server::admin_files::script_rel(docroot, rel)
+}
+
+#[cfg(test)]
+mod sanitize_tests {
+    use super::*;
+
+    fn hv(s: &str) -> HeaderValue {
+        HeaderValue::from_str(s).unwrap()
+    }
+
+    /// 与真实 body 不符的 `Content-Length` 必须被丢弃（否则响应走私/连接失步）；
+    /// 相符的保留；HEAD 下原样保留（描述的是对应 GET 的体）。
+    #[test]
+    fn drops_mismatched_content_length() {
+        let mut h = HeaderMap::new();
+        h.insert(header::CONTENT_LENGTH, hv("5"));
+        h.insert(header::CONTENT_TYPE, hv("text/html"));
+        let out = sanitize_response_headers(h, 10, false);
+        assert!(out.get(header::CONTENT_LENGTH).is_none(), "不符的 CL 必须丢弃");
+        assert_eq!(out.get(header::CONTENT_TYPE).unwrap(), "text/html");
+
+        let mut h2 = HeaderMap::new();
+        h2.insert(header::CONTENT_LENGTH, hv("10"));
+        let out2 = sanitize_response_headers(h2, 10, false);
+        assert_eq!(out2.get(header::CONTENT_LENGTH).unwrap(), "10", "相符的 CL 保留");
+
+        let mut h3 = HeaderMap::new();
+        h3.insert(header::CONTENT_LENGTH, hv("5"));
+        let out3 = sanitize_response_headers(h3, 0, true);
+        assert_eq!(out3.get(header::CONTENT_LENGTH).unwrap(), "5", "HEAD 保留 CL");
+    }
+
+    /// 逐跳头 + `Connection:` 点名的头必须被剥除（否则上游可污染下游定界/连接语义）。
+    #[test]
+    fn drops_hop_by_hop_and_connection_tokens() {
+        let mut h = HeaderMap::new();
+        h.insert(header::TRANSFER_ENCODING, hv("chunked"));
+        h.insert(header::CONNECTION, hv("x-secret, close"));
+        h.insert(HeaderName::from_static("x-secret"), hv("1"));
+        h.insert(HeaderName::from_static("x-keep"), hv("ok"));
+        let out = sanitize_response_headers(h, 3, false);
+        assert!(out.get(header::TRANSFER_ENCODING).is_none());
+        assert!(out.get(header::CONNECTION).is_none());
+        assert!(out.get("x-secret").is_none(), "Connection 点名的头也要剥");
+        assert_eq!(out.get("x-keep").unwrap(), "ok");
+    }
+
+    /// 分隔符必须取**第一个出现**的（min），而不是优先 CRLFCRLF：
+    /// LF 头的上游 + body 含 `\r\n\r\n` 时，旧实现把分隔点落进 body，body 前段被当响应头。
+    #[test]
+    fn header_sep_takes_first_of_crlf_or_lf() {
+        // LF 头块，body 里含 CRLFCRLF：必须切在真正的头体分隔处。
+        let raw = b"Status: 200 OK\nContent-Type: text/html\n\nuser: injected\r\n\r\nBODY";
+        let i = find_header_sep(raw).expect("sep");
+        let head = std::str::from_utf8(&raw[..i]).unwrap();
+        assert!(!head.contains("injected"), "body 不得混进头块: {head:?}");
+        // CRLF 头块，body 里含 LFLF：必须切在真分隔处（即首个 CRLFCRLF）。
+        let raw2 = b"Status: 200 OK\r\nContent-Type: text/html\r\n\r\nA\n\nB";
+        let expect = raw2.windows(4).position(|w| w == b"\r\n\r\n").unwrap();
+        assert_eq!(find_header_sep(raw2), Some(expect));
+        // 纯 CRLF 分隔
+        assert_eq!(find_header_sep(b"a: b\r\n\r\nx"), Some(4));
+        // 纯 LF 分隔
+        assert_eq!(find_header_sep(b"a: b\n\nx"), Some(4));
+    }
 }

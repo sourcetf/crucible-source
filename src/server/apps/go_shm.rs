@@ -113,40 +113,69 @@ pub async fn execute(
         }
     };
 
-    // P2-11：ensure（spawn 子进程 + 5s 等待）与整个 slot IPC（acquire_slot 50µs 忙等 +
-    // notify 阻塞 UnixStream）全部放 spawn_blocking——不再阻塞 tokio worker。
-    let key_for_ensure = key.clone();
-    tokio::task::spawn_blocking(move || ensure_runtime(&key_for_ensure))
-        .await
-        .map_err(|e| anyhow::anyhow!("go shm ensure join: {e}"))??;
-
-    // P2-11：锁在阻塞闭包内取——只按 app-key 分锁（不同 Go 应用互不阻塞），
-    // 且 RUNTIMES 全表锁不再横跨一次 IPC 往返。
-    let key_for_exec = key.clone();
-    let port = lc.port;
-    let (status, resp_body) = tokio::task::spawn_blocking(
-        move || -> Result<(u16, Bytes)> {
-            let slot_lock = {
-                let mut locks = RT_LOCKS.lock();
-                locks
-                    .entry(key_for_exec.clone())
-                    .or_insert_with(|| Arc::new(Mutex::new(())))
-                    .clone()
-            };
-            let _slot_guard = slot_lock.lock();
-            let mut map = RUNTIMES.lock();
-            let rt = map.get_mut(&key_for_exec).context("go shm runtime")?;
-            exec_slot(rt, &method, &path, &body, peer, port)
-        },
-    )
-    .await
-    .map_err(|e| anyhow::anyhow!("go shm exec join: {e}"))??;
-
+    let (status, resp_body) = execute_common(key, method, path, body, peer, lc.port).await?;
     Ok(Response::builder()
         .status(StatusCode::from_u16(status).unwrap_or(StatusCode::OK))
         .header(http::header::CONTENT_TYPE, "text/plain; charset=utf-8")
         .body(full(resp_body))
         .unwrap())
+}
+
+/// h2/h3 字节入口：请求体已在协议层收齐为 `Bytes`。与 h1 [`execute`] 共用
+/// [`execute_common`]（同一 `ensure_runtime` + `exec_slot` + 锁语义）—— 此前 h2/h3 的
+/// `/go/` 只走 `sidecar_engine`，在 OpenBSD 生产路径（go-shm IPC、无 libapp_go.so）上
+/// **恒 502**，而 h1 正常，同一 URL 两个协议不一致。
+pub async fn execute_simple(
+    req: &Request<Bytes>,
+    lc: &ListenerConfig,
+    _app: &AppRouteConfig,
+    app_idx: usize,
+    peer: SocketAddr,
+) -> Result<Response<Bytes>> {
+    let key = format!("{}-{}-go", lc.port, app_idx);
+    let method = req.method().as_str().to_string();
+    let path = req.uri().path().to_string();
+    let body = req.body().clone();
+    let (status, resp_body) = execute_common(key, method, path, body, peer, lc.port).await?;
+    Ok(Response::builder()
+        .status(StatusCode::from_u16(status).unwrap_or(StatusCode::OK))
+        .header(http::header::CONTENT_TYPE, "text/plain; charset=utf-8")
+        .body(resp_body)
+        .unwrap())
+}
+
+/// 两种入口共用的执行核心：ensure（spawn + 就绪等待）与 slot IPC 都放 spawn_blocking，
+/// 不阻塞 tokio worker；`RUNTIMES` 全表锁只在按 app-key 的槽锁内、且不横跨 IPC 往返。
+async fn execute_common(
+    key: String,
+    method: String,
+    path: String,
+    body: Bytes,
+    peer: SocketAddr,
+    port: u16,
+) -> Result<(u16, Bytes)> {
+    // P2-11：ensure（spawn 子进程 + 5s 等待）放 spawn_blocking。
+    let key_for_ensure = key.clone();
+    tokio::task::spawn_blocking(move || ensure_runtime(&key_for_ensure))
+        .await
+        .map_err(|e| anyhow::anyhow!("go shm ensure join: {e}"))??;
+
+    let key_for_exec = key;
+    tokio::task::spawn_blocking(move || -> Result<(u16, Bytes)> {
+        let slot_lock = {
+            let mut locks = RT_LOCKS.lock();
+            locks
+                .entry(key_for_exec.clone())
+                .or_insert_with(|| Arc::new(Mutex::new(())))
+                .clone()
+        };
+        let _slot_guard = slot_lock.lock();
+        let mut map = RUNTIMES.lock();
+        let rt = map.get_mut(&key_for_exec).context("go shm runtime")?;
+        exec_slot(rt, &method, &path, &body, peer, port)
+    })
+    .await
+    .map_err(|e| anyhow::anyhow!("go shm exec join: {e}"))?
 }
 
 fn exec_slot(
@@ -256,24 +285,46 @@ fn ensure_runtime(key: &str) -> Result<()> {
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::from(log_file));
-    let child = crate::server::apps::child_registry::spawn_tracked(
+    let mut child = crate::server::apps::child_registry::spawn_tracked(
         &mut cmd,
         &format!("go-shm-server {key}"),
     )
     .with_context(|| format!("spawn {}", bin.display()))?;
 
     let start = std::time::Instant::now();
+    let mut ready = false;
     while start.elapsed() < Duration::from_secs(5) {
-        if notify_path.exists() {
-            if UnixStream::connect(&notify_path).is_ok() {
-                break;
-            }
+        if notify_path.exists() && UnixStream::connect(&notify_path).is_ok() {
+            ready = true;
+            break;
         }
         std::thread::sleep(Duration::from_millis(40));
     }
+    // 就绪超时必须收拾刚拉起的子进程（`Child` 被 drop 不会终止进程），并且**不能**把
+    // 一个永不就绪的 runtime 插进表：此前这里照样 mmap + insert + 返回 Ok —— 于是这个
+    // 坏 runtime 被永久缓存，之后每个请求都撞上它，而它既不会被健康检查也不会被重启。
+    if !ready {
+        crate::server::apps::child_registry::kill_child(&mut child);
+        bail!(
+            "go-shm-server 未在 5s 内就绪（notify socket {} 不可用）；已杀掉刚拉起的子进程",
+            notify_path.display()
+        );
+    }
 
-    let file = OpenOptions::new().read(true).write(true).open(&shm_path)?;
-    let mmap = unsafe { memmap2::MmapMut::map_mut(&file)? };
+    let file = match OpenOptions::new().read(true).write(true).open(&shm_path) {
+        Ok(f) => f,
+        Err(e) => {
+            crate::server::apps::child_registry::kill_child(&mut child);
+            return Err(anyhow::anyhow!("open go shm file {}: {e}", shm_path.display()));
+        }
+    };
+    let mmap = match unsafe { memmap2::MmapMut::map_mut(&file) } {
+        Ok(m) => m,
+        Err(e) => {
+            crate::server::apps::child_registry::kill_child(&mut child);
+            return Err(anyhow::anyhow!("mmap go shm file {}: {e}", shm_path.display()));
+        }
+    };
     RUNTIMES.lock().insert(
         key.to_string(),
         Runtime {

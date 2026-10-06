@@ -147,10 +147,120 @@ fn parse_version(s: &str) -> Result<Option<SslVersion>> {
     }
 }
 
+/// 把一份 PEM 拆成 (叶证书, 中间链)。
+///
+/// 用 `X509::stack_from_pem` 而不是 `X509::from_pem`：后者**只解析第一张**，
+/// 而 `ssl.cert` 的典型形态就是 `fullchain.pem`（ACME/certbot 产物，叶+中间 CA）。
+/// 旧实现把整份 fullchain 丢给 `from_pem`、从不调用任何 `*_chain_cert` API ⇒
+/// 服务端**只发叶证书**。实测（本地 127.0.0.1:21443，三级链 leaf←int←root）：
+/// `openssl s_client -showcerts` 只拿到 1 张证书，客户端若未预置中间 CA 则链校验失败
+/// （`verify error: unable to get local issuer certificate`）。
+fn split_chain(pem: &[u8]) -> Result<(X509, Vec<X509>)> {
+    let mut certs = X509::stack_from_pem(pem)?;
+    if certs.is_empty() {
+        anyhow::bail!("证书 PEM 里没有任何 CERTIFICATE 块");
+    }
+    let leaf = certs.remove(0);
+    Ok((leaf, certs))
+}
+
+/// 把中间链追加到（刚设置的）容器证书上。`add_extra_chain_cert` = `SSL_CTX_add0_chain_cert`
+/// ⇒ 给 legacy credential 追加**非叶**证书（叶由 `set_certificate` 放链首）。
+fn attach_intermediates(builder: &mut SslAcceptorBuilder, chain: &[X509]) -> Result<()> {
+    for c in chain {
+        builder
+            .add_extra_chain_cert(c.clone())
+            .context("添加中间证书链失败（链过长或证书非法）")?;
+    }
+    Ok(())
+}
+
+/// 用**多 credential**（`SSL_CREDENTIAL_new_x509` + `SSL_CTX_add1_credential`）装配一张
+/// 证书，让 BoringSSL 按客户端 `signature_algorithms` 自动在 RSA / ECDSA 之间选。
+///
+/// 为什么必须这样：本 BoringSSL 的 `SSL_CTX_use_certificate` 只配置**单个**「legacy
+/// credential」，同一层里再 set 一次是**覆盖**（不是按类型各存一张）。所以旧实现
+/// 「先 set cert/key 再 set cert_ec/key_ec」的最终容器里**只剩 EC 那张**：
+/// 实测（本地 21444）`cert=rsa.pem, cert_ec=ec.pem` 时，只用 RSA sigalgs 的客户端
+/// 握手直接 `handshake failure (alert 40)` —— 配了 ECC 副证书反而**弄丢 RSA 主证书**。
+///
+/// `SSL_CREDENTIAL_set1_cert_chain` 接收 CRYPTO_BUFFER 数组、`set1_private_key` 接收
+/// `EVP_PKEY*`；boring 高层 API 未导出 credential 结构，故这条路径直接用 `boring_sys`
+/// （crate 已依赖）。传入的都是**已有对象的 DER/`*mut`**：key 指针由调用方从
+/// `PKey` 取（本项目 `libs/quinn-boring` 的 `bffi_ext.rs` 里同一个 crate 有现成写法）。
+/// 所有 CRYPTO_BUFFER 都是新建的，`set1_cert_chain` 内部会 `UpRef`，装配完由 guard 释放。
+#[cfg(feature = "tls_boring")]
+fn add_x509_credential_der(
+    builder: &mut SslAcceptorBuilder,
+    cert_der: &[u8],
+    intermediates_der: &[Vec<u8>],
+    key_ptr: *mut boring_sys::EVP_PKEY,
+) -> Result<()> {
+    use boring_sys as bsys;
+
+    unsafe {
+        let cred = bsys::SSL_CREDENTIAL_new_x509();
+        if cred.is_null() {
+            anyhow::bail!("SSL_CREDENTIAL_new_x509 失败");
+        }
+        /// RAII：中途任何一步失败都不泄漏。
+        struct CredGuard(*mut bsys::SSL_CREDENTIAL);
+        impl Drop for CredGuard {
+            fn drop(&mut self) {
+                if !self.0.is_null() {
+                    unsafe { bsys::SSL_CREDENTIAL_free(self.0) };
+                }
+            }
+        }
+        struct BufGuard(Vec<*mut bsys::CRYPTO_BUFFER>);
+        impl Drop for BufGuard {
+            fn drop(&mut self) {
+                for b in &self.0 {
+                    if !b.is_null() {
+                        unsafe { bsys::CRYPTO_BUFFER_free(*b) };
+                    }
+                }
+            }
+        }
+        let cred_guard = CredGuard(cred);
+
+        let mut ders: Vec<&[u8]> = Vec::with_capacity(1 + intermediates_der.len());
+        ders.push(cert_der);
+        for c in intermediates_der {
+            ders.push(c.as_slice());
+        }
+        let mut bufs: Vec<*mut bsys::CRYPTO_BUFFER> = Vec::with_capacity(ders.len());
+        for d in &ders {
+            let b = bsys::CRYPTO_BUFFER_new(d.as_ptr(), d.len(), std::ptr::null_mut());
+            if b.is_null() {
+                anyhow::bail!("CRYPTO_BUFFER_new 失败");
+            }
+            bufs.push(b);
+        }
+        let bufs_guard = BufGuard(bufs);
+        let buf_ptrs: Vec<*mut bsys::CRYPTO_BUFFER> = bufs_guard.0.clone();
+
+        if bsys::SSL_CREDENTIAL_set1_cert_chain(cred_guard.0, buf_ptrs.as_ptr(), buf_ptrs.len())
+            != 1
+        {
+            anyhow::bail!("SSL_CREDENTIAL_set1_cert_chain 失败");
+        }
+        if bsys::SSL_CREDENTIAL_set1_private_key(cred_guard.0, key_ptr) != 1 {
+            anyhow::bail!("SSL_CREDENTIAL_set1_private_key 失败（证书与私钥不匹配？）");
+        }
+        if bsys::SSL_CTX_add1_credential(builder.as_ptr(), cred_guard.0) != 1 {
+            anyhow::bail!("SSL_CTX_add1_credential 失败");
+        }
+        drop(bufs_guard);
+        drop(cred_guard);
+    }
+    Ok(())
+}
+
 fn load_identity(builder: &mut SslAcceptorBuilder, ssl: &SslConfig, ocsp: &OcspPlan) -> Result<()> {
     let cert_pem = ssl_material::load_bytes(ssl.cert.as_deref().context("ssl.cert")?)?;
     let key_pem = ssl_material::load_bytes(ssl.key.as_deref().context("ssl.key")?)?;
-    let cert = X509::from_pem(&cert_pem)?;
+    let (cert, real_chain) = split_chain(&cert_pem)?;
     let key = PKey::private_key_from_pem(&key_pem)?;
 
     // ⚠️ 本 BoringSSL 只有**一个** legacy credential 槽：
@@ -176,13 +286,13 @@ fn load_identity(builder: &mut SslAcceptorBuilder, ssl: &SslConfig, ocsp: &OcspP
 
     // ECH 外层（cover）证书：容器默认证书设为 cover —— **不带 ECH 的客户端**（以及
     // ECH 被拒后回退的客户端）按 `ech_public_name` 校验证书，走的就是这一张。
-    let cover = match (&ssl.ech_cover_cert, &ssl.ech_cover_key) {
+    let (cover, cover_chain) = match (&ssl.ech_cover_cert, &ssl.ech_cover_key) {
         (Some(c), Some(k)) => {
-            let cc = X509::from_pem(&ssl_material::load_bytes(c)?)?;
+            let (cc, chain) = split_chain(&ssl_material::load_bytes(c)?)?;
             let ck = PKey::private_key_from_pem(&ssl_material::load_bytes(k)?)?;
-            Some((cc, ck))
+            (Some((cc, ck)), chain)
         }
-        _ => None,
+        _ => (None, Vec::new()),
     };
 
     // 外层 cover 的**备用 EC 证书**。见上：本 BoringSSL 单 credential 槽，同层后设置的生效；
@@ -272,24 +382,63 @@ public_name 校验证书，必然失败"
             builder.set_certificate(cc)?;
             builder.set_private_key(ck)?;
             builder.check_private_key()?;
+            // 外层 cover 自己的中间链（容器上生效的就是这一层）。
+            attach_intermediates(builder, &cover_chain)?;
         }
         None => {
             builder.set_certificate(&cert)?;
             builder.set_private_key(&key)?;
             builder.check_private_key()?;
+            // 中间链（`ssl.cert` 是 fullchain.pem 时就在同一个文件里）。
+            // **必须在 set_certificate 之后**：`add_extra_chain_cert` 追加的是
+            // legacy credential 的**中间**证书（叶由 set_certificate 放在链首）。
+            attach_intermediates(builder, &real_chain)?;
         }
     }
     // 容器上的证书（非 ECH 路径生效的那张）：配了 cover 时是**外层**，否则是内层。
-    // 单 credential 槽 ⇒ 同层「后设置者生效」，所以这里放的必须是外层那一组
-    // （把内层的 EC 放进来就是 §21.34 的内层泄漏）。
-    let container_ec = if cover.is_some() {
-        cover_ec.as_ref().or(ec_pair.as_ref())
-    } else {
-        ec_pair.as_ref()
-    };
-    if let Some((ec_x509, ec_pkey)) = container_ec {
-        // 同一层再 set 一次 = 覆盖（本 BoringSSL 单 credential 槽；`add_extra_chain_cert`
-        // 只是追加中间证书、不会成为叶证书，别用它）。
+    //
+    // **非 ECH 的双证（RSA + ECDSA）**：不能再「同层再 set 一次」——那是覆盖，
+    // 结果是容器里只剩最后一张（EC），只提供 RSA sigalgs 的客户端直接
+    // `handshake failure`（实测本地 21444）。这里改为把 EC 作为**第二个 credential**
+    // 追加进列表（`SSL_CTX_add1_credential`），BoringSSL 按客户端 sigalgs 自动选：
+    //   * 列表顺序 = 优先级 ⇒ EC 在前（现代客户端默认拿 ECDSA）；
+    //   * legacy credential（RSA + 中间链 + OCSP staple）永远在列表**末尾**兜底，
+    //     所以「只支持 RSA 的客户端」「只支持 ECDSA 的客户端」都能成功。
+    //
+    // 为什么配了 cover 时**不**走这条路：ECH 的证书切换发生在 servername 回调里，
+    // 而回调只能改 legacy credential（`ssl.set_certificate`）；显式 credential 列表
+    // 在 `SSL_CTX_add1_credential` 之后即冻结（文档明言不得再改），ECH 接受时无法
+    // 把 cover 的 EC credential 换成真实那份 ⇒ 会向非 ECH 客户端泄漏内层 EC 证书
+    // （比现状更糟）。cover 场景维持原行为并把限制留在日志/报告里。
+    if cover.is_none() {
+        if let Some((ec_x509, ec_pkey)) = ec_pair.as_ref() {
+            // 取 EC 私钥的 `EVP_PKEY*`：**先把容器换成 EC**（证书+私钥必须同类型，
+            // 否则 `SSL_CREDENTIAL_set1_private_key` 会以 `KEY_TYPE_MISMATCH` 拒绝），
+            // 取回指针、注册成独立 credential，再换回主（RSA）证书。
+            // 这样不必新增依赖（`PKey` 的 `as_ptr` 来自 `foreign_types`，本 crate
+            // 没有直接依赖它），也不必手写 PEM/DER 解析。
+            //
+            // 指针生命周期：`set1_private_key` 内部 `UpRef`，所以第 4 步把容器换回
+            // 主证书（legacy 槽上类型不匹配的 EC 私钥被静默丢弃）之后指针仍有效。
+            builder.set_certificate(ec_x509)?;
+            builder.set_private_key(ec_pkey)?;
+            let key_ptr = unsafe { boring_sys::SSL_CTX_get0_privatekey(builder.as_ptr()) };
+            if key_ptr.is_null() {
+                anyhow::bail!("SSL_CTX_get0_privatekey 取 EC 私钥指针失败");
+            }
+            let ec_der = ec_x509.to_der()?;
+            add_x509_credential_der(builder, &ec_der, &[], key_ptr).with_context(|| {
+                "把 ssl.cert_ec 注册为独立 credential 失败（RSA 主证书仍可用）"
+            })?;
+            // 换回主证书 + 主密钥 + 主链。
+            builder.set_certificate(&cert)?;
+            builder.set_private_key(&key)?;
+            builder.check_private_key()?;
+            attach_intermediates(builder, &real_chain)?;
+            return Ok(());
+        }
+    } else if let Some((ec_x509, ec_pkey)) = cover_ec.as_ref().or(ec_pair.as_ref()) {
+        // ECH 路径：维持「单 credential 槽、后设置者生效」的历史行为。
         builder.set_certificate(ec_x509)?;
         builder.set_private_key(ec_pkey)?;
         builder.check_private_key()?;
@@ -570,17 +719,38 @@ fn apply_groups(builder: &mut SslAcceptorBuilder, ssl: &SslConfig) -> Result<()>
     };
     // 一个拼错的组名会让 `set_curves_list` 报错 ⇒ build_acceptor 失败 ⇒ 该监听口
     // **每条**连接都在构建 acceptor 处 soft-fail（热重载/面板保存不跑校验，只有
-    // `--check-config` 能提前拦）。boring 的 ErrorStack 不指名是哪个条目，所以这里
-    // 把配置原样带进错误文本，让运维在日志里直接看到可疑名字。**不做白名单拒绝**：
-    // BoringSSL 的组名集合很大（别名多），硬编码白名单会误拒合法名字。
+    // `--check-config` 能提前拦，tls-core P3）。
+    //
+    // 这里改为**逐名探测**：对每个名字单独调一次 `set_curves_list`（同名会整体失败、
+    // boring 的 ErrorStack 又不指名是哪个），把坏的剔除并指名列报，最后用过滤后的列表
+    // 定稿。这样拼错一个名字只降级为「该组被忽略」，而不是把整个监听口配死。
+    // 不做硬编码白名单（BoringSSL 组名别名多，白名单会误拒合法名字）。
+    let mut kept: Vec<String> = Vec::new();
+    let mut bad: Vec<String> = Vec::new();
+    for name in list.split(':').filter(|s| !s.is_empty()) {
+        match builder.set_curves_list(name) {
+            Ok(()) => kept.push(name.to_string()),
+            Err(_) => bad.push(name.to_string()),
+        }
+    }
+    if !bad.is_empty() {
+        crate::server::log_throttle::warn_every(
+            "tls-groups-invalid",
+            std::time::Duration::from_secs(60),
+            &format!(
+                "ssl.groups 含 BoringSSL 不认识的组名 {:?}（已剔除，否则整个监听口构建不出 acceptor、\
+所有连接被丢弃）；实际启用 {:?}。常用组名如 X25519MLKEM768/X25519/P-256/P-384",
+                bad, kept
+            ),
+        );
+    }
+    if kept.is_empty() {
+        // 全被剔除：不能调 `set_curves_list("")`（会报错把口配死），保持库内默认。
+        return Ok(());
+    }
     builder
-        .set_curves_list(&list)
-        .with_context(|| {
-            format!(
-                "ssl.groups 设置失败：{list:?} 含 BoringSSL 不认识的组名（一个错误组名会让整个监听口\
-无法构建 acceptor、所有连接被丢弃）；常用组名如 X25519MLKEM768/X25519/P-256/P-384"
-            )
-        })?;
+        .set_curves_list(&kept.join(":"))
+        .context("ssl.groups 定稿失败（逐名已过滤，理论上不应发生）")?;
     Ok(())
 }
 
@@ -611,6 +781,19 @@ fn apply_ech(builder: &mut SslAcceptorBuilder, ssl: &SslConfig) -> Result<()> {
             Ok(pem) => {
                 if let Err(e) = apply_ech_keys(builder, &pem) {
                     log::warn!("ECH keys invalid ({keys_path}): {e:#}; continuing without ECH");
+                } else {
+                    // 显式 ech_keys 场景：把这份 PEM 里的 ECHConfig 派生出的 ECHConfigList
+                    // 落盘到 DNS/面板读取的固定路径，保证「发布的 = 服务端实际在用的」。
+                    // 旧实现只把 PEM 装进 BoringSSL，DNS 读固定路径 → 发布缺失或另一把钥匙
+                    // 的配置（tls-core P2）。
+                    match crate::server::tls::ech_pem::first_config(&pem) {
+                        Some(cfg) => {
+                            crate::server::ech_auto::ensure_config_list_file(&cfg);
+                        }
+                        None => log::warn!(
+                            "ECH: ech_keys={keys_path} 解析不出 ECH CONFIG 块，DNS 无法发布对应配置"
+                        ),
+                    }
                 }
             }
             Err(e) => {
@@ -743,13 +926,38 @@ fn ocsp_auto_slot(host: &str, cert_path: &str) -> Option<StapleSource> {
         .map(StapleSource::Auto)
 }
 
+/// OCSP 自动获取用的站点身份。
+///
+/// 优先配置的 `sni_name` / `ech_public_name`；两者都缺时回退叶子证书的**第一个 DNS SAN**
+/// —— 站点身份本可从证书推导，而缓存键另有证书指纹隔离，host 只是文件名/日志标签。
+/// 旧实现只认配置字段，于是「只配了 cert/key 的最典型 listener」永远静默跳过自动 OCSP
+/// （tls-core P2）。都没有才返回 None。
+fn ocsp_identity(ssl: &SslConfig) -> Option<String> {
+    if let Some(h) = ssl.ocsp_host() {
+        return Some(h);
+    }
+    let cert_pem = ssl_material::load_bytes(ssl.cert.as_deref()?).ok()?;
+    let leaf = X509::from_pem(&cert_pem).ok()?;
+    if let Some(sans) = leaf.subject_alt_names() {
+        for gn in sans.iter() {
+            if let Some(dns) = gn.dnsname() {
+                let d = dns.trim();
+                if !d.is_empty() {
+                    return Some(d.to_string());
+                }
+            }
+        }
+    }
+    None
+}
+
 /// 为真实证书与 cover 证书各规划一份 staple（见 [`OcspPlan`] 的说明）。
 fn plan_ocsp(ssl: &SslConfig) -> OcspPlan {
-    // 真实证书：显式路径优先，否则自动获取（沿用既有语义：host 取 ssl.ocsp_host()）。
+    // 真实证书：显式路径优先，否则自动获取（身份取 ocsp_identity，含 SAN 回退）。
     let real = if let Some(p) = ssl.ocsp_der_path.as_deref() {
         ocsp_static_from(p)
     } else {
-        match (ssl.cert.as_deref(), ssl.ocsp_host()) {
+        match (ssl.cert.as_deref(), ocsp_identity(ssl)) {
             (Some(c), Some(h)) => ocsp_auto_slot(&h, c),
             _ => None,
         }
@@ -826,9 +1034,18 @@ fn apply_ocsp_static(builder: &mut SslAcceptorBuilder, path: &str) -> Result<()>
 }
 
 /// 自动获取路径（早期规格 1b）：`ocsp_der_path` 未配置时启用。
-/// 叶子无 AIA / 链不完整 → 静默保持无装订（与静态路径缺文件同语义）。
+/// 叶子无 AIA / 链不完整 → 保持无装订，但**留日志**说明原因（旧实现全程静默，
+/// 运维无法判断「为什么没装订」，tls-core P2）。
 fn apply_ocsp_auto(builder: &mut SslAcceptorBuilder, ssl: &SslConfig) -> Result<()> {
-    let (Some(cert_path), Some(host)) = (ssl.cert.as_deref(), ssl.ocsp_host()) else {
+    let Some(cert_path) = ssl.cert.as_deref() else {
+        log::info!("ocsp auto: 未配置 ssl.cert，跳过自动装订");
+        return Ok(());
+    };
+    let Some(host) = ocsp_identity(ssl) else {
+        log::info!(
+            "ocsp auto: 未配置 ssl.sni_name / ssl.ech_public_name 且叶子证书无 DNS SAN，\
+无法确定稳定身份 ⇒ 跳过自动装订（配任一即可启用，或显式设置 ssl.ocsp_der_path）"
+        );
         return Ok(());
     };
     let cert_pem = match ssl_material::load_bytes(cert_path) {
@@ -936,6 +1153,14 @@ fn apply_psk(builder: &mut SslAcceptorBuilder, ssl: &SslConfig) -> Result<()> {
     if !ssl.psk {
         return Ok(());
     }
+    // BoringSSL 的 `SSL_CTX_set_psk_server_callback` **只**在 TLS 1.2 协商时被调用
+    // （boringssl ssl.h：「called when TLS 1.2 PSK is negotiated on the server」），
+    // 本库没有 TLS1.3 外部 PSK 的服务端 API。因此 psk=true 对 TLS1.3 连接**不生效**：
+    // 如实告警，避免「配了 PSK 却在 1.3 上静默无用」（tls-core 移交的运行时验证项）。
+    log::warn!(
+        "ssl.psk=true：BoringSSL 的 PSK 服务端回调仅在 TLS1.2 协商时生效（本库不支持 TLS1.3 \
+外部 PSK）；TLS1.3 客户端将走证书而非 PSK。要强制 PSK 请把 ssl.versions 钉到 TLSv1.2"
+    );
     // 拒绝确定性占位 PSK（audit High）——材料必须真实配置。
     let secret: Vec<u8> = if let Some(k) = ssl.psk_key.as_deref() {
         psk_material(k)?
@@ -1201,8 +1426,17 @@ async fn dispatch_alpn(
         crate::server::qmux::serve_h1(tls, live, lc, peer).await
     } else if alpn.as_deref() == Some(b"h2") && lc.allows_h2() {
         h2::serve_tls(tls, live, lc, peer).await
-    } else {
+    } else if lc.allows_h1() {
         h1::serve_tls(tls, live, lc, peer).await
+    } else {
+        // 规格 §16：「未启用版本不监听对应 ALPN」。旧实现这里**无条件**回落 h1，
+        // 于是 `http_versions=["h2"]` 的口上，客户端只给 http/1.1（或不发 ALPN）时
+        // 仍会被服务 HTTP/1.1 —— 未启用版本被实际监听。协商不出已启用协议即丢弃。
+        log::debug!(
+            "ALPN 未协商出已启用协议（http_versions 未含 h1，且客户端未选 h2/qmux），丢弃连接 peer={peer}"
+        );
+        drop(tls);
+        Ok(())
     }
 }
 

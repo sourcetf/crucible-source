@@ -205,10 +205,10 @@ static int resolve_aspx(const char *script, const char *docroot, const char *pat
     FILE *f;
 
     if (name) {
-        if (docroot && docroot[0])
-            snprintf(filepath, filepath_sz, "%s/%s", docroot, name);
-        else
-            snprintf(filepath, filepath_sz, "%s", name);
+        /* 宿主（app_ffi）传进来的 `script` 是**已解析好的脚本路径**（已含 docroot），
+         * 这里不能再 join docroot —— 否则变成 `docroot/docroot/x.aspx`，永远打不开，
+         * 只能靠后面那条 index 兜底掩盖（而兜底正是软 404 的来源）。直接用。 */
+        snprintf(filepath, filepath_sz, "%s", name);
         f = fopen(filepath, "rb");
         if (f) {
             fclose(f);
@@ -230,15 +230,9 @@ static int resolve_aspx(const char *script, const char *docroot, const char *pat
             return 0;
         }
     }
-    if (docroot && docroot[0])
-        snprintf(filepath, filepath_sz, "%s/index.aspx", docroot);
-    else
-        snprintf(filepath, filepath_sz, "index.aspx");
-    f = fopen(filepath, "rb");
-    if (f) {
-        fclose(f);
-        return 0;
-    }
+    /* 不再回落 `docroot/index.aspx`：那会让 `/aspnet/<不存在的>.aspx` 返回首页内容
+     * （软 404，URL 不变但内容是别的页面）。宿主侧对目录请求已把 script 解析成
+     * `index.aspx`（`app_ffi::rel_script_path`），所以这里不需要这条兜底。 */
     return -1;
 }
 
@@ -276,7 +270,7 @@ int appengine_execute(
     const char *headers,
     AppEngineResult *out)
 {
-    char filepath[1024];
+    char filepath[1024] = {0};
     char *raw = NULL;
     size_t raw_len = 0;
     char *rendered = NULL;
@@ -318,29 +312,17 @@ int appengine_execute(
         }
     }
 
-    /* Explicit smoke-friendly response when hostfxr absent / no aspx file. */
-    {
-        char msg[640];
-        int n = snprintf(
-            msg, sizeof(msg),
-            "hello from aspnet engine path=%s script=%s method=%s query=%s "
-            "hostfxr=%s mode=aspnet-smoke\n",
-            path ? path : "/", script && script[0] ? script : "index.aspx",
-            method ? method : "GET", query ? query : "",
-            g_hostfxr_ok ? "loaded" : "absent");
-        /* 截断时 n 是「本来要写多长」：先夹到 msg 的真实容量再当长度用
-         * （与 appengine_fill_hello 同一类 bug，审计时容易漏）。 */
-        if (n < 0)
-            n = 0;
-        if ((size_t)n >= sizeof(msg))
-            n = (int)sizeof(msg) - 1;
-        out->status = 200;
-        appengine_result_set_headers(out,
-                                     "Content-Type: text/plain; charset=utf-8\r\n"
-                                     "X-Crucible-Engine: aspnet-smoke\r\n"
-                                     "X-Crucible-AspNet-Mode: mini-fallback\r\n");
-        appengine_result_set_body(out, msg, n > 0 ? (size_t)n : 0);
-    }
+    /* 脚本不存在 → **404**。此前走「smoke-friendly」分支回 200，body 里还带
+     * `script=%s`（app_ffi 传来的 canonicalize 后的**服务器绝对路径**）—— 既是软 404
+     * （页面不存在却 200），又向客户端泄露绝对路径。统一为固定 404 文本，细节只进
+     * out->error（Rust 侧节流写日志）。 */
+    out->status = 404;
+    appengine_result_set_headers(out, "Content-Type: text/plain; charset=utf-8\r\n"
+                                      "X-Crucible-Engine: aspnet-mini\r\n"
+                                      "X-Crucible-AspNet-Mode: mini-aspx\r\n");
+    appengine_result_set_body(out, "aspnet: script not found\n", 25);
+    appengine_result_set_error(
+        out, filepath[0] ? filepath : (script && script[0] ? script : "index.aspx"));
     return 0;
 }
 

@@ -122,10 +122,28 @@ fn main() -> Result<()> {
     //   * 多核机器上做公平对比（两侧线程数对齐）或压测时需要显式调大；
     //   * 容器里 CPU 配额很小的时候可以调小。
     // 注意这不是热重载项（runtime 只在启动时建一次），改它要重启进程。
+    //
+    // **必须钳制上界**：`CRUCIBLE_WORKER_THREADS=100000` 这类值会让 tokio 在启动时逐个
+    // spawn worker 线程，直到撞上本 uid 的 `RLIMIT_NPROC`（本机 96073）。实测后果**不是**
+    // 干净报错：进程在把整个线程/进程表吃满的过程中，**同一用户的所有 fork 都返回 EAGAIN**
+    // ——连启动它的 shell、其它 agent 的构建都会一起失败（本轮真机复现，靠进程最终自行退出
+    // 才恢复）。这不是「配大了慢一点」，而是能拖垮整机。上限取 1024：远超任何真实部署/压测
+    // 需要（32 核机器用 2~256），又远低于会把线程表吃空的量级。超限时钳制并告警（不静默）。
+    const MAX_WORKER_THREADS: usize = 1024;
     let worker_threads = std::env::var("CRUCIBLE_WORKER_THREADS")
         .ok()
         .and_then(|v| v.trim().parse::<usize>().ok())
         .filter(|n| *n > 0)
+        .map(|n| {
+            if n > MAX_WORKER_THREADS {
+                log::warn!(
+                    "CRUCIBLE_WORKER_THREADS={n} 过大，已钳制到 {MAX_WORKER_THREADS}（过大会在启动期耗尽本用户的进程/线程表，导致整机 fork 失败）"
+                );
+                MAX_WORKER_THREADS
+            } else {
+                n
+            }
+        })
         .unwrap_or(2);
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(worker_threads)
@@ -136,9 +154,11 @@ fn main() -> Result<()> {
     let result = rt.block_on(async move {
         // DNS(bind9) 控制面：启用 [dns] 时 reconcile named、启动 DoT 监听与维护循环
         server::dns::startup(&live, &dns_cfg_path).await;
+        // 信号处理需要一份 LiveConfig（SIGHUP → 强制重载），而 `live` 会被 move 进 `run`。
+        let live_for_signal = Arc::clone(&live);
         tokio::select! {
             r = server::run(live) => r,
-            _ = shutdown_signal() => Ok(()),
+            _ = shutdown_signal(live_for_signal) => Ok(()),
         }
     });
     // 访问日志是**批量写**的（见 access_log 的说明）：退出前必须刷一次，
@@ -176,20 +196,40 @@ fn main() -> Result<()> {
     result
 }
 
-/// SIGTERM（scripts 重启用）或 Ctrl-C。
-async fn shutdown_signal() {
+/// SIGTERM（scripts 重启用）、Ctrl-C（SIGINT）触发优雅关闭；**SIGHUP 触发配置重载**。
+///
+/// SIGHUP 的语义此前是「未处理 ⇒ 默认动作 = 立即终止」，而且是**绕过整个收尾路径**的终止：
+/// `access_log::flush_now()`、`child_registry::kill_all()`、`tor_hs::stop_on_shutdown()` 都
+/// 不会跑 ⇒ 最后的访问日志丢失、php-fpm/sidecar 引擎子进程变孤儿、tor 仍挂着而服务已停。
+/// 而 SIGHUP 在运维语境里通常就是「重载配置」。这里把它接成 `LiveConfig::reload()`
+/// （与 mtime watcher 走同一条路径，含 DNS effective 失效、acceptor 缓存清空、
+/// apps reconcile、tor ensure），重载失败只告警、**不**杀进程（坏配置不该让服务下线）。
+async fn shutdown_signal(live: Arc<LiveConfig>) {
     #[cfg(unix)]
     {
         let mut term =
             tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
                 .expect("install SIGTERM handler");
-        tokio::select! {
-            _ = tokio::signal::ctrl_c() => {},
-            _ = term.recv() => {},
+        let mut hup =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())
+                .expect("install SIGHUP handler");
+        loop {
+            tokio::select! {
+                _ = tokio::signal::ctrl_c() => break,
+                _ = term.recv() => break,
+                _ = hup.recv() => {
+                    log::info!("SIGHUP：触发配置重载（与 mtime watcher 同一路径）");
+                    match live.reload() {
+                        Ok(()) => log::info!("SIGHUP：配置已重载"),
+                        Err(e) => log::warn!("SIGHUP：配置重载失败（服务继续用旧配置）: {e:#}"),
+                    }
+                }
+            }
         }
     }
     #[cfg(not(unix))]
     {
+        let _ = live;
         let _ = tokio::signal::ctrl_c().await;
     }
 }

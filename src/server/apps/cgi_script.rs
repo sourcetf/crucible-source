@@ -21,6 +21,23 @@ use tokio::task;
 /// 超限说明脚本失控，宁可回 502 也不能把内存交给它。
 const CGI_OUTPUT_CAP: usize = 32 * 1024 * 1024;
 
+/// 杀死**整个进程组**并回收直接子进程。
+///
+/// 为什么需要：两条早期错误路径（stdout 读错、输出超限）此前只 `child.kill()`（读错那条
+/// 甚至不 kill），既不 kill 进程组也不 `wait` —— 直接子进程留下**僵尸**（`Child` 被 drop
+/// 不回收），脚本起的孙进程（持有 stdout 管道）要等 30s 看门狗才死。`done` 置位后看门狗
+/// 不再重复动作。
+fn kill_and_reap(child: &mut std::process::Child, pgid: i32, done: &AtomicBool) {
+    #[cfg(unix)]
+    unsafe {
+        // 负 pid = 整组（含孙进程），与看门狗同一口径。
+        libc::kill(-pgid, libc::SIGKILL);
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+    done.store(true, Ordering::Relaxed);
+}
+
 /// Spawn `binary` with CGI/1.1 environment; parse Status/headers/body.
 pub async fn execute_binary(
     binary: &Path,
@@ -123,10 +140,13 @@ pub async fn execute_binary(
                     Ok(0) => break,
                     Ok(n) => n,
                     Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-                    Err(e) => return Err(e).context("cgi_script read stdout"),
+                    Err(e) => {
+                        kill_and_reap(&mut child, pgid, &done);
+                        return Err(e).context("cgi_script read stdout");
+                    }
                 };
                 if stdout.len() + n > CGI_OUTPUT_CAP {
-                    let _ = child.kill();
+                    kill_and_reap(&mut child, pgid, &done);
                     bail!("cgi_script 输出超过上限 {CGI_OUTPUT_CAP} 字节（疑似脚本失控）");
                 }
                 stdout.extend_from_slice(&buf[..n]);
@@ -205,6 +225,11 @@ fn parse_cgi_response(raw: Vec<u8>) -> Result<Response<BoxBody>> {
 
     let mut status = StatusCode::OK;
     let mut content_type = "text/plain; charset=utf-8".to_string();
+    // CGI 脚本可以设置任意响应头（Set-Cookie 最常见）。旧实现只透传 Status 与
+    // Content-Type，其余全丢 —— CGI 语义不完整（其它引擎都全量透传头块）。
+    // 头名/值用 `app_ffi::valid_header_kv` 做注入净化（token 名、可见 ASCII 值），
+    // Content-Type 按 RFC 单值语义后者胜出。
+    let mut extra: Vec<(String, String)> = Vec::new();
     for line in hdr_text.lines() {
         let line = line.trim_end_matches('\r');
         if let Some(rest) = line.strip_prefix("Status:") {
@@ -212,17 +237,26 @@ fn parse_cgi_response(raw: Vec<u8>) -> Result<Response<BoxBody>> {
                 status = StatusCode::from_u16(code).unwrap_or(StatusCode::OK);
             }
         } else if let Some((k, v)) = line.split_once(':') {
+            let k = k.trim();
+            let v = v.trim();
             if k.eq_ignore_ascii_case("Content-Type") {
-                content_type = v.trim().to_string();
+                if !v.is_empty() {
+                    content_type = v.to_string();
+                }
+            } else if crate::server::apps::app_ffi::valid_header_kv(k, v) {
+                extra.push((k.to_string(), v.to_string()));
             }
         }
     }
 
-    Ok(Response::builder()
+    let mut builder = Response::builder()
         .status(status)
         .header(http::header::CONTENT_TYPE, content_type)
-        .header("X-Crucible-Engine", "cgi_script")
-        .body(full(Bytes::from(body)))?)
+        .header("X-Crucible-Engine", "cgi_script");
+    for (k, v) in &extra {
+        builder = builder.header(k.as_str(), v.as_str());
+    }
+    Ok(builder.body(full(Bytes::from(body)))?)
 }
 
 /// 在原始字节里定位空行分隔（\r\n\r\n 或 \n\n），返回 body 起始偏移。

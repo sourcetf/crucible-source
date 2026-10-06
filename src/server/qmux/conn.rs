@@ -95,6 +95,17 @@ struct StreamCore {
     send_stopped: bool,
     fin_sent: bool,
     write_waker: Option<Waker>,
+    /// 最近一次为「发送被卡住」而发出的 (流级额度, 连接级额度)。
+    ///
+    /// 为什么要有它：`flush_frames` 在额度为 0 时会补发 `STREAM_DATA_BLOCKED` +
+    /// `DATA_BLOCKED` 通知对端「我被你卡住了」。但每次 `poll_write`/`poll_flush` 都会
+    /// 调 `flush_frames`，而写任务每写完一条记录又会唤醒 `out_waker`（= 写方的 waker）
+    /// ⇒ 写方立刻再 poll、再补发两条 blocked 帧、再被唤醒…… 形成**紧循环**：
+    /// 实测单条连接（对端声明 `initial_max_data = 0` 且不发 `MAX_DATA`）可让服务端在
+    /// 7 秒里烧掉 4.3 个核、向 socket 写出 25 万条 blocked 帧。blocked 帧本身是
+    /// 幂等通知（RFC 9000 §19.12/§19.13），同一额度状态只需发一次。
+    /// 记录「已为该额度状态发过」即可把循环打断（额度推进或变化时重置）。
+    blocked_reported: Option<(u64, u64)>,
 }
 
 struct StreamState {
@@ -123,6 +134,13 @@ struct Conn {
     /// 待发送的连接级窗口更新（MAX_DATA）。
     pending_max_data: Mutex<Option<u64>>,
     closed: AtomicBool,
+    /// §4.2：`QX_TRANSPORT_PARAMETERS` 必须是**第一个**帧，且只出现一次。
+    /// 重复出现（对端可任意构造）此前被静默接受，并**无条件覆盖**连接级发送额度
+    /// `conn_sent.1` —— 一个更小的 `initial_max_data`（乃至 0）会把我们自己已经
+    /// 放行的额度收回去，对端随即拿不到任何响应（实测：单条连接即可让服务端把
+    /// 响应永久卡住，并伴随 blocked 帧紧循环）。与 QUIC（RFC 9000 §7.4 重复传输
+    /// 参数即错）同一取向：重复即协议违例。
+    tp_seen: AtomicBool,
     last_activity: Mutex<Instant>,
 }
 
@@ -330,16 +348,23 @@ impl QmuxStream {
                 let avail = (c.send_limit.saturating_sub(c.send_sent))
                     .min(sr.1.saturating_sub(sr.0)) as usize;
                 if avail == 0 {
-                    // 如实报 blocked（机会式）
+                    // 如实报 blocked（机会式）——但**每个额度状态只报一次**：见
+                    // `StreamCore::blocked_reported` 的说明（重复补发会与写任务的
+                    // 唤醒形成紧循环，单条连接即可烧满多个核）。
                     let (sl, cl) = (c.send_limit, sr.1);
                     drop(sr);
-                    self.conn.push_one(Frame::StreamDataBlocked {
-                        stream_id: self.id,
-                        limit: sl,
-                    });
-                    self.conn.push_one(Frame::DataBlocked(cl));
+                    if c.blocked_reported != Some((sl, cl)) {
+                        c.blocked_reported = Some((sl, cl));
+                        self.conn.push_one(Frame::StreamDataBlocked {
+                            stream_id: self.id,
+                            limit: sl,
+                        });
+                        self.conn.push_one(Frame::DataBlocked(cl));
+                    }
                     break;
                 }
+                // 有额度可用：清掉「已报告阻塞」，下次真被卡住时重新通知一次。
+                c.blocked_reported = None;
                 let take = (self.write_buf.len() - queued).min(avail).min(payload_cap);
                 let offset = c.send_sent;
                 c.send_sent += take as u64;
@@ -520,6 +545,7 @@ where
         pending_stream_updates: Mutex::new(HashMap::new()),
         pending_max_data: Mutex::new(None),
         closed: AtomicBool::new(false),
+        tp_seen: AtomicBool::new(false),
         last_activity: Mutex::new(Instant::now()),
     });
 
@@ -685,6 +711,13 @@ where
     match f {
         Frame::Padding(_) => {}
         Frame::QxTransportParameters(tp) => {
+            // §4.2：必须是第一个帧、且只出现一次。重复的 TP 会覆盖发送额度
+            // （见 `Conn::tp_seen`），必须拒绝而不是采纳。
+            if conn.tp_seen.swap(true, Ordering::Relaxed) {
+                return Err(ProtoError::protocol(
+                    "重复的 QX_TRANSPORT_PARAMETERS（§4.2 要求它只能是第一个帧）",
+                ));
+            }
             let (parsed, unknown) = TransportParams::decode(&tp)?;
             if !unknown.is_empty() {
                 log::debug!(
@@ -751,6 +784,7 @@ where
                             send_stopped: false,
                             fin_sent: false,
                             write_waker: None,
+                            blocked_reported: None,
                         }),
                     });
                     map.insert(stream_id, Arc::clone(&s));
@@ -818,14 +852,35 @@ where
             }
         }
         Frame::MaxData(v) => {
-            conn.conn_sent.lock().1 = v;
+            // RFC 9000 §4.1（草案 §4 要求沿用 QUIC v1 的帧语义）：
+            // *"Once a receiver advertises a limit ... it is not an error to advertise a
+            // smaller limit, but the smaller limit has no effect."* / *"A sender MUST ignore
+            // any MAX_STREAM_DATA or MAX_DATA frames that do not increase flow control
+            // limits."*
+            //
+            // 此前是无条件覆盖 `conn_sent.1 = v`：对端发一个**更小**的 MAX_DATA，我们再
+            // 回一个同样的值，对端的额度就被我们自己缩小了 —— 实测现象是「大文件传到一半
+            // 突然永久卡住」（发送侧认为只剩很少额度、对端认为早已放行，双方互等）。
+            // 这是纯状态机层面的错误：即使对端是恶意/有 bug 的，正确处置也是忽略而不是采纳。
+            {
+                let mut sr = conn.conn_sent.lock();
+                if v > sr.1 {
+                    sr.1 = v;
+                }
+            }
             conn.wake_all_writers();
         }
         Frame::MaxStreamData { stream_id, maximum } => {
             {
                 let map = conn.streams.lock();
                 if let Some(s) = map.get(&stream_id) {
-                    s.core.lock().send_limit = maximum;
+                    let mut c = s.core.lock();
+                    // 同 MAX_DATA：只接受**增长**的额度（RFC 9000 §4.1「发送方必须忽略
+                    // 不增加额度的 MAX_STREAM_DATA」）。无条件赋值会让一个更小的值把已经
+                    // 放行的额度收回去 ⇒ 该流永久 blocked。
+                    if maximum > c.send_limit {
+                        c.send_limit = maximum;
+                    }
                 }
             }
             conn.wake_writer(stream_id);
@@ -855,9 +910,48 @@ where
             drop(map);
             conn.maybe_retire_stream(stream_id);
         }
-        Frame::ResetStreamAt { .. } => {
-            // §9.2 扩展：数据已按序到达，「可靠部分」即全部已收数据 ⇒ 按 RESET_STREAM 语义处理
-            log::debug!("qmux: 收到 RESET_STREAM_AT（按 RESET_STREAM 语义处理）");
+        Frame::ResetStreamAt {
+            stream_id,
+            error_code,
+            final_size,
+            ..
+        } => {
+            // §9.2 扩展（draft-ietf-quic-reliable-stream-reset 的 RESET_STREAM_AT）：
+            // 「可靠部分」（reliable_size 之前）已经按序交付，其余部分被重置。
+            //
+            // 此前这里是**空分支 + 一句 debug 日志**，注释还写着「按 RESET_STREAM 语义处理」
+            // —— 即「宣称支持、实际什么都没做」。后果不是静默：`TransportParams::default()`
+            // 里 `reset_stream_at: true`，所以我们**对端宣告**支持它，对端于是放心地用
+            // RESET_STREAM_AT 来收尾流，而我们既不给应用发 Fin、也不发 Reset，流状态永远
+            // 停在「没收完」⇒ h1 会话永久挂住（只等空闲超时），而且 `maybe_retire_stream`
+            // 也永远不会归还那条流的并发额度（`fin` 始终 false）—— 100 条这样的流之后整条
+            // QMux 连接再也开不出新流。
+            //
+            // 正确处理与 RESET_STREAM 同一套：按序语义下 reliable_size 之前的数据都已交付，
+            // 因此 final_size 必须 ≥ 已收字节数（否则 FINAL_SIZE_ERROR），随后把
+            // Reset 事件交给应用并尝试退休该流。
+            log::debug!(
+                "qmux: 收到 RESET_STREAM_AT stream={stream_id} final_size={final_size} code={error_code}"
+            );
+            // **必须在 `maybe_retire_stream` 之前把 `streams` 锁放开**：那个函数自己也要
+            // `self.streams.lock()`（parking_lot::Mutex 不可重入，同线程二次加锁即死锁）。
+            {
+                let map = conn.streams.lock();
+                if let Some(s) = map.get(&stream_id) {
+                    let mut c = s.core.lock();
+                    if c.received > final_size {
+                        return Err(ProtoError::new(
+                            err::FINAL_SIZE_ERROR,
+                            "RESET_STREAM_AT 的 final_size 小于已收字节数",
+                        ));
+                    }
+                    c.fin = true;
+                    if let Some(tx) = c.events.as_ref() {
+                        let _ = tx.send(StreamEvent::Reset(error_code));
+                    }
+                }
+            }
+            conn.maybe_retire_stream(stream_id);
         }
         Frame::StopSending { stream_id, .. } => {
             {
@@ -1179,6 +1273,103 @@ mod tests {
         srv.abort();
     }
 
+    /// §4.2：`QX_TRANSPORT_PARAMETERS` 只能是第一个帧、且只出现一次。重复出现必须
+    /// 以 PROTOCOL_VIOLATION 关闭连接 —— 旧实现静默接受并用第二个 TP **无条件覆盖**
+    /// 连接级发送额度（`conn_sent.1`），一个更小的 `initial_max_data`（含 0）会把我们
+    /// 已放行的额度收回去，对端从此拿不到任何响应（实测单条连接即可把响应永久卡住）。
+    #[tokio::test]
+    async fn duplicate_transport_parameters_rejected() {
+        let (a, b) = tokio::io::duplex(8 * 1024);
+        let mut client = Client::new(a);
+        let srv = spawn_server(b, |_s: QmuxStream| async move {});
+        client.handshake().await;
+        // 第二个 TP：一个**更小**的 initial_max_data（旧实现会据此缩小发送窗口）
+        let tp = local_params().encode();
+        client
+            .send_frames(vec![Frame::QxTransportParameters(tp)])
+            .await;
+        let f = client.read_record().await;
+        match f.first() {
+            Some(Frame::ConnectionClose { error_code, .. }) => {
+                assert_eq!(*error_code, err::PROTOCOL_VIOLATION)
+            }
+            other => panic!("期望 CONNECTION_CLOSE(PROTOCOL_VIOLATION)，实际 {other:?}"),
+        }
+        srv.abort();
+    }
+
+    /// blocked 通知（`STREAM_DATA_BLOCKED` / `DATA_BLOCKED`）**每个额度状态只发一次**。
+    ///
+    /// 旧实现每次 `flush_frames`（每次 poll_write/poll_flush）都补发一对 blocked 帧，
+    /// 而写任务每写完一条记录又唤醒写方 ⇒ 紧循环：实测单条连接（对端 `initial_max_data=0`
+    /// 且不发 MAX_DATA）7 秒烧掉 4.3 核、写出 25 万条 blocked 帧。
+    /// 判据：0 额度下只应看到至多各一条 blocked 帧，之后 socket 上不应再冒出新记录。
+    #[tokio::test]
+    async fn blocked_frames_reported_once_per_limit() {
+        let (a, b) = tokio::io::duplex(64 * 1024);
+        let mut client = Client::new(a);
+        let srv = spawn_server(b, |mut s: QmuxStream| async move {
+            // 连接级额度为 0 ⇒ 这次写永远卡住（正是触发紧循环的形态）
+            let _ = s.write_all(b"HELLO").await;
+            let _ = s.shutdown().await;
+        });
+        let f = client.read_record().await;
+        assert!(matches!(f.first(), Some(Frame::QxTransportParameters(_))));
+
+        // 我方 TP：initial_max_stream_data_bidi_local=1MiB，initial_max_data=0
+        let mut tp = Vec::new();
+        for (id, val) in [(0x05u64, 1u64 << 20), (0x04, 0)] {
+            let mut v = Vec::new();
+            put_varint(&mut v, val);
+            put_varint(&mut tp, id);
+            put_varint(&mut tp, v.len() as u64);
+            tp.extend_from_slice(&v);
+        }
+        client
+            .send_frames(vec![Frame::QxTransportParameters(tp)])
+            .await;
+        client
+            .send_frames(vec![Frame::Stream {
+                stream_id: 0,
+                offset: 0,
+                fin: false,
+                data: b"GET / HTTP/1.1\r\n\r\n".to_vec(),
+            }])
+            .await;
+
+        // 收集 1s 内到达的记录；blocked 帧必须各至多一条。
+        let mut data_blocked = 0usize;
+        let mut stream_blocked = 0usize;
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(1);
+        loop {
+            let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if left.is_zero() {
+                break;
+            }
+            match tokio::time::timeout(left, client.read_record()).await {
+                Ok(frames) => {
+                    for fr in &frames {
+                        match fr {
+                            Frame::DataBlocked(_) => data_blocked += 1,
+                            Frame::StreamDataBlocked { .. } => stream_blocked += 1,
+                            _ => {}
+                        }
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+        assert!(
+            data_blocked <= 1,
+            "DATA_BLOCKED 每个额度状态只应发一次，实际 {data_blocked} 次（紧循环未修）"
+        );
+        assert!(
+            stream_blocked <= 1,
+            "STREAM_DATA_BLOCKED 每个额度状态只应发一次，实际 {stream_blocked} 次（紧循环未修）"
+        );
+        srv.abort();
+    }
+
     /// §4：被禁的帧（PING=0x01）→ FRAME_ENCODING_ERROR。
     #[tokio::test]
     async fn prohibited_frame_closes_connection() {
@@ -1298,6 +1489,230 @@ mod tests {
                 assert_eq!(p.initial_max_streams_bidi, MAX_STREAMS_BIDI);
             }
             other => panic!("期望服务端参数，实际 {other:?}"),
+        }
+        srv.abort();
+    }
+
+    /// RFC 9000 §4.1（草案 §4 沿用其帧语义）：**发送方必须忽略不增加额度的**
+    /// `MAX_STREAM_DATA` / `MAX_DATA`。
+    ///
+    /// 回归点：此前两个分支都是无条件赋值，对端发一个**更小的**值就能把我们**已经拿到**
+    /// 的额度收回去 ⇒ 发送侧永久 blocked（真机现象：大文件传到一半卡死，直到空闲超时）。
+    ///
+    /// 判据（能区分新旧行为）：先给足额度让第一段发出；随后发一个**更小**的额度；
+    /// 再让应用写第二段。旧实现会把额度缩回去 ⇒ 第二段永远发不出（测试超时失败）；
+    /// 新实现忽略收缩 ⇒ 第二段照常发出。
+    #[tokio::test]
+    async fn smaller_max_data_does_not_shrink_send_window() {
+        const PART1: &[u8] = b"AAAAAAAA"; // 8 字节
+        const PART2: &[u8] = b"BBBBBBBB"; // 8 字节（需要原始的大额度）
+        let (a, b) = tokio::io::duplex(64 * 1024);
+        let mut client = Client::new(a);
+        // handler 是 `Fn`（可被多次调用），所以接收端放进 Arc<Mutex<Option<..>>> 里取用。
+        let (go_tx, go_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+        let go_rx = std::sync::Arc::new(parking_lot::Mutex::new(Some(go_rx)));
+        let srv = spawn_server(b, move |mut s: QmuxStream| {
+            let go_rx = std::sync::Arc::clone(&go_rx);
+            async move {
+                let _ = s.write_all(PART1).await;
+                let _ = s.flush().await;
+                // 等测试发完「更小的 MAX_*」再写第二段
+                let mut rx = go_rx.lock().take();
+                if let Some(rx) = rx.as_mut() {
+                    let _ = rx.recv().await;
+                }
+                drop(rx);
+                let _ = s.write_all(PART2).await;
+                let _ = s.flush().await;
+                let _ = s.shutdown().await;
+                std::future::pending::<()>().await;
+            }
+        });
+
+        // 握手：给足额度
+        let _ = client.read_record().await; // 服务端参数
+        let mut tp = local_params();
+        tp.initial_max_stream_data_bidi_local = 1 << 20;
+        tp.initial_max_data = 1 << 20;
+        client
+            .send_frames(vec![Frame::QxTransportParameters(tp.encode())])
+            .await;
+        // 开流 0（带 FIN）触发回写
+        client
+            .send_frames(vec![Frame::Stream {
+                stream_id: 0,
+                offset: 0,
+                fin: true,
+                data: b"x".to_vec(),
+            }])
+            .await;
+
+        // 先收 PART1
+        let mut out: Vec<u8> = Vec::new();
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        while out.len() < PART1.len() {
+            assert!(tokio::time::Instant::now() < deadline, "超时未收到第一段");
+            for fr in client.read_record().await {
+                if let Frame::Stream { offset, data, .. } = fr {
+                    assert_eq!(offset, out.len() as u64);
+                    out.extend_from_slice(&data);
+                }
+            }
+        }
+        assert_eq!(out, PART1);
+
+        // 现在发**更小**的额度（1 字节）。旧实现会把额度收到 1，第二段就发不出去。
+        client
+            .send_frames(vec![
+                Frame::MaxData(1),
+                Frame::MaxStreamData {
+                    stream_id: 0,
+                    maximum: 1,
+                },
+            ])
+            .await;
+        // 放行第二段
+        let _ = go_tx.send(());
+
+        // 第二段必须能发出来（= 收缩被忽略，额度仍是初始的 1MiB）
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        while out.len() < PART1.len() + PART2.len() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "收缩额度后第二段发不出来（额度回退 bug）：已收 {:?}",
+                String::from_utf8_lossy(&out)
+            );
+            for fr in client.read_record().await {
+                match fr {
+                    Frame::Stream { offset, data, .. } => {
+                        assert_eq!(offset, out.len() as u64);
+                        out.extend_from_slice(&data);
+                    }
+                    Frame::ConnectionClose { error_code, reason, .. } => {
+                        panic!("不得关闭连接: code=0x{error_code:x} {reason:?}")
+                    }
+                    _ => {}
+                }
+            }
+        }
+        assert_eq!(out, b"AAAAAAAABBBBBBBB".to_vec());
+        srv.abort();
+    }
+
+    /// §9.2：`RESET_STREAM_AT` 必须真的**终结**那条流。
+    ///
+    /// 回归点：此前是空分支（只有一行 debug 日志），应用侧既收不到 Fin 也收不到 Reset
+    /// ⇒ h1 会话永久挂住，而且 `maybe_retire_stream` 因 `fin` 始终 false 永不归还并发额度
+    ///（100 条之后整条连接开不出新流）。
+    ///
+    /// 判据：服务端 handler 里读第二次必须**立刻**返回（Reset 事件已送达）。旧实现下
+    /// 第二次读会挂住（因为事件永远不来），测试超时失败。
+    #[tokio::test]
+    async fn reset_stream_at_terminates_stream() {
+        let (a, b) = tokio::io::duplex(64 * 1024);
+        let mut client = Client::new(a);
+        let (done_tx, mut done_rx) = tokio::sync::mpsc::unbounded_channel::<&'static str>();
+        let done_tx = std::sync::Arc::new(done_tx);
+        let srv = spawn_server(b, move |mut s: QmuxStream| {
+            let done_tx = std::sync::Arc::clone(&done_tx);
+            async move {
+                let mut buf = [0u8; 256];
+                // 读到全部数据 + Reset：第二次读必须立刻有结果，不能挂住
+                let first = s.read(&mut buf).await.is_ok();
+                let second = s.read(&mut buf).await;
+                let tag = if !first {
+                    "first-read-err"
+                } else {
+                    match second {
+                        Ok(_) => "terminated",
+                        Err(_) => "reset",
+                    }
+                };
+                let _ = done_tx.send(tag);
+                std::future::pending::<()>().await;
+            }
+        });
+        client.handshake().await;
+        client
+            .send_frames(vec![Frame::Stream {
+                stream_id: 0,
+                offset: 0,
+                fin: false,
+                data: b"hello".to_vec(),
+            }])
+            .await;
+        // RESET_STREAM_AT：reliable_size 之前的 5 字节已交付，final_size 也是 5
+        client
+            .send_frames(vec![Frame::ResetStreamAt {
+                stream_id: 0,
+                error_code: 1,
+                final_size: 5,
+                reliable_size: 5,
+            }])
+            .await;
+        // 连接必须保持可用（PING 回显）
+        client.send_frames(vec![Frame::QxPing(7)]).await;
+        let mut pong = false;
+        for _ in 0..8 {
+            for fr in client.read_record().await {
+                match fr {
+                    Frame::ConnectionClose { error_code, reason, .. } => {
+                        panic!("RESET_STREAM_AT 不得导致关闭: code=0x{error_code:x} {reason:?}")
+                    }
+                    Frame::QxPingAck(7) => pong = true,
+                    _ => {}
+                }
+            }
+            if pong {
+                break;
+            }
+        }
+        assert!(pong, "RESET_STREAM_AT 之后连接必须仍然可用");
+        // 应用侧必须被通知（这是「空分支」与「真处理」的可观察差别）
+        let tag = tokio::time::timeout(std::time::Duration::from_secs(10), done_rx.recv())
+            .await
+            .expect("应用侧必须收到流终结事件（旧实现：永远挂住）");
+        assert_eq!(tag, Some("reset"), "必须把 Reset 交给应用");
+        srv.abort();
+    }
+
+    /// §9.2：`RESET_STREAM_AT` 的 `final_size` 小于已收字节数 → `FINAL_SIZE_ERROR`
+    ///（与 `RESET_STREAM` 同一判据）。
+    #[tokio::test]
+    async fn reset_stream_at_final_size_below_received_is_error() {
+        let (a, b) = tokio::io::duplex(8 * 1024);
+        let mut client = Client::new(a);
+        let srv = spawn_server(b, |mut s: QmuxStream| async move {
+            let mut buf = [0u8; 256];
+            while let Ok(n) = s.read(&mut buf).await {
+                if n == 0 {
+                    break;
+                }
+            }
+        });
+        client.handshake().await;
+        client
+            .send_frames(vec![Frame::Stream {
+                stream_id: 0,
+                offset: 0,
+                fin: false,
+                data: b"0123456789".to_vec(), // 收到 10 字节
+            }])
+            .await;
+        client
+            .send_frames(vec![Frame::ResetStreamAt {
+                stream_id: 0,
+                error_code: 1,
+                final_size: 5, // < 10 ⇒ FINAL_SIZE_ERROR
+                reliable_size: 5,
+            }])
+            .await;
+        let f = client.read_record().await;
+        match f.first() {
+            Some(Frame::ConnectionClose { error_code, .. }) => {
+                assert_eq!(*error_code, err::FINAL_SIZE_ERROR)
+            }
+            other => panic!("期望 FINAL_SIZE_ERROR，实际 {other:?}"),
         }
         srv.abort();
     }

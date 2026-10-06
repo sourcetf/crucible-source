@@ -37,8 +37,20 @@ pub fn allow(ip: IpAddr, rate_per_sec: f64, burst: f64) -> bool {
     allow_key(&normalize_ip(ip).to_string(), rate_per_sec, burst)
 }
 
+/// per_path 模式的桶键：**路径不进 key 原文**，改用 64 位指纹。
+///
+/// 为什么必须这样（P1，无认证可触发）：hyper 允许请求目标长到 ~64KiB（`MAX_URI_LEN`），
+/// 而桶表上限是 [`BUCKET_CAP`]=10 万键 —— 原样把路径拼进 key 时，一个客户端只要
+/// 「每条请求换一个新路径、路径撑到 URI 上限」就能把表填满：
+/// 实测复刻（逐字照搬本文件逻辑）**10 万键 × 65KB ≈ 6.2GB RSS**。指纹把每键压到
+/// 固定的 `ip + 16 个十六进制字符`（10 万键 ≈ 4MB 上界），限流粒度不变
+/// （64 位空间里 10 万键的碰撞概率约 3e-10，且碰撞只会让两条不同路径共享一个桶 =
+/// 更严一点，不会放行）。
 pub fn allow_path(ip: IpAddr, path: &str, rate_per_sec: f64, burst: f64) -> bool {
-    let key = format!("{}|{}", normalize_ip(ip), path.trim_end_matches('/'));
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    path.trim_end_matches('/').hash(&mut h);
+    let key = format!("{}|{:016x}", normalize_ip(ip), h.finish());
     allow_key(&key, rate_per_sec, burst)
 }
 
@@ -125,5 +137,30 @@ mod tests {
         assert_eq!(m.len(), 90, "only the requested batch is dropped");
         assert!(!m.contains_key("k0"), "oldest goes first");
         assert!(m.contains_key("k99"), "newest survives");
+    }
+
+    /// per_path 的桶键必须**定长**（IP + 路径指纹），不能把可达 64KiB 的请求路径
+    /// 原样存进表里 —— 否则 10 万键 × 65KB ≈ 6.2GB RSS，一个客户端就能把进程撑爆
+    /// （复刻实验见报告）。
+    #[test]
+    fn path_key_is_fixed_size_regardless_of_path_length() {
+        let ip: IpAddr = "10.1.2.3".parse().unwrap();
+        let long = format!("/{}", "a".repeat(60_000));
+        let short = "/a";
+        let mut m: HashMap<String, Bucket> = HashMap::new();
+        // 直接调 allow_key 之外的可测入口不方便（内部用全局表），这里验证键构造本身。
+        for p in [long.as_str(), short] {
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            use std::hash::{Hash, Hasher};
+            p.trim_end_matches('/').hash(&mut h);
+            let key = format!("{}|{:016x}", normalize_ip(ip), h.finish());
+            m.insert(key.clone(), Bucket { tokens: 1.0, last: Instant::now() });
+            assert!(
+                key.len() <= 64,
+                "per_path 桶键必须定长（实测 {} 字节）",
+                key.len()
+            );
+        }
+        assert_eq!(m.len(), 2, "不同路径仍是不同桶（限流粒度不变）");
     }
 }

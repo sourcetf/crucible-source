@@ -262,7 +262,10 @@ fn issue(cfg: &AcmeCfg) -> anyhow::Result<()> {
     std::fs::create_dir_all(std::path::Path::new(&www).join(".well-known/acme-challenge"))?;
 
     // 1) acme.sh（用户目录安装或 /usr/local）；HOME 缺失时无法定位 ~/.acme.sh，跳过。
-    let home = std::env::var("HOME").unwrap_or_default();
+    // 走 env_lock 缓存读 HOME：本函数跑在 spawn_blocking 线程里，与请求路径上应用引擎
+    // 的 setenv（perl/python/ruby 的 ENV 注入）并发 —— libc setenv 可能 realloc environ，
+    // 此刻任何其它线程的 getenv 都会踩到已释放内存（仓库里已实测出同类 SIGSEGV）。
+    let home = crate::server::apps::env_lock::read_static_env("HOME").unwrap_or_default();
     if !home.trim().is_empty() {
         for bin in ["/usr/local/bin/acme.sh", "$HOME/.acme.sh/acme.sh"] {
             let bin = bin.replace("$HOME", &home);

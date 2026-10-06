@@ -29,15 +29,32 @@ pub async fn accept_and_serve(
     server_config.alpn_protocols = alpn_protocols(&lc);
     let acceptor = TlsAcceptor::from(StdArc::new(server_config));
     let io = PrefixedStream::new(stream, peek);
-    let tls = acceptor.accept(io).await.context("rustls accept")?;
+    // 与 BoringSSL 路径同等的握手截止时间：rustls 的 `accept` 自身没有超时，客户端发一个
+    // ClientHello 后停住即可永久占住任务与 fd（tls-core P3）。超时即丢弃连接。
+    let tls = match tokio::time::timeout(HANDSHAKE_TIMEOUT, acceptor.accept(io)).await {
+        Ok(Ok(t)) => t,
+        Ok(Err(e)) => return Err(e).context("rustls accept"),
+        Err(_) => {
+            log::debug!("rustls 握手超时（{HANDSHAKE_TIMEOUT:?}）peer={peer}，丢弃连接");
+            return Ok(());
+        }
+    };
     let (_, conn) = tls.get_ref();
     let alpn = conn.alpn_protocol().map(|p| p.to_vec());
     if alpn.as_deref() == Some(b"h2") && lc.allows_h2() {
         h2::serve_tls(tls, live, lc, peer).await
-    } else {
+    } else if lc.allows_h1() {
         h1::serve_tls(tls, live, lc, peer).await
+    } else {
+        // 同 boring_path::dispatch_alpn：未启用 h1 的口不得回落服务 HTTP/1.1。
+        log::debug!("rustls: ALPN 未协商出已启用协议，丢弃连接 peer={peer}");
+        drop(tls);
+        Ok(())
     }
 }
+
+/// 握手总预算（与 boring_path::HANDSHAKE_TIMEOUT 同量级，见那里的取值依据）。
+const HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 fn alpn_protocols(lc: &ListenerConfig) -> Vec<Vec<u8>> {
     let mut alpn = Vec::new();

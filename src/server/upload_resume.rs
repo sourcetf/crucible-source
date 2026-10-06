@@ -55,6 +55,10 @@ pub enum UploadErr {
     TotalMismatch,
     /// 进程在飞字节预算或磁盘余量不足 → 507（不是客户端的错，也不是请求格式错）。
     NoSpace,
+    /// 目标文件**名**不合法（控制字符 / 超出文件系统的单段长度上限）→ 400。
+    /// 与 [`UploadErr::Io`] 分开，是因为这类失败的根因在请求（客户端换名即可），
+    /// 报 500 会把「名字太长」说成「服务端故障」。
+    BadName(String),
     Io(String),
 }
 
@@ -86,6 +90,13 @@ pub struct Session {
     /// `commit()` 把 `.part` rename 走，另一个 append 撞上 `Io(No such file)` ⇒ **500**，
     /// 且**只有一方**的字节最终落盘（另一方静默丢数据却可能收到 201）。实测复现。
     active: std::sync::atomic::AtomicUsize,
+    /// 本会话当前**计入** [`BUDGET`]`.reserved` 的字节量（创建时声明、请求结束时归还）。
+    ///
+    /// 为什么用 AtomicU64 而不是直接读 `total`：声明预留（`reserved`）必须在
+    /// **请求结束时归还**（见 [`Attach::drop`] / [`release_reservation`]），而归还路径
+    /// 有多条（请求超时/中断、commit、abort、sweep）。用一个可 swap 到 0 的计数保证
+    /// 幂等：谁先归零，后面的人再减就是减 0，不会把全局预算减穿。
+    reserved: AtomicU64,
 }
 
 /// 会话持有守卫：`session_for` 已经把 `active` 加过 1，这个守卫负责在请求结束
@@ -106,6 +117,19 @@ impl Attach {
 impl Drop for Attach {
     fn drop(&mut self) {
         self.sess.active.fetch_sub(1, Ordering::Relaxed);
+        // 请求结束（无论成功、超时、中断、提前 return）即归还本会话的**声明预留**。
+        //
+        // 为什么必须在这里归还：`session_for` 建会话时把客户端声明的 `total` 计入了
+        // 全局在飞预算（`BUDGET.reserved`，防「先开一堆声明 2GiB 的会话再慢慢写」）。
+        // 但那个预留此前**只**在 commit/abort/sweep 时归还 —— 而「声明 2GiB、发 1 字节
+        // 就断开/超时」的请求走的是 400/408 分支（按续传语义**故意不 abort**），于是
+        // 一份 2GiB 的预留被一个**匿名**请求占住整整 [`SESSION_TTL`]（1h），期间**所有**
+        // 新上传（任何 target）都撞 `NoSuch` → 507（实测：单个中断的 2GiB PUT 之后，
+        // 后续正常小文件上传恒回 507）。这是「用一条请求把上传功能整体打死一小时」的 DoS。
+        //
+        // 归还**只动预留、不动 `.part`/会话**：断点续传完全不受影响（客户端稍后仍可按
+        // `X-Upload-Offset` 续传，续传会话本身不再预留——真正兜住磁盘的是逐片 `inflight`）。
+        release_reservation(&self.sess);
     }
 }
 
@@ -212,11 +236,15 @@ fn space_ok(target: &Path, want: u64) -> bool {
     }
 }
 
-/// 会话结束时回收预算（每 IP 计数 + 在飞字节）。
+/// 会话结束时回收预算（每 IP 计数 + 在飞字节 + **声明预留**）。
+///
+/// 预留用 `sess.reserved`（可 swap 到 0 的计数）而不是 `sess.total`：预留可能在
+/// 请求结束时就已被 [`release_reservation`] 归还（超时/中断路径），这里再减同一个量会
+/// 把**别的**会话的预留减穿。swap 到 0 保证两边只减一次。
 fn release_budget(sess: &Session) {
     let mut b = BUDGET.lock();
     b.inflight = b.inflight.saturating_sub(sess.received());
-    b.reserved = b.reserved.saturating_sub(sess.total.unwrap_or(0));
+    b.reserved = b.reserved.saturating_sub(sess.reserved.swap(0, Ordering::Relaxed));
     if let Some(ip) = sess.owner {
         if let Some(c) = b.by_ip.get_mut(&ip) {
             *c = c.saturating_sub(1);
@@ -227,19 +255,42 @@ fn release_budget(sess: &Session) {
     }
 }
 
+/// 归还本会话的**声明预留**（`BUDGET.reserved`），幂等。
+///
+/// 由 [`Attach::drop`] 在**每个**请求结束时调用（成功的 commit 已经归还过 → 这里是减 0）。
+/// `.part` 与会话都保留，只归还预留 —— 见 [`Attach::drop`] 里对 DoS 的说明。
+pub fn release_reservation(sess: &Arc<Session>) {
+    let r = sess.reserved.swap(0, Ordering::Relaxed);
+    if r > 0 {
+        let mut b = BUDGET.lock();
+        b.reserved = b.reserved.saturating_sub(r);
+    }
+}
+
+/// 纯 ASCII 数字解析（RFC 9110 §14.4 的 `first-pos`/`last-pos`/`complete-length` 只允许
+/// DIGIT）。不能直接用 `str::parse::<u64>()`：它**接受前导 `+`** 与前后空白，于是
+/// `Content-Range: bytes +0-99/100` 会被当成合法声明 —— 而按 §14.4 这是语法错误，
+/// 必须整条拒绝（调用方回 400），绝不能"宽容解析"后照写。
+fn digits_u64(s: &str) -> Option<u64> {
+    if s.is_empty() || !s.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    s.parse::<u64>().ok()
+}
+
 /// 解析 `Content-Range: bytes <start>-<end>/<total|*>` → `(start, end, total)`。
 pub fn parse_content_range(v: &str) -> Option<(u64, u64, Option<u64>)> {
     let rest = v.trim().strip_prefix("bytes")?.trim_start();
     let (range, total) = rest.split_once('/')?;
     let (a, b) = range.trim().split_once('-')?;
-    let start: u64 = a.trim().parse().ok()?;
-    let end: u64 = b.trim().parse().ok()?;
+    let start: u64 = digits_u64(a.trim())?;
+    let end: u64 = digits_u64(b.trim())?;
     if end < start {
         return None;
     }
     let total = match total.trim() {
         "*" => None,
-        t => Some(t.parse::<u64>().ok()?),
+        t => Some(digits_u64(t)?),
     };
     Some((start, end, total))
 }
@@ -317,6 +368,19 @@ pub fn session_for(
         if start != s.received() {
             return Err(UploadErr::OffsetMismatch(s.received()));
         }
+        // 并发闸门必须**同时**覆盖续传分片：另一个请求正持有这个会话（哪怕它一个字节
+        // 都还没写）时，后到者必须 409。
+        //
+        // 漏掉这一条会静默损坏文件（实测复现）：两个请求都带
+        // `Content-Range: bytes 4-7/16` 且当前 `received()==4` 时，`start == received`
+        // 对二者**同时成立**，于是两个都通过；而 `upload_api` 取写偏移用的是**实时**
+        // `sess.received()` —— 后到者读到的是已被前一个推进的偏移（8），把同一片数据
+        // **重复追加**（received 4→8→12），随后客户端按 Content-Range 发的收尾片撞
+        // `start != received` 回 409，文件永远拼不回来也 commit 不了（实测 race.bin 长度
+        // 12、内容重复、GET 404）。断线重试不受影响：旧请求的 `Attach` 已析构、`active` 归零。
+        if s.active.load(Ordering::Relaxed) > 0 {
+            return Err(UploadErr::OffsetMismatch(s.received()));
+        }
         *s.touched.lock() = Instant::now();
         s.active.fetch_add(1, Ordering::Relaxed);
         return Ok(s);
@@ -340,6 +404,26 @@ pub fn session_for(
         .file_name()
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_else(|| "upload".to_string());
+    // 文件**名**合法性：控制字符（含 NUL/换行）与超长名必须在建临时文件之前拒。
+    //
+    // * 控制字符：名字里带 `\n`/`\r` 会写进 access_log 与 autoindex（日志注入 / 列目录
+    //   时的显示破坏），NUL 直接让 fs 调用以难读的 OS 错误失败；
+    // * 超长名：临时文件名是 `.{name}.upload.part`，比目标名多 13 字节。单段上限
+    //   （Linux/OpenBSD 都是 255）附近的名字（240..255）会让**临时文件**创建失败
+    //   （ENAMETOOLONG），报出来却是「写入失败」500 —— 客户端无从下手。
+    //   这里按 255 的常见上限给出可读的 400。
+    if name
+        .chars()
+        .any(|c| c.is_control() || c == '\u{7f}')
+    {
+        return Err(UploadErr::BadName("文件名含控制字符".into()));
+    }
+    if name.len() + ".upload.part".len() + 1 > 255 {
+        return Err(UploadErr::BadName(format!(
+            "文件名过长（{} 字节，临时名上限 255）",
+            name.len()
+        )));
+    }
     let parent = target
         .parent()
         .ok_or_else(|| UploadErr::Io("upload target has no parent dir".into()))?;
@@ -379,6 +463,9 @@ pub fn session_for(
         // 新会话：下面 `Ok(sess)` 返回前会加 1（与复用分支同一处），
         // 保证「拿到会话」与「记账」在 SESSIONS 锁内是原子的。
         active: std::sync::atomic::AtomicUsize::new(0),
+        // 创建时把声明的 total 记进 `reserved`（下面紧接的 BUDGET 块把它计入全局预算），
+        // 请求结束时由 `Attach::drop` 归还。
+        reserved: AtomicU64::new(reserve),
     });
     map.insert(target.to_path_buf(), Arc::clone(&sess));
     // 计数在**插入成功之后**再加：上面任何一条提前 return 都不会漏计/多计。
@@ -469,12 +556,19 @@ pub fn abort(sess: &Arc<Session>) {
 }
 
 /// 清理超时会话（维护任务调用），返回清理数量。
+///
+/// **跳过正在被请求持有的会话**（`active > 0`）：否则一个 body 被客户端拖过
+/// [`SESSION_TTL`]（1 小时）的在途上传，其 `.part` 会被这里删掉，随后该请求的
+/// `append` 打开已删除文件失败回 500（不损坏数据，但把合法上传打成 500）。
 pub fn sweep_expired() -> usize {
     let now = Instant::now();
     let mut map = SESSIONS.lock();
     let dead: Vec<PathBuf> = map
         .iter()
-        .filter(|(_, s)| now.duration_since(*s.touched.lock()) > SESSION_TTL)
+        .filter(|(_, s)| {
+            s.active.load(Ordering::Relaxed) == 0
+                && now.duration_since(*s.touched.lock()) > SESSION_TTL
+        })
         .map(|(k, _)| k.clone())
         .collect();
     let mut freed = 0usize;
@@ -537,6 +631,46 @@ fn upload_target(name: &str) -> std::path::PathBuf {
         assert_eq!(parse_content_range("bytes 5-4/10"), None, "end<start 必须拒");
         assert_eq!(parse_content_range("items 0-1/2"), None);
         assert_eq!(parse_content_range("bytes a-b/c"), None);
+    }
+
+    /// `first-pos`/`last-pos`/`complete-length` 只允许 DIGIT（RFC 9110 §14.4）：
+    /// 前导 `+`（Rust 的 parse 会接受）、前导 0 之外的空格/字母都必须整条拒绝。
+    #[test]
+    fn content_range_rejects_signs_and_junk() {
+        assert_eq!(parse_content_range("bytes +0-99/100"), None, "前导 + 不是 DIGIT");
+        assert_eq!(parse_content_range("bytes 0-+99/100"), None);
+        assert_eq!(parse_content_range("bytes 0-99/+100"), None);
+        assert_eq!(parse_content_range("bytes 0-99/100x"), None);
+        assert_eq!(parse_content_range("bytes 0x10-99/100"), None);
+        // 合法的零与空白容忍仍成立（`bytes 0-99/ *` 是「总长未知」）
+        assert_eq!(parse_content_range("bytes 0-0/1"), Some((0, 0, Some(1))));
+        assert_eq!(parse_content_range("bytes 0-99/ *"), Some((0, 99, None)));
+    }
+
+    /// 文件名里的控制字符与超长名必须在**建临时文件之前**拒（否则报 500，
+    /// 而根因是客户端给的名字）。`BadName` 与 `Io` 分开，调用方能回 400。
+    #[test]
+    fn bad_target_name_rejected_before_touching_disk() {
+        let _g = serial();
+        let dir = std::env::temp_dir().join(format!("crucible-up-name-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // 换行：会写进 access_log / autoindex HTML
+        let bad = dir.join("a\nb.txt");
+        match session_for(&bad, 0, Some(1), None) {
+            Err(UploadErr::BadName(_)) => {}
+            other => panic!("含控制字符的名字应回 BadName，实际 {:?}", other.err()),
+        }
+        // 超长名（临时名 = `.` + name + `.upload.part`，超过 255 必须提前拒）
+        let long = dir.join(format!("{}.txt", "x".repeat(250)));
+        match session_for(&long, 0, Some(1), None) {
+            Err(UploadErr::BadName(_)) => {}
+            other => panic!("超长名应回 BadName，实际 {:?}", other.err()),
+        }
+        assert!(
+            !long.with_file_name(format!(".{}.txt.upload.part", "x".repeat(250))).exists(),
+            "被拒的目标不得留下临时文件"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// `/` 与 `*` 之间的空白必须容忍，且解析结果就是「总长未知」。
@@ -615,6 +749,46 @@ fn upload_target(name: &str) -> std::path::PathBuf {
         assert!(Arc::ptr_eq(&a, &b), "复用同一个会话对象");
         // 归还预算：`BUDGET` 是进程级全局量，用例留垃圾会破坏其他「正好填满预算」的用例
         //（实测：本用例留 4 字节就让 declared_total_reserves_inflight_budget 假失败）。
+        abort(&b);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 并发**续传分片**（非 0 start）到同一目标也必须被挡在 409。
+    ///
+    /// 实测复现的损坏：两个请求都带 `bytes 4-7/16` 且当前 `received()==4` 时，
+    /// `start == received` 对二者**同时成立**，旧实现两个都放行；而 `upload_api` 按
+    /// **实时** `received()` 取写偏移，后到者把同一片数据重复追加（received 4→8→12），
+    /// 客户端按 Content-Range 发的收尾片随后撞 409，文件损坏且永远 commit 不了
+    /// （真机 race.bin 实测：len=12、内容重复、GET 404）。
+    #[test]
+    fn concurrent_resume_chunk_to_same_target_is_rejected() {
+        let _g = serial();
+        if !test_fs_has_room() {
+            eprintln!("跳过：本机磁盘余量低于闸门阈值（{MIN_FREE_BYTES}）");
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("crucible-up-resume-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("resume.bin");
+        let _ = std::fs::remove_file(&target);
+        let _ = std::fs::remove_file(target.with_file_name(".resume.bin.upload.part"));
+
+        let a = session_for(&target, 0, Some(16), None).expect("开始会话");
+        assert_eq!(append(&a, 0, b"aaaa").unwrap(), 4);
+        // a 仍被本请求持有（active==1）：同偏移（start==received==4）的续传分片必须 409，
+        // 而不是拿到同一个会话（否则两片都写、数据重复）。
+        match session_for(&target, 4, Some(16), None) {
+            Err(UploadErr::OffsetMismatch(cur)) => assert_eq!(cur, 4),
+            Err(other) => panic!("期望 OffsetMismatch(4)，实得 {other:?}"),
+            Ok(_) => panic!("期望 409，实得 Ok —— 并发续传分片共享了会话（会重复追加数据）"),
+        }
+        // 释放（请求结束）后，合法的断线续传必须能重新拿到会话。
+        {
+            let g = Attach::new(Arc::clone(&a));
+            drop(g);
+        }
+        let b = session_for(&target, 4, Some(16), None).expect("释放后应可续传");
+        assert!(Arc::ptr_eq(&a, &b), "复用同一个会话对象");
         abort(&b);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -734,6 +908,41 @@ fn upload_target(name: &str) -> std::path::PathBuf {
         let after = dir.join("budget-after.bin");
         let s = session_for(&after, 0, Some(chunk), None).expect("释放后应可再开");
         abort(&s);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 请求结束（`Attach` drop）必须归还「声明预留」。
+    ///
+    /// 复现的 DoS：`PUT` 声明 `Content-Length: 2GiB`、发 1 字节后断开（走 400 分支，
+    /// 按续传语义**不 abort**），预留被占住 1h，期间**所有**新上传恒回 507。
+    /// 这条盯着 `Attach::drop` 的归还：`before` 与 `after` 必须相等。
+    #[test]
+    fn attach_drop_releases_declared_reservation() {
+        let _g = serial();
+        if !test_fs_has_room() {
+            eprintln!("跳过：本机磁盘余量低于闸门阈值（{MIN_FREE_BYTES}）");
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("crucible-up-resv-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let before = { BUDGET.lock().reserved };
+        let target = dir.join("resv.bin");
+        let sess = session_for(&target, 0, Some(64 * 1024 * 1024), None).expect("begin");
+        let during = { BUDGET.lock().reserved };
+        assert!(
+            during >= before + 64 * 1024 * 1024,
+            "创建会话时必须把声明的 total 计入 reserved（before={before} during={during}）"
+        );
+        {
+            let g = Attach::new(Arc::clone(&sess));
+            drop(g); // 模拟请求结束（未 commit）
+        }
+        let after = { BUDGET.lock().reserved };
+        assert_eq!(
+            after, before,
+            "请求结束必须归还声明预留（否则一个中断的大声明请求把上传打死 1h）"
+        );
+        abort(&sess);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

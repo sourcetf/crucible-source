@@ -129,6 +129,13 @@ pub async fn run(live: Arc<LiveConfig>) -> Result<()> {
     for problem in ech_selfcheck_problems(&cfg, &dns_effective) {
         log::warn!("{problem}");
     }
+    // ECH 发布面一致性：显式 `ssl.ech_keys` 形态下把密钥文件里的 ECHConfig 派生的
+    // ECHConfigList 落盘到 DNS/面板读取的固定路径（否则 DNS 可能发布缺失或另一把钥匙的
+    // 配置）。必须在生成 DNS 记录之前调用。
+    let n = crate::server::ech_auto::sync_explicit_keys_for_listeners(&cfg.listeners);
+    if n > 0 {
+        log::info!("ech: 启动期从显式 ech_keys 派生并落盘 {n} 份 ECHConfigList");
+    }
     // B-F2：管理面默认对**所有** listener 开放（`listeners_allow` 为空 = 不限制），
     // 而管理面走 Basic 认证 ⇒ 任何**明文 HTTP** 端口都成了凭据输入面（口令明文上线），
     // 防爆破面也扩到全部端口。默认值站在不安全的一侧，至少要在启动日志里说清楚。
@@ -153,8 +160,21 @@ pub async fn run(live: Arc<LiveConfig>) -> Result<()> {
             );
         }
     }
-    if active.lock().await.is_empty() {
+    // 区分两种「一个 listener 都没起来」：
+    //   ① 配置里**根本没有** listener ⇒ 这是配置错误，直接退出（原来的 `bail!` 只该管这一种）；
+    //   ② 配置里有 listener 但**所有地址都绑定失败**（启动期端口被旧实例占着、地址瞬时不可用）
+    //      ⇒ 保持进程存活，交给下面的 reconciler 每 2s 重试。原实现把这两种混为一谈：
+    //      `active.is_empty()` 即 `bail!("no listeners configured")` —— 一条**误导性**的错误
+    //      信息，且让「旧实例还在关闭、新实例抢不到端口」这种**瞬时**冲突变成启动即退出
+    //      （只能靠 systemd/rc 反复拉起）。reconciler 本就是为「绑定失败后重试」设计的，
+    //      这里不该在它有机会跑之前就把进程杀掉。
+    if cfg.listeners.is_empty() {
         anyhow::bail!("no listeners configured");
+    }
+    if active.lock().await.is_empty() {
+        log::error!(
+            "所有 listener 地址在启动时都未能绑定：进程保持存活，reconciler 每 2s 重试（端口被占用/地址暂不可用可自愈）；若长期如此请检查 address/port"
+        );
     }
 
     // Hot-spawn newly added ports after config reload (removed ports exit accept_loop).
@@ -401,18 +421,25 @@ async fn accept_loop(
     key: String,
     local: std::net::SocketAddr,
 ) -> Result<()> {
-    let port = local.port();
+    // 配置重查定时器：**整个循环只建一次**。
+    //
+    // 原实现在内层 `select!` 里写 `tokio::time::sleep(2s)` —— 每**接受一条连接**就
+    // 新建一个 Sleep、连接处理完再把它 drop，于是连接 churn 场景下每秒钟注册/注销
+    // 上万次 timer-wheel 项（还要拿 timer 分片锁），纯属 accept 热路径上的白工。
+    // 改用一次性 interval：`Interval::tick` 是 cancel-safe 的，每 2s 到期后在任意一次
+    // select 里被选中即可，不会因为中间的 accept 而丢失这一拍。
+    //
+    // 顺带去掉「每连接一次」的配置存活检查（`live.snapshot()` + `bind_key` 的 String
+    // 分配）：它的作用与下面 tick 分支里的检查**完全重复**，只是把「listener 被删后
+    // 停 accept」的时延从「下一条连接」提前到「下一条连接」。改为只在 tick 里检查后，
+    // 删除检测仍在 ≤2s 内完成（与 reconciler 的 2s 节奏一致），而 accept 热路径上不再有
+    // 快照 + 字符串分配。行为差异仅在「listener 被删后、下一条连接恰好落在 tick 之前」
+    // 这一窗口内会多 accept 一两条连接——那两条会由 `handle_connection` 的
+    // `listener vanished` 分支正常收尾。
+    let mut recheck = tokio::time::interval(std::time::Duration::from_secs(2));
+    recheck.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    recheck.tick().await; // interval 的首个 tick 立即就绪，先消费掉
     'accept: loop {
-        // Hot-reload: if this port disappeared from config, stop accepting.
-        {
-            let snap = live.snapshot();
-            if !snap.listeners.iter().any(|l| crate::server::bind_key(l) == key) {
-                log::info!(
-                    "listener {key} removed/changed in config; shutting down accept loop"
-                );
-                return Ok(());
-            }
-        }
         let accept = listener.accept();
         tokio::pin!(accept);
         let (stream, peer) = loop {
@@ -439,7 +466,7 @@ async fn accept_loop(
                         continue 'accept; // 重建 accept future；旧的已出错不能再 poll
                     }
                 },
-                _ = tokio::time::sleep(std::time::Duration::from_secs(2)) => {
+                _ = recheck.tick() => {
                     let snap = live.snapshot();
                     if !snap.listeners.iter().any(|l| crate::server::bind_key(l) == key) {
                         log::info!(

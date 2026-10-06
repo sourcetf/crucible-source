@@ -403,8 +403,25 @@ where
             let end = file_src.is_none() && data.is_empty();
             if let Ok(mut send) = respond.send_response(Response::from_parts(parts, ()), end) {
                 if let Some(src) = file_src {
-                    // 大文件：按 64KiB 分块读盘、逐帧发送。`send_data` 自带 h2 流控背压
-                    //（窗口满时 Pending），所以读盘被发送速率拉住，文件不会进内存。
+                    // 大文件：按 64KiB 分块读盘、逐帧发送。
+                    //
+                    // **必须自己等窗口**：`SendStream::send_data` 在窗口为 0 时**不阻塞、
+                    // 不报错**，而是把 DATA 帧塞进「无界发送缓冲」（h2 0.4 的
+                    // `prioritize::send_data`：`stream.send_flow.available() == 0` 时走
+                    // `stream.pending_send.push_back(...)`）。此前这里的注释写着「自带背压」，
+                    // 而实测（独立 harness，128KiB 流/连接窗口 + 客户端从不发 WINDOW_UPDATE）：
+                    // 一次 `GET` 大文件可让服务端把**整个文件**读进内存（harness 里 32MiB 请求
+                    // → RSS 由 7MiB 涨到 34MiB，纯线性）。真实场景 = 任意客户端对任意大文件发
+                    // 一次请求然后**只读一个字节就停住**（或窗口很小时），服务端按磁盘速度把
+                    // 文件读进 RAM —— 数十个并发就是 OOM（P0 级 DoS 面）。
+                    //
+                    // 正确姿势（h2 文档的 flow control 用法）：`reserve_capacity(n)` 声明
+                    // 「我打算发 n 字节」→ `poll_capacity()` 等到连接真的分配了额度 → 再
+                    // `send_data`。额度只在**对端 WINDOW_UPDATE 之后**才增长，于是读盘被对端
+                    // 的接收速度硬拉住，单流常驻内存上界 = `max_send_buffer_size`(128KiB)。
+                    // 同一 harness 用这个写法：20s 内一个字节都没发出去（正确背压），进程
+                    // RSS 不涨。
+                    //
                     // 循环体里不用 `?`（外层是 spawn 的 `async move` 块，返回 ()）。
                     use tokio::io::{AsyncReadExt, AsyncSeekExt};
                     match tokio::fs::File::open(&src.path).await {
@@ -420,25 +437,59 @@ where
                                 vec![0u8; crate::server::static_files::STREAM_CHUNK];
                             while left > 0 {
                                 let want = left.min(buf.len() as u64) as usize;
-                                match f.read(&mut buf[..want]).await {
+                                let n = match f.read(&mut buf[..want]).await {
                                     Ok(0) => {
                                         log::warn!("h2 stream_file 提前 EOF peer={peer}");
                                         break;
                                     }
-                                    Ok(n) => {
-                                        left -= n as u64;
-                                        if let Err(e) =
-                                            send.send_data(Bytes::copy_from_slice(&buf[..n]), false)
-                                        {
-                                            log::debug!("h2 stream_file send_data peer={peer}: {e}");
-                                            return;
-                                        }
-                                    }
+                                    Ok(n) => n,
                                     Err(e) => {
                                         log::warn!("h2 stream_file read peer={peer}: {e}");
                                         break;
                                     }
+                                };
+                                // 等额度：对端关闭/重置流时 poll_capacity 返回 None（或 Err），
+                                // 此时不能再往无界缓冲里灌数据，直接收摊。
+                                // 额度可能**小于**本次读到的块（对端窗口小/只放行一部分），
+                                // 因此按实际拿到的容量切片发送，剩下的继续等下一轮。
+                                let mut off = 0usize;
+                                while off < n {
+                                    let need = n - off;
+                                    send.reserve_capacity(need);
+                                    let cap =
+                                        match std::future::poll_fn(|cx| send.poll_capacity(cx))
+                                            .await
+                                        {
+                                            Some(Ok(c)) => c,
+                                            Some(Err(e)) => {
+                                                log::debug!(
+                                                    "h2 stream_file poll_capacity peer={peer}: {e}"
+                                                );
+                                                return;
+                                            }
+                                            None => {
+                                                log::debug!(
+                                                    "h2 stream_file 流已关闭（对端不再要数据）peer={peer}"
+                                                );
+                                                return;
+                                            }
+                                        };
+                                    // cap == 0：本次是「额度增加」的伪唤醒/或有别的流吃掉了连接
+                                    // 额度；再等一轮即可（循环里重新 reserve）。
+                                    let take = need.min(cap);
+                                    if take == 0 {
+                                        continue;
+                                    }
+                                    if let Err(e) = send.send_data(
+                                        Bytes::copy_from_slice(&buf[off..off + take]),
+                                        false,
+                                    ) {
+                                        log::debug!("h2 stream_file send_data peer={peer}: {e}");
+                                        return;
+                                    }
+                                    off += take;
                                 }
+                                left -= n as u64;
                             }
                             if let Err(e) = send.send_data(Bytes::new(), true) {
                                 log::debug!("h2 stream_file end peer={peer}: {e}");
@@ -450,6 +501,8 @@ where
                         ),
                     }
                 } else if !data.is_empty() {
+                    // 非文件响应体（≤ REQUEST_BODY_CAP 之类，最大也就 DoH/admin 的几百 KiB）：
+                    // 整块交给 h2 的发送缓冲即可，尺寸有界，不需要走额度等待。
                     let _ = send.send_data(data, true);
                 }
             }
@@ -732,6 +785,106 @@ fn batch_write_demo(frames: &[&[u8]], coalesce: bool, cap: usize) -> io::Result<
     w.into_inner()
 }
 
+/// `Host` / `:authority` 字段值校验：`host [":" port]`，host 为域名 / IPv4 / IPv6 字面量。
+///
+/// 这是 `h1::is_valid_host_value` 的**等价副本**（判据逐条相同，理由见那里的注释）。
+/// 为什么不直接引用 h1 的现成函数：本轮纪律禁止改 `h1.rs`（并发 agent 正在改它），
+/// 而 h1 的该函数是私有 `fn`；把它放宽到 `pub(crate)` 同样是对 h1.rs 的改动。
+/// **判据若变更必须三处同步**（`h1.rs` / 本函数 / 本模块单测）。
+///
+/// 背景：h2/h3 的权威名来自 `:authority` 伪头（crate 放进 `uri().authority()`），
+/// `Host` 头只作为可选回退。上游 crate 只校验「两者一致 / 非空」，**不校验值的语义** ——
+/// 于是 `:authority: ..`、`host:99999`（端口超 u16）、`user@host` 之类畸形值在 h2/h3
+/// 会被放行，而 h1 早已 400。权威名是 DoH 主机白名单分流、虚拟主机/重定向构造、
+/// admin 同源判定的输入，三协议必须同判。
+pub(crate) fn authority_value_ok(v: &str) -> bool {
+    if v.is_empty() || v.len() > 255 || v != v.trim() {
+        return false;
+    }
+    let host = if let Some(rest) = v.strip_prefix('[') {
+        // IPv6 字面量 `[ ... ]`，其后可选 `:port`。字面量本体交给 std 解析。
+        let Some(end) = rest.find(']') else {
+            return false;
+        };
+        if rest[..end].parse::<std::net::Ipv6Addr>().is_err() {
+            return false;
+        }
+        let after = &rest[end + 1..];
+        if after.is_empty() {
+            return true;
+        }
+        let Some(p) = after.strip_prefix(':') else {
+            return false;
+        };
+        return port_value_ok(p);
+    } else {
+        match v.split_once(':') {
+            Some((h, p)) => {
+                if !port_value_ok(p) {
+                    return false;
+                }
+                h
+            }
+            None => v,
+        }
+    };
+    !host.is_empty()
+        && host
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'_'))
+        // 纯标点的「主机名」（`.` / `..` / `-` / `_`）不是主机。
+        && host.bytes().any(|b| b.is_ascii_alphanumeric())
+}
+
+/// `port = *DIGIT`：非空、纯数字，且必须落在 u16 范围（与 `h1::port_value_ok` 同判据）。
+fn port_value_ok(p: &str) -> bool {
+    !p.is_empty()
+        && p.bytes().all(|b| b.is_ascii_digit())
+        && p.parse::<u32>().map(|n| n <= 65535).unwrap_or(false)
+}
+
+/// 校验 h2/h3 请求的权威名（`:authority` + 可选 `Host` 头）。`Err` 时调用方回 400。
+///
+/// 规则与 h1 的 `host_header_ok` 对齐：
+///   - 出现多于一行 `Host` ⇒ 拒绝；
+///   - `Host` / `:authority` 的值必须通过 [`authority_value_ok`]；
+///   - 两者同时出现时必须一致（RFC 9113 §8.3.1 / RFC 9114 §4.3.1，大小写不敏感，
+///     与 `http::uri::Authority` 的 host 大小写不敏感语义一致）；
+///   - 两者都缺失时放行（h2/h3 允许省略 `:authority`，如 `OPTIONS *`；h1 的
+///     absolute-form 同样允许省略 `Host`）。
+pub(crate) fn request_authority_ok(
+    uri: &http::Uri,
+    headers: &http::HeaderMap,
+) -> Result<(), &'static str> {
+    let host_count = headers.get_all(http::header::HOST).iter().count();
+    if host_count > 1 {
+        return Err("multiple Host header fields");
+    }
+    let host = match headers.get(http::header::HOST) {
+        Some(v) => match v.to_str() {
+            Ok(s) => Some(s),
+            Err(_) => return Err("invalid Host header value"),
+        },
+        None => None,
+    };
+    if let Some(h) = host {
+        if !authority_value_ok(h) {
+            return Err("invalid Host header value");
+        }
+    }
+    if let Some(a) = uri.authority() {
+        if !authority_value_ok(a.as_str()) {
+            return Err("invalid :authority");
+        }
+        if let Some(h) = host {
+            if !h.eq_ignore_ascii_case(a.as_str()) {
+                return Err("Host and :authority disagree");
+            }
+        }
+    }
+    Ok(())
+}
+
 async fn handle_h2(
     req: Request<H2Body>,
     live: Arc<LiveConfig>,
@@ -741,6 +894,17 @@ async fn handle_h2(
     use crate::server::static_files;
 
     let mut req = req;
+    // RFC 9113 §8.3.1：`:authority` / `Host` 的值必须在**任何路由判定之前**校验，
+    // 否则畸形权威名会被 DoH 分流 / 虚拟主机 / admin 同源判定当成可信输入。
+    if let Err(why) = request_authority_ok(req.uri(), req.headers()) {
+        return tag(
+            Response::builder()
+                .status(StatusCode::BAD_REQUEST)
+                .body(Bytes::from(format!("bad request: {why}")))
+                .unwrap(),
+            "h2",
+        );
+    }
     let path = req.uri().path().to_string();
     crate::server::telemetry::record_request();
 
@@ -798,8 +962,14 @@ async fn handle_h2(
         if dns_eff.enabled && dns_eff.doh.enabled {
             // 只有「确实是 DoH 请求」才收 body —— 否则会给普通上传白白套上 8MiB 上限。
             // 判定条件与 doh_prepared 的前几个早退分支保持一致（path + host）。
-            let host = req.headers().get(http::header::HOST).cloned();
-            if crate::server::dns::dot_doh::is_doh_request(&dns_eff, req.uri().path(), host.as_ref())
+            //
+            // 权威名必须取 **uri** 形态：HTTP/2 的 `:authority` 伪头由 crate 放进
+            // `Request::uri().authority()`，`HeaderMap` 里**没有** `Host`（真实 h2 客户端
+            // 也不发 Host）。此前用 `headers().get(HOST)` 恒为 None ⇒ 配了 `[dns.doh].hostnames`
+            // 白名单的部署在 h2 下 `is_doh_request` 恒 false，DoH 请求全部落到静态层 404。
+            // `is_doh_request_uri` 就是为 h2/h3 准备的（Host 优先、回退 authority），
+            // 与 `doh_prepared` 里的 `request_authority` 同一判据。
+            if crate::server::dns::dot_doh::is_doh_request_uri(&dns_eff, req.uri())
             {
                 let collected = match collect_bytes(req, REQUEST_BODY_CAP).await {
                     Ok(r) => r,
@@ -833,40 +1003,54 @@ async fn handle_h2(
     // 配置了 basic_auth 的站点在 ALPN=h2 / prior-knowledge 下对任何人敞开。
     // 与 h1 同一实现（check_listener_headers_at）：带来源 IP 的失败退避，
     // 退避期回 429 而不是再跑一次 argon2。
+    //
+    // P2（与 h1 同语义）：**admin 路径跳过 listener 级 basic_auth**。管理面由 admin 门
+    // 单独把关（serve_io 的 admin 前置门 + admin::handle 里的 admin_gate）。否则同一
+    // 端口既开站点 basic_auth 又开面板时，浏览器对同一 realm 只发**一组** `Authorization`
+    // 头，却要同时过「站点口令」与「管理员口令」两道 Basic 门 ⇒ 面板在该端口不可达
+    //（除非两组凭据恰好相同）。admin 路径的鉴权不会因此变松：admin_gate 对未配置
+    // 用户/无凭据一律 fail-closed（basic_auth::check_admin_headers）。
+    let admin_path = crate::server::access::is_admin_path(&snap.admin.path, &path);
     if let Some(ba) = &lc.basic_auth {
-        match crate::server::basic_auth::check_listener_headers_at(req.headers(), ba, peer.ip()) {
-            crate::server::basic_auth::BasicCheck::Ok => {}
-            crate::server::basic_auth::BasicCheck::Unauthorized => {
-                return tag(
-                    Response::builder()
-                        .status(StatusCode::UNAUTHORIZED)
-                        .header(
-                            http::header::WWW_AUTHENTICATE,
-                            format!("Basic realm=\"{}\"", ba.realm),
-                        )
-                        .body(Bytes::from_static(b"unauthorized"))
-                        .unwrap(),
-                    "acl",
-                )
-            }
-            crate::server::basic_auth::BasicCheck::Throttled(d) => {
-                return tag(
-                    Response::builder()
-                        .status(StatusCode::TOO_MANY_REQUESTS)
-                        .header(
-                            http::header::RETRY_AFTER,
-                            crate::server::basic_auth::retry_after_secs(d).to_string(),
-                        )
-                        .body(Bytes::from_static(b"too many failed authentication attempts"))
-                        .unwrap(),
-                    "acl",
-                )
+        if !admin_path {
+            match crate::server::basic_auth::check_listener_headers_at(
+                req.headers(),
+                ba,
+                peer.ip(),
+            ) {
+                crate::server::basic_auth::BasicCheck::Ok => {}
+                crate::server::basic_auth::BasicCheck::Unauthorized => {
+                    return tag(
+                        Response::builder()
+                            .status(StatusCode::UNAUTHORIZED)
+                            .header(
+                                http::header::WWW_AUTHENTICATE,
+                                format!("Basic realm=\"{}\"", ba.realm),
+                            )
+                            .body(Bytes::from_static(b"unauthorized"))
+                            .unwrap(),
+                        "acl",
+                    )
+                }
+                crate::server::basic_auth::BasicCheck::Throttled(d) => {
+                    return tag(
+                        Response::builder()
+                            .status(StatusCode::TOO_MANY_REQUESTS)
+                            .header(
+                                http::header::RETRY_AFTER,
+                                crate::server::basic_auth::retry_after_secs(d).to_string(),
+                            )
+                            .body(Bytes::from_static(b"too many failed authentication attempts"))
+                            .unwrap(),
+                        "acl",
+                    )
+                }
             }
         }
     }
 
     // P2-21（任务 4）：admin 暴露面——[admin].listeners_allow 非空时仅列出的端口可达。
-    if crate::server::access::is_admin_path(&snap.admin.path, &path) && !snap.admin.listener_allowed(lc.port) {
+    if admin_path && !snap.admin.listener_allowed(lc.port) {
         return tag(
             Response::builder()
                 .status(StatusCode::NOT_FOUND)
@@ -1069,10 +1253,98 @@ mod tests {
         let src = include_str!("h2.rs");
         let handle_pos = src.find("async fn handle_h2").expect("handle_h2");
         let tail = &src[handle_pos..];
-        let ba = tail.find("check_listener_headers").expect("basic_auth check");
-        let admin = tail.find("admin::handle").expect("admin call");
+        let ba = tail
+            .find("check_listener_headers_at(")
+            .expect("basic_auth check");
+        let admin = tail
+            .find("crate::server::admin::handle(")
+            .expect("admin call");
         let ip = tail.find("is_allowed").expect("ip_access");
         assert!(ip < ba && ba < admin, "order must be ip_access → basic_auth → admin");
+    }
+
+    /// P2 回归：admin 路径必须跳过 listener 级 basic_auth（否则同端口「站点口令 + 面板」
+    /// 时，一组 Authorization 要过两道 Basic 门 ⇒ 面板不可达）。
+    #[test]
+    fn h2_admin_path_skips_listener_basic_auth() {
+        let src = include_str!("h2.rs");
+        let pos = src.find("async fn handle_h2").expect("handle_h2");
+        let tail = &src[pos..];
+        let guard = tail.find("if !admin_path {").expect("admin_path guard");
+        let ba = tail
+            .find("check_listener_headers_at(")
+            .expect("basic_auth check");
+        assert!(
+            guard < ba,
+            "check_listener_headers 必须被 if !admin_path 包住（guard={guard} ba={ba}）"
+        );
+    }
+
+    /// h2/h3 权威名校验必须与 h1 同判据（`h1::is_valid_host_value` 的等价副本）。
+    /// 这些畸形值此前在 h2/h3 会被上游 crate 放行（crate 只校验「非空 / 两者一致」）。
+    #[test]
+    fn authority_value_validation_matches_h1() {
+        for ok in [
+            "example.com",
+            "host:8080",
+            "host:65535",
+            "[::1]",
+            "[::1]:8443",
+            "[::ffff:1.2.3.4]",
+            "127.0.0.1:443",
+        ] {
+            assert!(authority_value_ok(ok), "应接受合法 authority: {ok:?}");
+        }
+        for bad in [
+            "",
+            " ",
+            "a b",
+            "a,b",
+            "..",
+            ".",
+            "-",
+            "_",
+            "host:65536",
+            "host:99999",
+            "[....]",
+            "[:]",
+            "[:::]",
+            "user@host",
+            "[1:2:3:4:5:6:7:8:9]",
+            "[::1]:99999",
+            " example.com",
+            "example.com ",
+        ] {
+            assert!(!authority_value_ok(bad), "应拒绝非法 authority: {bad:?}");
+        }
+    }
+
+    #[test]
+    fn request_authority_ok_checks_host_and_authority() {
+        use http::{HeaderMap, HeaderValue, Uri};
+        let no_host = HeaderMap::new();
+        let uri = |s: &str| s.parse::<Uri>().unwrap();
+        let hdr = |v: &'static str| {
+            let mut h = HeaderMap::new();
+            h.insert(http::header::HOST, HeaderValue::from_static(v));
+            h
+        };
+        // 两者都缺失：放行（h2/h3 允许省略 :authority，如 OPTIONS *）
+        assert!(request_authority_ok(&uri("/x"), &no_host).is_ok());
+        // 非法 :authority（端口超 u16 / 纯标点）——crate 会放行，必须由我们挡住
+        assert!(request_authority_ok(&uri("https://host:99999/x"), &no_host).is_err());
+        assert!(request_authority_ok(&uri("https://../x"), &no_host).is_err());
+        // 非法 Host 头（无 :authority）
+        assert!(request_authority_ok(&uri("/x"), &hdr("..")).is_err());
+        // Host 与 :authority 不一致（RFC 9113 §8.3.1）
+        assert!(request_authority_ok(&uri("https://example.com/x"), &hdr("evil.com")).is_err());
+        // 一致（大小写不敏感）
+        assert!(request_authority_ok(&uri("https://Example.com/x"), &hdr("example.com")).is_ok());
+        // 多行 Host
+        let mut multi = HeaderMap::new();
+        multi.append(http::header::HOST, HeaderValue::from_static("a.com"));
+        multi.append(http::header::HOST, HeaderValue::from_static("b.com"));
+        assert!(request_authority_ok(&uri("/x"), &multi).is_err());
     }
 
     /// P0 回归：请求体适配器必须显式归还 h2 接收窗口（release_capacity）。
@@ -1109,17 +1381,25 @@ mod tests {
 
     /// P0 回归：在飞配额不得在 accept 循环里 await（await 期间 conn 不被 poll，
     /// 连接驱动停摆 → 一条恶意连接即可让所有 h2 连接失去响应）。
+    ///
+    /// 判据：`serve_io` 里 `tokio::spawn`（把每请求工作丢进任务）必须**早于**配额获取
+    /// `acquire_owned`。旧版这条测试找的字面量（`while let Some(result) = conn.accept()`）
+    /// 在 accept 循环被改写成 `loop { select! }` 后已不存在，于是 `find` 命中的是**测试自身**
+    /// 源码里的那串字面量 —— 测试变成永远通过的空壳。这里改成找生产代码里的
+    /// `tokio::spawn` / `acquire_owned`（两者在文件里都只有生产出现早于测试模块），
+    /// 位置比较才真正约束实现。
     #[test]
     fn h2_inflight_permit_not_awaited_in_accept_loop() {
         let src = include_str!("h2.rs");
-        let loop_pos = src
-            .find("while let Some(result) = conn.accept().await")
-            .expect("accept loop");
+        let loop_pos = src.find("async fn serve_io").expect("serve_io");
         let tail = &src[loop_pos..];
-        let spawn_pos = tail.find("tokio::spawn").expect("spawn");
+        let spawn_pos = tail.find("tokio::spawn").expect("spawn in accept loop");
+        let acq_pos = tail
+            .find("acquire_owned")
+            .expect("acquire_owned in the per-request task");
         assert!(
-            !tail[..spawn_pos].contains("acquire"),
-            "permit acquisition must happen inside the spawned task, not in the accept loop"
+            acq_pos > spawn_pos,
+            "配额必须在 spawn 出来的任务里获取（acquire_owned 位置 {acq_pos} 应晚于 spawn {spawn_pos}）"
         );
     }
 }

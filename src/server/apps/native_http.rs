@@ -189,6 +189,16 @@ static UDS_POOL: Lazy<
 #[cfg(unix)]
 const UDS_POOL_CAP: usize = 16;
 
+/// h1 引擎 sidecar 代理的墙钟上限：整段（发送 + 响应头 + 收集响应体）共用一个 deadline。
+///
+/// 这是 h1 引擎代理**唯一**没有超时的路径：proxy.rs 有 UPSTREAM_*_TIMEOUT，fastcgi.rs 有
+/// FCGI_TIMEOUT，sidecar_engine 的 h2/h3 字节路径有 SIDECAR_TIMEOUT，CGI/deps 各有
+/// init_timeout —— 只有这里裸奔。一个「接受连接但永不回包」的 sidecar 会让请求任务、UDS
+/// 池槽位与 fd 永久挂着；重复请求可无界堆积任务（fd/task 泄漏级联）。与
+/// `sidecar_engine::SIDECAR_TIMEOUT` 同值同语义。
+#[cfg(unix)]
+const SIDECAR_TIMEOUT: Duration = Duration::from_secs(30);
+
 #[cfg(unix)]
 async fn checkout_unix(sock: &Path) -> Result<hyper::client::conn::http1::SendRequest<Full<Bytes>>> {
     use hyper::client::conn::http1;
@@ -255,6 +265,7 @@ async fn proxy_unix(
     use hyper::client::conn::http1;
 
     let (parts, body) = req.into_parts();
+    let is_head = parts.method == http::Method::HEAD;
     // 任务 6（OOM 防护）：sidecar 请求体上限 32MiB；Limited 错误已装箱 → map_err。
     let collected = http_body_util::Limited::new(body, crate::server::h1::APP_BODY_CAP)
         .collect()
@@ -296,17 +307,32 @@ async fn proxy_unix(
     if !sender.is_ready() {
         sender = checkout_unix(sock).await?;
     }
-    let resp = sender.send_request(build()?).await.context("sidecar request")?;
-    let (rparts, rbody) = resp.into_parts();
-    // 任务 6（OOM 防护）：sidecar 响应体上限 64MiB。
-    let rbytes = http_body_util::Limited::new(rbody, crate::server::h1::UPSTREAM_BODY_CAP)
-        .collect()
-        .await
-        .map_err(|e| anyhow::anyhow!("collect upstream body: {e}"))?
-        .to_bytes();
+    // 整段一个 deadline（见 SIDECAR_TIMEOUT 说明）。超时后这条连接已不可复用，直接丢弃、
+    // 不 checkin —— 否则一个卡死的 sidecar 连接会被放回池里毒化后续请求。
+    let (rparts, rbytes) = tokio::time::timeout(SIDECAR_TIMEOUT, async {
+        let resp = sender.send_request(build()?).await.context("sidecar request")?;
+        let (rparts, rbody) = resp.into_parts();
+        // 任务 6（OOM 防护）：sidecar 响应体上限 64MiB。
+        let rbytes = http_body_util::Limited::new(rbody, crate::server::h1::UPSTREAM_BODY_CAP)
+            .collect()
+            .await
+            .map_err(|e| anyhow::anyhow!("collect upstream body: {e}"))?
+            .to_bytes();
+        Ok::<_, anyhow::Error>((rparts, rbytes))
+    })
+    .await
+    .map_err(|_| anyhow::anyhow!("sidecar timeout after {SIDECAR_TIMEOUT:?}"))??;
     checkin_unix(sock, sender);
+    // 上游响应头必须净化后再透传：sidecar 是「挂在某个路径前缀下的应用」，它回的
+    // `Content-Length`/`Transfer-Encoding` 与我们重建的 body 不符时会造成响应走私
+    // （与 proxy.rs / sidecar_engine.rs 同一套净化；本路径此前漏了）。
+    let headers = super::fastcgi::sanitize_response_headers(
+        rparts.headers,
+        rbytes.len(),
+        is_head,
+    );
     let mut out = Response::builder().status(rparts.status);
-    for (k, v) in rparts.headers.iter() {
+    for (k, v) in headers.iter() {
         out = out.header(k, v);
     }
     Ok(out.body(full(rbytes)).unwrap_or_else(|_| {

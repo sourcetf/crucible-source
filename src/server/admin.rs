@@ -7,6 +7,7 @@
 //!   `/api/config/toml`、`/api/listener/save|delete`、`/api/apps/save`、`/api/ssl/save`、
 //!   `/api/file_open/save`、`/api/autoindex/save`、`/api/page_rules/save`、
 //!   `/api/proxy_rules/save`、`/api/access_log/save`、`/api/ip_access/save`、`/api/geoip/save`
+//!   （站点级 Basic Auth 走 `/api/basic_auth/save`：明文进、后端加盐哈希）
 //! - 文件管理：`/api/files`（GET list/read、PUT/POST write）、`/api/files/mkdir`、`/api/files/delete`
 //! - GeoIP 面板：`/api/geoip/{lookup,status,filter,sources,conflicts,edit,audit,cron,update}`
 //! - 账号：`/api/password`（明文进、argon2id/yescrypt 盐哈希落盘）
@@ -259,9 +260,16 @@ async fn handle_inner(req: Request<Full<Bytes>>, live: Arc<LiveConfig>) -> Respo
                 )
             })
             .collect();
+        // 引擎 reconcile 运行状态（§16.19 #1 / §17 坑 #13）：面板必须能区分
+        // 「已就绪 / 材料缺失」，不能只显示配置里的 apps 条数 —— 那会掩盖
+        // 「端口在跑但引擎没起来」这类不同步。用**只读**探测（不 spawn 任何进程，
+        // 与 reconcile 的判定共用同一组 helper），见 engines_overview_json。
+        let active_engines = engines_overview_json(&cfg);
         let body = format!(
-            "{{\n  \"listeners\": {},\n  \"access_log\": {},\n  \"geoip\": {},\n  \"ip_access\": {{\n    \"allow\": {},\n    \"deny\": {}\n  }},\n  \"tls_stack\": {},\n  \"tls_legacy\": {}\n}}",
+            "{{\n  \"version\": {},\n  \"listeners\": {},\n  \"active_engines\": {},\n  \"access_log\": {},\n  \"geoip\": {},\n  \"ip_access\": {{\n    \"allow\": {},\n    \"deny\": {}\n  }},\n  \"tls_stack\": {},\n  \"tls_legacy\": {}\n}}",
+            json_str(env!("CARGO_PKG_VERSION")),
             serde_json_array(&listeners),
+            active_engines,
             cfg.access_log.enable,
             cfg.geoip.enabled,
             serde_json_array(&cfg.ip_access.allow),
@@ -353,8 +361,15 @@ async fn handle_inner(req: Request<Full<Bytes>>, live: Arc<LiveConfig>) -> Respo
         // ——面板会显示一个"看起来正常"的地址，实际连不进去）。
         let pid = crate::server::tor_hs::running_pid(&hs);
         // outbound 只报告**配置了什么**，不报告探测结果（探测要走网络/stat，不该在 HTTP 请求里做）
-        let env_unix = std::env::var("CRUCIBLE_TOR_SOCKS_UNIX").unwrap_or_default();
-        let env_tcp = std::env::var("CRUCIBLE_TOR_SOCKS").unwrap_or_default();
+        //
+        // 必须走 `env_lock::read_static_env`（启动期缓存），不能裸 `std::env::var`：
+        // 引擎请求期间 `env_lock` 会 `setenv`/`unsetenv`，glibc 的 setenv 可能 realloc
+        // `environ` —— 此刻任何线程的 `getenv`（哪怕读别的键）都会踩到已释放内存
+        // （SIGSEGV / 读到垃圾值）。本端点与引擎请求并发，属同一 P0 竞争类。
+        let env_unix = crate::server::apps::env_lock::read_static_env("CRUCIBLE_TOR_SOCKS_UNIX")
+            .unwrap_or_default();
+        let env_tcp =
+            crate::server::apps::env_lock::read_static_env("CRUCIBLE_TOR_SOCKS").unwrap_or_default();
         return json_ok(
             serde_json::json!({
                 "enabled": hs.enabled,
@@ -752,6 +767,115 @@ async fn handle_inner(req: Request<Full<Bytes>>, live: Arc<LiveConfig>) -> Respo
                 return text_err(StatusCode::BAD_REQUEST, format!("{e:#}"));
             }
             finish_write(&live, &tree, "ip_access saved")
+        })
+        .await;
+    }
+    // 站点级 Basic Auth（规格 §16.13 / §16.19 #8「访问控制 — IP、basic auth」）。
+    //
+    // 为什么单独一个端点而不是塞进 /api/listener/save：listener 保存是「整表替换」，
+    // 而 basic_auth 的核心是**口令哈希** —— 规格 §3.1/§16.13 明确「UI 只收集明文、
+    // 禁止让用户粘贴哈希」，所以必须由后端在这里把明文哈希进 password_hash；
+    // UI 无法（也不应）在 listener JSON 里自带哈希。此前面板**根本没有** basic auth
+    // 的入口（只能手改 config.toml），本端点补齐这条能力。
+    if path.ends_with("/api/basic_auth/save") && method == Method::POST {
+        return with_json(req, |v| {
+            let port = match json_port(&v, "port") {
+                Ok(p) => p,
+                Err(resp) => return resp,
+            };
+            let enabled = v.get("enabled").and_then(|b| b.as_bool()).unwrap_or(false);
+            let mut tree = match cfg_edit::load_tree(live.path()) {
+                Ok(t) => t,
+                Err(e) => return text_err(StatusCode::BAD_REQUEST, format!("{e:#}")),
+            };
+            if !enabled {
+                // 关闭：删掉该 listener 的 basic_auth 节（其余 listener 字段不动）。
+                if let Err(e) = cfg_edit::set_listener_key(&mut tree, port, "basic_auth", None) {
+                    return text_err(StatusCode::BAD_REQUEST, format!("{e:#}"));
+                }
+                return finish_write(&live, &tree, "basic_auth disabled");
+            }
+            let username = v
+                .get("username")
+                .and_then(|s| s.as_str())
+                .unwrap_or("")
+                .trim()
+                .to_string();
+            if username.is_empty() {
+                return bad_request("启用 basic_auth 需要用户名");
+            }
+            if let Err(e) = check_str("basic_auth.username", &username, MAX_SHORT_STR) {
+                return bad_request(e);
+            }
+            // 用户名参与 Basic 鉴权的字符串比较：空白/引号会让面板上「看起来一样」的名字
+            // 永远登录不上（或在 URL 编码后产生歧义）。
+            if username
+                .chars()
+                .any(|c| c.is_control() || c.is_whitespace() || c == '"' || c == '\\')
+            {
+                return bad_request("basic_auth.username 不能含空白、控制字符、引号或反斜杠");
+            }
+            let realm = v
+                .get("realm")
+                .and_then(|s| s.as_str())
+                .unwrap_or("")
+                .trim()
+                .to_string();
+            let realm = if realm.is_empty() {
+                "Restricted".to_string()
+            } else {
+                realm
+            };
+            // realm 会进 `WWW-Authenticate: Basic realm="…"`：与 admin.realm 同一判据
+            //（含换行/引号会让 HeaderValue 构造失败 → 未认证请求 panic）。
+            if let Err(e) = check_str("basic_auth.realm", &realm, MAX_SHORT_STR) {
+                return bad_request(e);
+            }
+            if !realm.bytes().all(|b| (0x20..0x7f).contains(&b)) {
+                return bad_request("basic_auth.realm 只能是可见 ASCII（会被写进 WWW-Authenticate 头）");
+            }
+            if realm.contains('"') || realm.contains('\\') {
+                return bad_request("basic_auth.realm 不能含引号或反斜杠");
+            }
+            // 口令：非空则现算哈希；留空表示「不改动已存哈希」（编辑时不必重输）。
+            let password = v.get("password").and_then(|s| s.as_str()).unwrap_or("");
+            let hash = if password.is_empty() {
+                let existing = cfg
+                    .listeners
+                    .iter()
+                    .find(|l| l.port == port)
+                    .and_then(|l| l.basic_auth.as_ref())
+                    .map(|b| b.password_hash.clone())
+                    .filter(|h| !h.is_empty());
+                match existing {
+                    Some(h) => h,
+                    None => {
+                        return bad_request(
+                            "启用 basic_auth 需要设置口令（留空口令仅在已有哈希时可省略）",
+                        )
+                    }
+                }
+            } else {
+                if password.len() > MAX_PASSWORD_BYTES {
+                    return bad_request(format!(
+                        "口令过长（{} > {MAX_PASSWORD_BYTES} 字节）",
+                        password.len()
+                    ));
+                }
+                match password::hash_password(password) {
+                    Ok(h) => h,
+                    Err(e) => return text_err(StatusCode::BAD_REQUEST, format!("{e:#}")),
+                }
+            };
+            let table = toml_table(&[
+                ("realm", toml::Value::String(realm)),
+                ("username", toml::Value::String(username)),
+                ("password_hash", toml::Value::String(hash)),
+            ]);
+            if let Err(e) = cfg_edit::set_listener_key(&mut tree, port, "basic_auth", Some(table)) {
+                return text_err(StatusCode::BAD_REQUEST, format!("{e:#}"));
+            }
+            finish_write(&live, &tree, "basic_auth saved")
         })
         .await;
     }
@@ -1375,7 +1499,39 @@ fn save_ssl(live: &Arc<LiveConfig>, v: &Json) -> Response<BoxBody> {
     };
     // 字段级合并（不是整表替换）：面板表单里没有的 ssl 键（ECH cover 证书族、
     // OCSP 路径等）必须保留，否则「保存 TLS」会把它们静默删掉。
-    let merged = match cfg_edit::merge_listener_table(&mut tree, port, "ssl", ssl_val) {
+    //
+    // 但「表单拥有的键」必须能**被清空**：面板对清空的选填框发 `null`，经 json_to_toml
+    // 变成「该键不存在」。若这些键也走「保留基底」语义，用户清空 cert_ec / sni_name /
+    // ocsp_der_path 后旧值会留在磁盘上（面板显示已清空、实际没变）。所以这里显式声明
+    // 表单完整拥有的键集合：它们以本次提交为准（缺了就删）。
+    const SSL_FORM_KEYS: &[&str] = &[
+        "cert",
+        "key",
+        "cert_ec",
+        "key_ec",
+        "versions",
+        "ciphers",
+        "prefer_tls13",
+        "ech",
+        "ech_keys",
+        "ech_public_name",
+        "ech_cipher_suite",
+        "ech_max_name_length",
+        "ech_advertise",
+        "early_data",
+        "sni_only",
+        "sni_name",
+        "ocsp_der_path",
+        "psk_identity",
+        "psk_key",
+        "psk",
+        "pqc",
+        "groups",
+        "enable_nss",
+        "enable_tomcrypt",
+    ];
+    let merged = match cfg_edit::merge_listener_table(&mut tree, port, "ssl", ssl_val, SSL_FORM_KEYS)
+    {
         Ok(m) => m,
         Err(e) => return text_err(StatusCode::BAD_REQUEST, format!("{e:#}")),
     };
@@ -2613,6 +2769,86 @@ fn serde_json_array(items: &[String]) -> String {
     }
     s.push(']');
     s
+}
+
+/// 概览里的引擎运行时就绪度（§16.19 #1 / §17 坑 #13）。
+///
+/// 只读探测：不 spawn 任何进程，与 `apps::reconcile_apps_runtime` 的判定共用同一组
+/// helper（`native_http::lib_available/sidecar_available/uds_socket_available`）。
+/// 每个条目 `{port, idx, engine, enabled, via, ready}`：
+///   - `via`：材料类型 —— `php-fpm` / `lib`(.so) / `sidecar`(deps/bin/index) /
+///     `uds`(socket) / `missing`(都没有) / `unknown`(未登记引擎)；
+///   - `ready`：`true`/`false`；`null` 表示无法在不产生副作用的前提下判定
+///     （php 由 `php::reconcile` 拉起，本处不重复 spawn、也不连它的 socket）。
+fn engines_overview_json(cfg: &Config) -> String {
+    let mut s = String::from("[");
+    let mut first = true;
+    for l in &cfg.listeners {
+        for (idx, a) in l.apps.iter().enumerate() {
+            // "do" 是 jsp 的别名，与 reconcile 同一归一化。
+            let mut eng = a.engine.to_ascii_lowercase();
+            if eng == "do" {
+                eng = "jsp".into();
+            }
+            let (via, ready) = engine_runtime_status(a, l, &eng);
+            if !first {
+                s.push(',');
+            }
+            first = false;
+            s.push_str(&format!(
+                "{{\"port\":{},\"idx\":{},\"engine\":{},\"enabled\":{},\"via\":{},\"ready\":{}}}",
+                l.port,
+                idx,
+                json_str(&a.engine),
+                a.enabled,
+                json_str(via),
+                match ready {
+                    Some(b) => b.to_string(),
+                    None => "null".to_string(),
+                }
+            ));
+        }
+    }
+    s.push(']');
+    s
+}
+
+/// 单个引擎的就绪度（只读，绝不 spawn）。返回 `(via, ready)`；`ready=None` 表示
+/// 无法在不产生副作用的前提下判定。
+fn engine_runtime_status(
+    app: &crate::config::AppRouteConfig,
+    lc: &ListenerConfig,
+    engine: &str,
+) -> (&'static str, Option<bool>) {
+    use crate::server::apps::native_http as nh;
+    match engine {
+        // php 走 php-fpm（由 php::reconcile 拉起）：本处不 spawn、也不连接其 socket，
+        // 只标注 managed，避免 /api/overview 触发副作用。
+        "php" => ("php-fpm", None),
+        // jsp 优先 UDS sidecar（显式 socket 或 deps/bin/index 自动分支）。
+        "jsp" => {
+            if nh::uds_socket_available(app) {
+                ("uds", Some(true))
+            } else if nh::sidecar_available(app, lc) {
+                ("sidecar", Some(true))
+            } else {
+                ("missing", Some(false))
+            }
+        }
+        "c" | "rust" | "go" | "lua" | "asp" | "aspnet" | "tsx" | "python" | "ruby"
+        | "perl" | "cgi" | "wsgi" | "asgi" | "psgi" | "rack" | "uwsgi" => {
+            if nh::lib_available(app, engine) {
+                ("lib", Some(true))
+            } else if nh::sidecar_available(app, lc) {
+                ("sidecar", Some(true))
+            } else if nh::uds_socket_available(app) {
+                ("uds", Some(true))
+            } else {
+                ("missing", Some(false))
+            }
+        }
+        _ => ("unknown", None),
+    }
 }
 
 /// `/api/config/json` 回显副本的凭据打码（只改副本，不碰 live 配置与磁盘）。

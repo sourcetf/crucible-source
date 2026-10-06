@@ -4,6 +4,11 @@
 #include <stdlib.h>
 #include <string.h>
 
+int appengine_abi_version(void)
+{
+    return APPENGINE_ABI_VERSION;
+}
+
 char *appengine_strdup(const char *s)
 {
     size_t n;

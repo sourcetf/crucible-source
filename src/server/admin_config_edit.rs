@@ -408,19 +408,27 @@ pub fn set_listener_key(
     Ok(())
 }
 
-/// 字段级合并：以磁盘上该 listener 现有的 `key` 表为基底，用 `incoming` 覆盖/新增；
-/// **`incoming` 里没有的键保留原值**。返回合并后的表（`None` = 删除该节，保持旧语义）。
+/// 字段级合并：以磁盘上该 listener 现有的 `key` 表为基底，用 `incoming` 覆盖/新增。
 ///
-/// 为什么需要：面板的 TLS 表单只包含它认识的字段，而 `ech_cover_cert` / `ech_cover_key` /
-/// `ech_cover_cert_ec` / `ech_cover_key_ec` / `ech_cover_ocsp_der_path` / `ocsp_der_path`
-/// 等**不在表单里**。此前 `set_listener_key(..., "ssl", Some(表单表))` 是整表替换 ⇒
-/// 点一次「保存 TLS」就把这些字段静默删掉：ECH 外层（cover）证书消失，主动探测者
+/// `managed` 是**调用方（表单）完整拥有**的键集合：
+///   * `managed` 里的键：以 `incoming` 为准 —— incoming 里有就写入，没有就**从基底删除**
+///     （面板把某个选填框清空时会发 `null`，经 [`json_to_toml`] 变成「该键不存在」；
+///     若这里不删，用户「清空 cert_ec / sni_name / ocsp_der_path…」后旧值会**留着不动**，
+///     面板显示已清空、磁盘却仍有值，属于「改了不生效」）；
+///   * `managed` 之外的键：**保留基底原值**（表单里没有的 ECH cover 证书族、
+///     `ech_cover_ocsp_der_path`、`min_version`/`max_version` 等必须原样带回，否则
+///     点一次「保存 TLS」就把它们静默删掉）。
+///
+/// 为什么需要保留语义：面板的 TLS 表单只包含它认识的字段，而 `ech_cover_cert` /
+/// `ech_cover_key` / `ech_cover_cert_ec` / `ech_cover_key_ec` / `ech_cover_ocsp_der_path`
+/// 等**不在表单里**。整表替换会把它们静默删掉：ECH 外层（cover）证书消失，主动探测者
 /// 能拿到内层真实证书，且面板既看不到也无法重新录入。
 pub fn merge_listener_table(
     tree: &mut Toml,
     port: u16,
     key: &str,
     incoming: Option<Toml>,
+    managed: &[&str],
 ) -> Result<Option<Toml>> {
     let Some(inc) = incoming else { return Ok(None) };
     let inc_tbl = match inc.as_table() {
@@ -433,6 +441,13 @@ pub fn merge_listener_table(
         t.get(key).and_then(|v| v.as_table()).cloned()
     };
     let mut base = existing.unwrap_or_default();
+    // 先删掉「表单拥有、但本次没有提交」的键（= 用户清空了该字段）。
+    for k in managed {
+        if !inc_tbl.contains_key(*k) {
+            base.remove(*k);
+        }
+    }
+    // 再叠上本次提交的键（覆盖/新增）。
     for (k, v) in inc_tbl {
         base.insert(k, v);
     }

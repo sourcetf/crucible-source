@@ -334,13 +334,30 @@ int appengine_execute(
         return -1;
 
     if (script && script[0]) {
-        if (read_file(script, &src, &src_len) != 0)
-            return appengine_fill_hello(out, "asp", path);
+        if (read_file(script, &src, &src_len) != 0) {
+            /* 脚本不存在 → **404**（此前回落 `appengine_fill_hello` 回 200
+             * "hello from asp engine path=..." —— 软 404：缓存/探测/监控都以为页面存在）。
+             * 绝对路径只进 out->error（Rust 侧节流写日志），客户端拿固定文本。 */
+            appengine_result_alloc(out);
+            out->status = 404;
+            appengine_result_set_headers(
+                out, "Content-Type: text/plain; charset=utf-8\r\n");
+            appengine_result_set_body(out, "asp: script not found\n", 22);
+            appengine_result_set_error(out, script);
+            return 0;
+        }
     } else {
         snprintf(script_path, sizeof(script_path), "%s/index.asp",
                  docroot ? docroot : ".");
-        if (read_file(script_path, &src, &src_len) != 0)
-            return appengine_fill_hello(out, "asp", path);
+        if (read_file(script_path, &src, &src_len) != 0) {
+            appengine_result_alloc(out);
+            out->status = 404;
+            appengine_result_set_headers(
+                out, "Content-Type: text/plain; charset=utf-8\r\n");
+            appengine_result_set_body(out, "asp: script not found\n", 22);
+            appengine_result_set_error(out, script_path);
+            return 0;
+        }
     }
 
     rendered = render_asp(src, src_len, path, path, query ? query : "");

@@ -1118,6 +1118,70 @@ pub fn list_secondary_records(zone: &str) -> Result<Vec<RecordRow>> {
         .collect())
 }
 
+/// 记录 rdata 的按类型合法性（面板新增/编辑与 .zone 导入共用）。
+///
+/// 为什么必须有：rdata 是**逐行拼进 zone 文件**的文本，一条非法行会让 named 拒载
+/// **整个分区**（该区全部记录 SERVFAIL），而面板/日志一切正常 —— 与 RPZ override
+/// 已修过的「一条坏值让全部 override 失效」是同一类静默失败。这里覆盖最容易写错、
+/// 且判据无歧义的几类：A/AAAA 必须是 IP 字面量，CNAME/NS/PTR 的目标必须是合法域名。
+pub(crate) fn validate_record_rdata(rtype: &str, rdata: &str) -> Result<()> {
+    let d = rdata.trim();
+    match rtype.trim().to_ascii_uppercase().as_str() {
+        "A" => {
+            if d.parse::<std::net::Ipv4Addr>().is_err() {
+                bail!("A 记录的 rdata 必须是 IPv4 地址（收到 {rdata:?}）");
+            }
+        }
+        "AAAA" => {
+            if d.parse::<std::net::Ipv6Addr>().is_err() {
+                bail!("AAAA 记录的 rdata 必须是 IPv6 地址（收到 {rdata:?}）");
+            }
+        }
+        "CNAME" | "NS" | "PTR" => {
+            let target = d.trim_end_matches('.');
+            if !valid_name(target) {
+                bail!("{rtype} 记录的目标不是合法域名（收到 {rdata:?}）");
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+/// 一批记录内部的 CNAME 共存冲突（导入用）。
+///
+/// RFC1034 §3.6.2：同一 owner 不能既有 CNAME 又有其它类型的数据（顶点还额外与模块
+/// 自动生成的 SOA/NS 冲突）。导入 `mode=replace` 会**先删旧记录再逐条 add_record**，
+/// 冲突若在中途才由 add_record 抛出，旧记录已经删掉、新记录只落一半 —— 与「不落半截
+/// 数据」的承诺相悖。故在解析阶段先按批扫一遍。
+pub(crate) fn batch_cname_conflict(recs: &[(String, String)]) -> Option<String> {
+    use std::collections::HashMap;
+    // name(lower) -> (has_cname, has_other)
+    let mut kinds: HashMap<String, (bool, bool)> = HashMap::new();
+    for (name, rtype) in recs {
+        let key = name.trim().trim_end_matches('.').to_ascii_lowercase();
+        let is_cname = rtype.trim().eq_ignore_ascii_case("CNAME");
+        if is_cname && (key == "@" || key.is_empty()) {
+            return Some(
+                "顶点（@）不能是 CNAME：与模块自动生成的 SOA/NS 冲突，named 会拒载整个分区"
+                    .to_string(),
+            );
+        }
+        let e = kinds.entry(key).or_insert((false, false));
+        if is_cname {
+            e.0 = true;
+        } else {
+            e.1 = true;
+        }
+        if e.0 && e.1 {
+            return Some(format!(
+                "{name} 同时有 CNAME 与其它类型记录（RFC1034 §3.6.2：CNAME 不能与其它数据共存）"
+            ));
+        }
+    }
+    None
+}
+
 pub fn add_record(zone: &str, line: &str, name: &str, rtype: &str, ttl: u32, rdata: &str) -> Result<()> {
     if !valid_name(zone) {
         bail!("bad zone name {zone:?}");
@@ -1148,7 +1212,30 @@ pub fn add_record(zone: &str, line: &str, name: &str, rtype: &str, ttl: u32, rda
     if rdata.contains('\n') || rdata.contains('\r') {
         bail!("rdata must be single-line");
     }
+    // 按类型的语义校验：一条坏记录让**整区**被 named 拒载（面板却显示 ok）。
+    validate_record_rdata(&rtype_u, rdata)?;
+    // CNAME 共存（RFC1034 §3.6.2）：顶点 CNAME 与自动 SOA/NS 冲突，同名既有 CNAME
+    // 又加其它类型（或反之）同样让 named 以 "CNAME and other data" 拒载整个分区。
     let conn = store()?;
+    if rtype_u == "CNAME" && (name == "@" || name.is_empty()) {
+        bail!("顶点（@）不能是 CNAME：与模块自动生成的 SOA/NS 冲突，named 会拒载整个分区");
+    }
+    {
+        let mut st = conn.prepare(
+            "SELECT rtype FROM records WHERE zone=?1 AND lower(name)=lower(?2)",
+        )?;
+        let existing: Vec<String> = st
+            .query_map(rusqlite::params![zone, name], |r| r.get::<_, String>(0))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        let has_cname = existing.iter().any(|t| t.eq_ignore_ascii_case("CNAME"));
+        let has_other = existing.iter().any(|t| !t.eq_ignore_ascii_case("CNAME"));
+        if rtype_u == "CNAME" && has_other {
+            bail!("{name} 已有其它类型记录，CNAME 不能与它们共存（RFC1034 §3.6.2，named 会拒载整个分区）");
+        }
+        if rtype_u != "CNAME" && has_cname {
+            bail!("{name} 已有 CNAME 记录，不能再添加其它类型（RFC1034 §3.6.2，named 会拒载整个分区）");
+        }
+    }
     conn.execute(
         "INSERT INTO records(zone,line,name,rtype,ttl,rdata) VALUES(?1,?2,?3,?4,?5,?6)",
         rusqlite::params![zone, line, name, &rtype_u, ttl as i64, rdata],
@@ -1451,6 +1538,14 @@ fn minimal_root_zone(cfg: &DnsConfig) -> String {
 
 // ---------------------------------------------------------------- named.conf 生成
 
+/// geo 分线路条数上限。这个值必须被**所有**用到「线路索引 → 127.0.0.(2+i)」的地方
+/// 共用：listen-on 地址表、fwd view 的 match-destinations、resolve_fwd_dest 的转发
+/// 目标、lo0 alias 供给。此前四处各写各的（listen 用 `min(251)`、其余 `take(250)`、
+/// 转发目标 `i.min(250)`）：第 251 条线路（index 250）会转发到 127.0.0.252，而该地址
+/// 既没有 fwd view（落到 default 视图 → 静默返回错误线路的数据），OpenBSD 上也没有
+/// lo0 alias（named bind 失败）。统一到 250：index 250 起直接拒绝，而不是静默错线。
+pub(crate) const MAX_GEO_LINES: usize = 250;
+
 fn acl_or(list: &[String], default: &str) -> String {
     let items: Vec<String> = list
         .iter()
@@ -1515,9 +1610,10 @@ fn listen_lists(addr: &str, test_mode: bool, geo_lines: usize) -> (String, Strin
         // （DoT/DoH 转发目标）都用 127.0.0.(2+i)，lo0 alias 也是这么加的（ifconfig 处）。
         // 早先这里写成 `127.0.{2+i}`（少了中间那段 0），三处不一致 ⇒ 配了 geo 分线路时
         // fwd-<line> view 的 match-destinations 上根本没有 socket，分线路转发静默失效。
-        // 索引范围与 resolve_fwd_dest 的 `i.min(250)` 对齐 ⇒ 泄露 127.0.0.2..127.0.0.252；
-        // 没有分线路时一个都不加（`0..=min(250)` 在 lines=0 时会多加一个，别写成那样）。
-        for i in 0..geo_lines.min(251) {
+        // 索引范围与 resolve_fwd_dest / fwd view / lo0 alias 对齐（统一 MAX_GEO_LINES）⇒
+        // 泄露 127.0.0.2..127.0.0.(1+MAX_GEO_LINES)；没有分线路时一个都不加
+        // （`0..=MAX_GEO_LINES` 在 lines=0 时会多加一个，别写成那样）。
+        for i in 0..geo_lines.min(MAX_GEO_LINES) {
             v4s.push_str(&format!(" 127.0.0.{};", 2 + i));
         }
     }
@@ -1742,7 +1838,7 @@ pub fn gen_named_conf(cfg: &DnsConfig, zones: &[ZoneRow]) -> String {
             emit_zones(&l.name, &l.name, true, &mut s);
             s.push_str("};\n");
         }
-        for (i, l) in cfg.geo.lines.iter().enumerate().take(250) {
+        for (i, l) in cfg.geo.lines.iter().enumerate().take(MAX_GEO_LINES) {
             // fwd view 的 match-destinations 必须与 listen-on / resolve_fwd_dest 的 127.0.0.(2+i)
             // 同一映射（此前写成 129+i，fwd view 永远不会命中）
             let dest = 2 + i as u16;
@@ -1773,21 +1869,24 @@ pub fn resolve_fwd_dest(cfg: &DnsConfig, client: Option<std::net::IpAddr>) -> st
     if !cfg.geo.enabled {
         return IpAddr::from([127u8, 0, 0, 1]);
     }
+    // 没有任何线路时直接返回默认：mmdb/ASN/国家映射最终都要落到 `lines` 里的某条，
+    // lines 为空时 `line_for` 的两次 mmdb 查找（+全局锁）纯属浪费 —— 每个 DoT/DoH
+    // 查询都白付一次（需求 9「全部默认线路时不要启用该模块」）。短路必须在 mmdb 之前。
+    if cfg.geo.lines.is_empty() {
+        return IpAddr::from([127u8, 0, 0, 1]);
+    }
     // mmdb 优先 (需求 9: 模块化, ASN/ISP/国家线路)
     if cfg.geo.mmdb.is_active() {
         if let Some(line) = crate::server::dns::geoip::line_for(&cfg.geo.mmdb, ip) {
             if let Some(i) = cfg.geo.lines.iter().position(|l| l.name == line) {
-                return IpAddr::from([127u8, 0, 0, (2 + i.min(250)) as u8]);
+                return IpAddr::from([127u8, 0, 0, (2 + i.min(MAX_GEO_LINES - 1)) as u8]);
             }
         }
-    }
-    if cfg.geo.lines.is_empty() {
-        return IpAddr::from([127u8, 0, 0, 1]);
     }
     for (i, l) in cfg.geo.lines.iter().enumerate() {
         for c in &l.cidrs {
             if cidr_contains(c, ip) {
-                return IpAddr::from([127u8, 0, 0, (2 + i.min(250)) as u8]);
+                return IpAddr::from([127u8, 0, 0, (2 + i.min(MAX_GEO_LINES - 1)) as u8]);
             }
         }
     }
@@ -1797,6 +1896,10 @@ pub fn resolve_fwd_dest(cfg: &DnsConfig, client: Option<std::net::IpAddr>) -> st
 /// 极小 CIDR 匹配（v4/v6，"a.b.c.d/len"；无掩码按主机地址）
 pub fn cidr_contains(cidr: &str, ip: std::net::IpAddr) -> bool {
     use std::net::IpAddr;
+    // v4-mapped（`::ffff:a.b.c.d`，双栈监听下 IPv4 客户端 peer 的常见形态）先折回 v4，
+    // 否则 `(V4 CIDR, V6 ip)` 落到 `_ => false`：v4 CIDR 线路对这类客户端**永不命中**、
+    // 静默走默认线路（ECS 侧与 access/rate_limit/iputil 都已 unmap，唯独这里漏了）。
+    let ip = crate::server::geoip_panel::iputil::unmap_v4_mapped(ip);
     let (base, prefix): (&str, u32) = match cidr.trim().split_once('/') {
         Some((b, p)) => (b, p.trim().parse::<u32>().unwrap_or(999)),
         None => (
@@ -2182,9 +2285,34 @@ pub(crate) fn check_config_strings(cfg: &DnsConfig) -> Result<()> {
         bail!("bad forwarder {bad:?}（只接受 IPv4/IPv6 字面量）");
     }
     let mut seen_lines: std::collections::HashSet<String> = std::collections::HashSet::new();
+    // 线路数上限：索引 0..MAX_GEO_LINES-1 映射到 127.0.0.2..127.0.0.(1+MAX_GEO_LINES)。
+    // 超出的线路没有 fwd view / listen socket / lo0 alias —— 客户端静默落到 default
+    // 视图拿到**错误线路**的数据。与其静默错线，不如在保存前明确拒绝。
+    if cfg.geo.lines.len() > MAX_GEO_LINES {
+        bail!(
+            "geo.lines 条数 {} 超过上限 {}（每条约占一个 127.0.0.x 转发地址，超出的线路不会被任何 view 承接）",
+            cfg.geo.lines.len(),
+            MAX_GEO_LINES
+        );
+    }
     for l in &cfg.geo.lines {
         if !valid_line_name(&l.name) {
             bail!("bad geo line name {:?}", l.name);
+        }
+        // 线路 CIDR 在生成侧会被 `acl_or`→`valid_acl_item` **静默过滤**：非法项被丢光后
+        // `match-clients` 退化成 `{ none; }`，该 view 永不命中 —— 面板显示线路存在、
+        // 客户端却全落默认线路，无任何日志。这里用与生成侧**同一判据**在保存前拒绝，
+        // 把「静默失效」变成面板可见的错误（校验先于 panel.toml 落盘）。
+        if l.cidrs.is_empty() {
+            bail!("geo line {:?} 没有任何 CIDR —— match-clients 会退化为 none，该线路永不命中", l.name);
+        }
+        for c in &l.cidrs {
+            if !valid_acl_item(c) {
+                bail!(
+                    "bad geo line cidr {c:?}（线路 {:?}）：非法项会被静默丢弃，该线路 match-clients 退化为 none 而永不命中",
+                    l.name
+                );
+            }
         }
         // 线路名同时是 named 的 view 名。模块自己还会生成兜底 view "default" 与
         // 转发 view "fwd-<线路>"：线路直接叫 default / fwd-x，或两条线路重名，
@@ -2317,7 +2445,7 @@ pub fn write_all(cfg: &DnsConfig) -> Result<Vec<(String, PathBuf)>> {
         for l in &cfg.geo.lines {
             views.push((l.name.clone(), l.name.clone()));
         }
-        for (i, l) in cfg.geo.lines.iter().enumerate().take(250) {
+        for (i, l) in cfg.geo.lines.iter().enumerate().take(MAX_GEO_LINES) {
             views.push((format!("fwd-{}", l.name), l.name.clone()));
         }
         views.push(("default".into(), String::new()));
@@ -2349,9 +2477,11 @@ pub fn write_all(cfg: &DnsConfig) -> Result<Vec<(String, PathBuf)>> {
     for (view_tag, line_tag) in &views {
         // 与 gen_named_conf 同步：权威关掉时不落用户 zone 文件
         // （否则盘上留着 orphan zone，且 named.conf 里已无引用，排障时极易误判）。
-        if !cfg.modes.authoritative {
-            break;
-        }
+        // 注意只跳过**用户 zone**：root 模式的 `.` 与 authoritative 无关
+        // （gen_named_conf 的 root 分支不看 authoritative），占位文件仍必须写 ——
+        // 否则 named.conf 声明了 `zone "."` 而 zones/root.zone 不存在（root=true 且
+        // authoritative=false 时，named 加载该区失败）。
+        if cfg.modes.authoritative {
         for z in &zones {
             // 从区（secondary/slave）的 zone 文件归 **named 自己**维护：
             // gen_named_conf 为它写的是 `type secondary; primaries { ... };`，
@@ -2455,6 +2585,7 @@ pub fn write_all(cfg: &DnsConfig) -> Result<Vec<(String, PathBuf)>> {
                 let _ = std::fs::remove_file(&j);
             }
             written.push((z.name.clone(), path));
+        }
         }
         if cfg.modes.root {
             let f = if view_tag.is_empty() { "root.zone".to_string() } else { format!("root.{view_tag}.zone") };
@@ -2647,7 +2778,7 @@ pub fn reconcile(cfg: &DnsConfig) -> Result<()> {
         }
         // OpenBSD lo0 默认只有 127.0.0.1/32——fwd view 的 127.0.0.(2+i) 目标需显式 alias
         if cfg.geo.enabled {
-            for (i, _) in cfg.geo.lines.iter().enumerate().take(250) {
+            for (i, _) in cfg.geo.lines.iter().enumerate().take(MAX_GEO_LINES) {
                 let _ = std::process::Command::new("ifconfig")
                     .args(["lo0", "inet", &format!("127.0.0.{}", 2 + i), "alias"])
                     .status();
@@ -3094,9 +3225,13 @@ pub async fn startup(live: &Arc<crate::server::live_config::LiveConfig>, cfg_pat
         Ok(Err(e)) => log::error!("dns: reconcile failed: {e:#}"),
         Err(e) => log::error!("dns: reconcile join: {e}"),
     }
-    if cfg.dot.enabled {
-        tokio::spawn(dot_doh::dot_listener(cfg.clone()));
-    }
+    // DoT 监听用 **live** 入口：每次判定取 `effective(live.snapshot())`，因此
+    // panel.toml 与 config.toml 热载的 [dns]/[dns.dot] 改动（ACL/限速/并发上限/端口/
+    // 启停）都会生效。旧实现用启动快照入口 `dot_listener(cfg.clone())`：它只重读
+    // panel.toml，配置文件里的 [dns.dot] 改动**永远不生效**，而且「启动时未开 DoT、
+    // 之后在 config.toml 打开」也永远起不来。supervisor 内部按 enabled 自行 bind/unbind，
+    // 所以这里无条件 spawn（关着时它只做一次配置轮询，不监听）。
+    tokio::spawn(dot_doh::dot_listener_live(Arc::clone(live)));
     tokio::spawn(maintenance_loop(Arc::clone(live), cfg_path.to_path_buf()));
 }
 
@@ -3839,7 +3974,7 @@ mod acl_primary_tests {
 
 #[cfg(test)]
 mod listen_lists_tests {
-    use super::{listen_lists, orphan_https_names, ZoneRow};
+    use super::{listen_lists, orphan_https_names, ZoneRow, MAX_GEO_LINES};
 
     /// 回归（生产事故）：named 9.20 对字面量 `0.0.0.0` **静默不建 socket**，所以
     /// `listen-on { 0.0.0.0; ... }` 会让 53 只在 loopback 上听、公网 IPv4 收不到查询。
@@ -3902,12 +4037,16 @@ mod listen_lists_tests {
         assert!(!v4.contains(" 127.0.3;"), "分线路地址必须是 127.0.0.{{2+i}}: {v4}");
     }
 
-    /// 上限与 `resolve_fwd_dest` 的 `i.min(250)` 对齐：索引 250 → 127.0.0.252 也要有 socket。
+    /// 上限与 `resolve_fwd_dest` / fwd view / lo0 alias 统一到 `MAX_GEO_LINES`：
+    /// 最高索引 `MAX_GEO_LINES-1` → 127.0.0.(1+MAX_GEO_LINES)，再高一律不出现
+    /// （`check_config_strings` 直接拒绝超过 MAX_GEO_LINES 的线路数）。
     #[test]
     fn geo_line_loopbacks_cover_the_resolver_index_cap() {
         let (v4, _) = listen_lists("127.0.0.1", false, 300);
-        assert!(v4.contains("127.0.0.252;"), "索引 250 的可达地址缺 socket: {v4}");
-        assert!(!v4.contains("127.0.0.253;"), "越界地址不该出现: {v4}");
+        let top = format!("127.0.0.{};", 1 + MAX_GEO_LINES); // 251
+        assert!(v4.contains(&top), "最高索引的可达地址缺 socket: {v4}");
+        let over = format!("127.0.0.{};", 2 + MAX_GEO_LINES); // 252
+        assert!(!v4.contains(&over), "越界地址不该出现: {v4}");
     }
 
     /// 没有分线路时不许出现任何 127.0.0.2+ 地址（`0..=min(250)` 会在 lines=0 时多加一个）。
@@ -4037,6 +4176,76 @@ mod config_guard_tests {
             value: String::new(),
         });
         assert!(check_config_strings(&rpz).is_err(), "rpz 名字带 .. 必须被拒");
+    }
+
+    /// geo 线路 CIDR 非法必须在**保存前**被拒：生成侧 `acl_or`→`valid_acl_item` 会
+    /// 静默丢弃非法项，`match-clients` 退化成 `{ none; }` —— 该线路永不命中，
+    /// 面板却显示一切正常。旧实现只校验线路名，非法 CIDR 直接落进 panel.toml。
+    #[test]
+    fn check_config_rejects_bad_geo_line_cidr() {
+        let mut bad = cfg_with("127.0.0.1");
+        bad.geo.enabled = true;
+        bad.geo.lines.push(GeoLine {
+            name: "lab".into(),
+            cidrs: vec!["not-a-cidr".into()],
+        });
+        assert!(
+            check_config_strings(&bad).is_err(),
+            "非法线路 CIDR 必须被拒（否则线路静默失效）"
+        );
+
+        let mut empty = cfg_with("127.0.0.1");
+        empty.geo.enabled = true;
+        empty.geo.lines.push(GeoLine {
+            name: "lab".into(),
+            cidrs: vec![],
+        });
+        assert!(
+            check_config_strings(&empty).is_err(),
+            "无 CIDR 的线路 match-clients 退化为 none，必须被拒"
+        );
+
+        let mut ok = cfg_with("127.0.0.1");
+        ok.geo.enabled = true;
+        ok.geo.lines.push(GeoLine {
+            name: "lab".into(),
+            cidrs: vec!["192.0.2.0/24".into(), "2001:db8::/32".into()],
+        });
+        assert!(check_config_strings(&ok).is_ok(), "合法 v4/v6 CIDR 必须通过");
+    }
+
+    /// v4-mapped 客户端（`::ffff:a.b.c.d`，双栈监听下 v4 客户端 peer 的形态）必须能命中
+    /// v4 CIDR：旧实现 `(V4 CIDR, V6 ip)` 落到 `_ => false`，这类客户端全部静默走默认线路。
+    #[test]
+    fn cidr_contains_folds_v4_mapped() {
+        let mapped: std::net::IpAddr = "::ffff:192.0.2.5".parse().unwrap();
+        assert!(cidr_contains("192.0.2.0/24", mapped));
+        assert!(!cidr_contains("198.51.100.0/24", mapped));
+        assert!(cidr_contains("192.0.2.0/24", "192.0.2.5".parse().unwrap()));
+    }
+
+    /// resolve_fwd_dest：v4-mapped 命中线路 → 对应 fwd view 的 127.0.0.(2+i)；
+    /// lines 为空时短路回默认（不再白查 mmdb）。
+    #[test]
+    fn resolve_fwd_dest_folds_v4_mapped_and_short_circuits() {
+        let mut c = DnsConfig::default();
+        c.geo.enabled = true;
+        c.geo.lines.push(GeoLine {
+            name: "lab-a".into(),
+            cidrs: vec!["192.0.2.0/24".into()],
+        });
+        let mapped: std::net::IpAddr = "::ffff:192.0.2.5".parse().unwrap();
+        assert_eq!(
+            resolve_fwd_dest(&c, Some(mapped)),
+            std::net::IpAddr::from([127u8, 0, 0, 2])
+        );
+
+        let mut empty = DnsConfig::default();
+        empty.geo.enabled = true;
+        assert_eq!(
+            resolve_fwd_dest(&empty, Some("192.0.2.5".parse().unwrap())),
+            std::net::IpAddr::from([127u8, 0, 0, 1])
+        );
     }
 }
 
@@ -4352,5 +4561,65 @@ mod dns_hardening_tests {
         assert_eq!(keygen_flag("CSK"), Some("KSK"));
         assert_eq!(keygen_flag("ksk"), Some("KSK"));
         assert_eq!(keygen_flag("zsk"), None);
+    }
+
+    /// P1：按类型的 rdata 校验 —— 一条坏记录会让**整区**被 named 拒载。
+    #[test]
+    fn record_rdata_validation_by_type() {
+        // A/AAAA 必须是 IP 字面量（面板/导入最容易写错，判据无歧义）。
+        assert!(validate_record_rdata("A", "192.0.2.1").is_ok());
+        assert!(validate_record_rdata("a", " 192.0.2.1 ").is_ok());
+        assert!(validate_record_rdata("A", "hello").is_err());
+        assert!(validate_record_rdata("A", "192.0.2.256").is_err());
+        assert!(validate_record_rdata("A", "::1").is_err(), "A 不能写 v6");
+        assert!(validate_record_rdata("AAAA", "2001:db8::1").is_ok());
+        assert!(validate_record_rdata("AAAA", "192.0.2.1").is_err());
+        // CNAME/NS/PTR 目标必须是合法域名。
+        assert!(validate_record_rdata("CNAME", "target.example.com.").is_ok());
+        assert!(validate_record_rdata("NS", "ns1.example.com.").is_ok());
+        assert!(validate_record_rdata("CNAME", "bad name with space").is_err());
+        // 未校验的类型不拦（保持最小改动）。
+        assert!(validate_record_rdata("MX", "10 mail.example.com.").is_ok());
+        assert!(validate_record_rdata("TXT", "anything at all").is_ok());
+    }
+
+    /// P1：导入批量 CNAME 共存冲突必须在删旧记录之前被发现（RFC1034 §3.6.2）。
+    #[test]
+    fn batch_cname_conflict_detects_apex_and_mixed() {
+        let clean = vec![
+            ("www".to_string(), "A".to_string()),
+            ("mail".to_string(), "CNAME".to_string()),
+            ("@".to_string(), "MX".to_string()),
+        ];
+        assert!(batch_cname_conflict(&clean).is_none());
+        // 顶点 CNAME：与模块自动生成的 SOA/NS 冲突。
+        let apex = vec![("@".to_string(), "CNAME".to_string())];
+        assert!(batch_cname_conflict(&apex).is_some());
+        // 同名既有 CNAME 又有 A。
+        let mixed = vec![
+            ("www".to_string(), "CNAME".to_string()),
+            ("www".to_string(), "A".to_string()),
+        ];
+        assert!(batch_cname_conflict(&mixed).is_some());
+    }
+
+    /// P2：geo 线路数超上限（MAX_GEO_LINES）必须在保存前拒绝 —— 超出部分没有
+    /// fwd view / listen socket / lo0 alias，客户端会静默落到 default 拿到错误线路。
+    #[test]
+    fn check_config_rejects_too_many_geo_lines() {
+        let mut c = test_cfg();
+        c.geo.enabled = true;
+        for i in 0..=MAX_GEO_LINES {
+            c.geo.lines.push(GeoLine {
+                name: format!("l{i}"),
+                cidrs: vec!["192.0.2.0/24".into()],
+            });
+        }
+        assert!(
+            check_config_strings(&c).is_err(),
+            "超过 MAX_GEO_LINES 必须被拒"
+        );
+        c.geo.lines.truncate(MAX_GEO_LINES);
+        assert!(check_config_strings(&c).is_ok(), "正好上限必须放行");
     }
 }

@@ -103,22 +103,23 @@ pub fn log_response(
         "{ts} {proto} {peer} \"{method} {path_esc}\" {status} {bytes_field} {}ms {engine}",
         dur.as_millis()
     );
-    match cfg.access_log.level.as_str() {
-        // debug/trace/warn 属低频诊断路径，保持走 env_logger（语义与级别过滤不变）。
-        "debug" | "trace" => log::debug!("{line}"),
-        "warn" => log::warn!("{line}"),
-        _ => {
-            ensure_flusher();
-            let full = {
-                let mut b = ACCESS_BUF.lock();
-                b.extend_from_slice(line.as_bytes());
-                b.push(b'\n');
-                b.len() >= ACCESS_BUF_FLUSH_AT
-            };
-            if full {
-                flush();
-            }
-        }
+    // 级别过滤：**所有**等级都走同一批量写路径。
+    //
+    // 此前 `"debug" | "trace" => log::debug!("{line}")`：env_logger 的默认过滤是
+    // `info`（`main.rs` 的 `default_filter_or("info")`，现场也没有 RUST_LOG），于是
+    // 把访问日志等级选成 `debug`/`trace`（面板下拉里就有这两个选项）会让**每一行
+    // 访问日志都被丢弃** —— 运维为了「看更多」而调低等级，结果一条都看不到，
+    // 且没有任何提示。访问日志的行本身没有严重级别语义（它记录的是每次请求），
+    // 所以等级只保留在配置/展示层，落盘路径统一。
+    ensure_flusher();
+    let full = {
+        let mut b = ACCESS_BUF.lock();
+        b.extend_from_slice(line.as_bytes());
+        b.push(b'\n');
+        b.len() >= ACCESS_BUF_FLUSH_AT
+    };
+    if full {
+        flush();
     }
     if cfg.access_log.realtime {
         let mut ring = RING.lock();

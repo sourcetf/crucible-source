@@ -300,6 +300,20 @@ img.preview{max-width:100%;max-height:420px}
       <button class="act" id="btnAccessSave">保存访问控制</button>
       <pre id="accessOut"></pre>
     </div>
+    <div class="card">
+      <h2>站点 Basic Auth（每站独立）</h2>
+      <p class="hint">对单个 listener 启用 HTTP Basic 认证。口令只填明文，后端加盐哈希（argon2id/yescrypt）；编辑时留空表示不改动已存口令。
+        <br/><b>注意</b>：listener 级 Basic Auth 对**该端口的全部路径**生效（含管理面）。若在该端口上也开放管理面（<code>admin.listeners_allow</code> 为空 = 全部端口，或含本端口），浏览器只会发一组凭据 ⇒ 需要同时通过「站点口令」与「管理员口令」两道门才进得去。请把管理面限制到不含本站点口令的端口（用 listeners_allow 指定），或在两个用户名/口令一致时使用。</p>
+      <div class="row">
+        <div><label>站点端口</label><select id="baPort"></select></div>
+        <div><label>启用</label><select id="baEnabled"><option value="false">关闭</option><option value="true">开启</option></select></div>
+        <div style="flex:1"><label>用户名</label><input id="baUser" style="width:100%"/></div>
+        <div style="flex:1"><label>口令（留空=不改）</label><input id="baPass" type="password" style="width:100%" autocomplete="new-password"/></div>
+        <div style="flex:1"><label>realm</label><input id="baRealm" style="width:100%" placeholder="Restricted"/></div>
+      </div>
+      <button class="act" id="btnBaSave">保存 Basic Auth</button>
+      <pre id="baOut"></pre>
+    </div>
   </section>
 
   <section class="tab" id="tab-accesslog">
@@ -1185,7 +1199,12 @@ async function renderApps(){
       o.enabled=tr.querySelector('.a-enabled').checked;
       o.paths=tr.querySelector('.a-paths').value.split(',').map(s=>s.trim()).filter(Boolean);
       o.engine=tr.querySelector('.a-engine').value;
-      o.extensions=tr.querySelector('.a-ext').value.split(',').map(s=>s.trim());
+      // 空 extensions 输入必须变成 **[]**（= 匹配该前缀下所有扩展名），不能是 [""]：
+      // `[""].split` 不滤空会得到 [""]，而运行期 `would_handle` 判 `extensions.is_empty()`
+      // 才等于「全匹配」，[ "" ] 反而只匹配**无扩展名**文件（apps/mod.rs:386）——
+      // 一次保存就把 /c /go /rust 这类 catch-all 路由的语义从「全匹配」翻成「只匹配无扩展名」，
+      // 站点静默 404。与上面 paths 的 filter(Boolean) 保持同一口径。
+      o.extensions=tr.querySelector('.a-ext').value.split(',').map(s=>s.trim()).filter(Boolean);
       o.workers=parseInt(tr.querySelector('.a-workers').value,10)||4;
       o.index=tr.querySelector('.a-index').value||null;
       o.socket=tr.querySelector('.a-socket').value||null;
@@ -1482,7 +1501,33 @@ $('btnPxLoad').onclick=renderPx;
 function initAccessTab(){
   $('accessAllow').value=((CFG.ip_access||{}).allow||[]).join('\n');
   $('accessDeny').value=((CFG.ip_access||{}).deny||[]).join('\n');
+  fillPortSelect($('baPort'),$('baPort').value);
+  $('baPort').onchange=fillBasicAuthForm;
+  fillBasicAuthForm();
 }
+// 站点级 Basic Auth（规格 §16.13 / §16.19 #8）。口令**永不回显**（配置 JSON 里也不含哈希，
+// 见 admin.rs 的 mask_secrets 口径）：留空即「不改动已存口令」，后端据此保留旧哈希。
+function fillBasicAuthForm(){
+  const l=listenerByPort($('baPort').value);
+  const ba=(l&&l.basic_auth)||null;
+  $('baEnabled').value=ba?'true':'false';
+  $('baUser').value=ba?(ba.username||''):'';
+  $('baRealm').value=ba?(ba.realm||''):'';
+  $('baPass').value='';
+}
+$('btnBaSave').onclick=async()=>{
+  const port=parseInt($('baPort').value,10);
+  if(!port){toast('请选择站点端口',true);return;}
+  const r=await api('/api/basic_auth/save',jpost({
+    port:port,
+    enabled:$('baEnabled').value==='true',
+    username:$('baUser').value.trim(),
+    password:$('baPass').value,
+    realm:$('baRealm').value.trim()
+  }));
+  out('baOut',r.text,r.ok);toast(r.text,!r.ok);
+  if(r.ok){await loadCfg();fillBasicAuthForm();}
+};
 $('btnAccessSave').onclick=async()=>{
   const toArr=t=>t.split('\n').map(s=>s.trim()).filter(Boolean);
   const r=await api('/api/ip_access/save',jpost({allow:toArr($('accessAllow').value),deny:toArr($('accessDeny').value)}));

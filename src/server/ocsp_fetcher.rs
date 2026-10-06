@@ -30,9 +30,28 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 const FALLBACK_TTL: Duration = Duration::from_secs(23 * 3600);
 /// 到期前提前重拉的余量。
 const RENEW_MARGIN: Duration = Duration::from_secs(3600);
-const SHA1_ALGID: &[u8] = &[
-    0x30, 0x0F, 0x06, 0x05, 0x2B, 0x0E, 0x03, 0x02, 0x1A, 0x05, 0x00,
-]; // SHA-1 + NULL
+/// OCSP 出网预算：responder 是第三方，可能不响应 / 极慢 / 返回超大 body。
+/// 不设限时唯一续期线程会被一个坏 responder **永久卡死**，随后**所有**证书的
+/// OCSP 续期一起停摆（tls-core P2）。冷路径，取值宽松但必须有限。
+const OCSP_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+const OCSP_IO_TIMEOUT: Duration = Duration::from_secs(15);
+/// 响应体上限：正常 OCSPResponse / caIssuers 证书都远小于此；超限即判对端异常并放弃
+/// （防止 `read_to_end` 被恶意/故障对端用无限 body 撑爆内存）。
+const OCSP_MAX_BODY: usize = 256 * 1024;
+/// SHA-1 + NULL 的 **AlgorithmIdentifier 内容**（OID 2.16.840.1.101.3.4.2.26 + NULL），
+/// **不含** 外层 `30 len`。
+///
+/// 旧常量是 11 字节的 `30 0F 06 05 ...`，即「一个完整 SEQUENCE 的头 + 内容」，
+/// 但 `build_ocsp_request` 又用 `der_tlv(0x30, SHA1_ALGID)` 在它外面**再套一层**
+/// SEQUENCE：实际产出变成 `30 0B 30 0F <TWO> <NULL>` —— 内层 SEQUENCE 声明长度
+/// 0x0F(15) 而其后只有 9 字节内容。这不是合法 DER（`openssl asn1parse` 直接报
+/// "ASN1_get_object:too long"），responder 只能回 `malformedRequest`：
+/// **自动 OCSP 抓取对任何真实 CA 都从未成功过一次**（换只手写编码也没救，
+/// 因为 BoringSSL 已移除请求构建 API，而校验路径只看响应、不看请求）。
+///
+/// 修法：常量只保留内容，让 `der_tlv(0x30, …)` 补上正确的长度头。
+/// 已验证：修正后请求与 `openssl ocsp -reqout` 的输出**逐字节一致**。
+const SHA1_ALGID_BODY: &[u8] = &[0x06, 0x05, 0x2B, 0x0E, 0x03, 0x02, 0x1A, 0x05, 0x00];
 
 /// 进程内存缓存：cache_key -> 已装订响应。
 /// 有效期完全由响应自身 nextUpdate 推导（见 [`fresh_for`]），不写死 TTL。
@@ -110,6 +129,16 @@ fn fresh_for(c: &Cached) -> Option<Duration> {
             Some(Duration::from_secs((ttl - age - margin) as u64))
         }
     }
+}
+
+/// 响应是否**已过期**（nextUpdate 明确存在且已过）。
+///
+/// 与 [`fresh_for`] 的区别：`fresh_for` 把「临近 nextUpdate（RENEW_MARGIN 内）」也算
+/// 不新鲜以便提前重拉；这里只判「确凿过期」。过期响应**绝不能装订**：must-staple
+/// 客户端会因 staple 无效直接握手失败，普通客户端也拿到无用的 staple。宁可保留旧槽
+/// （可能仍有效）或留空（客户端自行查询 OCSP），也不要用一份过期响应去覆盖它。
+fn hard_expired(next_update_unix: Option<i64>, now: i64) -> bool {
+    matches!(next_update_unix, Some(nu) if nu <= now)
 }
 
 /// 从 OCSPResponse 提取 nextUpdate（UNIX 秒）。
@@ -330,13 +359,23 @@ fn extract_spki_bits(cert_der: &[u8]) -> Option<Vec<u8>> {
         return None;
     }
     let spki = &cert_der[p + h..p + h + len];
-    let (_, _, ha) = der_head(spki, 0)?;
-    let mut q = ha;
+    // SubjectPublicKeyInfo ::= SEQUENCE { algorithm AlgorithmIdentifier, subjectPublicKey BIT STRING }
+    //
+    // 旧实现在这里只读了外层 SEQUENCE 的头（`ha`）就去看下一个 TLV —— 但紧随其后的
+    // 是 **AlgorithmIdentifier（SEQUENCE, 0x30）**，不是 BIT STRING。于是
+    // `bt != 0x03` 恒成立、`extract_spki_bits` 对**任何**证书都返回 None ⇒
+    // `build_ocsp_request` 的 `?` 直接让 `obtain()` 返回 None ⇒
+    // 「自动 OCSP 抓取」在**任何**配置下都不可能成功（与请求 DER 编码是同一条链上的
+    // 两个独立缺陷）。必须**跳过 AlgId 整个 TLV**（用 `der_next`）再读 BIT STRING。
+    let q = der_next(spki, 0)?;
     let (bt, blen, bh) = der_head(spki, q)?;
     if bt != 0x03 {
         return None;
     }
-    let start = q + bh + 1; // 首字节 = 未用位数
+    if blen == 0 {
+        return None;
+    }
+    let start = q + bh + 1; // 首字节 = 未用位数（unused bits）
     Some(spki[start..q + bh + blen].to_vec())
 }
 
@@ -412,6 +451,34 @@ pub fn find_issuer_in_pem(cert_pem: &[u8], leaf: &X509) -> Option<X509> {
 
 // ------------------------------------------------------------ OCSP 请求构建
 
+/// 纯函数部分：由三个已算好的字段组装完整 OCSPRequest DER。
+///
+/// 拆出来是为了能用**确定性测试向量**钉住编码（`build_ocsp_request` 需要 X509 对象，
+/// 单测里不好构造）。回归见 `tests::ocsp_request_der_matches_golden_vector`。
+///
+/// RFC 6960 的嵌套（**五层** SEQUENCE，缺一层都不是合法请求；旧的实现只有四层，
+/// 产出的其实是一个裸 TBSRequest —— responder 只能回 `malformedRequest`）：
+/// ```text
+/// OCSPRequest          SEQUENCE { tbsRequest }
+///   TBSRequest         SEQUENCE { requestList }
+///     requestList      SEQUENCE OF Request
+///       Request        SEQUENCE { reqCert }
+///         CertID       SEQUENCE { hashAlgorithm, issuerNameHash, issuerKeyHash, serialNumber }
+///           hashAlgorithm  AlgorithmIdentifier = SHA-1 + NULL
+/// ```
+fn encode_ocsp_request(name_hash: &[u8], key_hash: &[u8], serial: &[u8]) -> Vec<u8> {
+    // CertID 的内容：AlgId(TLV) + issuerNameHash + issuerKeyHash + serialNumber。
+    let mut certid_body = der_tlv(0x30, SHA1_ALGID_BODY);
+    certid_body.extend(der_tlv(0x04, name_hash));
+    certid_body.extend(der_tlv(0x04, key_hash));
+    certid_body.extend(der_tlv(0x02, serial));
+    let certid = der_tlv(0x30, &certid_body); // CertID
+    let request = der_tlv(0x30, &certid); // Request
+    let request_list = der_tlv(0x30, &request); // requestList（SEQUENCE OF）
+    let tbs = der_tlv(0x30, &request_list); // TBSRequest
+    der_tlv(0x30, &tbs) // OCSPRequest ← 这一层旧实现漏了
+}
+
 /// 手工 DER 编码 OCSPRequest（CertID = SHA1；RFC 6960）。
 pub fn build_ocsp_request(
     leaf: &X509,
@@ -421,52 +488,123 @@ pub fn build_ocsp_request(
     let name_hash = hash(MessageDigest::sha1(), issuer_name_der)?;
     let key_hash = hash(MessageDigest::sha1(), issuer_spki_bits)?;
     let serial = extract_serial(&leaf.to_der()?).context("leaf serial parse")?;
-
-    let mut certid = der_tlv(0x30, SHA1_ALGID);
-    certid.extend(der_tlv(0x04, &name_hash));
-    certid.extend(der_tlv(0x04, &key_hash));
-    certid.extend(der_tlv(0x02, &serial));
-    let request = der_tlv(0x30, &certid);
-    let request_list = der_tlv(0x30, &request);
-    let tbs = der_tlv(0x30, &request_list);
-    Ok(der_tlv(0x30, &tbs))
+    Ok(encode_ocsp_request(&name_hash, &key_hash, &serial))
 }
 
-// ------------------------------------------------------------ 阻塞 HTTPS（boring）
+// ------------------------------------------------------------ 阻塞 HTTP(S)（boring）
 
-/// 阻塞 HTTPS GET/POST（boring SslStream over std TcpStream；冷路径专用）。
-fn https_req(
+/// 对端地址解析（v4/v6 都要能连）：`(host, port)` 可能解析出多个地址，
+/// 逐个尝试而不是只取第一个 —— AIA URL 的域名常有 AAAA+A，首个不可达时
+/// 旧实现直接放弃（IPv6-only 环境里 v4 优先会全灭）。
+fn resolve_addrs(host: &str, port: u16) -> Result<Vec<std::net::SocketAddr>> {
+    use std::net::ToSocketAddrs;
+    let addrs: Vec<std::net::SocketAddr> = (host, port)
+        .to_socket_addrs()
+        .with_context(|| format!("ocsp resolve {host}:{port}"))?
+        .collect();
+    if addrs.is_empty() {
+        anyhow::bail!("ocsp: no address for {host}:{port}");
+    }
+    Ok(addrs)
+}
+
+/// 阻塞 HTTP(S) GET/POST（冷路径专用）：`https=true` 走 boring TLS，否则**明文**
+/// HTTP。
+///
+/// 为什么需要明文分支：RFC 6960 的 AIA `ocsp` / `caIssuers` URL 常见 `http://`
+/// （GlobalSign、DigiCert 的 OCSP responder 至今如此，见本机实测：
+/// `http://ocsp.globalsign.com/...`）。旧实现**不看 scheme**、一律先做 TLS 握手，
+/// 于是所有 `http://` responder 都在握手阶段失败（对 80 端口做 TLS 会收到明文
+/// HTTP 响应 → `record layer failure`），自动装订对这批 CA 从未成功。
+/// `SimpleUrl::https` 字段解析出来了却没有任何消费点 —— 这正是那条「解析了但没用」
+/// 的沉默降级。
+fn http_req(
     host: &str,
     port: u16,
+    https: bool,
     method: &str,
     path: &str,
     ctype: Option<&str>,
     body: Option<&[u8]>,
 ) -> Result<Vec<u8>> {
     use std::io::{Read, Write};
-    let tcp = std::net::TcpStream::connect((host, port))
-        .with_context(|| format!("ocsp connect {host}:{port}"))?;
-    let mut b = boring::ssl::SslConnector::builder(boring::ssl::SslMethod::tls())?;
-    b.set_alpn_protos(b"\x08http/1.1")?;
-    let ssl = b.build().configure()?.into_ssl(host)?;
-    let mut tls = boring::ssl::SslStream::new(ssl, tcp)?;
+    // connect 必须有超时（旧实现 `TcpStream::connect` 会一直阻塞到内核 TCP 超时，
+    // 单条坏 responder 即可冻结整个续期线程）；连上后读/写也要有超时，否则对端
+    // 收下请求后不回字节，`read_to_end` 同样永久阻塞。
+    let addr = resolve_addrs(host, port)?;
+    let mut last_err: Option<anyhow::Error> = None;
+    let tcp = addr.iter().find_map(|a| {
+        match std::net::TcpStream::connect_timeout(a, OCSP_CONNECT_TIMEOUT) {
+            Ok(t) => Some(t),
+            Err(e) => {
+                last_err = Some(anyhow::Error::new(e).context(format!("ocsp connect {host}:{port}")));
+                None
+            }
+        }
+    });
+    let tcp = tcp.ok_or_else(|| {
+        last_err.unwrap_or_else(|| anyhow::anyhow!("ocsp connect {host}:{port}: no address worked"))
+    })?;
+    tcp.set_read_timeout(Some(OCSP_IO_TIMEOUT))?;
+    tcp.set_write_timeout(Some(OCSP_IO_TIMEOUT))?;
     let path = if path.is_empty() { "/" } else { path };
     let cl = body.map(|b| b.len()).unwrap_or(0);
+    // ⚠️ 头部块必须以**空行**结束（`…\r\n\r\n`）。旧实现最后一段是
+    // `Content-Type: …\r\n`（或没有 Content-Type 时以 `Content-Length: …\r\n` 收尾），
+    // **从不发那个空行** —— 严格实现的 responder（如 `openssl ocsp -port`）直接判
+    // `error parsing HTTP header: missing end of line`、按协议错误处理；宽松的
+    // （Cloudflare 之类）会自动补一个空行从而「看起来能跑」，所以这个缺陷长期不可见。
+    // 实测：本地 responder 日志里能看到我们的 `POST / HTTP/1.1` 但读不到完整头。
     let req = format!(
-        "{method} {path} HTTP/1.1\r\nHost: {host}\r\nAccept: application/ocsp-response\r\nConnection: close\r\nContent-Length: {cl}\r\n{}",
+        "{method} {path} HTTP/1.1\r\nHost: {host}\r\nAccept: application/ocsp-response\r\nConnection: close\r\nContent-Length: {cl}\r\n{}\r\n",
         if ctype.is_some() {
             format!("Content-Type: {}\r\n", ctype.unwrap())
         } else {
             String::new()
         }
     );
-    tls.write_all(req.as_bytes())?;
-    if let Some(b) = body {
-        tls.write_all(b)?;
-    }
-    tls.flush()?;
+    // 有界读取：`read_to_end` 无上限，一个返回无限流的 responder 可把内存撑爆。
+    // 正常 OCSPResponse/证书链都远小于 OCSP_MAX_BODY。
     let mut buf = Vec::new();
-    tls.read_to_end(&mut buf)?;
+    let mut chunk = [0u8; 8192];
+    if https {
+        let mut b = boring::ssl::SslConnector::builder(boring::ssl::SslMethod::tls())?;
+        b.set_alpn_protos(b"\x08http/1.1")?;
+        let ssl = b.build().configure()?.into_ssl(host)?;
+        let mut tls = boring::ssl::SslStream::new(ssl, tcp)?;
+        tls.write_all(req.as_bytes())?;
+        if let Some(b) = body {
+            tls.write_all(b)?;
+        }
+        tls.flush()?;
+        loop {
+            let n = tls.read(&mut chunk)?;
+            if n == 0 {
+                break;
+            }
+            if buf.len() + n > OCSP_MAX_BODY {
+                anyhow::bail!("ocsp response body exceeds {OCSP_MAX_BODY} bytes");
+            }
+            buf.extend_from_slice(&chunk[..n]);
+        }
+    } else {
+        let mut plain = tcp;
+        plain.write_all(req.as_bytes())?;
+        if let Some(b) = body {
+            plain.write_all(b)?;
+        }
+        plain.flush()?;
+        loop {
+            let n = plain.read(&mut chunk)?;
+            if n == 0 {
+                break;
+            }
+            if buf.len() + n > OCSP_MAX_BODY {
+                anyhow::bail!("ocsp response body exceeds {OCSP_MAX_BODY} bytes");
+            }
+            buf.extend_from_slice(&chunk[..n]);
+        }
+    }
     let head_end = buf
         .windows(4)
         .position(|w| w == b"\r\n\r\n")
@@ -681,7 +819,7 @@ pub fn obtain(host: &str, leaf: &X509, chain_pem: &[u8]) -> Option<Vec<u8>> {
             // caIssuers 下载（阻塞）
             let url = cai_urls.first()?;
             let u = parse_simple(url)?;
-            let body = https_req(&u.host, u.port, "GET", &u.path, None, None).ok()?;
+            let body = http_req(&u.host, u.port, u.https, "GET", &u.path, None, None).ok()?;
             parse_issuer_from_body(&body, leaf)
         }
     }?;
@@ -690,8 +828,8 @@ pub fn obtain(host: &str, leaf: &X509, chain_pem: &[u8]) -> Option<Vec<u8>> {
     let spki = extract_spki_bits(&issuer_der)?;
     let req = build_ocsp_request(leaf, &name_der, &spki).ok()?;
     let u = parse_simple(&ocsp_url)?;
-    let resp = https_req(&u.host, u.port, "POST", &u.path,
-                         Some("application/ocsp-request"), Some(&req))
+    let resp = http_req(&u.host, u.port, u.https, "POST", &u.path,
+                        Some("application/ocsp-request"), Some(&req))
         .ok()?;
     if !ocsp_response_ok(&resp) {
         return None;
@@ -704,17 +842,24 @@ pub fn obtain(host: &str, leaf: &X509, chain_pem: &[u8]) -> Option<Vec<u8>> {
         log::warn!("ocsp: {host} 响应 CertID 序列号与站点证书不符，丢弃本次响应");
         return None;
     }
+    let entry = Cached {
+        fetched_unix: now_unix(),
+        next_update_unix: parse_next_update(&resp),
+        der: resp.clone(),
+    };
+    // 过期响应绝不落盘、绝不入缓存、绝不上槽：否则续期线程会 `slot.set` 一份客户端
+    // 必拒的 staple，而且下次 tick 之前都无法恢复（tls-core P2）。返回 None 让调用方
+    // 保留旧槽（可能仍有效）或维持无装订。
+    if hard_expired(entry.next_update_unix, now_unix()) {
+        log::warn!("ocsp: {host} responder 返回**已过期**响应（nextUpdate 已过），丢弃且不装订");
+        return None;
+    }
     let dir = cache_dir();
     let _ = std::fs::create_dir_all(&dir);
     // 原子落盘：崩溃/断电留下的截断文件会被下次启动当成有效缓存（见 write_cache_atomic）。
     if let Err(e) = write_cache_atomic(&cache_file_for(host, &fingerprint), &resp) {
         log::warn!("ocsp: {host} 缓存落盘失败: {e}");
     }
-    let entry = Cached {
-        fetched_unix: now_unix(),
-        next_update_unix: parse_next_update(&resp),
-        der: resp.clone(),
-    };
     if let Some(ttl) = fresh_for(&entry) {
         log::info!(
             "ocsp: fetched {} bytes for {host} (nextUpdate in ~{}s)",
@@ -977,6 +1122,17 @@ fn parse_simple(url: &str) -> Option<SimpleUrl> {
 mod tests {
     use super::*;
 
+    /// 已过 nextUpdate 的响应必须被判为「硬过期」（据此拒绝装订），
+    /// 而没有 nextUpdate 或未到期的不能误判（否则会永远不装订）。
+    #[test]
+    fn hard_expired_only_when_next_update_passed() {
+        let now = 1_000_000i64;
+        assert!(hard_expired(Some(now - 1), now), "已过 nextUpdate 必须判过期");
+        assert!(hard_expired(Some(now), now), "恰好到点即过期");
+        assert!(!hard_expired(Some(now + 1), now), "未到期不得误判");
+        assert!(!hard_expired(None, now), "无 nextUpdate 不能凭此判过期");
+    }
+
     /// GeneralizedTime：`Z` 形式与带小数秒的形式都要能用（旧实现遇到小数秒就
     /// 退回 23h 兜底 TTL，可能把已过 nextUpdate 的响应继续装订出去）。
     #[test]
@@ -1016,6 +1172,119 @@ mod tests {
         // 连 responseStatus 都不完整。
         let short = [0x30u8, 0x05, 0x0A, 0x01];
         assert!(!ocsp_response_ok(&short));
+    }
+
+    /// **编码回归（P1）**：OCSPRequest 必须是合法 DER——旧实现把「完整 SEQUENCE 头 +
+    /// 内容」的错误常量又套了一层 `der_tlv(0x30, …)`，产出
+    /// `30 … 30 0F <9 字节>`：内层声明 15 字节内容、其后只有 9 字节。
+    /// `openssl asn1parse` 直接报 `ASN1_get_object:too long`，responder 只能回
+    /// `malformedRequest(1)` ⇒ **自动 OCSP 抓取对任何真实 CA 从未成功**。
+    ///
+    /// 向量是照 `openssl ocsp -reqout`（对本机真实 GlobalSign 链）的输出逐字节抄下来的
+    /// 结构：`SEQUENCE{ SEQUENCE{ SEQUENCE{ SEQUENCE{ AlgId, OCTET, OCTET, INTEGER } } } }`。
+    /// 断言三件事：
+    ///   1. 每个 TLV 的长度自洽（可被 `der_head` 完整走完，不会越界）；
+    ///   2. AlgorithmIdentifier 是 `30 09 06 05 2B 0E 03 02 1A 05 00`（9 字节内容）；
+    ///   3. 整串总长 = 5 个 header + 4 个 TLV 内容（用已知字段长度算出来的常数 71）。
+    #[test]
+    fn ocsp_request_der_matches_golden_vector() {
+        let name_hash = [0x11u8; 20];
+        let key_hash = [0x22u8; 20];
+        let serial = [0x01u8, 0x02, 0x03, 0x04];
+        let req = encode_ocsp_request(&name_hash, &key_hash, &serial);
+
+        // ① AlgorithmIdentifier：必须是 30 09（不是旧的 30 0F），内容 OID+SHA1+NULL。
+        //    偏移：5 层 SEQUENCE 头（各 2 字节）+ CertID 头 ⇒ AlgId 在 req[10..12]。
+        assert_eq!(
+            &req[10..12],
+            &[0x30, 0x09],
+            "AlgorithmIdentifier 头必须是 30 09（旧实现的 30 0F 声明了不存在的内容）"
+        );
+        assert_eq!(&req[12..14], &[0x06, 0x05]);
+        assert_eq!(&req[14..19], &[0x2B, 0x0E, 0x03, 0x02, 0x1A]); // OID 1.3.14.3.2.26
+        assert_eq!(&req[19..21], &[0x05, 0x00]); // NULL
+
+        // ② 整串能被 DER 头**逐层**走完（长度自洽，无 `too long`）。
+        //    RFC 6960 的嵌套是 5 层 SEQUENCE：OCSPRequest/TBSRequest/requestList/Request/CertID。
+        let mut off = 0usize;
+        for depth in 0..5 {
+            let (t, l, h) = der_head(&req, off).expect("每一层都必须能解析出 TLV 头");
+            assert_eq!(t, 0x30, "第 {depth} 层必须是 SEQUENCE");
+            assert!(
+                off + h + l <= req.len(),
+                "第 {depth} 层声明的内容越界：off={off} len={l} total={}",
+                req.len()
+            );
+            off += h;
+        }
+        // 走到最内层（CertID 内容起点）看到的必须正是 AlgId。
+        assert_eq!(&req[off..off + 2], &[0x30, 0x09]);
+        assert_eq!(off, 10, "五层 SEQUENCE 头之后应恰好是 CertID 内容");
+
+        // ③ 已知长度：serial 4 字节 + 两个 20 字节 OCTET + AlgId 11 ⇒ 71 字节
+        //    （与 `openssl ocsp -reqout` 对本机真实链的输出**逐字节一致**，实测比对过）。
+        assert_eq!(req.len(), 71, "OCSPRequest 结构长度不对（字段被多套/少套了一层）");
+    }
+
+    /// `parse_simple` 必须把 **scheme** 带出来：`http://` 的 AIA URL 要用明文 HTTP 抓，
+    /// 旧实现解析出 `https` 字段却**没有任何消费点**、一律先做 TLS 握手 ⇒ 对 80 端口
+    /// 做 TLS 必然 `record layer failure`，GlobalSign/DigiCert 这类 `http://` responder
+    /// 的自动装订从未成功过（本机实测：`openssl s_client -connect ocsp.globalsign.com:80`
+    /// 与真实 responder 直连均失败）。
+    #[test]
+    fn parse_simple_preserves_scheme_and_port() {
+        let u = parse_simple("http://ocsp.globalsign.com/gsgccr46ovtlsca2025").unwrap();
+        assert!(!u.https, "http:// 必须解析为明文");
+        assert_eq!(u.host, "ocsp.globalsign.com");
+        assert_eq!(u.port, 80);
+        assert_eq!(u.path, "/gsgccr46ovtlsca2025");
+
+        let u = parse_simple("https://ocsp.example.com:8443/ocsp").unwrap();
+        assert!(u.https);
+        assert_eq!(u.port, 8443);
+        assert_eq!(u.path, "/ocsp");
+
+        // 无路径/无端口 的默认值。
+        let u = parse_simple("https://x.example").unwrap();
+        assert_eq!((u.port, u.path.as_str()), (443, "/"));
+        assert!(parse_simple("ftp://x/y").is_none());
+    }
+
+    /// **联网**端到端（默认 `#[ignore]`，需要外网 + 真实 CA 证书链）：
+    /// 用 `obtain()` 对真实 responder 走完整流程（AIA 解析 → issuer 查找 → 请求编码 →
+    /// 明文/HTTPS 抓取 → 响应校验 → CertID 匹配）。
+    ///
+    /// 跑法（证书链来自任意公共站点，`openssl s_client -showcerts` 导出为 PEM）：
+    /// ```text
+    /// CRUCIBLE_OCSP_TEST_CHAIN=/path/fullchain.pem CRUCIBLE_OCSP_TEST_HOST=mirrors.aliyun.com \
+    ///   cargo test --release --bin webserver ocsp_live -- --ignored --nocapture
+    /// ```
+    /// 修复前 `build_ocsp_request` 产出非法 DER（responder 回 `malformedRequest`），
+    /// 本用例必然失败（`obtain` 返回 None）；修复后应拿到一份通过
+    /// `ocsp_response_ok` + CertID 匹配的响应。
+    #[test]
+    #[ignore]
+    fn ocsp_live_obtain_against_real_responder() {
+        let chain_path = std::env::var("CRUCIBLE_OCSP_TEST_CHAIN")
+            .expect("需要 CRUCIBLE_OCSP_TEST_CHAIN=<fullchain.pem>");
+        let host = std::env::var("CRUCIBLE_OCSP_TEST_HOST").unwrap_or_else(|_| "test".into());
+        let pem = std::fs::read(&chain_path).expect("read chain");
+        let leaf = X509::from_pem(&pem).expect("leaf parse");
+        let der = obtain(&host, &leaf, &pem).expect(
+            "obtain() 返回 None —— 请求编码/抓取/校验任一步失败（修复前正是这条会失败）",
+        );
+        assert!(ocsp_response_ok(&der), "拿回的响应未通过基本校验");
+        let serial = extract_serial(&leaf.to_der().unwrap()).unwrap();
+        assert_ne!(
+            response_covers_leaf(&der, &serial),
+            Some(false),
+            "响应 CertID 与站点证书不匹配"
+        );
+        eprintln!(
+            "[ocsp-live] host={host} response={} bytes nextUpdate={:?}",
+            der.len(),
+            parse_next_update(&der)
+        );
     }
 
     /// 同一 DER **长度**的两张证书必须得到不同指纹（旧实现按长度做缓存键，

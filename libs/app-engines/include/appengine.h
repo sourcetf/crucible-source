@@ -12,6 +12,30 @@
 extern "C" {
 #endif
 
+/*
+ * ABI version. Bump this **whenever** the signature of `appengine_execute`,
+ * the `AppEngineResult` layout, or the meaning of any parameter changes.
+ *
+ * Why it must exist and be checked: C has no arity/type info at the ABI
+ * boundary. The host dlsym()s `appengine_execute` and calls it with a fixed
+ * argument list; if the loaded `.so` was built against an **older** header
+ * (e.g. before the `headers` parameter was added), the callee reads `out`
+ * from the wrong argument slot. In the observed case `out` landed on the
+ * request-header string, so `appengine_result_alloc()` memset 48 bytes over a
+ * heap allocation → glibc `sysmalloc` abort killed the **whole** webserver,
+ * and every request returned a bogus 500. `RTLD_NOW` cannot catch this
+ * (symbols resolve fine; only the arity is wrong).
+ *
+ * The host therefore requires `appengine_abi_version()` to be present and to
+ * equal its own compiled-in value, and refuses to load the engine otherwise
+ * (clean 502 + "rebuild engines" message instead of heap corruption).
+ * Defined in `common/appengine_common.c`, which every engine links.
+ */
+#define APPENGINE_ABI_VERSION 2
+
+/* Returns APPENGINE_ABI_VERSION. The host calls this right after dlopen. */
+int appengine_abi_version(void);
+
 typedef struct AppEngineResult {
     int status;
     char *headers;       /* "Name: value\r\n" pairs, NUL-terminated block */

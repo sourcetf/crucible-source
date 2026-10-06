@@ -41,7 +41,7 @@ const SMALL_FILE_MAX: u64 = 256 * 1024;
 const CACHE_CAP: usize = 256;
 
 struct CacheEntry {
-    mtime: SystemTime,
+    id: FileId,
     data: Bytes,
     content_type: String,
 }
@@ -85,10 +85,53 @@ fn read_file_capped(path: &Path) -> Result<Vec<u8>> {
     Ok(fs::read(path)?)
 }
 
+/// 大文件（>SMALL_FILE_MAX）整读走 `spawn_blocking`，别在 async worker 上同步读盘。
+///
+/// 为什么：`fs::read` 最大 16MiB，而 bench/生产形态只给 2 个 tokio worker；一次冷读
+/// 就能让整个进程（三协议共用 runtime）停止调度数十毫秒。小文件仍走 [`read_cached`]
+/// 的同步读（≤256KiB，通常已在页缓存里，且要把锁保持在 await 之外）。
+async fn read_file_async(path: PathBuf) -> Result<Bytes> {
+    tokio::task::spawn_blocking(move || read_file_capped(&path).map(Bytes::from))
+        .await
+        .map_err(|e| anyhow::anyhow!("blocking read task failed: {e}"))?
+}
+
+/// 目录请求缺少尾斜杠 → 301 Location（保留 query）。
+///
+/// 为什么必须有：`/dir` 与 `/dir/` 在浏览器里是**不同的基地址**。直接把目录索引
+/// （index.html）或 autoindex 列表回给 `/dir` 时，页面里的相对链接（`./a.css`、`a.png`）
+/// 会以 `/` 为基解析成 `/a.css` → 全部 404（典型症状：子目录页面样式/图片全丢）。
+/// 301 到带尾斜杠的同一路径后相对链接才正确；query 原样保留（否则带参数的目录页丢参数）。
+///
+/// 语义与 nginx / h2o 的 `file.dir` 一致：**只要解析出来是目录**且路径不以 `/` 结尾就跳转
+/// （无论该目录最后会不会回 index.html 或目录列表）。返回 `None` 表示无需跳转。
+fn dir_redirect_location(uri: &http::Uri) -> Option<http::HeaderValue> {
+    let path = uri.path();
+    if path.ends_with('/') {
+        return None;
+    }
+    let mut target = String::with_capacity(path.len() + 16);
+    target.push_str(path);
+    target.push('/');
+    if let Some(q) = uri.query() {
+        target.push('?');
+        target.push_str(q);
+    }
+    http::HeaderValue::from_str(&target).ok()
+}
+
 pub async fn serve(req: &Request<Incoming>, lc: &ListenerConfig) -> Result<Response<BoxBody>> {
     if req.method() != Method::GET && req.method() != Method::HEAD {
+        // RFC 9110 §15.5.6：405 **必须**带 Allow，告诉客户端该资源支持哪些方法
+        // （此前只回状态码 + 文案，自动化客户端无从得知）。
+        // 头必须与 h2/h3 的 `serve_simple` 405 **逐字一致**：此前 h1 这条漏了
+        // `Content-Type`，于是同一个 `POST /index.html` 在 h1 上是「无 Content-Type」、
+        // 在 h2/h3 上是 `text/plain; charset=utf-8` —— 跨协议头不一致（规格 §4/§16 要求
+        // 同一资源在任何协议下行为一致，缓存/CDN/自动化客户端会据此分叉）。
         return Ok(Response::builder()
             .status(StatusCode::METHOD_NOT_ALLOWED)
+            .header(header::ALLOW, "GET, HEAD")
+            .header(header::CONTENT_TYPE, "text/plain; charset=utf-8")
             .body(full("method not allowed"))
             .unwrap());
     }
@@ -96,10 +139,20 @@ pub async fn serve(req: &Request<Incoming>, lc: &ListenerConfig) -> Result<Respo
     let fs_path = resolve_path(&lc.root, path)?;
     let meta = fs::metadata(&fs_path)?;
     if meta.is_dir() {
+        // 目录缺尾斜杠 → 301 补上（保留 query）。必须在 index/autoindex 之前：
+        // 否则 `/dir` 会直接回 index.html，页面里的相对链接以 `/` 为基解析 → 全 404。
+        if let Some(loc) = dir_redirect_location(req.uri()) {
+            return Ok(Response::builder()
+                .status(StatusCode::MOVED_PERMANENTLY)
+                .header(header::LOCATION, loc)
+                .header(header::CONTENT_TYPE, "text/html; charset=utf-8")
+                .body(full("<h1>301 Moved Permanently</h1>"))
+                .unwrap());
+        }
         // 目录索引优先（h2o/nginx 默认）：docroot 带 index.html 时根路径必须返回它，
         // 而不是目录列表或 404。索引文件走与普通文件**完全相同**的闸门
         // （file_open/engine_owns/app_private_path），不放宽任何安全判定。
-        if let Some((idx, idx_meta)) = directory_index(&fs_path) {
+        if let Some((idx, idx_meta)) = directory_index(&fs_path, &lc.root) {
             let mode = lc.file_open_mode(path);
             if !engine_owns(lc, path, mode) && !app_private_path(lc, path, mode) {
                 return serve_file(req, &idx, &idx_meta, mode).await;
@@ -228,23 +281,74 @@ fn normalize_url_path(p: &str) -> Option<String> {
 // If-Unmodified-Since / If-None-Match / If-Modified-Since / If-Range
 // ---------------------------------------------------------------------------
 
+/// 文件 inode（Unix）；非 Unix 平台返回 0（该项目主目标是 OpenBSD）。
+/// 用于把「原子替换」识别成新表示：`rename` 后 inode 必变（实测确认）。
+#[cfg(unix)]
+fn file_ino(meta: &fs::Metadata) -> u64 {
+    use std::os::unix::fs::MetadataExt;
+    meta.ino()
+}
+#[cfg(not(unix))]
+fn file_ino(_meta: &fs::Metadata) -> u64 {
+    0
+}
+
+/// 文件「身份指纹」：(长度, inode, mtime)。小文件缓存与 ETag 都用它。
+///
+/// 为什么不能只看 mtime：本机（WSL ext4 与 OpenBSD）的文件时间戳走**粗粒度时钟**
+/// （jiffy），实测同一毫秒内的两次写盘得到**完全相同**的 `mtime_ns` —— 于是
+/// 「同一 tick 内的等长改写」在只比 mtime 时会被误判成「没变」，缓存与条件请求
+/// 都会把**旧内容**当成当前表示。inode 能把**原子替换**（rename：部署脚本
+/// `sed -i`/`cp`、以及本项目的上传 commit 都是这个形态）区分开。
+///
+/// 诚实边界：**同 inode 原地改写 + 同长度 + 同 tick** 仍然分辨不出（要彻底解决
+/// 只能读内容算哈希，代价与收益不成比例）。这条边界写在这里而不是假装不存在。
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct FileId {
+    len: u64,
+    ino: u64,
+    mtime: SystemTime,
+}
+
+fn file_id(meta: &fs::Metadata) -> FileId {
+    FileId {
+        len: meta.len(),
+        ino: file_ino(meta),
+        mtime: meta.modified().unwrap_or(SystemTime::UNIX_EPOCH),
+    }
+}
+
 /// 当前表示的验证器：`(ETag, 截断到秒的 mtime)`。
 ///
-/// ETag 取 `"{len:x}-{mtime_secs:x}"`（nginx 同款：长度 + 秒级 mtime）。**诚实边界**：
-/// 这是*弱*验证器语义（同一秒内等长改写识别不出来），但按业界惯例不加 `W/` 前缀，
-/// 因而客户端会当强验证器用于 `If-Range`。要真正强验证器需改成内容哈希
-/// （意味着每个请求都全量读文件，代价与收益不成比例）。秒截断是必须的：
-/// HTTP 日期只有秒精度，不截断会让 `If-Modified-Since` 把同一秒内的请求判成「已修改」。
+/// ETag 取 `"{len:x}-{mtime_secs:x}-{mtime_nanos:x}-{ino:x}"`（长度 + mtime + inode）。
+///
+/// * `mtime_nanos` + `ino` 都是为了识别「文件被换掉了」：只到秒的 `{len}-{secs}`
+///   对同一秒内的**等长改写**会生成完全相同的 ETag，于是 `If-None-Match` 错误回 304、
+///   `If-Range` 错误放行旧偏移的 Range —— 客户端拿到旧内容。上传的原子 rename、
+///   部署脚本的 `sed -i` 都属于这类（可复现：同目录 `rename` 覆盖同长度文件）。
+///   时间戳粒度不足时（粗粒度时钟），inode 仍然能兜住原子替换这条主流路径。
+/// * `Last-Modified` / `If-Modified-Since` / `If-Range`(日期形式) 仍用**秒级**截断：
+///   HTTP 日期只有秒精度，不截断会把同一秒内的请求判成「已修改」，条件请求永远拿不到 304。
+///
+/// **诚实边界**：这仍是*弱*验证器语义（同 inode 原地改写 + 同长度 + 同 tick 识别不出），
+/// 按业界惯例不加 `W/` 前缀。真正强验证器需内容哈希（每请求全量读文件，代价与收益不成比例）。
 fn validators(meta: &fs::Metadata) -> (String, Option<SystemTime>) {
-    let mtime = meta
-        .modified()
-        .ok()
-        .map(|t| trunc_to_secs(t));
-    let secs = mtime
+    let mtime_full = meta.modified().ok();
+    let mtime = mtime_full.map(trunc_to_secs);
+    let (secs, nanos) = mtime_full
         .and_then(|t| t.duration_since(SystemTime::UNIX_EPOCH).ok())
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    (format!("\"{:x}-{:x}\"", meta.len(), secs), mtime)
+        .map(|d| (d.as_secs(), d.subsec_nanos()))
+        .unwrap_or((0, 0));
+    (
+        format!(
+            "\"{:x}-{:x}-{:x}-{:x}\"",
+            meta.len(),
+            secs,
+            nanos,
+            file_ino(meta)
+        ),
+        mtime,
+    )
 }
 
 fn trunc_to_secs(t: SystemTime) -> SystemTime {
@@ -255,17 +359,30 @@ fn trunc_to_secs(t: SystemTime) -> SystemTime {
     }
 }
 
-/// ETag 列表匹配（RFC 9110 §8.8.3.2）：`*` 匹配任何现有表示；`W/` 前缀双方任一为弱即
-/// 按弱比较相等；逗号分隔列表逐个比。`*` 之外的列表项必须**整体**相等（含引号）。
-fn etag_list_matches(header_value: &str, etag: &str) -> bool {
+/// ETag 列表匹配（RFC 9110 §8.8.3.2）：`*` 匹配任何现有表示；逗号分隔列表逐个比；
+/// `*` 之外的列表项必须**整体**相等（含引号）。
+///
+/// `strong = true`（`If-Match`）按**强比较**：任一方带 `W/` 弱标记即不匹配
+/// （RFC 9110 §13.1.1「If-Match 用强比较，弱验证器永不匹配」）；
+/// `strong = false`（`If-None-Match`）按弱比较：双方任一为弱即按相等处理。
+fn etag_list_matches(header_value: &str, etag: &str, strong: bool) -> bool {
     let v = header_value.trim();
     if v == "*" {
         return true;
     }
+    let etag_weak = etag.trim().starts_with("W/");
     let want = etag.trim().trim_start_matches("W/");
     v.split(',').any(|c| {
         let c = c.trim();
-        !c.is_empty() && c.trim_start_matches("W/") == want
+        if c.is_empty() {
+            return false;
+        }
+        let cand = c.trim_start_matches("W/");
+        // 强比较下任一方是弱验证器就不算匹配
+        if strong && (c.starts_with("W/") || etag_weak) {
+            return false;
+        }
+        cand == want
     })
 }
 
@@ -286,9 +403,9 @@ fn eval_conditions(
     mtime: Option<SystemTime>,
     method_allows_304: bool,
 ) -> Cond {
-    // 1) If-Match：不匹配 → 412
+    // 1) If-Match：不匹配 → 412（强比较：弱验证器永不匹配，RFC 9110 §13.1.1）
     if let Some(v) = headers.get(header::IF_MATCH).and_then(|v| v.to_str().ok()) {
-        if !etag_list_matches(v, etag) {
+        if !etag_list_matches(v, etag, true) {
             return Cond::PreconditionFailed;
         }
     } else if let Some(v) = headers
@@ -302,12 +419,13 @@ fn eval_conditions(
             }
         }
     }
-    // 3) If-None-Match：命中 → 304（GET/HEAD）或 412（其它方法）
+    // 3) If-None-Match：命中 → 304（GET/HEAD）或 412（其它方法）。**弱比较**
+    //（RFC 9110 §13.1.2：与 If-Match 相反，这里弱验证器也算匹配）。
     if let Some(v) = headers
         .get(header::IF_NONE_MATCH)
         .and_then(|v| v.to_str().ok())
     {
-        if etag_list_matches(v, etag) {
+        if etag_list_matches(v, etag, false) {
             return if method_allows_304 {
                 Cond::NotModified
             } else {
@@ -332,6 +450,12 @@ fn eval_conditions(
 
 /// `If-Range`（RFC 9110 §13.1.5）：给了验证器但与当前表示不符（含无法解析、含 `W/`
 /// 弱标记 —— 强比较不成立）→ 必须**忽略 Range 回 200 全量**。返回 true 表示 Range 可用。
+///
+/// entity-tag 形式按**强比较**逐字节相等（§13.1.5「using the strong comparison
+/// function」）；日期形式必须与本表示的 `Last-Modified`（秒精度，见 [`validators`]）
+/// **精确相等** —— RFC 的两条判据是「日期是强验证器」+「与 Last-Modified 完全一致」，
+/// 宽松的 `mtime <= date` 会让时钟偏快的客户端用一个「未来日期」蒙过校验，拿到新文件的
+/// 旧偏移片段（内容错乱）。日期无法解析/表示没有 mtime → 条件为假（忽略 Range）。
 fn if_range_allows(headers: &http::HeaderMap, etag: &str, mtime: Option<SystemTime>) -> bool {
     let Some(raw) = headers.get(header::IF_RANGE).and_then(|v| v.to_str().ok()) else {
         return true;
@@ -345,13 +469,79 @@ fn if_range_allows(headers: &http::HeaderMap, etag: &str, mtime: Option<SystemTi
         return v == etag.trim();
     }
     match httpdate::parse_http_date(v) {
+        // 只有与 Last-Modified 完全一致才算未修改（RFC 9110 §13.1.5 第 2 步）
         Ok(t) => match mtime {
-            // mtime <= t ⇒ 未修改 ⇒ Range 可用
-            Some(m) => m <= t,
+            Some(m) => trunc_to_secs(t) == m,
             None => false,
         },
         // 既不是 entity-tag 也不是合法日期：无法匹配 → 忽略 Range
         Err(_) => false,
+    }
+}
+
+/// HEAD 请求 + `Range`：按 RFC 9110 §9.3.2/§14.2 返回与 GET **相同**的状态与
+/// `Content-Range`（206 / 416），但不读一个字节的正文。
+///
+/// 为什么不能在 Range 之前就短路回 200：`curl -I -r 0-9` 这类客户端靠 206 +
+/// `Content-Range` 判断服务端是否支持区间，回 200 会让它们认为「不支持续传」；
+/// 而此前为了避免 32MiB 的读放大，HEAD 被放在了 Range 判定之前。
+/// 这里改为「只算区间、不读数据」：既满足协议语义，也没有任何读放大。
+/// HEAD 版的 Range 响应（不读盘）：按 GET 会返回的状态/头作答。
+///
+/// 多段时必须报 `multipart/byteranges` 的 `Content-Type` 与**精确**的 `Content-Length`
+/// ——那个长度由 [`multipart_plan`] 的排版算出来，不需要读任何数据。
+fn head_range_response(
+    path: &Path,
+    len: u64,
+    range: &str,
+    ct: &str,
+    disposition: Option<&str>,
+    etag: &str,
+    mtime: Option<SystemTime>,
+) -> Option<Response<BoxBody>> {
+    match head_range_outcome(len, range, ct) {
+        RangeOutcome::Ignore => None,
+        RangeOutcome::Unsatisfiable => Some(add_validators(
+            Response::builder()
+                .status(StatusCode::RANGE_NOT_SATISFIABLE)
+                // RFC 9110 §14.4：416 必须带 `Content-Range: bytes */<length>`
+                .header(header::CONTENT_RANGE, format!("bytes */{len}"))
+                .body(empty())
+                .unwrap(),
+            etag,
+            mtime,
+        )),
+        RangeOutcome::Single { start, end, .. } => {
+            let mut b = Response::builder()
+                .status(StatusCode::PARTIAL_CONTENT)
+                .header(header::CONTENT_TYPE, ct)
+                .header(header::CONTENT_RANGE, format!("bytes {start}-{end}/{len}"))
+                .header(header::CONTENT_LENGTH, end - start + 1)
+                .header(header::ACCEPT_RANGES, "bytes");
+            if let Some(d) = disposition {
+                b = b.header(header::CONTENT_DISPOSITION, disposition_value(path, d));
+                b = b.header("x-content-type-options", "nosniff");
+            }
+            Some(add_validators(b.body(empty()).unwrap(), etag, mtime))
+        }
+        RangeOutcome::Multi {
+            content_type,
+            content_length,
+            ..
+        } => {
+            // 与 GET 的多段响应同头（顶层无 Content-Range）。长度由 head_range_outcome
+            // 用 multipart 排版算出来（不需要读数据），这里直接用。
+            let mut b = Response::builder()
+                .status(StatusCode::PARTIAL_CONTENT)
+                .header(header::CONTENT_TYPE, content_type)
+                .header(header::CONTENT_LENGTH, content_length)
+                .header(header::ACCEPT_RANGES, "bytes");
+            if let Some(d) = disposition {
+                b = b.header(header::CONTENT_DISPOSITION, disposition_value(path, d));
+                b = b.header("x-content-type-options", "nosniff");
+            }
+            Some(add_validators(b.body(empty()).unwrap(), etag, mtime))
+        }
     }
 }
 
@@ -376,6 +566,7 @@ pub async fn serve_simple<T>(req: &Request<T>, lc: &ListenerConfig) -> Result<Re
     if method != Method::GET && method != Method::HEAD {
         return Ok(Response::builder()
             .status(StatusCode::METHOD_NOT_ALLOWED)
+            .header(header::ALLOW, "GET, HEAD")
             .header(header::CONTENT_TYPE, "text/plain; charset=utf-8")
             .body(Bytes::from_static(b"method not allowed"))
             .unwrap());
@@ -384,8 +575,18 @@ pub async fn serve_simple<T>(req: &Request<T>, lc: &ListenerConfig) -> Result<Re
     let mut fs_path = resolve_path(&lc.root, path)?;
     let mut meta = fs::metadata(&fs_path)?;
     if meta.is_dir() {
+        // 与 h1 一致：目录缺尾斜杠先 301（保留 query），再谈 index/autoindex。
+        // 此前 h2/h3 完全没有这道跳转：`GET /dir` 直接回目录内容，页面相对链接全错。
+        if let Some(loc) = dir_redirect_location(req.uri()) {
+            return Ok(Response::builder()
+                .status(StatusCode::MOVED_PERMANENTLY)
+                .header(header::LOCATION, loc)
+                .header(header::CONTENT_TYPE, "text/html; charset=utf-8")
+                .body(Bytes::from_static(b"<h1>301 Moved Permanently</h1>"))
+                .unwrap());
+        }
         // 与 h1 相同：index.html/index.htm 优先（否则 h1 与 h2/h3 行为不一致）。
-        if let Some((idx, idx_meta)) = directory_index(&fs_path) {
+        if let Some((idx, idx_meta)) = directory_index(&fs_path, &lc.root) {
             fs_path = idx;
             meta = idx_meta;
         }
@@ -458,10 +659,69 @@ pub async fn serve_simple<T>(req: &Request<T>, lc: &ListenerConfig) -> Result<Re
         }
         Cond::Proceed => {}
     }
-    // HEAD 短路必须与 h1 一致（h1 已修，h2/h3 漏了）：此前 HEAD 照样整读文件并
+    // HEAD 短路必须与 h1 一致：此前 HEAD 照样整读文件并
     // 经 DATA 帧把正文发上线——RFC 9110 §9.3.2 禁止 HEAD 响应带内容，且一个
     // `HEAD /big.bin` 就能造成最多 16MiB 的读放大 + 上线放大。
+    // 与 h1 同样保留 Range 语义（206/416 + Content-Range），只是不读数据。
     if method == Method::HEAD {
+        if if_range_allows(req.headers(), &etag, mtime) {
+            if let Some(rr) = req.headers().get(header::RANGE).and_then(|v| v.to_str().ok()) {
+                match head_range_outcome(len, rr, &ct) {
+                    RangeOutcome::Ignore => {}
+                    RangeOutcome::Unsatisfiable => {
+                        return Ok(with_validators(
+                            Response::builder()
+                                .status(StatusCode::RANGE_NOT_SATISFIABLE)
+                                .header(header::CONTENT_RANGE, format!("bytes */{len}")),
+                            &etag,
+                            mtime,
+                        )
+                        .body(Bytes::new())
+                        .unwrap());
+                    }
+                    RangeOutcome::Single { start, end, .. } => {
+                        let mut b = with_validators(
+                            Response::builder()
+                                .status(StatusCode::PARTIAL_CONTENT)
+                                .header(header::CONTENT_TYPE, ct)
+                                .header(header::CONTENT_RANGE, format!("bytes {start}-{end}/{len}"))
+                                .header(header::CONTENT_LENGTH, end - start + 1)
+                                .header(header::ACCEPT_RANGES, "bytes"),
+                            &etag,
+                            mtime,
+                        );
+                        if let Some(d) = disposition {
+                            b = b.header(header::CONTENT_DISPOSITION, disposition_value(&fs_path, d));
+                            b = b.header("x-content-type-options", "nosniff");
+                        }
+                        return Ok(b.body(Bytes::new()).unwrap());
+                    }
+                    RangeOutcome::Multi {
+                        content_type,
+                        content_length,
+                        ..
+                    } => {
+                        let mut b = with_validators(
+                            Response::builder()
+                                .status(StatusCode::PARTIAL_CONTENT)
+                                .header(header::CONTENT_TYPE, content_type)
+                                .header(header::CONTENT_LENGTH, content_length)
+                                .header(header::ACCEPT_RANGES, "bytes"),
+                            &etag,
+                            mtime,
+                        );
+                        if let Some(d) = disposition {
+                            b = b.header(
+                                header::CONTENT_DISPOSITION,
+                                disposition_value(&fs_path, d),
+                            );
+                            b = b.header("x-content-type-options", "nosniff");
+                        }
+                        return Ok(b.body(Bytes::new()).unwrap());
+                    }
+                }
+            }
+        }
         let mut b = with_validators(
             Response::builder()
                 .status(StatusCode::OK)
@@ -480,20 +740,32 @@ pub async fn serve_simple<T>(req: &Request<T>, lc: &ListenerConfig) -> Result<Re
 
     // Range/206：h2/h3 此前完全不支持 Range。浏览器/播放器默认走 h2/h3，
     // 于是「下载断点续传」在主协议上不可用，而且超过 MAX_FULL_READ 的文件
-    // 只能拿到下面的 413（等于完全下不动）。这里补上与 h1 相同的单段 Range 语义。
+    // 只能拿到下面的 413（等于完全下不动）。这里补上与 h1 相同的 Range 语义
+    //（单段 + multipart/byteranges，见 `eval_range`）。
     // `If-Range` 门：验证器不符时必须忽略 Range 回 200 全量（否则续传客户端会拿到
     // 新文件的一段旧偏移数据 —— 静默的文件内容错乱）。
     if if_range_allows(req.headers(), &etag, mtime) {
         if let Some(rr) = req.headers().get(header::RANGE).and_then(|v| v.to_str().ok()) {
-            match parse_range(rr, len) {
-                RangeSpec::Slice { start, end } => {
-                    let buf = read_slice(&fs_path, start, end)?;
+            match eval_range(&fs_path, len, rr, &ct).await? {
+                RangeOutcome::Ignore => {}
+                RangeOutcome::Unsatisfiable => {
+                    return Ok(with_validators(
+                        Response::builder()
+                            .status(StatusCode::RANGE_NOT_SATISFIABLE)
+                            .header(header::CONTENT_RANGE, format!("bytes */{len}")),
+                        &etag,
+                        mtime,
+                    )
+                    .body(Bytes::new())
+                    .unwrap());
+                }
+                RangeOutcome::Single { start, end, body } => {
                     let mut b = with_validators(
                         Response::builder()
                             .status(StatusCode::PARTIAL_CONTENT)
                             .header(header::CONTENT_TYPE, ct)
                             .header(header::CONTENT_RANGE, format!("bytes {start}-{end}/{len}"))
-                            .header(header::CONTENT_LENGTH, buf.len())
+                            .header(header::CONTENT_LENGTH, body.len())
                             .header(header::ACCEPT_RANGES, "bytes"),
                         &etag,
                         mtime,
@@ -504,16 +776,30 @@ pub async fn serve_simple<T>(req: &Request<T>, lc: &ListenerConfig) -> Result<Re
                         b = b.header(header::CONTENT_DISPOSITION, disposition_value(&fs_path, d));
                         b = b.header("x-content-type-options", "nosniff");
                     }
-                    return Ok(b.body(Bytes::from(buf)).unwrap());
+                    return Ok(b.body(body).unwrap());
                 }
-                RangeSpec::Unsatisfiable => {
-                    return Ok(Response::builder()
-                        .status(StatusCode::RANGE_NOT_SATISFIABLE)
-                        .header(header::CONTENT_RANGE, format!("bytes */{len}"))
-                        .body(Bytes::new())
-                        .unwrap());
+                RangeOutcome::Multi {
+                    content_type,
+                    content_length,
+                    body,
+                } => {
+                    // 多段：顶层不带 Content-Range（RFC 9110 §15.3.7.2）。
+                    let mut b = with_validators(
+                        Response::builder()
+                            .status(StatusCode::PARTIAL_CONTENT)
+                            .header(header::CONTENT_TYPE, content_type)
+                            .header(header::CONTENT_LENGTH, content_length)
+                            .header(header::ACCEPT_RANGES, "bytes"),
+                        &etag,
+                        mtime,
+                    );
+                    let _ = body.len();
+                    if let Some(d) = disposition {
+                        b = b.header(header::CONTENT_DISPOSITION, disposition_value(&fs_path, d));
+                        b = b.header("x-content-type-options", "nosniff");
+                    }
+                    return Ok(b.body(body).unwrap());
                 }
-                RangeSpec::Ignore => {}
             }
         }
     }
@@ -547,7 +833,8 @@ pub async fn serve_simple<T>(req: &Request<T>, lc: &ListenerConfig) -> Result<Re
     let data = if len <= SMALL_FILE_MAX {
         read_cached(&fs_path, &meta)?
     } else {
-        Bytes::from(read_file_capped(&fs_path)?)
+        // >256KiB 的整读走 spawn_blocking（同 h1 路径）。
+        read_file_async(fs_path.clone()).await?
     };
     let mut b = with_validators(
         Response::builder()
@@ -762,11 +1049,19 @@ async fn serve_file(
         Cond::Proceed => {}
     }
 
-    // HEAD 必须在 Range 与整读**之前**短路。hyper 会丢弃 HEAD 的 body，但这里
-    // 仍会 range_response（最多 32MiB 的 vec![0u8; take] + read_exact）或
-    // read_file_capped（最多 16MiB）把数据读一遍再扔掉 —— 一个 ~120 字节的
-    // `HEAD /big.bin` + `Range: bytes=0-33554431` 就是一次 32MiB 放大。
+    // HEAD 在 Range 与整读**之前**短路，但**不吞掉 Range 语义**（RFC 9110 §9.3.2
+    // 要求 HEAD 与 GET 同状态、同头）。此前 HEAD 恒回 200：`curl -I -r 0-9` 会据此判定
+    // 「服务端不支持区间」；而把 HEAD 放到 Range 之后又会造成最多 32MiB 的读放大
+    // （`HEAD /big.bin` + `Range: bytes=0-33554431`）。这里的折中是：**只算区间、不读数据**。
     if req.method() == Method::HEAD {
+        if if_range_allows(req.headers(), &etag, mtime) {
+            if let Some(rr) = req.headers().get(header::RANGE).and_then(|v| v.to_str().ok()) {
+                if let Some(resp) = head_range_response(path, len, rr, &ct, disposition, &etag, mtime)
+                {
+                    return Ok(resp);
+                }
+            }
+        }
         let mut b = with_validators(
             Response::builder()
                 .status(StatusCode::OK)
@@ -787,7 +1082,7 @@ async fn serve_file(
     if if_range_allows(req.headers(), &etag, mtime) {
         if let Some(range) = req.headers().get(header::RANGE) {
             if let Ok(r) = range.to_str() {
-                if let Some(resp) = range_response(path, len, r, &ct, disposition)? {
+                if let Some(resp) = range_response(path, len, r, &ct, disposition).await? {
                     return Ok(add_validators(resp, &etag, mtime));
                 }
             }
@@ -823,7 +1118,9 @@ async fn serve_file(
     let data = if len <= SMALL_FILE_MAX {
         read_cached(path, meta)?
     } else {
-        Bytes::from(read_file_capped(path)?)
+        // >256KiB 的整读走 spawn_blocking：同步 `fs::read` 最大 16MiB，在 2-worker 的
+        // bench 形态下会把整个 runtime（三协议共用）卡住数十毫秒。
+        read_file_async(path.to_path_buf()).await?
     };
 
     let mut b = with_validators(
@@ -844,11 +1141,14 @@ async fn serve_file(
 }
 
 fn read_cached(path: &Path, meta: &std::fs::Metadata) -> Result<Bytes> {
-    let mtime = meta.modified().unwrap_or(SystemTime::UNIX_EPOCH);
+    let id = file_id(meta);
     {
         let cache = SMALL_CACHE.lock();
         if let Some(e) = cache.get(path) {
-            if e.mtime == mtime {
+            // 用 FileId（长度+inode+mtime）而不是裸 mtime：粗粒度时钟下同一 tick 内的
+            // 等长改写会得到相同 mtime，只比 mtime 时缓存会把**旧内容**当当前表示
+            // 发出去（同一个文件在 autoindex/preview 页面上"改了不生效"）。
+            if e.id == id {
                 return Ok(e.data.clone());
             }
         }
@@ -864,7 +1164,7 @@ fn read_cached(path: &Path, meta: &std::fs::Metadata) -> Result<Bytes> {
     cache.insert(
         path.to_path_buf(),
         CacheEntry {
-            mtime,
+            id,
             data: data.clone(),
             content_type: ct,
         },
@@ -883,7 +1183,49 @@ enum RangeSpec {
     Slice { start: u64, end: u64 },
 }
 
-/// 解析单段 Range（RFC 7233 §2.1）：支持 `bytes=N-M`、`bytes=N-`、`bytes=-N`。
+/// 一个已解析、已收窄的字节区间（闭区间）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ByteRange {
+    pub start: u64,
+    pub end: u64,
+}
+
+impl ByteRange {
+    fn len(&self) -> u64 {
+        self.end - self.start + 1
+    }
+}
+
+/// 把「已解析的单段」收进 [`MAX_RANGE_BYTES`] 上限（超限时按 suffix/显式对齐收窄）。
+fn clamp_slice(start: u64, end: u64, suffix: bool) -> ByteRange {
+    if end - start + 1 > MAX_RANGE_BYTES {
+        let cap = MAX_RANGE_BYTES - 1;
+        // suffix 请求要的是文件尾部，收窄时保持尾部对齐；显式请求保持头部对齐。
+        if suffix {
+            ByteRange { start: end - cap, end }
+        } else {
+            ByteRange { start, end: start + cap }
+        }
+    } else {
+        ByteRange { start, end }
+    }
+}
+
+/// 解析一个**纯 ASCII 数字**的 u64 位置。非纯数字（空串、前导 `+`、含空白、含字母）
+/// 一律 `None` —— RFC 9110 §14.1.1 的 `first-pos`/`last-pos` 只允许 DIGIT。
+///
+/// 为什么不能直接用 `str::parse::<u64>()`：Rust 的整型解析**接受前导 `+`**（`"+5".parse()`
+/// 得到 5）与前后空白，于是 `Range: bytes=+5-9` 会被当成合法区间 5-9 回 206；而按 §14.2
+/// 畸形/不可满足之外、语法不成立的 Range 必须**忽略**（回 200 全量）。同理超长数字串
+/// （`parse` 溢出 Err）也归入忽略，而不是 panic。
+fn digits_u64(s: &str) -> Option<u64> {
+    if s.is_empty() || !s.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    s.parse::<u64>().ok()
+}
+
+/// 解析**单段** Range（RFC 7233 §2.1）：支持 `bytes=N-M`、`bytes=N-`、`bytes=-N`。
 fn parse_range(range: &str, len: u64) -> RangeSpec {
     let range = range.trim();
     // range unit（`bytes`）是 token，按 RFC 9110 §14.2 大小写不敏感；不认识的
@@ -903,7 +1245,7 @@ fn parse_range(range: &str, len: u64) -> RangeSpec {
     let suffix = start_s.is_empty();
     let (start, end) = if suffix {
         // suffix 形式：bytes=-N → 最后 N 字节
-        let Ok(n) = end_s.parse::<u64>() else {
+        let Some(n) = digits_u64(end_s) else {
             return RangeSpec::Ignore;
         };
         if n == 0 || len == 0 {
@@ -911,14 +1253,20 @@ fn parse_range(range: &str, len: u64) -> RangeSpec {
         }
         (len.saturating_sub(n), len.saturating_sub(1))
     } else {
-        let Ok(s) = start_s.parse::<u64>() else {
+        let Some(s) = digits_u64(start_s) else {
             return RangeSpec::Ignore;
         };
-        let e = match end_s.parse::<u64>() {
-            Ok(e) => e.min(len.saturating_sub(1)),
-            Err(_) => len.saturating_sub(1), // 开放末端 bytes=5-
-        };
-        (s, e)
+        // 末端为空 = 合法的开放末端（`bytes=5-`）；末端非空但不是纯数字 = 畸形
+        // （`bytes=5-abc`、`bytes=5-1x`）→ 按 §14.2 **忽略整个 Range**，而不是把它
+        // 当成开放末端回 206（旧实现的行为）。
+        if end_s.is_empty() {
+            (s, len.saturating_sub(1))
+        } else {
+            let Some(e) = digits_u64(end_s) else {
+                return RangeSpec::Ignore;
+            };
+            (s, e.min(len.saturating_sub(1)))
+        }
     };
     if len == 0 || start >= len || start > end {
         return RangeSpec::Unsatisfiable;
@@ -928,16 +1276,119 @@ fn parse_range(range: &str, len: u64) -> RangeSpec {
     // 「下载断点续传」彻底不可用（curl 会直接判定 "doesn't support byte ranges"）。
     // RFC 7233 §4.1 允许服务器只回请求区间的一个子集，客户端按 Content-Range
     // 里的实际区间继续请求剩余部分，所以这里改为按上限收窄而不是拒绝。
-    if end - start + 1 > MAX_RANGE_BYTES {
-        let cap = MAX_RANGE_BYTES - 1;
-        // suffix 请求要的是文件尾部，收窄时保持尾部对齐；显式请求保持头部对齐。
-        return if suffix {
-            RangeSpec::Slice { start: end - cap, end }
-        } else {
-            RangeSpec::Slice { start, end: start + cap }
+    let s = clamp_slice(start, end, suffix);
+    RangeSpec::Slice { start: s.start, end: s.end }
+}
+
+/// 多段 Range 的解析结果（RFC 9110 §14.1.1/§14.2）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum MultiRange {
+    /// 整条 Range 语法不成立 / 单位不认识 → 按 §14.2 **忽略**（回 200 全量）。
+    Ignore,
+    /// 语法成立但**没有任何可满足的区间** → 416（带 `Content-Range: bytes */len`）。
+    Unsatisfiable,
+    /// 一个或多个可满足区间（已排序、已合并、已按 [`MAX_RANGE_BYTES`] 收窄）。
+    ///
+    /// `coalesced_single == true` 表示「客户端只请求了一段」（此时**必须**回单段 206，
+    /// 不能回 multipart/byteranges —— §15.3.7.2 明确禁止对单段请求回 multipart）。
+    Ranges {
+        ranges: Vec<ByteRange>,
+        coalesced_single: bool,
+    },
+}
+
+/// 解析完整 Range 头（含**多段**），按 RFC 9110 §14.1.1 的 `byte-ranges-specifier` 语法。
+///
+/// 为什么必须支持多段而不是像旧实现那样「见到逗号就忽略整条 Range」：
+/// * §14.2 说服务器 MAY ignore 多段（那是给 DoS 留的口子），但**忽略**的后果是回 200
+///   **全量** —— 对 `Range: bytes=0-0,-1`（PDF 阅读器/视频播放器常用的首尾探测）意味着
+///   把整个大文件推给客户端，比正确回 multipart 更糟；
+/// * 规格 §16.2 明确要求「Range / HEAD / 206 Partial Content 全支持」。
+///
+/// 内存护栏不变：合并后的每个区间与区间总长都受 [`MAX_RANGE_BYTES`] 约束（见
+/// [`clamp_slice`] 与 `MAX_TOTAL_RANGE_BYTES`），绝不会因为多段而放大内存。
+pub(crate) fn parse_ranges(range: &str, len: u64) -> MultiRange {
+    let range = range.trim();
+    let Some((unit, rest)) = range.split_once('=') else {
+        return MultiRange::Ignore;
+    };
+    if !unit.eq_ignore_ascii_case("bytes") {
+        return MultiRange::Ignore;
+    }
+    // 单段直接复用单段解析（含畸形判据与收窄语义），保证既有行为逐字不变。
+    if !rest.contains(',') {
+        return match parse_range(range, len) {
+            RangeSpec::Ignore => MultiRange::Ignore,
+            RangeSpec::Unsatisfiable => MultiRange::Unsatisfiable,
+            RangeSpec::Slice { start, end } => MultiRange::Ranges {
+                ranges: vec![ByteRange { start, end }],
+                coalesced_single: true,
+            },
         };
     }
-    RangeSpec::Slice { start, end }
+    // 多段：任一 spec 语法不成立 → 整条忽略（§14.2「invalid ranges-specifier」）。
+    let mut specs: Vec<ByteRange> = Vec::with_capacity(4);
+    for part in rest.split(',') {
+        let part = part.trim();
+        if part.is_empty() {
+            // `bytes=0-9,` / `bytes=0-9,,20-29`：尾部/中间空元素属语法不成立
+            return MultiRange::Ignore;
+        }
+        let Some((start_s, end_s)) = part.split_once('-') else {
+            return MultiRange::Ignore;
+        };
+        let suffix = start_s.is_empty();
+        let (start, end) = if suffix {
+            let Some(n) = digits_u64(end_s) else {
+                return MultiRange::Ignore;
+            };
+            if n == 0 || len == 0 {
+                continue; // `bytes=-0` 单段不可满足，跳过（其余段仍可能满足）
+            }
+            (len.saturating_sub(n), len.saturating_sub(1))
+        } else {
+            let Some(s) = digits_u64(start_s) else {
+                return MultiRange::Ignore;
+            };
+            if end_s.is_empty() {
+                (s, len.saturating_sub(1))
+            } else {
+                let Some(e) = digits_u64(end_s) else {
+                    return MultiRange::Ignore;
+                };
+                (s, e.min(len.saturating_sub(1)))
+            }
+        };
+        if len == 0 || start >= len || start > end {
+            continue; // 该段不可满足，跳过（不影响其它段）
+        }
+        specs.push(clamp_slice(start, end, suffix));
+    }
+    if specs.is_empty() {
+        return MultiRange::Unsatisfiable;
+    }
+    // §15.3.7.2：服务器 MAY 合并重叠或「间隔小于 multipart 开销（约 80 字节）」的区间。
+    // 这里用 128 字节做阈值（略保守：合并后最多多发 O(阈值) 字节，却省掉 ~80 字节
+    // 的 part 头 + 一次读盘）。必须先按 start 排序再合并。
+    specs.sort_by_key(|r| (r.start, r.end));
+    let mut merged: Vec<ByteRange> = Vec::with_capacity(specs.len());
+    for r in specs {
+        match merged.last_mut() {
+            Some(last) if r.start <= last.end.saturating_add(1).saturating_add(128) => {
+                // 与上一段重叠或间隔很小 → 合并（取并集）
+                if r.end > last.end {
+                    last.end = r.end;
+                }
+            }
+            _ => merged.push(r),
+        }
+    }
+    // 合并后仍只有一段 → 按单段回（§15.3.7.2 禁止对单段请求回 multipart，合并成一段同理）。
+    let single = merged.len() == 1;
+    MultiRange::Ranges {
+        ranges: merged,
+        coalesced_single: single,
+    }
 }
 
 /// 读文件的一个闭区间切片。调用方保证 `end - start + 1 ≤ MAX_RANGE_BYTES`。
@@ -952,31 +1403,220 @@ fn read_slice(path: &Path, start: u64, end: u64) -> Result<Vec<u8>> {
     Ok(buf)
 }
 
-fn range_response(
+/// 多段响应体的**总字节**上限。单段上限是 [`MAX_RANGE_BYTES`]，多段若不加总量限制，
+/// 一个 `Range: bytes=0-33554431,0-33554431,…`（同一区间重复 N 次）就能把内存放大 N 倍。
+pub(crate) const MAX_TOTAL_RANGE_BYTES: u64 = MAX_RANGE_BYTES;
+/// 多段响应最多回几段（超过就按 §15.3.7 只回靠前的那几段；段头本身也要占内存）。
+pub(crate) const MAX_RANGE_PARTS: usize = 16;
+
+/// Range 求值结果（单段与多段共用，供 h1/h2/h3 三条发送路径各自渲染）。
+pub(crate) enum RangeOutcome {
+    /// 「忽略 Range」：语法不成立、或整条 Range 没有可满足的段 ⇒ 调用方回 200 全量。
+    /// 注意与 `Unsatisfiable` 的区别（§14.2：语法成立但不可满足才回 416）。
+    Ignore,
+    /// 416（带 `Content-Range: bytes */len`）。
+    Unsatisfiable,
+    /// 单段 206；`len` 是正文长度（HEAD 时为 0 但 `end - start + 1` 仍是准确长度）。
+    Single { start: u64, end: u64, body: Bytes },
+    /// 多段 206（`multipart/byteranges`）。`content_length` 是正文的精确长度，
+    /// **不依赖 body**（HEAD 的 body 为空，但长度头必须准确）。
+    Multi {
+        content_type: String,
+        content_length: u64,
+        body: Bytes,
+    },
+}
+
+/// 生成 multipart/byteranges 的边界串。用内容摘要做边界：同一请求稳定（便于调试/缓存），
+/// 且不会与文件内容里出现的任意字符串冲突（长度 40 的十六进制 + 前缀足够）。
+fn byteranges_boundary(len: u64, ranges: &[ByteRange]) -> String {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    len.hash(&mut h);
+    for r in ranges {
+        r.start.hash(&mut h);
+        r.end.hash(&mut h);
+    }
+    format!("__crucible_byteranges_{:016x}__", h.finish())
+}
+
+/// multipart/byteranges 的「排版计划」：先算好每个 part 的头部与尾部字节，
+/// 这样 **HEAD 也能算出精确的 `Content-Length` 而不读一个字节**（RFC 9110 §9.3.2
+/// 要求 HEAD 与 GET 同头）。
+struct MultipartPlan {
+    boundary: String,
+    heads: Vec<(Vec<u8>, ByteRange)>,
+    tail: Vec<u8>,
+}
+
+impl MultipartPlan {
+    fn content_type(&self) -> String {
+        format!("multipart/byteranges; boundary={}", self.boundary)
+    }
+    /// 计划中的正文总长度（每个 part = 头部 + 数据 + 末尾边界）。
+    fn body_len(&self) -> u64 {
+        let head: u64 = self
+            .heads
+            .iter()
+            .map(|(h, r)| h.len() as u64 + r.len())
+            .sum();
+        head + self.tail.len() as u64
+    }
+}
+
+/// 按 RFC 9110 §14.6/§15.3.7.2 规划 `multipart/byteranges` 正文。
+///
+/// * 顶层**不带** `Content-Range`（§15.3.7.2：多段响应不得在 HTTP 头里带它，改在每个
+///   part 的头部里带）；
+/// * 每个 part 带自己的 `Content-Type`（与 200 响应的类型一致）与 `Content-Range`；
+/// * 段间用 `\r\n--boundary` 分隔，末尾 `\r\n--boundary--\r\n`（RFC 2046 的语法）。
+/// * 段数/总字节已由调用方收敛到 [`MAX_RANGE_PARTS`]/[`MAX_TOTAL_RANGE_BYTES`]。
+fn multipart_plan(len: u64, ranges: &[ByteRange], ct: &str) -> MultipartPlan {
+    let boundary = byteranges_boundary(len, ranges);
+    let mut heads = Vec::with_capacity(ranges.len());
+    for r in ranges {
+        let head = format!(
+            "\r\n--{boundary}\r\nContent-Type: {ct}\r\nContent-Range: bytes {}-{}/{len}\r\n\r\n",
+            r.start, r.end
+        );
+        heads.push((head.into_bytes(), *r));
+    }
+    let tail = format!("\r\n--{boundary}--\r\n").into_bytes();
+    MultipartPlan {
+        boundary,
+        heads,
+        tail,
+    }
+}
+
+/// 渲染 multipart 正文（真正读盘）。调用方保证总量在内存上限内。
+fn render_multipart(path: &Path, plan: &MultipartPlan) -> Result<Bytes> {
+    let mut out: Vec<u8> = Vec::with_capacity(plan.body_len() as usize);
+    for (head, r) in &plan.heads {
+        out.extend_from_slice(head);
+        out.extend_from_slice(&read_slice(path, r.start, r.end)?);
+    }
+    out.extend_from_slice(&plan.tail);
+    Ok(Bytes::from(out))
+}
+
+/// 把「已解析合并的区间列表」收敛到内存护栏内（段数 + 总字节）。
+fn cap_ranges(ranges: &[ByteRange]) -> Vec<ByteRange> {
+    let mut acc: u64 = 0;
+    let mut out: Vec<ByteRange> = Vec::new();
+    for r in ranges {
+        acc = acc.saturating_add(r.len());
+        if acc > MAX_TOTAL_RANGE_BYTES || out.len() >= MAX_RANGE_PARTS {
+            // §15.3.7：服务器可以不回全部请求的区间（客户端按收到的 Content-Range 续请求）。
+            break;
+        }
+        out.push(*r);
+    }
+    out
+}
+
+/// Range 求值的统一入口（h1/h2/h3 共用）：解析 → 收窄/合并 → 读盘 → 产出结果。
+async fn eval_range(path: &Path, len: u64, range: &str, ct: &str) -> Result<RangeOutcome> {
+    match parse_ranges(range, len) {
+        MultiRange::Ignore => Ok(RangeOutcome::Ignore),
+        MultiRange::Unsatisfiable => Ok(RangeOutcome::Unsatisfiable),
+        MultiRange::Ranges { ranges, .. } => {
+            let capped = cap_ranges(&ranges);
+            match capped.len() {
+                // 一段都没收敛出来（理论不可达：单段已被收窄到上限内）→ 保守回 200
+                0 => Ok(RangeOutcome::Ignore),
+                1 => {
+                    let r = capped[0];
+                    // 单段仍走 spawn_blocking（≤32MiB 同步读，别卡 async worker）
+                    let body = read_slice_async(path.to_path_buf(), r.start, r.end).await?;
+                    Ok(RangeOutcome::Single {
+                        start: r.start,
+                        end: r.end,
+                        body,
+                    })
+                }
+                // §15.3.7.2：单段（含合并成一段）**必须**回单段 206，不得回 multipart。
+                _ => {
+                    let p = path.to_path_buf();
+                    let ct_s = ct.to_string();
+                    let out = tokio::task::spawn_blocking(move || {
+                        let plan = multipart_plan(len, &capped, &ct_s);
+                        let body = render_multipart(&p, &plan)?;
+                        Ok::<_, anyhow::Error>(RangeOutcome::Multi {
+                            content_type: plan.content_type(),
+                            content_length: body.len() as u64,
+                            body,
+                        })
+                    })
+                    .await
+                    .map_err(|e| anyhow::anyhow!("blocking multipart task failed: {e}"))??;
+                    Ok(out)
+                }
+            }
+        }
+    }
+}
+
+/// HEAD 版的 Range 结果（不读盘）：按 GET 会返回的状态与头作答。
+/// 多段时报 206 + `multipart/byteranges` 的 `Content-Type` 与**精确**长度。
+fn head_range_outcome(len: u64, range: &str, ct: &str) -> RangeOutcome {
+    match parse_ranges(range, len) {
+        MultiRange::Ignore => RangeOutcome::Ignore,
+        MultiRange::Unsatisfiable => RangeOutcome::Unsatisfiable,
+        MultiRange::Ranges { ranges, .. } => {
+            let capped = cap_ranges(&ranges);
+            match capped.len() {
+                0 => RangeOutcome::Ignore,
+                1 => RangeOutcome::Single {
+                    start: capped[0].start,
+                    end: capped[0].end,
+                    body: Bytes::new(),
+                },
+                _ => {
+                    let plan = multipart_plan(len, &capped, ct);
+                    RangeOutcome::Multi {
+                        content_type: plan.content_type(),
+                        content_length: plan.body_len(),
+                        body: Bytes::new(),
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Range 切片读取的 async 包装：`read_slice` 一次最多同步读 32MiB
+/// （`vec![0u8; take]` + `read_exact`），在 async worker 上是明确的阻塞点。
+async fn read_slice_async(path: PathBuf, start: u64, end: u64) -> Result<Bytes> {
+    tokio::task::spawn_blocking(move || read_slice(&path, start, end).map(Bytes::from))
+        .await
+        .map_err(|e| anyhow::anyhow!("blocking range read task failed: {e}"))?
+}
+
+async fn range_response(
     path: &Path,
     len: u64,
     range: &str,
     ct: &str,
     disposition: Option<&str>,
 ) -> Result<Option<Response<BoxBody>>> {
-    // P2-2（RFC7233）：支持 suffix（bytes=-N）与显式 end；start>=len / start>end → 416
-    //（带 Content-Range: bytes */len）；非法格式与多段不启用 Range 语义（回 200 全量）。
-    match parse_range(range, len) {
-        RangeSpec::Ignore => Ok(None),
-        RangeSpec::Unsatisfiable => Ok(Some(
+    // P2-2（RFC7233）+ RFC 9110 §14.1.1/§15.3.7：单段（含 suffix 与开放末端）与多段都支持；
+    // 语法不成立 → 忽略（回 200 全量）；语法成立但不可满足 → 416（带 `Content-Range: bytes */len`）。
+    match eval_range(path, len, range, ct).await? {
+        RangeOutcome::Ignore => Ok(None),
+        RangeOutcome::Unsatisfiable => Ok(Some(
             Response::builder()
                 .status(StatusCode::RANGE_NOT_SATISFIABLE)
                 .header(header::CONTENT_RANGE, format!("bytes */{len}"))
                 .body(empty())
                 .unwrap(),
         )),
-        RangeSpec::Slice { start, end } => {
-            let buf = read_slice(path, start, end)?;
+        RangeOutcome::Single { start, end, body } => {
             let mut b = Response::builder()
                 .status(StatusCode::PARTIAL_CONTENT)
                 .header(header::CONTENT_TYPE, ct)
                 .header(header::CONTENT_RANGE, format!("bytes {start}-{end}/{len}"))
-                .header(header::CONTENT_LENGTH, buf.len())
+                .header(header::CONTENT_LENGTH, body.len())
                 .header(header::ACCEPT_RANGES, "bytes");
             if let Some(d) = disposition {
                 // 206 也必须带 disposition + nosniff：否则「preview 强制
@@ -985,7 +1625,24 @@ fn range_response(
                 b = b.header(header::CONTENT_DISPOSITION, disposition_value(path, d));
                 b = b.header("x-content-type-options", "nosniff");
             }
-            Ok(Some(b.body(full(Bytes::from(buf))).unwrap()))
+            Ok(Some(b.body(full(body)).unwrap()))
+        }
+        RangeOutcome::Multi {
+            content_type,
+            content_length,
+            body,
+        } => {
+            // §15.3.7.2：多段响应**不得**在顶层带 Content-Range（改在每个 part 里）。
+            let mut b = Response::builder()
+                .status(StatusCode::PARTIAL_CONTENT)
+                .header(header::CONTENT_TYPE, content_type)
+                .header(header::CONTENT_LENGTH, content_length)
+                .header(header::ACCEPT_RANGES, "bytes");
+            if let Some(d) = disposition {
+                b = b.header(header::CONTENT_DISPOSITION, disposition_value(path, d));
+                b = b.header("x-content-type-options", "nosniff");
+            }
+            Ok(Some(b.body(full(body)).unwrap()))
         }
     }
 }
@@ -1008,12 +1665,33 @@ fn autoindex(dir: &Path, url: &str, enable_upload: bool) -> Result<Response<BoxB
 /// 让 h2o 服务同一目录的 index.html —— 公平基准比的不是同一个响应体（规格 §22）。
 const INDEX_FILES: &[&str] = &["index.html", "index.htm"];
 
-fn directory_index(dir: &Path) -> Option<(PathBuf, fs::Metadata)> {
+/// 在目录里找索引文件。
+///
+/// **必须做 containment 校验**：`dir` 已由 [`resolve_path`] 校验过，但 `dir.join(name)`
+/// 的结果**没有**经过 canonicalize —— docroot 里一个 `index.html -> /etc/passwd` 的符号链接
+/// 就能让 `GET /dir/` 直接把 root 外的文件吐出去（直连文件那条路有 containment，索引这条路
+/// 此前漏了）。判据与 `resolve_path` 一致：canonicalize 后必须仍在 root 内（root 内互链允许，
+/// 与 web 服务器惯例一致）。
+fn directory_index(dir: &Path, root: &Path) -> Option<(PathBuf, fs::Metadata)> {
+    let canon_root = canon_root_cached(root);
     for name in INDEX_FILES {
         let p = dir.join(name);
-        if let Ok(m) = fs::metadata(&p) {
+        let Ok(canon) = p.canonicalize() else {
+            continue; // 不存在 / 断链
+        };
+        if !canon.starts_with(&canon_root) {
+            log::debug!(
+                "static: 拒绝 root 外的目录索引符号链接 {} -> {}",
+                p.display(),
+                canon.display()
+            );
+            continue;
+        }
+        if let Ok(m) = fs::metadata(&canon) {
             if m.is_file() {
-                return Some((p, m));
+                // 返回 canonical 路径：与 `resolve_path` 对直连文件的处理一致
+                //（MIME / disposition 都按真实目标名判）。
+                return Some((canon, m));
             }
         }
     }
@@ -1130,17 +1808,40 @@ mod tests {
     use super::*;
 
     /// 目录索引：index.html 存在时必须优先返回它（此前只有列表/404 两条路）。
+    /// 同时校验 root 外的符号链接索引被拒（`index.html -> /etc/passwd` 不得服务）。
     #[test]
     fn directory_index_prefers_index_html() {
         let dir = std::env::temp_dir().join(format!("crucible-idx-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
         let _ = fs::create_dir_all(&dir);
-        assert!(directory_index(&dir).is_none());
+        assert!(directory_index(&dir, &dir).is_none());
         fs::write(dir.join("index.htm"), b"htm").unwrap();
-        assert!(directory_index(&dir).unwrap().0.ends_with("index.htm"));
+        assert!(directory_index(&dir, &dir).unwrap().0.ends_with("index.htm"));
         fs::write(dir.join("index.html"), b"html").unwrap();
-        let (p, m) = directory_index(&dir).unwrap();
+        let (p, m) = directory_index(&dir, &dir).unwrap();
         assert!(p.ends_with("index.html"));
         assert_eq!(m.len(), 4);
+
+        // root 外的符号链接索引必须被拒（返回 None 或跳过它）
+        #[cfg(unix)]
+        {
+            let outside = std::env::temp_dir().join(format!("crucible-idx-out-{}", std::process::id()));
+            fs::write(&outside, b"secret").unwrap();
+            let _ = fs::remove_file(dir.join("index.htm"));
+            let _ = fs::remove_file(dir.join("index.html"));
+            std::os::unix::fs::symlink(&outside, dir.join("index.html")).unwrap();
+            assert!(
+                directory_index(&dir, &dir).is_none(),
+                "root 外的符号链接索引不得被服务"
+            );
+            // 指向 root 内的符号链接仍允许（web 服务器惯例）
+            let inside = dir.join("real.html");
+            fs::write(&inside, b"ok").unwrap();
+            let _ = fs::remove_file(dir.join("index.html"));
+            std::os::unix::fs::symlink(&inside, dir.join("index.html")).unwrap();
+            assert!(directory_index(&dir, &dir).is_some(), "root 内互链仍应服务");
+            let _ = fs::remove_file(&outside);
+        }
         let _ = fs::remove_dir_all(&dir);
     }
         #[test]
@@ -1165,6 +1866,21 @@ mod tests {
         assert_eq!(parse_range("bytes=0-9,20-29", 100), RangeSpec::Ignore);
         assert_eq!(parse_range("bytes=abc-", 100), RangeSpec::Ignore);
         assert_eq!(parse_range("bytes=", 100), RangeSpec::Ignore);
+        // 畸形 last-pos / 前导 `+` / 内含空白：必须**忽略**整个 Range（回 200 全量），
+        // 不能当成开放末端（`bytes=5-abc` → 206 bytes 5-1023，旧实现的 bug）或合法区间
+        // （`bytes=+5-9` → 206，Rust parse 接受前导 `+`）。
+        assert_eq!(parse_range("bytes=5-abc", 100), RangeSpec::Ignore);
+        assert_eq!(parse_range("bytes=5-1x", 100), RangeSpec::Ignore);
+        assert_eq!(parse_range("bytes=+5-9", 100), RangeSpec::Ignore);
+        assert_eq!(parse_range("bytes= 5-9", 100), RangeSpec::Ignore);
+        assert_eq!(parse_range("bytes=5- 9", 100), RangeSpec::Ignore);
+        // 超长数字（parse 溢出）也不能 panic，按忽略处理
+        assert_eq!(
+            parse_range("bytes=99999999999999999999999-", 100),
+            RangeSpec::Ignore
+        );
+        // 合法的开放末端仍必须工作
+        assert_eq!(parse_range("bytes=5-", 100), RangeSpec::Slice { start: 5, end: 99 });
     }
 
     /// 大文件的 `bytes=N-`（curl -C - 等续传客户端的写法）必须回 206 的**子段**，
@@ -1210,13 +1926,13 @@ mod tests {
     #[test]
     fn etag_list_matching() {
         let etag = "\"1f4-65a1b2c3\"";
-        assert!(etag_list_matches("\"1f4-65a1b2c3\"", etag));
-        assert!(etag_list_matches("\"aaa\", \"1f4-65a1b2c3\"", etag));
-        assert!(etag_list_matches("W/\"1f4-65a1b2c3\"", etag));
-        assert!(etag_list_matches("*", etag));
-        assert!(!etag_list_matches("\"aaa\"", etag));
-        assert!(!etag_list_matches("\"1f4\"", etag));
-        assert!(!etag_list_matches("", etag));
+        assert!(etag_list_matches("\"1f4-65a1b2c3\"", etag, false));
+        assert!(etag_list_matches("\"aaa\", \"1f4-65a1b2c3\"", etag, false));
+        assert!(etag_list_matches("W/\"1f4-65a1b2c3\"", etag, false));
+        assert!(etag_list_matches("*", etag, false));
+        assert!(!etag_list_matches("\"aaa\"", etag, false));
+        assert!(!etag_list_matches("\"1f4\"", etag, false));
+        assert!(!etag_list_matches("", etag, false));
     }
 
     /// RFC 9110 §13.2.2 求值顺序：If-Match → If-Unmodified-Since →
@@ -1317,5 +2033,237 @@ mod tests {
         let m = mtime.expect("mtime");
         let rt = httpdate::parse_http_date(&httpdate::fmt_http_date(m)).expect("roundtrip");
         assert_eq!(trunc_to_secs(rt), m, "mtime 未截断到秒");
+    }
+
+    /// If-Range 的**日期**形式必须与 Last-Modified 精确相等（RFC 9110 §13.1.5 第 2 步）。
+    /// 更宽松的 `mtime <= date` 会让时钟偏快的客户端用未来日期蒙过校验，
+    /// 从而拿到新文件的旧偏移片段。
+    #[test]
+    fn if_range_date_must_match_exactly() {
+        let mtime = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
+        let etag = "\"10-6553f100\"";
+        let mk = |v: &str| {
+            let mut h = http::HeaderMap::new();
+            h.insert(header::IF_RANGE, v.parse().unwrap());
+            h
+        };
+        // 精确相等 → 可用
+        assert!(if_range_allows(
+            &mk(&httpdate::fmt_http_date(mtime)),
+            etag,
+            Some(mtime)
+        ));
+        // 未来日期（时钟偏快的客户端）→ **不可用**（旧实现 m <= t 会错误放行）
+        let future = mtime + std::time::Duration::from_secs(3600);
+        assert!(
+            !if_range_allows(&mk(&httpdate::fmt_http_date(future)), etag, Some(mtime)),
+            "未来日期不得通过 If-Range（否则续传拿到旧偏移的新内容）"
+        );
+        // 更早 → 不可用
+        let older = mtime - std::time::Duration::from_secs(60);
+        assert!(!if_range_allows(
+            &mk(&httpdate::fmt_http_date(older)),
+            etag,
+            Some(mtime)
+        ));
+    }
+
+    /// 强/弱比较的区分（RFC 9110 §8.8.3.2）：`If-Match` 用强比较（弱验证器永不匹配），
+    /// `If-None-Match` 用弱比较（弱验证器也能匹配 → 304）。
+    #[test]
+    fn if_match_strong_vs_if_none_match_weak() {
+        let etag = "\"1f4-65a1b2c3-123\"";
+        assert!(etag_list_matches("\"1f4-65a1b2c3-123\"", etag, true));
+        assert!(
+            !etag_list_matches("W/\"1f4-65a1b2c3-123\"", etag, true),
+            "If-Match 是强比较：弱验证器不得匹配"
+        );
+        assert!(
+            etag_list_matches("W/\"1f4-65a1b2c3-123\"", etag, false),
+            "If-None-Match 是弱比较：弱验证器应当匹配"
+        );
+        // 本地 ETag 本身带 W/ 时，强比较同样不成立
+        assert!(!etag_list_matches("\"1f4-65a1b2c3-123\"", "W/\"1f4-65a1b2c3-123\"", true));
+        assert!(etag_list_matches("\"1f4-65a1b2c3-123\"", "W/\"1f4-65a1b2c3-123\"", false));
+        // `*` 两种比较都匹配任何现有表示
+        assert!(etag_list_matches("*", etag, true));
+        assert!(etag_list_matches("*", etag, false));
+    }
+
+    /// ETag / 小文件缓存必须能识别「**原子替换**成同长度文件」。
+    ///
+    /// 这是真实部署形态：上传 commit 是 `rename`，`sed -i`/`cp` 也会换 inode。
+    /// 只比 mtime 时，粗粒度时钟（jiffy）下同一 tick 内的等长改写会得到**完全相同**的
+    /// mtime → `If-None-Match` 误回 304、缓存发旧内容。inode 能兜住这条路径。
+    #[test]
+    fn etag_and_cache_detect_atomic_replace() {
+        let dir = std::env::temp_dir().join(format!("crucible-etag-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("a.txt");
+        fs::write(&p, b"AAAA").unwrap();
+        let m1 = fs::metadata(&p).unwrap();
+        let (e1, _) = validators(&m1);
+        assert_eq!(read_cached(&p, &m1).unwrap().as_ref(), b"AAAA");
+
+        // 原子替换：写临时文件再 rename（同长度）
+        let t = dir.join(".a.txt.upload.part");
+        fs::write(&t, b"BBBB").unwrap();
+        fs::rename(&t, &p).unwrap();
+        let m2 = fs::metadata(&p).unwrap();
+        let (e2, _) = validators(&m2);
+        assert_ne!(
+            e1, e2,
+            "原子替换（inode 变化）必须产生不同 ETag —— 否则 If-None-Match 会误回 304 让客户端吃旧内容"
+        );
+        // 缓存必须重读，不能把旧内容当当前表示发出去
+        assert_eq!(
+            read_cached(&p, &m2).unwrap().as_ref(),
+            b"BBBB",
+            "原子替换后小文件缓存必须刷新（否则发送的是旧内容）"
+        );
+        // 内容确实没变时，缓存仍应命中（避免每次都重读）
+        assert_eq!(read_cached(&p, &m2).unwrap().as_ref(), b"BBBB");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// 多段 Range：解析、合并（重叠/近邻）、单段回落、不可满足、畸形忽略。
+    #[test]
+    fn multi_range_parse_and_coalesce() {
+        // 两段明显分开且间隔 > 128 → 保持两段
+        match parse_ranges("bytes=0-9,1000-1009", 4096) {
+            MultiRange::Ranges { ranges, coalesced_single } => {
+                assert!(!coalesced_single);
+                assert_eq!(ranges.len(), 2);
+                assert_eq!((ranges[0].start, ranges[0].end), (0, 9));
+                assert_eq!((ranges[1].start, ranges[1].end), (1000, 1009));
+            }
+            other => panic!("expected 2 ranges, got {other:?}"),
+        }
+        // 重叠 → 合并成一段
+        match parse_ranges("bytes=0-99,50-149", 4096) {
+            MultiRange::Ranges { ranges, coalesced_single } => {
+                assert!(coalesced_single, "重叠段必须合并成一段");
+                assert_eq!(ranges.len(), 1);
+                assert_eq!((ranges[0].start, ranges[0].end), (0, 149));
+            }
+            other => panic!("expected merged single, got {other:?}"),
+        }
+        // 间隔很小（< 128）→ 合并
+        match parse_ranges("bytes=0-9,20-29", 4096) {
+            MultiRange::Ranges { coalesced_single, .. } => assert!(coalesced_single),
+            other => panic!("expected coalesced, got {other:?}"),
+        }
+        // 乱序输入 → 输出按 start 升序
+        match parse_ranges("bytes=2000-2009,0-9", 4096) {
+            MultiRange::Ranges { ranges, .. } => {
+                assert!(ranges[0].start < ranges[1].start, "必须按位置排序");
+            }
+            other => panic!("expected 2 ranges, got {other:?}"),
+        }
+        // 部分段不可满足（超出文件尾）→ 丢弃该段，其余仍满足
+        match parse_ranges("bytes=0-9,99999-", 100) {
+            MultiRange::Ranges { ranges, .. } => {
+                assert_eq!(ranges.len(), 1);
+                assert_eq!((ranges[0].start, ranges[0].end), (0, 9));
+            }
+            other => panic!("expected 1 satisfiable range, got {other:?}"),
+        }
+        // 全部不可满足 → 416（不是忽略）
+        assert_eq!(parse_ranges("bytes=200-300,400-500", 100), MultiRange::Unsatisfiable);
+        // 畸形（空元素 / 非数字 / 单位错）→ 忽略整条
+        assert_eq!(parse_ranges("bytes=0-9,", 100), MultiRange::Ignore);
+        assert_eq!(parse_ranges("bytes=0-9,,20-29", 100), MultiRange::Ignore);
+        assert_eq!(parse_ranges("bytes=0-abc,20-29", 100), MultiRange::Ignore);
+        assert_eq!(parse_ranges("items=0-9,20-29", 100), MultiRange::Ignore);
+        // 单段走同一入口时行为不变（含 suffix 与开放末端）
+        match parse_ranges("bytes=-10", 100) {
+            MultiRange::Ranges { ranges, coalesced_single } => {
+                assert!(coalesced_single);
+                assert_eq!((ranges[0].start, ranges[0].end), (90, 99));
+            }
+            other => panic!("expected suffix single, got {other:?}"),
+        }
+    }
+
+    /// 多段响应的**内存护栏**：段数与总字节都必须在 `MAX_RANGE_BYTES` 量级封顶，
+    /// 否则「同一区间重复 N 次」的请求能把内存放大 N 倍。
+    #[test]
+    fn multi_range_is_capped() {
+        let mut s = String::from("bytes=");
+        for i in 0..2000u64 {
+            if i > 0 {
+                s.push(',');
+            }
+            // 每段 64KiB，间隔远大于合并阈值
+            let start = i * 1024 * 1024;
+            s.push_str(&format!("{}-{}", start, start + 65535));
+        }
+        match parse_ranges(&s, 4 * 1024 * 1024 * 1024) {
+            MultiRange::Ranges { ranges, .. } => {
+                let capped = cap_ranges(&ranges);
+                assert!(capped.len() <= MAX_RANGE_PARTS, "段数必须封顶");
+                let total: u64 = capped.iter().map(|r| r.len()).sum();
+                assert!(
+                    total <= MAX_TOTAL_RANGE_BYTES,
+                    "总字节必须封顶（实得 {total}）"
+                );
+            }
+            other => panic!("expected ranges, got {other:?}"),
+        }
+    }
+
+    /// HEAD 的多段响应必须给出**精确**的 `Content-Length`（不读数据）。
+    #[test]
+    fn head_multi_range_length_matches_render() {
+        let dir = std::env::temp_dir().join(format!("crucible-mp-{}", std::process::id()));
+        let _ = fs::create_dir_all(&dir);
+        let p = dir.join("mp.bin");
+        let data: Vec<u8> = (0..=255u8).cycle().take(4096).collect();
+        fs::write(&p, &data).unwrap();
+        let range = "bytes=0-9,2000-2009";
+        let outcome = head_range_outcome(4096, range, "application/octet-stream");
+        let (ct, cl) = match outcome {
+            RangeOutcome::Multi {
+                content_type,
+                content_length,
+                ..
+            } => (content_type, content_length),
+            other => panic!("expected multi, got {}", matches!(other, RangeOutcome::Ignore)),
+        };
+        assert!(ct.starts_with("multipart/byteranges; boundary="), "ct={ct}");
+        let boundary = ct.split("boundary=").nth(1).unwrap().to_string();
+        let ranges = match parse_ranges(range, 4096) {
+            MultiRange::Ranges { ranges, .. } => cap_ranges(&ranges),
+            _ => unreachable!(),
+        };
+        let plan = multipart_plan(4096, &ranges, "application/octet-stream");
+        let body = render_multipart(&p, &plan).unwrap();
+        assert_eq!(body.len() as u64, cl, "HEAD 的 Content-Length 必须与真实正文一致");
+        assert_eq!(plan.body_len(), cl);
+        // 分片头必须带各自的 Content-Range；顶层不带
+        let text = String::from_utf8_lossy(&body);
+        assert!(text.contains("bytes 0-9/4096"), "{text}");
+        assert!(text.contains("bytes 2000-2009/4096"), "{text}");
+        assert!(text.contains(&format!("--{boundary}")));
+        assert!(text.trim_end().ends_with(&format!("--{boundary}--")));
+        // 各片数据必须正确
+        assert!(body.windows(10).any(|w| w == &data[0..10]));
+        assert!(body.windows(10).any(|w| w == &data[2000..2010]));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// 目录跳转：`/dir` → 301 `/dir/`（保留 query）；`/dir/` 不跳。
+    #[test]
+    fn dir_redirect_preserves_query() {
+        let uri: http::Uri = "/up?x=1&y=2".parse().unwrap();
+        let loc = dir_redirect_location(&uri).expect("应产生跳转");
+        assert_eq!(loc.to_str().unwrap(), "/up/?x=1&y=2");
+        let uri: http::Uri = "/up/".parse().unwrap();
+        assert!(dir_redirect_location(&uri).is_none(), "带尾斜杠不应跳转");
+        let uri: http::Uri = "/".parse().unwrap();
+        assert!(dir_redirect_location(&uri).is_none(), "根路径不跳转");
+        let uri: http::Uri = "/a/b".parse().unwrap();
+        assert_eq!(dir_redirect_location(&uri).unwrap(), "/a/b/");
     }
 }

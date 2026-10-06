@@ -17,9 +17,28 @@ use http::{header, Method, Request, Response, StatusCode};
 use http_body_util::{BodyExt, Full};
 use hyper::body::Body;
 use std::path::PathBuf;
+use std::time::{Duration, Instant};
 
 use super::h1::{full, BoxBody};
 use super::upload_resume::{self, UploadErr, MAX_UPLOAD_BYTES};
+
+/// 两帧请求体之间的**空闲**上限：超过即 408 并放弃本次请求。
+///
+/// 为什么必须有：`upload_gate` 的 permit 覆盖整段 body 读取（默认 4 个），而 hyper 的
+/// `header_read_timeout` 只覆盖请求头。匿名客户端发合法头 + `Content-Length: 100000000`
+/// 后每帧只发 1 字节，就能用 4 条连接把该端口的**所有**上传永久打成 503（属 slowloris 的
+/// 上传变体）。60s 与 nginx `client_body_timeout` 默认值同量级，不影响正常客户端。
+const UPLOAD_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+/// 速率下限的宽限期：刚开始的几十秒不判速率（TCP 慢启动、首帧延迟）。
+const UPLOAD_RATE_GRACE: Duration = Duration::from_secs(60);
+/// 宽限期之后要求的最低平均速率（**只算本次请求**收到的字节）。
+///
+/// 空闲超时挡不住「每 59s 发 1 字节」：那种客户端永不过期。1KiB/s（≈8kbps）
+/// 是非常宽松的下限（真实的大文件上传远高于它，含慢速移动网络），但足以让
+/// 「几乎不发送数据却长期占住 permit」的客户端在宽限期后被 408。
+/// 注意：**只释放 permit，不删已收数据** —— 断点续传是产品功能，
+/// 被限速的客户端稍后仍可按 `X-Upload-Offset` 接着传。
+const UPLOAD_MIN_BYTES_PER_SEC: u64 = 1024;
 
 /// 默认拒收的可执行/可解析扩展名（webshell 面）。想上传这些必须改配置或先改名。
 const EXEC_EXTS: &[&str] = &[
@@ -67,11 +86,18 @@ fn upload_gate(port: u16, threads: u16) -> std::sync::Arc<tokio::sync::Semaphore
 /// `PUT /up/shell.php/`、`/up/shell.php/.`、`/up/shell.php//` 都让 name 变成空串，
 /// 扩展名判成「没有」，闸门放行，而文件实际写到 `<root>/up/shell.php` ⇒ **webshell 落盘**
 /// （同一条路径随后由引擎执行）。这是审计报的 P0，实测可复现。
+///
+/// Windows 追加：Win32 **会剥掉**文件名的尾随 `.` 与空格，于是 `shell.php.` / `shell.php `
+/// 落盘后就是 `shell.php` —— 闸门必须按剥掉后的名字判（不改判据的话，这两个名字
+/// 在 Windows 上直接是 webshell 通道）。Unix 上尾随点是合法且不可执行的独立名字，
+/// 故只在 Windows 上收紧，避免误伤运营方的正常上传。
 fn has_exec_ext(path: &str) -> bool {
     let name = path
         .rsplit('/')
         .find(|s| !s.is_empty() && *s != ".")
         .unwrap_or("");
+    #[cfg(windows)]
+    let name = name.trim_end_matches(['.', ' ']);
     match name.rsplit_once('.') {
         Some((_, ext)) => EXEC_EXTS.iter().any(|e| e.eq_ignore_ascii_case(ext)),
         None => false,
@@ -95,11 +121,38 @@ fn hidden_segment(decoded_path: &str) -> Option<String> {
     None
 }
 
+/// 取「这条连接对应的**当前**生效配置」。
+///
+/// 为什么不能只用 `listener_by_port`：同端口不同地址的两个 listener（`127.0.0.1:8080`
+/// 与 `10.0.0.1:8080`，§16.1 允许且各自有独立 root）里，`listener_by_port` 返回**第一个**，
+/// 于是 B 站上的上传会把文件写进 **A 站的 root**（跨站写入），并沿用 A 站的
+/// `enable_upload`/`paths` 策略。连接分发（`listener::listener_matches_local`）是地址感知的，
+/// 上传是唯一的写盘面，必须与它一致。
+///
+/// 判据用连接的 `lc` 的 **bind_key**（address|address_v6|port）在当前配置里找同一条 listener：
+/// * 命中 → 用它（地址身份保持一致，跨站写入消失）；
+/// * 未命中（热重载刚改过该 listener 的 address）→ 回退 `listener_by_port`（与旧行为一致，
+///   不会因为找不到而整个关掉上传）。
+fn listener_for_conn(
+    live: &Arc<LiveConfig>,
+    lc: &ListenerConfig,
+) -> Option<crate::config::ListenerConfig> {
+    let key = crate::server::bind_key(lc);
+    let found = {
+        let cur = live.snapshot();
+        cur.listeners
+            .iter()
+            .find(|l| crate::server::bind_key(l) == key)
+            .cloned()
+    };
+    found.or_else(|| crate::server::live_config::listener_by_port(live, lc.port))
+}
+
 /// 该请求是否应交给上传处理（调用方在 ACL/限速/鉴权之后、静态分发之前问一次）。
 pub fn enabled_for(live: &Arc<LiveConfig>, lc: &ListenerConfig, path: &str) -> bool {
     // 判据用**当前生效**的 listener 配置（连接期快照只作回退）：否则「面板里关掉上传」
     // 之后，已建立的长连接仍会被当成「开了上传」的端口。
-    let cur = crate::server::live_config::listener_by_port(live, lc.port);
+    let cur = listener_for_conn(live, lc);
     let lc = cur.as_ref().unwrap_or(lc);
     let a = &lc.autoindex;
     if !a.enabled || !a.enable_upload {
@@ -138,12 +191,28 @@ where
 {
     // 闸门尺寸与落盘 root 都取**当前生效**的配置：`lc` 是建连快照，长连接下可能已经过期
     //（面板关上传 / 改 upload_threads / 改 root 都应当立刻生效，见文件头说明）。
-    let lc_now = crate::server::live_config::listener_by_port(live, lc.port);
+    // 但**地址身份**必须保持（见 `listener_for_conn`）：否则同端口多地址部署会跨站写入。
+    let lc_now = listener_for_conn(live, lc);
     let lc = lc_now.as_ref().unwrap_or(lc);
     let path = req.uri().path().to_string();
     let method = req.method().clone();
     if !matches!(method, Method::PUT | Method::PATCH | Method::POST) {
-        return resp(StatusCode::METHOD_NOT_ALLOWED, "method not allowed", None);
+        // RFC 9110 §15.5.6：405 **必须**带 Allow（静态层已修，这里此前漏了）。
+        // 支持的写方法 = PUT/PATCH（POST 仍接受，但见下面的跨站闸门）。
+        return Response::builder()
+            .status(StatusCode::METHOD_NOT_ALLOWED)
+            .header(header::ALLOW, "PUT, PATCH")
+            .header(header::CONTENT_TYPE, "text/plain; charset=utf-8")
+            .body(full("method not allowed"))
+            .unwrap_or_else(|_| Response::new(full("method not allowed".to_string())));
+    }
+    // 跨站写闸门（CSRF）：POST 是浏览器 HTML 表单**唯一**能发出的写方法
+    //（PUT/PATCH 需 CORS 预检），而本端点把 POST 直接当上传处理，body 原样落盘。
+    // listener 若开了 basic_auth，浏览器会给跨站表单自动附上缓存凭据 ⇒ 攻击者页面
+    // 可在站点 origin 下写文件。`Sec-Fetch-Site` 由浏览器写、脚本改不了，
+    // 且天然放行 curl/运维脚本（它不带这个头）。与 admin 路径同一套判据。
+    if method == Method::POST && crate::server::access::cross_site_blocked(req.headers()) {
+        return resp(StatusCode::FORBIDDEN, "跨站写请求被拒绝", None);
     }
     // 并发闸门：拿不到本端口的许可就直接 503（不排队、不占 body 缓冲）。
     // permit 活到函数返回 —— 覆盖整段 body 读取与落盘。
@@ -166,25 +235,35 @@ where
                 .unwrap_or_else(|_| Response::new(full("upload busy".to_string())));
         }
     };
-    // 扩展名闸门：在**落盘之前**拒，避免任何可执行内容进入 docroot。
-    if has_exec_ext(&path) {
-        return resp(
-            StatusCode::FORBIDDEN,
-            "该扩展名被上传策略拒绝（可执行/可解析内容不允许上传；请改名或调整策略）",
-            None,
-        );
-    }
     // 路径安全第一道：拒绝**编码过的分隔符**（`%2f`/`%5c`）与解码后含 `..` 段的路径。
     // 没有这道时 `PUT /..%2f..%2fetc%2fpasswd` 会被当作**一个字面文件名**落在 docroot 里
     //（实测返回 201 ✗）——虽然没逃逸出 root，但客户端意图是穿越、目录里也会留脏名字，
     // 必须拒。判据与 static 层的 normalize_url_path 同一套。
+    //
+    // 注意顺序：**先**拒编码分隔符，**再**解码 —— 否则 `%2f` 解码出来的 `/` 会让下面
+    // 「解码后含 .. 段」的判据失去意义（`%2e%2e%2f` 会被拆成正常的 `..` + `/` 两段而漏判）。
     let lower = path.to_ascii_lowercase();
     if lower.contains("%2f") || lower.contains("%5c") {
         return resp(StatusCode::BAD_REQUEST, "路径含编码分隔符(%2f/%5c)，拒绝", None);
     }
     let decoded = percent_encoding::percent_decode_str(&path).decode_utf8_lossy();
+    // NUL 不能在路径里：fs 层会以难读的 OS 错误冒泡（Windows 上还可能有截断语义）。
+    if decoded.contains('\0') {
+        return resp(StatusCode::BAD_REQUEST, "路径含 NUL 字节，拒绝", None);
+    }
     if decoded.split(['/', '\\']).any(|seg| seg == "..") {
         return resp(StatusCode::BAD_REQUEST, "路径含 .. 段，拒绝", None);
+    }
+    // 扩展名闸门必须按**解码后**的路径判：落盘用的是解码后的名字，只看原始路径时
+    // `PUT /up/shell.ph%70` 会带着 raw 名（`shell.ph%70`，判不出扩展名）通过闸门，
+    // 却以 `shell.php` 落盘 ⇒ webshell。`%2e`/`%70` 这类写法现在是免费的绕过通道，
+    // 必须与落盘对象对齐判据（此前解码只用于别的闸门，属「闸门看 decoded、落盘用 raw」）。
+    if has_exec_ext(&decoded) {
+        return resp(
+            StatusCode::FORBIDDEN,
+            "该扩展名被上传策略拒绝（可执行/可解析内容不允许上传；请改名或调整策略）",
+            None,
+        );
     }
     // 隐藏路径（任一段以 `.` 开头）不得作为上传目标。
     //
@@ -216,7 +295,14 @@ where
         );
     }
     // containment 第二道：safe_join 拒绝 `..`/绝对路径/反斜杠/Windows 盘符。
-    let rel = path.trim_start_matches('/');
+    //
+    // **必须传解码后的路径**：static 层 `resolve_path` 会先 percent-decode 再解析，
+    // 上传若按原始 URL（`%20`、`%E6%8A%A5`）落盘，就会在 docroot 里创建**字面文件名**
+    // `%20`/`%E6%8A%A5…`，与下载侧、autoindex 链接三处互相不一致；更严重的是
+    // 「上传到含编码字符的目录」（autoindex 对目录名做了 encodeURIComponent，
+    // 目录名带空格时 URL 就是 `/my%20dir/`）会去找字面名为 `my%20dir` 的目录 ⇒ 不存在
+    // ⇒ `File::create` ENOENT ⇒ 上传**恒回 500**（功能完全不可用，见下方错误映射）。
+    let rel = decoded.trim_start_matches('/');
     let target: PathBuf = match crate::server::admin_files::safe_join(&lc.root, rel) {
         Ok(p) => p,
         // 不回显文件系统细节（`canon /abs/path: Permission denied` 会把绝对路径交给匿名客户端）
@@ -225,18 +311,56 @@ where
             return resp(StatusCode::BAD_REQUEST, "路径不合法", None);
         }
     };
+    // 目标本身是目录（`PUT /up/`、`PUT /up/subdir/`）→ 409 Conflict。
+    //
+    // RFC 9110 §9.3.4：PUT 的目标是**资源**，用一个目录当资源语义冲突；且继续走下去
+    // 会让 `session_for` 把临时文件写到该目录的**父目录**（`.{dirname}.upload.part`），
+    // 既有越出 docroot 的写面、commit 又必然 EISDIR ⇒ 500。这里明确回 409
+    //（与 `PUT /up/` 真机实测的 500 相比，至少是「说得清」的应答）。
+    if target.is_dir() {
+        return resp(StatusCode::CONFLICT, "目标是目录，不能作为上传目标", None);
+    }
+    // 父目录必须**已经存在**（autoindex/文件管理不负责隐式建目录）→ 409 Conflict。
+    //
+    // 旧行为：`File::create(tmp)` 在父目录不存在时 ENOENT → `UploadErr::Io` → 500
+    //「写入失败」，把「URL 打错了/目录还没建」这种客户端问题报成服务端故障
+    //（真机实测 `PUT /up/newdir/x.txt` → 500）。RFC 9110 §9.3.4 允许 409（与 nginx
+    // 的 DAV 实现一致：目标层级不存在就是冲突）。
+    if let Some(parent) = target.parent() {
+        if !parent.is_dir() {
+            return resp(StatusCode::CONFLICT, "父目录不存在（请先建目录）", None);
+        }
+    }
 
     // Content-Range（可选）：`bytes <start>-<end>/<total|*>`；缺省 = 全量、start=0。
     let mut wildcard_total = false;
+    // 本请求声明的区间上界（`Content-Range` 的 last-pos）。用于拒绝「body 比声明的区间长」
+    // 的写入：旧实现从不校验，多出来的字节被照单追加，最终文件比声明的 total 还大也能 commit
+    //（客户端拿到 201、校验和却对不上）。
+    let mut declared_end: Option<u64> = None;
     let (start, total) = match req.headers().get(header::CONTENT_RANGE) {
         Some(v) => match v.to_str().ok().and_then(upload_resume::parse_content_range) {
-            Some((s, _e, t)) => {
+            Some((s, e, t)) => {
                 // `bytes N-M/*` = 总长未知：**不能**把首片当完整文件。
                 // 判据必须直接用解析结果（`t` 为 None 就是 `*`），不要再去拿原始头做
                 // `ends_with("/*")` —— 那个写法对 `bytes 0-99/ *`（`/` 与 `*` 之间有空白，
                 // parse_content_range 用 `trim()` 容忍、这里却不认）会判成「有总长」，
                 // 于是唯一的首片直接 commit（**静默截断** + 会话被合并），
                 // 正是下面 ③ 要避免的那个 bug。
+                // RFC 9110 §14.4：`Content-Range: bytes first-last/complete-length` 要求
+                // `last < complete-length`（除非 complete-length 未知用 `*`）——
+                // `bytes 0-100/50` 这类声明本身自相矛盾，继续走会把「比声明的 total 多收的
+                // 字节」照单收下（文件比 total 大却 commit），故直接 400。
+                if let Some(t) = t {
+                    if e >= t {
+                        return resp(
+                            StatusCode::BAD_REQUEST,
+                            "Content-Range 与 total 矛盾（last >= total）",
+                            None,
+                        );
+                    }
+                }
+                declared_end = Some(e);
                 wildcard_total = t.is_none();
                 (s, t)
             }
@@ -295,6 +419,9 @@ where
                 None,
             )
         }
+        Err(UploadErr::BadName(why)) => {
+            return resp(StatusCode::BAD_REQUEST, &format!("文件名不可用：{why}"), None)
+        }
         Err(UploadErr::Io(e)) => {
             // 其他分支都是 return（类型 `!`），这一支也必须 return，否则 match 各臂类型不一致
             //（build42 实测 E0308）。
@@ -313,35 +440,120 @@ where
 
     // 流式读 body：逐帧 append。offset 用会话当前值 —— 因此并发分片必须带 Content-Range
     // 且服务端按顺序接纳（偏移不符会直接回 409，客户端据此校正重发）。
-    let mut body = req.into_body();
-    loop {
-        let frame = match body.frame().await {
-            Some(Ok(f)) => f,
-            Some(Err(e)) => {
-                log::debug!("upload: 读取请求体失败: {e:#}");
-                return resp(StatusCode::BAD_REQUEST, "读取请求体失败", Some(sess.received()))
-            }
-            None => break,
-        };
-        let Some(data) = frame.data_ref() else { continue };
-        if data.is_empty() {
-            continue;
-        }
-        let off = sess.received();
-        if let Err(e) = upload_resume::append(&sess, off, data) {
-            return match e {
-                UploadErr::OffsetMismatch(cur) => resp(StatusCode::CONFLICT, "偏移不符", Some(cur)),
-                UploadErr::TooLarge => resp(StatusCode::PAYLOAD_TOO_LARGE, "超过单文件上限", None),
-                UploadErr::NoSpace => resp(
-                    StatusCode::INSUFFICIENT_STORAGE,
-                    "存储余量不足，请稍后重试",
-                    Some(sess.received()),
-                ),
-                other => {
-                    log::warn!("upload: append 失败: {other:?}");
-                    resp(StatusCode::INTERNAL_SERVER_ERROR, "写入失败", Some(sess.received()))
+    //
+    // 两层时间预算（slowloris 防线，见 `UPLOAD_IDLE_TIMEOUT` 注释）：
+    //   * 帧间**空闲**超时 60s：卡住不发的连接最多占 permit 60s；
+    //   * 宽限期（60s）之后的**最低平均速率** 8KiB/s：挡住「每 59s 发 1 字节」这类
+    //     刚好绕过空闲超时、却能把 permit 永久占住的客户端。
+    // 超时返回 408 并**放弃会话**（`abort` 删掉 `.part` 并归还预算）——半截数据留着
+    // 既没用又占盘。速率按「本请求已收到的字节 / 已用时长」算，不受其他会话影响。
+    {
+        let mut body = req.into_body();
+        let started = Instant::now();
+        let mut rxed: u64 = 0;
+        loop {
+            let frame = match tokio::time::timeout(UPLOAD_IDLE_TIMEOUT, body.frame()).await {
+                Ok(Some(Ok(f))) => f,
+                Ok(Some(Err(e))) => {
+                    log::debug!("upload: 读取请求体失败: {e:#}");
+                    return resp(StatusCode::BAD_REQUEST, "读取请求体失败", Some(sess.received()));
+                }
+                Ok(None) => break,
+                Err(_) => {
+                    log::warn!(
+                        "upload: 请求体空闲超时（{}s）peer={peer} path={path:?}",
+                        UPLOAD_IDLE_TIMEOUT.as_secs()
+                    );
+                    // 只释放 permit（靠函数返回），**保留**会话与已收字节：
+                    // 断点续传正是为「网络中断/超时」设计的，删掉 `.part` 等于
+                    // 让客户端从头再来。弃用会话由 `sweep_expired`（TTL 1h）回收。
+                    return resp(
+                        StatusCode::REQUEST_TIMEOUT,
+                        "请求体读取超时（可按 X-Upload-Offset 续传）",
+                        Some(sess.received()),
+                    );
                 }
             };
+            let Some(data) = frame.data_ref() else { continue };
+            if data.is_empty() {
+                continue;
+            }
+            rxed += data.len() as u64;
+            // 「body 比声明的区间长」必须拒：否则多出来的字节被静默追加进目标文件，
+            // 最终长度超过 `Content-Range` 声明的 total 也能 commit（§14.4 语义被破坏）。
+            if let Some(end) = declared_end {
+                let limit = end - start + 1;
+                if rxed > limit {
+                    log::warn!(
+                        "upload: 请求体超出声明的 Content-Range 区间（{rxed} > {limit}）peer={peer} path={path:?}"
+                    );
+                    upload_resume::abort(&sess);
+                    return resp(
+                        StatusCode::BAD_REQUEST,
+                        "请求体长度超出 Content-Range 声明的区间",
+                        Some(sess.received()),
+                    );
+                }
+            }
+            let elapsed = started.elapsed();
+            if elapsed > UPLOAD_RATE_GRACE
+                && rxed / elapsed.as_secs().max(1) < UPLOAD_MIN_BYTES_PER_SEC
+            {
+                log::warn!(
+                    "upload: 请求体速率过低（{rxed}B/{elapsed:?}）peer={peer} path={path:?}"
+                );
+                // 同上：只释放 permit，会话与已收字节留下（客户端可续传）。
+                return resp(
+                    StatusCode::REQUEST_TIMEOUT,
+                    "请求体速率过低，已中止（可按 X-Upload-Offset 续传）",
+                    Some(sess.received()),
+                );
+            }
+            let off = sess.received();
+            // 落盘走 spawn_blocking：`append` 每个 DATA 帧做一次
+            // `open(O_APPEND) + write_all + flush`，而 `commit` 还要对最大 2GiB 的临时文件
+            // `fsync`。这些都是同步阻塞调用，直接跑在 async worker 上时（bench 形态只有
+            // 2 条 worker，三协议共用 runtime）会让整个进程停止调度数秒到数十秒。
+            // 这里**只包装调用点**，不改 `upload_resume::append` 的签名（它仍被
+            // upload_api 同步调用，模块 API 与单测都不受影响）。`Bytes` 的 clone 是
+            // 引用计数，不复制数据。
+            let sess2 = Arc::clone(&sess);
+            let chunk = data.clone();
+            let res = tokio::task::spawn_blocking(move || {
+                upload_resume::append(&sess2, off, &chunk)
+            })
+            .await;
+            match res {
+                Ok(Ok(_)) => {}
+                Ok(Err(e)) => {
+                    return match e {
+                        UploadErr::OffsetMismatch(cur) => {
+                            resp(StatusCode::CONFLICT, "偏移不符", Some(cur))
+                        }
+                        UploadErr::TooLarge => {
+                            resp(StatusCode::PAYLOAD_TOO_LARGE, "超过单文件上限", None)
+                        }
+                        UploadErr::NoSpace => resp(
+                            StatusCode::INSUFFICIENT_STORAGE,
+                            "存储余量不足，请稍后重试",
+                            Some(sess.received()),
+                        ),
+                        other => {
+                            log::warn!("upload: append 失败: {other:?}");
+                            resp(StatusCode::INTERNAL_SERVER_ERROR, "写入失败", Some(sess.received()))
+                        }
+                    };
+                }
+                Err(e) => {
+                    // spawn_blocking 任务 panic/取消：会话状态不可信，按服务端错误回。
+                    log::warn!("upload: append 任务异常: {e}");
+                    return resp(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "写入失败",
+                        Some(sess.received()),
+                    );
+                }
+            }
         }
     }
 
@@ -364,24 +576,37 @@ where
         // 客户端一旦给出具体 total，就不再是「未知长度」会话了
         sess.clear_wildcard_total();
         if received >= t {
-            return match upload_resume::commit(&sess) {
-                Ok(()) => resp(StatusCode::CREATED, "uploaded", None),
-                Err(e) => {
-                    resp(StatusCode::INTERNAL_SERVER_ERROR, &format!("落盘失败: {e:?}"), None)
-                }
-            };
+            return commit_response(&sess).await;
         }
     } else if wildcard {
         sess.mark_wildcard_total();
     } else {
         // 没有 Content-Range/Length：读到 EOF 就是完整文件（`curl -T` 的分块传输形态）
-        return match upload_resume::commit(&sess) {
-            Ok(()) => resp(StatusCode::CREATED, "uploaded", None),
-            Err(e) => resp(StatusCode::INTERNAL_SERVER_ERROR, &format!("落盘失败: {e:?}"), None),
-        };
+        return commit_response(&sess).await;
     }
     // 未收齐（分片上传）：202 + 当前偏移，客户端据此续传
     resp(StatusCode::ACCEPTED, "partial; continue with X-Upload-Offset", Some(received))
+}
+
+/// 收尾落盘（fsync + rename）并映射状态码。
+///
+/// `commit` 里的 `sync_all()` 是对**最大 2GiB** 的临时文件做 fsync，纯同步阻塞调用；
+/// 在 2-worker 的 bench 形态下直接跑在 async worker 上会让整个进程失去响应数秒。
+/// 包一层 `spawn_blocking`，签名不改（`upload_resume::commit` 仍可同步调用）。
+async fn commit_response(sess: &Arc<upload_resume::Session>) -> Response<BoxBody> {
+    let sess2 = Arc::clone(sess);
+    match tokio::task::spawn_blocking(move || upload_resume::commit(&sess2)).await {
+        Ok(Ok(())) => resp(StatusCode::CREATED, "uploaded", None),
+        Ok(Err(e)) => {
+            // 不回显 e：Io 错误里带**绝对路径**（`rename /opt/...`）。
+            log::warn!("upload: commit 失败: {e:?}");
+            resp(StatusCode::INTERNAL_SERVER_ERROR, "落盘失败", None)
+        }
+        Err(e) => {
+            log::warn!("upload: commit 任务异常: {e}");
+            resp(StatusCode::INTERNAL_SERVER_ERROR, "落盘失败", None)
+        }
+    }
 }
 
 /// h2/h3 用：这两个协议在协议层已把请求体收齐（`Request<Bytes>`），而返回体是 `Response<Bytes>`。
@@ -499,5 +724,80 @@ mod tests {
         let r = resp(StatusCode::ACCEPTED, "partial", Some(1234));
         assert_eq!(r.status(), StatusCode::ACCEPTED);
         assert_eq!(r.headers().get("x-upload-offset").unwrap(), "1234");
+    }
+
+    /// 扩展名闸门必须看**percent-decode 之后**的路径：落盘用的是解码后的名字，
+    /// 只看 raw 时 `shell.ph%70` 会被当成「没有扩展名」放行，却以 `shell.php` 落盘。
+    #[test]
+    fn exec_ext_gate_sees_through_percent_encoding() {
+        let decoded = |p: &str| {
+            percent_encoding::percent_decode_str(p)
+                .decode_utf8_lossy()
+                .to_string()
+        };
+        // 这些 raw 形式判不出扩展名（旧实现的闸门会放行）
+        for raw in ["/up/shell.ph%70", "/up/shell%2Ephp", "/up/x.HT%4DL"] {
+            assert!(
+                has_exec_ext(&decoded(raw)),
+                "{raw} 解码后（{}）必须被扩展名闸门拒",
+                decoded(raw)
+            );
+        }
+        // 正常名字仍放行
+        for raw in ["/up/a.txt", "/up/data.bin"] {
+            assert!(!has_exec_ext(&decoded(raw)), "{raw} 不应被拒");
+        }
+    }
+
+    /// 隐藏段闸门也要看解码后的路径（`%2Eenv` → `.env`）。
+    #[test]
+    fn hidden_segment_sees_through_percent_encoding() {
+        let d = |p: &str| {
+            percent_encoding::percent_decode_str(p)
+                .decode_utf8_lossy()
+                .to_string()
+        };
+        assert_eq!(hidden_segment(&d("/%2Eenv")), Some(".env".into()));
+        assert_eq!(hidden_segment(&d("/.git/hooks/x")), Some(".git".into()));
+        // .well-known 是唯一例外
+        assert_eq!(hidden_segment(&d("/.well-known/acme-challenge/x")), None);
+    }
+
+    /// 连接的**地址身份**必须保持（同端口多地址部署不得串站）。
+    ///
+    /// 这里直接验证判据函数：`bind_key` 命中时取命中的那条 listener，
+    /// 而不是「同端口的第一个」。
+    #[test]
+    fn listener_for_conn_keeps_address_identity() {
+        let toml_text = r#"
+[[listeners]]
+address = "127.0.0.1"
+port = 8080
+root = "/tmp/site-a"
+
+[[listeners]]
+address = "127.0.0.2"
+port = 8080
+root = "/tmp/site-b"
+"#;
+        let cfg: crate::config::Config = ::toml::from_str(toml_text).expect("parse");
+        let live = std::sync::Arc::new(crate::server::live_config::LiveConfig::new(
+            cfg,
+            std::path::PathBuf::from("/tmp/crucible-upload-addr.toml"),
+        ));
+        let site_a = live.snapshot().listeners[0].clone();
+        let site_b = live.snapshot().listeners[1].clone();
+        let got_a = listener_for_conn(&live, &site_a).expect("a");
+        let got_b = listener_for_conn(&live, &site_b).expect("b");
+        assert!(
+            got_a.root.ends_with("site-a"),
+            "A 站必须取到 A 站的 root，实得 {:?}",
+            got_a.root
+        );
+        assert!(
+            got_b.root.ends_with("site-b"),
+            "B 站必须取到 B 站的 root（旧实现按端口取第一个 ⇒ 跨站写入），实得 {:?}",
+            got_b.root
+        );
     }
 }

@@ -3,11 +3,12 @@
 use once_cell::sync::Lazy;
 use std::collections::HashMap;
 
-/// (匹配键, 显示别名)，**按 key 长度降序**存放：匹配取第一个命中 = 最长键优先。
+/// (匹配键, 显示别名)。
 ///
-/// 原实现是 `Lazy<HashMap>` 遍历（`RandomState` 迭代序随进程/运行变化）：org 名同时
-/// 包含多个键时（如 "AMAZON.COM" 同时含 AMAZON 与 AMAZON.COM、"GOOGLE AMAZON ..."）
-/// 同一输入可能得到不同别名，面板标签不稳定。等长键之间以本数组声明序为准（确定）。
+/// 匹配规则是「最长键优先，等长键以本数组声明序为准」，但**不依赖**数组恰好按长度
+/// 降序排列（见 [`resolve_isp_alias`]）：本表历史上就被手工维护成「近似降序」
+/// （`CHINANET` 8 排在 `MICROSOFT` 9 之前），一旦某天新增一个更长的键忘了挪位置，
+/// 依赖声明序的实现就会选错别名。实现改为显式取最长命中，声明序只用于等长 tie-break。
 static ISP_ALIASES: &[(&str, &str)] = &[
     ("CHINA MOBILE", "China Mobile"),
     ("DIGITALOCEAN", "DigitalOcean"),
@@ -21,14 +22,24 @@ static ISP_ALIASES: &[(&str, &str)] = &[
 ];
 
 /// Resolve a display alias for an ISP name (case-insensitive substring match).
+///
+/// 最长键优先：`AMAZON.COM` 必须压过 `AMAZON`、`CHINA UNICOM` 必须压过别的子串。
+/// 显式比较键长（而不是依赖声明序）后，结果与输入无关、与数组排列无关，可重复。
 pub fn resolve_isp_alias(name: &str) -> String {
     let upper = name.to_ascii_uppercase();
+    let mut best: Option<(&str, usize)> = None; // (alias, key_len)
     for (key, alias) in ISP_ALIASES {
         if upper.contains(key) {
-            return (*alias).to_string();
+            // 等长键保留先声明者（`>` 而非 `>=`），保证确定性。
+            if best.map_or(true, |(_, len)| key.len() > len) {
+                best = Some((alias, key.len()));
+            }
         }
     }
-    name.trim().to_string()
+    match best {
+        Some((alias, _)) => alias.to_string(),
+        None => name.trim().to_string(),
+    }
 }
 
 /// P1-7（G8）：国家/地区别名（中文名 / 英文全称 / 常见缩写 → ISO2）。
@@ -119,5 +130,15 @@ mod tests {
         }
         // 未命中任何键：原样返回（仅 trim）。
         assert_eq!(resolve_isp_alias(" Level3 "), "Level3");
+    }
+
+    /// 最长键优先必须与数组声明序无关：`CHINANET`(8) 在表里排在 `MICROSOFT`(9) 之前，
+    /// 旧实现（取第一个命中）会把同时含两者的 org 判成 China Telecom；正确结果是更长的
+    /// `MICROSOFT` → Microsoft Azure。修复后按显式键长比较，声明序只做等长 tie-break。
+    #[test]
+    fn isp_alias_longest_match_independent_of_order() {
+        assert_eq!(resolve_isp_alias("CHINANET MICROSOFT"), "Microsoft Azure");
+        assert_eq!(resolve_isp_alias("AMAZON GOOGLE"), "AWS"); // 等长(6) → 先声明 AMAZON
+        assert_eq!(resolve_isp_alias("AMAZON.COM"), "AWS");
     }
 }

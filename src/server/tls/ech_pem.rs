@@ -21,9 +21,20 @@ struct PemBlock {
     der: Vec<u8>,
 }
 
+/// 取出 PEM 里的**第一个** ECH CONFIG 块（DER），用于把管理员显式提供的
+/// `ssl.ech_keys` 派生出的 ECHConfigList 发布到 DNS/面板——旧实现只把它装进
+/// BoringSSL，DNS 永远读固定路径 `state/ech/ech_config_list.bin`，于是显式
+/// ech_keys 场景下发布的要么缺失、要么是**另一把钥匙**的配置（tls-core P2）。
+pub fn first_config(pem: &[u8]) -> Option<Vec<u8>> {
+    let blocks = parse_pem_blocks(pem).ok()?;
+    blocks
+        .iter()
+        .find(|b| b.label.contains("ECH CONFIG"))
+        .map(|b| b.der.clone())
+}
+
 /// Load ECH keys from PEM text or raw binary blobs.
-pub fn load_ech_keys(pem: &[u8]) -> Result<SslEchKeys> {
-    let blocks = parse_pem_blocks(pem)?;
+pub fn load_ech_keys(pem: &[u8]) -> Result<SslEchKeys> {    let blocks = parse_pem_blocks(pem)?;
     if blocks.is_empty() {
         return load_ech_from_raw(pem);
     }

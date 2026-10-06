@@ -183,7 +183,7 @@ async fn dispatch_simple(
             if native_http::lib_available(app, "fastcgi") {
                 simple_ffi(req, lc, app, peer, deps_env, "fastcgi").await
             } else {
-                match php::handle_external_bytes(req, lc, app, peer).await {
+                match php::handle_external_bytes(req, lc, app, peer, deps_env).await {
                     Ok(r) => r,
                     Err(e) => simple_engine_error("fastcgi", &e),
                 }
@@ -195,8 +195,35 @@ async fn dispatch_simple(
             simple_sidecar_dispatch(req, lc, app, app_idx, peer, deps_env, &engine).await
         }
         // 与 h1 的 go 分支对应（h1 侧同步补上 sidecar 降级，见 dispatch）。
-        "go" => simple_sidecar_dispatch(req, lc, app, app_idx, peer, deps_env, &engine).await,
-        "lua" | "jsp" | "do" | "asp" | "aspnet" | "aspx" | "tsx" | "python" | "ruby" | "perl" => {
+        "go" => {
+            // c/rust/go 的 sidecar 链（FFI → 显式 UDS → deps/bin/index）。若都不可用，
+            // OpenBSD 生产路径（go-shm IPC、无 libapp_go.so）还要试 go-shm —— 与 h1
+            // dispatch 的 go 分支同一决策树。此前 h2/h3 只走 sidecar_engine，于是同一个
+            // `/go/` 在 h1 正常、在 h2/h3 恒 502（跨协议不一致）。
+            let has_backend = native_http::lib_available(app, "go")
+                || native_http::uds_socket_available(app)
+                || native_http::sidecar_available(app, lc);
+            #[cfg(all(feature = "go_shm_ipc", unix))]
+            {
+                if !has_backend && go_shm::available() {
+                    return match go_shm::execute_simple(req, lc, app, app_idx, peer).await {
+                        Ok(r) => r,
+                        Err(e) => simple_engine_error("go shm", &e),
+                    };
+                }
+            }
+            let _ = has_backend;
+            simple_sidecar_dispatch(req, lc, app, app_idx, peer, deps_env, &engine).await
+        }
+        // tsx 必须走 tsx.rs 的编译管线（与 h1 `dispatch` 的 "tsx" 分支一致）：
+        // `libapp_tsx.so` 是只按产物目录回文件的 stub、**忽略请求路径** —— 走它会让
+        // `/tsx/<不存在的源>` 在 h2/h3 回 dist/index.js（h1 是 404），同一 URL 两个协议
+        // 给不同资源。此处直接调字节入口 `tsx::handle_bytes`。
+        "tsx" => match tsx::handle_bytes(req, lc, app, peer, app_idx).await {
+            Ok(r) => r,
+            Err(e) => simple_engine_error("tsx", &e),
+        },
+        "lua" | "jsp" | "do" | "asp" | "aspnet" | "aspx" | "python" | "ruby" | "perl" => {
             simple_sidecar_dispatch(req, lc, app, app_idx, peer, deps_env, &engine).await
         }
         "cgi" | "wsgi" | "asgi" | "psgi" | "rack" | "uwsgi" => {
@@ -446,62 +473,47 @@ async fn dispatch(
             Ok(r) => r,
             Err(e) => engine_error("fastcgi", &e),
         },
+        // c/rust 与 lua/jsp/asp… 走**同一条** fallback 链（FFI .so → 显式且存活的
+        // UDS → deps/bin/index 持久 sidecar → 502）。此前这里是手写的三分支：与 h2/h3
+        // 的 `handle_with_fallback_simple` 有两处偏差 —— 不检查显式 socket，且「无后端」
+        // 时的 502 文本不同（h1 `no libapp_c.so; run make engines` vs h2 `unavailable
+        // (no libapp_c.so, sidecar, or socket)`）。统一到一个实现即消除全部偏差。
         "c" | "rust" => {
-            if native_http::lib_available(app, &engine) {
-                match app_ffi::execute(req, lc, app, peer).await {
-                    Ok(resp) => resp,
-                    Err(e) => engine_error("app ffi", &e),
-                }
-            } else if native_http::sidecar_available(app, lc) {
-                match native_http::try_handle(req, lc, app, peer, app_idx).await {
-                    Ok(resp) => resp,
-                    // 同 `engine_error`：sidecar 的错误链里有 socket 路径与后端文本，
-                    // 只进本地日志，不回显给客户端。
-                    Err(e) => engine_error("native sidecar", &e),
-                }
-            } else {
-                Response::builder()
-                    .status(StatusCode::BAD_GATEWAY)
-                    .body(full(format!(
-                        "engine `{engine}`: no libapp_{engine}.so; run make engines"
-                    )))
-                    .unwrap()
+            match sidecar_engine::handle_with_fallback(
+                req, lc, app, peer, app_idx, &engine, &engine,
+            )
+            .await
+            {
+                Ok(r) => r,
+                Err(e) => engine_error("native sidecar", &e),
             }
         }
         "go" => {
             // Spec §7.3: prefer in-process FFI libapp_go.so when present (Linux).
             // OpenBSD: c-shared unsupported; missing .so is OK if go_shm_ipc + go-shm-server.
-            // 与 c/rust 同一决策树（§16.3）：`init.sh` 产出的 `deps/bin/index` 原生
-            // sidecar 也是合法降级 —— reconcile_apps_runtime 早就按 sidecar_available
-            // 检查 go，dispatch 不认的话「reconcile 认为可用、请求恒 502」。
-            if native_http::lib_available(app, "go") {
-                match app_ffi::execute(req, lc, app, peer).await {
-                    Ok(resp) => resp,
-                    Err(e) => engine_error("app ffi", &e),
+            // 决策树（§16.3）：FFI → 显式存活 UDS → `deps/bin/index` sidecar → go-shm
+            // IPC → 502。前三步与 c/rust 共用 `handle_with_fallback`；只有「都不可用」
+            // 时才轮到 go-shm（仅 OpenBSD 构建），故这里先探测再决定。
+            let has_sidecar_backend = native_http::lib_available(app, "go")
+                || native_http::uds_socket_available(app)
+                || native_http::sidecar_available(app, lc);
+            #[cfg(all(feature = "go_shm_ipc", unix))]
+            {
+                if !has_sidecar_backend && go_shm::available() {
+                    return match go_shm::execute(req, lc, app, app_idx, peer).await {
+                        Ok(resp) => resp,
+                        Err(e) => engine_error("go shm", &e),
+                    };
                 }
-            } else if native_http::sidecar_available(app, lc) {
-                match native_http::try_handle(req, lc, app, peer, app_idx).await {
-                    Ok(resp) => resp,
-                    Err(e) => engine_error("native sidecar", &e),
-                }
-            } else {
-                #[cfg(all(feature = "go_shm_ipc", unix))]
-                {
-                    if go_shm::available() {
-                        match go_shm::execute(req, lc, app, app_idx, peer).await {
-                            Ok(resp) => return resp,
-                            Err(e) => {
-                                return engine_error("go shm", &e);
-                            }
-                        }
-                    }
-                }
-                Response::builder()
-                    .status(StatusCode::BAD_GATEWAY)
-                    .body(full(format!(
-                        "engine go: no libapp_go.so (FFI) or go-shm-server (openbsd fallback)"
-                    )))
-                    .unwrap()
+            }
+            let _ = has_sidecar_backend;
+            match sidecar_engine::handle_with_fallback(
+                req, lc, app, peer, app_idx, "go", "go",
+            )
+            .await
+            {
+                Ok(r) => r,
+                Err(e) => engine_error("native sidecar", &e),
             }
         }
         "lua" => match lua::handle(req, lc, app, peer, app_idx).await {

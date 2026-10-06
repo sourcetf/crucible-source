@@ -77,10 +77,15 @@ fn cidr_or_exact(pattern: &str, ip: IpAddr) -> bool {
         return false;
     }
     if let Some((net, bits)) = pattern.split_once('/') {
-        let Ok(base) = net.parse::<IpAddr>() else {
+        // 两侧都必须 trim：配置期校验（`config::ip_access_entry_is_valid`）对
+        // `"10.0.0.0/ 8"`、`"10.0.0.0 /8"` 是**接受**的（它分别 trim 了两侧），
+        // 而这里原先只 trim 整个 pattern，于是 `"10.0.0.0 "` / `" 8"` 都 parse 失败
+        // ⇒ 该条目运行期**恒不匹配**。实测：`deny = ["203.0.113.0/ 24"]` 对
+        // 203.0.113.9 直接放行（封禁静默失效，还不在加载期报错）。
+        let Ok(base) = net.trim().parse::<IpAddr>() else {
             return false;
         };
-        let Ok(prefix) = bits.parse::<u8>() else {
+        let Ok(prefix) = bits.trim().parse::<u8>() else {
             return false;
         };
         return ip_in_cidr(ip, base, prefix);
@@ -161,6 +166,23 @@ mod tests {
         };
         // allow 非空却没有任何条目匹配 ⇒ 拒绝（fail-closed），而不是放行所有人。
         assert!(!is_allowed(&cfg, "10.0.0.1:9".parse().unwrap()));
+    }
+
+    /// CIDR 条目两侧的空白必须被容忍 —— 配置期校验（`config::ip_access_entry_is_valid`）
+    /// 对 `"10.0.0.0/ 8"` / `"10.0.0.0 /8"` 是接受的，运行期若 parse 失败就是
+    /// 「配置通过、规则恒不匹配」：`deny` 静默失效（安全），`allow` 静默全员拒绝（可用性）。
+    #[test]
+    fn cidr_tolerates_inner_whitespace_like_config_validation() {
+        let peer: SocketAddr = "10.1.2.3:9".parse().unwrap();
+        for rule in ["10.0.0.0/8", "10.0.0.0/ 8", "10.0.0.0 /8", "10.0.0.0 / 8"] {
+            assert!(
+                !is_allowed(
+                    &IpAccessConfig { allow: vec![], deny: vec![rule.into()] },
+                    peer
+                ),
+                "deny {rule:?} 必须生效（此前带内部空白时静默放行）"
+            );
+        }
     }
 
     /// 只拦 cross-site：同源/无该头（非浏览器客户端）一律放行。

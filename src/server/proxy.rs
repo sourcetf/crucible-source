@@ -126,6 +126,39 @@ impl std::fmt::Display for BufferBudgetExhausted {
 
 impl std::error::Error for BufferBudgetExhausted {}
 
+/// 上游**超时**（连接 / 读响应头 / 读响应体 / WS 握手）：与「上游拒绝连接、返回非法
+/// 响应、提前关闭」等故障区分开，映射为 **504 Gateway Timeout** 而不是 502。
+///
+/// 为什么必须区分：网关语义里 502 = 上游给出了非法/无法处理的响应，504 = 上游在预算内
+/// 没有及时响应（客户端可安全重试）。此前全部超时都落成 502，与「连不上/坏响应」混为
+/// 一谈，调用方无法据此决定重试；真机复现：上游 sleep 45s，我方 30s 头超时后回 502。
+#[derive(Debug)]
+struct UpstreamTimeout(String);
+
+impl std::fmt::Display for UpstreamTimeout {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "upstream {} timed out", self.0)
+    }
+}
+
+impl std::error::Error for UpstreamTimeout {}
+
+/// 上游处理失败 → 客户端状态码的统一映射（`try_proxy` 与 page-rule `pass` 共用，
+/// 避免两处再次分叉）。顺序：预算耗尽 503 → 超时 504 → 其余 502。
+fn upstream_error_response(e: &anyhow::Error) -> Response<BoxBody> {
+    let (status, msg) = if e.downcast_ref::<BufferBudgetExhausted>().is_some() {
+        (StatusCode::SERVICE_UNAVAILABLE, "503 Service Unavailable")
+    } else if e.downcast_ref::<UpstreamTimeout>().is_some() {
+        (StatusCode::GATEWAY_TIMEOUT, "504 Gateway Timeout")
+    } else {
+        (StatusCode::BAD_GATEWAY, "502 Bad Gateway")
+    };
+    Response::builder()
+        .status(status)
+        .body(full(msg))
+        .unwrap()
+}
+
 /// 连接池键：把每个决定「这条请求能复用到哪条连接」的维度**原样**放进结构体，
 /// 由字段比较/字段哈希定相等，**不做 64 位哈希截断**。
 ///
@@ -135,7 +168,13 @@ impl std::error::Error for BufferBudgetExhausted {}
 /// 所以相等性语义与原来一致（同规则 → 同键 → 可复用，不会退化成每条请求都新建连接）。
 #[derive(Clone, PartialEq, Eq, Hash)]
 struct PoolKey {
-    /// 目的地（host + port）：同 host 不同端口是不同上游。
+    /// 目的地：TCP 上游是 host（+ 下面的 port），**UDS 上游是 socket 路径**。
+    ///
+    /// 为什么 UDS 不能用占位 `localhost`：两条规则分别指向 `unix:/run/a.sock` 与
+    /// `unix:/run/b.sock` 时，键会完全一样，池里取出的就是**发往另一个上游**的连接
+    /// （真机复现：/u1 → /run/u1.sock、/u2 → /run/u2.sock 两条 pool=true 规则，
+    /// 两条路径都得到 u1 的响应，取决于哪个先入池）。这是把请求发给错误后端的
+    /// 功能/安全问题，不只是命中率问题。
     host: String,
     port: u16,
     /// `http` 与 `https` 决定是否起 TLS 握手，而同一 host:port 完全可能同时被
@@ -227,6 +266,15 @@ struct UpstreamIo {
     /// 上游 TLS 协商出的 ALPN 是否为 h2（规格 11：`upstream_http_version`
     /// 不配置时按 ALPN 自动选择回源 HTTP 版本）。
     negotiated_h2: bool,
+    /// 这条上游连接**是否真的做了 TLS 握手**（`http://` 直连为 false；`https://` /
+    /// `.onion` TLS 档为 true）。显式 `upstream_http_version = "h2"` 的降级判定要用它：
+    /// 明文上游的 h2 是 h2c prior-knowledge（直接按 h2 讲话），TLS 上游必须以 ALPN
+    /// 协商结果为准（见 `proxy_once` 的 ALPN 校验）。
+    tls: bool,
+    /// TLS 握手协商出的 ALPN 协议名（`Some("h2")` / `Some("http/1.1")`）；未协商出
+    /// ALPN 或明文连接为 `None`。显式配置 `upstream_http_version = "h2"` 时用来在**发请求
+    /// 之前**发现「上游不会说 h2」，而不是等 30s 头超时后回一个误导性的 504。
+    tls_alpn: Option<String>,
     /// 「已经读进来但还没被消费」的字节 —— poll_read 时优先吐出。
     ///
     /// 为什么必须留着：读响应头（[`read_http_head`]）按 `\r\n\r\n` 切分，而一次 `read`
@@ -241,6 +289,8 @@ impl UpstreamIo {
         Self {
             inner: Box::pin(tcp),
             negotiated_h2: false,
+            tls: false,
+            tls_alpn: None,
             leftover: Vec::new(),
         }
     }
@@ -252,6 +302,22 @@ impl UpstreamIo {
         Self {
             inner: Box::pin(s),
             negotiated_h2: false,
+            tls: true,
+            tls_alpn: None,
+            leftover: Vec::new(),
+        }
+    }
+
+    /// 任意字节流上游（UDS 等）：与 [`Self::from_tls`] 同一包装，只是命名上区分来源。
+    fn from_stream<S>(s: S) -> Self
+    where
+        S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    {
+        Self {
+            inner: Box::pin(s),
+            negotiated_h2: false,
+            tls: false,
+            tls_alpn: None,
             leftover: Vec::new(),
         }
     }
@@ -318,12 +384,27 @@ const HOP_BY_HOP: &[&str] = &[
 
 /// `Connection:` 里点名的头也是逐跳头（RFC 9110 §7.6.1）。固定名单盖不住对端自定义的
 /// 逐跳头，所以剥除时要连这些 token 一起用。
+///
+/// **必须遍历所有 `Connection` 行**：`HeaderMap::get` 只看第一个值，
+/// 而 RFC 允许 `Connection: keep-alive` 与 `Connection: X-Secret` 分两行写
+/// （等价于 `Connection: keep-alive, X-Secret`）。只读第一行时，第二行点名的
+/// `X-Secret` 会被当成**端到端头**原样转发（请求方向送进上游、响应方向送还客户端），
+/// 逐跳剥离被一行头绕过。真机复现（本地 29095 → python 上游）：多行 Connection 的第二个
+/// token 在两种方向都残留在报文里。
 fn connection_tokens(headers: &HeaderMap) -> Vec<String> {
-    headers
-        .get(CONNECTION)
-        .and_then(|v| v.to_str().ok())
-        .map(|v| v.split(',').map(|s| s.trim().to_ascii_lowercase()).collect())
-        .unwrap_or_default()
+    let mut out = Vec::new();
+    // `get_all` 取**全部**同名的行；每行再按逗号拆 token。
+    for v in headers.get_all(CONNECTION).iter() {
+        if let Ok(s) = v.to_str() {
+            for t in s.split(',') {
+                let t = t.trim().to_ascii_lowercase();
+                if !t.is_empty() {
+                    out.push(t);
+                }
+            }
+        }
+    }
+    out
 }
 
 /// 规则（`modify_response_headers`）注入响应头时的禁用名单：HOP_BY_HOP 之外再加两个。
@@ -423,18 +504,8 @@ pub async fn try_proxy(
                     // 而拿到它的人只是任意一个能命中该规则的客户端。细节进本地日志。
                     log::warn!("proxy: 规则 {} 处理 {path} 失败: {e:#}", rule.path);
                     // 缓冲预算耗尽不是上游故障：503（可重试）而不是 502。
-                    let (status, msg) = if e.downcast_ref::<BufferBudgetExhausted>().is_some() {
-                        (StatusCode::SERVICE_UNAVAILABLE, "503 Service Unavailable")
-                    } else {
-                        (StatusCode::BAD_GATEWAY, "502 Bad Gateway")
-                    };
-                    return Some((
-                        true,
-                        Response::builder()
-                            .status(status)
-                            .body(full(msg))
-                            .unwrap(),
-                    ));
+                    // 超时（连接/读头/读体）是 504；其余上游故障 502。
+                    return Some((true, upstream_error_response(&e)));
                 }
             }
         }
@@ -472,10 +543,17 @@ fn join_upstream(upstream: &str, rest: &str) -> Result<String> {
     //（`/api/users/@me`、`?u=user@host`、`?next=mailto:a@b`），旧版把这些正常请求全打成
     // 502。它当年要防的是「用 `@` 再造一个 authority」，而下面「必须补 `/` 分隔符」那句
     // 已经把门关死：rest 一定以 `/` 开头，拼出的 URL 的 authority 就是 upstream 自己的。
-    if rest.starts_with("//") {
-        bail!("proxy refused protocol-relative suffix");
-    }
+    //
+    // 曾经还有一条 `rest.starts_with("//") → bail!`（「protocol-relative suffix」），
+    // **同样过严**：`//` 在路径里是合法字节（RFC 3986 §3.3 的 path 段允许空段），
+    // 客户端 `GET /api//x` 会被这条打成 502 —— 真机复现：/api//x → 502，
+    // 而上游根本没收到请求。安全性不靠这条 bail：下面把 rest 补成以 `/` 开头后
+    // 拼出的 `http://base//x` 里 authority 仍是 base（http::Uri 已在本地核对：
+    // `http://127.0.0.1:29096//evil/x` 解析出 host=127.0.0.1、path=//evil/x），
+    // 攻击者无法借 `//` 换掉 authority。UI/配置里的 path 也收到 `path_matches` 的边界约束。
     // Reject `http:` / `https:` absolute URLs sneaked into the path suffix.
+    // （rest 由请求路径切出，正常必然以 `/` 开头；这条只兜住 UDS 形态下
+    //  `join_upstream("", rest)` 的绝对 URL 注入面。）
     let lower = rest.to_ascii_lowercase();
     if lower.starts_with("http:") || lower.starts_with("https:") {
         bail!("proxy refused absolute URL suffix");
@@ -520,6 +598,30 @@ impl UpSender {
             UpSender::H2(s) => s.is_ready(),
         }
     }
+
+    /// 这条 sender 说的是 h2 还是 h1（决定回源请求行/伪头的 URI 形态）。
+    ///
+    /// 用 sender 的**实际**变体而不是配置推断：池里取出的 sender 就是接下来真正发请求的
+    /// 那条连接，URI 形态必须与它一致（h2 需要带 scheme+authority 的 URI 生成
+    /// `:scheme`/`:authority`；h1 需要 origin-form，见 `send_uri` 的说明）。
+    fn is_h2(&self) -> bool {
+        matches!(self, UpSender::H2(_))
+    }
+}
+
+/// 上游是否为 UDS 形态（`unix:/abs/path`，或裸绝对路径 `/abs/path`）。
+///
+/// 规格 §16.10：上游可写 `ip:port` 或 `unix:/path` 两种形态。此前只支持 http(s)://
+/// authority，写 `unix:/…` 会在 `upstream_parts` 直接报「no host」→ 该规则恒 502。
+/// 与 `fastcgi.rs`/`native_http.rs` 的 UDS 写法保持一致（`unix:` 前缀或裸绝对路径）。
+fn upstream_uds_path(upstream: &str) -> Option<&str> {
+    let s = upstream.trim();
+    let p = s.strip_prefix("unix:").unwrap_or(s);
+    if p.starts_with('/') && !p.starts_with("//") {
+        Some(p)
+    } else {
+        None
+    }
 }
 
 async fn proxy_once(
@@ -532,7 +634,6 @@ async fn proxy_once(
         return proxy_websocket(req, rule, peer_ip, client_https).await;
     }
 
-    let upstream = rule.upstream.trim_end_matches('/');
     let suffix = req
         .uri()
         .path_and_query()
@@ -542,49 +643,118 @@ async fn proxy_once(
         .strip_prefix(&rule.path)
         .or_else(|| suffix.strip_prefix(rule.path.trim_end_matches('/')))
         .unwrap_or(suffix.as_str());
-    let target = join_upstream(upstream, rest)?;
-    let uri = Uri::from_str(&target).context("upstream uri")?;
-
-    let (host, scheme, port) = upstream_parts(&uri)?;
-
-    let stream = connect_upstream(&host, port, &scheme, rule).await?;
-    // 规格 11：未配置 upstream_http_version 时按上游 ALPN 协商结果自动选 h2/h1。
-    let alpn_h2 = stream.negotiated_h2;
-    let io = TokioIo::new(stream);
+    // UDS 上游：没有 authority，请求目标用 origin-form（`/rest`），Host 用占位值；
+    // 连接是 UnixStream，不做 TLS/Tor。`pool_dest` 是**池键里的目的地**：
+    // UDS 用 socket 路径，TCP 用 host —— 见下面的说明。
+    let (uri, host, scheme, port, pool_dest) = if let Some(sock) = upstream_uds_path(&rule.upstream)
+    {
+        let path = join_upstream("", rest)?;
+        let uri = Uri::from_str(&path).context("uds upstream uri")?;
+        log::debug!("proxy: UDS 上游 {sock}（请求目标 {path}）");
+        (
+            uri,
+            "localhost".to_string(),
+            "unix".to_string(),
+            80u16,
+            sock.to_string(),
+        )
+    } else {
+        let upstream = rule.upstream.trim_end_matches('/');
+        let target = join_upstream(upstream, rest)?;
+        let uri = Uri::from_str(&target).context("upstream uri")?;
+        let (host, scheme, port) = upstream_parts(&uri)?;
+        let pool_dest = host.clone();
+        (uri, host, scheme, port, pool_dest)
+    };
 
     // 规格 11：回源 HTTP 版本可配（h2 显式启用；不配置时按 ALPN 协商结果自动选）。
     // UpSender 定义在模块级（连接池 POOL 按它声明类型，两处必须同一个类型）。
 
     // 大小写/空白归一：面板与手写 TOML 里 `"H2"`、`" h2 "` 都是合法写法，
     // 而精确比较会让它们**静默**按 h1 处理（保存成功、行为不变 —— 最难查的一类）。
-    let want_h2 = rule
+    // `Some(true)` = 显式 h2、`Some(false)` = 显式 h1、`None` = 未配置（按 ALPN 自动）。
+    let explicit_version: Option<bool> = rule
         .upstream_http_version
         .as_deref()
-        .map(|v| v.trim().eq_ignore_ascii_case("h2"))
-        .unwrap_or(false)
-        || (rule.upstream_http_version.is_none() && alpn_h2);
-    let pool_key = PoolKey::new(
-        &host,
-        port,
-        &scheme,
-        want_h2,
-        needs_tor(&host, rule),
-        &rule.ssl_mode,
-        rule.upstream_tls_version.as_deref(),
-        rule.tor_socks.as_deref(),
-    );
-    // §3 连接池：仅当规则显式 `connection_pool = true` 时复用上游连接（默认关闭）。
-    // 此前 POOL / pool_give / pool_take 三个都是死代码（无任何调用者），
-    // 配置项开了也没有任何效果。
-    let pooled = if rule.connection_pool {
-        pool_take(pool_key.clone()).await
-    } else {
-        None
+        .map(|v| v.trim().eq_ignore_ascii_case("h2"));
+    let explicit_h2 = explicit_version == Some(true);
+    // 池键构造函数：`pool_dest`（TCP=host、UDS=socket 路径）+ 全部 TLS/出口维度。
+    let mk_pool_key = |want_h2: bool| {
+        PoolKey::new(
+            &pool_dest,
+            port,
+            &scheme,
+            want_h2,
+            needs_tor(&host, rule),
+            &rule.ssl_mode,
+            rule.upstream_tls_version.as_deref(),
+            rule.tor_socks.as_deref(),
+        )
     };
-    let mut sender = match pooled {
-        Some(s) if s.is_ready() => s,
-        _ => {
-            if want_h2 {
+    // §3 连接池：仅当规则显式 `connection_pool = true` 时复用上游连接（默认关闭）。
+    //
+    // **先查池、命中就不建连**：旧顺序是「无条件 connect（含 TCP/SOCKS/TLS 握手）→
+    // 再 pool_take → 命中就把刚建好的连接丢掉」，于是开了池反而比不开更贵（每条请求
+    // 多一次建连再丢弃）。真机复现（本地 4 条 pool=true 请求）：上游侧看到 4 条独立
+    // TCP 连接，其中两条只承载 1 个请求就被丢弃 —— 池的收益全被这笔浪费抵消。
+    // 只有**显式指定了回源 HTTP 版本**时才能在拨号前定池键（ALPN 自动档的结果
+    // 必须等握手后才知道，见下）。
+    let mut sender: Option<UpSender> = None;
+    let mut pool_key = mk_pool_key(explicit_version.unwrap_or(false));
+    if rule.connection_pool {
+        if let Some(want_h2) = explicit_version {
+            pool_key = mk_pool_key(want_h2);
+            if let Some(s) = pool_take(pool_key.clone()).await {
+                if s.is_ready() {
+                    sender = Some(s);
+                }
+            }
+        }
+    }
+
+    if sender.is_none() {
+        let stream = connect_upstream(&host, port, &scheme, rule, false).await?;
+        // 规格 11：未配置 upstream_http_version 时按上游 ALPN 协商结果自动选 h2/h1。
+        let alpn_h2 = stream.negotiated_h2;
+        let upstream_alpn: Option<String> = stream.tls_alpn.clone();
+        let upstream_is_tls = stream.tls;
+        let io = TokioIo::new(stream);
+
+        // 显式 `upstream_http_version = "h2"` + TLS 上游：**必须**以 ALPN 协商结果为准。
+        //
+        // 显式 h2 只在握手时提供 `h2`；若上游要么不支持 ALPN、要么回话里没有 h2，
+        // 我们仍按 h2 prior-knowledge 前奏讲话 —— 上游把二进制前奏当非法请求行丢掉，
+        // 于是这条规则**每个请求**都要等满 30s 头超时才失败（真机复现：本地 /stall 规则
+        // 显式 h2 + 一个只 accept 不回话的 TCP 上游 = 30s 后 504，而超时消息把
+        // 「上游不会说 h2」这个真因完全遮住了）。
+        // ALPN 是 TLS 才有的协商机制：协商不到 h2 就等于「上游不会说 h2」，此时
+        // ALPN 是权威证据 —— 不回落到 h1（那是另一条连接上的另一种协议，不能凭空假设），
+        // 而是**立刻**按上游故障处理，日志给出准确的 ALPN 值。
+        // 明文（无 TLS）上游没有 ALPN 可用：显式 h2 就是 h2c prior-knowledge，照发。
+        if explicit_h2 && upstream_is_tls && !alpn_h2 {
+            let got = upstream_alpn.as_deref().unwrap_or("（无 ALPN）");
+            log::warn!(
+                "proxy: 规则指向 {host}:{port} 且 upstream_http_version=h2，但 TLS ALPN 协商结果是 {got} \
+                 —— 上游不会说 h2，拒绝按 h2 讲话（避免每请求等满头超时）"
+            );
+            anyhow::bail!(
+                "upstream {host}:{port} did not negotiate ALPN h2 (got {got}); \
+                 set upstream_http_version to h1/omit it, or point at an h2-capable upstream"
+            );
+        }
+        let want_h2 = explicit_h2 || (explicit_version.is_none() && alpn_h2);
+        pool_key = mk_pool_key(want_h2);
+        // 自动档：刚做完 ALPN 握手才知道池键，这里补一次查找（命中则丢弃刚建的连接，
+        // 与旧行为一致；显式档已在上面查过且不会走到这里）。
+        if rule.connection_pool && sender.is_none() {
+            if let Some(s) = pool_take(pool_key.clone()).await {
+                if s.is_ready() {
+                    sender = Some(s);
+                }
+            }
+        }
+        if sender.is_none() {
+            sender = Some(if want_h2 {
                 use hyper_util::rt::TokioExecutor;
                 let (sender, conn) =
                     hyper::client::conn::http2::handshake(TokioExecutor::new(), io)
@@ -602,9 +772,10 @@ async fn proxy_once(
                     let _ = conn.await;
                 });
                 UpSender::H1(sender)
-            }
+            });
         }
-    };
+    }
+    let mut sender = sender.expect("sender established above");
 
     let (parts, body) = req.into_parts();
     // 任务 6（OOM 防护）：上游请求体上限 64MiB；超限 → Err → 调用方 502。
@@ -616,14 +787,32 @@ async fn proxy_once(
     // 先把「是不是 HEAD」记下来：`parts.method` 马上会被 move 进 builder，
     // 而响应侧判断上游 Content-Length 能不能透传时还要用它（HEAD 的 CL 描述 GET 体大小）。
     let req_is_head = parts.method == http::Method::HEAD;
-    let mut builder = Request::builder().method(parts.method).uri(&uri);
+    // 回源请求行里的 request-target 形态（RFC 9112 §3.2.1）：
+    //
+    // * h1 上游：直接对**源服务器**讲话，请求目标必须是 **origin-form**（`/path?q`）。
+    //   `Request::builder().uri(<绝对 URL>)` 经 hyper h1 客户端会**原样**写进请求行
+    //   （`role.rs::Client::encode` 只做 `write!("{}")`），于是一台严格的源服务器会按
+    //   「绝对 URL 不是本机资源」处理 —— 真机复现：python `http.server` 对
+    //   `GET http://127.0.0.1:29095/index.html` 回 **404**，而同一个请求走本代理
+    //   （绝对形态）也回 404；改成 origin-form 后 200。nginx/大多数源服务器接受两种形态，
+    //   但这属于「不该依赖上游宽容」的协议正确性。
+    // * h2 上游：URI 必须带 scheme+authority —— hyper 的 h2 客户端从 URI 生成
+    //   `:scheme`/`:authority` 伪头，剥掉 authority 会让部分 h2 上游收不到 vhost 信息。
+    // * UDS 上游：`uri` 本来就是 origin-form（没有 authority），原样用。
+    let send_uri: Uri = if sender.is_h2() {
+        uri.clone()
+    } else if upstream_uds_path(&rule.upstream).is_some() {
+        uri.clone()
+    } else {
+        uri.path_and_query()
+            .map(|pq| pq.as_str())
+            .unwrap_or("/")
+            .parse()
+            .context("upstream origin-form uri")?
+    };
+    let mut builder = Request::builder().method(parts.method).uri(&send_uri);
     // hop-by-hop 头与 Connection 列名的头一律不上游（host 单独重写）。
-    let conn_tokens: Vec<String> = parts
-        .headers
-        .get(CONNECTION)
-        .and_then(|v| v.to_str().ok())
-        .map(|v| v.split(',').map(|s| s.trim().to_ascii_lowercase()).collect())
-        .unwrap_or_default();
+    let conn_tokens: Vec<String> = connection_tokens(&parts.headers);
     for (k, v) in parts.headers.iter() {
         let kl = k.as_str().to_ascii_lowercase();
         if k == HOST || HOP_BY_HOP.contains(&kl.as_str()) || conn_tokens.iter().any(|t| *t == kl) {
@@ -688,10 +877,10 @@ async fn proxy_once(
     let resp = tokio::time::timeout(UPSTREAM_HEAD_TIMEOUT, sender.send_request(upstream_req))
         .await
         .map_err(|_| {
-            anyhow::anyhow!(
-                "upstream response head timed out after {}s",
+            anyhow::Error::new(UpstreamTimeout(format!(
+                "response head (budget {}s)",
                 UPSTREAM_HEAD_TIMEOUT.as_secs()
-            )
+            )))
         })?
         .context("upstream send")?;
     let (rparts, rbody) = resp.into_parts();
@@ -709,10 +898,10 @@ async fn proxy_once(
     )
     .await
     .map_err(|_| {
-        anyhow::anyhow!(
-            "upstream response body timed out after {}s",
+        anyhow::Error::new(UpstreamTimeout(format!(
+            "response body (budget {}s)",
             UPSTREAM_BODY_TIMEOUT.as_secs()
-        )
+        )))
     })?
     .map_err(|e| anyhow::anyhow!("read upstream response body: {e}"))?
     .to_bytes();
@@ -790,7 +979,7 @@ async fn proxy_websocket(
     let (target, host, port, scheme) = resolve_upstream_target(&parts.uri, rule)?;
     let target_uri = Uri::from_str(&target).context("websocket upstream uri")?;
     let host_hdr = upstream_host_header(&host, port, &scheme);
-    let mut upstream = connect_upstream(&host, port, &scheme, rule).await?;
+    let mut upstream = connect_upstream(&host, port, &scheme, rule, true).await?;
     // 写握手请求 + 读 101 响应头共用一段 deadline：read_http_head 自身没有超时，
     // 上游若收下升级请求后不回包，这个任务会一直挂在这里（连接与两端口都被占住）。
     let (status, headers) =
@@ -810,10 +999,10 @@ async fn proxy_websocket(
         })
         .await
         .map_err(|_| {
-            anyhow::anyhow!(
-                "websocket upstream handshake timed out after {}s",
+            anyhow::Error::new(UpstreamTimeout(format!(
+                "websocket handshake (budget {}s)",
                 UPSTREAM_HEAD_TIMEOUT.as_secs()
-            )
+            )))
         })??;
     if status != StatusCode::SWITCHING_PROTOCOLS {
         // Do not upgrade client unless upstream accepted the handshake.
@@ -873,18 +1062,24 @@ async fn proxy_websocket(
 }
 
 fn is_websocket_upgrade(req: &Request<Full<Bytes>>) -> bool {
+    // `Upgrade` 与 `Connection` 都可能**跨多行**（RFC 9110 §7.6.1 允许把 token 拆到多行，
+    // 等价于逗号连接的一行）。此前用 `get(UPGRADE)` / `get(CONNECTION)` 只看**第一行**：
+    //   * `Connection: keep-alive` + `Connection: Upgrade` 两行 → 只看 "keep-alive"，
+    //     `contains("upgrade")` 为假 ⇒ 明明带了升级意图却被当成普通请求转发，
+    //     101 升级静默退化成一次普通回源（真机复现：多行 Connection 的 /ws 请求
+    //     得到上游的普通 200，而不是升级）。
+    //   * `Upgrade: h2c` + `Upgrade: websocket` 两行 → 只看第一行同理。
+    // 这里改用 `connection_tokens`（本文件已按「遍历全部行 + 拆逗号」实现，与逐跳头剥离
+    // 同一判据）与 `get_all`，把多行/多值都覆盖到；token 用**精确匹配**而不是
+    // `contains("upgrade")`，避免 `Connection: x-upgrade-y` 这类子串误判。
     let upgrade_ok = req
         .headers()
-        .get(UPGRADE)
-        .and_then(|v| v.to_str().ok())
-        .map(|s| s.eq_ignore_ascii_case("websocket"))
-        .unwrap_or(false);
-    let conn_ok = req
-        .headers()
-        .get(CONNECTION)
-        .and_then(|v| v.to_str().ok())
-        .map(|s| s.to_ascii_lowercase().contains("upgrade"))
-        .unwrap_or(false);
+        .get_all(UPGRADE)
+        .iter()
+        .any(|v| v.to_str().map(|s| s.eq_ignore_ascii_case("websocket")).unwrap_or(false));
+    let conn_ok = connection_tokens(req.headers())
+        .iter()
+        .any(|t| t == "upgrade");
     let key_ok = req.headers().get("sec-websocket-key").is_some();
     upgrade_ok && conn_ok && key_ok
 }
@@ -893,7 +1088,6 @@ fn resolve_upstream_target(
     uri: &Uri,
     rule: &ProxyRuleConfig,
 ) -> Result<(String, String, u16, String)> {
-    let upstream = rule.upstream.trim_end_matches('/');
     let suffix = uri
         .path_and_query()
         .map(|pq| pq.as_str().to_string())
@@ -902,6 +1096,12 @@ fn resolve_upstream_target(
         .strip_prefix(&rule.path)
         .or_else(|| suffix.strip_prefix(rule.path.trim_end_matches('/')))
         .unwrap_or(suffix.as_str());
+    // UDS 上游：请求目标 origin-form，无 authority（host 占位、scheme=unix）。
+    if upstream_uds_path(&rule.upstream).is_some() {
+        let target = join_upstream("", rest)?;
+        return Ok((target, "localhost".to_string(), 80u16, "unix".to_string()));
+    }
+    let upstream = rule.upstream.trim_end_matches('/');
     let target = join_upstream(upstream, rest)?;
     let parsed = Uri::from_str(&target).context("upstream uri")?;
     let (host, scheme, port) = upstream_parts(&parsed)?;
@@ -913,6 +1113,9 @@ fn resolve_upstream_target(
 /// 旧写法是 `uri.host().unwrap_or("127.0.0.1")`：相对形式（`/foo`、漏写 scheme 的
 /// `backend:8080`）解析不出 host，于是被**静默**改成对本机 80 端口的请求 ——
 /// 配置写错一个字符就从「转发到上游」退化成「打本机」。这里改成显式报错。
+///
+/// 返回的 host 保留 `[ ]`（IPv6 字面量的 Host 头/authority 写法，RFC 9110 §7.2）；
+/// 需要**拨号 / SNI** 的调用点必须先过 [`host_for_connect`]。
 fn upstream_parts(uri: &Uri) -> Result<(String, String, u16)> {
     let host = uri
         .host()
@@ -929,6 +1132,22 @@ fn upstream_parts(uri: &Uri) -> Result<(String, String, u16)> {
         .port_u16()
         .unwrap_or(if scheme == "https" { 443 } else { 80 });
     Ok((host, scheme, port))
+}
+
+/// 把 URI host 变成可直接用于**拨号 / TLS SNI** 的形态：去掉 IPv6 字面量的方括号。
+///
+/// `Uri::host()` 对 `http://[::1]:9000/` 返回 `[::1]`（带括号，Host 头要的就是这个），
+/// 但：
+///   * `TcpStream::connect(("[::1]", p))` 的 `ToSocketAddrs` 解析**失败**
+///     （`failed to lookup address information`）—— 真机复现：IPv6 上游规则
+///     100% 502，日志 `connect [::1]:29096: failed to lookup address information`；
+///   * TLS SNI / 证书名也不允许括号（`[` `]` 不是合法 DNS 字符，也不是 IP 字面量语法）。
+///
+/// 所以拨号与 SNI 一律用去括号后的 `::1`；Host 头仍用带括号的原值。
+fn host_for_connect(host: &str) -> &str {
+    host.strip_prefix('[')
+        .and_then(|h| h.strip_suffix(']'))
+        .unwrap_or(host)
 }
 
 /// 是否必须经 Tor 出站（早期规格 A.1）。连接与连接池判定必须用同一份逻辑，
@@ -960,28 +1179,55 @@ fn connect_budget(via_tor: bool) -> std::time::Duration {
     }
 }
 
+/// UDS 上游连接：`unix:/abs/path`（或裸绝对路径）。
+async fn connect_unix(path: &str) -> Result<UpstreamIo> {
+    let unix = UnixStream::connect(path)
+        .await
+        .with_context(|| format!("connect unix upstream {path}"))?;
+    Ok(UpstreamIo::from_stream(unix))
+}
+
 async fn connect_upstream(
     host: &str,
     port: u16,
     scheme: &str,
     rule: &ProxyRuleConfig,
+    force_h1: bool,
 ) -> Result<UpstreamIo> {
+    // UDS 上游：直接连 UnixStream（无 TLS/Tor），仍套连接超时（防止目标 socket 存在
+    // 但 accept 队列满/不推进时把任务挂死）。
+    if let Some(sock) = upstream_uds_path(&rule.upstream) {
+        return tokio::time::timeout(UPSTREAM_CONNECT_TIMEOUT, connect_unix(sock))
+            .await
+            .map_err(|_| {
+                anyhow::Error::new(UpstreamTimeout(format!(
+                    "connect unix after {}s ({sock})",
+                    UPSTREAM_CONNECT_TIMEOUT.as_secs()
+                )))
+            })?;
+    }
     let via_tor = needs_tor(host, rule);
     let budget = connect_budget(via_tor);
+    // 拨号/SNI 用去括号的 host（见 [`host_for_connect`]）：`[::1]` 这种 Host 头写法
+    // 交给 `TcpStream::connect` 会解析失败（真机复现的 100% 502），也不能当 SNI。
+    let dial_host = host_for_connect(host).to_string();
     // 连接阶段统一 deadline：TCP connect、SOCKS5 握手、TLS 握手都在这一段里，
     // 上游或 SOCKS 端「接受连接后不推进握手」会被这里掐断（future 一并取消）。
-    tokio::time::timeout(budget, connect_upstream_inner(host, port, scheme, rule))
-        .await
+    tokio::time::timeout(
+        budget,
+        connect_upstream_inner(&dial_host, port, scheme, rule, force_h1),
+    )
+    .await
         .map_err(|_| {
-            anyhow::anyhow!(
-                "upstream connect timed out after {}s ({host}:{port}{})",
+            anyhow::Error::new(UpstreamTimeout(format!(
+                "connect after {}s ({host}:{port}{})",
                 budget.as_secs(),
                 if via_tor {
                     "，经 Tor：冷电路建路可能较慢，若持续超时请查 tor 的 notice.log"
                 } else {
                     ""
                 }
-            )
+            )))
         })?
 }
 
@@ -990,6 +1236,7 @@ async fn connect_upstream_inner(
     port: u16,
     scheme: &str,
     rule: &ProxyRuleConfig,
+    force_h1: bool,
 ) -> Result<UpstreamIo> {
     let mode = OnionSslMode::parse(&rule.ssl_mode);
     // 早期规格 A.1：走 Tor 的三种情形——显式 via_tor、.onion 目标、ssl_mode=tor。
@@ -1039,15 +1286,38 @@ async fn connect_upstream_inner(
     //   * 显式 h2  → 只给 h2（不给上游挑 h1 的机会，我们只会说 h2）
     //   * 显式 h1  → 不发 ALPN
     //   * 未指定   → h2 + http/1.1（现状：按协商结果选 client conn）
-    let alpn = match rule
-        .upstream_http_version
-        .as_deref()
-        .map(|v| v.trim().to_ascii_lowercase())
-        .as_deref()
-    {
-        Some("h2") => UpstreamAlpn::H2Only,
-        Some(_) => UpstreamAlpn::Off,
-        None => UpstreamAlpn::Auto,
+    //
+    // **WebSocket 升级例外（`force_h1`）**：WS 握手是 `proxy_websocket` 里**手写的
+    // HTTP/1.1 报文**（`write_raw_request`），它不会说 h2。若这里仍发 `h2 + http/1.1`
+    // 的 ALPN，任何支持 h2 的 TLS 上游（nginx/Caddy/Envoy/本 webserver 自身）都会**挑 h2**，
+    // 于是我们把 h1 报文写进一条 h2 连接 —— 上游按 h2 前奏解析失败后直接关连接，
+    // 表现为 `upstream closed before headers` → 502（真机复现：/ws2 → https 上游
+    // ALPN=h2，502）。所以 WS 路径**一律不发 h2**：显式配了 h2 也强制按 h1 协商
+    // （WS over h2 需要 Extended CONNECT，本项目未实现）。
+    let alpn = if force_h1 {
+        if rule
+            .upstream_http_version
+            .as_deref()
+            .map(|v| v.trim().eq_ignore_ascii_case("h2"))
+            .unwrap_or(false)
+        {
+            log::warn!(
+                "proxy: WebSocket 规则指向 {host}:{port} 且配了 upstream_http_version=h2，\
+                 但 WS 握手是 HTTP/1.1（h2 需 Extended CONNECT，未实现）—— 该连接强制按 h1 协商"
+            );
+        }
+        UpstreamAlpn::Off
+    } else {
+        match rule
+            .upstream_http_version
+            .as_deref()
+            .map(|v| v.trim().to_ascii_lowercase())
+            .as_deref()
+        {
+            Some("h2") => UpstreamAlpn::H2Only,
+            Some(_) => UpstreamAlpn::Off,
+            None => UpstreamAlpn::Auto,
+        }
     };
     wrap_upstream_tls(
         tcp,
@@ -1188,11 +1458,11 @@ async fn wrap_upstream_tls_boring(
         log::debug!("onion cert-as-pubkey verified for {host}");
     }
 
-    let negotiated_h2 = tls
+    let negotiated_alpn = tls
         .ssl()
         .selected_alpn_protocol()
-        .map(|p| p == b"h2")
-        .unwrap_or(false);
+        .map(|p| p.to_vec());
+    let negotiated_h2 = negotiated_alpn.as_deref() == Some(b"h2".as_slice());
     if alpn != UpstreamAlpn::Off {
         log::debug!(
             "upstream {host}: ALPN {alpn:?} → {}",
@@ -1201,6 +1471,7 @@ async fn wrap_upstream_tls_boring(
     }
     let mut io = UpstreamIo::from_tls(tls);
     io.negotiated_h2 = negotiated_h2;
+    io.tls_alpn = negotiated_alpn.map(|p| String::from_utf8_lossy(&p).into_owned());
     Ok(io)
 }
 
@@ -1383,14 +1654,11 @@ async fn wrap_upstream_tls_rustls(
         .with_context(|| format!("rustls TLS connect to {host}"))?;
     // 与 boring 路径一致：把 ALPN 协商结果带回去，未显式配 upstream_http_version 时
     // 据此选 h2/h1 的 client conn。
-    let negotiated_h2 = tls
-        .get_ref()
-        .1
-        .alpn_protocol()
-        .map(|p| p == b"h2")
-        .unwrap_or(false);
+    let negotiated_alpn = tls.get_ref().1.alpn_protocol().map(|p| p.to_vec());
+    let negotiated_h2 = negotiated_alpn.as_deref() == Some(b"h2".as_slice());
     let mut io = UpstreamIo::from_tls(tls);
     io.negotiated_h2 = negotiated_h2;
+    io.tls_alpn = negotiated_alpn.map(|p| String::from_utf8_lossy(&p).into_owned());
     Ok(io)
 }
 
@@ -1410,6 +1678,10 @@ async fn write_raw_request(
         .unwrap_or("/");
     let method = parts.method.as_str();
     let mut lines = format!("{method} {path_q} HTTP/1.1\r\nHost: {host_hdr}\r\n");
+    // `Connection:` 点名的头同样是逐跳头（RFC 9110 §7.6.1），WS 直写路径也必须剥掉，
+    // 否则客户端一行 `Connection: X-Secret` + `X-Secret: v` 就能把自定义头送进上游
+    // （与 proxy_once 的 h1/h2 路径同一判据、同一多行处理）。
+    let conn_tokens = connection_tokens(&parts.headers);
     for (k, v) in parts.headers.iter() {
         if k == HOST {
             continue;
@@ -1417,7 +1689,10 @@ async fn write_raw_request(
         let kl = k.as_str().to_ascii_lowercase();
         // WS 路径同样剥掉客户端转发头族（此前只剥了 XFF/XFP 两个名字），
         // 权威值在下面注入。
-        if WS_SKIP.contains(&kl.as_str()) || is_client_forwarded_header(&kl) {
+        if WS_SKIP.contains(&kl.as_str())
+            || is_client_forwarded_header(&kl)
+            || conn_tokens.iter().any(|t| *t == kl)
+        {
             continue;
         }
         if rule
@@ -1483,11 +1758,18 @@ async fn read_http_head(stream: &mut UpstreamIo) -> Result<(StatusCode, HeaderMa
             stream.leftover = buf[pos + 4..].to_vec();
             // 1xx 是**中间响应**（`HTTP/1.1 100 Continue` 最常见：客户端带
             // `Expect: 100-continue` 时 nginx/Caddy 会先回 100 再回 101），不是最终状态行。
-            // 旧实现在第一个空行处就返回，于是 WS 升级被判成「上游返回 100 Continue」→ 硬 502。
-            // hyper 自己的客户端会跳过 1xx，这里补上同一语义（丢弃该段头，继续读真正的头）。
+            //
+            // 但 **101 是最终响应**：hyper 自己的客户端正是这么分类的
+            //（`hyper::proto::h1::role::Client::decoder`：`101 => Some((ZERO, true))`，
+            //  `100 | 102..=199 => None`（跳过））。升级握手把 101 也当中间响应跳过，
+            // 就会一直等「真正的头」直到 UPSTREAM_HEAD_TIMEOUT —— 上游明明已经回了 101，
+            // 客户端却一个字节都收不到，30s 后拿到 504。真机复现（本地 29095 → python
+            // 上游 /ws）：客户端 101 永远等不到；日志一行
+            // `ws upstream 中间响应 101：继续读最终头` 之后就是 head 超时。
             if let Ok((code, _)) = parse_http_head(&head) {
-                if code.as_u16() < 200 {
-                    log::debug!("ws upstream 中间响应 {}：继续读最终头", code.as_u16());
+                let c = code.as_u16();
+                if c < 200 && c != 101 {
+                    log::debug!("ws upstream 中间响应 {c}：继续读最终头");
                     buf = std::mem::take(&mut stream.leftover);
                     continue;
                 }
@@ -1904,15 +2186,7 @@ pub async fn proxy_page_rule(
             // 与端口、tor 的 unix socket 路径、TLS 后端错误文本、超时预算等内网布局信息，
             // 而能拿到它的人只是任意一个命中该 page rule 的客户端。细节只进本地日志。
             log::warn!("proxy: page rule pass 处理失败: {e:#}");
-            let (status, msg) = if e.downcast_ref::<BufferBudgetExhausted>().is_some() {
-                (StatusCode::SERVICE_UNAVAILABLE, "503 Service Unavailable")
-            } else {
-                (StatusCode::BAD_GATEWAY, "502 Bad Gateway")
-            };
-            Response::builder()
-                .status(status)
-                .body(full(msg))
-                .unwrap()
+            upstream_error_response(&e)
         }
     }
 }
@@ -2172,5 +2446,100 @@ mod tor_socks_tests {
             assert!(joined.iter().any(|j| j == want), "缺少候选 {want}: {joined:?}");
         }
         assert!(joined.iter().any(|j| j.ends_with("state/tor-client/socks.sock")));
+    }
+
+    /// 规格 §16.10：上游 UDS 形态识别（`unix:/path` 与裸绝对路径）。
+    #[test]
+    fn uds_upstream_forms_are_recognized() {
+        assert_eq!(
+            upstream_uds_path("unix:/run/backend.sock"),
+            Some("/run/backend.sock")
+        );
+        assert_eq!(upstream_uds_path("unix:/tmp/x.sock"), Some("/tmp/x.sock"));
+        assert_eq!(upstream_uds_path("/run/backend.sock"), Some("/run/backend.sock"));
+        assert_eq!(upstream_uds_path("http://127.0.0.1:8080"), None);
+        assert_eq!(upstream_uds_path("https://backend/"), None);
+        assert_eq!(upstream_uds_path("backend:8080"), None);
+        assert_eq!(upstream_uds_path("//evil/x"), None);
+    }
+
+    /// `is_websocket_upgrade` 必须看**全部** `Connection`/`Upgrade` 行（不只是第一行）：
+    /// RFC 9110 允许把 token 拆成多行，只看第一行会把升级静默降级成普通回源。
+    fn ws_req(upgrade_lines: &[&str], conn_lines: &[&str], key: bool) -> Request<Full<Bytes>> {
+        let mut b = Request::builder().method("GET").uri("/ws");
+        for u in upgrade_lines {
+            b = b.header(UPGRADE, *u);
+        }
+        for c in conn_lines {
+            b = b.header(CONNECTION, *c);
+        }
+        if key {
+            b = b.header("sec-websocket-key", "dGhlIHNhbXBsZSBub25jZQ==");
+        }
+        b.body(Full::new(Bytes::new())).unwrap()
+    }
+
+    #[test]
+    fn websocket_upgrade_detects_multiline_connection_and_upgrade() {
+        // 单行标准写法
+        assert!(is_websocket_upgrade(&ws_req(
+            &["websocket"],
+            &["Upgrade"],
+            true
+        )));
+        // Connection 跨两行：keep-alive + Upgrade（等价 `keep-alive, Upgrade`）
+        assert!(is_websocket_upgrade(&ws_req(
+            &["websocket"],
+            &["keep-alive", "Upgrade"],
+            true
+        )));
+        // Upgrade 跨两行
+        assert!(is_websocket_upgrade(&ws_req(
+            &["h2c", "websocket"],
+            &["Upgrade"],
+            true
+        )));
+        // 逗号连接的 token
+        assert!(is_websocket_upgrade(&ws_req(
+            &["websocket"],
+            &["keep-alive, Upgrade"],
+            true
+        )));
+        // 只有 keep-alive：不是升级
+        assert!(!is_websocket_upgrade(&ws_req(
+            &["websocket"],
+            &["keep-alive"],
+            true
+        )));
+        // 子串误判防护：`x-upgrade-y` 不是 `upgrade` token
+        assert!(!is_websocket_upgrade(&ws_req(
+            &["websocket"],
+            &["x-upgrade-y"],
+            true
+        )));
+        // 缺 key / Upgrade 不是 websocket
+        assert!(!is_websocket_upgrade(&ws_req(
+            &["websocket"],
+            &["Upgrade"],
+            false
+        )));
+        assert!(!is_websocket_upgrade(&ws_req(&["h2c"], &["Upgrade"], true)));
+    }
+
+    /// P2：上游超时映射 504、预算耗尽 503、其余上游故障 502（此前超时也落 502）。
+    #[test]
+    fn upstream_error_status_mapping() {
+        let t = anyhow::Error::new(UpstreamTimeout("connect".into()));
+        assert_eq!(
+            upstream_error_response(&t).status(),
+            StatusCode::GATEWAY_TIMEOUT
+        );
+        let b = anyhow::Error::new(BufferBudgetExhausted);
+        assert_eq!(
+            upstream_error_response(&b).status(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        let o = anyhow::anyhow!("upstream send: connection reset by peer");
+        assert_eq!(upstream_error_response(&o).status(), StatusCode::BAD_GATEWAY);
     }
 }

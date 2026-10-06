@@ -69,6 +69,21 @@ pub fn overlapping_prefix_count(conn: &Connection, ip: &str) -> Result<usize> {
 }
 
 pub fn load_covering_prefixes(conn: &Connection, ip: &str) -> Result<Vec<CoveringPrefix>> {
+    // 入口归一化：v4-mapped（`::ffff:a.b.c.d`）折回 v4，并把地址重写成规范字符串。
+    //
+    // 为什么必须在这里做：本函数按**地址族分流**（v4 走 geoip/ipv4 表、v6 走 ipv6 表），
+    // 且 `load_from_geoip` 用 `ip.parse::<Ipv4Addr>()` 判族。带 `::ffff:` 前缀的 v4 客户端
+    // 会被当成纯 v6 去查 ipv6 表 —— 库里有该 v4 段却返回空（面板显示「无结果」），
+    // 与 `apply_panel_edits` / `anycast::is_anycast_conn` / `rate_limit` / `access` /
+    // `basic_auth` 早就统一的口径不一致。admin_geoip 恰好在调用前 unmap 了，所以这条
+    // 静默缺口只在其它调用方（`lookup::lookup`、`overlapping_prefix_count` 以及未来调用者）
+    // 上暴露 —— 归一化放在唯一的入口处，谁调都安全。
+    // 非 IP 字面量（畸形输入）保持原样：下面各查询会自行判空。
+    let ip_norm = match crate::server::geoip_panel::iputil::parse_ip(ip) {
+        Some(a) => crate::server::geoip_panel::iputil::unmap_v4_mapped(a).to_string(),
+        None => ip.to_string(),
+    };
+    let ip = ip_norm.as_str();
     let mut out = load_from_geoip(conn, ip)?;
     // Also merge ipv4/ipv6 range tables when present (§23 dual schema).
     if let Ok(extra) = load_from_range_table(conn, "ipv4", ip) {
@@ -165,7 +180,10 @@ fn load_from_geoip(conn: &Connection, ip: &str) -> Result<Vec<CoveringPrefix>> {
          -- `IS NULL` 放行（见文件下方的注释），geoip 这张表漏了 —— 同一个库两条路径给出
          -- 不同的覆盖结果（面板 lookup 少行/空）。
          WHERE start_i IS NULL OR (start_i <= ?1 AND end_i >= ?1)
-         ORDER BY COALESCE(commit_unix, 0) ASC, COALESCE(weight, 0) ASC, COALESCE(bits, 0) ASC",
+         -- rowid 收尾：合并侧 prefer_field/prefix 用 `>=`（同分时后行胜），而
+         -- (commit_unix,weight,bits) 相同的行在 SQLite 里顺序未定义 —— 少了唯一键，
+         -- 同一查询在不同查询计划（是否走 idx_geoip_numeric）下可能选出不同字段值。
+         ORDER BY COALESCE(commit_unix, 0) ASC, COALESCE(weight, 0) ASC, COALESCE(bits, 0) ASC, rowid ASC",
     )?;
     let rows = stmt.query_map([target_i], |row| {
         let mut p = map_covering_row(row)?;
@@ -227,7 +245,12 @@ fn load_from_range_table(conn: &Connection, table: &str, ip: &str) -> Result<Vec
                 start,
                 end
          FROM {table}
-         WHERE start_i IS NULL OR (start_i <= ?1 AND end_i >= ?1)"
+         WHERE start_i IS NULL OR (start_i <= ?1 AND end_i >= ?1)
+         -- 与 load_from_geoip 的 ORDER BY **逐键一致**（含 rowid 唯一键收尾）。
+         -- 原来这条完全没有 ORDER BY：SQLite 对无 ORDER BY 的扫描返回顺序取决于查询计划
+         -- （走 idx_*_numeric 索引 vs 全表扫描 ⇒ 索引序 vs rowid 序），而合并侧同分取后行，
+         -- 于是「同一份数据在不同计划/建索引前后」会合并出不同的字段值与命中前缀。
+         ORDER BY COALESCE(commit_unix, 0) ASC, COALESCE(weight, 0) ASC, COALESCE(bits, 0) ASC, rowid ASC"
     );
     let mut stmt = conn.prepare(&sql)?;
     let rows = stmt.query_map([key], |row| {
@@ -769,5 +792,65 @@ mod tests {
         let mut merged = MergedFields::default();
         crate::server::geoip_panel::ops::apply_panel_edits(&panel, "10.1.2.3", &mut merged).unwrap();
         assert_eq!(merged.country, "");
+    }
+
+    /// v6 覆盖行（写在 `ipv6` range 表）必须能被 v6 查询命中。
+    #[test]
+    fn v6_range_table_row_is_found() {
+        let conn = crate::server::geoip_panel::db::open(std::path::Path::new(":memory:")).unwrap();
+        conn.execute(
+            "INSERT INTO ipv6(start, end, bits, weight, country, city, prefix, start_i, end_i)
+             VALUES('2001:db8::','2001:db8::ffff', 112, 80, 'US', 'Doc', '2001:db8::/112',
+                    -6917232468739227648, -6917232468739227648)",
+            [],
+        )
+        .unwrap();
+        let rows = load_covering_prefixes(&conn, "2001:db8::1").unwrap();
+        assert_eq!(rows.len(), 1, "v6 range row must be found");
+        assert_eq!(rows[0].prefix, "2001:db8::/112");
+    }
+
+    /// 回归：v4-mapped 字符串（`::ffff:a.b.c.d`）必须在 `load_covering_prefixes` 内折回 v4。
+    /// 修复前这里按地址族分流把 v4-mapped 当纯 v6 去查 ipv6 表 ⇒ 库里有该 v4 段却返回 0 行
+    /// （面板显示「无结果」）。与 apply_panel_edits/anycast/rate_limit 口径统一。
+    #[test]
+    fn v4_mapped_string_lookup_finds_v4_row() {
+        let conn = crate::server::geoip_panel::db::open(std::path::Path::new(":memory:")).unwrap();
+        conn.execute(
+            "INSERT INTO geoip(ip_start, ip_end, bits, weight, country, prefix, start_i, end_i)
+             VALUES('10.0.0.0','10.255.255.255', 8, 80, 'US', '10.0.0.0/8', 167772160, 184549375)",
+            [],
+        )
+        .unwrap();
+        // 直接给 v4-mapped 字符串：修复前返回空。
+        let rows = load_covering_prefixes(&conn, "::ffff:10.1.2.3").unwrap();
+        assert_eq!(rows.len(), 1, "v4-mapped lookup must find the v4 row");
+        assert_eq!(rows[0].country, "US");
+        // 大写 / 压缩形态的 v6 也应被规范化后正常查询（不改变结果）。
+        let rows6 = load_covering_prefixes(&conn, "::FFFF:10.1.2.3").unwrap();
+        assert_eq!(rows6.len(), 1);
+    }
+
+    /// 合并确定性：同 (commit_unix, weight, bits) 的多行（含跨 geoip / ipv4 两张表）
+    /// 合并结果必须可重复。修复前 range 表查询无 ORDER BY、geoip 表 ORDER BY 无唯一键收尾，
+    /// 同分行的先后取决于查询计划；现在两侧都以 rowid 收尾。
+    #[test]
+    fn merge_is_deterministic_for_equal_scores() {
+        let conn = crate::server::geoip_panel::db::open(std::path::Path::new(":memory:")).unwrap();
+        for cc in ["AA", "BB", "CC", "DD", "EE", "FF", "GG", "HH"] {
+            conn.execute(
+                "INSERT INTO geoip(ip_start, ip_end, bits, weight, commit_unix, country, prefix, start_i, end_i)
+                 VALUES('10.0.0.0','10.255.255.255', 8, 100, 5, ?1, '10.0.0.0/8', 167772160, 184549375)",
+                rusqlite::params![cc],
+            )
+            .unwrap();
+        }
+        let first = merge_covering(&load_covering_prefixes(&conn, "10.1.2.3").unwrap()).country;
+        for _ in 0..50 {
+            let again = merge_covering(&load_covering_prefixes(&conn, "10.1.2.3").unwrap()).country;
+            assert_eq!(again, first, "同分行的合并结果必须稳定");
+        }
+        // 唯一键 rowid 收尾 ⇒ 同分取最后插入（HH）。
+        assert_eq!(first, "HH");
     }
 }

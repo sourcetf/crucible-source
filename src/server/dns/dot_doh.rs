@@ -57,6 +57,10 @@ pub async fn udp_query_opts(
 ) -> Result<Vec<u8>> {
     use tokio::net::UdpSocket;
     let port = cfg.port_or_default();
+    // 客户端**原始**查询（ECS 注入/剥离之前）：应答回显 ECS 必须按它判定 ——
+    // RFC 7871 §7.2.2「查询带 ECS ⇒ 应答必须带 ECS」，而注入后的 wire 我们已经
+    // 改过，不能拿它当「客户端到底带没带 ECS」的依据。
+    let client_query = wire.clone();
     // ECS（RFC7871）：
     // - 开关开：v4 固定 /24、v6 /56，客户端自带 ECS 也重写（禁止 /32 出网）；
     // - 开关关：剥离客户端自带的 ECS option —— 否则「关」只关掉了注入，客户端 ECS
@@ -86,7 +90,16 @@ pub async fn udp_query_opts(
     let mut buf = vec![0u8; 65535];
     let n = tokio::time::timeout(std::time::Duration::from_secs(3), sock.recv(&mut buf)).await??;
     buf.truncate(n);
-    Ok(buf)
+    // RFC 7871 §7.2.2（递归/中介侧）：客户端查询**带** ECS 时，应答**必须**回带 ECS
+    // option。上游是本机 BIND 9 —— 它不实现 ECS、不会在应答里回 option，所以只能由
+    // 本层按客户端原始查询回显（FAMILY/SOURCE/ADDRESS 与查询一致、SCOPE=0）。
+    // `apply_response_ecs` 在查询**没带** ECS 时原样返回，故这里可以无条件调用。
+    // （此前该函数已写好但从未接线 —— 应答侧 ECS 等于没实现。）
+    // 回显会加一个 OPT（约 11~15 字节）：UDP 收到的应答最大 65535，加上后可能越过
+    // 65535 —— DoT 侧用 `answer.len() as u16` 写长度前缀，越界会静默截断成坏帧，
+    // 因此越过上限时放弃回显（宁可少一个 option 也不能发坏帧）。
+    let echoed = super::ecs::apply_response_ecs(&client_query, &buf);
+    Ok(if echoed.len() <= 65535 { echoed } else { buf })
 }
 
 /// H1 请求钩子：命中 DoH 则应答 `Ok(resp)`；未命中（非 DoH 域名/路径）返回 `Err(req)`
@@ -792,6 +805,10 @@ fn dot_port_conflicts_named(dns: &crate::server::dns::DnsConfig) -> bool {
 /// 配置源 =「panel.toml（存在则整体覆盖，与 `effective()` 同语义）→ 启动快照」，
 /// 由 supervisor **周期重读**：面板“保存并应用”后 ACL/限速/并发上限/端口/启停都会生效。
 /// 完整热载（config.toml 的 `[dns]` 改动、启动时未启用后来启用）用 [`dot_listener_live`]。
+/// DoT TCP+TLS 监听（快照入口，**已不再由 `dns::startup` 使用** —— 它只重读 panel.toml，
+/// config.toml 热载的 [dns.dot] 改动不生效；`startup` 现在 spawn [`dot_listener_live`]）。
+/// 保留它是因为面板/测试仍有按「panel.toml → 启动快照」取配置的用法。
+#[allow(dead_code)]
 pub async fn dot_listener(dns: crate::config::DnsConfig) {
     #[cfg(feature = "tls_boring")]
     {
@@ -820,7 +837,6 @@ pub async fn dot_listener(dns: crate::config::DnsConfig) {
 /// DoT 监听（live 配置入口）：每次判定都取 `effective(live.snapshot())`，
 /// 端口/启停变化自动重建监听，ACL/限速/并发上限每 accept 与每查询读取当前值（P1-2）。
 /// `dns::startup` 应改为 spawn 它（跨文件需求），替代启动时快照入口 [`dot_listener`]。
-#[allow(dead_code)]
 pub async fn dot_listener_live(live: Arc<crate::server::live_config::LiveConfig>) {
     #[cfg(feature = "tls_boring")]
     {

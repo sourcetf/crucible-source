@@ -153,6 +153,20 @@ async fn handle_inner(
                             {
                                 return Err(format!("记录 {} {} 的值不合法（单行且 ≤4096 字节）", r.name, r.rtype));
                             }
+                            // 按类型语义校验（A/AAAA 必须是 IP 字面量、CNAME/NS/PTR 目标
+                            // 必须是域名）：与 add_record 同一判据。replace 会先清空本分区，
+                            // 若等到 add_record 才失败，旧记录已删、新记录只落一半。
+                            super::validate_record_rdata(&r.rtype, &r.rdata)
+                                .map_err(|e| format!("{e:#}"))?;
+                        }
+                        // CNAME 共存冲突（RFC1034 §3.6.2）必须在**删旧记录之前**按整批判定，
+                        // 否则 replace 半途失败会留下空分区。
+                        let batch: Vec<(String, String)> = recs
+                            .iter()
+                            .map(|r| (r.name.clone(), r.rtype.clone()))
+                            .collect();
+                        if let Some(why) = super::batch_cname_conflict(&batch) {
+                            return Err(why);
                         }
                         if mode == "replace" {
                             del_zone_records(&name).map_err(|e| e.to_string())?;
@@ -308,14 +322,22 @@ async fn handle_inner(
                 Ok(json!({"ok": true, "lines": dc.geo.lines.len()}))
             }
             // DoT/DoH（需求 9）
+            //
+            // **按字段合并，不整体替换**：面板的 DoT 卡片只提交 enabled/port/cert/key，
+            // 而 DotCfg 还有 allow / rate_per_sec / burst / max_conns。整体
+            // `serde_json::from_value` 会让这些**未提交**字段回落 `#[serde(default)]`：
+            // admin 经 config.toml 或 API 设的 DoT 客户端白名单被一次「保存并应用」
+            // 静默抹空（随后 `dot_effective_allow` 回落到 recursion_acl —— 默认空 = 仅
+            // 回环 → DoT 服务中断；若 recursion_acl 是 0.0.0.0/0 则 DoT 变公网开放解析器），
+            // 单 IP 限速/并发上限同样被重置为默认。与 geo 分支（294 行）同一修法。
             p if p.ends_with("/api/dns/dot_doh") => {
                 if v["dot"].is_object() {
-                    dc.dot =
-                        serde_json::from_value(v["dot"].clone()).map_err(|e| format!("dot: {e}"))?;
+                    dc.dot = merge_json_object(&dc.dot, &v["dot"])
+                        .map_err(|e| format!("dot: {e}"))?;
                 }
                 if v["doh"].is_object() {
-                    dc.doh =
-                        serde_json::from_value(v["doh"].clone()).map_err(|e| format!("doh: {e}"))?;
+                    dc.doh = merge_json_object(&dc.doh, &v["doh"])
+                        .map_err(|e| format!("doh: {e}"))?;
                 }
                 persist_and_reconcile(&dc).await?;
                 Ok(json!({"ok": true}))
@@ -524,6 +546,25 @@ fn json_strs(v: &Value) -> Vec<String> {
 /// 会把一个配置为关闭的部署就地打开并 spawn named（其它字段都用现值，唯独它不是）。
 fn keep_or(v: &Value, key: &str, cur: bool) -> bool {
     v.get(key).and_then(|x| x.as_bool()).unwrap_or(cur)
+}
+
+/// 把 `over`（JSON 对象）里的键**叠加**到 `cur`（先序列化成 JSON 对象）上，未出现的键
+/// 保持 `cur` 原值，最后反序列化回 `T`。
+///
+/// 用于「面板只提交一部分字段」的保存接口：整体 `serde_json::from_value` 会让未提交的
+/// 字段回落 `#[serde(default)]`，把 admin 通过 config.toml/API 设的值静默抹掉
+/// （DoT 白名单/限速就是这种 —— 见 `/api/dns/dot_doh` 分支）。
+fn merge_json_object<T>(cur: &T, over: &Value) -> Result<T, String>
+where
+    T: serde::Serialize + serde::de::DeserializeOwned,
+{
+    let mut base = serde_json::to_value(cur).map_err(|e| e.to_string())?;
+    if let (Some(b), Some(o)) = (base.as_object_mut(), over.as_object()) {
+        for (k, val) in o {
+            b.insert(k.clone(), val.clone());
+        }
+    }
+    serde_json::from_value(base).map_err(|e| e.to_string())
 }
 
 async fn persist_and_reconcile(dc: &DnsConfig) -> Result<(), String> {
@@ -989,7 +1030,10 @@ pub(super) fn parse_zone_text(text: &str, origin: &str) -> Result<Vec<ZoneRec>, 
 
 #[cfg(test)]
 mod dns_admin_api_tests {
-    use super::{drop_soa_records, keep_or, parse_zone_text, strip_zone_comment, zone_tokens, ZoneRec};
+    use super::{
+        drop_soa_records, keep_or, merge_json_object, parse_zone_text, strip_zone_comment,
+        zone_tokens, ZoneRec,
+    };
     use serde_json::json;
 
     /// `enabled` 缺字段时必须保持现值：旧实现兜底 true，会把关闭的部署就地打开。
@@ -1037,5 +1081,41 @@ mod dns_admin_api_tests {
         assert_eq!(recs[0].rtype, "TXT");
         assert!(recs[0].rdata.contains("semi;colon"), "rdata={:?}", recs[0].rdata);
         assert!(recs[0].rdata.ends_with('"'), "rdata 收尾引号丢失: {:?}", recs[0].rdata);
+    }
+
+    /// DoT 面板保存只提交 enabled/port/cert/key：未提交的 allow/限速/并发上限必须保持
+    /// 原值。整体 `from_value` 会让它们回落 `#[serde(default)]` —— DoT 白名单被静默抹空
+    /// （随后回落 recursion_acl：默认空=仅回环，服务中断；或 0.0.0.0/0 则公网开放）。
+    #[test]
+    fn dot_doh_partial_payload_preserves_unsubmitted_fields() {
+        use crate::server::dns::DotCfg;
+        let cur = DotCfg {
+            enabled: true,
+            port: 853,
+            cert: Some("c.pem".into()),
+            key: Some("k.pem".into()),
+            allow: vec!["203.0.113.0/24".into()],
+            rate_per_sec: 7,
+            burst: 9,
+            max_conns: 33,
+        };
+        // 面板风格 payload：只有 enabled/port/cert/key（cert/key 用 null 表示清空）
+        let merged = merge_json_object(
+            &cur,
+            &json!({"enabled": false, "port": 8853, "cert": null, "key": null}),
+        )
+        .unwrap();
+        assert!(!merged.enabled);
+        assert_eq!(merged.port, 8853);
+        assert_eq!(merged.cert, None, "cert=null 应清空");
+        assert_eq!(merged.key, None, "key=null 应清空");
+        assert_eq!(
+            merged.allow,
+            vec!["203.0.113.0/24".to_string()],
+            "未提交的 DoT 白名单不能被抹空"
+        );
+        assert_eq!(merged.rate_per_sec, 7);
+        assert_eq!(merged.burst, 9);
+        assert_eq!(merged.max_conns, 33);
     }
 }

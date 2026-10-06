@@ -29,7 +29,14 @@ pub fn check_admin<T>(req: &Request<T>, admin: &AdminConfig) -> bool {
 pub fn check_admin_headers(headers: &HeaderMap, admin: &AdminConfig) -> bool {
     if admin.users.is_empty() {
         // 未配置任何用户 → 拒绝，而不是放行。启动时会打 warn 提示补配置。
-        log::warn!("admin: no [[admin.users]] configured; admin panel is inaccessible");
+        // **必须节流**：这条路径由**未认证**请求驱动（带任意垃圾 Basic 凭据打
+        // /__admin 就会走到这里），每请求一条 warn 等于给了一条免费写日志的通道
+        //（本机磁盘长期 95%，日志写满是可远程触发的停机面）。
+        crate::server::log_throttle::warn_every(
+            "admin-no-users",
+            std::time::Duration::from_secs(300),
+            "admin: no [[admin.users]] configured; admin panel is inaccessible",
+        );
         return false;
     }
     // Only users with a real hash participate; empty-hash entries never grant access.
@@ -162,7 +169,7 @@ fn check_user_pass_headers(headers: &HeaderMap, username: &str, password_hash: &
     let Ok(s) = val.to_str() else {
         return false;
     };
-    let Some(b64) = s.strip_prefix("Basic ") else {
+    let Some(b64) = strip_basic_scheme(s) else {
         return false;
     };
     let decoded = decode_base64(b64.trim()).unwrap_or_default();
@@ -188,6 +195,26 @@ fn ct_eq_str(a: &str, b: &str) -> bool {
         diff |= a[i] ^ b[i];
     }
     diff == 0
+}
+
+/// 取出 `Authorization: Basic <b64>` 里的凭据部分（无则 None）。
+///
+/// 认证方案名是**大小写不敏感**的 token（RFC 9110 §11.1 的 `auth-scheme` 比较规则、
+/// RFC 7617 §2）。此前两处调用点都硬编码 `strip_prefix("Basic ")`，于是
+/// `Authorization: basic dXNlcjpwYXNz`（小写方案名，部分客户端/脚本会这么发）
+/// 被判「不是 Basic 凭据」⇒ 客户端带着**完全正确**的口令永远拿 401，且
+/// `WWW-Authenticate: Basic` 会诱导它一直重试。
+///
+/// 注意 `has_basic_credentials`（admin 前置门）与 `check_user_pass_headers`（真正校验）
+/// 共用本函数：口径必须同一份，否则会出现「门放行、校验必然失败」的错配。
+fn strip_basic_scheme(s: &str) -> Option<&str> {
+    let idx = s.find(' ')?;
+    let (scheme, rest) = s.split_at(idx);
+    if !scheme.eq_ignore_ascii_case("basic") {
+        return None;
+    }
+    let b64 = rest.trim_start();
+    (!b64.is_empty()).then_some(b64)
 }
 
 fn decode_base64(input: &str) -> Option<Vec<u8>> {
@@ -319,7 +346,7 @@ fn has_basic_credentials(headers: &HeaderMap) -> bool {
     headers
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
-        .and_then(|s| s.strip_prefix("Basic "))
+        .and_then(strip_basic_scheme)
         .is_some_and(|b64| !b64.trim().is_empty())
 }
 
@@ -575,6 +602,34 @@ mod tests {
         let cfg = admin_with_hash(&hash);
         assert!(!admin_ok_hit(admin_users_fp(&cfg), b""));
         assert!(!check_admin_headers(&HeaderMap::new(), &cfg));
+    }
+
+    /// 认证方案名大小写不敏感（RFC 9110 §11.1）：`basic`/`BASIC` 都是 Basic。
+    /// 此前只认字面量 `"Basic "`，客户端发小写方案名时永远 401（凭据其实正确）。
+    #[test]
+    fn auth_scheme_is_case_insensitive() {
+        assert_eq!(strip_basic_scheme("Basic dXNlcjpwdw=="), Some("dXNlcjpwdw=="));
+        assert_eq!(strip_basic_scheme("basic dXNlcjpwdw=="), Some("dXNlcjpwdw=="));
+        assert_eq!(strip_basic_scheme("BASIC dXNlcjpwdw=="), Some("dXNlcjpwdw=="));
+        assert_eq!(strip_basic_scheme("BaSiC dXNlcjpwdw=="), Some("dXNlcjpwdw=="));
+        assert_eq!(strip_basic_scheme("Bearer xyz"), None);
+        assert_eq!(strip_basic_scheme("Basic"), None, "无凭据部分");
+        assert_eq!(strip_basic_scheme("Basic "), None, "空凭据");
+        assert_eq!(strip_basic_scheme(""), None);
+        // 门与校验必须同一口径：门放行的输入，校验路径也必须能解析出凭据。
+        let hash = password::hash_password("pw").unwrap();
+        let cfg = admin_with_hash(&hash);
+        let mut h = HeaderMap::new();
+        h.insert(
+            header::AUTHORIZATION,
+            http::HeaderValue::from_str(&format!("basic {}", b64("u:pw"))).unwrap(),
+        );
+        assert!(has_basic_credentials(&h), "小写方案名必须被门接受");
+        assert!(check_admin_headers(&h, &cfg), "小写方案名必须通过校验");
+        assert!(matches!(
+            admin_gate(&h, &cfg, "10.9.9.77".parse().unwrap()),
+            AdminGate::Proceed
+        ));
     }
 
     /// listener 校验在退避期内快速失败（不再进口令哈希路径）。

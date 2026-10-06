@@ -343,6 +343,23 @@ int appengine_execute(
         ngx_ctx_t ctx;
         lua_State *L;
 
+        /* 脚本不存在 → 404（而不是把 luaL_dofile 的 "cannot open ..." 一律当 500）。
+         * 此前请求一个不存在的 `.lua` 得到 **500**：与 php/tsx/ruby 的 404 口径不一致，
+         * 也让「文件没部署」看起来像「引擎坏了」。绝对路径只进 out->error（Rust 侧节流
+         * 写日志），客户端拿固定文本。用 fopen 探测（access/F_OK 在 -std=c99 下不可见）。 */
+        {
+            FILE *probe = fopen(script, "rb");
+            if (!probe) {
+                out->status = 404;
+                appengine_result_set_headers(
+                    out, "Content-Type: text/plain; charset=utf-8\r\n");
+                appengine_result_set_body(out, "lua: script not found\n", 22);
+                appengine_result_set_error(out, script);
+                return 0;
+            }
+            fclose(probe);
+        }
+
         memset(&ctx, 0, sizeof(ctx));
 
         /* Per-request lua_State — no shared global state across threads. */
