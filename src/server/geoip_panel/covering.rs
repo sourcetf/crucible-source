@@ -552,7 +552,7 @@ fn merge_pipeline(conn: &Connection, ip: &str, rows: &[CoveringPrefix]) -> Merge
     // 面板覆盖失败必须留痕：旧实现 `let _ = ...` 静默吞掉 —— 库锁/表缺失时
     // 手工勘误整体不生效，面板却一切正常（与「假成功」同类）。lookup 是热路径，
     // 相同错误只告警一次（消息变化才再打），避免把日志刷爆。
-    match super::db::open_panel(std::path::Path::new("data/geoip/panel.sqlite")) {
+    match super::db::open_panel(&super::db::panel_db_path()) {
         Ok(panel) => {
             if let Err(e) = super::ops::apply_panel_edits(&panel, ip, &mut merged) {
                 warn_once(&format!("geoip panel edits skipped: {e:#}"));

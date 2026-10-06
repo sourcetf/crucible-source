@@ -14,13 +14,15 @@ import re, sys, os
 
 REPO = "/home/dev123/crucible-git"
 SRC = os.path.join(REPO, "config-test.toml")
-OUT = sys.argv[1] if len(sys.argv) > 1 else "/home/dev123/scratch-verify/conf/config-verify.toml"
-SCRATCH = "/home/dev123/scratch-verify"
+# 工号 1009 / agent-verify2（wave-5）：端口块 26000+，状态根 scratch-verify2（与
+# wave-3 的 23000/scratch-verify 隔离，避免与其他 agent 抢端口）。
+OUT = sys.argv[1] if len(sys.argv) > 1 else "/home/dev123/scratch-verify2/conf/config-verify.toml"
+SCRATCH = "/home/dev123/scratch-verify2"
 
 PORTMAP = {
-    "19095": "23095", "19081": "23081", "19445": "23445", "19446": "23446",
-    "18443": "23443", "18444": "23444", "55556": "23556", "55555": "23555",
-    "11853": "23853",
+    "19095": "26095", "19081": "26081", "19445": "26445", "19446": "26446",
+    "18443": "26443", "18444": "26444", "55556": "26556", "55555": "26555",
+    "11853": "26853",
 }
 
 src = open(SRC).read()
@@ -28,7 +30,7 @@ for k, v in PORTMAP.items():
     src = re.sub(r"(?<![0-9])" + k + r"(?![0-9])", v, src)
 
 # 显式 DNS 端口
-src = src.replace("test_mode = true", "test_mode = true\nport = 23553\nrndc_port = 23153", 1)
+src = src.replace("test_mode = true", "test_mode = true\nport = 26553\nrndc_port = 26153", 1)
 
 # 需要绝对化的路径键（值形如 "xxx"，非绝对路径才加前缀）
 ABS_KEYS = ("root", "docroot", "lib", "cert", "cert_ec", "key", "key_ec", "ech_keys")
@@ -43,25 +45,36 @@ src = re.sub(r'\b(root|docroot|lib|cert|cert_ec|key|key_ec|ech_keys)\s*=\s*"([^"
 # ── 高级 listener（工号 1009 自建，用于 proxy / page_rules / rate_limit / ACL 验收）──
 ADV = f"""
 
-# ============ 验收用高级 listener（工号 1009）============
+# ============ 验收用高级 listener（工号 1009 / agent-verify2）============
 
 # proxy + page_rules + 响应/请求头改写
 [[listeners]]
 address = "127.0.0.1"
-port = 23090
+port = 26090
 root = "{SCRATCH}/www-adv"
 http_versions = ["h1", "h2"]
 server_name = "adv.crucible.local"
 
 [[listeners.proxy_rules]]
 path = "/proxy"
-upstream = "http://127.0.0.1:23099"
+upstream = "http://127.0.0.1:26099"
 modify_request_headers = {{ X-Added-Req = "req-yes" }}
 modify_response_headers = {{ X-Added-Resp = "resp-yes" }}
 
 [[listeners.proxy_rules]]
 path = "/ws"
-upstream = "http://127.0.0.1:23099"
+upstream = "http://127.0.0.1:26099"
+
+# WS 到 TLS h2 上游（上游 ALPN 广告 h2,http/1.1）——验证 force_h1（回源强制 h1）
+[[listeners.proxy_rules]]
+path = "/wss"
+upstream = "https://127.0.0.1:26100"
+ssl_mode = "no_verify"
+
+# 代理到「无人在听」的上游 —— 验证错误映射不泄露内部路径
+[[listeners.proxy_rules]]
+path = "/dead"
+upstream = "http://127.0.0.1:26199"
 
 [[listeners.page_rules]]
 match_url = "/old/*"
@@ -85,7 +98,7 @@ action = "block"
 # 上传 + autoindex + 目录 301（root 含子目录；php app 用于 webshell 上传拦截探测）
 [[listeners]]
 address = "127.0.0.1"
-port = 23094
+port = 26094
 root = "{SCRATCH}/www-up"
 http_versions = ["h1", "h2"]
 server_name = "up.crucible.local"
@@ -106,7 +119,7 @@ docroot = "{SCRATCH}/www-up/php"
 # 限流：5 req/s，burst 5
 [[listeners]]
 address = "127.0.0.1"
-port = 23091
+port = 26091
 root = "{SCRATCH}/www-rate"
 http_versions = ["h1"]
 
@@ -115,10 +128,20 @@ enabled = true
 rate_per_sec = 5.0
 burst = 5.0
 
+# 组合顺序：限流先于页面规则（h1 dispatch 顺序 rate → page_rules）
+[[listeners.page_rules]]
+match_url = "/blocked*"
+action = "block"
+
+[[listeners.page_rules]]
+match_url = "/r/*"
+action = "redirect"
+target = "301:https://example.com/rd"
+
 # 站点级 basic auth（口令 admin，复用 config-test 的 argon2id 哈希）
 [[listeners]]
 address = "127.0.0.1"
-port = 23092
+port = 26092
 root = "{SCRATCH}/www-auth"
 http_versions = ["h1"]
 
@@ -127,16 +150,64 @@ realm = "verify-auth"
 username = "admin"
 password_hash = "$argon2id$v=19$m=19456,t=2,p=1$E/RLobwgix2BWMRMT++urA$yEympjJtiDh0ezwSQsnkbsfYAoSzeDAHYw3EsUMBsj4"
 
-# ip_access：只允许 10.0.0.0/8（本机 127.0.0.1 应被拒）——探测 per-listener ip_access 是否生效
+# ip_access（明文）：只允许 10.0.0.0/8（本机 127.0.0.1 应被拒）——per-listener 档位
 [[listeners]]
 address = "127.0.0.1"
-port = 23093
+port = 26093
 root = "{SCRATCH}/www-ip"
 http_versions = ["h1"]
 
 [listeners.ip_access]
 allow = ["10.0.0.0/8"]
 deny = []
+
+# ip_access（TLS 面）：core2-wave4 报告点名「TLS/h3 请求路径仍走全局 ip_access」
+# —— 用来回归 per-listener 档位在 TLS 面是否已接线。
+[[listeners]]
+address = "127.0.0.1"
+port = 26096
+root = "{SCRATCH}/www-tlsip"
+http_versions = ["h1", "h2"]
+server_name = "tlsip.crucible.local"
+
+[listeners.ssl]
+cert = "{REPO}/cert.pem"
+key = "{REPO}/key.pem"
+versions = ["TLSv1.2", "TLSv1.3"]
+
+[listeners.ip_access]
+allow = ["10.0.0.0/8"]
+deny = []
+
+# ip_access（h3 面）：h1+h2+h3 + TLS，per-listener ip_access 只允许 10/8。
+[[listeners]]
+address = "127.0.0.1"
+port = 26097
+root = "{SCRATCH}/www-h3ip"
+http_versions = ["h1", "h2", "h3"]
+server_name = "h3ip.crucible.local"
+
+[listeners.ssl]
+cert = "{REPO}/cert.pem"
+key = "{REPO}/key.pem"
+versions = ["TLSv1.2", "TLSv1.3"]
+
+[listeners.ip_access]
+allow = ["10.0.0.0/8"]
+deny = []
+
+# h3 目录 301 验证用：h1+h2+h3，root 含子目录（scratch，无 ACL）
+[[listeners]]
+address = "127.0.0.1"
+port = 26098
+root = "{SCRATCH}/www-h3dir"
+http_versions = ["h1", "h2", "h3"]
+server_name = "h3dir.crucible.local"
+
+[listeners.ssl]
+cert = "{REPO}/cert.pem"
+key = "{REPO}/key.pem"
+versions = ["TLSv1.2", "TLSv1.3"]
 """
 
 src = src + ADV

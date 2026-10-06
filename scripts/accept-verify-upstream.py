@@ -1,19 +1,34 @@
 #!/usr/bin/env python3
 """accept-verify-upstream.py — 验收用本机上游（反向代理 / WebSocket 测试）。
 
-监听 127.0.0.1:23099（可用 argv[1] 覆盖）。
+监听 127.0.0.1:PORT（默认 26099，可用 argv[1] 覆盖）。同时起一个 TLS 监听在 PORT+1
+（默认 26100），ALPN 广告 `h2,http/1.1` —— 用于验证代理回源「WS 到 h2 上游」时的
+force_h1（即便上游广告 h2，也必须按 h1 讲话）。
+
 - GET/POST /proxy*  → 200，body 为收到的请求行 + 请求头（供检查请求头改写），
                       响应头带 X-Upstream: yes。
 - GET /ws (Upgrade) → 101 Switching Protocols，之后把收到的字节原样回显（WS 隧道检查）。
 - 其它             → 200 + 固定 body。
 """
-import socket, sys, threading
+import socket, sys, threading, ssl, os
 
-PORT = int(sys.argv[1]) if len(sys.argv) > 1 else 23099
+PORT = int(sys.argv[1]) if len(sys.argv) > 1 else 26099
+TLSPORT = PORT + 1
 BIND = "127.0.0.1"
+REPO = "/home/dev123/crucible-git"
+LOGDIR = "/home/dev123/scratch-verify2/logs"
 
 
-def handle(conn, addr):
+def log_req(proto, head):
+    try:
+        os.makedirs(LOGDIR, exist_ok=True)
+        with open(os.path.join(LOGDIR, "upstream-req.log"), "a") as lf:
+            lf.write(f"--- {proto}\n" + head.decode("latin1") + "\n")
+    except Exception:
+        pass
+
+
+def handle(conn, addr, proto="plain"):
     try:
         conn.settimeout(10)
         buf = b""
@@ -32,11 +47,7 @@ def handle(conn, addr):
                 k, v = ln.split(":", 1)
                 headers[k.strip().lower()] = v.strip()
         is_ws = headers.get("upgrade", "").lower() == "websocket"
-        try:
-            with open("/home/dev123/scratch-verify/logs/upstream-req.log", "a") as lf:
-                lf.write(f"--- {method} {path} ws={is_ws}\n" + head.decode("latin1") + "\n")
-        except Exception:
-            pass
+        log_req(proto, head)
         if is_ws:
             key = headers.get("sec-websocket-key", "")
             import base64, hashlib
@@ -45,7 +56,6 @@ def handle(conn, addr):
             conn.sendall(("HTTP/1.1 101 Switching Protocols\r\n"
                           "Upgrade: websocket\r\nConnection: Upgrade\r\n"
                           f"Sec-WebSocket-Accept: {acc}\r\n\r\n").encode())
-            # 之后回显（WS 隧道字节流验证）
             if rest:
                 conn.sendall(rest)
             while True:
@@ -73,18 +83,51 @@ def handle(conn, addr):
             pass
 
 
-def main():
+def serve_plain():
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     s.bind((BIND, PORT))
     s.listen(64)
-    print(f"upstream listening on {BIND}:{PORT}", flush=True)
+    print(f"upstream plain listening on {BIND}:{PORT}", flush=True)
     while True:
         try:
             c, a = s.accept()
         except OSError:
             break
-        threading.Thread(target=handle, args=(c, a), daemon=True).start()
+        threading.Thread(target=handle, args=(c, a, "plain"), daemon=True).start()
+
+
+def serve_tls():
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    ctx.load_cert_chain(os.path.join(REPO, "cert.pem"), os.path.join(REPO, "key.pem"))
+    try:
+        ctx.set_alpn_protocols(["h2", "http/1.1"])
+    except Exception as e:
+        print(f"ALPN set failed: {e}", flush=True)
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    s.bind((BIND, TLSPORT))
+    s.listen(64)
+    print(f"upstream TLS listening on {BIND}:{TLSPORT} (alpn h2,http/1.1)", flush=True)
+    while True:
+        try:
+            c, a = s.accept()
+        except OSError:
+            break
+        try:
+            tc = ctx.wrap_socket(c, server_side=True)
+        except Exception:
+            try:
+                c.close()
+            except Exception:
+                pass
+            continue
+        threading.Thread(target=handle, args=(tc, a, "tls"), daemon=True).start()
+
+
+def main():
+    threading.Thread(target=serve_tls, daemon=True).start()
+    serve_plain()
 
 
 if __name__ == "__main__":

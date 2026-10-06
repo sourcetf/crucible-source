@@ -2,7 +2,7 @@
 """accept-verify.py — 工号 1009 黑盒验收套件（HTTP/1.x + HTTP/2 + 静态 + 上传 +
 autoindex + header 改写 + 限流 + ACL + 重定向 + 代理 + 应用引擎 + DNS 面板 + Admin API）。
 
-前提：先 `sh scripts/accept-verify-start.sh` 起实例（端口块 23000+），
+前提：先 `sh scripts/accept-verify-start.sh` 起实例（端口块 26000+），
 并 `python3 scripts/accept-verify-upstream.py &` 起本机上游。
 本脚本只做黑盒请求，不修任何东西。
 
@@ -13,21 +13,23 @@ import sys, os, json, socket, ssl, subprocess, time, re, base64, argparse
 
 REPO = "/home/dev123/crucible-git"
 HOST = "127.0.0.1"
-PLAIN = 23081     # h1+h2c 静态（qmux 明文）
-APPS = 23095      # 应用引擎
-TLS12 = 23445
-TLS13 = 23446
-PROD = 23443      # h1+h2+h3 + TLS + autoindex upload
-DOH = 23444
-ADV = 23090       # proxy + page_rules
-RATE = 23091
-AUTH = 23092
-IPACC = 23093
-UP = 23094        # upload + autoindex + 目录 301
-UPSTREAM = 23099
+PLAIN = 26081     # h1+h2c 静态（qmux 明文）
+APPS = 26095      # 应用引擎
+TLS12 = 26445
+TLS13 = 26446
+PROD = 26443      # h1+h2+h3 + TLS + autoindex upload
+DOH = 26444
+ADV = 26090       # proxy + page_rules
+RATE = 26091
+AUTH = 26092
+IPACC = 26093
+UP = 26094        # upload + autoindex + 目录 301
+UPSTREAM = 26099
+TLSIP = 26096     # TLS + per-listener ip_access（扩展面）
+H3IP = 26097      # h1+h2+h3 + per-listener ip_access（扩展面）
 
 ADMIN = ("admin", "admin")
-TMP = "/home/dev123/scratch-verify/tmp"
+TMP = "/home/dev123/scratch-verify2/tmp"
 os.makedirs(TMP, exist_ok=True)
 
 RESULTS = []          # dict: area,name,status(PASS/FAIL/SKIP),severity,expected,observed,repro
@@ -144,7 +146,7 @@ def raw_h1(port, payload, read_timeout=5, maxread=65536):
 
 # ───────────────────────── 静态 / HTTP 语义 ─────────────────────────
 def test_static():
-    area("静态文件 / HTTP 语义 (h1 :23081)")
+    area("静态文件 / HTTP 语义 (h1 :26081)")
     c, h, b, _ = curl(port=PLAIN, path="/")
     rec("GET / → 200", c == 200, 200, c, f"curl -s http://127.0.0.1:{PLAIN}/")
     rec("Content-Length 存在且等于 body", h.get("content-length") == str(len(b)),
@@ -155,12 +157,12 @@ def test_static():
     # HTTP/1.0
     r = raw_h1(PLAIN, b"GET / HTTP/1.0\r\n\r\n")
     rec("HTTP/1.0 GET / 无 Host → 200", r.startswith(b"HTTP/1.0 200") or r.startswith(b"HTTP/1.1 200"),
-        "200", r.split(b"\r\n")[0][:40], "printf 'GET / HTTP/1.0\\r\\n\\r\\n' | nc 127.0.0.1 23081")
+        "200", r.split(b"\r\n")[0][:40], "printf 'GET / HTTP/1.0\\r\\n\\r\\n' | nc 127.0.0.1 26081")
 
     # HTTP/1.1 缺 Host → 400
     r = raw_h1(PLAIN, b"GET / HTTP/1.1\r\n\r\n")
     rec("HTTP/1.1 缺 Host → 400", b" 400" in r.split(b"\r\n")[0], "400", r.split(b"\r\n")[0][:40],
-        "printf 'GET / HTTP/1.1\\r\\n\\r\\n' | nc 127.0.0.1 23081", sev="P1", owner="h1")
+        "printf 'GET / HTTP/1.1\\r\\n\\r\\n' | nc 127.0.0.1 26081", sev="P1", owner="h1")
 
     # 目录无尾斜杠 → 301 且 Location 以 / 结尾
     c, h, b, _ = curl(port=UP, path="/sub")
@@ -225,7 +227,7 @@ def test_static():
 
 # ───────────────────────── HTTP/2 ─────────────────────────
 def test_h2():
-    area("HTTP/2 (h2c :23081 / TLS h2 :23443)")
+    area("HTTP/2 (h2c :26081 / TLS h2 :26443)")
     c, h, b, raw = curl(port=PLAIN, path="/", http2=True)
     rec("h2c GET / → 200", c == 200, 200, c, f"curl --http2-prior-knowledge http://127.0.0.1:{PLAIN}/",
         sev="P0", owner="h2h3")
@@ -257,7 +259,7 @@ def test_h2():
 
 # ───────────────────────── TLS ─────────────────────────
 def test_tls():
-    area("TLS (:23445 TLS1.2 / :23446 TLS1.3 / :23443)")
+    area("TLS (:26445 TLS1.2 / :26446 TLS1.3 / :26443)")
     c, h, b, raw = curl(port=TLS13, path="/", scheme="https")
     rec("TLS1.3 listener 200", c == 200, 200, c)
     # 版本协商：23446 prefer 1.3
@@ -292,7 +294,7 @@ def test_tls():
 
 # ───────────────────────── 上传 / 断点续传 ─────────────────────────
 def test_upload():
-    area("上传 / 断点续传 (:23094 PUT/PATCH)")
+    area("上传 / 断点续传 (:26094 PUT/PATCH)")
     name = f"/accept-{int(time.time())}.txt"
     payload = "hello-crucible-upload"
     c, h, b, _ = curl(port=UP, path=name, method="PUT", data=payload,
@@ -350,7 +352,7 @@ def test_upload():
 
 # ───────────────────────── header 改写 / 页面规则 / 代理 ─────────────────────────
 def test_adv():
-    area("页面规则 / 代理 / header 改写 (:23090)")
+    area("页面规则 / 代理 / header 改写 (:26090)")
     # rewrite /old/* → /new （rewrite_path 把 /old/<x> 映射为 /new/<x>）
     c, h, b, _ = curl(port=ADV, path="/old/index.html")
     rec("page_rule rewrite /old/* → /new", c == 200 and b"new content" in b,
@@ -407,7 +409,7 @@ def test_adv():
 
 # ───────────────────────── 限流 / ACL ─────────────────────────
 def test_acl():
-    area("限流 / ACL / basic auth (:23091/:23092/:23093)")
+    area("限流 / ACL / basic auth (:26091/:26092/:26093)")
     # rate limit
     codes = []
     for _ in range(15):
@@ -427,12 +429,12 @@ def test_acl():
     c, h, b, _ = curl(port=IPACC, path="/")
     rec("per-listener ip_access allow=[10/8] 拒 127.0.0.1", c == 403,
         "403 forbidden", c, sev="P1", owner="core",
-        repro=f"config [[listeners]] port=23093 [listeners.ip_access] allow=[10.0.0.0/8]; curl http://127.0.0.1:{IPACC}/")
+        repro=f"config [[listeners]] port=26093 [listeners.ip_access] allow=[10.0.0.0/8]; curl http://127.0.0.1:{IPACC}/")
 
 
 # ───────────────────────── 重定向 / HSTS ─────────────────────────
 def test_redirect_hsts():
-    area("重定向 / HSTS (:23445 port_reuse)")
+    area("重定向 / HSTS (:26445 port_reuse)")
     # 明文打到「port_reuse 且无 TLS 兄弟」的 listener 才应 301 到 https（config-test 无此形态，
     # 23445 有 TLS 兄弟 → 明文请求非 301 属正常，跳过）。open-redirect 用 Host 探测。
     # HSTS 头
@@ -448,6 +450,278 @@ def test_redirect_hsts():
     loc = h.get("location", "")
     rec("301 不因 Host 变协议相对 open-redirect", not loc.startswith("//"),
         "Location 不以 // 开头", f"code={c} loc={loc}", sev="P0", owner="h1")
+
+
+# ───────────────────────── 扩展：静态 / 条件请求 / 上传语义 ─────────────────────────
+def _recv_head(sock, timeout=8):
+    """读到首个响应头块（含状态行），返回 (status:int|None, raw:bytes)。"""
+    sock.settimeout(timeout)
+    data = b""
+    try:
+        while b"\r\n\r\n" not in data:
+            d = sock.recv(4096)
+            if not d:
+                break
+            data += d
+    except socket.timeout:
+        pass
+    m = re.match(rb"HTTP/\S+\s+(\d+)", data)
+    return (int(m.group(1)) if m else None), data
+
+
+def test_static_ext():
+    area("扩展·静态语义 (h1 :26090 / h1+h2c :26081)")
+    # 符号链接索引绕过：symout/index.html -> docroot 外（应拒），symin/index.html -> 内（应服务）
+    c, h, b, _ = curl(port=ADV, path="/symout/")
+    rec("符号链接索引指向 docroot 外 → 拒绝", c in (403, 404) and b"OUTSIDE-SECRET" not in b,
+        "403/404 无泄漏", f"{c} leak={'OUTSIDE-SECRET' in b.decode('latin1','replace')}",
+        f"ln -s outside/secret.html www-adv/symout/index.html; curl http://127.0.0.1:{ADV}/symout/",
+        sev="P0", owner="static")
+    c, h, b, _ = curl(port=ADV, path="/symin/")
+    rec("符号链接索引指向 docroot 内 → 服务", c == 200 and b"INSIDE-REAL" in b,
+        "200 INSIDE-REAL", f"{c} {b[:30]!r}", sev="P2", owner="static")
+
+    # ETag 含 inode：原子替换（rename）后 ETag 必须变（即便内容/秒级 mtime 不变）
+    c, h, b, _ = curl(port=ADV, path="/etag.txt")
+    etag1 = h.get("etag")
+    replaced = False
+    if etag1:
+        import os as _os
+        tmp = os.path.join(TMP, "etag.new")
+        open(tmp, "w").write("etag-body-1")          # 同内容
+        _os.replace(tmp, "/home/dev123/scratch-verify2/www-adv/etag.txt")
+        replaced = True
+        c2, h2, b2, _ = curl(port=ADV, path="/etag.txt")
+        etag2 = h2.get("etag")
+        rec("原子替换后 ETag 变化（含 inode）", bool(etag2) and etag2 != etag1,
+            "etag2 != etag1", f"{etag1} -> {etag2}",
+            "写同内容临时文件 + rename 覆盖；GET 取 ETag 比对", sev="P1", owner="static")
+    else:
+        rec("原子替换后 ETag 变化（含 inode）", False, "ETag present", "no etag",
+            sev="P1", owner="static")
+
+    # 多段 Range（间隔 >128 字节，不可合并）→ multipart/byteranges，2 个 part
+    c, h, b, _ = curl(port=ADV, path="/range.txt", headers=["Range: bytes=0-1,1000-1001"])
+    ct = h.get("content-type", "")
+    body = b.decode("latin1", "replace")
+    has_both = ("AA" in body) and ("BB" in body)
+    rec("多段 Range → multipart/byteranges", c == 206 and ct.startswith("multipart/byteranges") and has_both,
+        "206 multipart/byteranges 2 parts", f"{c} ct={ct[:40]} both={has_both}",
+        f"curl -H 'Range: bytes=0-1,1000-1001' http://127.0.0.1:{ADV}/range.txt", sev="P1", owner="static")
+    rec("multipart 响应带 boundary", "boundary=" in ct, "boundary=", ct[:60], sev="P2", owner="static")
+    # 相邻/重叠段可合并（RFC 9110 §15.3.7.2 允许）；间隔小 → 单段
+    c, h, b, _ = curl(port=ADV, path="/range.txt", headers=["Range: bytes=0-9,5-14"])
+    rec("重叠段合并为单段 206", c == 206 and not h.get("content-type", "").startswith("multipart"),
+        "206 single", f"{c} ct={h.get('content-type')}", sev="P2", owner="static")
+
+    # 条件请求组合
+    c, h, b, _ = curl(port=ADV, path="/range.txt")
+    et = h.get("etag")
+    lm = h.get("last-modified")
+    if et:
+        c2, _, _, _ = curl(port=ADV, path="/range.txt", headers=[f'If-None-Match: {et}'])
+        rec("If-None-Match 命中 → 304", c2 == 304, 304, c2, sev="P1", owner="static")
+        c2, _, _, _ = curl(port=ADV, path="/range.txt", headers=['If-Match: "nope"'])
+        rec("If-Match 不匹配 → 412", c2 == 412, 412, c2, sev="P2", owner="static")
+        c2, _, _, _ = curl(port=ADV, path="/range.txt", headers=['If-None-Match: "nope"'])
+        rec("If-None-Match 不匹配 → 200", c2 == 200, 200, c2, sev="P2", owner="static")
+        # If-Range 不匹配 → 忽略 Range，回 200 全量
+        c2, h2, b2, _ = curl(port=ADV, path="/range.txt",
+                             headers=['If-Range: "stale"', "Range: bytes=0-3"])
+        rec("If-Range 不匹配 → 200 全量", c2 == 200 and len(b2) == 2000, "200 full 2000B", f"{c2} {len(b2)}B",
+            sev="P2", owner="static")
+        # If-Range 匹配 → 206
+        c2, h2, b2, _ = curl(port=ADV, path="/range.txt",
+                             headers=[f"If-Range: {et}", "Range: bytes=0-3"])
+        rec("If-Range 匹配 → 206", c2 == 206 and len(b2) == 4, "206 4B", f"{c2} {len(b2)}B",
+            sev="P2", owner="static")
+    if lm:
+        c2, _, _, _ = curl(port=ADV, path="/range.txt",
+                           headers=["If-Unmodified-Since: Thu, 01 Jan 1970 00:00:00 GMT"])
+        rec("If-Unmodified-Since 过期 → 412", c2 == 412, 412, c2, sev="P2", owner="static")
+
+    # 静态 405 头跨协议一致（h1 vs h2c）
+    c1, h1d, _, _ = curl(port=ADV, path="/range.txt", method="POST", data="x")
+    c2, h2d, _, _ = curl(port=ADV, path="/range.txt", http2=True, method="POST", data="x")
+    rec("静态 405 状态 h1/h2c 一致", c1 == c2 == 405, "both 405", f"h1={c1} h2={c2}",
+        sev="P2", owner="static")
+    rec("静态 405 content-type h1/h2c 一致", ("content-type" in h1d) == ("content-type" in h2d),
+        "same ct presence", f"h1ct={h1d.get('content-type')} h2ct={h2d.get('content-type')}",
+        sev="P2", owner="static")
+    rec("静态 405 带 Allow 头 h1", "allow" in h1d, "Allow", h1d.get("allow"), sev="P2", owner="static")
+
+
+def test_upload_ext():
+    area("扩展·上传语义 (:26094)")
+    # percent-decode：PUT /pct%2ddecode.txt → 落盘为 pct-decode.txt
+    c, h, b, _ = curl(port=UP, path="/pct%2ddecode.txt", method="PUT", data="pct-ok")
+    c2, h2, b2, _ = curl(port=UP, path="/pct-decode.txt")
+    rec("上传路径 percent-decode", c2 == 200 and b2.decode("latin1") == "pct-ok",
+        "200 pct-ok", f"PUT={c} GET={c2} {b2[:20]!r}",
+        f"curl -T - http://127.0.0.1:{UP}/pct%2ddecode.txt; curl http://127.0.0.1:{UP}/pct-decode.txt",
+        sev="P2", owner="static")
+    # PUT 到不存在的父目录 → 409（不隐式建目录）
+    c, h, b, _ = curl(port=UP, path="/nodir/x.txt", method="PUT", data="x")
+    rec("PUT 父目录缺失 → 409", c == 409, 409, c, sev="P2", owner="static")
+    # 并发同目标上传：两个 PUT 同名 → 至少一个成功，且不 500/挂死
+    import threading as _th
+    res = []
+    def _put():
+        cc, _, _, _ = curl(port=UP, path="/concur.bin", method="PUT", data="concurrent-data")
+        res.append(cc)
+    ts = [_th.Thread(target=_put) for _ in range(4)]
+    [t.start() for t in ts]; [t.join() for t in ts]
+    ok_any = any(x is not None and 200 <= x < 300 for x in res)
+    no500 = all(x != 500 for x in res)
+    rec("并发同目标上传不 500/挂死", ok_any and no500, "≥1 success, no 500", f"codes={res}",
+        sev="P2", owner="static")
+    # 断点续传预留释放：声明 2GiB、发 1 字节后中断；随后普通上传仍须可用
+    try:
+        s = socket.create_connection((HOST, UP), timeout=5)
+        s.sendall((f"PUT /resv-abandon.bin HTTP/1.1\r\nHost: 127.0.0.1:{UP}\r\n"
+                   "Content-Range: bytes 0-2147483647/2147483648\r\n"
+                   "Content-Length: 2147483648\r\n\r\n").encode() + b"A")
+        try:
+            s.recv(4096)
+        except socket.timeout:
+            pass
+        s.close()                       # 中断（abort）
+    except Exception:
+        pass
+    time.sleep(2.0)
+    c, h, b, _ = curl(port=UP, path=f"/after-resv-{int(time.time())}.txt", method="PUT", data="normal-ok")
+    rec("2GiB 声明中断后普通上传仍可用（预留归还）", c is not None and 200 <= c < 300,
+        "2xx (非 507)", c,
+        "PUT 声明 Content-Range 0-2147483647/2147483648 后发 1 字节断开；再普通 PUT 小文件",
+        sev="P1", owner="static")
+    # 请求体超出声明的 Content-Range 区间 → 400
+    c, h, b, _ = curl(port=UP, path=f"/overrange-{int(time.time())}.txt", method="PUT",
+                      data="0123456789", headers=["Content-Range: bytes 0-3/10"])
+    rec("body 超出 Content-Range 区间 → 400", c == 400, 400, c, sev="P2", owner="static")
+
+
+def test_request_smuggling():
+    area("扩展·请求定界 (h1 :26094)")
+    # Content-Length + Transfer-Encoding 同时出现 → 400（走私防御）
+    payload = (f"PUT /smug1.txt HTTP/1.1\r\nHost: 127.0.0.1:{UP}\r\n"
+               "Content-Length: 5\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nHELLO\r\n0\r\n\r\n")
+    r = raw_h1(UP, payload.encode())
+    rec("CL+TE 同时出现 → 400", b" 400" in r.split(b"\r\n")[0], "400",
+        r.split(b"\r\n")[0][:40], sev="P2", owner="h1")
+    # 两个不一致的 Content-Length → 400
+    payload = (f"PUT /smug2.txt HTTP/1.1\r\nHost: 127.0.0.1:{UP}\r\n"
+               "Content-Length: 5\r\nContent-Length: 6\r\n\r\nHELLO")
+    r = raw_h1(UP, payload.encode())
+    rec("重复且不一致的 Content-Length → 400", b" 400" in r.split(b"\r\n")[0], "400",
+        r.split(b"\r\n")[0][:40], sev="P1", owner="h1")
+    # Transfer-Encoding: chunked + trailer → 正常收（2xx）
+    payload = (f"PUT /chunked-trailer.txt HTTP/1.1\r\nHost: 127.0.0.1:{UP}\r\n"
+               "Transfer-Encoding: chunked\r\n\r\n5\r\nHELLO\r\n0\r\nX-Trailer: v\r\n\r\n")
+    r = raw_h1(UP, payload.encode())
+    st = r.split(b"\r\n")[0][:40]
+    rec("chunked + trailer 被正确接收", b" 2" in r.split(b"\r\n")[0], "2xx", st,
+        sev="P2", owner="h1")
+    c, h, b, _ = curl(port=UP, path="/chunked-trailer.txt")
+    rec("chunked 内容正确落盘 HELLO", c == 200 and b.decode("latin1") == "HELLO", "HELLO",
+        f"{c} {b[:20]!r}", sev="P2", owner="h1")
+    # Expect: 100-continue（大 body）
+    try:
+        s = socket.create_connection((HOST, UP), timeout=5)
+        body = b"X" * 2000
+        s.sendall((f"PUT /expect100-{int(time.time())}.txt HTTP/1.1\r\nHost: 127.0.0.1:{UP}\r\n"
+                   f"Content-Length: {len(body)}\r\nExpect: 100-continue\r\n\r\n").encode())
+        st, _ = _recv_head(s, timeout=5)
+        got100 = st == 100
+        s.sendall(body)
+        st2, _ = _recv_head(s, timeout=5)
+        s.close()
+        rec("Expect: 100-continue → 先 100 再 2xx", got100 and (st2 is not None and 200 <= st2 < 300),
+            "100 then 2xx", f"first={st} final={st2}", sev="P2", owner="h1")
+    except Exception as e:
+        rec("Expect: 100-continue → 先 100 再 2xx", False, "100 then 2xx", f"exc {e}", sev="P2", owner="h1")
+
+
+def test_h2_authority():
+    area("扩展·h2c/h3 authority 校验")
+    # h2c 明文（PLAIN 26081）：非法 Host → 400
+    for hv in ["..", "_"]:
+        c, h, b, _ = curl(port=PLAIN, path="/", http2=True, headers=[f"Host: {hv}"])
+        rec(f"h2c 非法 Host {hv!r} → 400", c == 400, 400, c,
+            f"curl --http2-prior-knowledge -H 'Host: {hv}' http://127.0.0.1:{PLAIN}/",
+            sev="P1", owner="h2h3")
+    # DoH 明文拒绝 h1 与 h2c 一致（Host 命中白名单 crucible.local 才算 DoH 请求）
+    dq = "/dns-query?dns=AAABAAABAAAAAAAAA3d3dwdleGFtcGxlA2NvbQAAAQAB"
+    dh = ["Accept: application/dns-message", "Host: crucible.local"]
+    c1, h1d, b1, _ = curl(port=PLAIN, path=dq, headers=dh)
+    c2, h2d, b2, _ = curl(port=PLAIN, path=dq, http2=True, headers=dh)
+    rec("DoH 明文拒绝 h1 与 h2c 一致（RFC 8484 §5）", c1 == c2 == 400, "both 400",
+        f"h1={c1} h2c={c2}",
+        f"curl -H 'Host: crucible.local' http://127.0.0.1:{PLAIN}/dns-query?...", sev="P1", owner="h2h3")
+
+
+def test_proxy_ext():
+    area("扩展·代理错误映射 (:26090)")
+    c, h, b, _ = curl(port=ADV, path="/dead/x", timeout=8)
+    body = b.decode("latin1", "replace")
+    leak = ("/home/dev123" in body) or ("crucible-git" in body) or ("/src/" in body)
+    rec("上游不可达 → 502/504", c in (502, 504), "502/504", c, sev="P1", owner="proxy")
+    rec("代理错误响应不泄露内部路径", not leak, "no fs path",
+        body[:80] if leak else "clean", sev="P1", owner="proxy")
+    # WS 到 h2 上游（TLS ALPN 广告 h2,http/1.1）→ 应 101（force_h1）+ 回显
+    try:
+        s = socket.create_connection((HOST, ADV), timeout=5)
+        s.sendall((f"GET /wss HTTP/1.1\r\nHost: 127.0.0.1:{ADV}\r\n"
+                   "Upgrade: websocket\r\nConnection: Upgrade\r\n"
+                   "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n"
+                   "Sec-WebSocket-Version: 13\r\n\r\n").encode())
+        s.settimeout(6)
+        first = s.recv(4096)
+        upgraded = b" 101" in first.split(b"\r\n")[0]
+        tunnel = False
+        if upgraded:
+            s.sendall(b"WSS-H2-ECHO")
+            try:
+                tunnel = b"WSS-H2-ECHO" in s.recv(4096)
+            except socket.timeout:
+                tunnel = False
+        s.close()
+        rec("WS → TLS h2 上游（force_h1）→ 101", upgraded, "101", first.split(b"\r\n")[0][:40],
+            sev="P1", owner="proxy")
+        rec("WS → TLS h2 上游 隧道回显", tunnel, "echo", "ok" if tunnel else "no echo",
+            sev="P1", owner="proxy")
+    except Exception as e:
+        rec("WS → TLS h2 上游（force_h1）→ 101", False, "101", f"exc {e}", sev="P1", owner="proxy")
+
+
+def test_metrics():
+    area("扩展·/__metrics 鉴权 (:26095)")
+    p = subprocess.run(["curl", "-sS", "--max-time", "8", "-o", "/dev/null", "-w", "%{http_code}",
+                        f"http://{HOST}:{APPS}/__metrics"], capture_output=True)
+    anon = p.stdout.decode().strip()
+    p = subprocess.run(["curl", "-sS", "--max-time", "8", "-o", "/dev/null", "-w", "%{http_code}",
+                        "-u", "admin:admin", f"http://{HOST}:{APPS}/__metrics"], capture_output=True)
+    auth = p.stdout.decode().strip()
+    rec("/__metrics 匿名 → 401", anon == "401", "401", anon, sev="P1", owner="core")
+    rec("/__metrics 管理员 → 200", auth == "200", "200", auth, sev="P1", owner="core")
+
+
+def test_rule_order():
+    area("扩展·规则/限流组合顺序 (:26091)")
+    # 限流窗口内：页面规则生效（block → 403；redirect → 301）
+    time.sleep(1.5)  # 让令牌桶回满
+    c, h, b, _ = curl(port=RATE, path="/blocked", timeout=4)
+    rec("限流窗口内 page_rule block → 403", c == 403, 403, c, sev="P2", owner="h1")
+    c, h, b, _ = curl(port=RATE, path="/r/x", timeout=4)
+    rec("限流窗口内 page_rule redirect → 301", c == 301 and h.get("location") == "https://example.com/rd",
+        "301", f"{c} {h.get('location')}", sev="P2", owner="h1")
+    # 打满 burst 后再请求被 block 的路径 → 429（限流先于页面规则）
+    codes = []
+    for _ in range(12):
+        c, _, _, _ = curl(port=RATE, path="/", timeout=3)
+        codes.append(c)
+    c, _, _, _ = curl(port=RATE, path="/blocked", timeout=3)
+    rec("限流先于页面规则（耗尽后 /blocked → 429）", 429 in codes and c == 429,
+        "429", f"codes={codes} blocked={c}", sev="P2", owner="h1")
 
 
 # ───────────────────────── 应用引擎 ─────────────────────────
@@ -492,7 +766,7 @@ ENV_SKIP = {
 
 
 def test_apps():
-    area("应用引擎 (:23095)")
+    area("应用引擎 (:26095)")
     for path, slug, label in ENGINES:
         c, h, b, _ = curl(port=APPS, path=path + "/", timeout=20)
         body = b.decode("latin1", "replace")
@@ -526,7 +800,7 @@ def admin_req(method, sub, port=APPS, data=None, ct="application/json", auth=ADM
 
 
 def test_admin():
-    area("Admin API (:23095 /__admin)")
+    area("Admin API (:26095 /__admin)")
     # 无凭据
     p = subprocess.run(["curl", "-sS", "--max-time", "8", "-o", "/dev/null", "-w", "%{http_code}",
                         f"http://{HOST}:{APPS}/__admin/api/overview"], capture_output=True)
@@ -592,7 +866,7 @@ def test_admin():
 
 # ───────────────────────── DNS 面板 / DoH ─────────────────────────
 def test_dns():
-    area("DNS 面板 API / DoH (:23095 /__admin/api/dns)")
+    area("DNS 面板 API / DoH (:26095 /__admin/api/dns)")
     out, _ = admin_req("GET", "/api/dns/status")
     named_missing = '"named_running":false' in out.replace(" ", "")
     rec("dns status 可读", out.strip().startswith("{"), "JSON", out[:80], sev="P1", owner="dns")
@@ -610,10 +884,9 @@ def test_dns():
     else:
         rec("dns 添加 zone", '"ok"' in out, "ok", out[:80], sev="P2", owner="dns")
     # DoH：明文 listener 上应拒绝（RFC 8484 MUST https）
-    c, h, b, _ = curl(port=APPS, path="/dns-query?dns=AAABAAABAAAAAAAAA3d3dwdleGFtcGxlA2NvbQAAAQAB",
-                      headers=["Accept: application/dns-message"])
-    rec("DoH 明文 listener 被拒（RFC 8484 §5）", c in (400, 403, 404, 421, 426),
-        "4xx（须 https）", c, sev="P1", owner="h1")
+    c, h, b, _ = curl(port=PLAIN, path="/dns-query?dns=AAABAAABAAAAAAAAA3d3dwdleGFtcGxlA2NvbQAAAQAB",
+                      headers=["Accept: application/dns-message", "Host: crucible.local"])
+    rec("DoH 明文 listener 被拒（RFC 8484 §5）", c == 400, "400（须 https）", c, sev="P1", owner="h1")
     # DoH host 白名单 fail-closed：白名单只含 crucible.local，用别的 Host 应拒
     c, h, b, _ = curl(port=DOH, path="/dns-query?dns=AAABAAABAAAAAAAAA3d3dwdleGFtcGxlA2NvbQAAAQAB",
                       scheme="https", headers=["Accept: application/dns-message",
@@ -623,7 +896,7 @@ def test_dns():
 
 def test_listeners():
     area("Listener 绑定 / 双栈 / H3 端点")
-    log = "/home/dev123/scratch-verify/logs/webserver.log"
+    log = "/home/dev123/scratch-verify2/logs/webserver.log"
     try:
         txt = open(log, encoding="utf-8", errors="replace").read()
     except Exception:
@@ -633,28 +906,28 @@ def test_listeners():
         "EADDRINUSE [::] (IPV6_V6ONLY 未设)" if bad_v6 else "ok",
         "config [[listeners]] address_v6=\"::\" + address=\"0.0.0.0\"; 启动日志出现 '有地址未能绑定: bind [::]:PORT: Address already in use'",
         sev="P1", owner="core")
-    # h3 UDP 端点（config 23443 http_versions 含 h3）
+    # h3 UDP 端点（config 26443 http_versions 含 h3）
     try:
         p = subprocess.run(["ss", "-lun"], capture_output=True, timeout=5)
         udp = p.stdout.decode()
     except Exception:
         udp = ""
-    h3_up = ":23443" in udp
-    rec("h3/QUIC UDP 端点已绑定 (23443)", h3_up, "ss -lun 有 :23443",
+    h3_up = ":26443" in udp
+    rec("h3/QUIC UDP 端点已绑定 (26443)", h3_up, "ss -lun 有 :26443",
         "bound" if h3_up else "no UDP socket",
-        "config 23443 http_versions=[h1,h2,h3]; ss -lun | grep 23443",
+        "config 26443 http_versions=[h1,h2,h3]; ss -lun | grep 26443",
         sev="P1", owner="h2h3")
 
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--json", default="/home/dev123/scratch-verify/accept-results.json")
+    ap.add_argument("--json", default="/home/dev123/scratch-verify2/accept-results.json")
     args = ap.parse_args()
 
     # 先确认实例活着
     c, _, _, _ = curl(port=PLAIN, path="/")
     if c is None:
-        print("FATAL: instance not up on 23081; run scripts/accept-verify-start.sh first")
+        print("FATAL: instance not up on 26081; run scripts/accept-verify-start.sh first")
         sys.exit(2)
 
     test_static()
@@ -665,6 +938,13 @@ def main():
     test_adv()
     test_acl()
     test_redirect_hsts()
+    test_static_ext()
+    test_upload_ext()
+    test_request_smuggling()
+    test_h2_authority()
+    test_proxy_ext()
+    test_metrics()
+    test_rule_order()
     test_apps()
     test_admin()
     test_dns()

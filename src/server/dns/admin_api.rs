@@ -32,7 +32,10 @@ async fn handle_inner(
     let method = req.method().clone();
     let query_str = req.uri().query().unwrap_or("").to_string();
     let snap = live.snapshot();
-    let mut dc = effective(&snap);
+    // effective() 返回 Arc（热路径不再深拷贝）；面板处理函数**需要可变拥有**一份副本
+    // （下面大量 `dc.modes.x = …` 原地改），故在此解引用并 clone 一次。面板请求非热路径，
+    // 这一次 clone 可忽略。
+    let mut dc = (*effective(&snap)).clone();
 
     let result: Result<Value, String> = if method == Method::GET {
         match path.as_str() {
@@ -606,8 +609,8 @@ async fn persist_and_reconcile(dc: &DnsConfig) -> Result<(), String> {
 async fn reconcile_current(
     live: &std::sync::Arc<crate::server::live_config::LiveConfig>,
 ) -> Result<(), String> {
-    let dc = effective(&live.snapshot());
-    let d2 = dc;
+    // effective() 现返回 Arc<DnsConfig>；reconcile 只读，直接把它移进 spawn_blocking 即可。
+    let d2 = effective(&live.snapshot());
     tokio::task::spawn_blocking(move || reconcile(&d2))
         .await
         .map_err(|e| e.to_string())?

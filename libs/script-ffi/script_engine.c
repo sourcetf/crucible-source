@@ -323,8 +323,11 @@ static int run_python_inprocess(const char *script, const char *method, const ch
     const char *dir;
     int rc = -1, shim_active = 0;
 
-    /* 跨 .so 共享初始化锁：并发冷启动只有一个线程真正 Py_Initialize。 */
-    if (crucible_pyinit_ensure(Py_IsInitialized, Py_Initialize, PyEval_SaveThread, errbuf,
+    /* 跨 .so 共享初始化锁：并发冷启动只有一个线程真正 Py_Initialize。
+     * PyEval_SaveThread 的返回类型是 PyThreadState*，共享 ABI 用 void*（宽度一致）；
+     * 新 GCC（15）把「函数指针类型不兼容」从告警升级为错误，故显式转换。 */
+    if (crucible_pyinit_ensure(Py_IsInitialized, Py_Initialize,
+                               (void *(*)(void))PyEval_SaveThread, errbuf,
                                sizeof(errbuf)) != 0) {
         fprintf(stderr, "scriptffi: CPython 初始化失败: %s\n", errbuf);
         return -1;

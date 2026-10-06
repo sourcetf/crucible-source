@@ -541,6 +541,19 @@ pub struct ListenerConfig {
     pub port_reuse: bool,
     #[serde(default)]
     pub rate_limit: Option<RateLimitConfig>,
+    /// §16.1：**每 listener 独立**的 IP 访问控制。
+    ///
+    /// 此前 `ListenerConfig` **没有**这个字段，于是 `[listeners.ip_access]`（规格 §16.1
+    /// 明确要求 per-listener）被 serde **静默忽略** —— 配置看着像生效、实际只用全局
+    /// `[ip_access]`（验收 agent 黑盒复现：listener 配 `allow = ["10.0.0.0/8"]`，从
+    /// 127.0.0.1 访问仍回 200）。
+    ///
+    /// 语义：`None` = 只用全局 `[ip_access]`（旧行为，零变化）；`Some` = 该 listener
+    /// 在全局档位之上**再收窄**（两份都要放行才放行，见 `server::listener::ip_allowed`）。
+    /// 收窄而非覆盖，是为了「全局白名单 + 个别 listener 再加一道」符合直觉，也避免某个
+    /// listener 少配一处就把全局策略整体放宽。
+    #[serde(default)]
+    pub ip_access: Option<IpAccessConfig>,
     /// §16.18 L4 不透明转发：配置后整条连接双向透传（不做 HTTP/TLS 解析）。
     #[serde(default)]
     pub l4_forward: Option<String>,
@@ -604,6 +617,7 @@ impl Default for ListenerConfig {
             address_v6: None,
             port_reuse: false,
              rate_limit: None,
+            ip_access: None,
             l4_forward: None,
             quic_ecn: false,
             qmux: false,
@@ -1021,6 +1035,14 @@ pub struct PageRuleConfig {
     pub action: String,
     #[serde(default)]
     pub target: Option<String>,
+    /// §16.11 优先级：数值**越大越先评估**。缺省 `0`。
+    ///
+    /// 同一 listener 内规则按此**稳定**排序（等值保持配置顺序），因此
+    /// **旧配置（无 priority 字段）评估顺序 = 配置书写顺序，行为逐字节不变**。
+    /// 旧实现是「按书写顺序首个命中者胜」，无优先级可言；面板/手写配置里
+    /// 想「把某条规则提到前面」只能整体重排，这条给出显式手段。
+    #[serde(default)]
+    pub priority: i64,
 }
 
 /// 兼容旧版 `[admin] username/password_hash` 扁平字段。
@@ -1371,26 +1393,17 @@ cover 只用于「未使用 / 被拒 ECH」的连接，ECH 关闭时它会成为
         //     会变成一个**永不生效**的封禁项（你以为封住了，实际没封）。
         // 两种都不会有任何报错，只表现为「站点突然全 403 / 白名单形同虚设 / 封禁没生效」。
         // 面板保存路径（admin.rs::check_ip_access_entry）已经拒空串，这里补上配置期这一道。
-        for (name, list) in [
-            ("allow", &self.ip_access.allow),
-            ("deny", &self.ip_access.deny),
-        ] {
-            for (i, p) in list.iter().enumerate() {
-                if p.trim().is_empty() {
-                    anyhow::bail!(
-                        "[ip_access].{name}[{i}] 是空串 —— 空项在任何一种语义下都是错的\
-（曾等于「匹配所有地址」：deny 让全站 403、allow 放行所有人；现在则永不匹配：封禁静默失效），\
-请删掉这一项或显式写 \"*\""
-                    );
-                }
-                // 非法条目（拼错、前缀越界）在运行期**永不匹配**（`access::cidr_or_exact`
-                // 解析失败一律返回 false）⇒ `deny` 会**静默失效**，比不写更糟（你以为封住了）。
-                // 配置期直接拒，并把「要匹配全部请写 *」说清楚。
-                if !ip_access_entry_is_valid(p) {
-                    anyhow::bail!(
-                        "[ip_access].{name}[{i}] 不是合法 IP/CIDR：{p:?} —— 运行期这类条目**永不匹配**（deny 会静默失效）；要匹配全部地址请显式写 \"*\""
-                    );
-                }
+        //
+        // §16.1：per-listener `[listeners.ip_access]` 同样校验（同一套判据，只是 what 不同）
+        // —— 它此前因字段不存在被 serde 静默忽略，加字段后必须一起过校验，否则只是把
+        // 「静默无效」变成「静默无效 + 新增一处可写但运行期永不匹配的表」。
+        check_ip_access_entries("[ip_access]", &self.ip_access)?;
+        for l in &self.listeners {
+            if let Some(ia) = &l.ip_access {
+                check_ip_access_entries(
+                    &format!("listener {}:{} 的 [listeners.ip_access]", l.address, l.port),
+                    ia,
+                )?;
             }
         }
 
@@ -1808,6 +1821,34 @@ fn safe_header_value(s: &str) -> bool {
     // 其余可打印 ASCII 原样保留；非 ASCII 与换行会让 header 构造失败。
     let ok = |b: u8| (0x20..=0x7e).contains(&b) && b != b'"' && b != b'\\';
     !s.is_empty() && s.bytes().all(ok)
+}
+
+/// 校验一份 `ip_access`（全局或 per-listener）的 allow/deny 条目。
+///
+/// `what` 只用于报错定位（`"[ip_access]"` 或 `"listener A:B 的 [listeners.ip_access]"`）。
+/// 判据与运行期 `access::cidr_or_exact` 对齐：空串/非法条目在运行期**永不匹配**，
+/// 放在 `deny` 里等于静默失效、放在 `allow` 里等于把白名单收成空集 —— 都必须在加载期拒。
+fn check_ip_access_entries(what: &str, cfg: &IpAccessConfig) -> Result<()> {
+    for (name, list) in [("allow", &cfg.allow), ("deny", &cfg.deny)] {
+        for (i, p) in list.iter().enumerate() {
+            if p.trim().is_empty() {
+                anyhow::bail!(
+                    "{what}.{name}[{i}] 是空串 —— 空项在任何一种语义下都是错的\
+（曾等于「匹配所有地址」：deny 让全站 403、allow 放行所有人；现在则永不匹配：封禁静默失效），\
+请删掉这一项或显式写 \"*\""
+                );
+            }
+            // 非法条目（拼错、前缀越界）在运行期**永不匹配**（`access::cidr_or_exact`
+            // 解析失败一律返回 false）⇒ `deny` 会**静默失效**，比不写更糟（你以为封住了）。
+            // 配置期直接拒，并把「要匹配全部请写 *」说清楚。
+            if !ip_access_entry_is_valid(p) {
+                anyhow::bail!(
+                    "{what}.{name}[{i}] 不是合法 IP/CIDR：{p:?} —— 运行期这类条目**永不匹配**（deny 会静默失效）；要匹配全部地址请显式写 \"*\""
+                );
+            }
+        }
+    }
+    Ok(())
 }
 
 /// `ip_access` 条目是否可解析。
@@ -2392,6 +2433,48 @@ root = "/tmp/ipacc"
                 .is_ok(),
             "合法条目不该被拦"
         );
+    }
+
+    /// §16.1：per-listener `[listeners.ip_access]` 必须被**解析**（此前字段不存在，
+    /// serde 静默忽略 ⇒ 配置看着生效、实际无效），且非法条目要在配置期拒。
+    #[test]
+    fn per_listener_ip_access_is_parsed_and_validated() {
+        let base = r#"
+[[listeners]]
+address = "127.0.0.1"
+port = 14443
+root = "/tmp/ipacc-l"
+"#;
+        // ① 能解析出字段（旧实现这里恒为 None → 运行期只看全局）。
+        let cfg: Config = toml::from_str(&format!(
+            "{base}[listeners.ip_access]\nallow = [\"10.0.0.0/8\"]\ndeny = []\n"
+        ))
+        .expect("parse");
+        let ia = cfg.listeners[0]
+            .ip_access
+            .as_ref()
+            .expect("per-listener ip_access 必须被解析（否则就是静默忽略）");
+        assert_eq!(ia.allow, vec!["10.0.0.0/8".to_string()]);
+        assert!(cfg.validate().is_ok(), "合法 per-listener ip_access 不该被拦");
+
+        // ② 空串条目必须被配置期拒（否则运行期永不匹配 / 静默放宽）。
+        let bad: Config = toml::from_str(&format!(
+            "{base}[listeners.ip_access]\nallow = [\"\"]\n"
+        ))
+        .expect("parse");
+        let e = bad.validate().expect_err("per-listener 空条目必须报错");
+        let msg = format!("{e}");
+        assert!(
+            msg.contains("listeners.ip_access") && msg.contains("allow[0]"),
+            "错误信息应定位到 listener 的 ip_access: {msg}"
+        );
+
+        // ③ 非法 CIDR 前缀同样拒。
+        let bad2: Config = toml::from_str(&format!(
+            "{base}[listeners.ip_access]\ndeny = [\"10.0.0.0/33\"]\n"
+        ))
+        .expect("parse");
+        assert!(bad2.validate().is_err(), "越界前缀必须报错");
     }
 
     /// sni_only 但没有可比对的名字：必须加载失败（否则所有连接被丢弃）。

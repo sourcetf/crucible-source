@@ -1,20 +1,21 @@
 #!/usr/bin/env python3
 """accept-verify-h3.py — HTTP/3 + DoT 报文黑盒检查（用 aioquic / 自写 TLS，不依赖 dig/named）。
 
-- H3 GET https://127.0.0.1:23443/  （ALPN h3，SNI prod-test.crucible.local）
+- H3 GET https://127.0.0.1:26443/  （ALPN h3，SNI prod-test.crucible.local）
 - H3 目录无尾斜杠 → 期望与 h1 一致（301）
-- DoT  TLS 握手到 127.0.0.1:23853（named 缺失 → 报文层可能超时，只验握手/端口）
-- DoH  POST https://127.0.0.1:23444/dns-query（Host: crucible.local，application/dns-message）
+- DoT  TLS 握手到 127.0.0.1:26853（named 缺失 → 报文层可能超时，只验握手/端口）
+- DoH  POST https://127.0.0.1:26444/dns-query（Host: crucible.local，application/dns-message）
 
 用法: python3 scripts/accept-verify-h3.py [--json out.json]
 """
 import asyncio, sys, json, os, socket, ssl, struct, time
 
 HOST = "127.0.0.1"
-H3_PORT = 23443
-DOH_PORT = 23444
-DOT_PORT = 23853
-TMP = "/home/dev123/scratch-verify/tmp"
+H3_PORT = 26443
+H3_DIR_PORT = 26098
+DOH_PORT = 26444
+DOT_PORT = 26853
+TMP = "/home/dev123/scratch-verify2/tmp"
 os.makedirs(TMP, exist_ok=True)
 
 RESULTS = []
@@ -28,7 +29,8 @@ def rec(area, name, ok, expected="", observed="", repro="", sev="P1", skip=False
 
 
 # ── HTTP/3 ──
-async def h3_get(path, authority="127.0.0.1:23443", alpn="h3"):
+async def h3_get(path, authority=f"127.0.0.1:{H3_PORT}", alpn="h3", port=None):
+    port = port or H3_PORT
     from aioquic.asyncio.client import connect
     from aioquic.asyncio.protocol import QuicConnectionProtocol
     from aioquic.quic.configuration import QuicConfiguration
@@ -77,12 +79,12 @@ async def h3_get(path, authority="127.0.0.1:23443", alpn="h3"):
 
     cfg = QuicConfiguration(is_client=True, alpn_protocols=[alpn], verify_mode=ssl.CERT_NONE)
     cfg.max_datagram_frame_size = 65536
-    async with connect(HOST, H3_PORT, configuration=cfg, create_protocol=Client) as cli:
+    async with connect(HOST, port, configuration=cfg, create_protocol=Client) as cli:
         return await cli.get(authority, path)
 
 
 def test_h3():
-    area = "HTTP/3 (:23443)"
+    area = "HTTP/3 (:26443)"
     try:
         st, hd, body = asyncio.run(h3_get("/"))
         rec(area, "h3 GET / → 200", st == 200, 200, st, sev="P1", owner="h2h3",
@@ -102,6 +104,22 @@ def test_h3():
         rec(area, "h3 不存在路径 → 404", st == 404, 404, st, sev="P2", owner="h2h3")
     except Exception as e:
         rec(area, "h3 不存在路径 → 404", False, 404, f"exc {e!r}", sev="P2", owner="h2h3")
+    # h3 非法 authority 校验（wave2 交接项 2；h1 已 400）
+    for av in ["..", "_"]:
+        try:
+            st, hd, body = asyncio.run(h3_get("/", authority=av))
+            rec(area, f"h3 非法 authority {av!r} → 400", st == 400, 400, st, sev="P1", owner="h2h3",
+                repro=f"aioquic h3 GET / with :authority: {av}")
+        except Exception as e:
+            rec(area, f"h3 非法 authority {av!r} → 400", False, 400, f"exc {e!r}", sev="P1", owner="h2h3")
+    # h3 目录无尾斜杠 → 301（专用 listener 26098，root 含 sub/）
+    try:
+        st, hd, body = asyncio.run(h3_get("/sub", authority=f"{HOST}:{H3_DIR_PORT}",
+                                          alpn="h3", port=H3_DIR_PORT))
+        rec(area, "h3 目录无尾斜杠 → 301", st == 301, 301, st, sev="P2", owner="h2h3",
+            repro=f"aioquic h3 GET https://{HOST}:{H3_DIR_PORT}/sub")
+    except Exception as e:
+        rec(area, "h3 目录无尾斜杠 → 301", False, 301, f"exc {e!r}", sev="P2", owner="h2h3")
 
 
 # ── DoT ──
@@ -114,7 +132,7 @@ def dns_query(name="example.com"):
 
 
 def test_dot():
-    area = "DoT (:23853)"
+    area = "DoT (:26853)"
     try:
         raw = socket.create_connection((HOST, DOT_PORT), timeout=5)
         ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
@@ -144,7 +162,7 @@ def test_dot():
 
 # ── DoH ──
 def test_doh():
-    area = "DoH (:23444)"
+    area = "DoH (:26444)"
     import base64, urllib.request
     q = dns_query("example.com")
     ctx = ssl._create_unverified_context()
@@ -178,7 +196,7 @@ def test_doh():
 
 
 def main():
-    out = "/home/dev123/scratch-verify/accept-h3-results.json"
+    out = "/home/dev123/scratch-verify2/accept-h3-results.json"
     if "--json" in sys.argv:
         out = sys.argv[sys.argv.index("--json") + 1]
     test_h3()

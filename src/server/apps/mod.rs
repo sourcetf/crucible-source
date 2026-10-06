@@ -229,7 +229,7 @@ async fn dispatch_simple(
         "cgi" | "wsgi" | "asgi" | "psgi" | "rack" | "uwsgi" => {
             simple_ffi(req, lc, app, peer, deps_env, &engine).await
         }
-        "cgi_script" => match cgi_script_simple(req, lc, app, peer).await {
+        "cgi_script" => match cgi_script_simple(req, lc, app, peer, deps_env).await {
             Ok(resp) => resp,
             Err(e) => simple_engine_error("cgi_script", &e),
         },
@@ -283,6 +283,7 @@ async fn cgi_script_simple(
     lc: &ListenerConfig,
     app: &AppRouteConfig,
     peer: SocketAddr,
+    deps_env: &deps::DepsEnv,
 ) -> anyhow::Result<Response<Bytes>> {
     let docroot = app.docroot.clone().unwrap_or_else(|| lc.root.clone());
     let rel = app_ffi::rel_script_path(app, req.uri().path());
@@ -295,7 +296,9 @@ async fn cgi_script_simple(
         &script,
         req.method(),
         req.uri(),
+        req.headers(),
         req.body().clone(),
+        &deps_env.vars,
         lc,
         app,
         peer,
@@ -678,6 +681,7 @@ mod script_rel_tests {
             status_path: None,
             port_reuse: false,
             rate_limit: None,
+            ip_access: None,
             l4_forward: None,
             quic_ecn: false,
             qmux: false,

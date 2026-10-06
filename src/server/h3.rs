@@ -107,6 +107,25 @@ pub fn h3_inflight_gate() -> Arc<tokio::sync::Semaphore> {
     H3_INFLIGHT.clone()
 }
 
+/// 全局「同时存活的 CONNECT-UDP 隧道」上限。
+///
+/// 与 [`H3_MAX_INFLIGHT`] **分开**的原因：隧道不缓冲请求体（单条隧道缓冲上界是
+/// `connect_udp::MAX_HTTP_DATAGRAM` ≈ 64 KiB，不占 8 MiB 的 body 配额），但会存活到
+/// idle 超时（默认 120s）。此前隧道**整个生命周期**都占用 `H3_MAX_INFLIGHT` 的一个
+/// 名额（`handle_resolver` 在 CONNECT 分流**之前**就取了该名额），于是只要 listener
+/// 开了 `connect_udp`，一个客户端开满 256 条长隧道就能把**进程级**在飞闸门耗光 ⇒
+/// 同一进程上**所有正常 h3 请求**（含别的 listener）回 503。
+/// 独立闸门既保留「隧道有进程级上界」，又不再让隧道饿死普通请求。
+pub const H3_MAX_TUNNELS: usize = 256;
+
+static H3_TUNNEL_GATE: once_cell::sync::Lazy<Arc<tokio::sync::Semaphore>> =
+    once_cell::sync::Lazy::new(|| Arc::new(tokio::sync::Semaphore::new(H3_MAX_TUNNELS)));
+
+/// 隧道闸门的引用（测试用）。
+pub fn h3_tunnel_gate() -> Arc<tokio::sync::Semaphore> {
+    H3_TUNNEL_GATE.clone()
+}
+
 #[cfg(feature = "tls")]
 mod imp {
     use super::*;
@@ -166,17 +185,34 @@ mod imp {
         .context("h3 quinn endpoint")?;
         log::info!("h3 quinn endpoint ready on {bind} (boring crypto preferred)");
 
-        // **配置/材料变化 → 关闭端点、让本函数返回**，调用方（mod.rs 的任务）会用
-        // 最新的 listener 配置重新拉起 QUIC 端点 ⇒ 新证书/新 per-listener 设置随之生效。
+        // **优雅停机广播**：配置/材料变化或 listener 被移除时，先让每条活跃 h3 连接
+        // 发一个 H3 GOAWAY（RFC 9114 §5.2），宽限 [`H3_SHUTDOWN_GRACE`] 让在飞请求收尾，
+        // **之后**才 `ep.close()` 关掉整个 QUIC 端点、由上层用新配置重启。
         //
-        // 为什么用「关端点」而不是在 accept 循环里 select：`serve()` 的循环是
-        // `while let Some(incoming) = endpoint.accept().await`（不是 `loop/match`），
-        // 直接改它的控制流要动整段长循环体；而 `Endpoint::close()` 会让 accept 返回
-        // None、循环自然收尾，改动面小得多。代价是**在飞的连接会被关闭**（配置/证书
-        // 变更时这是可接受的：H3 没有 per-connection 的热更新路径）。
+        // 为什么要这样（而不是像旧版直接 `ep.close()`）：`Endpoint::close()` 会对所有连接
+        // 立即发 QUIC CONNECTION_CLOSE，热重载会**打断在飞的 h3 请求**（h2 走 graceful_shutdown，
+        // h1 无此问题 ⇒ 三协议不一致）。GOAWAY 让客户端知道「最后一条被接受的请求 id」，
+        // 从而优雅迁移/重试。
+        //
+        // 为什么用 broadcast + 连接级 select!（而不是「每端点连接注册表 + async Mutex」）：
+        // `h3::server::Connection::shutdown()` 需要 `&mut self`，而 `accept()` 会长期持有该
+        // `&mut`（见其 `poll_accept_request_stream_internal`）。把 Connection 存进注册表再用
+        // 锁共享会与 accept 争锁、易死锁。改为：每个 `handle_incoming` 自己拥有 Connection，
+        // 在自己的 accept 循环里 `select!` 一条广播接收器 —— 命中就发 GOAWAY 并继续服务
+        // 在飞请求（新请求由 crate 自动回 H3_REQUEST_REJECTED）。**只在连接级 accept 循环
+        // 增加一个 select 分支，不引入任何每请求锁**，连接热路径（handle_resolver）零改动。
+        //
+        // `accept()` 的取消安全性：其内部 `poll_accept_request_stream_internal` 是纯
+        // `poll_fn`，状态全在 Connection 自身（`&mut self`），被 select! 丢弃的 future 不持有
+        // 任何外部资源；`poll_accept_bidi` 走 `Stream::poll_next_unpin`（Pending 无副作用）
+        // ⇒ 中途取消不丢请求流、不卡连接。
+        // 注意：初始 Receiver 必须**立即丢弃**（`_` 模式），否则 `send()` 永远至少有一个
+        // 接收者、`h3_graceful_endpoint_close` 的「无连接则不宽限」判定会失效。
+        let (shutdown_tx, _) = tokio::sync::broadcast::channel::<()>(16);
         {
             let mut rx = cfg_rx.clone();
             let ep = endpoint.clone();
+            let tx_w = shutdown_tx.clone();
             // 周期性自检也要做：**不能只依赖 watch**。reconciler 只为「仍然允许 h3」的
             // listener 更新指纹（见 `mod.rs` 里那段循环），所以当 h3 被从 `http_versions`
             // 里删掉、或整个 listener 被删掉时，watch **永远不会触发** ⇒ 端点一直服务下去
@@ -195,9 +231,9 @@ mod imp {
                             }
                             if *rx.borrow() != cfg_fp {
                                 log::info!(
-                                    "h3 endpoint config/materials changed; closing QUIC endpoint to restart with new config"
+                                    "h3 endpoint config/materials changed; GOAWAY to active h3 connections, then closing QUIC endpoint to restart with new config"
                                 );
-                                ep.close(quinn::VarInt::from_u32(0), b"config changed");
+                                h3_graceful_endpoint_close(&tx_w, &ep, b"config changed").await;
                                 return;
                             }
                         }
@@ -209,9 +245,9 @@ mod imp {
                                 .any(|l| crate::server::bind_key(l) == key_w && l.allows_h3());
                             if !keep {
                                 log::info!(
-                                    "h3 endpoint 不再需要（listener 已移除或 http_versions 不再含 h3）；关闭 QUIC 端点"
+                                    "h3 endpoint 不再需要（listener 已移除或 http_versions 不再含 h3）；GOAWAY 后关闭 QUIC 端点"
                                 );
-                                ep.close(quinn::VarInt::from_u32(0), b"h3 disabled");
+                                h3_graceful_endpoint_close(&tx_w, &ep, b"h3 disabled").await;
                                 return;
                             }
                         }
@@ -223,8 +259,11 @@ mod imp {
         while let Some(incoming) = endpoint.accept().await {
             let live_c = Arc::clone(&live);
             let lc_c = lc.clone();
+            // 每条连接一份广播接收器：配置/证书变更时 `serve` 的 watcher 会广播，
+            // 连接自己的 accept 循环据此发 GOAWAY（见 `handle_incoming`）。
+            let shutdown_rx = shutdown_tx.subscribe();
             tokio::spawn(async move {
-                if let Err(e) = handle_incoming(incoming, live_c, lc_c).await {
+                if let Err(e) = handle_incoming(incoming, live_c, lc_c, shutdown_rx).await {
                     // 按**类别+时间**节流：这条是每条出错的 QUIC 连接一条，而 `{e:#}`
                     // 是完整错误链（可能很长）。与 tls/accept.rs 的握手失败同一处理
                     // （那里也是匿名对端可驱动）。
@@ -237,6 +276,29 @@ mod imp {
             });
         }
         Ok(())
+    }
+
+    /// 配置/证书变更或 listener 被移除时的**优雅**端点关闭：
+    /// 1. 广播 shutdown（每条活跃连接的 accept 循环据此发 H3 GOAWAY）；
+    /// 2. 有活跃连接时宽限 [`H3_SHUTDOWN_GRACE`]，让在飞请求把响应写完；
+    /// 3. 最后 `ep.close()` 兜底（仍在宽限期内没结束的连接会被 CONNECTION_CLOSE 收掉）。
+    ///
+    /// 没有活跃连接时**不宽限**（配置/证书热重载在空闲时不额外等待）。
+    async fn h3_graceful_endpoint_close(
+        tx: &tokio::sync::broadcast::Sender<()>,
+        ep: &quinn::Endpoint,
+        reason: &[u8],
+    ) {
+        // `broadcast::Sender::send` 返回 Err（无接收者）或 Ok(收到广播的接收者数)。
+        let receivers = tx.send(()).unwrap_or(0);
+        if receivers > 0 {
+            log::info!(
+                "h3 graceful close: broadcast GOAWAY to {receivers} active connection(s), grace {}s",
+                H3_SHUTDOWN_GRACE.as_secs()
+            );
+            tokio::time::sleep(H3_SHUTDOWN_GRACE).await;
+        }
+        ep.close(quinn::VarInt::from_u32(0), reason);
     }
 
     /// QUIC 传输层显式限额（**不依赖 quinn 的库默认值**）。
@@ -264,6 +326,12 @@ mod imp {
     pub const QUIC_SEND_WINDOW: u64 = 8 * 1024 * 1024;
     /// WebTransport/QMux 方向的 datagram 接收缓冲（显式给值，否则由 quinn 默认决定）。
     pub const QUIC_DATAGRAM_RECV: usize = 1024 * 1024;
+
+    /// 配置/证书变更（或 listener 被移除）时，先对每条活跃 h3 连接发 GOAWAY，再等这么久
+    /// 让在飞请求收尾，最后才 `ep.close()`。取 5s：足够本地/同城 RTT 下把已接受的请求
+    /// 响应写完，又不会让热重载明显变慢。空闲（无连接）时**不等待**（见
+    /// [`h3_graceful_endpoint_close`]）。
+    pub const H3_SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
 
     /// 见上方常量的说明。
     /// **不设 keep-alive**：空闲连接按 [`QUIC_MAX_IDLE_SECS`] 回收（要长连的客户端
@@ -344,6 +412,7 @@ mod imp {
         incoming: quinn::Incoming,
         live: Arc<LiveConfig>,
         lc: ListenerConfig,
+        mut shutdown_rx: tokio::sync::broadcast::Receiver<()>,
     ) -> Result<()> {
         let connection = match incoming.await {
             Ok(c) => c,
@@ -396,8 +465,49 @@ mod imp {
 
         // Stream resets / CANCEL must not tear down the process or the accept loop
         // for the whole endpoint — only this QUIC connection's request loop.
+        //
+        // `select!` 额外监听 shutdown 广播：配置/证书变更或 listener 被移除时，先给本连接
+        // 发 H3 GOAWAY（RFC 9114 §5.2），再继续服务在飞请求。见 `serve` 里的长注释。
+        let mut goaway_sent = false;
         loop {
-            match server.accept().await {
+            let accepted = tokio::select! {
+                biased;
+                r = shutdown_rx.recv() => {
+                    // Ok(()) 或 Lagged 都表示「上层要求优雅停机」；Closed 表示监督任务已退出。
+                    let shutdown = matches!(
+                        r,
+                        Ok(())
+                            | Err(tokio::sync::broadcast::error::RecvError::Lagged(_))
+                    );
+                    if !shutdown {
+                        break; // 广播发送端已消失：端点正在收尾，本连接交给 ep 关闭
+                    }
+                    if !goaway_sent {
+                        goaway_sent = true;
+                        log::info!(
+                            "h3 peer={peer}: listener config/materials changed, sending H3 GOAWAY (graceful) before endpoint close"
+                        );
+                        // max_requests=0 ⇒ GOAWAY 携带「最后一条被接受的请求 id」，
+                        // 在飞请求（id ≤ 该值）照常完成；之后的请求由 crate 回 H3_REQUEST_REJECTED。
+                        if let Err(e) = server.shutdown(0).await {
+                            log::debug!("h3 GOAWAY send failed peer={peer}: {e:#}");
+                            break;
+                        }
+                    }
+                    // **不能**发完 GOAWAY 就 break：break 会 drop `server`，
+                    // `h3::server::Connection::drop` 立即关掉整条 QUIC 连接（H3_NO_ERROR），
+                    // 于是 (a) 在飞请求的响应被截断、(b) 刚发出的 GOAWAY 与 CONNECTION_CLOSE
+                    // 竞争、客户端常常只看到连接被关而**收不到 GOAWAY**（真机实测：
+                    // 客户端报 ConnectionTerminated 而无 GOAWAY 帧）。
+                    // 正确做法是继续留在 accept 循环里：GOAWAY 已发出、在飞请求继续由各自的
+                    // resolver 任务写响应、新请求被 crate 拒绝；连接由**客户端**主动关闭
+                    // （收到 GOAWAY 后按 RFC 9114 §5.2 收尾）或端点级 `ep.close()`
+                    // （[`H3_SHUTDOWN_GRACE`] 到点后的兜底）结束。
+                    continue;
+                }
+                res = server.accept() => res,
+            };
+            match accepted {
                 Ok(Some(resolver)) => {
                     let live_c = Arc::clone(&live);
                     let lc_c = lc.clone();
@@ -481,41 +591,51 @@ mod imp {
         };
         crate::server::telemetry::record_request();
 
-        // **全局在飞闸门：先取名额，再收 body / 建隧道。**
+        // **全局在飞闸门（仅普通请求）：先取名额，再收 body。**
         //
-        // 位置很关键：必须在 CONNECT 分流**之前**、收 body **之前**（见 `H3_MAX_INFLIGHT`
+        // CONNECT-UDP 走**独立的隧道闸门**（见 [`H3_MAX_TUNNELS`]）：隧道不缓冲 body、
+        // 却存活到 idle 超时，若也占用这个「body 在飞」名额，开满隧道就会把普通请求
+        // 全部饿成 503。因此这里对 CONNECT **不取** `H3_INFLIGHT`，改在下面的 CONNECT
+        // 分支里取 `H3_TUNNEL_GATE`（同等待时长、同 503 语义）。
+        //
+        // 位置很关键：普通请求必须在收 body **之前**取到名额（见 `H3_MAX_INFLIGHT`
         // 的说明 —— 否则「未认证客户端并发慢速请求」仍能把内存吃光）。守卫是 RAII，
-        // 早退（包括下面的 CONNECT 拒绝、503、413）都会自动归还，不会漏账。
-        let _inflight = match tokio::time::timeout(H3_INFLIGHT_WAIT, h3_inflight_gate().acquire_owned())
-            .await
-        {
-            Ok(Ok(p)) => Some(p),
-            // 信号量关闭（进程退出中）：不加限制，交给上层收尾，别在这里制造新错误。
-            Ok(Err(_)) => None,
-            Err(_) => {
-                let t0 = std::time::Instant::now();
-                let resp = Response::builder()
-                    .status(StatusCode::SERVICE_UNAVAILABLE)
-                    .header(http::header::RETRY_AFTER, "1")
-                    .body(())
-                    .unwrap();
-                let _ = stream.send_response(resp).await;
-                let _ = stream
-                    .send_data(Bytes::from_static(b"server busy (h3 in-flight limit)\n"))
-                    .await;
-                let _ = stream.finish().await;
-                crate::server::access_log::log_response(
-                    &live,
-                    peer,
-                    "h3",
-                    req.method().as_str(),
-                    req.uri().path(),
-                    StatusCode::SERVICE_UNAVAILABLE.as_u16(),
-                    None,
-                    t0.elapsed(),
-                    "busy",
-                );
-                return Ok(());
+        // 早退（包括下面的 503、413）都会自动归还，不会漏账。
+        let is_connect = req.method() == http::Method::CONNECT;
+        let _inflight = if is_connect {
+            None
+        } else {
+            match tokio::time::timeout(H3_INFLIGHT_WAIT, h3_inflight_gate().acquire_owned())
+                .await
+            {
+                Ok(Ok(p)) => Some(p),
+                // 信号量关闭（进程退出中）：不加限制，交给上层收尾，别在这里制造新错误。
+                Ok(Err(_)) => None,
+                Err(_) => {
+                    let t0 = std::time::Instant::now();
+                    let resp = Response::builder()
+                        .status(StatusCode::SERVICE_UNAVAILABLE)
+                        .header(http::header::RETRY_AFTER, "1")
+                        .body(())
+                        .unwrap();
+                    let _ = stream.send_response(resp).await;
+                    let _ = stream
+                        .send_data(Bytes::from_static(b"server busy (h3 in-flight limit)\n"))
+                        .await;
+                    let _ = stream.finish().await;
+                    crate::server::access_log::log_response(
+                        &live,
+                        peer,
+                        "h3",
+                        req.method().as_str(),
+                        req.uri().path(),
+                        StatusCode::SERVICE_UNAVAILABLE.as_u16(),
+                        None,
+                        t0.elapsed(),
+                        "busy",
+                    );
+                    return Ok(());
+                }
             }
         };
 
@@ -570,7 +690,7 @@ mod imp {
             let path = req.uri().path().to_string();
             let t0 = std::time::Instant::now();
             let snap = live.snapshot();
-            if !crate::server::access::is_allowed(&snap.ip_access, peer) {
+            if !crate::server::listener::ip_allowed(&snap.ip_access, &lc, peer) {
                 connect_reject(
                     &mut stream,
                     &live,
@@ -671,6 +791,44 @@ mod imp {
                     return Ok(());
                 }
             };
+            // **独立隧道闸门**（见 [`H3_MAX_TUNNELS`]）：CONNECT 不占 `H3_INFLIGHT`
+            // （body 在飞）名额，但要在这里取自己的进程级上界。取不到 → 503，语义与
+            // body 闸门完全一致（同等待时长、同 Retry-After、同访问日志 tag）。
+            let _tunnel = match tokio::time::timeout(
+                H3_INFLIGHT_WAIT,
+                h3_tunnel_gate().acquire_owned(),
+            )
+            .await
+            {
+                Ok(Ok(p)) => Some(p),
+                // 信号量关闭（进程退出中）：不额外设限，交给上层收尾。
+                Ok(Err(_)) => None,
+                Err(_) => {
+                    let t0 = std::time::Instant::now();
+                    let resp = Response::builder()
+                        .status(StatusCode::SERVICE_UNAVAILABLE)
+                        .header(http::header::RETRY_AFTER, "1")
+                        .body(())
+                        .unwrap();
+                    let _ = stream.send_response(resp).await;
+                    let _ = stream
+                        .send_data(Bytes::from_static(b"server busy (h3 tunnel limit)\n"))
+                        .await;
+                    let _ = stream.finish().await;
+                    crate::server::access_log::log_response(
+                        &live,
+                        peer,
+                        "h3",
+                        req.method().as_str(),
+                        req.uri().path(),
+                        StatusCode::SERVICE_UNAVAILABLE.as_u16(),
+                        None,
+                        t0.elapsed(),
+                        "busy",
+                    );
+                    return Ok(());
+                }
+            };
             let r = proxy_connect_udp(&req, stream, &live, peer).await;
             drop(permit);
             return r;
@@ -712,7 +870,7 @@ mod imp {
                 // 提前到收 body 之前做不影响限流计数，因此这里先补判一次；限流是有状态的
                 // （消耗令牌），仍留在 handle_h3 里只算一次。
                 let reject: Option<(StatusCode, Option<u64>, &'static str)> =
-                    if !crate::server::access::is_allowed(&snap.ip_access, peer) {
+                    if !crate::server::listener::ip_allowed(&snap.ip_access, &lc, peer) {
                         let (st, msg) = crate::server::access::deny_response();
                         Some((st, None, msg))
                     } else if !snap.admin.listener_allowed(lc.port) {
@@ -1179,7 +1337,7 @@ use chunked uploads (Content-Range) or HTTP/1.1 for larger bodies",
         let path = req.uri().path().to_string();
 
         let snap = live.snapshot();
-        if !crate::server::access::is_allowed(&snap.ip_access, peer) {
+        if !crate::server::listener::ip_allowed(&snap.ip_access, &lc, peer) {
             return tag(
                 Response::builder()
                     .status(StatusCode::FORBIDDEN)
@@ -1906,6 +2064,45 @@ mod inflight_tests {
         assert_eq!(H3_MAX_INFLIGHT, crate::server::h2::H2_MAX_INFLIGHT);
     }
 
+    /// P2 回归：CONNECT-UDP 隧道必须用**独立**闸门，不能占用 body 在飞名额
+    /// （否则开满长隧道会把普通 h3 请求全部饿成 503）。判据：两个闸门是不同实例，
+    /// 且隧道闸门的取用/归还只影响它自己。
+    #[test]
+    fn h3_tunnel_gate_is_separate_from_inflight() {
+        assert_eq!(H3_MAX_TUNNELS, 256);
+        assert!(
+            !Arc::ptr_eq(&h3_inflight_gate(), &h3_tunnel_gate()),
+            "隧道闸门不得与 body 在飞闸门是同一个信号量"
+        );
+        let before = h3_tunnel_gate().available_permits();
+        let p = h3_tunnel_gate().try_acquire_owned().expect("acquire tunnel");
+        assert_eq!(h3_tunnel_gate().available_permits(), before - 1);
+        drop(p);
+        assert_eq!(h3_tunnel_gate().available_permits(), before);
+    }
+
+    /// P2 回归（源码判据）：`handle_resolver` 里 `is_connect` 判定必须在取 body 在飞
+    /// 名额**之前**（这样 CONNECT 不占该名额），且隧道闸门必须在 `proxy_connect_udp(`
+    /// 调用之前取到（否则隧道没有自己的上界）。
+    #[test]
+    fn h3_connect_udp_uses_separate_tunnel_gate() {
+        let src = include_str!("h3.rs");
+        let pos = src.find("async fn handle_resolver").expect("handle_resolver");
+        let tail = &src[pos..];
+        let is_connect = tail.find("let is_connect").expect("is_connect gate");
+        let inflight = tail.find("h3_inflight_gate()").expect("inflight gate");
+        assert!(
+            is_connect < inflight,
+            "is_connect 判定必须在取 body 在飞名额之前（is_connect={is_connect} inflight={inflight}）"
+        );
+        let tunnel = tail.find("h3_tunnel_gate()").expect("tunnel gate");
+        let tunnel_call = tail.find("proxy_connect_udp(").expect("proxy_connect_udp");
+        assert!(
+            tunnel < tunnel_call,
+            "隧道闸门必须在 proxy_connect_udp 之前取到（tunnel={tunnel} call={tunnel_call}）"
+        );
+    }
+
     /// P2 回归：admin 路径必须跳过 listener 级 basic_auth（否则同端口「站点口令 + 面板」
     /// 时面板不可达）。判据：handle_h3 里 `check_listener_headers` 被 `if !admin_path` 包住。
     #[test]
@@ -1930,7 +2127,7 @@ mod inflight_tests {
         let check = tail
             .find("request_authority_ok")
             .expect("authority check in handle_h3");
-        let acl = tail.find("is_allowed").expect("ip_access");
+        let acl = tail.find("listener::ip_allowed").expect("ip_access");
         assert!(check < acl, "权威名校验必须在 ACL/路由之前");
     }
 }

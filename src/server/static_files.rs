@@ -74,6 +74,32 @@ const CANON_CAP: usize = 4096;
 
 
 
+/// `file_open` 表的廉价查询：**表为空时直接返回 `Auto`**。
+///
+/// `ListenerConfig::file_open_mode` 走 `FileOpenTable::mode_for_path`，后者**先**做
+/// `normalize_path_key`（percent-decode + `Vec` + `format!`），再查表。纯静态站点
+/// （含公平基准用的 listener）几乎都配空表，此时每请求白付一次堆分配 + 解码。
+/// 语义等价：空表的 `mode_for_path` 必然落到 `self.0.get("*")...unwrap_or(Auto)` = Auto。
+#[inline]
+fn file_open_mode(lc: &ListenerConfig, path: &str) -> FileOpenMode {
+    if lc.file_open.is_empty() {
+        FileOpenMode::Auto
+    } else {
+        lc.file_open_mode(path)
+    }
+}
+
+/// listener 是否配置了应用引擎路由。
+///
+/// `engine_owns` / `app_private_path` 在 `lc.apps` 为空时**必然**返回 false，但两者都会
+/// 先做一次 `normalize_url_path`（percent-decode + `Vec` + `format!`）与若干次前缀扫描。
+/// 纯静态 listener（例如 `www-static-fair`）因此每请求白付两次分配 —— 这里让调用方
+/// 在 apps 为空时整段跳过。
+#[inline]
+fn apps_configured(lc: &ListenerConfig) -> bool {
+    !lc.apps.is_empty()
+}
+
 fn read_file_capped(path: &Path) -> Result<Vec<u8>> {
     let meta = fs::metadata(path)?;
     if meta.len() > MAX_FULL_READ {
@@ -153,8 +179,10 @@ pub async fn serve(req: &Request<Incoming>, lc: &ListenerConfig) -> Result<Respo
         // 而不是目录列表或 404。索引文件走与普通文件**完全相同**的闸门
         // （file_open/engine_owns/app_private_path），不放宽任何安全判定。
         if let Some((idx, idx_meta)) = directory_index(&fs_path, &lc.root) {
-            let mode = lc.file_open_mode(path);
-            if !engine_owns(lc, path, mode) && !app_private_path(lc, path, mode) {
+            let mode = file_open_mode(lc, path);
+            let owned = apps_configured(lc)
+                && (engine_owns(lc, path, mode) || app_private_path(lc, path, mode));
+            if !owned {
                 return serve_file(req, &idx, &idx_meta, mode).await;
             }
         }
@@ -169,15 +197,18 @@ pub async fn serve(req: &Request<Incoming>, lc: &ListenerConfig) -> Result<Respo
     if !meta.is_file() {
         bail!("not a regular file");
     }
-    let mode = lc.file_open_mode(path);
-    // §16.2：static 层不得替引擎把「应执行的脚本」当普通文件吐出去（见 engine_owns）。
-    if engine_owns(lc, path, mode) {
-        bail!("path is owned by an app engine");
-    }
-    // 应用 docroot 里的运维/私密文件（部署脚本、配置、密钥、库文件）也不静态服务，
-    // 见 app_private_path 的说明。
-    if app_private_path(lc, path, mode) {
-        bail!("app docroot private file is not served");
+    let mode = file_open_mode(lc, path);
+    // 引擎/私有文件判定：apps 为空时整段跳过（见 apps_configured 的说明）。
+    if apps_configured(lc) {
+        // §16.2：static 层不得替引擎把「应执行的脚本」当普通文件吐出去（见 engine_owns）。
+        if engine_owns(lc, path, mode) {
+            bail!("path is owned by an app engine");
+        }
+        // 应用 docroot 里的运维/私密文件（部署脚本、配置、密钥、库文件）也不静态服务，
+        // 见 app_private_path 的说明。
+        if app_private_path(lc, path, mode) {
+            bail!("app docroot private file is not served");
+        }
     }
     serve_file(req, &fs_path, &meta, mode).await
 }
@@ -614,7 +645,7 @@ pub async fn serve_simple<T>(req: &Request<T>, lc: &ListenerConfig) -> Result<Re
     // 此前 serve_simple 完全无视 file_open：管理员把 /uploads/x.html 配成
     // preview/download（强制 text/plain + inline/attachment + nosniff，防上传文件被
     // 当页面执行）时，h2/h3 上这条缓解被静默忽略——而浏览器默认就走 h2/h3。
-    let mode = lc.file_open_mode(path);
+    let mode = file_open_mode(lc, path);
     let mut ct = mime_guess::from_path(&fs_path)
         .first_or_octet_stream()
         .to_string();
@@ -627,11 +658,14 @@ pub async fn serve_simple<T>(req: &Request<T>, lc: &ListenerConfig) -> Result<Re
         _ => None,
     };
     // §16.2：static 层不得替引擎把「应执行的脚本」当普通文件吐出去（见 engine_owns）。
-    if engine_owns(lc, path, mode) {
-        bail!("path is owned by an app engine");
-    }
-    if app_private_path(lc, path, mode) {
-        bail!("app docroot private file is not served");
+    // apps 为空时整段跳过（见 apps_configured 的说明）。
+    if apps_configured(lc) {
+        if engine_owns(lc, path, mode) {
+            bail!("path is owned by an app engine");
+        }
+        if app_private_path(lc, path, mode) {
+            bail!("app docroot private file is not served");
+        }
     }
 
     let len = meta.len();
@@ -1676,8 +1710,25 @@ fn directory_index(dir: &Path, root: &Path) -> Option<(PathBuf, fs::Metadata)> {
     let canon_root = canon_root_cached(root);
     for name in INDEX_FILES {
         let p = dir.join(name);
-        let Ok(canon) = p.canonicalize() else {
+        // 热路径快车道：`dir` 由 [`resolve_path`] canonicalize 过（其自身路径分量里没有
+        // 符号链接），因此**只有最后一段 `name`** 可能是符号链接。一次 `lstat` 就能分流：
+        //   * 不是符号链接的普通文件 ⇒ `canonicalize(p)` 必然等于 `p`（前提 p 仍在
+        //     canon_root 内，即 `p.starts_with(canon_root)`，这里显式再判一次），
+        //     于是直接返回 `p` 与这次 lstat 的结果 —— 省掉 `realpath` 的逐段
+        //     `lstat`/`readlink`（`/` 这个基准路径每请求的最大一条 syscall 链）。
+        //   * 符号链接（或落在 root 外的路径）⇒ 仍走下面的 `canonicalize` 做 containment，
+        //     安全语义与旧实现**逐字相同**（root 外链接依旧被拒）。
+        let Ok(lmeta) = fs::symlink_metadata(&p) else {
             continue; // 不存在 / 断链
+        };
+        if !lmeta.file_type().is_symlink() {
+            if lmeta.is_file() && p.starts_with(&canon_root) {
+                return Some((p, lmeta));
+            }
+            continue;
+        }
+        let Ok(canon) = p.canonicalize() else {
+            continue; // 断链
         };
         if !canon.starts_with(&canon_root) {
             log::debug!(

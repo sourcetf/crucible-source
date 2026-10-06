@@ -34,6 +34,51 @@ fn listener_matches_local(l: &ListenerConfig, local: SocketAddr) -> bool {
     }
 }
 
+/// §16.1：per-listener `[listeners.ip_access]` 与全局 `[ip_access]` 的**合并判定**。
+///
+/// 语义：**两份都必须放行**才放行 —— listener 档位是在全局档位之上**再收窄**，不是覆盖。
+/// 这样「全局白名单 + 个别 listener 再加一道」符合直觉，也不会因为某个 listener 少配一处
+/// 就把全局策略意外放宽。`lc.ip_access` 为 `None` 时等价于只用全局档位（与旧版行为一致）。
+///
+/// **调用点说明**：h1/h2/h3 的请求路径目前调的是 `access::is_allowed(&snap.ip_access, peer)`；
+/// 要完整支持 per-listener（含 TLS 口），把那一行换成
+/// `crate::server::listener::ip_allowed(&snap.ip_access, &lc, peer)` 即可（`lc` 在三个
+/// 调用点都已持有）。本函数放在 listener.rs（core scope）供其调用。明文 listener 的连接层
+/// 拦截见 `handle_connection`。
+pub fn ip_allowed(
+    global: &crate::config::IpAccessConfig,
+    lc: &ListenerConfig,
+    peer: SocketAddr,
+) -> bool {
+    if !crate::server::access::is_allowed(global, peer) {
+        return false;
+    }
+    match &lc.ip_access {
+        Some(local) => crate::server::access::is_allowed(local, peer),
+        None => true,
+    }
+}
+
+/// 明文 listener 上对「被 ip_access 拒绝」的连接写一个最小 HTTP/1.1 403 后关闭。
+///
+/// 为什么在连接层直接回（而不是交给 h1/h2/h3）：明文口在协议分发**之前**就能确定对端 IP，
+/// 这里拒绝可让 h1/h2c/port_reuse 共用同一道门，且无需改 h1/h2/h3。响应固定为 HTTP/1.1
+/// 文本 403（拒绝场景下不保证协议协商，符合「拒绝」语义）。带超时，避免对端不收包时挂住。
+async fn deny_plain_http(mut stream: TcpStream) {
+    use tokio::io::AsyncWriteExt;
+    let body = b"forbidden by ip_access\n";
+    let head = format!(
+        "HTTP/1.1 403 Forbidden\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len()
+    );
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        stream.write_all(head.as_bytes()).await?;
+        stream.write_all(body).await?;
+        stream.shutdown().await
+    })
+    .await;
+}
+
 pub async fn handle_connection(
     stream: TcpStream,
     live: Arc<LiveConfig>,
@@ -57,7 +102,7 @@ pub async fn handle_connection(
     // 若把它放在 ACL 之前，一条 l4_forward 配置就等于给被 deny 的来源开了一个
     // 直通内网目标的隧道（报告 P2「l4_forward 完全绕过 ip_access」实测正是如此）。
     if let Some(dest) = &lc.l4_forward {
-        if !crate::server::access::is_allowed(&cfg.ip_access, peer) {
+        if !ip_allowed(&cfg.ip_access, &lc, peer) {
             log::debug!("l4: connection from {peer} denied by [ip_access]");
             return Ok(());
         }
@@ -76,6 +121,22 @@ pub async fn handle_connection(
     #[cfg(not(feature = "tls"))]
     if lc.ssl.is_some() {
         anyhow::bail!("TLS listener but crucible built without `tls` feature");
+    }
+
+    // §16.1 per-listener `[listeners.ip_access]`：**明文** listener 在连接层直接拒绝。
+    //
+    // 只在该 listener **确实配了** `ip_access` 时走这条（`lc.ip_access.is_some()`），
+    // 因此「只有全局 [ip_access]」的既有行为完全不变（仍由 h1/h2/h3 的请求路径回 403）。
+    // TLS listener 不在此拦截（握手后才能判定协议），其 per-listener 档位由各协议请求路径
+    // 的 `ip_allowed` 处理（见该函数注释里点名的一行改法）。
+    if lc.ip_access.is_some() && !ip_allowed(&cfg.ip_access, &lc, peer) {
+        log::debug!(
+            "plain connection from {peer} denied by [listeners.ip_access] ({}:{})",
+            lc.address,
+            lc.port
+        );
+        deny_plain_http(stream).await;
+        return Ok(());
     }
 
     dispatch_plain(stream, live, lc, peer).await
@@ -350,5 +411,71 @@ mod match_tests {
             &lc("0.0.0.0", Some("::1"), 8443),
             "[::1]:8443".parse().unwrap()
         ));
+    }
+}
+
+#[cfg(test)]
+mod ip_allowed_tests {
+    use super::ip_allowed;
+    use crate::config::{IpAccessConfig, ListenerConfig};
+
+    fn local(allow: &[&str], deny: &[&str]) -> Option<IpAccessConfig> {
+        Some(IpAccessConfig {
+            allow: allow.iter().map(|s| s.to_string()).collect(),
+            deny: deny.iter().map(|s| s.to_string()).collect(),
+        })
+    }
+
+    /// §16.1：per-listener 档位必须在全局之上**再收窄**，而不是被忽略。
+    ///
+    /// 这正是验收 agent 黑盒复现的缺陷：`[listeners.ip_access] allow = ["10.0.0.0/8"]`
+    /// 从 127.0.0.1 访问应被拒，而旧实现（字段不存在 → serde 静默忽略）放行。
+    #[test]
+    fn per_listener_allow_denies_outside_source() {
+        let global = IpAccessConfig::default(); // 全局不限制
+        let peer: std::net::SocketAddr = "127.0.0.1:5000".parse().unwrap();
+
+        let mut lc = ListenerConfig::default();
+        lc.ip_access = local(&["10.0.0.0/8"], &[]);
+        assert!(
+            !ip_allowed(&global, &lc, peer),
+            "listener allow=[10/8] 必须拒绝 127.0.0.1（旧实现因字段缺失而放行）"
+        );
+
+        // 白名单内的来源放行。
+        let inside: std::net::SocketAddr = "10.1.2.3:5000".parse().unwrap();
+        assert!(ip_allowed(&global, &lc, inside));
+    }
+
+    /// `None` = 只用全局档位（旧行为零变化）。
+    #[test]
+    fn none_falls_back_to_global_only() {
+        let global = IpAccessConfig {
+            allow: vec![],
+            deny: vec!["127.0.0.1".into()],
+        };
+        let peer: std::net::SocketAddr = "127.0.0.1:5000".parse().unwrap();
+        let lc = ListenerConfig::default(); // ip_access = None
+        assert!(!ip_allowed(&global, &lc, peer), "全局 deny 必须生效");
+
+        let global_open = IpAccessConfig::default();
+        assert!(ip_allowed(&global_open, &lc, peer));
+    }
+
+    /// 两份都要放行：全局拒绝时，listener 再宽松也拒（listener 只能收窄，不能放宽）。
+    #[test]
+    fn listener_cannot_widen_global_deny() {
+        let global = IpAccessConfig {
+            allow: vec![],
+            deny: vec!["127.0.0.1".into()],
+        };
+        let peer: std::net::SocketAddr = "127.0.0.1:5000".parse().unwrap();
+        let mut lc = ListenerConfig::default();
+        // listener 明确放行 127.0.0.1 —— 但全局 deny 优先，仍必须拒。
+        lc.ip_access = local(&["127.0.0.1"], &[]);
+        assert!(
+            !ip_allowed(&global, &lc, peer),
+            "listener 档位不得覆盖（放宽）全局 deny"
+        );
     }
 }

@@ -178,6 +178,62 @@ fn resp(status: StatusCode, msg: &str, offset: Option<u64>) -> Response<BoxBody>
         .unwrap_or_else(|_| Response::new(full("upload error".to_string())))
 }
 
+/// 取「最深的已存在祖先」canonicalize 后的路径，再把剩余**不存在**的段词法拼回。
+///
+/// 与 `admin_files::safe_join` 对「尚不存在目标」的处理同一策略：符号链接在 canonicalize
+/// 处被解析，故拿到的是**真实**路径；不存在的段没有符号链接语义，词法拼接即真实路径。
+fn canon_best_effort(p: &std::path::Path) -> PathBuf {
+    let mut base = p.to_path_buf();
+    let mut rest: Vec<std::ffi::OsString> = Vec::new();
+    while !base.exists() {
+        match base.file_name() {
+            Some(n) => {
+                rest.push(n.to_os_string());
+                match base.parent() {
+                    Some(par) => base = par.to_path_buf(),
+                    None => break,
+                }
+            }
+            None => break,
+        }
+    }
+    let mut c = std::fs::canonicalize(&base).unwrap_or(base);
+    for seg in rest.iter().rev() {
+        c.push(seg);
+    }
+    c
+}
+
+/// 上传目标是否落在**任何应用 docroot**（docroot 本身或其子路径）之内。
+///
+/// # 为什么必须拦（条件性 P0：上传 → RCE）
+///
+/// 应用 docroot 是**运行期目录**，里面有一批「非可执行扩展名、GET 也不会走引擎」的文件，
+/// 扩展名闸门（`has_exec_ext`）与 `would_execute_on_get`（只看 GET 路由）都拦不住：
+///   * `init.sh` —— `deps::ensure_app_deps` 在 mtime 变化时用 `sh` 执行它（**改它即 RCE**）；
+///   * `deps/bin/index` —— `sidecar_engine` 把它当可执行 sidecar 二进制拉起（**RCE**）；
+///   * `.env` —— `deps::parse_env_file` 把它注入引擎执行环境（**凭据注入/越权**）；
+///   * `deps/**` —— 应用依赖产物，覆盖可影响后续执行。
+/// 出厂配置默认不开上传故不可达；一旦运维开整站上传（规格要求上传可用），`PUT /rust/init.sh`
+/// 就能覆盖它 → 下一次 `deps` 重跑 = 任意命令执行。这是**跨应用**的写面，必须按 docroot 拦。
+///
+/// 判据用 `canon_best_effort`（与 `safe_join` 落盘用的真实路径对齐）：`www-apps/up/link ->
+/// www-apps/rust` 这种符号链接会被解析到真实 docroot 上，从而同样命中。
+/// 正常上传目录（如 `/up/`，不在任何 app docroot 内）不受影响。
+fn inside_any_app_docroot(lc: &ListenerConfig, target: &std::path::Path) -> Option<PathBuf> {
+    for app in &lc.apps {
+        if !app.enabled {
+            continue;
+        }
+        let dr = canon_best_effort(&crate::server::apps::deps::app_docroot(lc, app));
+        // `Path::starts_with` 按**组件**比较：`/a/rusty` 不以 `/a/rust` 开头（不会误伤兄弟目录）。
+        if target == dr || target.starts_with(&dr) {
+            return Some(dr);
+        }
+    }
+    None
+}
+
 /// 处理上传。body 泛型化以便 h1（Incoming）/h2/h3（Bytes）共用同一条路径。
 pub async fn handle<B>(
     req: Request<B>,
@@ -311,6 +367,21 @@ where
             return resp(StatusCode::BAD_REQUEST, "路径不合法", None);
         }
     };
+    // 应用 docroot 闸门（条件性 P0：上传覆盖 `init.sh`/`deps/bin/index`/`.env` → RCE）。
+    // 必须放在 `target` 解析之后、任何落盘动作之前；判据见 `inside_any_app_docroot`。
+    // 这条在扩展名闸门/隐藏段闸门/would_execute_on_get 之后，作为**兜底**把整个运行期目录
+    // 挡掉（那三道都漏「无扩展名、GET 不路由」的 `deps/bin/index` 之类）。
+    if let Some(dr) = inside_any_app_docroot(lc, &target) {
+        log::warn!(
+            "upload: 目标落在应用 docroot 内，拒绝（docroot={}）peer={peer} path={path:?}",
+            dr.display()
+        );
+        return resp(
+            StatusCode::FORBIDDEN,
+            "目标位于应用运行期目录（docroot）内，禁止上传（init.sh/deps/.env 等会被执行或注入）",
+            None,
+        );
+    }
     // 目标本身是目录（`PUT /up/`、`PUT /up/subdir/`）→ 409 Conflict。
     //
     // RFC 9110 §9.3.4：PUT 的目标是**资源**，用一个目录当资源语义冲突；且继续走下去
@@ -799,5 +870,70 @@ root = "/tmp/site-b"
             "B 站必须取到 B 站的 root（旧实现按端口取第一个 ⇒ 跨站写入），实得 {:?}",
             got_b.root
         );
+    }
+
+    /// 应用 docroot 闸门：docroot 内一律拒（含 init.sh / deps/bin/index / .env 这类
+    /// 「无扩展名、GET 不路由」的运行期文件），docroot 外的正常上传目录放行。
+    #[test]
+    fn upload_gate_rejects_app_docroot_targets() {
+        use crate::config::{AppRouteConfig, AutoindexConfig, FileOpenTable, ListenerConfig};
+        let base = std::env::temp_dir().join("crucible-upload-docroot-gate");
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(base.join("up")).unwrap();
+        std::fs::create_dir_all(base.join("rust")).unwrap();
+        let app = AppRouteConfig {
+            paths: vec!["/rust".into()],
+            enabled: true,
+            engine: "rust".into(),
+            socket: None,
+            extensions: vec!["rs".into()],
+            index: None,
+            php_bin: None,
+            workers: 1,
+            source_dir: None,
+            out_dir: None,
+            entry: vec![],
+            watch: false,
+            docroot: Some(base.join("rust")),
+            lib: None,
+            deps_dir: None,
+            init_timeout_secs: None,
+            libc: None,
+        };
+        let lc = ListenerConfig {
+            address: "127.0.0.1".into(),
+            address_v6: None,
+            port: 1,
+            root: base.clone(),
+            autoindex: AutoindexConfig::default(),
+            http_versions: vec!["h1".into()],
+            server_name: None,
+            ssl: None,
+            file_open: FileOpenTable::default(),
+            apps: vec![app],
+            basic_auth: None,
+            proxy_rules: vec![],
+            page_rules: vec![],
+            status_path: None,
+            port_reuse: false,
+            rate_limit: None,
+            ip_access: None,
+            l4_forward: None,
+            quic_ecn: false,
+            qmux: false,
+            connect_udp: false,
+        };
+        let t = |rel: &str| canon_best_effort(&base.join(rel));
+        // docroot 内（含 init.sh / deps/bin/index 这类非可执行扩展名的运行期文件）→ 命中
+        assert!(inside_any_app_docroot(&lc, &t("rust/init.sh")).is_some());
+        assert!(inside_any_app_docroot(&lc, &t("rust/deps/bin/index")).is_some());
+        assert!(inside_any_app_docroot(&lc, &t("rust/.env")).is_some());
+        // docroot 本身 → 命中
+        assert!(inside_any_app_docroot(&lc, &t("rust")).is_some());
+        // 正常上传目录（不在任何 docroot 内）→ 放行
+        assert!(inside_any_app_docroot(&lc, &t("up/x.txt")).is_none());
+        // 组件级前缀相同的兄弟目录 → 放行（不得把 /rust 误当成 /rusty 的前缀）
+        assert!(inside_any_app_docroot(&lc, &t("rusty/x.txt")).is_none());
+        let _ = std::fs::remove_dir_all(&base);
     }
 }

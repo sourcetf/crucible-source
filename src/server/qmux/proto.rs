@@ -88,6 +88,15 @@ pub fn varint_len(v: u64) -> usize {
 }
 
 pub fn put_varint(out: &mut Vec<u8>, v: u64) {
+    // RFC 9000 §16：8 字节形态的高两位固定为 `11`，只剩 62 位有效载荷 —— 即最大
+    // 可编码值是 2^62-1。传进来 ≥ 2^62 的值时 `v | 0xc000_...` 会与这两个前缀位冲突，
+    // **静默**编出一个错的值（如 2^62 编成 0），对端解析出来就是另一个数。
+    // 当前所有调用点的值都有界（内部流控窗口/发送偏移/记录长/流 id），无外部可驱动
+    // 路径（见 reports/h2h3c-wave4.md F3）；这里加 debug 断言，让将来误用**当场暴露**。
+    debug_assert!(
+        v < (1u64 << 62),
+        "put_varint: {v} 超出变长整数 62 位上限（RFC 9000 §16）"
+    );
     match varint_len(v) {
         1 => out.push(v as u8),
         2 => out.extend_from_slice(&((v as u16) | 0x4000).to_be_bytes()),

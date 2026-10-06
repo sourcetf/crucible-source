@@ -423,6 +423,7 @@ mod tests {
             status_path: None,
             port_reuse: false,
             rate_limit: None,
+            ip_access: None,
             l4_forward: None,
             quic_ecn: false,
             qmux: false,

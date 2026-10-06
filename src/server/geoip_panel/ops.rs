@@ -418,17 +418,35 @@ fn like_escape(s: &str) -> String {
 /// 旧实现只 `FROM geoip` —— 写入 `ipv4`/`ipv6` 表的行（v6 demo/镜像数据）在面板里
 /// 永远筛不到，表现为「库里有数据、筛选结果为空」。列名差异（ip_start/ip_end vs
 /// start/end、缺 dc）在子查询里对齐。
+///
+/// §23.6 追加两个维度（规格「按国家/城市/地区/运营商/**IPv4|v6** 等筛」）：
+/// - `family`：`v4`/`ipv4`/`4` 只留 IPv4，`v6`/`ipv6`/`6` 只留 IPv6，其余（空）不过滤。
+///   判定用**前缀文本**是否含 `:`（IPv6 字面量必含冒号；主表 `geoip` 与 range 表
+///   `ipv4`/`ipv6` 三路 UNION 之后 `prefix` 列口径统一，故在派生表外层过滤即可，
+///   无需按表名区分）。
+/// - `prefix`：对（可能已 COALESCE 的）前缀做**包含**匹配，便于按 `1.2.4.0/24`
+///   或某个网段片段定位。与 country 等一样做 LIKE 元字符转义。
 pub fn filter_prefixes(
     conn: &Connection,
     country: Option<&str>,
     isp: Option<&str>,
     cloud: Option<&str>,
+    family: Option<&str>,
+    prefix: Option<&str>,
     limit: usize,
 ) -> Result<Vec<FilterRow>> {
     let lim = limit.min(500);
     let c = country.unwrap_or("").to_ascii_lowercase();
     let i = isp.unwrap_or("").to_ascii_lowercase();
     let cl = cloud.unwrap_or("").to_ascii_lowercase();
+    // 归一化 family：只保留三种语义（v4 / v6 / 空）。其余值（含拼写错误）按空处理，
+    // 不做「静默当 v4」——那是把运维的笔误变成错误结果。
+    let fam = match family.unwrap_or("").trim().to_ascii_lowercase().as_str() {
+        "v4" | "ipv4" | "4" => "v4",
+        "v6" | "ipv6" | "6" => "v6",
+        _ => "",
+    };
+    let pfx = prefix.unwrap_or("").to_ascii_lowercase();
     // 过滤下推到 SQL。原实现是 `ORDER BY weight DESC LIMIT 5000` 之后再在 Rust 里
     // 按 country/isp/cloud 过滤 —— 命中的行只要排在权重前 5000 之外就被**静默截断**
     // （面板显示「没有结果」，其实数据存在）。这里的 LIMIT 作用在过滤后的结果集上。
@@ -458,7 +476,12 @@ pub fn filter_prefixes(
                     COALESCE(province, ''), COALESCE(city, ''), COALESCE(isp, ''),
                     COALESCE(cloud_provider, ''), COALESCE(weight, 0)
                FROM ipv6 {where_clause}
-         ) ORDER BY weight DESC LIMIT ?4"
+         )
+         WHERE (?5 = ''
+                OR (?5 = 'v6' AND instr(prefix, ':') > 0)
+                OR (?5 = 'v4' AND instr(prefix, ':') = 0))
+           AND (?6 = '' OR lower(prefix) LIKE '%' || ?6 || '%' ESCAPE '\\')
+         ORDER BY weight DESC LIMIT ?4"
     );
     let mut stmt = conn.prepare(&sql)?;
     let rows = stmt.query_map(
@@ -466,7 +489,9 @@ pub fn filter_prefixes(
             like_escape(&c),
             like_escape(&i),
             like_escape(&cl),
-            lim as i64
+            lim as i64,
+            fam,
+            like_escape(&pfx)
         ],
         |row| {
             Ok((
@@ -630,14 +655,31 @@ mod tests {
             [],
         )
         .unwrap();
-        let all = filter_prefixes(&conn, None, None, None, 100).unwrap();
+        let all = filter_prefixes(&conn, None, None, None, None, None, 100).unwrap();
         assert!(all.iter().any(|r| r.prefix == "1.2.4.0/24"));
         assert!(all.iter().any(|r| r.prefix == "8.8.8.0/24"), "ipv4 表行必须被筛到");
         assert!(all.iter().any(|r| r.prefix == "2001:db8::/112"), "ipv6 表行必须被筛到");
-        let us = filter_prefixes(&conn, Some("us"), None, None, 100).unwrap();
+        let us = filter_prefixes(&conn, Some("us"), None, None, None, None, 100).unwrap();
         assert!(us.iter().any(|r| r.city == "Mountain View"));
         assert!(us.iter().any(|r| r.city == "Documentation"));
         assert!(!us.iter().any(|r| r.country == "CN"));
+
+        // §23.6 新维度：family=IPv4|v6 与 prefix 包含匹配。
+        let v6 = filter_prefixes(&conn, None, None, None, Some("v6"), None, 100).unwrap();
+        assert!(v6.iter().any(|r| r.prefix == "2001:db8::/112"), "family=v6 应保留 IPv6 行");
+        assert!(!v6.iter().any(|r| r.prefix.contains('.')), "family=v6 不应含 IPv4 行：{:?}", v6.iter().map(|r| &r.prefix).collect::<Vec<_>>());
+        let v4 = filter_prefixes(&conn, None, None, None, Some("IPv4"), None, 100).unwrap();
+        assert!(v4.iter().any(|r| r.prefix == "8.8.8.0/24"), "family=IPv4 别名应生效");
+        assert!(!v4.iter().any(|r| r.prefix.contains(':')), "family=IPv4 不应含 IPv6 行");
+        // 拼写错误/未知 family 不应把结果筛空（按「不过滤」处理）。
+        let bogus = filter_prefixes(&conn, None, None, None, Some("v5"), None, 100).unwrap();
+        assert_eq!(bogus.len(), all.len(), "未知 family 应等同不过滤");
+        let by_prefix = filter_prefixes(&conn, None, None, None, None, Some("2001:db8"), 100).unwrap();
+        assert_eq!(by_prefix.len(), 1);
+        assert_eq!(by_prefix[0].prefix, "2001:db8::/112");
+        let by_prefix_v4 = filter_prefixes(&conn, None, None, None, Some("v4"), Some("8.8.8"), 100).unwrap();
+        assert_eq!(by_prefix_v4.len(), 1);
+        assert_eq!(by_prefix_v4[0].prefix, "8.8.8.0/24");
     }
 
     /// 源管理不得假成功：无字段可改、或源名不存在，都必须报错（旧实现无条件回 ok）。

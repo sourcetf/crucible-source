@@ -438,8 +438,12 @@ pub async fn handle_request(
     // P1-11：访问日志在响应完成侧统一记录全字段（时间/method/status/bytes/duration/engine），
     // 请求入口拿不到 status/bytes/duration；engine 标签由各 dispatch 分支经 extensions 注入。
     let t0 = std::time::Instant::now();
-    let method = req.method().as_str().to_string();
-    let path0 = req.uri().path().to_string();
+    // 只保留**借用得到的最小副本**供收口处的访问日志使用：
+    // `http::Method` 对标准方法（GET/POST/…）是廉价枚举拷贝，不分配；`http::Uri` 的
+    // path-and-query 存的是 `Bytes`，克隆只增引用计数、不分配。此前两者都
+    // `.to_string()`，等于每请求白付两次堆分配（GET/HEAD 静态热路径上最常见）。
+    let method = req.method().clone();
+    let path0 = req.uri().clone();
     let is_https = lc.ssl.is_some();
     let mut resp = handle_request_inner(req, Arc::clone(&live), lc, peer).await;
     // 大文件（static 层的 FileSource 标记）在这里换成真正的流式 body：这是所有
@@ -473,8 +477,8 @@ pub async fn handle_request(
         &live,
         peer,
         "h1",
-        &method,
-        &path0,
+        method.as_str(),
+        path0.path(),
         resp.status().as_u16(),
         resp_bytes,
         t0.elapsed(),
@@ -522,7 +526,11 @@ async fn handle_request_inner(
     // 都绕过监听器 IP 白名单与限速，白拿一个公共递归解析器（DoS/滥用放大器）。
     // 同时它排在 basic_auth 之前——DoH 客户端（浏览器/系统解析器）无法交互式
     // 提供 Basic 凭据，要求它会直接让 DoH 不可用。
-    if !crate::server::access::is_allowed(&snap.ip_access, peer) {
+    // §16.1：per-listener `[listeners.ip_access]` 必须与全局 `[ip_access]` 合并判定
+    // （两份都放行才放行）。此前这里只判全局 `snap.ip_access`，于是 listener 档位里
+    // 收窄的白名单在 **h1 路径上完全不生效**（h2/h3 已由 agent-h2h3 接线）—— 功能缺陷。
+    // `ip_allowed` 内部先判全局、再判 `lc.ip_access`（None 等价于旧行为）。
+    if !crate::server::listener::ip_allowed(&snap.ip_access, &lc, peer) {
         let (st, msg) = crate::server::access::deny_response();
         return tag(
             Response::builder().status(st).body(full(msg)).unwrap(),
@@ -731,7 +739,11 @@ async fn handle_request_inner(
     }
 
     // admin：在 ip_access / rate limit / basic auth 之后、页面规则改写之前
-    if crate::server::access::is_admin_path(&snap.admin.path, &path) {
+    //
+    // 复用上面（listeners_allow 判定处）已算出的 `is_admin`：`path` 与 `snap.admin.path`
+    // 在这两点之间都不变（路径改写发生在本判定**之后**），而 `is_admin_path` 内部每次都要
+    // `format!("{}/", …)` 一次堆分配 —— 这里省掉每请求一次多余分配与字符串比较。
+    if is_admin {
         // CSRF 补强（详见 access::cross_site_blocked）：admin.rs 的检查缺 `Origin` 时
         // 整段跳过、且 GET 从不带 `Origin`，这里用浏览器自写的 Sec-Fetch-Site 拒跨站。
         // 与 h2/h3 同序：先判跨站（403），再判鉴权（401/429）。
@@ -810,7 +822,15 @@ async fn handle_request_inner(
     }
 
     let mut req = req;
-    if let Some(np) = crate::server::page_rules::rewrite_path(&lc, &path) {
+    // 改写之后必须以**新路径**做后续判定与分发。
+    // 此前把改写前的 path 传进 dispatch_tail，于是 `would_handle`/`would_proxy` 判断
+    // 的是一个路径、真正干活的 handler（apps::try_handle 内部自己重算 req.uri()）
+    // 用的是另一个：改写命中时会错发 502「app dispatch returned empty」，
+    // 或者把本该交给引擎的请求当静态文件发出去。
+    //
+    // 无 rewrite 命中时 `path` 不变，直接沿用已有的 owned String —— 省掉每请求一次
+    // 多余的 `req.uri().path().to_string()` 堆分配（绝大多数请求都不带 rewrite 规则）。
+    let path = if let Some(np) = crate::server::page_rules::rewrite_path(&lc, &path) {
         let pq = match req.uri().query() {
             Some(q) => format!("{np}?{q}"),
             None => np,
@@ -818,13 +838,10 @@ async fn handle_request_inner(
         if let Ok(u) = pq.parse() {
             *req.uri_mut() = u;
         }
-    }
-    // 改写之后必须以**新路径**做后续判定与分发。
-    // 此前把改写前的 path 传进 dispatch_tail，于是 `would_handle`/`would_proxy` 判断
-    // 的是一个路径、真正干活的 handler（apps::try_handle 内部自己重算 req.uri()）
-    // 用的是另一个：改写命中时会错发 502「app dispatch returned empty」，
-    // 或者把本该交给引擎的请求当静态文件发出去。
-    let path = req.uri().path().to_string();
+        req.uri().path().to_string()
+    } else {
+        path
+    };
     if let Some(resp) = crate::server::page_rules::apply(&lc, &req) {
         return tag(resp, "rule");
     }
@@ -855,10 +872,14 @@ async fn handle_request_inner(
         return tag(resp, "proxy");
     }
     let resp_mods = crate::server::page_rules::response_headers(&lc, &path);
-    let mut resp = dispatch_tail(req, live, lc.clone(), peer, path).await;
+    // `lc` 此后只用于读 `ssl` 标志：先取出该标志，把 lc **移进** dispatch_tail，
+    // 省掉每请求一次 `ListenerConfig` 深拷贝（address/root/http_versions/apps/
+    // page_rules… 一串 String/Vec/PathBuf 的堆分配）。
+    let is_https_local = lc.ssl.is_some();
+    let mut resp = dispatch_tail(req, live, lc, peer, path).await;
     crate::server::headers_mod::apply_response(resp.headers_mut(), &resp_mods);
     // HTTPS responses get HSTS header (P1-7)
-    if lc.ssl.is_some() {
+    if is_https_local {
         // 与 handle_request 收口处的写法**一致**（`entry().or_insert`）：不覆盖
         // page_rules / 分支已显式设置的 Strict-Transport-Security。此前这里用
         // `insert` 强制覆盖，而 apply_response 刚把 page_rules 的头写进去 ——
@@ -886,7 +907,10 @@ async fn dispatch_tail(
     peer: SocketAddr,
     path: String,
 ) -> Response<BoxBody> {
-    if apps::would_handle(&lc, &path) {
+    // apps 为空时 `would_handle` 必然 false，但它会先做 `Path::extension` + 一次
+    // `file_open_mode`（percent-decode + `Vec` + `format!` 的堆分配）。纯静态 listener
+    // 每请求白付这次分配 —— 直接短路。
+    if !lc.apps.is_empty() && apps::would_handle(&lc, &path) {
         let resp = apps::try_handle(req, &live, &lc, peer)
             .await
             .unwrap_or_else(|| {

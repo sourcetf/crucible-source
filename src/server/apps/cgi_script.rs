@@ -39,11 +39,19 @@ fn kill_and_reap(child: &mut std::process::Child, pgid: i32, done: &AtomicBool) 
 }
 
 /// Spawn `binary` with CGI/1.1 environment; parse Status/headers/body.
+///
+/// CGI/1.1 要求把请求头映射为 `HTTP_*`、`CONTENT_TYPE` 单独给（不是 `HTTP_CONTENT_TYPE`），
+/// 并把 `.env`（deps）变量并入脚本环境（规格 §7.9「.env 行 KEY=VAL 并入 CGI/FFI 环境」）。
+/// 旧实现这三样都缺 —— 与 `cgi` 引擎（libapp_cgi.so，走 ABI headers + env_lock）行为分叉：
+/// 同一个 CGI 脚本在 `engine="cgi"` 下能读到 `HTTP_HOST`/`CONTENT_TYPE`/`.env`，在
+/// `engine="cgi_script"` 下全是空。
 pub async fn execute_binary(
     binary: &Path,
     method: &Method,
     uri: &Uri,
+    headers: &http::HeaderMap,
     body: Bytes,
+    env_vars: &[(String, String)],
     lc: &ListenerConfig,
     app: &AppRouteConfig,
     peer: SocketAddr,
@@ -60,6 +68,10 @@ pub async fn execute_binary(
     let query = query.to_string();
     let path_info = path.to_string();
     let peer_s = peer.ip().to_string();
+    // 请求头 + authority + .env 一并搬进阻塞任务（HeaderMap 是 Send+Sync，克隆开销小）。
+    let headers = headers.clone();
+    let authority = uri.authority().map(|a| a.to_string());
+    let env_vars: Vec<(String, String)> = env_vars.to_vec();
 
     let raw = task::spawn_blocking(move || -> Result<Vec<u8>> {
         let mut cmd = Command::new(&bin);
@@ -77,6 +89,42 @@ pub async fn execute_binary(
             .env("SERVER_PROTOCOL", "HTTP/1.1")
             .env("SERVER_PORT", port.to_string())
             .env("CONTENT_LENGTH", body.len().to_string());
+        // 请求头 → HTTP_*（CGI/1.1）。Content-Type/Length 走专门变量，不重复成 HTTP_*。
+        let mut has_host = false;
+        for (k, v) in headers.iter() {
+            let name = k.as_str();
+            if name.eq_ignore_ascii_case("content-type")
+                || name.eq_ignore_ascii_case("content-length")
+            {
+                continue;
+            }
+            let Ok(vs) = v.to_str() else { continue };
+            let mut key = String::with_capacity(name.len() + 5);
+            key.push_str("HTTP_");
+            for ch in name.chars() {
+                key.push(if ch == '-' { '_' } else { ch.to_ascii_uppercase() });
+            }
+            if key == "HTTP_HOST" {
+                has_host = true;
+            }
+            cmd.env(key, vs);
+        }
+        // h2/h3 的权威在 `:authority`（无字面 Host 头）——补一条，避免 HTTP_HOST 缺失。
+        if !has_host {
+            if let Some(a) = authority.as_deref() {
+                cmd.env("HTTP_HOST", a);
+            }
+        }
+        if let Some(ct) = headers
+            .get(http::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+        {
+            cmd.env("CONTENT_TYPE", ct);
+        }
+        // .env（deps）变量：与 cgi/其它引擎一致并入 CGI 环境。
+        for (k, v) in &env_vars {
+            cmd.env(k, v);
+        }
         // 让脚本与**它的子进程**同属一个新进程组（组长 = 子进程 pid）。看门狗要杀的
         // 是**整组**而不是单个进程：`#!/bin/sh` 脚本里起 `sleep`/`cat` 这类子命令时，
         // 杀 shell 并不会杀掉孙进程，而孙进程**继承了 stdout 管道** ⇒ 我们这端永远等不到
@@ -194,11 +242,19 @@ pub async fn handle(
     if !script.is_file() {
         bail!("cgi_script: script not found {}", script.display());
     }
+    // .env（deps）变量随请求 extensions 下发（try_handle 注入），与 cgi 引擎一致并入脚本环境。
+    let env_vars = parts
+        .extensions
+        .get::<crate::server::apps::deps::DepsEnv>()
+        .map(|d| (*d.vars).clone())
+        .unwrap_or_default();
     execute_binary(
         &script,
         &parts.method,
         &parts.uri,
+        &parts.headers,
         body_bytes,
+        &env_vars,
         lc,
         app,
         peer,

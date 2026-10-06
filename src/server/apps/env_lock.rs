@@ -15,6 +15,11 @@
 //! 持有 `INNER` 的临界区内；调用方只有在「自己安装了该组」或「在 `INNER` 临界区内确认该组
 //! 已生效」之后才运行 `f()`。因此任意时刻进程 env 里的临时值只可能来自同一组内容 ——
 //! 两批不同 env 绝不会并发生效。
+//!
+//! **「无 .env」也是一个组（空组）**，同样走上面这套机制：它不装任何键，但 active 期间
+//! 会挡住（并等待）任何非空组。这是修「空值窗口」的关键 —— 旧实现让无 .env 请求完全绕过
+//! 互斥，于是在 A（带 .env）在飞时并发的 B（无 .env）会读到 A 的私密值（跨应用秘密泄漏）。
+//! 空组跨引擎同身份，所以「无 .env」请求彼此仍并发（§13.8 的 sleep-CGI DoS 不回归）。
 
 use once_cell::sync::Lazy;
 use parking_lot::{Condvar, Mutex};
@@ -36,17 +41,20 @@ impl Group {
     /// `vars` 必须已归一化（见 [`normalized`]）。
     fn from_normalized(engine: &str, vars: &[(&str, &str)]) -> Group {
         Group {
-            engine: engine.to_string(),
+            // 空组（没有可装的键）与引擎无关：本组不改进程 env，任何「无 .env」请求装出来的
+            // 环境都完全一样，故共用一个身份 —— 否则「空 cgi」与「空 php」会被当成两组而
+            // 互相串行（把一个 sleep CGI 变成全站应用的排队点，即 §13.8 那个 DoS 换了个壳）。
+            engine: if vars.is_empty() { String::new() } else { engine.to_string() },
             vars: vars.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect(),
         }
     }
 
-    fn is_empty(&self) -> bool {
-        self.vars.is_empty()
-    }
-
     /// 本组与「引擎 + 键值」是不是同一份内容。`vars` 必须已归一化。
     fn matches(&self, engine: &str, vars: &[(&str, &str)]) -> bool {
+        // 空组跨引擎同身份（见 `from_normalized`）。非空组仍按引擎 + 键值逐项比较。
+        if self.vars.is_empty() && vars.is_empty() {
+            return true;
+        }
         self.engine == engine
             && self.vars.len() == vars.len()
             && self
@@ -128,27 +136,29 @@ pub fn with_temp_env_named<T, F>(engine: &str, vars: &[(&str, &str)], f: F) -> T
 where
     F: FnOnce() -> T,
 {
-    // 没有 .env 变量时**绝不能拿锁**：这把锁存在的唯一理由是「临时改进程环境」必须互斥，
-    // 而它是在整个引擎调用期间被持有的。空变量时白拿锁 = 把同一引擎的所有请求串行化。
-    // 实测（build31）：一个 sleep 120 的 CGI 会把整条 `/cgi/` 路径堵死——后续请求
-    // （包括另一个脚本）全部排队超时，而静态口完全正常。修复后同一实验应并发通过。
-    if vars.is_empty() {
-        return f();
-    }
-    // `_slot` 必须绑定到具名变量：写成 `_` 会立刻析构 → 环境刚装上就被恢复。
-    // 归一化后没有任何可装的键时 `enter` 返回 None（等价于没有变量），此时同样不拿锁。
-    let Some(_slot) = enter(engine, vars) else {
-        return f();
-    };
+    // **空变量也必须进 `enter`**（不再直接跑 `f()`）。
+    //
+    // 旧实现 `vars.is_empty() → return f()` 是为了修 §13.8 的 DoS（一个 sleep CGI 把整条
+    // `/cgi/` 堵死）。但它把「无 .env 的请求」完全排除在互斥之外：当 A（带 `.env`）在飞时，
+    // 进程 env 里装着 A 的值，而并发到达的 B（无 `.env`）直接跑 `f()` —— 它的引擎读
+    // `environ`（cgi 引擎会 `setenv` 后再 fork；FFI 引擎经 `appengine_apply_extra`）就
+    // **读到了 A 应用的私密 .env**（DB 口令/API key）—— 跨应用秘密泄漏，规格最忌讳的故障。
+    //
+    // 正确做法：把「无 .env」也建模成**一个空组**并走同一套「至多一组 active」的机制。
+    //   * 空组不装任何键（`install(&[])` 是 no-op），恢复也是 no-op —— 语义不变；
+    //   * 空组跨引擎同身份（见 `Group::from_normalized`）→ 所有「无 .env」请求仍并发，
+    //     §13.8 的 sleep-CGI DoS **不回归**（下面 `empty_requests_are_concurrent` 用例守着）；
+    //   * 代价：空组 active 时非空组要等它退干净（反之亦然）—— 这是「进程 env 只有一个」
+    //     的固有约束，无法既保证 B 看不到 A 的值、又让两组真正并发。
+    let _slot = enter(engine, vars);
     f()
 }
 
-/// 取得「依赖某组临时环境」的资格；`None` 表示本次没有任何键要装。
-fn enter(engine: &str, vars: &[(&str, &str)]) -> Option<Slot> {
+/// 取得「依赖某组临时环境」的资格。
+///
+/// 恒返回 [`Slot`]：空变量也参与互斥（见 [`with_temp_env_named`] 的说明）。
+fn enter(engine: &str, vars: &[(&str, &str)]) -> Slot {
     let g = normalized(vars);
-    if g.is_empty() {
-        return None;
-    }
     let mut st = INNER.lock();
     loop {
         // ① 内容相同 + 没人在等换组 + 环境确实还是那组 → 直接加入：不写环境，故与同内容并发。
@@ -160,7 +170,7 @@ fn enter(engine: &str, vars: &[(&str, &str)]) -> Option<Slot> {
         };
         if joinable {
             st.inflight += 1;
-            return Some(Slot);
+            return Slot;
         }
         // ② 有别的组生效中，或有人等着换组：进程 env 只有一个，只能等这一组连同它的读者
         //    一起退干净（`drain_requested` 让同内容的新调用也不再续命，缩短这个等待）。
@@ -175,7 +185,7 @@ fn enter(engine: &str, vars: &[(&str, &str)]) -> Option<Slot> {
         st.active = Some(Active { group, prev });
         st.inflight = 1;
         st.drain_requested = false;
-        return Some(Slot);
+        return Slot;
     }
 }
 
@@ -441,7 +451,7 @@ mod tests {
     }
 
     #[test]
-    fn restores_env_on_return_and_empty_vars_never_wait() {
+    fn restores_env_on_return_and_empty_vars_wait_for_active_group() {
         let _gate = gate();
         const ENGINE: &str = "ut-return";
         const KEY: &str = "CRUCIBLE_UT_RETURN";
@@ -471,8 +481,9 @@ mod tests {
         assert_eq!(std::env::var(KEY).unwrap(), "orig");
         std::env::remove_var(KEY);
 
-        // 空变量：不拿锁 / 不等锁（回归 §13.8：旧实现会把同引擎请求串行化）。
-        // 用一个「不同内容」的组占住全局状态，空变量调用仍必须立刻跑完。
+        // **空变量必须等「生效中的非空组」退干净**（这是「空值窗口」的修复点）：
+        // 否则空请求的引擎会读到别人装的 .env。用一个「不同内容」的组占住全局状态，
+        // 空变量调用此时**不得**进入闭包；释放后才进入，且此时看不到别人的值。
         let (tx, rx) = channel::<()>();
         let (tx_rel, rx_rel) = channel::<()>();
         let holder = std::thread::spawn(move || {
@@ -482,17 +493,60 @@ mod tests {
             });
         });
         rx.recv_timeout(Duration::from_secs(5)).unwrap();
-        let (tx2, rx2) = channel::<()>();
+
+        let (tx2, rx2) = channel::<Option<String>>();
         let empty = std::thread::spawn(move || {
             with_temp_env_named("ut-empty", &[], || {
+                tx2.send(std::env::var(HOLDER).ok()).unwrap();
+            });
+        });
+        match rx2.recv_timeout(Duration::from_millis(300)) {
+            Err(RecvTimeoutError::Timeout) => {}
+            other => panic!("空变量请求不得与非空组并发生效（会读到别人的 .env）：{other:?}"),
+        }
+        tx_rel.send(()).unwrap();
+        let seen = rx2
+            .recv_timeout(Duration::from_secs(5))
+            .expect("holder 释放后空请求应能进入");
+        assert_eq!(
+            seen.as_deref(),
+            None,
+            "空请求必须看不到 holder 的 .env 值（空值窗口已闭）"
+        );
+        holder.join().unwrap();
+        empty.join().unwrap();
+        assert!(std::env::var_os(HOLDER).is_none());
+    }
+
+    /// 「无 .env」请求彼此仍并发：空组跨引擎同身份，一个 sleep 的空请求不会把其它空请求
+    /// 串行化（§13.8 的 DoS 不回归）。这是空值窗口修复**不能**引入的回归。
+    #[test]
+    fn empty_requests_are_concurrent() {
+        let _gate = gate();
+        let (tx_entered, rx_entered) = channel::<()>();
+        let (tx_release, rx_release) = channel::<()>();
+        // 两个「无 .env」请求、**不同引擎**（模拟 /cgi/ 与 /php/ 的空请求）。
+        let first = std::thread::spawn(move || {
+            with_temp_env_named("ut-empty-a", &[], || {
+                tx_entered.send(()).unwrap();
+                rx_release.recv().unwrap();
+            });
+        });
+        rx_entered
+            .recv_timeout(Duration::from_secs(5))
+            .expect("第一个空请求应进入闭包");
+
+        let (tx2, rx2) = channel::<()>();
+        let second = std::thread::spawn(move || {
+            with_temp_env_named("ut-empty-b", &[], || {
                 tx2.send(()).unwrap();
             });
         });
         rx2.recv_timeout(Duration::from_secs(5))
-            .expect("vars 为空时不得拿锁/等待（会被别人生效中的组挡住）");
-        tx_rel.send(()).unwrap();
-        holder.join().unwrap();
-        empty.join().unwrap();
-        assert!(std::env::var_os(HOLDER).is_none());
+            .expect("空请求之间必须并发（空组同身份），不得被另一个空请求阻塞");
+
+        tx_release.send(()).unwrap();
+        first.join().unwrap();
+        second.join().unwrap();
     }
 }

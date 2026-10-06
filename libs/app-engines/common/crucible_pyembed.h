@@ -112,13 +112,19 @@ static pthread_mutex_t g_py_lock = PTHREAD_MUTEX_INITIALIZER;
 
 static const char *const g_py_libnames[] = {
     /* 绝对路径优先（OpenBSD 的 ld.so 默认搜索路径含 /usr/local/lib，但显式更稳）：
-     * 本机（OpenBSD）为 /usr/local/lib/libpython3.13.so.0.0。 */
+     * 本机（OpenBSD）为 /usr/local/lib/libpython3.13.so.0.0。
+     * Debian/Ubuntu 的 soname 是 libpython3.14.so.1.0（无 .so.0.0 命名）→ 单列。 */
+    "/usr/local/lib/libpython3.14.so.0.0",
     "/usr/local/lib/libpython3.13.so.0.0",
     "/usr/local/lib/libpython3.13.so",
     "/usr/local/lib/libpython3.12.so.0.0",
     "/usr/local/lib/libpython3.11.so.0.0",
     "/usr/lib/libpython3.13.so.0.0",
     "/usr/lib/libpython3.12.so.0.0",
+    "/usr/lib/x86_64-linux-gnu/libpython3.14.so.1.0",
+    "/usr/lib/x86_64-linux-gnu/libpython3.14.so.1",
+    "/usr/lib/x86_64-linux-gnu/libpython3.14.so",
+    "libpython3.14.so.1.0", "libpython3.14.so.1", "libpython3.14.so",
     "libpython3.13.so.0.0", "libpython3.13.so.0", "libpython3.13.so",
     "libpython3.12.so.0.0", "libpython3.12.so.0", "libpython3.12.so",
     "libpython3.11.so.0.0", "libpython3.11.so.0", "libpython3.11.so",
@@ -459,21 +465,35 @@ static void crucible_py_append_seq(crucible_buf *bb, void *seq)
     }
 }
 
-/* 把 C 层 environ 同步进 Python 的 os.environ。
+/* 把 C 层 environ 同步进 Python 的 os.environ，并把「请求前状态」记进 restore_out。
  *
  * 场景：Rust 侧把 .env / deps 变量经 env_lock::with_temp_env_named（setenv）注入
  * C environ，但 Python 的 os.environ 是 posix 模块 import 时构建的缓存映射，
  * 看不到之后的 setenv（旧实现每请求 spawn python3，子进程天然继承 env；嵌入后
  * 必须显式同步，否则 .env 变量对 WSGI 应用不可见）。
  *
- * 只做 update 不做 clear：clear+update 之间会有"进程级 env 为空"的窗口，同进程
- * 其他引擎线程可能读到空环境。代价是 C 环境里已删除的键会在 os.environ 残留，
- * 记为已知限制（下一请求的 update 会覆盖仍在的键）。 */
+ * 关键：os.environ 是独立缓存，必须与 C environ 保持一致；而 Rust 的
+ * env_lock::restore 会在请求结束把本请求的 .env 键从 C environ 移除。若不同步清理，
+ * A 应用 .env 的值会在 os.environ 里**永久残留**，同进程内后续任何应用
+ * （wsgi/asgi/uwsgi 共用同一解释器）都能读到 A 的私密 .env —— 跨应用环境泄漏。
+ *
+ * 本实现把「清理」放到请求结束：`restore_out`（一个 dict）记录本次同步**会改动**的
+ * 键及其请求前状态（原值 str，或 None 表示原本不存在）。请求结束时调用
+ * crucible_py_restore_environ(restore_out) 还原 os.environ，与 Rust 对 C environ 的
+ * restore 对称。这样做的两个好处：
+ *   1) 「无 .env」的请求（env_dirty=0）不需要遍历 C environ —— 那条路径拿不到
+ *      env_lock，遍历 environ 会与别的请求的 setenv 竞争 environ 数组的 realloc
+ *      （见 env_lock.rs 对 setenv/getenv 竞争的说明）；
+ *   2) 应用在请求内对**其他**键的改动不受影响（只还原本次同步动过的键）。
+ *
+ * 并发安全性：只在 env_dirty 请求里调用（Rust 侧持 env_lock，内容非空才拿锁），
+ * 因此本函数遍历 environ 期间不会有另一个 .env 正在 setenv。
+ */
 extern char **environ;
 
-static void crucible_py_sync_environ_locked(void)
+static void crucible_py_sync_environ_locked(void *restore_out)
 {
-    void *d, *os_mod, *envmap;
+    void *d, *os_mod, *envmap = NULL, *none = NULL;
     char **e;
 
     if (g_py_state != 1)
@@ -483,6 +503,11 @@ static void crucible_py_sync_environ_locked(void)
         crucible_py_clear_error();
         return;
     }
+    os_mod = g_py.import_module("os");
+    if (os_mod != NULL)
+        envmap = g_py.object_get_attr_string(os_mod, "environ"); /* 借用 */
+    if (restore_out != NULL)
+        none = crucible_py_none_obj(); /* None 作「原本不存在」哨兵（env 值恒为 str） */
     for (e = environ; e != NULL && *e != NULL; e++) {
         const char *eq = strchr(*e, '=');
         char kbuf[128];
@@ -502,17 +527,71 @@ static void crucible_py_sync_environ_locked(void)
             continue;
         }
         (void)g_py.dict_set_item_string(d, kbuf, v);
+        /* 记录请求前状态（此刻 os.environ 尚未 update）：只记「本次会改动」的键。 */
+        if (restore_out != NULL && envmap != NULL) {
+            void *prior = g_py.dict_get_item_string(envmap, kbuf); /* 借用，可能 NULL */
+            if (prior == NULL) {
+                if (none != NULL)
+                    (void)g_py.dict_set_item_string(restore_out, kbuf, none);
+            } else {
+                const char *ps = crucible_py_text(prior, NULL, NULL);
+                if (ps == NULL || strcmp(ps, eq + 1) != 0) {
+                    g_py.inc_ref(prior);
+                    (void)g_py.dict_set_item_string(restore_out, kbuf, prior);
+                    g_py.dec_ref(prior);
+                }
+                crucible_py_clear_error();
+            }
+        }
         g_py.dec_ref(v);
     }
-    os_mod = g_py.import_module("os");
-    if (os_mod != NULL) {
-        envmap = g_py.object_get_attr_string(os_mod, "environ"); /* 借用 */
-        if (envmap != NULL)
-            (void)g_py.object_call_method(envmap, "update", "O", d);
+    if (envmap != NULL)
+        (void)g_py.object_call_method(envmap, "update", "O", d);
+    if (os_mod != NULL)
         g_py.dec_ref(os_mod);
-    }
     crucible_py_clear_error();
     g_py.dec_ref(d);
+}
+
+/* 请求结束：把 os.environ 还原到 crucible_py_sync_environ_locked 记录的请求前状态。
+ * 须持 GIL。restore 为 NULL（无 .env 的请求）时 no-op。 */
+static void crucible_py_restore_environ(void *restore)
+{
+    void *os_mod, *envmap, *it, *k, *none;
+
+    if (restore == NULL || g_py_state != 1)
+        return;
+    os_mod = g_py.import_module("os");
+    if (os_mod == NULL) {
+        crucible_py_clear_error();
+        return;
+    }
+    envmap = g_py.object_get_attr_string(os_mod, "environ"); /* 借用 */
+    none = crucible_py_none_obj();
+    it = g_py.object_get_iter(restore);
+    if (envmap != NULL && it != NULL) {
+        while ((k = g_py.iter_next(it)) != NULL) {
+            const char *ks = g_py.unicode_as_utf8_and_size(k, NULL);
+            if (ks != NULL) {
+                void *prior = g_py.dict_get_item_string(restore, ks); /* 借用 */
+                if (prior == NULL || prior == none) {
+                    void *r = g_py.object_call_method(envmap, "__delitem__", "O", k);
+                    if (r == NULL)
+                        crucible_py_clear_error();
+                    else
+                        g_py.dec_ref(r);
+                } else {
+                    (void)g_py.dict_set_item_string(envmap, ks, prior);
+                }
+            } else {
+                crucible_py_clear_error();
+            }
+            g_py.dec_ref(k);
+        }
+    }
+    crucible_py_clear_error();
+    crucible_py_xdecref(it);
+    g_py.dec_ref(os_mod);
 }
 
 /* 引擎级失败：填 out->error 并返回 -1（app_ffi 把它变成 502 文本，不会假装成功）。 */
@@ -911,6 +990,7 @@ static int crucible_py_wsgi_request(const char *label, const char *script,
     int gil = 0, rc = -1, we_gil = 0;
     void *app = NULL;
     void *environ = NULL, *args = NULL, *sr = NULL, *result = NULL, *it = NULL;
+    void *restore = NULL; /* .env 同步的「请求前状态」恢复表（见 sync_environ） */
     void *state = NULL, *write_fn = NULL, *io = NULL, *pybody = NULL, *wsgi_in = NULL;
     void *sys_mod = NULL, *sys_err = NULL, *tmp = NULL, *st = NULL, *close_fn = NULL;
     void *true_obj = NULL, *false_obj = NULL, *bools = NULL;
@@ -940,8 +1020,12 @@ static int crucible_py_wsgi_request(const char *label, const char *script,
      * 应用本体在锁外执行：应用回调本服务器时不会自锁（GIL 在 I/O 期间会释放）。 */
     gil = g_py.gil_ensure();
     we_gil = 1;
-    if (env_dirty)
-        crucible_py_sync_environ_locked();
+    /* 带 .env 的请求才同步（env_dirty）——它同时建好「请求前状态」恢复表，请求结束
+     * 在 done: 里还原 os.environ（否则该 .env 的键会永久残留，泄漏给后续应用）。 */
+    if (env_dirty) {
+        restore = g_py.dict_new();
+        crucible_py_sync_environ_locked(restore);
+    }
     pthread_mutex_lock(&g_py_lock);
     if (crucible_py_wsgi_app_locked(script, errbuf, sizeof(errbuf)) != 0) {
         pthread_mutex_unlock(&g_py_lock);
@@ -1143,6 +1227,10 @@ static int crucible_py_wsgi_request(const char *label, const char *script,
 
 done:
     /* 先释放 Python 引用（须持 GIL），再释放 GIL。锁在步骤 2 末尾已释放。 */
+    /* 还原 .env 注入的 os.environ 键（须在释放 GIL 之前；与 Rust 对 C environ 的
+     * restore 对称）——否则这些键会永久留在 os.environ，泄漏给后续应用。 */
+    crucible_py_restore_environ(restore);
+    crucible_py_xdecref(restore);
     crucible_py_xdecref(app);
     crucible_py_xdecref(environ);
     crucible_py_xdecref(args);
@@ -1286,7 +1374,7 @@ static int crucible_py_asgi_request(const char *label, const char *script,
     char *trace = NULL;
     int gil = 0, rc = -1, we_gil = 0;
     void *g = NULL, *res = NULL, *pybody = NULL, *drv = NULL, *st = NULL, *hd = NULL;
-    void *bdy = NULL, *portobj = NULL, *pyheaders = NULL;
+    void *bdy = NULL, *portobj = NULL, *pyheaders = NULL, *restore = NULL;
     const char *srv = server_name != NULL && server_name[0] != '\0' ? server_name : "crucible";
     int port = server_port > 0 ? server_port : 80;
 
@@ -1314,8 +1402,11 @@ static int crucible_py_asgi_request(const char *label, const char *script,
     /* 步骤 2：只持 GIL（驱动在每请求独立命名空间里跑，无共享可变状态，不占进程锁）。 */
     gil = g_py.gil_ensure();
     we_gil = 1;
-    if (env_dirty)
-        crucible_py_sync_environ_locked();
+    /* 带 .env 的请求才同步，并建恢复表（理由同 WSGI 路径）。 */
+    if (env_dirty) {
+        restore = g_py.dict_new();
+        crucible_py_sync_environ_locked(restore);
+    }
 
     if (port == 80)
         snprintf(hostbuf, sizeof(hostbuf), "%s", srv);
@@ -1392,6 +1483,9 @@ static int crucible_py_asgi_request(const char *label, const char *script,
     rc = 0;
 
 done:
+    /* 还原 .env 注入的 os.environ 键（须在释放 GIL 之前；理由同 WSGI 路径）。 */
+    crucible_py_restore_environ(restore);
+    crucible_py_xdecref(restore);
     crucible_py_xdecref(drv);
     crucible_py_xdecref(pybody);
     crucible_py_xdecref(portobj);

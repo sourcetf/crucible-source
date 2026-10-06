@@ -37,7 +37,7 @@ pub async fn handle_status_with_live(
         .map(|p| p.display().to_string())
         .unwrap_or_default();
     let exists = db_path.as_ref().map(|p| p.is_file()).unwrap_or(false);
-    let panel = std::path::Path::new("data/geoip/panel.sqlite");
+    let panel = crate::server::geoip_panel::db::panel_db_path();
     let panel_exists = panel.is_file();
     json_ok(format!(
         "{{\"enabled\":{},\"db_path\":{},\"exists\":{},\"panel_exists\":{},\"message\":\"rust geoip panel §23\"}}",
@@ -60,7 +60,10 @@ pub async fn handle_lookup(req: &Request<Full<Bytes>>) -> Response<BoxBody> {
     lookup_json(&ip_s, db_path.as_deref())
 }
 
-/// `GET /api/geoip/filter?country=&isp=&cloud=&limit=`
+/// `GET /api/geoip/filter?country=&isp=&cloud=&family=&prefix=&limit=`
+///
+/// §23.6：`family`（IPv4|v6）与 `prefix`（前缀包含）是筛选器要求的维度，
+/// 此前只支持 country/isp/cloud ⇒ 面板无法按地址族或网段定位。
 pub async fn handle_filter_with_live(
     req: &Request<Full<Bytes>>,
     live: &Arc<LiveConfig>,
@@ -72,6 +75,8 @@ pub async fn handle_filter_with_live(
     let country = query_param(q, "country");
     let isp = query_param(q, "isp");
     let cloud = query_param(q, "cloud");
+    let family = query_param(q, "family");
+    let prefix = query_param(q, "prefix");
     let limit = query_param(q, "limit")
         .and_then(|s| s.parse().ok())
         .unwrap_or(50usize);
@@ -91,6 +96,8 @@ pub async fn handle_filter_with_live(
             country_norm.as_deref(),
             isp.as_deref(),
             cloud.as_deref(),
+            family.as_deref(),
+            prefix.as_deref(),
             limit,
         ) {
             Ok(rows) => {
@@ -119,7 +126,8 @@ pub async fn handle_filter_with_live(
 
 /// `GET /api/geoip/sources` — panel sources + optional SOURCES.json.
 pub async fn handle_sources(_req: &Request<Full<Bytes>>) -> Response<BoxBody> {
-    let panel_path = std::path::Path::new("data/geoip/panel.sqlite");
+    let panel_path = crate::server::geoip_panel::db::panel_db_path();
+    let panel_path = panel_path.as_path();
     let mut items = String::new();
     if panel_path.is_file() {
         if let Ok(conn) = db::open_panel(panel_path) {
@@ -163,7 +171,8 @@ pub async fn handle_sources(_req: &Request<Full<Bytes>>) -> Response<BoxBody> {
 
 /// `GET /api/geoip/conflicts`
 pub async fn handle_conflicts(_req: &Request<Full<Bytes>>) -> Response<BoxBody> {
-    let panel_path = std::path::Path::new("data/geoip/panel.sqlite");
+    let panel_path = crate::server::geoip_panel::db::panel_db_path();
+    let panel_path = panel_path.as_path();
     if !panel_path.is_file() {
         return json_ok("{\"conflicts\":[]}".into());
     }
@@ -211,7 +220,8 @@ pub async fn handle_edit(req: Request<Full<Bytes>>) -> Response<BoxBody> {
     if prefix.is_empty() || field.is_empty() {
         return json_ok("{\"error\":\"missing prefix or field\"}".into());
     }
-    let panel_path = std::path::Path::new("data/geoip/panel.sqlite");
+    let panel_path = crate::server::geoip_panel::db::panel_db_path();
+    let panel_path = panel_path.as_path();
     match db::open_panel(panel_path) {
         Ok(conn) => {
             if crate::server::geoip_panel::ops::upsert_edit(
@@ -240,7 +250,8 @@ pub async fn handle_edits(req: &Request<Full<Bytes>>) -> Response<BoxBody> {
     let limit = query_param(req.uri().query().unwrap_or(""), "limit")
         .and_then(|s| s.parse().ok())
         .unwrap_or(200usize);
-    let panel_path = std::path::Path::new("data/geoip/panel.sqlite");
+    let panel_path = crate::server::geoip_panel::db::panel_db_path();
+    let panel_path = panel_path.as_path();
     if !panel_path.is_file() {
         return json_ok("{\"edits\":[]}".into());
     }
@@ -281,7 +292,8 @@ pub async fn handle_edit_delete(req: Request<Full<Bytes>>) -> Response<BoxBody> 
     let Some(id) = form_field(&body, "id").and_then(|s| s.parse::<i64>().ok()) else {
         return json_ok("{\"error\":\"missing id\"}".into());
     };
-    let panel_path = std::path::Path::new("data/geoip/panel.sqlite");
+    let panel_path = crate::server::geoip_panel::db::panel_db_path();
+    let panel_path = panel_path.as_path();
     match db::open_panel(panel_path) {
         Ok(conn) => {
             match crate::server::geoip_panel::ops::delete_edit(&conn, id) {
@@ -309,7 +321,8 @@ pub async fn handle_conflict_resolve(req: Request<Full<Bytes>>) -> Response<BoxB
     let Some(id) = form_field(&body, "id").and_then(|s| s.parse::<i64>().ok()) else {
         return json_ok("{\"error\":\"missing id\"}".into());
     };
-    let panel_path = std::path::Path::new("data/geoip/panel.sqlite");
+    let panel_path = crate::server::geoip_panel::db::panel_db_path();
+    let panel_path = panel_path.as_path();
     match db::open_panel(panel_path) {
         Ok(conn) => match crate::server::geoip_panel::ops::resolve_conflict(&conn, id) {
             Ok(true) => json_ok("{\"ok\":true}".into()),
@@ -328,7 +341,8 @@ pub async fn handle_audit(req: &Request<Full<Bytes>>) -> Response<BoxBody> {
     let limit = query_param(req.uri().query().unwrap_or(""), "limit")
         .and_then(|s| s.parse().ok())
         .unwrap_or(100usize);
-    let panel_path = std::path::Path::new("data/geoip/panel.sqlite");
+    let panel_path = crate::server::geoip_panel::db::panel_db_path();
+    let panel_path = panel_path.as_path();
     if !panel_path.is_file() {
         return json_ok("{\"audit\":[]}".into());
     }
@@ -356,7 +370,8 @@ pub async fn handle_audit(req: &Request<Full<Bytes>>) -> Response<BoxBody> {
 
 /// `GET /api/geoip/cron` | `POST name=&schedule=&enabled=`
 pub async fn handle_cron(req: Request<Full<Bytes>>) -> Response<BoxBody> {
-    let panel_path = std::path::Path::new("data/geoip/panel.sqlite");
+    let panel_path = crate::server::geoip_panel::db::panel_db_path();
+    let panel_path = panel_path.as_path();
     match req.method() {
         &Method::GET => {
             if !panel_path.is_file() {
@@ -438,7 +453,8 @@ pub async fn handle_source_set(req: Request<Full<Bytes>>) -> Response<BoxBody> {
     }
     let enabled = form_field(&body, "enabled").map(|s| s == "1" || s.eq_ignore_ascii_case("true"));
     let weight = form_field(&body, "weight").and_then(|s| s.parse().ok());
-    let panel_path = std::path::Path::new("data/geoip/panel.sqlite");
+    let panel_path = crate::server::geoip_panel::db::panel_db_path();
+    let panel_path = panel_path.as_path();
     match db::open_panel(panel_path) {
         Ok(conn) => {
             if crate::server::geoip_panel::ops::set_source(&conn, &name, enabled, weight).is_ok() {
@@ -782,7 +798,8 @@ pub async fn handle_conflict_source(req: Request<Full<Bytes>>) -> Response<BoxBo
     let (Some(id), Some(s), Some(f)) = (id_val, src, field) else {
         return json_ok(r#"{"error":"missing id/src/field"}"#.into());
     };
-    let panel_path = std::path::Path::new("data/geoip/panel.sqlite");
+    let panel_path = crate::server::geoip_panel::db::panel_db_path();
+    let panel_path = panel_path.as_path();
     let panel = match db::open_panel(panel_path) {
         Ok(c) => c,
         Err(e) => return json_ok(format!(r#"{{"error":"{}"}}"#, json_escape(&format!("{e:#}")))),

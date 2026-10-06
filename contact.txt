@@ -2714,3 +2714,473 @@ scope：`src/server/geoip_panel/**`。**只改 5 个文件**：`covering.rs`、`
 - **复核正确（勿重复报）**：`iputil` 全部 CIDR/归一/范围键；`anycast` 掩码与分族；`apply_panel_edits`
   语义；`filter_prefixes` 的 `?1` OR country/province/city 是**有意**（UI 标签 `country / 省市`）；
   `db.rs` 列顺序与 `map_covering_row` 逐列一致。
+
+---
+
+# 【agent-spec 规格符合性矩阵（工号 1009）】2026-10-06 Wave-3 收工
+
+scope：**文档 + 只读核对**。续写 `.agents/1009/reports/spec-matrix.md` 的 §7–§23（§3–§6 既有，未删）；
+新增 `.agents/1009/reports/spec-matrix-notes.md`（未实现/未验证清单 + 方法论）。**未改任何产品代码**；
+未 commit/push/checkout/reset/stash/clean；只写这两个报告文件与本节。
+
+方法：本轮**重新 grep/读码**逐条核对（不照抄旧报告）；另跑
+`cargo check --release --bin webserver --offline --features tls,tls_boring` → **rc=0（4.51s）**，证实 feature 门控
+（tls_nss/tls_tomcrypt 未启用即不编译其模块）。
+
+## 章节映射澄清（重要）
+任务括号里的「§7 应用引擎、§8 反代、§9 TLS、§10 ECH、§11 QMux、§12 CONNECT-UDP、§13–§15 DNS」**不匹配**
+权威文件 `webserver-rebuild-prompt-v2.txt`（其 §7–§23 = 应用引擎/Admin UI/GeoIP/安全/Bench/已知坑/实现顺序/验收/
+元指令/功能规格详解16.1-16.19/已知坑扩展/样例/构建验收/AppRouteConfig/检查清单/性能/GeoIP细粒度）。既有矩阵 §3–§6
+与该文件 §3–§6 逐节对应，故按**该文件 §7–§23** 续写。括号点名的 ECH/QMux/CONNECT-UDP/DNS 来自「本会话附加要求」
+附件（`01-pasted-text-*.txt`，本机**未找到**），已并入矩阵 §16.16/§16.17 相应行，并在 notes §C 单独汇总。
+
+## 仍未实现 / 未验证（详 notes §A；按规格条目）
+- **[P1·代码缺失·core] §16.1/§16.13 per-listener `ip_access`**：`ListenerConfig` 无该字段 → `[listeners.ip_access]`
+  被 serde 静默忽略（verify-wave3 V3-4 真机复现）。需 config.rs 加字段 + 三协议接线。
+- **[P1·代码缺失] §16.11 页面规则**：`PageRuleConfig` 仅 match_url/action/target，**缺 priority**，匹配**仅 URL 前缀**
+  （无 host/header/method/country）。
+- **[P0 条件性·跨 scope] §10/§16.2/§17#23 上传 `.sh` 覆盖 app docroot** → 下次访问 `sh init.sh` = RCE
+  （`upload_api.rs:290` 只按引擎扩展名判）。出厂 config 未开上传故不可达；开整站上传即成 P0。
+- **[P2·代码缺失] §16.12 访问日志仅全局**（无 per-site）；**§23.6 面板筛选缺 family/prefix**；**§23.6 面板 DB 路径硬编码**
+  `data/geoip/panel.sqlite`（`toml_store`/`config::from_server_config` 死代码）。
+- **代码在·本机无法验证**：NSS/TomCrypt（无 OpenBSD 工具链）、busy_poll/syncookie（feature 未启用）、PHP/JSP/ASP.NET/
+  Go/Rust/Ruby/TSX 引擎（无工具链）、OCSP/ECH/ACME（无真实 CA/responder/域名）、DNS 权威区（无 named）、
+  h2o 性能门禁（无 wrk/h2o）、GeoIP 数据质量（未跑更新流水线）。
+
+## 最近几波已改变的状态（旧报告缺口已闭，勿重复报；矩阵已标 [已修]）
+app_ffi ABI 校验（`appengine.h:37`+`app_ffi.rs:623`）、WebSocket 升级（`h1.rs:428 with_upgrades` + `proxy.rs:1698` 保留
+Upgrade 头 + `proxy.rs:1190 force_h1`）、DoH 仅 TLS（`h1.rs:570-596`）、h2/h3 authority 校验（h2h3b F1）、admin 路径跳过
+listener basic_auth（`h1.rs:626-627` + h2h3b F2）、双栈 `IPV6_V6ONLY`（`mod.rs:481/374`）、h3 端点绑定失败不再牵连
+（`mod.rs:518-525`）、ECS 应答（`dot_doh.rs:101`）、DoT 热载（`dot_doh.rs:840`）、zone rdata/CNAME 校验（`dns/mod.rs:1127/1157`）、
+面板空 extensions（admin-wave2）、站点级 Basic Auth（`admin.rs:780`）、Save TLS 清空（admin-wave2）、v4-mapped 归一
+（`covering.rs:71`）、只读 DB（`db.rs` ddl_best_effort）、冲突裁决确定性（`conflict.rs:35`）、SIGHUP 重载（`main.rs:207-238`）、
+worker 上界（`main.rs:132-146`）、h1 405 content-type（`static_files.rs:127-137`）、上传声明预留 507 DoS（`upload_resume.rs`）、
+QMux 重复 TP/blocked 自旋（`qmux/conn.rs`）、CONNECT-UDP `%zz`（`connect_udp.rs:75-101`）。
+
+## 交付
+`.agents/1009/reports/spec-matrix.md`（§7–§23 续写，逐行 `文件:行号`）、`.agents/1009/reports/spec-matrix-notes.md`
+（未实现/未验证清单 + 方法论 + 附加要求主题汇总）、本节。
+
+---
+
+# 【agent-proxy2 · `src/server/proxy.rs` Wave-4】2026-10-06 收工
+
+scope：`src/server/proxy.rs`（唯一改动文件；`tor_hs.rs`/`l4.rs` 只读复核）。
+未 commit/push/checkout/reset/stash/clean。报告 `.agents/1009/reports/proxy2-wave4.md`，
+修复 `.agents/1009/fixes/proxy2-wave4.md`。
+
+## 修了 2 条（均真机复现 → 修复 → 真机验证）
+1. **[P0] `write_raw_request` 剥掉 `Upgrade` 头 ⇒ WS 反代 100% 502**（验收 agent V3-1 定位的
+   第二个独立根因）。`Connection: Upgrade` 的 token `upgrade` 让逐头拷贝把 `Upgrade: websocket`
+   也 `continue` 掉，上游只收到 `connection: Upgrade`、无升级意图 → 回 200 → 代理
+   `502 websocket upstream returned 200 OK, expected 101`。修法：token 剥离排除
+   `upgrade`/`connection`（`proxy.rs:1707`）。真机 `/ws` 与 `/wss`（TLS 上游 ALPN 广告
+   h2,http/1.1）修复后均 **101 + 双向帧 PASS**；普通反代请求仍不带逐跳头（无回归）。
+2. **[P2] WS 直写路径 `modify_request_headers` 注入缺闸**（与 `proxy_once` 不对称）：规则可把
+   `Content-Length:999`+`Transfer-Encoding:chunked`+`Host:evil`+`Connection:close` 原样写进
+   握手（TE.CL 走私形态，真机复现四头全部到达上游）。修法：套用与 `proxy_once` 同一条禁用名单，
+   并让被拒头名不再连带丢弃客户端的 `Connection: Upgrade`（`proxy.rs:1688/1713/1725`）。
+
+## 验证
+`cargo test --release --bin webserver --offline --features tls,tls_boring` →
+**459 passed / 0 failed / 1 ignored**（proxy 模块 20 passed，含 2 条新回归）。
+真机基座端口块 20290/20298/20299/20260/20261（20295/20296 被 scratch-apps2 占用，已规避）；
+临时件 `~/scratch-proxy2/`。
+
+## 复核为正确（未改，详见报告 §3）
+WS 非 101 映射与连接回收（连发 5 次后上游连接 0、FD 稳定）、WS 半关闭（客户端
+`shutdown(WR)` → 上游 EOF 回帧经隧道回传）、WS 隧道超时/16KiB 帧缓冲/握手 body 64MiB 上限、
+连接池不误用 WS 升级连接、响应头注入边界、Tor SOCKS 优先链、`tor_hs` 权限
+（O_NOFOLLOW/fchmod/chown 跳链接）、L4 半关闭与 IPv6。
+
+## 跨 scope / 交接
+- Wave-2 交接项 1（`h1.rs` 缺 `.with_upgrades()`）**已由 agent-h1b 修好**（当前 `h1.rs:428`）；
+  本 agent 的 FIX-1 是**第二个独立根因**，两者都修 WS 才通 —— 已双重确认。
+- 中途一次 test 编译失败（`E0063 missing field ip_access`，在 `admin_files.rs`/`apps/deps.rs`/
+  `apps/mod.rs` 测试构造器）系 core agent 正在加 `ListenerConfig.ip_access`（V3-4）的共享树瞬时破损，
+  与本 scope 无关，其补齐后重跑全绿。
+
+---
+
+# 【agent-h2h3c · h2/h3/QMux/CONNECT-UDP Wave-4】2026-10-06 收工
+
+scope：`src/server/h2.rs`、`src/server/h3.rs`、`src/server/qmux/*`、`src/server/connect_udp.rs`、
+`src/server/ecn.rs`、`libs/h2/*`、`libs/quinn-boring/*`。本波只改 3 个文件：`h2.rs`/`h3.rs`/`qmux/proto.rs`。
+未 commit/push/checkout/reset/stash/clean。报告 `.agents/1009/reports/h2h3c-wave4.md`，
+修复 `.agents/1009/fixes/h2h3c-wave4.md`。构建/测试：`cargo test --release --bin webserver
+--offline --features tls,tls_boring` → **461 passed / 0 failed / 1 ignored**（+3 单测）。
+
+## 修了 3 条（F1/F5 真机 A/B 验证；F3 静态）
+1. **[P1] h2 的 DoH 分流不看 TLS ⇒ 明文 h2c 口上 `/dns-query` 被当 DoH 正常应答**
+   （`h2.rs:966-1022`）。h1 已修（明文 DoH→400，`h1.rs:573-596`），h2 却**无条件** `doh_prepared`。
+   真机 BEFORE：明文 h2c `/dns-query` → **504**（走到上游 named = 完整处理了 DoH）；AFTER → **400**
+   「DoH requires HTTPS (RFC 8484 section 5)」，与 h1 逐字同判；TLS h2 仍 504（照常 DoH）。
+   单测 `h2::tests::h2_doh_requires_tls`。
+2. **[P2] CONNECT-UDP 隧道长期占用 `H3_MAX_INFLIGHT` ⇒ 慢隧道饿死全部普通 h3 请求**
+   （`h3.rs`）。隧道不缓冲 body（≤64KiB）却存活到 idle 超时，此前**整个生命周期**占进程级
+   `H3_MAX_INFLIGHT=256` 一个名额 ⇒ 开满 256 隧道即让**所有**普通 h3 请求 503。修法：新增独立
+   `H3_TUNNEL_GATE`(256)，`handle_resolver` 对 CONNECT 跳过 `H3_INFLIGHT` 改取隧道闸门。
+   真机 A/B：256 隧道存活时新连接普通 h3 GET → BEFORE **503**「server busy (h3 in-flight limit)」，
+   AFTER **200**。单测 2 条。
+3. **[P3] `put_varint` 8 字节分支**（`qmux/proto.rs:90`）：复核**无外部可驱动路径**（逐调用点：
+   内部流控窗口/发送偏移/记录长/流 id/本地 TP，均非对端值），加 `debug_assert!(v < 1<<62)` 防误用。
+
+## 复核为正确（未改，详见报告 §2）
+h2 WINDOW_UPDATE/RST_STREAM/trailers 由上游 `h2 0.4.14` 处理（本仓库唯一流控责任是
+`H2RecvBody::release_capacity`，`is_err()→EOF` 是防御性死路径，不会因 RST 把截断 body 当干净 EOF）；
+`SETTINGS_MAX_FRAME_SIZE` 本仓库不设=用 crate 默认；h3 0-RTT/DATAGRAM 默认关（静态）；
+QMux 帧编解码边界（截断/未知/超大）已用 `checked_add` 封；生产路径零外部可触发 panic/自旋/无界内存。
+
+## 评估未改（详见报告 §3）
+- **[F4 · 中等偏大] h3 配置/证书变更 `ep.close()` 关整个 QUIC 端点、不发 H3 GOAWAY**
+  （`h3.rs:187-221`）。要发 GOAWAY 必须 `h3::server::Connection::shutdown(&mut self)`
+  （h3-0.0.8 `connection.rs:160`），而该 Connection 被 `handle_incoming` 的 accept 循环独占消费，
+  无句柄 ⇒ 需「连接注册表 + async Mutex」或「accept 循环改 `select!` + broadcast + 宽限后 close」。
+  推荐后者（方案+风险评估见报告 §3 O1）；因触达每连接热路径、`accept()` 取消安全未在本仓库验证、
+  收益仅 P3，**本波不改**（与 Wave-2 O2 / Wave-3 O1 一致）。
+- **[F2 · 确认] h3 DoH 恒在 https 上**（QUIC 强制 TLS 1.3，无明文 h3），RFC 8484 §5 恒满足，**非缺陷**。
+  真机：h3 `GET /dns-query`(:authority doh.test) → 400「bad dns message」（到达处理器）。
+
+## 验证边界
+UDP 出向被墙 ⇒ CONNECT-UDP 端到端回程仍未复现（只验准入全表 + 隧道可建立存活）。F5 的 BEFORE
+用一次性源码开关 A/B，随后**已从备份恢复并重建**（grep 无残留、diff 逐字节一致）。远程 OpenBSD 未用。
+
+---
+
+# 【agent-apps2 · `src/server/apps/**` `libs/app-engines/**` `libs/script-ffi/**` `www-apps/**` Wave-4】2026-10-06 收工
+
+scope：`src/server/apps/*.rs`、`libs/app-engines/**`、`libs/script-ffi/**`、`libs/aspnet-ffi/**`、
+`libs/axonasp-ffi/**`、`www-apps/**`。**未** commit/push/checkout/reset/stash/clean；只改本 scope。
+报告 `.agents/1009/reports/apps2-wave4.md`，修复 `.agents/1009/fixes/apps2-wave4.md`。
+
+## 修了 4 条（P1×2 P2×1 构建×1；均真机或 check 验证）
+1. **[P1] pyembed `os.environ` 跨应用 `.env` 泄漏（wsgi/asgi/uwsgi 共用解释器）**
+   `libs/app-engines/common/crucible_pyembed.h`：旧同步只 `os.environ.update()` 从不删 + `env_dirty`
+   当门 ⇒ A 的 `.env` 键**永久残留**在 `os.environ`，后续**任何**请求（含无 `.env` 的）都读到 A 的
+   密钥（顺序即可复现）。修复：同步同时产出「请求前状态」恢复表，请求结束还原 `os.environ`
+   （与 Rust 对 C environ 的 restore 对称）；保留 `env_dirty` 门（无锁路径不遍历 environ，避免 setenv
+   realloc 竞争）。顺带补 libpython3.14 名。**真机 20295/20296 修前/修后对照**：BEFORE `B->alpha(泄漏)`
+   `C->alpha(泄漏)`；AFTER `B->None` `C->None`（h1+h2c 各一遍，ASGI 同样验证）。无性能回归
+   （无 `.env` 的 `/wsgi-b/` 2084.6→2059.0 rps）。
+2. **[P1] `cgi_script` 缺 `HTTP_*`/`CONTENT_TYPE`/`.env`**（`cgi_script.rs` + `mod.rs`）：与 `cgi` 引擎
+   分叉。修复：请求头→`HTTP_*`（h2/h3 用 authority 合成 `HTTP_HOST`）+ `CONTENT_TYPE` + `.env` 经
+   `cmd.envs` 每子进程传。真机 `/cgis/` 修复后 h1+h2c 均得 `HTTP_HOST/HTTP_X_TEST/HTTP_USER_AGENT/
+   CONTENT_TYPE/ENVMARK`（修复前全空）。
+3. **[P2] `go_shm` 无崩溃自愈**（`go_shm.rs:254`）：死掉的 go-shm-server 被永久缓存 ⇒ `/go/` 恒 502
+   到重启。修复：`ensure_runtime` 命中缓存先 `child.try_wait()`，退出即移除重建。
+   `cargo check --features go_shm_ipc` OK（本机无 go-shm 真机）。
+4. **[构建] `PyEval_SaveThread` 函数指针类型**（`script_engine.c:330`/`scriptffi.c:99`）：GCC 15 把
+   incompatible-pointer-types 当错误 ⇒ 嵌入 python 编译单元整体失败。修复：显式 cast。python 报错消失；
+   剩余失败是**系统 perl 5.40** 头文件（`my_perl`/`hv_iterkey`），本机无 OpenBSD perl，跳过。
+
+## 复核 / 待拍板
+- **[P1] `env_lock` 空值窗口（`env_lock.rs:135-137`）：已证实外部可观测**。真机 cgi 引擎：A
+  （`sleep 2`，`.env WINDOWMARK=from-app-A`）并发中，无 `.env` 的 B 读到 `WINDOWMARK=from-app-A`
+  （B 单独跑=`<unset>`）。修法：①空值也拿锁→退回作者实测的 sleep-CGI 堵死 DoS（不采用）；
+  ②spawn 类引擎**按子进程传 `.env`**（`cgi_script` 本轮已如此，`cgi` 引擎仍继承 environ）→ 属设计改动，
+  **需拍板**。
+- **跨协议矩阵**：17 条路由 h1 vs h2c（状态码/body 逐字节/头名集合，含 POST/PATH_INFO/HEAD/大 body/
+  穿越探针）**全部一致**，未发现新的「h1 能 h2 不能」引擎。
+- **`.env`/deps 生命周期**：确认 `remove_dir_all` 仅在 docroot 有 `init.sh` 时触发（规格 §7.9「变更
+  wipe 重建」）。规则：`deps/` 是 `init.sh` 专属输出，手工放入的文件一律会丢（含 host 写的
+  `.crucible_manifest`）；样例文件须放 `deps/` 之外。观察：缓存是内存态 ⇒ **每次重启**首请求都会
+  wipe+重跑 init.sh（manifest 只写不读）。
+- **`tsx.rs`**：复核无新问题（等号形式 flag/argv 直启/超时 kill/EOF break/诚实失败/npx 门控）。
+- **`cgi_script` `SCRIPT_NAME`=脚本绝对路径、`PATH_INFO`=整条请求路径**（CGI 规范偏差）：记录未改。
+- **外部可触发 panic 复核**：apps scope 的 `Response::builder().body().unwrap()` 全有 `unwrap_or_else`
+  兜底 502，且头经净化 ⇒ 不可由引擎输出触发。
+
+## 验证
+单测 **461 passed / 0 failed / 1 ignored**；`cargo build --release --bin webserver --features tls,tls_boring`
+clean；`cargo check --features tls,tls_boring,go_shm_ipc` clean。端口块 20295/20296；临时设施在
+`/home/dev123/scratch-apps2/`（含「修复前」引擎 `libapp_wsgi_before.so`）。远程 OpenBSD 未用。
+
+# 【agent-core2 <core: main.rs/mod.rs/listener.rs/syncookie.rs/config.rs>】core2-wave4 收工
+
+承接 verify-wave3 的 3 条 core 缺陷（V3-2/V3-3/V3-4），**全部真机复现→修复→真机验证**。
+报告：`.agents/1009/reports/core2-wave4.md`；修复：`.agents/1009/fixes/core2-wave4.md`。
+单测 **464 passed / 0 failed / 1 ignored**；黑盒 `accept-verify.sh --no-build`（用本机新二进制）
+PASS1 **82/0/12**、PASS2 **6/0/2**（verify-wave3 基线 75/5/14）。
+
+已修：
+1. **[P1] V3-2 双栈 `[::]` Linux 绑定失败**：新增 `mod.rs::bind_tcp`，对双栈 listener 的 v6 socket
+   显式 `IPV6_V6ONLY=1`（libc 自建 socket，不新增依赖）。改前 `v4=200 v6=000`、日志
+   `bind [::]:P: Address already in use`；改后 `0.0.0.0`+`[::]` 都 ready、`v4=200 v6=200`。
+   忠实配置 8×`address_v6="::"` → `ready on [::]`×8、绑定失败×0；黑盒 check PASS。
+2. **[P1] V3-3 bind 失败掐掉 h3/QUIC**：h3 端点启动**移到错误返回之前**，并让「本次无新绑地址」
+   也能拉起 h3；h3 用合成键 `h3|<key>` 去重（2s 重试不会重复 bind）；reconciler 补 h3 存活判定
+   （去 h3→停、加回→自动重启）。真机：占住 `::1:24645`（v6 绑失败）时 h3 端点在 `127.0.0.1:24645`
+   照常 ready、`aioquic h3 GET → 200`（改前 0 端点、超时）。
+3. **[P2] V3-4 `[listeners.ip_access]` 静默忽略**：`config.rs::ListenerConfig` 加
+   `ip_access: Option<IpAccessConfig>` + 配置期校验（空串/非法条目）；新增
+   `listener::ip_allowed(global, lc, peer)`（在全局之上再收窄）；**明文 listener 在连接层直接
+   403** ⇒ 黑盒 check「per-listener ip_access」由 200→**PASS(403)**。
+   **跨 scope 一行改法（点名 owner）**：TLS/h3 面把 h1.rs:525 / h2.rs:913,247 / h3.rs:1182,573,715 的
+   `access::is_allowed(&snap.ip_access, peer)` 换成
+   `crate::server::listener::ip_allowed(&snap.ip_access, &lc, peer)`（`lc` 均已持有）。
+
+**跨 scope 被迫改动（请知悉）**：新增 ListenerConfig 字段使 3 处**测试**完整结构体字面量无法编译，
+各补一行 `ip_access: None,`：`src/server/admin_files.rs:426`、`src/server/apps/mod.rs:681`、
+`src/server/apps/deps.rs:399`。
+
+第二优先：listener 增删/热重载**无 fd 泄漏**（3 轮 17→20→17）；全绑不上时进程存活+清晰日志+重试；
+worker 上界 100000→1024 仍生效（Threads=1026）；`/__metrics` 匿名 401 / 管理员 200（字段正确）/ POST 405；
+syncookie 本机构建 no-op（无 `linux_syncookie`），仅静态审阅无缺陷。未 commit/push/checkout/reset/stash/clean。
+
+---
+
+# 【agent-perf · h1.rs/static_files.rs/Cargo.toml Wave-4】2026-10-06 收工
+
+scope：`src/server/h1.rs`、`src/server/static_files.rs`、`Cargo.toml`（仅 `[profile.release]`）。
+**只做性能路径，功能语义不变**（461 单测绿 + 真机符号链接/304/301 复现）。未 commit/push/
+checkout/reset/stash/clean。报告 `.agents/1009/reports/perf-wave4.md`，修复 `.agents/1009/fixes/perf-wave4.md`。
+
+环境：`. /home/dev123/scratch-perf/buildenv.sh`（target 在 `~/scratch-perf/target`）；实例端口
+24081/24095（`~/scratch-perf/`）。本机 Linux `--features tls,tls_boring`。**无 h2o/wrk/perf/gdb** ⇒
+自写多进程压测器 `~/scratch-perf/bench.py`（ka/churn/h2c 三模式，含 `/proc/<pid>/stat` 算 cores）
++ `run_bench.py` + **交替 A/B 脚本 `ab.sh`**。**只有自身前后对比，无 h2o 对比数字。**
+
+## 落地 6 处（全在 scope）
+1-2. `static_files.rs`：`file_open_mode` 空表短路 + `apps_configured` 跳过 engine_owns/app_private_path
+     （纯静态 listener 每请求省 ~5 次 `normalize_path_key`/`normalize_url_path` 分配）。
+3. `static_files.rs`：`directory_index` 快车道——非符号链接索引文件一次 `lstat` 取代 `canonicalize`
+     （省 realpath 逐段 lstat）；符号链接仍走原 containment。
+4. `h1.rs`：`handle_request` 用 `Method::clone()`/`Uri::clone()` 取代两个 `.to_string()`。
+5. `h1.rs`：`dispatch_tail` 加 `!lc.apps.is_empty()` 短路。
+6. `Cargo.toml`：`lto = "thin"` → `"fat"`。
+
+## 数据（同机同场景交替 3 轮取中位；2 worker，cores≈1.97 打满；pristine vs full）
+| 场景 | pristine | full | Δ |
+|---|---|---|---|
+| **ka（keep-alive 静态 `/`）** | 34,032 | **39,298** | **+15.5%** |
+| 404 | 44,288 | 46,030 | +3.9% |
+| admin（401 早退，对照） | 50,737 | 50,792 | +0.1%（噪声） |
+| churn | 21,378 | 22,619 | +5.8% |
+| **h2c** | 45,062 | **63,699** | **+41.4%** |
+
+拆解（同一棵树只切我的文件）：**代码改动** ka +12.4% / h2c +32.3%；**lto=fat 只利好 h2c +7.5%**
+（h1 在噪声内）。二进制 19.65MB → **18.17MB（−7.5%）**。静态层增量成本 **17.6→11.1µs/req（−37%）**。
+
+## 重要：两条历史结论被本轮实测**推翻**
+- **「访问日志 ~90µs/req」已作废**：关掉 access log 只快 **0.5–4.9%**（配置级 A/B）。前几轮批量写已吃掉。
+- **「hyper h1 没开 writev」是错的**：hyper 1.11.1 `io.rs` 默认 `is_write_vectored()→Queue`，TCP 已走 writev。
+  显式 `writev(true)` 反而会把 TLS 强制成 Queue（有害），**别设**。
+
+## 门禁结论（诚实）
+**仍差 ~2.5–3×，没进 1.2×**。根因是**每请求底噪**：`/__admin`（最小早退路径）也要 **39.7µs/req**，
+h2o 2 线程同机 ~15µs/req；静态层只占 `/` 的 22%。**门禁不是静态层能修的。**
+
+## 跨 scope 建议（我未改）
+1. **[高] `dns::effective` 每请求 clone 整个 `DnsConfig`**（`h1.rs:580`/`h2.rs:968`/`h3.rs:1234`）。
+   改为返回 `Arc<DnsConfig>` 可去掉 clone + 每请求 `state_root().join()` 分配。**dns scope**。
+2. [中] h1 路由链「未配置即短路」（DNS 关 + 无 panel 覆盖时免进 DoH 分支；空 rules 短路）。
+3. [中] `access_log::log_response` 去掉内部多余 `live.snapshot()`、合并多次 `format!`。
+
+## 未落地（写了理由）
+`panic="abort"`（会毁 tokio 任务隔离 → 单点 panic 全监听口下线，**不开**）、`strip`（丢 gdb 符号，
+本项目靠它排查崩溃，**不开**）、h1 再省 1 次分配 + `is_admin_path` 去重（**低于噪声不可测，未加**）。
+
+## 验证边界
+本机无 h2o（无对比数字）；无 perf/gdb（差分微基准定位）；共享 32 核有别的 agent 并发负载
+（A/B 期间 load 1–5）；生产 OpenBSD ≠ 本机 Linux（busy_poll/syncookie/NSS/TomCrypt 本机 no-op；
+fat LTO 构建时间成本只在 32 核本机测：thin ~1m17s / fat ~1m38s，1 vCPU 真机会更久）。
+
+---
+
+# 【agent-spec2 · 规格缺口补齐 Wave-5（工号 1009）】2026-10-06 收工
+
+scope：`src/config.rs`、`src/server/page_rules.rs`、`src/server/admin.rs`、`src/server/admin_ui.html`、
+`src/server/geoip_panel/**`。**未** commit/push/checkout/reset/stash/clean；**未**改 h1/h2/h3。
+报告 `.agents/1009/reports/spec2-wave5.md`，修复 `.agents/1009/fixes/spec2-wave5.md`。
+单测 **468 passed / 0 failed / 1 ignored**；真机 `127.0.0.1:25095`（`~/scratch-spec2/`）。
+
+## 落地 3 条（全真机验证）
+1. **§16.11 页面规则 priority**（完整、向后兼容）：`PageRuleConfig` 加 `priority:i64`（serde 默认 0）；
+   `page_rules.rs::ordered()` **数值大者先评估、等值保持配置顺序**（全 0 时不排序、零开销），五个
+   评估入口统一走它；Admin 落盘/校验/回显 + UI 列。真机：`/dup`(p1=301/p9=308) h1 与 h2c 均 `308 /high`；
+   无 priority 的 `/order` → `301 /first`（回归不变）；Admin save p100 翻转 → `301 /low` 且文件落盘。
+2. **§23.6 面板筛选 family/prefix**（完整）：`filter_prefixes` 增 `family`/`prefix`，SQL 派生表外层按
+   `instr(prefix,':')` 判 v4/v6（含 ipv4/ipv6/4/6 别名，未知按不过滤）+ 前缀 LIKE 包含；API + UI 暴露。
+   真机：`family=v6`→仅 IPv6、`family=v4`→仅 IPv4、`prefix=10.1`→`10.1.2.0/24`、组合筛选 OK。
+3. **§23.6 面板 DB 路径硬编码 → env 覆盖**（完整）：新增 `geoip_panel::db::panel_db_path()`
+   （`CRUCIBLE_GEOIP_PANEL_DB` 经 `read_static_env`），替换 `admin_geoip.rs` 12 处 + `covering.rs` 1 处硬编码。
+   真机：env 指向自定义库后 `/__admin/api/geoip/edits` 返回自定义库的行。
+
+## 未做（跨 scope，方案已写入报告）
+- **§16.11 host/header/method/国家 匹配维度**：需请求上下文，而只有 `apply(lc,req)` 拿得到 `Request`；
+  `rewrite_path`/`pass_upstream`/`response_headers`/`apply_simple`/`plan` 只收 path，调用点在
+  h1.rs（**本轮归 agent-perf2，禁改**）/h2.rs/h3.rs。只接 `apply` 会造成 h1↔h2/h3 分叉，故**不接**，
+  给出精确改法（MatchCtx + 11 处调用点，需 h1/h2h3 owner 协同）。
+- **§16.12 访问日志 per-site**：`log_response` 不知 listener；需把 `lc.access_log` 传到 h1/h2/h3 调用点
+  （禁改/非 scope），且 `ListenerConfig` 加字段会连带跨 scope 结构体字面量（`admin_files.rs:391` 等）。
+- **候选 4 ACME**：`src/server/dns/admin_api.rs:658 acme_issue` 自拼 acme.sh 命令，缺
+  `--server letsencrypt`/`--keylength ec-256`、多 `--force`、无 `$HOME/.acme.sh` 与 acme-client/certbot 回退，
+  与 `acme.rs::issue`（续期）不一致。**dns scope**：改调 `acme::issue_now()`（`acme.rs:450` 注释已指明）。
+- **候选 5 `malformed_ecs`**：`src/server/dns/ecs.rs:111` 定义+单测齐全但**无生产调用者**；
+  DoT/DoH/:53 查询入口应对畸形 ECS 回 FORMERR（§7.2.1）。**dns scope**。
+
+## 验证边界
+本机 Linux `--features tls,tls_boring`（非生产 OpenBSD）；无 h2o/wrk。页面规则维度与 per-site
+访问日志**未实现**故无真机证据（scope 所限，非未测）。
+
+
+# 【agent-sec2 · `src/server/upload_api.rs` `src/server/apps/env_lock.rs` `src/server/apps/deps.rs` Wave-5（工号 1009）】2026-10-06 收工
+
+## 本波修了 2 条（只改本 scope 3 个文件；未 commit/push/checkout/reset/stash/clean）
+1. **[P0 条件性] 上传覆盖 app docroot 运行期文件 → RCE** —— 已修。
+   新增兜底闸门「目标落在任何 enabled app 的 docroot 内即 403」：
+   `upload_api.rs:223 inside_any_app_docroot`（+`:185 canon_best_effort`、接线 `:374`），
+   docroot 由 `apps/deps.rs:246 app_docroot` 解析。判据用真实路径（canon 解符号链接），
+   组件级 `starts_with`（不误伤 `/a/rusty`）。
+   真机（20295）：`PUT /cgia/init.sh`→403、`/cgia/.env`→403、`/cgia/foo.txt`→403、
+   `/up/link/init.sh`(symlink)→403、`/up/new.txt`→**201**、`init.sh` 内容+mtime **未变**。
+   **无需改 static_files.rs/config.rs。**
+2. **[P1 待决] `env_lock` 空值窗口跨应用泄漏** —— 已修。
+   把「无 .env」建成**一等空组**（`env_lock.rs:135/160/42/53`）：空组不装键、**跨引擎同身份**
+   → 空请求彼此仍并发（§13.8 sleep-CGI DoS 不回归）；空组与非空组互斥 → B 永远看不到 A 的值。
+   真机：A(`/cgia` 带 `.env`,sleep2) 在飞时并发 B(`/cgib`) 5 轮全 `<unset>`；
+   慢空 `cgic`(sleep3) 在飞时并发空 `cgib` 时延 **5.2–5.7ms**。
+   **诚实边界**：慢**空**请求会挡住**带 .env** 的应用请求（实测 4.70s）——进程全局 env 固有串行，
+   根治需 C 引擎按子进程传 .env（owner：**apps**，`libs/app-engines/cgi/cgi_engine.c:580`）。
+
+## 复审结论（新代码，未发现新的可利用缺陷）
+- 代理/WS **真机验证**：伪造 `X-Forwarded-For/Forwarded/X-Real-IP/X-Forwarded-Host` 与
+  `Connection`-点名的 `X-Secret` 全被剥、注入权威值；上游 `Connection`+`X-Upstream-Hop` 被剥；
+  `/ws` 升级 → **101 + 隧道字节**。h2/h3 authority 校验、ABI 握手（fail-closed）、
+  面板鉴权顺序（admin 跳过 listener ba + `admin_gate` fail-closed）、配置往返（managed 键集保 TLS）、
+  `/__metrics` 默认需管理员、DNS/GeoIP（参数化 SQL + rdata 拒换行）、静态路径/Range 内存上限 —— 均 **OK**。
+- 畸形输入扫描 **909 请求 → 0 个 5xx / 0 连接错误 / 进程存活 / 日志 0 panic**。
+- 单测全量 **468 passed / 0 failed / 1 ignored**（`env_lock::` 8、`upload_api::` 8 全绿）。
+
+## 给协调员
+- 复审期间共享树曾**短暂不可编译**（`src/server/dns/dot_doh.rs:822` `dot_supervisor` 闭包返回
+  `DnsConfig` 而签名要 `Arc<DnsConfig>`，非本 scope）→ 已等树自愈。
+- 详见 `.agents/1009/reports/sec2-wave5.md`、`.agents/1009/fixes/sec2-wave5.md`。
+
+# 【agent-verify2 验收/回归 · `scripts/accept-*` Wave-5（工号 1009）】2026-10-06 收工
+
+构建指纹：`git HEAD=b3af018`（dirty，40 改+1 新，均属各 wave 修复 agent，本 agent 未回退）；
+二进制 `md5=a65c1ef32e8b6fa395eff145b0dc6bf9`（当前工作树，`--features tls,tls_boring`，22:35）。
+测量时 `uptime` load≈0.9–2.2（共享 32 核）。**未 commit/push/checkout/reset/stash/clean；只改 `scripts/accept-*`。**
+
+## 结论（对比基线）
+- PASS1（忠实档）：**118 PASS / 1 FAIL / 12 SKIP**（wave-4 基线 82/0/12；新增 ~36 检查）。
+- PASS1.5 扩展（新趟）：**9 / 0 / 0**。
+- PASS2（H3/DoT/DoH）：**9 / 0 / 2**（wave-3 基线 6/0/2）。
+- 单测：`cargo test --release --bin webserver --offline --features tls,tls_boring` → **468 passed / 0 failed / 1 ignored**。
+
+## 回归：上轮 5 条 FAIL **全部转 PASS**
+1. **WS 反代双向隧道**（V3-1，proxy 第二根因）：`/ws` → `101 Switching Protocols` + `PING123` 回显。
+2. **双栈 `[::]` 绑定**（V3-2）：启动日志 `有地址未能绑定` 计数 = 0；`ready on [::]:PORT` ×8。
+3. **bind 失败不掐 h3**（V3-3）：`ss -lun` 有 `:26443`，`h3 quinn endpoint ready on 0.0.0.0:26443`。
+4. **明文 per-listener `ip_access`**（V3-4）：26093 → `403 forbidden by ip_access`。
+   **额外回归（core2-wave4 点名的未接线）**：TLS h1/h2（26096）与 **h3（26097）** 也 **403
+   `forbidden by ip_access`** —— 该未接线项在当前树**已不复现**，无需再改 h1.rs/h2.rs/h3.rs。
+
+## 扩展覆盖（Wave-2/3/4 新修区域）——全部 PASS
+目录 301（h1/h2/h3 一致）、符号链接索引绕过（外→404/内→200）、ETag 含 inode（原子替换必变）、
+多段 Range `multipart/byteranges`、条件请求组合（If-Match/If-Unmodified-Since/If-Range）、
+上传 percent-decode/409/408、**2GiB 声明中断后预留归还（普通上传仍 2xx）**、并发同目标上传不 500、
+h2c+h3 非法 authority → 400、DoH 明文拒绝 h1/h2c 一致（400）、WS→TLS h2 上游（force_h1）→101+回显、
+面板空 extensions 保存后路由仍 200、`/__metrics` 401/200、SIGHUP 存活+服务、worker 线程上界钳制到 1024、
+`Expect: 100-continue`、chunked+trailer、限流先于页面规则（429）。
+
+## 新发现缺陷（1 条）
+- **[P2] `CL+TE` 未当错误处理（请求走私硬化面）** —— owner **h1**（`src/server/h1.rs`）。
+  `Content-Length` + `Transfer-Encoding: chunked` 并存时按 chunked 接受（**201**），未回 400；
+  与既有「重复不一致 CL → 400」不对称。依据 RFC 9112 §6.1「ought to be handled as an error」。
+  复现：`printf 'PUT /x HTTP/1.1\r\nHost: 127.0.0.1:26094\r\nContent-Length: 5\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nHELLO\r\n0\r\n\r\n' | nc -w 3 127.0.0.1 26094`。
+  规格高层文档未逐字要求，故判 **P2 硬化**（非 P0/P1 硬违反），**本 agent 未改 h1.rs**。
+
+## 误报澄清（曾疑似、经查合规）
+- `Range: bytes=0-1,5-6` 合并为单段 `206`：`static_files.rs:1404` 按 RFC 9110 §15.3.7.2
+  「MAY 合并小间隔区间」（阈值 128B），**合规**；>128B 间隔时正确回 multipart。
+- 明文 `/dns-query` 在 Host 非白名单时 404：属非 DoH 请求的正常静态 404，非分流泄漏。
+
+## 套件变更（scope：`scripts/accept-*`）
+端口块 23000→**26000**、状态根 `scratch-verify`→**`scratch-verify2`**（避让他人端口/状态根）；
+`accept-verify-genconf.py` 加 listener 26096/26097/26098 与 `/wss`+`/dead` proxy_rules、26091 page_rules；
+`accept-verify-upstream.py` 加 TLS 26100（ALPN `h2,http/1.1`）；新增 `accept-verify-ext.py`。
+一键重跑：`sh scripts/accept-verify.sh`（或 `--no-build`）。
+详见 `.agents/1009/reports/verify2-wave5.md`、`.agents/1009/fixes/verify2-wave5.md`。
+
+# 【agent-h3b / 工号 1009 · scope: h2.rs h3.rs(+子模块) qmux/* connect_udp.rs ecn.rs libs/h2 libs/quinn-boring】Wave-5 收工
+
+只改 `src/server/h2.rs`、`src/server/h3.rs`（未碰 `h1.rs`）。未 commit/push/checkout/reset/stash/clean。
+报告 `.agents/1009/reports/h3b-wave5.md`、修复 `.agents/1009/fixes/h3b-wave5.md`。
+构建：`~/scratch-h3b/target`（独立），`--features tls,tls_boring --offline`；实例端口块 **254xx**；
+配置 `~/scratch-h3b/conf/config-h3b.toml`（`genconf.py` 生成）；h3 客户端 aioquic 1.3.0。
+单测 **468 passed / 0 failed / 1 ignored**。
+
+## 已修（真机验证）
+1. **[P1] per-listener `ip_access` 在 h2/h3 请求路径未接线** —— `h2.rs:247`/`h2.rs:913`、
+   `h3.rs:693`(CONNECT)/`h3.rs:873`(admin 前置门)/`h3.rs:1340`(`handle_h3`) 共 5 处，由
+   `access::is_allowed(&snap.ip_access, peer)` 改为 `listener::ip_allowed(&snap.ip_access, &lc, peer)`。
+   同步修了 h2/h3 两条**源码判据单测**（查找串 `"is_allowed"`→`"listener::ip_allowed"`）。
+   **真机 A/B（同端口/配置/客户端）**：listener 25497（TLS h1+h2+h3 + `[listeners.ip_access] allow=["10.0.0.0/8"]`）
+   BEFORE（回退 5 处的二进制）TLS h2→**200**、h3→**200**（bug）；AFTER TLS h1/h2/h3→**403 forbidden by ip_access**。
+   对照 25443（TLS 无 ip_access）h2/h3→200、25495（明文无 ip_access）h2c/h1.1→200、25496（明文+ip_access）h1.1→403。
+   > 注：verify2-wave5 报「TLS/h3 面已不复现」是因为本修复已先落进共享树；A/B 的 BEFORE 证明正是这 5 处。
+2. **[P2 · 本波唯一结构性任务] h3 配置/证书变更改为「先发 H3 GOAWAY 再关端点」**（Wave-2/3/4 一直记为未做的 O1）。
+   `h3.rs`：`serve()` 建 broadcast；watcher 变化时 `h3_graceful_endpoint_close()`（广播→宽限 `H3_SHUTDOWN_GRACE=5s`→
+   `ep.close()` 兜底，无连接不宽限）；每条连接 accept 循环改 `select!`，命中即 `server.shutdown(0).await` 发 GOAWAY 并
+   **继续服务在飞请求**（**不** break/self-close —— 否则 GOAWAY 与 CONNECTION_CLOSE 竞争、客户端收不到，真机踩到并修正）。
+   热路径零改动、无每请求锁。**真机（aioquic，自解析 control stream 抓 GOAWAY）**：
+   证书变更→GOAWAY@0.30s；config+SIGHUP→GOAWAY@0.45s；在飞 /slow(2s) 请求 GOAWAY@1.21s、响应 200@2.01s、连接未关；
+   服务端日志 `broadcast GOAWAY to 1 active connection(s), grace 5s` → 5s 后端点用新配置重启。
+
+## 扫描（scope 内，未发现新缺陷）
+- **QMux 帧边界（真机 25481）**：normal→404 正常；dup_tp_shrink/grow→CLOSE 0xa；zero_window→timeout（无自旋）；
+  oversized-record(2^62)→CLOSE 0x7「超过上限 16382」；truncated→timeout（等待、不崩）；unknown-frame-type→CLOSE 0x7。
+- **观察（P3，未改）**：`qmux::proto::RecordReader::set_max_record_size` 生产代码**无调用点**（全树仅测试引用），
+  reader 上限恒为默认 16382 —— 与**我方声明**的 `max_record_size` 一致，**非漏洞**，仅文档措辞略有出入。
+- h2 `WINDOW_UPDATE`/`SETTINGS_MAX_FRAME_SIZE`/`RST_STREAM`/半闭流/trailers 均由上游 `h2 0.4.x` 处理（本仓库无对应代码）；
+  h2 body 空闲超时 + 一帧延迟 `release_capacity` 正确。h3 0-RTT 默认关（`config.rs:801 early_data=false`）、
+  未启用 datagram 上层 API。CONNECT-UDP：隧道 permit 独立成 `H3_TUNNEL_GATE`（256），与 `H3_INFLIGHT` 互不饿死，
+  RAII 随隧道释放 —— **未见新饥饿面**。
+- **验证边界**：本机 UDP 出网被封 ⇒ CONNECT-UDP 真实上游往返未做（写明）；GOAWAY/h3 用回环 aioquic 已验。
+
+---
+
+# 【agent-perf2 1009 · perf2-wave5（h1/dns 地板 + 真 h2o 对比）】
+scope：`src/server/h1.rs`、`src/server/dns/mod.rs`、`src/server/dns/dot_doh.rs`、`src/server/dns/admin_api.rs`
+（`static_files.rs`/`Cargo.toml` 未改）。**未** commit/push/checkout/reset/stash/clean。
+报告 `.agents/1009/reports/perf2-wave5.md`、修复总结 `.agents/1009/fixes/perf2-wave5.md`。工具在 `~/scratch-perf2/`。
+
+## 头号结论（两条，都推翻/修正了上一轮）
+1. **拿到了真 h2o 做同机同客户端对比**（h2o 2.2.5，从 Ubuntu `h2o_2.2.5+dfsg2-11_amd64.deb` 用
+   `dpkg-deb -x` 免 root 解出直接跑；远程 `pkg_add h2o` → `Can't find h2o`，装不上，已放弃）。
+   **真实门禁差距 ≈ 1.4–1.5×，不是上一轮推断的 2.5–3×**：`ka` 静态小文件 `h2o/ours=1.47×`（吞吐）、
+   `ours/h2o=1.51×`（延迟）；404 路径 1.53×（2 线程、cores≈1.96、同一 127B 文件）。上一轮「历史 h2o ~130k rps」
+   推算被推翻（本机 2 线程 h2o 只有 ~51k rps）。
+2. **瓶颈不是 hyper，是我们自己的每请求应用层代码。** 把一个「立即回 200」的 stub 塞进
+   `h1::handle_request` 测出 **hyper h1 纯地板 ≈ 32µs/req（≈60–62k rps）≈ h2o 干完整件事的 36µs**。
+   差距全来自我们叠加的 **~18µs**：静态解析 8.5µs + 路由链/日志 6.7µs + 静态 body 3.4µs。
+   ⇒ **「换掉 hyper / 自写 h1 编解码」是错误方向**（换了也动不了这 18µs）；该砍的是应用层那 18µs。
+   另：去掉 `header_read_timeout`+`TokioTimer` 实测**无收益**（notimer 34.4k ≤ after3 36.0k），排除 timer 假设。
+
+## 落地的 5 处改动
+1. **`dns::effective()` 返回 `Arc<DnsConfig>`**（快路径 `(*e.cfg).clone()` → `Arc::clone`）——去掉**每请求
+   整份 `DnsConfig` 深拷贝**；`dot_doh.rs` 的 `dot_supervisor` 约束与 `dot_listener` 死代码、`admin_api.rs`
+   两个调用点配合调整（面板处按需 clone 一次，非热路径）。**跨 scope 点名项已落地。**
+2. **【功能修复】`h1.rs` 的 `access::is_allowed(&snap.ip_access, peer)` → `listener::ip_allowed(&snap.ip_access, &lc, peer)`**：
+   per-listener `[listeners.ip_access]` 此前在 **h1 的 TLS 口完全无效**（h2/h3 已接线）。真机 A/B：
+   TLS listener 配 `allow=["10.0.0.0/8"]`，从 127.0.0.1 访问 **改前 200 → 改后 403**。
+3. `h1.rs`：rewrite 未命中时复用已有 `path`（省一次 `to_string()`）。
+4. `h1.rs`：`dispatch_tail(.., lc.clone(), ..)` 改成先取 `is_https`、把 `lc` **移进** dispatch_tail（省一次
+   `ListenerConfig` 深拷贝）。
+5. `h1.rs`：`is_admin_path` 去重（复用 listeners_allow 判定结果，省一次 `format!` 分配）。
+
+## 数据（同机交替 A/B，冻结树构建以排除别的 agent 并发改动污染）
+- **改动 A/B（base2→after2）**：churn **+3.36%**、h2c **+2.04%**、admin +1.80%、404 +0.96%、ka +0.85%。
+  （含 #3-#5 的 after3 另测：churn +3.7%、h2c +5.4%、404 +3.2%、admin +1.8%；ka 被负载漂移淹没，
+  ABBA 3 轮比值 1.068/1.052/0.992 中位≈1.05。）⇒ **请求路径 +2–4%，量级小，不改变门禁结论。**
+- **单测 468 passed / 0 failed / 1 ignored。** **`effective()` 改 Arc 后 panel.toml 覆盖/热重载/回退语义
+  逐项真机验证未变**（明文口 DoH 识别：无 panel→400、panel doh=false→404、doh=true→400、删 panel→400）。
+
+## 下一步（可执行、带预估，全部在应用层）
+① 静态解析：`/` 结尾 URL 跳过冗余目录 stat（直走 `directory_index`，未命中再回退）+ 降 `CANON_CACHE`/
+`ROOT_CACHE` 两把 mutex/两 HashMap/若干分配（−5~7µs）；② 路由未配置项短路 + `admin_geoip::try_handle_public`
+（恒 None 的 stub）不再 `.await`（−2~3µs）；③ `access_log::log_response` 去掉多余 `live.snapshot()`（跨 scope，
+`access_log.rs`，−0.3~2.5µs）。**三者全落地：`/` 50.7µs→~41µs→~48.8k rps→`h2o/ours≈1.04×`，有望压进 1.2×。**
+详见报告 §8。

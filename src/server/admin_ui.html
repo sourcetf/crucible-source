@@ -370,6 +370,12 @@ img.preview{max-width:100%;max-height:420px}
         <div><label>country / 省市</label><input id="geoCountry" size="10"/></div>
         <div><label>isp</label><input id="geoIsp" size="10"/></div>
         <div><label>cloud</label><input id="geoCloud" size="10"/></div>
+        <div><label>family</label>
+          <select id="geoFamily">
+            <option value="">全部</option><option value="v4">IPv4</option><option value="v6">IPv6</option>
+          </select>
+        </div>
+        <div><label>prefix</label><input id="geoPrefix" size="12"/></div>
         <div><label>limit</label><input id="geoLimit" size="5" value="50"/></div>
         <div><button class="act" id="btnGeoFilter">筛选</button></div>
       </div>
@@ -1401,6 +1407,7 @@ function prRow(r){
   tr.innerHTML='<td><input class="r-match" value="'+esc(scrubBrand(r.match_url||''))+'" placeholder="/old/*"/></td>'
     +'<td><select class="r-action">'+PR_ACTIONS.map(a=>'<option'+(a===(r.action||'redirect')?' selected':'')+'>'+a+'</option>').join('')+'</select></td>'
     +'<td><input class="r-target" value="'+esc(r.target||'')+'" placeholder="/new 或 301:https://… 或 Cache 指令"/></td>'
+    +'<td><input class="r-prio" size="4" value="'+esc(String(r.priority==null?0:r.priority))+'" title="数值越大越先评估"/></td>'
     +'<td class="actions"><button class="act mini danger">删</button></td>';
   tr.querySelector('button.danger').onclick=()=>tr.remove();
   return tr;
@@ -1410,7 +1417,7 @@ function renderPr(){
   const wrap=$('prOut');
   if(!l){wrap.innerHTML='<p class="hint">无站点。</p>';return;}
   const table=document.createElement('table');table.className='data';
-  table.innerHTML='<thead><tr><th>match_url</th><th>action</th><th>target</th><th></th></tr></thead>';
+  table.innerHTML='<thead><tr><th>match_url</th><th>action</th><th>target</th><th>priority</th><th></th></tr></thead>';
   const tb=document.createElement('tbody');
   (l.page_rules||[]).forEach(r=>tb.appendChild(prRow(r)));
   table.appendChild(tb);
@@ -1422,7 +1429,8 @@ function renderPr(){
       rules.push({
         match_url:tr.querySelector('.r-match').value.trim(),
         action:tr.querySelector('.r-action').value,
-        target:tr.querySelector('.r-target').value.trim()||null
+        target:tr.querySelector('.r-target').value.trim()||null,
+        priority:parseInt(tr.querySelector('.r-prio').value,10)||0
       });
     });
     const r=await api('/api/page_rules/save',jpost({port:parseInt($('prPort').value,10),rules:rules}));
@@ -1620,7 +1628,7 @@ $('btnGeoipLookup').onclick=async()=>{
   el.innerHTML=h;
 };
 $('btnGeoFilter').onclick=async()=>{
-  const q=new URLSearchParams({country:$('geoCountry').value.trim(),isp:$('geoIsp').value.trim(),cloud:$('geoCloud').value.trim(),limit:$('geoLimit').value.trim()||'50'});
+  const q=new URLSearchParams({country:$('geoCountry').value.trim(),isp:$('geoIsp').value.trim(),cloud:$('geoCloud').value.trim(),family:$('geoFamily').value,prefix:$('geoPrefix').value.trim(),limit:$('geoLimit').value.trim()||'50'});
   const r=await apiJson('/api/geoip/filter?'+q.toString());
   const el=$('geoFilterOut');
   if(!r.ok||!r.json){el.innerHTML='<pre class="err">'+esc(r.text)+'</pre>';return;}

@@ -207,7 +207,11 @@ pub async fn run(live: Arc<LiveConfig>) -> Result<()> {
                     let need = match listener_addrs(lc) {
                         Ok(addrs) => {
                             let a = active_r.lock().await;
+                            // 地址没绑上 ⇒ 重建；**或 h3 端点不在跑**（例如 http_versions
+                            // 去掉 h3 后端点停了，之后又重新加回）⇒ 也要重建，否则 QUIC 面
+                            // 永远不恢复（端点任务已退出，仅靠地址记账看不出来）。
                             addrs.iter().any(|ad| !a.contains(&addr_key(&key, ad)))
+                                || (lc.allows_h3() && !a.contains(&format!("h3|{key}")))
                         }
                         Err(_) => true,
                     };
@@ -313,6 +317,141 @@ fn listener_addrs(
         .collect()
 }
 
+/// 绑定一个 TCP 监听 socket；可显式设置 `IPV6_V6ONLY`（见下）。
+///
+/// **为什么需要这个函数（而不是直接 `tokio::net::TcpListener::bind`）**：
+/// 本实现的双栈语义是「v4 与 v6 **各绑一个** socket」（`listener_addrs` 先 v4 后 v6，
+/// 见其注释）。OpenBSD 上 `[::]` 默认就是 v6-only（`net.inet6.ip6.v6only=1`），两个 bind
+/// 互不冲突；但 **Linux 默认 `v6only=0`** —— 先绑 `0.0.0.0:P` 再绑 `[::]:P` 时，内核把
+/// 后者视为与 v4 通配冲突，返回 `EADDRINUSE`（验收 agent 黑盒复现：整个 IPv6 监听面丢失，
+/// 日志只有一条 `bind [::]:P: Address already in use`）。
+///
+/// 显式 `IPV6_V6ONLY=1` 让 Linux 与 OpenBSD 行为一致：v6 socket 只管 v6、v4 socket 管 v4。
+/// `v6only` 只在「同一 listener 同时绑 v4 与 v6」时为真（此时必须切开两个 socket）；
+/// 只配单个 v6 地址时不改默认，保留「Linux 上 `[::]` 单栈即可覆盖双栈」的既有行为
+/// （避免把 `address = "::"` 这种单地址配置意外收窄成 v6-only）。
+fn bind_tcp(addr: SocketAddr, v6only: bool) -> std::io::Result<std::net::TcpListener> {
+    use std::os::fd::{FromRawFd, RawFd};
+
+    let family = if addr.is_ipv6() {
+        libc::AF_INET6
+    } else {
+        libc::AF_INET
+    };
+    let fd: RawFd = unsafe { libc::socket(family, libc::SOCK_STREAM, 0) };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // 从这里起任何失败都要先 close(fd)，否则 fd 泄漏。
+    let close = |fd: RawFd| unsafe {
+        libc::close(fd);
+    };
+    let set_int =
+        |fd: RawFd, level: libc::c_int, name: libc::c_int, val: libc::c_int| -> std::io::Result<()> {
+            let rc = unsafe {
+                libc::setsockopt(
+                    fd,
+                    level,
+                    name,
+                    &val as *const libc::c_int as *const libc::c_void,
+                    std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+                )
+            };
+            if rc != 0 {
+                Err(std::io::Error::last_os_error())
+            } else {
+                Ok(())
+            }
+        };
+
+    // SO_REUSEADDR：与 tokio 在 unix 上的 bind 行为保持一致（TIME_WAIT 友好）。
+    if let Err(e) = set_int(fd, libc::SOL_SOCKET, libc::SO_REUSEADDR, 1) {
+        close(fd);
+        return Err(e);
+    }
+    if v6only {
+        // 只有 v6 socket 谈得上 IPV6_V6ONLY；对 v4 socket 设它会得到 ENOPROTOOPT。
+        if let Err(e) = set_int(fd, libc::IPPROTO_IPV6, libc::IPV6_V6ONLY, 1) {
+            close(fd);
+            return Err(e);
+        }
+    }
+
+    // 组装 sockaddr。BSD 的 sockaddr_in/sockaddr_in6 有 len 字段、Linux 没有 → 用 cfg 处理。
+    let mut storage: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
+    let len = match addr {
+        SocketAddr::V4(v4) => {
+            let sin = unsafe {
+                &mut *(&mut storage as *mut libc::sockaddr_storage as *mut libc::sockaddr_in)
+            };
+            sin.sin_family = libc::AF_INET as libc::sa_family_t;
+            sin.sin_port = v4.port().to_be();
+            sin.sin_addr.s_addr = u32::from(*v4.ip()).to_be();
+            #[cfg(any(
+                target_os = "openbsd",
+                target_os = "netbsd",
+                target_os = "freebsd",
+                target_os = "dragonfly",
+                target_os = "macos",
+                target_os = "ios"
+            ))]
+            {
+                sin.sin_len = std::mem::size_of::<libc::sockaddr_in>() as u8;
+            }
+            std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t
+        }
+        SocketAddr::V6(v6) => {
+            let sin6 = unsafe {
+                &mut *(&mut storage as *mut libc::sockaddr_storage as *mut libc::sockaddr_in6)
+            };
+            sin6.sin6_family = libc::AF_INET6 as libc::sa_family_t;
+            sin6.sin6_port = v6.port().to_be();
+            sin6.sin6_addr = libc::in6_addr {
+                s6_addr: v6.ip().octets(),
+            };
+            sin6.sin6_scope_id = v6.scope_id();
+            #[cfg(any(
+                target_os = "openbsd",
+                target_os = "netbsd",
+                target_os = "freebsd",
+                target_os = "dragonfly",
+                target_os = "macos",
+                target_os = "ios"
+            ))]
+            {
+                sin6.sin6_len = std::mem::size_of::<libc::sockaddr_in6>() as u8;
+            }
+            std::mem::size_of::<libc::sockaddr_in6>() as libc::socklen_t
+        }
+    };
+    let rc = unsafe {
+        libc::bind(
+            fd,
+            &storage as *const libc::sockaddr_storage as *const libc::sockaddr,
+            len,
+        )
+    };
+    if rc != 0 {
+        let e = std::io::Error::last_os_error();
+        close(fd);
+        return Err(e);
+    }
+    if unsafe { libc::listen(fd, 1024) } != 0 {
+        let e = std::io::Error::last_os_error();
+        close(fd);
+        return Err(e);
+    }
+    // 非阻塞（tokio 要求）+ CLOEXEC（避免被引擎子进程继承监听 fd）。
+    unsafe {
+        let fl = libc::fcntl(fd, libc::F_GETFL);
+        if fl >= 0 {
+            libc::fcntl(fd, libc::F_SETFL, fl | libc::O_NONBLOCK);
+        }
+        libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC);
+    }
+    Ok(unsafe { std::net::TcpListener::from_raw_fd(fd) })
+}
+
 async fn spawn_listener_port(
     live: Arc<LiveConfig>,
     lc: crate::config::ListenerConfig,
@@ -323,19 +462,29 @@ async fn spawn_listener_port(
     // 绑定键含地址：同端口不同地址是**两个** listener，改地址也能正确重建（C-2）。
     let key = bind_key(&lc);
     let addrs = listener_addrs(&lc)?;
+    // 双栈（同时有 v4 与 v6 地址）时，v6 socket 必须显式 V6ONLY，否则 Linux 上两个 bind
+    // 会冲突（见 `bind_tcp`）。单地址/单栈配置不改默认。
+    let dual_stack = addrs.iter().any(|a| a.is_ipv4()) && addrs.iter().any(|a| a.is_ipv6());
     // 逐地址登记 + 逐地址绑定：**部分失败不牵连已经绑上的地址**（见 `addr_key` 的说明）。
     let mut listeners: Vec<(SocketAddr, tokio::net::TcpListener)> = Vec::new();
     let mut first_err: Option<anyhow::Error> = None;
-    for addr in addrs {
+    // 有多少地址**已经**在跑（本次被跳过）。用于区分「本次没绑任何新地址」的两种含义：
+    //   ① 全都已经在跑（正常，无需重建 TCP）  ② 全都绑失败（真失败）。
+    let mut already_active = 0usize;
+    for addr in addrs.iter().copied() {
         let akey = addr_key(&key, &addr);
         {
             let mut a = active.lock().await;
             if a.contains(&akey) {
+                already_active += 1;
                 continue; // 这个地址已有活着的 accept 任务
             }
             a.insert(akey.clone());
         }
-        match TcpListener::bind(addr).await {
+        // 用 `bind_tcp` 而不是 `TcpListener::bind`：只有前者能在 bind 前设 IPV6_V6ONLY。
+        let bound = bind_tcp(addr, addr.is_ipv6() && dual_stack)
+            .and_then(tokio::net::TcpListener::from_std);
+        match bound {
             Ok(l) => listeners.push((addr, l)),
             Err(e) => {
                 // 只注销**这个地址**的账，让 reconciler 2s 后单独重试它；
@@ -347,13 +496,22 @@ async fn spawn_listener_port(
             }
         }
     }
-    if listeners.is_empty() {
-        return Err(first_err
-            .unwrap_or_else(|| anyhow::anyhow!("listener {key}: 没有可绑定的地址")));
+    // h3/QUIC 的 UDP 绑定地址：优先用本次新绑的第一个地址；若本次没绑新的（全部已在跑），
+    // 用配置里的第一个地址 —— 它必然已经在 active 里（否则不会被跳过），UDP 与 TCP 不冲突。
+    let h3_addr = listeners
+        .first()
+        .map(|(a, _)| *a)
+        .or_else(|| addrs.first().copied());
+    // 这个 listener 是否有任何一个地址在服务（本次新绑 或 早已在跑）。用于区分
+    // 「没绑新地址是因为全在跑」与「全绑失败」（后者 first_err 为 Some，另有返回）。
+    let bound_or_active = !listeners.is_empty() || already_active > 0;
+
+    if !listeners.is_empty() {
+        maybe_set_busy_poll(&listeners[0].1);
+        for (a, _) in &listeners {
+            log::info!("listener[{idx}] ready on {a} root={}", lc.root.display());
+        }
     }
-    let addr = listeners[0].0;
-    maybe_set_busy_poll(&listeners[0].1);
-    for (a, _) in &listeners { log::info!("listener[{idx}] ready on {a} root={}", lc.root.display()); }
 
     for (a, listener) in listeners {
         let live_c = Arc::clone(&live);
@@ -370,47 +528,81 @@ async fn spawn_listener_port(
             log::warn!("accept_loop {a} ended: {res:?}");
         });
     }
+    // HTTP/3 端点：**必须在下面的 `first_err` 提前返回之前**启动。
+    //
+    // 旧实现把 `if let Some(e) = first_err { return Err(e) }` 排在这里之前 ⇒ 只要**任一**
+    // 地址绑不上（双栈冲突、某地址被别的进程占用、权限不足…），该 listener 的 h3/QUIC
+    // 端点就永远起不来，而且日志里**没有任何** h3 相关报错（验收 agent 对照复现：去掉
+    // `address_v6` 后 h3 UDP 立刻正常、`h3 GET / → 200`）。地址绑定失败只该影响**那个
+    // 地址**的 TCP/HTTP 面，不该牵连同 listener 的 QUIC 端点。
+    if lc.allows_h3() {
+      if let Some(udp_addr) = h3_addr {
+        // 去重：reconciler 会因某个地址没绑上而每 2s 重调本函数；若每次都能再 spawn 一个
+        // h3 任务，就会重复 bind 同一个 UDP 端口。用 active 集合里的合成键 `h3|<key>` 记账，
+        // 任务退出（listener 被删）时自行注销，保证同一 listener 只跑一个 h3 端点。
+        let h3key = format!("h3|{key}");
+        let should_spawn = {
+            let mut a = active.lock().await;
+            if a.contains(&h3key) {
+                false
+            } else {
+                a.insert(h3key.clone());
+                true
+            }
+        };
+        if should_spawn {
+            let live_h3 = Arc::clone(&live);
+            let active_h3 = Arc::clone(&active);
+            let h3key_c = h3key.clone();
+            let key_h3 = key.clone();
+            tokio::spawn(async move {
+                loop {
+                    // 每轮都从 live 快照**重新取**配置（不再克隆一次用到天荒地老）：
+                    // `serve()` 因配置/材料变化主动返回后，这里就能用新配置重启端点。
+                    let Some(cur) = live_h3
+                        .snapshot()
+                        .listeners
+                        .iter()
+                        .find(|l| crate::server::bind_key(l) == key_h3)
+                        .cloned()
+                    else {
+                        log::info!("h3 listener {key_h3} removed; stopping");
+                        break;
+                    };
+                    // **http_versions 去掉 "h3"** 也必须停：原来只判「listener 还在不在」，
+                    // 于是把 h3 从 http_versions 里删掉后，QUIC 端点每轮照旧重新 bind+serve
+                    // —— UDP/QUIC 面继续在服务（面板显示 h3 已关），只有删掉整个 listener 才停。
+                    if !cur.allows_h3() {
+                        log::info!("h3 listener {key_h3}: http_versions 不再含 h3，停止 QUIC 端点");
+                        break;
+                    }
+                    let fp = crate::server::h3::h3_config_fingerprint(&cur);
+                    crate::server::h3::set_h3_config_fingerprint(port, fp);
+                    let rx = crate::server::h3::h3_config_watch(port, fp);
+                    if let Err(e) =
+                        crate::server::h3::serve(udp_addr, cur, Arc::clone(&live_h3), fp, rx).await
+                    {
+                        log::warn!("h3 listener {udp_addr}: {e:#}; retry in 5s");
+                        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                    }
+                }
+                // 端点已停：注销 h3 记账，这样 listener 被重新加回（或 http_versions 重新
+                // 含 h3）时 reconciler 能再次拉起它（见 reconciler 的 `need` 判定）。
+                active_h3.lock().await.remove(&h3key_c);
+            });
+        }
+      }
+    }
+
     // 有地址没绑上：把错误交回调用方（记日志 + 让 reconciler 重试该地址），
-    // 但**不要**因此丢掉上面已经起来的那些地址。
+    // 但**不要**因此丢掉上面已经起来的那些地址，也**不要**因此跳过 h3 端点。
     if let Some(e) = first_err {
         return Err(e);
     }
-
-    if lc.allows_h3() {
-        let udp_addr = addr;
-        let live_h3 = Arc::clone(&live);
-        tokio::spawn(async move {
-            loop {
-                // 每轮都从 live 快照**重新取**配置（不再克隆一次用到天荒地老）：
-                // `serve()` 因配置/材料变化主动返回后，这里就能用新配置重启端点。
-                let Some(cur) = live_h3
-                    .snapshot()
-                    .listeners
-                    .iter()
-                    .find(|l| crate::server::bind_key(l) == key)
-                    .cloned()
-                else {
-                    log::info!("h3 listener {key} removed; stopping");
-                    break;
-                };
-                // **http_versions 去掉 "h3"** 也必须停：原来只判「listener 还在不在」，
-                // 于是把 h3 从 http_versions 里删掉后，QUIC 端点每轮照旧重新 bind+serve
-                // —— UDP/QUIC 面继续在服务（面板显示 h3 已关），只有删掉整个 listener 才停。
-                if !cur.allows_h3() {
-                    log::info!("h3 listener {key}: http_versions 不再含 h3，停止 QUIC 端点");
-                    break;
-                }
-                let fp = crate::server::h3::h3_config_fingerprint(&cur);
-                crate::server::h3::set_h3_config_fingerprint(port, fp);
-                let rx = crate::server::h3::h3_config_watch(port, fp);
-                if let Err(e) =
-                    crate::server::h3::serve(udp_addr, cur, Arc::clone(&live_h3), fp, rx).await
-                {
-                    log::warn!("h3 listener {udp_addr}: {e:#}; retry in 5s");
-                    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-                }
-            }
-        });
+    // 本次既没绑上任何新地址、也没有任何地址已在跑 ⇒ 所有地址都绑失败（first_err 必为
+    // Some，上面已返回）。保留这道兜底只为防御 `addrs` 为空这种不可能情形。
+    if !bound_or_active {
+        return Err(anyhow::anyhow!("listener {key}: 没有可绑定的地址"));
     }
     Ok(())
 }
@@ -881,6 +1073,60 @@ mod bind_key_tests {
             crate::server::bind_key(&same),
             "端口必须参与键"
         );
+    }
+}
+
+#[cfg(all(test, unix))]
+mod bind_tcp_tests {
+    use super::bind_tcp;
+
+    fn v6only_of(l: &std::net::TcpListener) -> libc::c_int {
+        use std::os::fd::AsRawFd;
+        let mut val: libc::c_int = -1;
+        let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+        let rc = unsafe {
+            libc::getsockopt(
+                l.as_raw_fd(),
+                libc::IPPROTO_IPV6,
+                libc::IPV6_V6ONLY,
+                &mut val as *mut libc::c_int as *mut libc::c_void,
+                &mut len,
+            )
+        };
+        assert_eq!(rc, 0, "getsockopt IPV6_V6ONLY: {}", std::io::Error::last_os_error());
+        val
+    }
+
+    /// V3-2 回归：**同端口**先绑 v4 通配、再绑 v6 通配必须都成功。
+    ///
+    /// 这正是验收 agent 黑盒复现的缺陷：Linux 默认 `v6only=0`，`[::]:P` 会与
+    /// `0.0.0.0:P` 冲突（EADDRINUSE）⇒ 整个 IPv6 面丢失。修复靠对 v6 socket 显式设
+    /// `IPV6_V6ONLY=1`。没有这条测试，有人把 `v6only` 参数去掉也不会有测试变红。
+    #[test]
+    fn dual_stack_same_port_binds_both() {
+        let v4 = bind_tcp("0.0.0.0:0".parse().unwrap(), false).expect("v4 wildcard bind");
+        let port = v4.local_addr().unwrap().port();
+        let v6 = bind_tcp(format!("[::]:{port}").parse().unwrap(), true);
+        assert!(
+            v6.is_ok(),
+            "dual-stack：同端口 v6 必须能绑（V6ONLY=1），实际 {:?}",
+            v6.err()
+        );
+        assert_eq!(v6only_of(&v6.unwrap()), 1, "dual-stack v6 socket 必须 V6ONLY=1");
+    }
+
+    /// 只配单个 v6 地址时不设 V6ONLY —— 保留 Linux 上「`[::]` 单栈即覆盖双栈」的行为。
+    #[test]
+    fn single_v6_keeps_default_v6only() {
+        let l = bind_tcp("[::]:0".parse().unwrap(), false).expect("v6 bind");
+        // Linux 默认 v6only=0（双栈）；这里只断言「没有被我们改成 1」。
+        assert_eq!(v6only_of(&l), 0, "单 v6 地址不应被强制 V6ONLY=1");
+    }
+
+    #[test]
+    fn v4_socket_binds_and_is_v4() {
+        let l = bind_tcp("127.0.0.1:0".parse().unwrap(), false).expect("v4 bind");
+        assert!(l.local_addr().unwrap().is_ipv4());
     }
 }
 

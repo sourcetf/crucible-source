@@ -244,7 +244,7 @@ where
                     // 纯判定，提前到收 body 之前做不会影响限流计数，因此这里先补判一次；
                     // 限流是有状态的（消耗令牌），仍留在 handle_h2 里只算一次。
                     let reject: Option<(StatusCode, Option<u64>, &'static str)> =
-                        if !crate::server::access::is_allowed(&snap.ip_access, peer) {
+                        if !crate::server::listener::ip_allowed(&snap.ip_access, &lc, peer) {
                             let (st, msg) = crate::server::access::deny_response();
                             Some((st, None, msg))
                         } else if !snap.admin.listener_allowed(lc.port) {
@@ -910,7 +910,7 @@ async fn handle_h2(
 
     let snap = live.snapshot();
     // DoH 分流已下移到 ACL/限速之后（见下方），此处不再提前返回。
-    if !crate::server::access::is_allowed(&snap.ip_access, peer) {
+    if !crate::server::listener::ip_allowed(&snap.ip_access, &lc, peer) {
         return tag(
             Response::builder()
                 .status(StatusCode::FORBIDDEN)
@@ -957,44 +957,66 @@ async fn handle_h2(
     // DoH 挪到这里（ACL/限速之后、basic auth 之前）：
     // 原先排在 is_allowed 之前，等于绕过监听器 IP 白名单与限速白拿一个递归解析器；
     // 而排在 basic auth 之前是因为 DoH 客户端无法交互式提供 Basic 凭据。
+    //
+    // **RFC 8484 §5：DoH 必须走 https。** h1 已在**明文口**上对 DoH 请求回 400
+    // （见 `h1.rs` 同名注释），h2 此前却**不看 listener 是否 TLS** —— 明文 h2c 口上的
+    // `/dns-query` 被当成 DoH 正常应答（真机实测：明文 h2c 回 504「dns upstream timeout」
+    // 而 h1 同请求回 400），等于任何能连上明文口的人都白拿一个递归解析器，也违反 MUST。
+    // 这里与 h1 **完全同判**：TLS listener 上照常 DoH；明文口上若确实是 DoH 请求回 400
+    // （port_reuse 明文口例外：交由既定 301 重定向到 https，与 h1 一致）。
     {
         let dns_eff = crate::server::dns::effective(&snap);
         if dns_eff.enabled && dns_eff.doh.enabled {
-            // 只有「确实是 DoH 请求」才收 body —— 否则会给普通上传白白套上 8MiB 上限。
-            // 判定条件与 doh_prepared 的前几个早退分支保持一致（path + host）。
-            //
-            // 权威名必须取 **uri** 形态：HTTP/2 的 `:authority` 伪头由 crate 放进
-            // `Request::uri().authority()`，`HeaderMap` 里**没有** `Host`（真实 h2 客户端
-            // 也不发 Host）。此前用 `headers().get(HOST)` 恒为 None ⇒ 配了 `[dns.doh].hostnames`
-            // 白名单的部署在 h2 下 `is_doh_request` 恒 false，DoH 请求全部落到静态层 404。
-            // `is_doh_request_uri` 就是为 h2/h3 准备的（Host 优先、回退 authority），
-            // 与 `doh_prepared` 里的 `request_authority` 同一判据。
-            if crate::server::dns::dot_doh::is_doh_request_uri(&dns_eff, req.uri())
-            {
-                let collected = match collect_bytes(req, REQUEST_BODY_CAP).await {
-                    Ok(r) => r,
-                    Err(resp) => return tag(resp, "dns-doh"),
-                };
-                let (parts, body) = collected.into_parts();
-                let (method, uri, headers) = (
-                    parts.method.clone(),
-                    parts.uri.clone(),
-                    parts.headers.clone(),
-                );
-                let body_for_rest = body.clone();
-                if let Some(resp) = crate::server::dns::dot_doh::doh_prepared(
-                    &dns_eff,
-                    &method,
-                    &uri,
-                    &headers,
-                    body,
-                    peer,
-                )
-                .await
+            if lc.ssl.is_some() {
+                // 只有「确实是 DoH 请求」才收 body —— 否则会给普通上传白白套上 8MiB 上限。
+                // 判定条件与 doh_prepared 的前几个早退分支保持一致（path + host）。
+                //
+                // 权威名必须取 **uri** 形态：HTTP/2 的 `:authority` 伪头由 crate 放进
+                // `Request::uri().authority()`，`HeaderMap` 里**没有** `Host`（真实 h2 客户端
+                // 也不发 Host）。此前用 `headers().get(HOST)` 恒为 None ⇒ 配了 `[dns.doh].hostnames`
+                // 白名单的部署在 h2 下 `is_doh_request` 恒 false，DoH 请求全部落到静态层 404。
+                // `is_doh_request_uri` 就是为 h2/h3 准备的（Host 优先、回退 authority），
+                // 与 `doh_prepared` 里的 `request_authority` 同一判据。
+                if crate::server::dns::dot_doh::is_doh_request_uri(&dns_eff, req.uri())
                 {
-                    return tag(collect_to_bytes(resp).await, "dns-doh");
+                    let collected = match collect_bytes(req, REQUEST_BODY_CAP).await {
+                        Ok(r) => r,
+                        Err(resp) => return tag(resp, "dns-doh"),
+                    };
+                    let (parts, body) = collected.into_parts();
+                    let (method, uri, headers) = (
+                        parts.method.clone(),
+                        parts.uri.clone(),
+                        parts.headers.clone(),
+                    );
+                    let body_for_rest = body.clone();
+                    if let Some(resp) = crate::server::dns::dot_doh::doh_prepared(
+                        &dns_eff,
+                        &method,
+                        &uri,
+                        &headers,
+                        body,
+                        peer,
+                    )
+                    .await
+                    {
+                        return tag(collect_to_bytes(resp).await, "dns-doh");
+                    }
+                    req = Request::from_parts(parts, bytes_body(body_for_rest));
                 }
-                req = Request::from_parts(parts, bytes_body(body_for_rest));
+            } else if !lc.port_reuse
+                && crate::server::dns::dot_doh::is_doh_request_uri(&dns_eff, req.uri())
+            {
+                // 明文口上的 DoH 请求：拒绝（与 h1 同一状态码与文案）。
+                return tag(
+                    Response::builder()
+                        .status(StatusCode::BAD_REQUEST)
+                        .body(Bytes::from_static(
+                            b"DoH requires HTTPS (RFC 8484 section 5)",
+                        ))
+                        .unwrap(),
+                    "dns-doh",
+                );
             }
         }
     }
@@ -1259,7 +1281,7 @@ mod tests {
         let admin = tail
             .find("crate::server::admin::handle(")
             .expect("admin call");
-        let ip = tail.find("is_allowed").expect("ip_access");
+        let ip = tail.find("listener::ip_allowed").expect("ip_access");
         assert!(ip < ba && ba < admin, "order must be ip_access → basic_auth → admin");
     }
 
@@ -1277,6 +1299,31 @@ mod tests {
         assert!(
             guard < ba,
             "check_listener_headers 必须被 if !admin_path 包住（guard={guard} ba={ba}）"
+        );
+    }
+
+    /// P1 回归：h2 的 DoH 分流必须与 h1 一样看 TLS —— 明文 h2c 口上的 `/dns-query`
+    /// 必须回 400（RFC 8484 §5），而不是被当成 DoH 正常应答。真机 A/B：修复前明文
+    /// h2c 回 504（走到了上游 named），修复后与 h1 同判 400。
+    #[test]
+    fn h2_doh_requires_tls() {
+        let src = include_str!("h2.rs");
+        let pos = src.find("async fn handle_h2").expect("handle_h2");
+        let tail = &src[pos..];
+        let ssl = tail
+            .find("if lc.ssl.is_some() {")
+            .expect("DoH TLS gate");
+        let prepared = tail.find("doh_prepared(").expect("doh_prepared call");
+        assert!(
+            ssl < prepared,
+            "DoH 处理必须在 `if lc.ssl.is_some()` 之内（ssl={ssl} prepared={prepared}）"
+        );
+        let bad = tail
+            .find("DoH requires HTTPS (RFC 8484 section 5)")
+            .expect("明文 DoH 拒绝文案");
+        assert!(
+            ssl < bad,
+            "明文 DoH 拒绝分支必须在 TLS 门之后（ssl={ssl} bad={bad}）"
         );
     }
 

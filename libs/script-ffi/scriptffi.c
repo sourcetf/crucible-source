@@ -93,7 +93,10 @@ static const char *interp_for(const char *lang)
  * Py_Initialize 的线程才该释放，那由 crucible_py_ensure_init 内部保证。 */
 static int crucible_scriptffi_py_boot(char *err, size_t errsz)
 {
-    return crucible_py_ensure_init(Py_IsInitialized, Py_Initialize, PyEval_SaveThread,
+    /* PyEval_SaveThread 返回 PyThreadState*，共享 ABI 用 void*（宽度一致）；
+     * GCC 15 把函数指针类型不兼容当错误，故显式转换。 */
+    return crucible_py_ensure_init(Py_IsInitialized, Py_Initialize,
+                                   (void *(*)(void))PyEval_SaveThread,
                                    err, errsz);
 }
 

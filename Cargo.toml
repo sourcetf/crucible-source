@@ -99,7 +99,11 @@ rustls-pemfile = { version = "2", optional = true }
 cc = "1"
 
 [profile.release]
-lto = "thin"
+# 性能攻坚（工号 1009）：`thin` → `fat`。请求热路径上的分派/包装大量跨 crate
+# （boring / quinn / hyper / h2 / h3-quinn），fat LTO 能把它们内联掉。代价是最终
+# link 阶段做全量 LTO —— 本机 32 核可接受，但 1 vCPU 生产机（OpenBSD）整轮重链会
+# 明显变慢，构建时间成本见报告。行为语义不变（纯代码生成选项）。
+lto = "fat"
 codegen-units = 1
 
 

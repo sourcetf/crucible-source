@@ -10,6 +10,21 @@ use std::path::Path;
 /// 静默跳过（打开失败也不落日志），表现为「覆盖列表有、lookup 不生效」。
 const BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
+/// §23.6：面板 SQLite 库路径。此前**多处**硬编码 `data/geoip/panel.sqlite`
+/// （`admin_geoip.rs` 12 处 + `covering.rs` merge_pipeline 1 处），
+/// 于是 `CRUCIBLE_GEOIP_PANEL_DB` 之类的部署覆盖完全无效、面板设置也无从指向
+/// 自定义位置。这里集中成一个解析器：env 覆盖 → 默认值。
+///
+/// 用 `read_static_env`（启动期缓存）而非裸 `std::env::var`：本函数在面板每个请求
+/// 上被调用，而应用引擎会在请求期 `setenv`，libc 的 environ realloc 会让并发
+/// `getenv` 踩到已释放内存（见 `apps/env_lock`）。
+pub fn panel_db_path() -> std::path::PathBuf {
+    crate::server::apps::env_lock::read_static_env("CRUCIBLE_GEOIP_PANEL_DB")
+        .filter(|s| !s.trim().is_empty())
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::path::PathBuf::from("data/geoip/panel.sqlite"))
+}
+
 const MIGRATE_COLS: &[(&str, &str)] = &[
     ("prefix", "TEXT"),
     ("bits", "INTEGER DEFAULT 0"),

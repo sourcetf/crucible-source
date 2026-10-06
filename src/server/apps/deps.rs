@@ -239,6 +239,14 @@ fn resolve_docroot(lc: &ListenerConfig, app: &AppRouteConfig) -> PathBuf {
     absolutize(&app.docroot.clone().unwrap_or_else(|| lc.root.clone()))
 }
 
+/// [`resolve_docroot`] 的公开包装：给上传闸门判「目标是否落在某应用 docroot 内」用。
+///
+/// 应用 docroot 是**运行期目录**：`init.sh` 会被 `ensure_app_deps` 用 `sh` 执行、
+/// `deps/bin/index` 会被 sidecar 引擎当可执行文件拉起 —— 上传若能写进去就等于 RCE。
+pub fn app_docroot(lc: &ListenerConfig, app: &AppRouteConfig) -> PathBuf {
+    resolve_docroot(lc, app)
+}
+
 /// 相对路径 → 绝对路径（以进程当前目录为基准，**词法**拼接，不 canonicalize）。
 ///
 /// 协调员已修 `src/config.rs`（base 绝对化）；这里是**防御性**兜底：任何直接构造的
@@ -396,6 +404,7 @@ mod tests {
             status_path: None,
             port_reuse: false,
             rate_limit: None,
+            ip_access: None,
             l4_forward: None,
             quic_ecn: false,
             qmux: false,

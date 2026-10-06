@@ -1747,6 +1747,10 @@ fn save_page_rules(live: &Arc<LiveConfig>, v: &Json) -> Response<BoxBody> {
                 );
             }
         }
+        // §16.11 优先级：显式写出（含 0）便于面板回显与手改；缺省不写也能反序列化为 0。
+        if let Some(p) = r.get("priority").and_then(|x| x.as_i64()) {
+            t.insert("priority".into(), toml::Value::Integer(p));
+        }
         out.push(toml::Value::Table(t));
     }
     let mut tree = match cfg_edit::load_tree(live.path()) {
@@ -2212,6 +2216,12 @@ fn check_page_rule(rule: &Json, idx: usize) -> Result<(), String> {
             "rule[{idx}] action 不合法: {action:?}（只能是 {}）",
             PAGE_RULE_ACTIONS.join("/")
         ));
+    }
+    // §16.11 优先级：必须能解析成整数（面板可能传来 "abc"/空串）；缺省视为 0。
+    if let Some(p) = rule.get("priority") {
+        if !p.is_null() && p.as_i64().is_none() {
+            return Err(format!("rule[{idx}].priority 必须是整数（当前 {p:?}）"));
+        }
     }
     let target = rule.get("target").and_then(|t| t.as_str()).map(str::trim);
     if let Some(t) = target {
@@ -2914,11 +2924,12 @@ async fn handle_rules_api(
                     // match_url 与 action/target 同一口径 scrub：旧配置/手写 toml 里的
                     // 品牌词不得经 GET 回显扩散到面板（保存入口早已 scrub）。
                     s.push_str(&format!(
-                        "{{\"idx\":{},\"match_url\":{},\"action\":{},\"target\":{}}}",
+                        "{{\"idx\":{},\"match_url\":{},\"action\":{},\"target\":{},\"priority\":{}}}",
                         i,
                         json_str(&crate::server::page_rules::scrub_brand(&r.match_url)),
                         json_str(&crate::server::page_rules::scrub_brand(&r.action)),
-                        target
+                        target,
+                        r.priority
                     ));
                 }
             }
@@ -3040,6 +3051,9 @@ async fn handle_rules_api(
                             toml::Value::String(crate::server::page_rules::scrub_brand(tg)),
                         );
                     }
+                }
+                if let Some(p) = v.get("priority").and_then(|x| x.as_i64()) {
+                    t.insert("priority".into(), toml::Value::Integer(p));
                 }
                 toml::Value::Table(t)
             }

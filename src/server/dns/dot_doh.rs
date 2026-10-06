@@ -819,11 +819,11 @@ pub async fn dot_listener(dns: crate::config::DnsConfig) {
             if let Ok(text) = std::fs::read_to_string(&panel) {
                 if !text.trim().is_empty() {
                     if let Ok(p) = toml::from_str::<crate::server::dns::DnsConfig>(&text) {
-                        return p;
+                        return Arc::new(p);
                     }
                 }
             }
-            (*base).clone()
+            Arc::new((*base).clone())
         })
         .await;
     }
@@ -853,7 +853,7 @@ pub async fn dot_listener_live(live: Arc<crate::server::live_config::LiveConfig>
 #[cfg(feature = "tls_boring")]
 async fn dot_supervisor<F>(source: F)
 where
-    F: Fn() -> crate::server::dns::DnsConfig,
+    F: Fn() -> Arc<crate::server::dns::DnsConfig>,
 {
     let first = source();
     let (tx, rx) = tokio::sync::watch::channel(Arc::new(DotLive::from_cfg(&first, None)));

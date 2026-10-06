@@ -253,9 +253,20 @@ fn notify_and_wait(rt: &Runtime, slot_id: u32) -> Result<()> {
 
 fn ensure_runtime(key: &str) -> Result<()> {
     {
-        let map = RUNTIMES.lock();
-        if map.contains_key(key) {
-            return Ok(());
+        let mut map = RUNTIMES.lock();
+        if let Some(rt) = map.get_mut(key) {
+            // 崩溃自愈：子进程已退出 ⇒ 丢弃这个坏 runtime（它的 notify socket / 共享内存
+            // 都已失效），落到下面的冷启动重新拉起。此前这里只 `contains_key` 就返回 Ok ——
+            // 一个崩溃的 go-shm-server 会被**永久缓存**，之后每个 /go/ 请求都 connect 到死
+            // socket 恒 502，直到整个 webserver 重启。`try_wait` 顺带回收僵尸进程。
+            match rt.child.try_wait() {
+                Ok(Some(st)) => {
+                    log::warn!("go-shm-server {key} 已退出（{st:?}），重建 runtime");
+                    map.remove(key);
+                }
+                // 还在跑（None）或查询失败（Err，当作仍在跑，不误杀）：直接复用。
+                _ => return Ok(()),
+            }
         }
     }
     // 冷启动串行化：「查表 → spawn」不是原子的。两个并发首请求会各自 spawn 一个

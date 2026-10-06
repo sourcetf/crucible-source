@@ -12,15 +12,28 @@
 //! 响应头（`response_headers` 按改写后的路径求值）。rewrite 命中后的路径必须重新
 //! 经过 block/redirect，否则改写可以绕过安全规则（h2/h3 旧实现即如此）。
 
-use crate::config::ListenerConfig;
+use crate::config::{ListenerConfig, PageRuleConfig};
 use crate::server::h1::{full, BoxBody};
 use http::{header, Request, Response, StatusCode};
 use hyper::body::Incoming;
 
+/// 按 §16.11 的 `priority` 排序：**数值大者先评估**；等值保持**配置顺序**
+/// （`sort_by` 是稳定排序，且全默认 0 时直接沿用原切片顺序，零排序开销）。
+///
+/// 所有评估入口（apply / scan_immediate / rewrite_path / pass_upstream /
+/// response_headers）都经此遍历，保证「首个命中者胜」在协议间与优先级间一致。
+fn ordered<'a>(rules: &'a [PageRuleConfig]) -> Vec<&'a PageRuleConfig> {
+    let mut v: Vec<&PageRuleConfig> = rules.iter().collect();
+    if v.iter().any(|r| r.priority != 0) {
+        v.sort_by(|a, b| b.priority.cmp(&a.priority));
+    }
+    v
+}
+
 /// 立即响应类动作(redirect/block)的同步判定;rewrite/pass/cache/header 见其余入口。
 pub fn apply(lc: &ListenerConfig, req: &Request<Incoming>) -> Option<Response<BoxBody>> {
     let path = req.uri().path();
-    for rule in &lc.page_rules {
+    for rule in ordered(&lc.page_rules) {
         if path_matches(&rule.match_url, path) {
             match rule.action.as_str() {
                 "redirect" => {
@@ -92,7 +105,7 @@ fn scan_immediate(
     lc: &ListenerConfig,
     path: &str,
 ) -> Option<(StatusCode, Option<String>)> {
-    for rule in &lc.page_rules {
+    for rule in ordered(&lc.page_rules) {
         if path_matches(&rule.match_url, path) {
             match rule.action.as_str() {
                 "block" => return Some((StatusCode::FORBIDDEN, None)),
@@ -169,7 +182,7 @@ fn redirect_response(target: String) -> Response<BoxBody> {
 
 /// `rewrite` 动作:把 match_url 匹配的前缀替换为 target,返回新路径。
 pub fn rewrite_path(lc: &ListenerConfig, path: &str) -> Option<String> {
-    for rule in &lc.page_rules {
+    for rule in ordered(&lc.page_rules) {
         if rule.action != "rewrite" {
             continue;
         }
@@ -197,7 +210,7 @@ pub fn rewrite_path(lc: &ListenerConfig, path: &str) -> Option<String> {
 /// `pass` 动作:返回 (match_url, upstream 基础 URL)。
 /// path 合并交由 `proxy::proxy_page_rule` 按反代规则处理。
 pub fn pass_upstream(lc: &ListenerConfig, path: &str) -> Option<(String, String)> {
-    for rule in &lc.page_rules {
+    for rule in ordered(&lc.page_rules) {
         if rule.action != "pass" {
             continue;
         }
@@ -217,7 +230,7 @@ pub fn pass_upstream(lc: &ListenerConfig, path: &str) -> Option<(String, String)
 /// `cache`/`header` 动作产生的响应头(注入到最终响应)。
 pub fn response_headers(lc: &ListenerConfig, path: &str) -> Vec<(String, String)> {
     let mut out = Vec::new();
-    for rule in &lc.page_rules {
+    for rule in ordered(&lc.page_rules) {
         if !path_matches(&rule.match_url, path) {
             continue;
         }
@@ -319,6 +332,16 @@ mod tests {
             match_url: m.into(),
             action: a.into(),
             target: t.map(|s| s.into()),
+            priority: 0,
+        }
+    }
+
+    fn rule_p(m: &str, a: &str, t: Option<&str>, priority: i64) -> crate::config::PageRuleConfig {
+        crate::config::PageRuleConfig {
+            match_url: m.into(),
+            action: a.into(),
+            target: t.map(|s| s.into()),
+            priority,
         }
     }
 
@@ -444,5 +467,52 @@ mod tests {
         assert_eq!(scrub_brand("CLOUDFLARE"), "CDN");
         assert_eq!(scrub_brand("xCloudflareY"), "xCDNY");
         assert_eq!(scrub_brand("保持中文不动"), "保持中文不动");
+    }
+
+    /// §16.11 优先级：**数值大者先评估**，与书写顺序无关。
+    /// 两条同前缀 redirect，后者 priority 更高 ⇒ 后者胜（旧实现是「先写者胜」）。
+    #[test]
+    fn priority_overrides_config_order() {
+        let lc = lc_with(vec![
+            rule_p("/a", "redirect", Some("302:/first"), 1),
+            rule_p("/a", "redirect", Some("301:/second"), 5),
+        ]);
+        assert_eq!(
+            apply_simple(&lc, "/a"),
+            Some((StatusCode::MOVED_PERMANENTLY, "/second".to_string()))
+        );
+        // block 同理：高优先级的 block 压过低优先级的 redirect。
+        let lc2 = lc_with(vec![
+            rule_p("/x", "redirect", Some("301:/ok"), 1),
+            rule_p("/x", "block", None, 9),
+        ]);
+        assert_eq!(apply_simple(&lc2, "/x"), Some((StatusCode::FORBIDDEN, String::new())));
+    }
+
+    /// 等优先级必须**稳定**保持配置顺序（旧配置无 priority 字段 ⇒ 行为不变）。
+    #[test]
+    fn equal_priority_keeps_config_order() {
+        let lc = lc_with(vec![
+            rule("/p", "redirect", Some("301:/first")),
+            rule("/p", "redirect", Some("308:/second")),
+        ]);
+        assert_eq!(
+            apply_simple(&lc, "/p"),
+            Some((StatusCode::MOVED_PERMANENTLY, "/first".to_string())),
+            "等优先级首条胜"
+        );
+        // rewrite 入口同样按优先级：高优先级的 rewrite 先改路径。
+        let lc2 = lc_with(vec![
+            rule_p("/r/*", "rewrite", Some("/low"), 0),
+            rule_p("/r/*", "rewrite", Some("/high"), 3),
+        ]);
+        assert_eq!(rewrite_path(&lc2, "/r/a").as_deref(), Some("/high/a"));
+        // response_headers 的注入顺序也按优先级（高者在前）。
+        let lc3 = lc_with(vec![
+            rule_p("/h", "header", Some("X-Order: low"), 0),
+            rule_p("/h", "header", Some("X-Order: high"), 7),
+        ]);
+        let hs = response_headers(&lc3, "/h");
+        assert_eq!(hs, vec![("X-Order".to_string(), "high".to_string()), ("X-Order".to_string(), "low".to_string())]);
     }
 }

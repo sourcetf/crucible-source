@@ -1682,24 +1682,35 @@ async fn write_raw_request(
     // 否则客户端一行 `Connection: X-Secret` + `X-Secret: v` 就能把自定义头送进上游
     // （与 proxy_once 的 h1/h2 路径同一判据、同一多行处理）。
     let conn_tokens = connection_tokens(&parts.headers);
+    // 规则 `modify_request_headers` 里**真正会被注入**的头名（去掉定界头/authority/逐跳头）。
+    // 只有这些才该在下面把客户端同名头“让位”给规则值；被拒的头（见下方注入循环）不能
+    // 连带把客户端那份也丢掉 —— 尤其 `Connection`/`Upgrade` 是升级握手所必需。
+    let injectable_rule_keys: Vec<String> = rule
+        .modify_request_headers
+        .keys()
+        .map(|k| k.to_ascii_lowercase())
+        .filter(|l| !(HOP_BY_HOP.contains(&l.as_str()) || l == "content-length" || l == "host"))
+        .collect();
     for (k, v) in parts.headers.iter() {
         if k == HOST {
             continue;
         }
         let kl = k.as_str().to_ascii_lowercase();
+        // `Connection:` 点名的头是逐跳头，必须剥 —— 但 WS 直写路径有一处**致命例外**：
+        // `Connection: Upgrade` 点名的正是 `Upgrade` 头本身，而升级握手**必须**把
+        // `Upgrade: <proto>` 与 `Connection: Upgrade` 原样送到上游。旧代码无条件按 token
+        // 剥离，`conn_tokens={"upgrade"}` 于是把 `Upgrade: websocket` 也一并 continue 掉，
+        // 上游只看到 `Connection: Upgrade`、看不到升级意图，按普通请求回 200，客户端拿到
+        // `502 websocket upstream returned 200 OK, expected 101` —— WS 反代 100% 不通。
+        // `connection` 本身不是 token（token 是它的值），排除它以防 `Connection: Connection`
+        // 这类自指名写法。其余 token（`X-Secret` 等自定义逐跳头）照常剥离，逐跳语义不受损。
+        let conn_named_hop = conn_tokens.iter().any(|t| *t == kl) && kl != "upgrade" && kl != "connection";
         // WS 路径同样剥掉客户端转发头族（此前只剥了 XFF/XFP 两个名字），
         // 权威值在下面注入。
-        if WS_SKIP.contains(&kl.as_str())
-            || is_client_forwarded_header(&kl)
-            || conn_tokens.iter().any(|t| *t == kl)
-        {
+        if WS_SKIP.contains(&kl.as_str()) || is_client_forwarded_header(&kl) || conn_named_hop {
             continue;
         }
-        if rule
-            .modify_request_headers
-            .keys()
-            .any(|mk| mk.eq_ignore_ascii_case(&kl))
-        {
+        if injectable_rule_keys.iter().any(|mk| mk == &kl) {
             continue;
         }
         if let Ok(vs) = v.to_str() {
@@ -1720,11 +1731,21 @@ async fn write_raw_request(
         // 这一路是**直接拼报文**（非 WS 的 h1/h2 路径会先经 HeaderName/HeaderValue 校验，
         // 非法值让 builder 报错、整条请求 502）。不校验就等于让规则的名字/值里塞 CR/LF
         // 而往上游请求注入任意个头、甚至提前结束请求头，所以这里照同样的失败语义拦下。
-        if HeaderName::from_bytes(k.as_bytes()).is_err() {
+        let Ok(name) = HeaderName::from_bytes(k.as_bytes()) else {
             bail!("modify_request_headers has an invalid header name `{k}`");
-        }
+        };
         if HeaderValue::from_bytes(v.as_bytes()).is_err() {
             bail!("modify_request_headers value for `{k}` has invalid bytes (CR/LF?)");
+        }
+        // 与 proxy_once 的请求注入**同一条禁用名单**：定界头（TE/CL）、authority（Host）、
+        // 逐跳头（Connection/Upgrade/…）都不得由规则注入。WS 直写路径是手拼报文，缺了这道闸
+        // 就会把 `Content-Length: 999` + `Transfer-Encoding: chunked` 同时写进握手（TE.CL
+        // 走私形态）、用 `Host: evil` 覆盖真实 authority、或用 `Connection: close` 顶掉升级
+        // 所需的 `Connection: Upgrade`（真机复现：规则注入这四个头全部原样到达上游）。
+        let l = name.as_str();
+        if HOP_BY_HOP.contains(&l) || l == "content-length" || l == "host" {
+            log::warn!("proxy: 忽略 WS 规则注入的请求头 {k:?}（定界头/authority/逐跳头不得注入）");
+            continue;
         }
         lines.push_str(&format!("{k}: {v}\r\n"));
     }
@@ -2524,6 +2545,129 @@ mod tor_socks_tests {
             false
         )));
         assert!(!is_websocket_upgrade(&ws_req(&["h2c"], &["Upgrade"], true)));
+    }
+
+    /// P0：WS 直写路径（`write_raw_request`）必须把 `Upgrade: websocket` 与
+    /// `Connection: Upgrade` **原样**送到上游，同时仍按 `Connection:` 点名剥掉其它逐跳头
+    /// （`X-Secret`）。旧代码无条件按 token 剥离，`conn_tokens={"upgrade"}` 把 `Upgrade`
+    /// 头也 continue 掉 —— 上游只看到 `Connection: Upgrade`、看不到升级意图，回 200，
+    /// 客户端拿到 `502 websocket upstream returned 200 OK, expected 101`（真机复现）。
+    #[tokio::test]
+    async fn write_raw_request_keeps_upgrade_and_strips_conn_named_hop() {
+        let mut req = ws_req(&["websocket"], &["Upgrade, X-Secret"], true);
+        req.headers_mut()
+            .insert("x-secret", HeaderValue::from_static("v"));
+        let (parts, _body) = req.into_parts();
+        let rule = ProxyRuleConfig {
+            path: "/ws".into(),
+            upstream: "http://127.0.0.1:9/".into(),
+            ..Default::default()
+        };
+        let (client, mut server) = tokio::io::duplex(4096);
+        let mut io = UpstreamIo::from_stream(client);
+        let uri = Uri::from_str("/").unwrap();
+        write_raw_request(
+            &mut io,
+            &parts,
+            b"",
+            "127.0.0.1:9",
+            &uri,
+            &rule,
+            "1.2.3.4".parse().unwrap(),
+            false,
+        )
+        .await
+        .unwrap();
+        drop(io); // 关掉写半部，让 server 侧 read_to_end 拿到 EOF
+        let mut out = Vec::new();
+        server.read_to_end(&mut out).await.unwrap();
+        let s = String::from_utf8_lossy(&out);
+        let lower = s.to_ascii_lowercase();
+        assert!(
+            lower.contains("\r\nupgrade: websocket\r\n"),
+            "Upgrade 头必须保留（否则上游看不到升级意图）: {s}"
+        );
+        assert!(
+            lower.contains("\r\nconnection: upgrade, x-secret\r\n"),
+            "Connection 头必须原样保留: {s}"
+        );
+        assert!(
+            !lower.contains("\r\nx-secret:"),
+            "Connection 点名的自定义逐跳头必须剥离: {s}"
+        );
+    }
+
+    /// P2：WS 直写路径的规则注入必须与 `proxy_once` 同一禁用名单 —— 定界头/authority/
+    /// 逐跳头不得注入；且当规则**只**点名这些头时，客户端的 `Connection: Upgrade` 不能被
+    /// 连带丢掉（否则升级握手不成立）。真机复现：规则注入 CL/TE/Host/Connection 时四个头
+    /// 全部原样到达上游（TE.CL 走私形态）。
+    #[tokio::test]
+    async fn write_raw_request_rejects_rule_injected_framing_headers() {
+        let req = ws_req(&["websocket"], &["Upgrade"], true);
+        let (parts, _body) = req.into_parts();
+        let mut rule = ProxyRuleConfig {
+            path: "/ws".into(),
+            upstream: "http://127.0.0.1:9/".into(),
+            ..Default::default()
+        };
+        for (k, v) in [
+            ("Content-Length", "999"),
+            ("Transfer-Encoding", "chunked"),
+            ("Host", "evil.example"),
+            ("Connection", "close"),
+            ("X-Injected", "yes"),
+        ] {
+            rule.modify_request_headers
+                .insert(k.to_string(), v.to_string());
+        }
+        let (client, mut server) = tokio::io::duplex(4096);
+        let mut io = UpstreamIo::from_stream(client);
+        let uri = Uri::from_str("/").unwrap();
+        write_raw_request(
+            &mut io,
+            &parts,
+            b"",
+            "127.0.0.1:9",
+            &uri,
+            &rule,
+            "1.2.3.4".parse().unwrap(),
+            false,
+        )
+        .await
+        .unwrap();
+        drop(io);
+        let mut out = Vec::new();
+        server.read_to_end(&mut out).await.unwrap();
+        let s = String::from_utf8_lossy(&out);
+        let lower = s.to_ascii_lowercase();
+        assert!(
+            lower.contains("\r\nconnection: upgrade\r\n"),
+            "客户端 Connection: Upgrade 必须保留（不能被规则点名连带丢掉）: {s}"
+        );
+        assert!(
+            lower.contains("\r\nx-injected: yes\r\n"),
+            "正常业务头仍应注入: {s}"
+        );
+        assert!(!lower.contains("999"), "规则注入的 Content-Length 必须被拒: {s}");
+        assert!(
+            !lower.contains("chunked"),
+            "规则注入的 Transfer-Encoding 必须被拒: {s}"
+        );
+        assert!(
+            !lower.contains("evil.example"),
+            "规则注入的 Host 必须被拒: {s}"
+        );
+        assert!(
+            !lower.contains("\r\nconnection: close"),
+            "规则注入的 Connection 必须被拒: {s}"
+        );
+        // 真实 Host 头仍应是我方权威值，且只有一份 Content-Length（来自 body 长度）。
+        assert!(lower.contains("host: 127.0.0.1:9\r\n"), "真实 Host 应在: {s}");
+        assert_eq!(
+            lower.matches("content-length:").count(),
+            1,
+            "Content-Length 只能有一份（我方追加的）: {s}"
+        );
     }
 
     /// P2：上游超时映射 504、预算耗尽 503、其余上游故障 502（此前超时也落 502）。

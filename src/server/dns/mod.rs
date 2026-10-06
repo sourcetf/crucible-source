@@ -537,7 +537,12 @@ fn panel_key(m: Option<&std::fs::Metadata>) -> (Option<std::time::SystemTime>, u
 /// 122µs，其中最大一块就在这里；高并发下所有 worker 一起等同一份文件读，
 /// 吞吐卡在 ~20k rps 不再随并发上升（2→16 workers 只涨 1.4×），而 h2o 同机 100k+。
 /// 现在快路径只做一次 `stat`（~1µs），内容一变（mtime/size/ino 或世代号）立刻重读。
-pub fn effective(cfg: &Config) -> DnsConfig {
+///
+/// 返回值是 `Arc<DnsConfig>`：缓存里本就是 `Arc`，此前每次调用 `(*e.cfg).clone()` 把整份
+/// `DnsConfig`（含 geo/rpz/https_rr 等 Vec）**深拷贝**一遍 —— 而本函数在每个 HTTP 请求上被
+/// 调用（h1/h2/h3 的 DoH 分流）。改成返回 `Arc` 后每请求只做一次引用计数自增，热路径不再有
+/// 配置深拷贝；调用方通过 `Deref` 拿 `&DnsConfig`，语义不变（只读，无 `DerefMut`）。
+pub fn effective(cfg: &Config) -> Arc<DnsConfig> {
     let panel = state_root().join("etc/panel.toml");
     let gen = EFFECTIVE_GEN.load(std::sync::atomic::Ordering::Relaxed);
     // 外部改动（手改 panel.toml）的检测节流：≤1s 内不重复 stat。
@@ -554,8 +559,8 @@ pub fn effective(cfg: &Config) -> DnsConfig {
                     && e.path == panel
                     && now.duration_since(e.checked_at) < STAT_INTERVAL =>
             {
-                // 世代号与路径都没变、且刚查过：直接命中
-                return (*e.cfg).clone();
+                // 世代号与路径都没变、且刚查过：直接命中（只增引用计数，不深拷贝）
+                return Arc::clone(&e.cfg);
             }
             _ => {}
         }
@@ -569,17 +574,17 @@ pub fn effective(cfg: &Config) -> DnsConfig {
                 // 内容没变：刷新节流时间戳，**避免下一个请求又来一次 stat**
                 // （否则 1s 之后每个请求都会 stat，节流形同虚设）。
                 e.checked_at = now;
-                return (*e.cfg).clone();
+                return Arc::clone(&e.cfg);
             }
         }
     }
-    let parsed = effective_slow(cfg, &panel);
+    let parsed = Arc::new(effective_slow(cfg, &panel));
     *EFFECTIVE_CACHE.lock() = Some(EffectiveCache {
         gen,
         path: panel,
         checked_at: std::time::Instant::now(),
         key,
-        cfg: Arc::new(parsed.clone()),
+        cfg: Arc::clone(&parsed),
     });
     parsed
 }
