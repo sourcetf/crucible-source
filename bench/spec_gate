@@ -1,0 +1,64 @@
+#!/bin/sh
+# spec_gate.sh — 按规格 §22.1 双门禁复现「h2o vs ours」对比（同机、同 payload、同客户端参数）。
+#
+# 规格条件：
+#   * ours  : tokio worker_threads=2（CRUCIBLE_WORKER_THREADS=2，规格 §5/§22.12）
+#   * h2o   : num-threads: 2（bench/h2o-fair-2t.conf 已对齐）
+#   * 客户端: 规格脚本 bench/h2_fair_gate.py 用 wrk -t2 -c64 -d10（或 h2load -c50 -t2 -D10）。
+#             本机没有 wrk/h2load（无 sudo），用 bench/gobench.go 复刻同样负载形状：
+#             每个连接同一时刻一个请求、c 个长连接、固定持续时间；客户端为原生 Go（非 GIL）。
+#   * payload: 127B 小静态 index.html（www-static-fair 里那一份），双方同一文件。
+#   * 口径  : 交替多轮（奇偶轮换先后顺序）取中位；吞吐比 = h2o_rps/ours_rps（≤1.2 过），
+#             延迟比 = ours_mean / h2o_mean（≤1.2 过）。wrk 的 "Latency" 是均值，故取 mean。
+#
+# 用法:
+#   OURS_PORT=9081 H2O_PORT=9082 DUR=10 CONNS=64 ROUNDS=5 sh bench/spec_gate.sh
+#   端口/二进制按环境覆盖：
+#     OURS_BIN=target/release/webserver OURS_CFG=bench/spec-ours.toml OURS_PORT=24081 \
+#     H2O_BIN=~/scratch-bench/h2o/root/usr/bin/h2o H2O_CONF=... H2O_PORT=24781 \
+#     WWW=~/scratch-bench/www sh bench/spec_gate.sh
+set -u
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+CONNS="${CONNS:-64}"; DUR="${DUR:-10}"; ROUNDS="${ROUNDS:-5}"
+OURS_PORT="${OURS_PORT:-9081}"; H2O_PORT="${H2O_PORT:-9082}"
+H2O_BIN="${H2O_BIN:-/usr/local/bin/h2o}"
+GOBENCH="${GOBENCH:-$ROOT/bench/gobench}"
+OUT="${OUT:-/tmp/spec_gate_$(date +%s).log}"
+
+if [ ! -x "$GOBENCH" ]; then
+  echo "building bench/gobench ..." | tee -a "$OUT"
+  (cd "$ROOT/bench" && go build -o gobench gobench.go) || { echo "need go to build bench/gobench"; exit 2; }
+fi
+
+# 确认双方在同一台机上活着（不做进程管理，起停由调用方负责）
+for spec in "ours $OURS_PORT" "h2o $H2O_PORT"; do
+  set -- $spec
+  code=$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$2/" || true)
+  if [ "$code" != "200" ]; then echo "FATAL: $1 ($2) not serving 200 (got $code)"; exit 2; fi
+done
+
+echo "=== spec gate: c$CONNS d$DUR r$ROUNDS ours=:$OURS_PORT h2o=:$H2O_PORT $(date) ===" | tee -a "$OUT"
+r=1
+while [ $r -le "$ROUNDS" ]; do
+  if [ $((r % 2)) -eq 1 ]; then
+    "$GOBENCH" -addr "127.0.0.1:$H2O_PORT"  -path / -c "$CONNS" -d "$DUR" -label "h2o-r$r"  | tee -a "$OUT"
+    "$GOBENCH" -addr "127.0.0.1:$OURS_PORT" -path / -c "$CONNS" -d "$DUR" -label "ours-r$r" | tee -a "$OUT"
+  else
+    "$GOBENCH" -addr "127.0.0.1:$OURS_PORT" -path / -c "$CONNS" -d "$DUR" -label "ours-r$r" | tee -a "$OUT"
+    "$GOBENCH" -addr "127.0.0.1:$H2O_PORT"  -path / -c "$CONNS" -d "$DUR" -label "h2o-r$r"  | tee -a "$OUT"
+  fi
+  r=$((r+1))
+done
+echo "raw log: $OUT" | tee -a "$OUT"
+awk '
+  /rps=/ {
+    match($0, /rps=[0-9]+/); rps=substr($0,RSTART+4,RLENGTH-4)+0;
+    match($0, /mean=[0-9.]+/); mean=substr($0,RSTART+5,RLENGTH-5)+0;
+    if ($0 ~ /\[h2o-/) {hr[n]=rps; hm[n]=mean; n++}
+    else {or_[m]=rps; om[m]=mean; m++}
+  }
+  END {
+    printf "pairs: %d ours / %d h2o\n", m, n;
+    for (i=0;i<n && i<m;i++) printf "  round %d: thr h2o/ours=%.3f  lat ours/h2o=%.3f\n", i+1, hr[i]/or_[i], om[i]/hm[i];
+  }' "$OUT"
+echo "判定请用「双方都打满 2 线程的轮次」与中位数人工核对（本机共享、噪声大，见 bench-wave8 报告）。"

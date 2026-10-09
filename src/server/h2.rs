@@ -180,6 +180,27 @@ where
         idle.as_mut().reset(tokio::time::Instant::now() + H2_IDLE_TIMEOUT);
         let Some(result) = accepted else { break };
         let (request, mut respond) = result?;
+        // RFC 9113 §8.2.2：connection-specific 字段（`connection` / `transfer-encoding` /
+        // `upgrade` / `keep-alive` / `proxy-connection`）与 `te != trailers` 必须判 malformed。
+        // 上游 h2 0.4.19 本已在 HPACK 解码层拒绝（RST_STREAM(PROTOCOL_ERROR)）；这里显式
+        // 再判一次，作为**跨协议同判据的防线**（谓词与 h3::handle_resolver 的同类检查共用
+        // [`prohibited_request_field`]）：一旦上游放宽或换 crate，h2 侧仍与 h1/h3 一致地
+        // 拒绝，而不是把畸形请求路由进静态/应用层。`te: trailers` 是唯一例外，照常放行。
+        // 位置在 spawn/配额之前：畸形请求不吃在飞配额、不记 telemetry（与 h3 侧一致）。
+        if let Some(field) = prohibited_request_field(request.headers()) {
+            crate::server::log_throttle::warn_every(
+                "h2-prohibited-field",
+                Duration::from_secs(60),
+                &format!(
+                    "h2 malformed request peer={peer}: prohibited connection-specific field \
+                     `{field}` (RFC 9113 §8.2.2) -> RST_STREAM PROTOCOL_ERROR"
+                ),
+            );
+            // 不读 body、不发响应：RST_STREAM(PROTOCOL_ERROR) 结束该流；
+            // 连接里未读 DATA 由 crate 在流关闭时统一归还连接级窗口。
+            respond.send_reset(h2::Reason::PROTOCOL_ERROR);
+            continue;
+        }
         if !goaway_sent && live.listeners_generation() != gen0 {
             goaway_sent = true;
             log::info!("h2 peer={peer}: listener 配置已变，发 GOAWAY 让后续请求换用新配置的连接");
@@ -890,6 +911,42 @@ pub(crate) fn request_authority_ok(
     Ok(())
 }
 
+/// RFC 9113 §8.2.2（与 RFC 9114 §4.2 同规）：HTTP/2/HTTP/3 的**连接特定字段**
+/// （`connection` / `transfer-encoding` / `upgrade` / `keep-alive` / `proxy-connection`）
+/// 一律禁用；`te` 是唯一例外，且只能取 `trailers`。违反即 malformed（流级错误）。
+///
+/// 为什么本仓库要显式判：h3 0.0.8 只校验字段名全小写与伪头顺序，**不查**这些字段
+/// （wave-7 真机修复前：h3 上 `transfer-encoding: chunked` / `connection: close` /
+/// `upgrade: h2c` / `proxy-connection: ...` / `te: gzip` 全部被正常路由回 200）。
+/// h2 0.4.19 在 HPACK 解码层已经拒绝（`frame/headers.rs::load_hpack` → `MalformedMessage`
+/// ⇒ RST_STREAM(PROTOCOL_ERROR)），h2 侧 [`serve_io`] 的调用是**防线**：一旦上游放宽
+/// 或换 crate，h2 仍与 h3 同判据拒绝，不会把畸形请求路由进静态/应用层。
+///
+/// 比较口径与 h2 crate 逐字一致（`te` 值必须**恰好**是 `trailers`，不做 token 大小写
+/// 归一），保证三协议同判据（`te: TRAILERS` 在 h2 上也是 RST）。
+/// 返回违规字段名（供日志与单测）。
+pub(crate) fn prohibited_request_field(headers: &http::HeaderMap) -> Option<&'static str> {
+    const PROHIBITED: [&str; 5] = [
+        "connection",
+        "transfer-encoding",
+        "upgrade",
+        "keep-alive",
+        "proxy-connection",
+    ];
+    for name in PROHIBITED {
+        if headers.contains_key(name) {
+            return Some(name);
+        }
+    }
+    // RFC 9113 §8.2.2 / RFC 9114 §4.2：`TE: trailers` 是唯一允许的形态。
+    for value in headers.get_all(http::header::TE).iter() {
+        if value.as_bytes() != b"trailers" {
+            return Some("te");
+        }
+    }
+    None
+}
+
 async fn handle_h2(
     req: Request<H2Body>,
     live: Arc<LiveConfig>,
@@ -1410,6 +1467,69 @@ mod tests {
         multi.append(http::header::HOST, HeaderValue::from_static("a.com"));
         multi.append(http::header::HOST, HeaderValue::from_static("b.com"));
         assert!(request_authority_ok(&uri("/x"), &multi).is_err());
+    }
+
+    /// RFC 9113 §8.2.2：connection-specific 字段判 malformed，`te: trailers` 是唯一例外。
+    #[test]
+    fn prohibited_connection_specific_fields() {
+        use http::{HeaderMap, HeaderValue};
+        let hdr = |name: &'static str, v: &'static str| {
+            let mut h = HeaderMap::new();
+            h.insert(
+                http::header::HeaderName::from_static(name),
+                HeaderValue::from_static(v),
+            );
+            h
+        };
+        // 全部 5 个被禁字段名
+        for name in [
+            "connection",
+            "transfer-encoding",
+            "upgrade",
+            "keep-alive",
+            "proxy-connection",
+        ] {
+            assert_eq!(
+                prohibited_request_field(&hdr(name, "x")),
+                Some(name),
+                "必须拒绝 {name}"
+            );
+        }
+        // te：只有 `trailers` 恰好放行（与 h2 crate 的字面比较一致 ⇒ 三协议同判据）
+        assert_eq!(prohibited_request_field(&hdr("te", "trailers")), None);
+        assert_eq!(prohibited_request_field(&hdr("te", "TRAILERS")), Some("te"));
+        assert_eq!(prohibited_request_field(&hdr("te", "gzip")), Some("te"));
+        assert_eq!(prohibited_request_field(&hdr("te", "trailers, gzip")), Some("te"));
+        // 空头集合放行
+        assert_eq!(prohibited_request_field(&HeaderMap::new()), None);
+        // 多行 te：任一行不是 trailers 都算违规
+        let mut multi = HeaderMap::new();
+        multi.append(http::header::TE, HeaderValue::from_static("trailers"));
+        multi.append(http::header::TE, HeaderValue::from_static("gzip"));
+        assert_eq!(prohibited_request_field(&multi), Some("te"));
+    }
+
+    /// 防线接线回归：serve_io 的 accept 循环里，被禁字段检查必须存在，且在
+    /// `tokio::spawn`（把请求交给任务处理）与配额获取之前 —— 畸形请求不能进路由、
+    /// 不吃在飞配额（与 h3::handle_resolver 的同类检查同序）。
+    #[test]
+    fn h2_prohibited_field_check_before_spawn() {
+        let src = include_str!("h2.rs");
+        let pos = src.find("async fn serve_io").expect("serve_io");
+        let tail = &src[pos..];
+        let check = tail
+            .find("prohibited_request_field(request.headers())")
+            .expect("serve_io 必须在 accept 后检查被禁字段");
+        let spawn = tail.find("tokio::spawn").expect("tokio::spawn");
+        let acq = tail.find("acquire_owned").expect("acquire_owned");
+        assert!(
+            check < spawn && check < acq,
+            "被禁字段检查必须早于 spawn（{check} < {spawn}）与配额获取（{check} < {acq}）"
+        );
+        let reset = tail
+            .find("send_reset(h2::Reason::PROTOCOL_ERROR)")
+            .expect("被禁字段必须用 RST_STREAM(PROTOCOL_ERROR) 处置");
+        assert!(reset < spawn, "send_reset 必须早于 spawn");
     }
 
     /// P0 回归：请求体适配器必须显式归还 h2 接收窗口（release_capacity）。

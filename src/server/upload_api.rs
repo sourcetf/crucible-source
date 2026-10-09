@@ -204,6 +204,47 @@ fn canon_best_effort(p: &std::path::Path) -> PathBuf {
     c
 }
 
+/// 真实（canonical）落盘路径上的复判；返回拒绝原因（`None` = 放行）。
+///
+/// # 为什么需要
+///
+/// `safe_join` 对已存在的目标做 canonicalize，符号链接在那里被解析 —— 请求路径
+/// （`up/aliasenv`）与真实落盘路径（`.env`）可能不同。按请求路径判的三道闸门
+///（[`has_exec_ext`] / [`hidden_segment`] / `would_execute_on_get`）于是被别名绕过：
+/// 本波实测 `PUT /up/aliasenv`（`aliasenv -> ../.env`）→ 201 且 `.env` 被改写；
+/// `PUT /up/aliasphp`（`aliasphp -> shellX.php`）→ 201 且 PHP 内容落进 `.php`。
+/// 这里把同一组闸门按真实相对路径再跑一遍（纵深防御；链接本身需本地权限才能创建，
+/// 但运营方目录里常见这类链接，且被绕过的判据是「绝不允许写」的那几条）。
+///
+/// 目标的真实路径不在 root 内时返回 `None`（containment 已由 `safe_join` 保证，
+/// 这里不重复报错）；`rel_real == rel`（无链接介入）时同样直接放行，避免对同一
+/// 字符串重复判定、也避免与请求路径写法（`//`、`./`）产生不一致结论。
+fn real_path_gate(lc: &ListenerConfig, target: &std::path::Path, rel: &str) -> Option<String> {
+    let root_canon = std::fs::canonicalize(&lc.root).unwrap_or_else(|_| lc.root.clone());
+    let rel_real = target
+        .strip_prefix(&root_canon)
+        .ok()?
+        .to_string_lossy()
+        .into_owned();
+    if rel_real == rel {
+        return None;
+    }
+    if has_exec_ext(&rel_real) {
+        return Some(
+            "该扩展名被上传策略拒绝（可执行/可解析内容不允许上传；请改名或调整策略）".into(),
+        );
+    }
+    if let Some(bad) = hidden_segment(&rel_real) {
+        return Some(format!(
+            "隐藏路径（.{bad}…）不允许作为上传目标；只有 /.well-known 例外"
+        ));
+    }
+    if crate::server::admin_files::would_execute_on_get(lc, &rel_real) {
+        return Some("该路径由应用引擎执行（归一化后仍落在引擎路径上），禁止上传".into());
+    }
+    None
+}
+
 /// 上传目标是否落在**任何应用 docroot**（docroot 本身或其子路径）之内。
 ///
 /// # 为什么必须拦（条件性 P0：上传 → RCE）
@@ -375,6 +416,23 @@ where
             return resp(StatusCode::BAD_REQUEST, "路径不合法", None);
         }
     };
+    // 符号链接闸门：`safe_join` 对**已存在**的目标会 canonicalize（符号链接在那一层被
+    // 解析），于是请求路径与真实落盘路径可能不同 —— 上面三道「按请求路径判」的闸门
+    //（扩展名 / 隐藏段 / 引擎执行）看到的全是人畜无害的别名。本波实测（修前）：
+    //   * `up/aliasenv -> ../.env` 上 `PUT /up/aliasenv` → **201** 且 `.env` 被改写
+    //     （deps.rs 会把 `.env` 的 KEY=VAL 注入引擎进程环境 ⇒ 凭据注入）；
+    //   * `up/aliasphp -> shellX.php` 上 `PUT /up/aliasphp` → **201** 且 PHP 内容落进
+    //     `.php` 文件（webshell）。
+    // 攻击者不能经上传面创建符号链接（需本地写权限），但运营方上传目录里常见
+    // `latest -> …` 这类链接，而被绕过的恰是「绝不允许写」的判据 ⇒ 按**真实相对路径**
+    // 复判一次。真实路径正常（无链接介入）时 rel_real == rel，直接跳过。
+    if let Some(why) = real_path_gate(lc, &target, rel) {
+        log::warn!(
+            "upload: 真实落盘路径闸门拒绝 path={path:?} target={} peer={peer}",
+            target.display()
+        );
+        return resp(StatusCode::FORBIDDEN, &why, None);
+    }
     // 应用 docroot 闸门（条件性 P0：上传覆盖 `init.sh`/`deps/bin/index`/`.env` → RCE）。
     // 必须放在 `target` 解析之后、任何落盘动作之前；判据见 `inside_any_app_docroot`。
     // 这条在扩展名闸门/隐藏段闸门/would_execute_on_get 之后，作为**兜底**把整个运行期目录
@@ -857,6 +915,65 @@ mod tests {
         assert_eq!(hidden_segment(&d("/.git/hooks/x")), Some(".git".into()));
         // .well-known 是唯一例外
         assert_eq!(hidden_segment(&d("/.well-known/acme-challenge/x")), None);
+    }
+
+    /// 真实落盘路径闸门：`up/aliasenv -> ../.env` 这类**别名**不得绕过隐段/扩展名闸门。
+    ///
+    /// 修前实测（黑盒）：`PUT /up/aliasenv` → 201 且 `.env` 被改写；`PUT /up/aliasphp`
+    /// （`aliasphp -> shellX.php`）→ 201 且 PHP 内容落进 `.php`。这条盯着
+    /// [`real_path_gate`] 的接线：有链接介入（rel_real != rel）时必须按真实路径判，
+    /// 无链接介入时不得误伤普通上传。
+    #[cfg(unix)]
+    #[test]
+    fn real_path_gate_sees_through_symlink_alias() {
+        use crate::config::{AutoindexConfig, FileOpenTable, ListenerConfig};
+        let base = std::env::temp_dir().join(format!("crucible-upload-alias-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(base.join("up")).unwrap();
+        let lc = ListenerConfig {
+            address: "127.0.0.1".into(),
+            address_v6: None,
+            port: 1,
+            root: base.clone(),
+            autoindex: AutoindexConfig::default(),
+            http_versions: vec!["h1".into()],
+            server_name: None,
+            ssl: None,
+            file_open: FileOpenTable::default(),
+            apps: vec![],
+            basic_auth: None,
+            proxy_rules: vec![],
+            page_rules: vec![],
+            status_path: None,
+            port_reuse: false,
+            rate_limit: None,
+            ip_access: None,
+            l4_forward: None,
+            quic_ecn: false,
+            qmux: false,
+            connect_udp: false,
+            access_log: None,
+        };
+        std::fs::write(base.join(".env"), "SECRET\n").unwrap();
+        std::fs::write(base.join("up/shellX.php"), "<?php ?>\n").unwrap();
+        std::os::unix::fs::symlink("../.env", base.join("up/aliasenv")).unwrap();
+        std::os::unix::fs::symlink("shellX.php", base.join("up/aliasphp")).unwrap();
+
+        for rel in ["up/aliasenv", "up/aliasphp"] {
+            let target = crate::server::admin_files::safe_join(&base, rel)
+                .unwrap_or_else(|e| panic!("{rel} safe_join 应成功（canonicalize 后仍在 root 内）: {e:#}"));
+            assert!(
+                real_path_gate(&lc, &target, rel).is_some(),
+                "{rel} 的真实落盘路径命中受保护目标，必须被拒（修前实测 201 + 改写目标）"
+            );
+        }
+        // 正常路径（无链接介入）不得误伤：既有文件与新建文件都要放行
+        std::fs::write(base.join("up/plain.txt"), "x").unwrap();
+        let t = crate::server::admin_files::safe_join(&base, "up/plain.txt").unwrap();
+        assert!(real_path_gate(&lc, &t, "up/plain.txt").is_none(), "普通文件不得误拒");
+        let t2 = crate::server::admin_files::safe_join(&base, "up/new.txt").unwrap();
+        assert!(real_path_gate(&lc, &t2, "up/new.txt").is_none(), "新建文件不得误拒");
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     /// 连接的**地址身份**必须保持（同端口多地址部署不得串站）。

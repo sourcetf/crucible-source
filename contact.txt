@@ -3612,3 +3612,130 @@ script_engine 已在用，pyembed 这条路径没接）+ 三个 pyembed 引擎 `
 1. `pkill -f "<目录>/config.toml"` 会匹配到**你自己的命令行**（把当前 shell 杀掉）——用 `pkill -f 'scratch-perf[4]/config.toml'` 这种字符类写法。
 2. 验收套件的上游（24099/24100）会被别的 agent 的宽泛 `pkill -f accept-verify-upstream.py` 误杀 → 表现为 8 个 proxy/WS 502；
    跑套件前先确认上游在听，或用 `ss -tlnp | grep 24099` 复查。
+
+---
+# 【agent-h2h3e / 工号 1009 · scope: src/server/h2.rs、h3.rs、qmux/*、connect_udp.rs、ecn.rs、libs/h2、libs/quinn-boring】Wave-8（开工 2026-10-09 22:20，收工 23:2x）
+
+**构建指纹**：共享树 HEAD `9ef9102` 之上，本 agent 只改 `src/server/h2.rs`(+120) / `src/server/h3.rs`(−29/+9)。
+修复后 md5：`h2.rs=17a7086eaa9507dbd80cf95d2082f676`、`h3.rs=f20e11d16d2d9a847d7846b58e95989f`。
+A/B 二进制 `~/scratch-h2h3e/webserver-pre`（不含本波改动，md5 `c898bc59e8a5b74ecab9a2a3b5b7bf01`）与
+`webserver-post`（含，md5 `0b6be0b5d42e954134b0333d6a5d3258`）。单测 **489 passed / 0 failed / 1 ignored**。
+**未** commit/push/checkout/reset/stash/clean；只改 scope 内两文件；contact.txt 只追加。
+报告 `reports/h2h3e-wave8.md`、修复总结 `fixes/h2h3e-wave8.md`。
+
+## 1. 【P1 结论：前提不成立】h2c「接受 Transfer-Encoding」是 **curl 测试假象**，服务器本来就 RST
+- **curl ≥8 在 HTTP/2 上静默抑制 `Transfer-Encoding` 请求头**：`curl -v` 原文
+  `* suppressing chunked transfer encoding on connection using HTTP version 2 or higher`；
+  字节捕获（同端口同命令）：带/不带 `-H 'Transfer-Encoding: chunked'` 的线路字节**逐字节相同**
+  （183B，md5 `e8eeca7d4dc91bb610aec97f9441867c`），而 `-H 'X-Foo: bar'` 是 193B。证据 `~/scratch-h2h3e/d_*.bin`。
+- raw 帧真机（手写 HPACK，`h2raw.py`）在 **pre 二进制**（= 验收套件同树构建）上：
+  h2c/h2-TLS `transfer-encoding: chunked` → **RST_STREAM err=1(PROTOCOL_ERROR)**、无响应；
+  `te: trailers` → 正常路由（POST→405）；`te:gzip`/connection/upgrade/keep-alive/proxy-connection → RST 1；
+  正常 GET/POST 404/405 不变；RST 后同连接可复用。⇒ `h2 0.4.19 load_hpack` 本就判 malformed。
+- h3（aioquic raw）：`transfer-encoding` → **RST 0x10e**、`te:gzip`→0x10e、`te:trailers`→200（wave-7 修复无回归）。
+- **本波仍做的改动（防线，非行为修复）**：`h2.rs:928` 新增 `prohibited_request_field`（5 字段 + te 只认 `trailers`），
+  `h2.rs:190-202` 在 `serve_io` accept 后、spawn/配额前命中即 `send_reset(PROTOCOL_ERROR)`；
+  `h3.rs:635` 改为委托同一谓词（单一判据）。pre/post 真机 10 case 逐项一致（对现有流量零行为差异）；
+  新增 2 条单测全绿。**防线分支当前外部不可达（上游先拒），如实标注，不编造真机触发**。
+- **【跨 scope，请主会话/verify4 处理】验收套件唯一 FAIL 无法靠服务端修掉**：
+  `scripts/accept-verify.py::test_h2_authority` 的 curl 检查永远测不到 TE。已备好并实测过的替换探针
+  `~/scratch-h2h3e/h2c_te_probe.py`（零依赖 raw 帧；判定 `rst:1`⇒PASS），**补丁全文在报告 §5**，
+  请套件 owner 换用它（另加 `te: trailers` 必被服务的对照）。
+
+## 2. 【P3 复核：树内已修，真机复验通过】h3 GOAWAY 宽限窗口内新建连接
+真机（20944）：触发证书/配置变更 → 服务端 `broadcast GOAWAY … grace 5s`（22:41:50）→ **宽限窗口内**
+新连接（22:41:51）→ 服务端日志 `connection arrived inside the shutdown grace window; sending H3 GOAWAY
+immediately`，客户端 **0.051s 收到 H3 GOAWAY(max_id=0)**、连接保留到宽限结束再由 `ep.close` 收尾，
+端点 22:42:00 用新配置重启。verify3b §3 P3-1 的建议已满足，无新改动。**注意**：此时该新连接第一条
+请求（stream id 0 ≤ GOAWAY id 0）会被 h3 crate 照常服务（grace-interval 语义，RFC 合规）。
+
+## 3. 第二优先清单（真机复跑，全部与旧基线一致）
+h2：raw 帧发 `SETTINGS(MAX_FRAME_SIZE=1)` → GOAWAY(PROTOCOL_ERROR)；连接窗口 +3×(2^31−1) →
+GOAWAY(FLOW_CONTROL_ERROR)；流级 WINDOW_UPDATE=0 → crate 按连接错误 GOAWAY(§5.4 允许)。421 规格无要求。
+QMux(20992)：normal 200 / dup_tp CLOSE 0xa / zero_window 静默无自旋 / 超大记录 CLOSE 0x7 / 截断等待 /
+未知帧 CLOSE 0x7。CONNECT-UDP(20944) 12 用例全表 200/403/400/501/capsule 一致；隧道独立闸门未动。
+DATAGRAM/0-RTT 默认关：静态（本波未改该面）。
+
+## 4. 边界
+未整跑验收套件（owner verify4；共享树有他人在途改动）；未用远程 OpenBSD；CONNECT-UDP 真实上游回程
+因本机 UDP 出网被墙仍未覆盖；性能未测（本波无热路径实质改动）。
+复现资产全在 `~/scratch-h2h3e/`（cfg/ctl/h2raw.py/h3e_probe.py/h2c_te_probe.py/dump_server.py/d_*.bin/server.log）。
+本 agent 实例（20995/20944/20992）收工时已 `ctl.sh stop` 停掉。
+
+---
+# 【agent-upload3 <src/server/upload_api.rs, upload_resume.rs, static_files.rs(仅上传行)>】Wave-8 收工（2026-10-09/10）
+
+**快照**：起始 HEAD `9ef9102`（起始工作树 clean）。修前二进制 md5 `c898bc59e8a5b74ecab9a2a3b5b7bf01`
+（= HEAD 树，与 perf4 final 同 md5）；修后 `e5151595ee986fae235495c69b41da70`。
+**本轮 src 改动仅 `src/server/upload_api.rs`（+117：1 闸门函数 + 1 调用点 + 1 单测）**；
+`upload_resume.rs`/`static_files.rs` 0 改动（未与 perf agent 冲突；`git status` 无它们）。
+未 commit/push/checkout/reset/stash/clean。报告 `reports/upload3-wave8.md`、`fixes/upload3-wave8.md`。
+基座：`~/scratch-upload3/`（cfg.toml，端口 20301 h1 上传 / 20302 h2c / 20303 h1+h2+h3 TLS /
+20304 h1 上传第二口 / 20305 docroot 闸门；探针 probe.py、task1_quota.py、task2_regress.py、
+task3_scan.py、task3b_extra.py + logs-*.txt）。
+
+## 任务 1（点名项）：per-IP 配额 DoS —— **当前树已修，独立确认，无需再改**
+- 证据（13/13 PASS，`logs-task1*.txt`）：24 次中断上传（CL 半截 RST/FIN + 畸形 chunk；畸形在
+  received=0 时被 abort，不留 .part）后同 IP 正常上传 **201**；中断会话仍可按 `X-Upload-Offset`
+  续传（202→201 内容一致）；**超限仍限额**：跨 20301/20304 共 16 个在途后第 17 个
+  **503 + `Retry-After: 5`**；在途关闭即释放；70 个闲置会话触发**淘汰该 IP 最旧**（总数 64、
+  `.idle0` 被回收）而**不拒绝**新上传。实现见 `upload_resume.rs:49/57/512-531/443-454`、
+  `upload_api.rs:544`。
+
+## 任务 2（回归）：**33/33 黑盒 PASS + 26 条上传单测 0 failed**
+- 2GiB 声明 + 1 字节：空闲 **60.0s→408+offset 1**、RST 中断→400；两条之后正常上传均 **201**
+  （旧缺陷=507 恒锁，不再复现），且被中断的 2GiB 会话仍可续传。
+- 并发同偏移分片→**409+`x-upload-offset:4`**（A/B 真实并发，内容 `A*8+C*8` 无损）；
+  同名并发全量（同 total）→409；percent-decode 落盘名正确；11 例隐段/扩展名闸门；
+  docroot 闸门 6 例（含 **disabled-but-docroot 403** 与 disabled-no-docroot 跳过 → 201）；
+  目录符号链接→docroot 403；Content-Range 13 例（wildcard 202 不 commit、last≥total 400、
+  区间超长 400、total 冲突 400、无会话续传 409+offset 0）；`.part` 不可 GET/不进 autoindex；
+  sweep 不误删在途（单测 `sweep_skips_inflight_sessions`；周期 300s 见 `mod.rs:82-95`）。
+- h1/h2c/h1TLS/h2TLS/h3 五协议面同操作同结果（正常 201+回读、shell.php 403、断点续传 202/201）。
+
+## 任务 3（另扫）：**30/30 + 7/7 PASS**；新发现并修 1 条 P2
+- CL×CR 矩阵（10B/4B/超区间 400/`bytes */8` 400/`0-0/0` 400/无 CL 无 CR→201 空文件/CL:10+20B
+  不串）、`Expect:100-continue`+1MiB→100+201、被拒扩展名→403 不发 100、目录/父目录 409、
+  `%0A/%0D/%00`/裸 0x7f→400 不落盘、超长名 246B→400 BadName（242 边界）、**裸 socket**
+  `..`/编码分隔符 8 变体全 400 + 点段/`//` 归一 201 + root 外零写入、chunked 完整上传与
+  chunked+CR 分片、符号链接逃逸（root 外目录/文件均 400 且未写出）。
+- **P2 新发现（已修）**：in-root 符号链接**别名**绕过三道路径闸门 —— `up/aliasenv -> ../.env`
+  上 `PUT /up/aliasenv` 修前 **201 且 .env 被改写**（deps 注入面）；`up/aliasphp -> shellX.php`
+  修前 **201 且 PHP 落进 .php**（webshell）。`safe_join` 对已存在目标 canonicalize（链接被解析），
+  而隐段/扩展名/引擎闸门只判请求 URL 路径。修法：`upload_api.rs:222 real_path_gate()`（调用点
+  `:429`）对**真实相对路径**复跑同组闸门（rel_real != rel 时才判，不误伤合法链接与普通上传）。
+  修后同一探针：两个别名 **403 且目标未变**；对照 normal/alias→普通文件仍 201。
+  单测 `real_path_gate_sees_through_symlink_alias`（`:928`）→ 全部 26 条上传单测绿。
+- P3 残留（记录）：双编码 `%252e%252e%252f`→201 字面名（非穿越）；别名→普通文件放行；
+  `Content-Range: bytes 0-0/0`→400（RFC §14.4）。
+
+## 给后续 agent 的坑（重要）
+- hyper 的 `allow_half_close` 默认 **false**：裸 socket 请求后立刻 `shutdown(SHUT_WR)`（FIN）
+  会**收不到任何响应**（连接被当关闭）；探针别用 half-close，用 `Connection: close` 或读后关。
+  这不是上传缺陷（`h1.rs:311` 有说明）。
+- 同名并发全量 PUT 若两边**声明的 total 不同**，会先撞 `TotalMismatch` 分支回 **400**（正确语义）；
+  要测「并发 → 409」必须用**相同 total**。
+- 复现资产：`~/scratch-upload3/`（探针 + logs + cfg + restart.sh）。20300 端口块本 agent 收工后
+  实例仍在跑（如需端口可 `pkill -f scratch-upload3/cfg.toml`，我不再使用）。
+
+（补记：本 agent 的 20301-20305 测试实例**已停止**，端口块 20300 已释放；复现按 `~/scratch-upload3/restart.sh` 一条命令拉起。）
+
+# 【agent-bench / 1009 · bench-wave8】规格条件性能门禁裁决：**不达标（1.34–1.44）**；1.20 是口径产物
+- 条件：同机 WSL2 32 核；冻结树 HEAD `9ef9102`（md5 `c898bc59e8a5b74ecab9a2a3b5b7bf01`，与 perf4 的 final 同源）；
+  ours `CRUCIBLE_WORKER_THREADS=2`（访问日志开）、真 h2o 2.2.5 `num-threads: 2`（无日志）、同一 127B index.html；
+  端口 24081/24781；客户端：本机无 wrk/h2load（无 sudo）→ 新增 `bench/gobench.go`（wrk 同款连接模型的原生 Go 客户端）。
+- **裁决**：c64 d10（规格脚本形状，8 对交替，load 3.3–7.3）吞吐比 **1.34**（pairwise 中位 1.341）、延迟比 **1.34**；
+  c128 d8（双方打满 1.96/1.97 核）吞吐 **1.44**、延迟 **1.47**；404 **1.36**。均 >1.2 ⇒ FAIL。
+- **1.20 vs 1.42 的解释（同窗口对照）**：同一并发 c128 只换客户端——python 工具 1.13–1.17（服务端 CPU/req 被抬到
+  h2o 49.7µs/ours 51.7µs，h2o 吞吐被客户端封顶在 ~40k）；Go 工具 1.44（12–18µs，h2o 160k）。规格脚本用 wrk/h2load
+  （低开销）⇒ 门禁应按 1.34–1.44。perf4 的 1.20 是「python 客户端低载 + h2o 未打满（1.66–1.87 核）」的压平口径；
+  verify4 的 1.42（c256）与本报告 c128 一致。
+- **不做架构重写能否达标：不能**。应用层只剩访问日志 0.75µs（实测 +3.9%），路由割肉 0（perf4），快车道已落地
+  （本轮实测 +21% rps/−4.3µs，且确认基准场景命中）；打满口径还差 2.6–3.3µs/req，缺口在 hyper 驱动+响应对象模型。
+- **架构杠杆最小实验（scratch 原型，未进生产）**：手写 h1 循环+1 次 lstat+预编码字节 ⇒ 13.28µs/req，
+  c64 比值 **1.05**、c128 **1.08–1.10 ⇒ 双门禁达标**，总收益 −4.27µs/req；分解显示「只裁 vendored hyper」（≤1.4µs）不够，
+  需自写驱动+热路径字节化（2–3 周、P0 风险）或混合快车道（~1 周、连接行为变化）——**请用户/主会话拍板**。
+- 交付：`reports/bench-wave8.md`（全部表格/原始日志路径/复现命令）、`fixes/bench-wave8.md`；
+  仓库内新增仅 `bench/gobench.go`、`bench/spec_gate.sh`（`bench/**` scope）；**src/ 零改动**；未 commit。
+- 资产：`~/scratch-bench/{frozen,work,target,target-work,h2o,logs/*.log}`；端口 24081/24095/24781 收工后释放
+  （如需复现：`sh ~/scratch-bench/restart.sh && sh ~/scratch-bench/restart-h2o.sh`）。

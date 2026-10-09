@@ -622,36 +622,14 @@ mod imp {
     /// 一律禁用；`te` 是唯一例外，且只能取 `trailers`。违反即 malformed，
     /// 按 RFC 9114 §4.1.2 用 `H3_MESSAGE_ERROR` 的**流错误**处置。
     ///
-    /// 为什么必须由本仓库补：h2 侧上游 `h2 0.4` 在 HPACK 解码时就判 malformed
-    /// （`frame/headers.rs::load_hpack`，真机 raw 帧客户端发 `transfer-encoding: chunked`
-    /// → RST_STREAM(PROTOCOL_ERROR)），而 h3 0.0.8 只校验字段名全小写与伪头顺序，
-    /// **不查**这些被禁字段 —— 真机实测（修复前）：h3 上 `transfer-encoding: chunked` /
-    /// `connection: close` / `upgrade: h2c` / `proxy-connection: ...` / `te: gzip`
-    /// 全部被正常路由回 200，与 h2/h1 的宽严口径不一致。
-    ///
-    /// 比较口径与 h2 crate 逐字一致（`te` 值必须**恰好**是 `trailers`，不做 token 大小写
-    /// 归一），保证三协议同判据（`te: TRAILERS` 在 h2 上也是 RST）。
-    /// 返回违规字段名（供日志与单测）。
+    /// 判据本体是 [`crate::server::h2::prohibited_request_field`]（h2 与 h3 共用同一
+    /// 谓词，保证三协议同判据）。h3 必须显式判的原因：h3 0.0.8 只校验字段名全小写与
+    /// 伪头顺序，**不查**这些被禁字段 —— 真机实测（wave-7 修复前）：h3 上
+    /// `transfer-encoding: chunked` / `connection: close` / `upgrade: h2c` /
+    /// `proxy-connection: ...` / `te: gzip` 全部被正常路由回 200。
+    #[inline]
     fn prohibited_request_field(headers: &http::HeaderMap) -> Option<&'static str> {
-        const PROHIBITED: [&str; 5] = [
-            "connection",
-            "transfer-encoding",
-            "upgrade",
-            "keep-alive",
-            "proxy-connection",
-        ];
-        for name in PROHIBITED {
-            if headers.contains_key(name) {
-                return Some(name);
-            }
-        }
-        // RFC 9113 §8.2.2 / RFC 9114 §4.2：`TE: trailers` 是唯一允许的形态。
-        for value in headers.get_all(http::header::TE).iter() {
-            if value.as_bytes() != b"trailers" {
-                return Some("te");
-            }
-        }
-        None
+        crate::server::h2::prohibited_request_field(headers)
     }
 
     async fn handle_resolver(
