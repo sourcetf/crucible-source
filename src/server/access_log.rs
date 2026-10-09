@@ -161,30 +161,29 @@ pub fn log_response_with(
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis())
         .unwrap_or(0);
-    // 只做**一次**格式化到一条 `String`（然后整行进批量缓冲）：旧实现每请求 4 次堆分配
-    // —— ts `format!` / bytes `to_string` / path 转义 `collect::<String>()` / 整行 `format!`。
-    // 字段顺序、转义规则与输出逐字不变（访问日志是审计证据，格式不能变）。
+    // 行格式化只有**一条实现**（[`format_line`]）：
+    // * `realtime=false`（默认）：**直接**写进批量缓冲（一条锁内路径，无中间 `String`）；
+    // * `realtime=true`：先写进 `String`（Admin 实时窗口要留一份），再追加进批量缓冲。
+    // 旧实现每请求 4 次堆分配（ts `format!` / bytes `to_string` / path 转义
+    // `collect::<String>()` / 整行 `format!`）。字段顺序、转义规则与输出逐字不变
+    // （访问日志是审计证据，格式不能变）。
+    ensure_flusher();
+    if !eff.realtime {
+        let mut b = ACCESS_BUF.lock();
+        {
+            let mut w = BufW(&mut b);
+            format_line(&mut w, now, proto, peer, method, path, status, bytes, dur, engine);
+        }
+        b.push(b'\n');
+        let full = b.len() >= ACCESS_BUF_FLUSH_AT;
+        drop(b);
+        if full {
+            flush();
+        }
+        return;
+    }
     let mut line = String::with_capacity(path.len() + 64);
-    let _ = write!(line, "{}.{:03} {proto} {peer} \"{method} ", now / 1000, now % 1000);
-    // `path` 是请求目标，**不能原样进引号字段**：一个含 `"` 的请求就能提前结束引号、
-    // 把后面的字段伪造成任意内容（日志是审计证据，伪造一行等于污染审计）。
-    // 换行/控制字符由 hyper 的 URI 校验挡住，这里的重点是引号与个别控制字符。
-    for c in path.chars() {
-        if c == '"' || c == '\\' || (c as u32) < 0x20 {
-            line.push('\u{fffd}');
-        } else {
-            line.push(c);
-        }
-    }
-    line.push('"');
-    let _ = write!(line, " {status} ");
-    match bytes {
-        Some(n) => {
-            let _ = write!(line, "{n}");
-        }
-        None => line.push('-'),
-    }
-    let _ = write!(line, " {}ms {engine}", dur.as_millis());
+    format_line(&mut line, now, proto, peer, method, path, status, bytes, dur, engine);
     // 级别过滤：**所有**等级都走同一批量写路径（`level` 仍逐站生效于配置/展示层，
     // 但访问日志行本身没有严重级别语义——见下方注释）。
     //
@@ -211,6 +210,55 @@ pub fn log_response_with(
         }
         ring.push_back(line);
     }
+}
+
+/// 把访问日志行**直接**格式化进 `Vec<u8>`（`fmt::Write` 适配器）：
+/// `realtime=false`（默认）时省掉中间 `String`（每请求一次堆分配 + 一次整行 memcpy）。
+/// 格式函数与 realtime 路径共用同一条实现，字段/转义规则不可能分叉。
+struct BufW<'a>(&'a mut Vec<u8>);
+impl std::fmt::Write for BufW<'_> {
+    #[inline]
+    fn write_str(&mut self, s: &str) -> std::fmt::Result {
+        self.0.extend_from_slice(s.as_bytes());
+        Ok(())
+    }
+}
+
+/// 单条访问日志行的格式化（**唯一**实现；`out` 为 `String` 或 [`BufW`]）。
+#[allow(clippy::too_many_arguments)]
+fn format_line(
+    out: &mut impl std::fmt::Write,
+    now_ms: u128,
+    proto: &str,
+    peer: SocketAddr,
+    method: &str,
+    path: &str,
+    status: u16,
+    bytes: Option<u64>,
+    dur: Duration,
+    engine: &str,
+) {
+    let _ = write!(out, "{}.{:03} {proto} {peer} \"{method} ", now_ms / 1000, now_ms % 1000);
+    // `path` 是请求目标，**不能原样进引号字段**：含 `"` 的请求能提前结束引号、
+    // 把后面的字段伪造成任意内容（日志是审计证据，伪造一行等于污染审计）。
+    for c in path.chars() {
+        if c == '"' || c == '\\' || (c as u32) < 0x20 {
+            let _ = out.write_char('\u{fffd}');
+        } else {
+            let _ = out.write_char(c);
+        }
+    }
+    let _ = out.write_char('"');
+    let _ = write!(out, " {status} ");
+    match bytes {
+        Some(n) => {
+            let _ = write!(out, "{n}");
+        }
+        None => {
+            let _ = out.write_char('-');
+        }
+    }
+    let _ = write!(out, " {}ms {engine}", dur.as_millis());
 }
 
 /// Snapshot of recent access lines for Admin realtime window (SSE/WS can wrap this).

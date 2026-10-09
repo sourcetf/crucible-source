@@ -753,8 +753,18 @@ static int cgi_execute(const char *script, const char *docroot, const char *meth
         envp[nenv++] = own[i];
     for (i = 0; i < hdrs.n; i++)
         envp[nenv++] = hdrs.v[i];
-    for (i = 0; i < extra_env.n; i++)
+    for (i = 0; i < extra_env.n; i++) {
+        /* 空值项（`.env` 里的 `KEY=`）= **该键不存在**：条目仍留在 extra_env 里参与
+         * `cgi_key_in_extra` 的同名判定（把基底里的同名键也过滤掉），但不进子进程 envp。
+         * 与宿主 Rust 侧 `env_lock::install()` 的 `remove_var` 语义严格一致 —— 否则同一份
+         * `.env` 在 cgi（子进程 envp，键=空串）与 wsgi/lua（进程 env，键不存在）上分叉：
+         * 真机实测同一 `.env`（`EMPTYKEY=`）cgi 侧 `set=yes`、wsgi 侧 `set=False`。 */
+        const char *eq = strchr(extra_env.v[i], '=');
+
+        if (eq != NULL && eq[1] == '\0')
+            continue;
         envp[nenv++] = extra_env.v[i];
+    }
     envp[nenv] = NULL;
 
     if (cgi_spawn(script, envp, &proc) != 0) {

@@ -167,6 +167,10 @@ pub async fn serve(req: &Request<Incoming>, lc: &ListenerConfig) -> Result<Respo
             .body(full("method not allowed"))
             .unwrap());
     }
+    // PERF4 快车道：命中即返回（语义等价于走完整路径，见 FastEntry 说明）。
+    if let Some(resp) = serve_fast(req, lc) {
+        return Ok(resp);
+    }
     let path = req.uri().path();
     let fs_path = resolve_path(&lc.root, path)?;
     // 快车道（性能）：URL 以 `/` 结尾 ⇒ **语义上必是目录**，可以直接探测索引文件
@@ -181,7 +185,11 @@ pub async fn serve(req: &Request<Incoming>, lc: &ListenerConfig) -> Result<Respo
             let owned = apps_configured(lc)
                 && (engine_owns(lc, path, mode) || app_private_path(lc, path, mode));
             if !owned {
-                return serve_file(req, &idx, &idx_meta, mode).await;
+                let resp = serve_file(req, &idx, &idx_meta, mode).await?;
+                if fast_cacheable(req, lc, path) {
+                    fast_store(&lc.root, path, &idx, &idx_meta);
+                }
+                return Ok(resp);
             }
         }
     }
@@ -205,7 +213,11 @@ pub async fn serve(req: &Request<Incoming>, lc: &ListenerConfig) -> Result<Respo
             let owned = apps_configured(lc)
                 && (engine_owns(lc, path, mode) || app_private_path(lc, path, mode));
             if !owned {
-                return serve_file(req, &idx, &idx_meta, mode).await;
+                let resp = serve_file(req, &idx, &idx_meta, mode).await?;
+                if fast_cacheable(req, lc, path) {
+                    fast_store(&lc.root, path, &idx, &idx_meta);
+                }
+                return Ok(resp);
             }
         }
         if lc.autoindex.allows(path) {
@@ -232,7 +244,11 @@ pub async fn serve(req: &Request<Incoming>, lc: &ListenerConfig) -> Result<Respo
             bail!("app docroot private file is not served");
         }
     }
-    serve_file(req, &fs_path, &meta, mode).await
+    let resp = serve_file(req, &fs_path, &meta, mode).await?;
+    if fast_cacheable(req, lc, path) {
+        fast_store(&lc.root, path, &fs_path, &meta);
+    }
+    Ok(resp)
 }
 
 /// §16.2 `app_owns_path`：auto/execute 下命中的应用引擎路径不得当纯静态/下载返回。
@@ -1251,6 +1267,138 @@ fn read_cached(path: &Path, meta: &std::fs::Metadata) -> Result<Bytes> {
         },
     );
     Ok(data)
+}
+
+
+// ---------------------------------------------------------------------------
+// PERF4：静态响应「快车道」缓存
+// ---------------------------------------------------------------------------
+//
+// 热路径（`GET /index.html`、`GET /`）的全部材料在**填充时算一次**：
+// 「resolve_path（含 canonicalize/containment 或 CANON 命中）→ 目录索引 lstat →
+// 读体（SMALL_CACHE）→ mime_guess / validators / httpdate → 响应头」。
+// 命中时只做：一次 `lstat` 复核 + 一次查表 + 若干引用计数克隆（body/头值都是
+// `Bytes` 支持，克隆零分配）。
+//
+// 语义边界（与既有实现严格对齐，不新开窗口、不放宽任何判定）：
+// * 身份指纹（len+ino+mtime，[`FileId`]）未变 ⇒ 重发的 body/验证器与「重算」逐字一致：
+//   ETag 本身就由这三个字段决定（见 [`validators`]），Last-Modified 由 mtime 决定，
+//   body 由 SMALL_CACHE 的同一条 FileId 判据决定 —— 命中等价于今天「命中 SMALL_CACHE」。
+// * 条目 TTL = [`CANON_TTL`]（2s），与 `resolve_path` 的 canonical 缓存同一窗口；过期后
+//   走完整路径重新解析（canonicalize + containment 复核 + 重新 lstat）。
+// * 复核用 `lstat`：**符号链接一律回完整路径**（root 外拒/root 内允的 containment 判定
+//   不变）；非普通文件（FIFO/设备…）同样回完整路径。
+// * 只对「无条件的 GET + apps/file_open 未配置 + 路径无 `%`/裸 `..`/隐藏段」生效。
+//   HEAD/Range/If-*/查询串/目录 301/autoindex/405/404 全部走原路径。
+// * 键 = (root, url_path)：`root` 是 listener 配置的 docroot（与 CANON_CACHE 同键域）。
+struct FastEntry {
+    fs_path: PathBuf,
+    id: FileId,
+    data: Bytes,
+    /// 预构建的响应（status/版本/五个头）模板：`Parts::clone` 只做一次表分配 +
+    /// 头值的引用计数克隆，省掉每请求 5 次 `HeaderValue` 解析 + `HeaderMap` 增长。
+    parts: http::response::Parts,
+    at: std::time::Instant,
+}
+
+/// 容量上限：条目数受 docroot 里的热文件数约束，超限整体清空（与 SMALL_CACHE 同策略）。
+const FAST_CAP: usize = 256;
+static FAST_CACHE: Lazy<Mutex<HashMap<PathBuf, HashMap<String, Arc<FastEntry>>>>> =
+    Lazy::new(|| Mutex::new(HashMap::new()));
+
+/// 「这个请求能不能走快车道」的**保守**前置条件：任一不满足即回完整路径。
+#[inline]
+fn fast_cacheable(req: &Request<Incoming>, lc: &ListenerConfig, path: &str) -> bool {
+    req.method() == Method::GET
+        && lc.apps.is_empty()
+        && lc.file_open.is_empty()
+        // `%` 解码后可能出现 `..`/隐藏段/`.upload.part`；裸 `..`/隐藏段由完整路径判。
+        // 这里只是「宁可少走快车道」的前置过滤，不是安全判据。
+        && !path.contains('%')
+        && !path.contains("..")
+        && !path.contains("/.")
+}
+
+/// 快车道命中：返回可直接发送的响应（与 `serve_file` 的 GET 200 逐项一致）。
+fn serve_fast(req: &Request<Incoming>, lc: &ListenerConfig) -> Option<Response<BoxBody>> {
+    let path = req.uri().path();
+    if !fast_cacheable(req, lc, path) {
+        return None;
+    }
+    // 条件请求 / Range 一律回完整路径（304/412/206/416 语义全部由 serve_file 处理）。
+    let h = req.headers();
+    if h.contains_key(header::RANGE)
+        || h.contains_key(header::IF_MATCH)
+        || h.contains_key(header::IF_NONE_MATCH)
+        || h.contains_key(header::IF_MODIFIED_SINCE)
+        || h.contains_key(header::IF_UNMODIFIED_SINCE)
+        || h.contains_key(header::IF_RANGE)
+    {
+        return None;
+    }
+    let e = {
+        let now = std::time::Instant::now();
+        let cache = FAST_CACHE.lock();
+        let e = cache.get(&lc.root)?.get(path)?.clone();
+        if now.duration_since(e.at) >= CANON_TTL {
+            return None;
+        }
+        e
+    };
+    // 一次 `lstat` 复核：非符号链接的普通文件 + 身份指纹未变（见 FastEntry 说明）。
+    let m = fs::symlink_metadata(&e.fs_path).ok()?;
+    if m.file_type().is_symlink() || !m.is_file() || file_id(&m) != e.id {
+        return None;
+    }
+    Some(Response::from_parts(e.parts.clone(), full(e.data.clone())))
+}
+
+/// 快车道条目填充：在完整路径**成功产出 200** 之后调用（每 entry 每 TTL 一次）。
+fn fast_store(root: &Path, url_path: &str, fs_path: &Path, meta: &fs::Metadata) {
+    // 只缓存小文件：`read_cached` 是**同步**整读，对大文件（>256KiB）会阻塞 worker；
+    // 且条目数 × 单文件上限（256 × 256KiB = 64MiB）与 SMALL_CACHE 同量级，是有界内存。
+    if meta.len() > SMALL_FILE_MAX {
+        return;
+    }
+    let Ok(data) = read_cached(fs_path, meta) else {
+        return;
+    };
+    let (etag_s, Some(mtime)) = validators(meta) else {
+        return;
+    };
+    let (Ok(ct_v), Ok(etag_v), Ok(lm_v)) = (
+        http::HeaderValue::from_str(mime_guess::from_path(fs_path).first_or_octet_stream().as_ref()),
+        http::HeaderValue::from_str(&etag_s),
+        http::HeaderValue::from_str(&httpdate::fmt_http_date(mtime)),
+    ) else {
+        return;
+    };
+    // 模板头顺序与 `serve_file` 的 GET 200 一致：CT, CL, AR, ETag, Last-Modified。
+    let Ok(template) = Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, ct_v)
+        .header(header::CONTENT_LENGTH, data.len())
+        .header(header::ACCEPT_RANGES, "bytes")
+        .header(header::ETAG, etag_v)
+        .header(header::LAST_MODIFIED, lm_v)
+        .body(())
+    else {
+        return;
+    };
+    let (parts, ()) = template.into_parts();
+    let e = FastEntry {
+        fs_path: fs_path.to_path_buf(),
+        id: file_id(meta),
+        data,
+        parts,
+        at: std::time::Instant::now(),
+    };
+    let mut cache = FAST_CACHE.lock();
+    let inner = cache.entry(root.to_path_buf()).or_default();
+    if inner.len() >= FAST_CAP {
+        inner.clear();
+    }
+    inner.insert(url_path.to_string(), Arc::new(e));
 }
 
 /// RFC 7233 单段 Range 的解析结果。

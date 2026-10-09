@@ -78,7 +78,9 @@ int appengine_init(const char *engine, const char *lib_hint)
 #endif
 
     (void)engine;
-    (void)lib_hint;
+    /* 记下本 .so 的路径：跨 .so 的 CPython 初始化协调要靠它定位同目录的
+     * libscriptffi.so（进程级互斥在那里；见 crucible_pyinit.h / pyembed 的 P0 修复）。 */
+    crucible_pyinit_set_hint(lib_hint);
     g_inited = 1;
 #ifdef CRUCIBLE_HAVE_PYTHON
     if (crucible_py_embed_ensure(err, sizeof(err)) == 0) {

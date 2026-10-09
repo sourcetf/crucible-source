@@ -145,13 +145,39 @@ pub fn base_env() -> Vec<(OsString, OsString)> {
 ///
 /// 语义：本请求 `.env` 覆盖同名基底键（后写胜出）；调用方随后可用 `cmd.env(...)` 追加
 /// 引擎专属变量（CGI 变量等），它们同样覆盖同名键。
+///
+/// **空值项 = 该键不存在**（`env_remove`，包括把基底里的同名键也去掉）——与
+/// [`install`] 对进程 env 的空值语义（`remove_var`）严格一致。此前这里直接
+/// `cmd.env(k, "")` 把键设成**空串**，于是同一个 `.env` 在 cgi/cgi_script（子进程 envp）
+/// 与 wsgi/lua 等（进程 env）两条路径上含义不同（真机实测：`EMPTYKEY=` 前者
+/// `set=yes`、后者 `set=False`）。
 pub fn apply_clean_env(cmd: &mut std::process::Command, vars: &[(String, String)]) {
     cmd.env_clear();
     for (k, v) in base_env() {
         cmd.env(k, v);
     }
     for (k, v) in vars {
+        if v.is_empty() {
+            cmd.env_remove(k);
+        } else {
+            cmd.env(k, v);
+        }
+    }
+}
+
+/// [`apply_clean_env`] 的 tokio 版本（deps 的 init.sh 用 `tokio::process::Command`）。
+/// 两条路径的语义必须完全一致，否则同一个 `.env` 在不同 spawn 点行为分叉。
+pub fn apply_clean_env_tokio(cmd: &mut tokio::process::Command, vars: &[(String, String)]) {
+    cmd.env_clear();
+    for (k, v) in base_env() {
         cmd.env(k, v);
+    }
+    for (k, v) in vars {
+        if v.is_empty() {
+            cmd.env_remove(k);
+        } else {
+            cmd.env(k, v);
+        }
     }
 }
 
@@ -341,6 +367,51 @@ mod tests {
 
     fn gate() -> parking_lot::MutexGuard<'static, ()> {
         TEST_GATE.lock()
+    }
+
+    /// `apply_clean_env` 的两条不变量（真机行为级，跑一次 `env`）：
+    ///   1) 进程 env 里的「请求期临时值」（模拟 env_lock 窗口里别人装的 .env）绝不被继承；
+    ///   2) 空值项 = 该键不存在 —— **包括把基底里的同名键也去掉**（与 `install()` 一致）。
+    /// 否则同一个 `.env`（`FOO=`）在 cgi/cgi_script（子进程 envp）与 wsgi/lua（进程 env）
+    /// 上语义分叉。
+    #[cfg(unix)]
+    #[test]
+    fn apply_clean_env_is_base_plus_request_and_empty_means_absent() {
+        let _gate = gate();
+        const LEAK: &str = "CRUCIBLE_UT_ACLEAN_LEAK";
+        const BASE: &str = "CRUCIBLE_UT_ACLEAN_REQ";
+        const EMPTY: &str = "CRUCIBLE_UT_ACLEAN_EMPTY";
+        // 先在进程 env 里放 EMPTY，**再**拍基底快照 —— 这样基底**确实**含这个键，
+        // 「空值要去掉基底同名键」才被真正测到（而不是因为基底里本来就没有它）。
+        std::env::set_var(EMPTY, "from-process-env");
+        init_base_env();
+        // 模拟「env_lock 窗口里进程 env 装着别的应用的 .env」——LEAK 不在基底快照里，
+        // 若 apply_clean_env 没做 env_clear，子进程就会带上它。
+        std::env::set_var(LEAK, "should-not-appear");
+        let mut cmd = std::process::Command::new("env");
+        apply_clean_env(
+            &mut cmd,
+            &[
+                (EMPTY.to_string(), String::new()),
+                (BASE.to_string(), "ok".to_string()),
+            ],
+        );
+        let out = cmd.output().expect("spawn env");
+        let text = String::from_utf8_lossy(&out.stdout);
+        std::env::remove_var(LEAK);
+        std::env::remove_var(EMPTY);
+        assert!(
+            !text.lines().any(|l| l.starts_with(&format!("{LEAK}="))),
+            "进程 env 里的请求期临时值不得被继承: {text}"
+        );
+        assert!(
+            text.lines().any(|l| l == format!("{BASE}=ok")),
+            "本请求 .env 的键必须在子进程里: {text}"
+        );
+        assert!(
+            !text.lines().any(|l| l.starts_with(&format!("{EMPTY}="))),
+            "空值 = 该键不存在（基底同名键也要去掉）: {text}"
+        );
     }
 
     #[test]

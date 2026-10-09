@@ -60,6 +60,15 @@ int appengine_headers_foreach(
  * out 需 >= name_len + 6 字节；返回写入的键长（不含 NUL），0 = 参数非法。 */
 size_t appengine_cgi_http_key(char *out, size_t out_sz, const char *name, size_t name_len);
 
+/* 在 ABI 请求头块里按名字查一条头（大小写不敏感），命中返回 1 并写 NUL 结尾的值。
+ *
+ * `key` 接受两种形态：
+ *   * 原头名（`Host`、`X-Request-Id`）—— 逐字（忽略大小写）匹配；
+ *   * CGI 形态（`HTTP_HOST`、`HTTP_X_REQUEST_ID`）—— 剥掉 `HTTP_` 后把 `_` 还原成 `-`
+ *     再匹配（Classic ASP 的 `Request.ServerVariables("HTTP_HOST")` 就是这种写法）。
+ * 值超过 out_sz-1 时截断（调用方给足缓冲即可）。headers 可为 NULL（返回 0）。 */
+int appengine_header_lookup(const char *headers, const char *key, char *out, size_t out_sz);
+
 #ifdef __cplusplus
 }
 #endif

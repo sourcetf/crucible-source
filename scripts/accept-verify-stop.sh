@@ -1,6 +1,6 @@
 #!/bin/sh
 # accept-verify-stop.sh — 停掉工号 1009 / agent-verify2 验收实例。
-SCRATCH=/home/dev123/scratch-verify3b
+SCRATCH=/home/dev123/scratch-verify4
 PIDF=$SCRATCH/webserver.pid
 if [ -f "$PIDF" ]; then
   OLD=$(cat "$PIDF" 2>/dev/null || true)

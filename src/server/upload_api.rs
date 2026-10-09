@@ -478,11 +478,17 @@ where
             return resp(StatusCode::PAYLOAD_TOO_LARGE, "超过单文件上限", None)
         }
         Err(UploadErr::TooManySessions) => {
-            return resp(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "上传会话过多（或本来源 IP 的并发上传已达上限），稍后再试",
-                None,
-            )
+            // RFC 9110 §15.6.4：503 建议带 `Retry-After`（与上面的并发闸门 503 一致）。
+            // 语义是「同一来源 IP 的**在途**上传并发已达上限」，闲置的可续传会话不占配额
+            //（见 `upload_resume::MAX_SESSIONS_PER_IP`），所以重试是短期有效的。
+            return Response::builder()
+                .status(StatusCode::SERVICE_UNAVAILABLE)
+                .header(header::RETRY_AFTER, "5")
+                .header(header::CONTENT_TYPE, "text/plain; charset=utf-8")
+                .body(full(
+                    "上传会话过多（本来源 IP 的并发上传已达上限），稍后再试",
+                ))
+                .unwrap_or_else(|_| Response::new(full("upload busy".to_string())));
         }
         Err(UploadErr::NoSpace) => {
             return resp(
@@ -535,6 +541,13 @@ where
                 Ok(Some(Ok(f))) => f,
                 Ok(Some(Err(e))) => {
                     log::debug!("upload: 读取请求体失败: {e:#}");
+                    // 一字节都没收到时**放弃会话**：空 `.part` 没有任何可续传的内容，留着只
+                    // 占 inode/会话表（h1c 实测：批量畸形请求会在上传根堆积 0 字节 `.part`）。
+                    // 收到过字节则保留（断线续传的核心场景）。注意：读失败**也可能**是
+                    // 连接被重置（网络抖动）——那条路径只在 `received() > 0` 时保留会话。
+                    if sess.received() == 0 {
+                        upload_resume::abort(&sess);
+                    }
                     return resp(StatusCode::BAD_REQUEST, "读取请求体失败", Some(sess.received()));
                 }
                 Ok(None) => break,
@@ -546,6 +559,10 @@ where
                     // 只释放 permit（靠函数返回），**保留**会话与已收字节：
                     // 断点续传正是为「网络中断/超时」设计的，删掉 `.part` 等于
                     // 让客户端从头再来。弃用会话由 `sweep_expired`（TTL 1h）回收。
+                    // 例外：一个字节都没收到时没有可续传的内容，直接放弃（卫生）。
+                    if sess.received() == 0 {
+                        upload_resume::abort(&sess);
+                    }
                     return resp(
                         StatusCode::REQUEST_TIMEOUT,
                         "请求体读取超时（可按 X-Upload-Offset 续传）",

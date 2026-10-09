@@ -36,6 +36,11 @@
 #include "appengine.h"
 #include "appengine_common.h"
 #include "crucible_embed.h"
+/* 跨 .so 的 CPython 初始化协调（进程级互斥在共享库 libscriptffi.so 里）：
+ * wsgi/asgi/uwsgi 与 script_engine 各自 dlopen 同一份 libpython，而每个 .so 的
+ * g_py_lock 是**私有**的 —— 光靠它挡不住两个 .so 并发进入 Py_Initialize
+ * （P0：CPython 直接 Py_FatalError/abort，整个 webserver 进程消失）。 */
+#include "crucible_pyinit.h"
 
 #include <pthread.h>
 #include <stdarg.h>
@@ -771,8 +776,36 @@ static int crucible_py_init_locked(char *err, size_t errsz)
     CRUCIBLE_PY_LOAD(err_normalize_exception, "PyErr_NormalizeException");
 
     if (!g_py.is_initialized()) {
-        g_py.init();
-        we_initialized = 1;
+        /* 首次初始化**必须**经 libscriptffi.so 的进程级互斥（crucible_pyinit_ensure）。
+         *
+         * 为什么不能在这里直接 g_py.init()：wsgi.so / asgi.so / uwsgi.so /
+         * libapp_python.so 各自 dlopen 同一份 libpython，各自的 g_py_lock 是 .so
+         * **私有**锁。冷启动时两个 .so 的首请求（或两次并发 dlopen 触发的
+         * appengine_init）同时到达：两边都看到 Py_IsInitialized()==false，双双调用
+         * Py_Initialize —— CPython 3.14 对此直接
+         * `Fatal Python error: _PyImport_Init: global import state already
+         * initialized` + abort()，**整个 webserver 进程被杀、所有监听口下线**。
+         * 真机实测（2026-10-09）：冷启动后 /wsgi-a/ 与 /asgi-a/ 两个并发首请求，
+         * 5/5 复现进程消失。
+         * 协调器（scriptffi.c::crucible_py_ensure_init）用进程级静态互斥串行化
+         * 「检查 + initialize + SaveThread」；libscriptffi.so 缺失时退回本 .so
+         * 私有锁（只有一个嵌入点的场景仍然正确）。 */
+        if (crucible_pyinit_ensure(g_py.is_initialized, g_py.init,
+                                   (void *(*)(void))g_py.save_thread, err, errsz) != 0) {
+            snprintf(g_py_init_err, sizeof(g_py_init_err), "%s",
+                     (err != NULL && err[0] != '\0') ? err : "CPython 初始化失败");
+            if (err != NULL && errsz > 0)
+                snprintf(err, errsz, "%s", g_py_init_err);
+            memset(&g_py, 0, sizeof(g_py));
+            g_py_state = -1;
+            if (h != NULL)
+                dlclose(h);
+            return -1;
+        }
+        /* 协调器（或真正执行初始化的那个 .so）已在初始化线程上 SaveThread；
+         * 当前线程**并不持有 GIL**，这里绝不能再 SaveThread（旧代码在这里按
+         * 「我初始化的」调用的前提已由协调器接管）。 */
+        we_initialized = 0;
     }
     if (g_py.get_version != NULL) {
         const char *v = g_py.get_version();

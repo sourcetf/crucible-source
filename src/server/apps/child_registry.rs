@@ -35,12 +35,23 @@ fn register_with_program(pid: i32, name: &str, program: &str) {
 }
 
 /// pid 还活着、且命令行里仍能看到当初记录的程序名（没记录程序名则退回「还活着就动手」）。
+///
+/// **自己的直系子进程一律算匹配**（`ppid == self`）：`spawn_tracked` 登记的是**壳程序**
+/// 的命令行，而壳常常立刻 `exec` 成别的程序（`deps/bin/index` wrapper → sh → python3 /
+/// java / ruby；实测 JSP sidecar），exec 之后命令行里**再也不含**登记的程序名 —— 只按名字
+/// 判会把**自己的直系子进程**误判成「pid 已被复用」而跳过不杀：真机实测，一个忽略
+/// SIGTERM 的 sidecar 在 SIGTERM 优雅关机后**存活下来**（日志里正是
+/// `skip ...（pid 已被复用或已退出，命令行无 index）`）。`ppid == self` 只有在「子进程
+/// 已退出且 pid 立刻被复用」时才会不成立，比名字强得多（那种情况才退回名字判据）。
 fn alive_and_matches(pid: i32, program: &str) -> bool {
     if pid <= 1 {
         return false;
     }
     if unsafe { libc::kill(pid, 0) } != 0 {
         return false; // 已退出
+    }
+    if ppid_of(pid) == Some(std::process::id() as i32) {
+        return true; // 本进程的直接子进程：身份确定
     }
     if program.is_empty() {
         return true; // 旧式注册（无程序名）→ 保持旧行为
@@ -49,6 +60,18 @@ fn alive_and_matches(pid: i32, program: &str) -> bool {
         Some(cmd) => cmd.contains(program),
         None => false,
     }
+}
+
+/// `pid` 的父进程号（`ps -o ppid=`；OpenBSD 无 /proc，用 ps 统一）。
+fn ppid_of(pid: i32) -> Option<i32> {
+    let out = Command::new("ps")
+        .arg("-o")
+        .arg("ppid=")
+        .arg("-p")
+        .arg(pid.to_string())
+        .output()
+        .ok()?;
+    String::from_utf8_lossy(&out.stdout).trim().parse().ok()
 }
 
 pub fn unregister(pid: i32) {
@@ -163,8 +186,8 @@ pub fn cleanup_orphans_at_startup() {
         if pid == self_pid {
             continue;
         }
-        // 其它存活 webserver 实例（含测试实例）拥有这些 sidecar → 跳过清理
-        if cmd.contains("webserver") && cmd.contains("--config") {
+        // 其它存活 webserver 实例（含测试实例）拥有这些 sidecar → 跳过清理。
+        if cmdline_is_webserver_instance(cmd) {
             live_webserver = true;
         }
         let stale = (cmd.contains("php-fpm") && cmd.contains(&format!("{root_str}/state/")))
@@ -196,6 +219,27 @@ pub fn cleanup_orphans_at_startup() {
             }
         }
     }
+}
+
+/// 「这条命令行是另一个存活 webserver 实例」——启动期孤儿清理据此决定动不动手。
+///
+/// 判据必须与 CLI 一致：`parse_config_path()`（src/main.rs）同时接受
+/// `--config <path>` **和** `-c <path>`（文档化别名）。旧实现只认字面 `"--config"`
+/// 子串，于是 `webserver -c cfg.toml` 的实例被当成「不存在」—— 它拉起的 php-fpm /
+/// sidecar（命令行都引用本仓库的 state/ 或 target/app-engines/，见 stale 判据）会被
+/// 新实例的启动清理 SIGTERM/SIGKILL 掉，那个实例随即开始 502，直到它自己重新拉起子进程。
+///
+/// 按 token 判定（而不是整串 contains）避免把参数里恰好含 `-c`/`--config` 的无关命令
+/// 也算成 webserver 实例（会让清理该做时不做，属保守方向）。
+fn cmdline_is_webserver_instance(cmd: &str) -> bool {
+    let tokens: Vec<&str> = cmd.split_whitespace().collect();
+    let is_webserver = tokens
+        .iter()
+        .any(|t| *t == "webserver" || t.ends_with("/webserver"));
+    let has_config_flag = tokens
+        .iter()
+        .any(|t| *t == "-c" || *t == "--config" || t.starts_with("--config="));
+    is_webserver && has_config_flag
 }
 
 /// `ps -axww -o pid=,command=` 全量列表。
@@ -248,5 +292,53 @@ mod tests {
         );
         // 记录为空串（旧式 register）⇒ 退回旧行为：活着即 true
         assert!(alive_and_matches(me, ""), "旧式注册应保持旧行为");
+    }
+
+    /// 直系子进程即使 `exec` 成别的程序（命令行不再含登记的程序名）也必须算「匹配」。
+    /// 真机教训：`deps/bin/index` wrapper → `exec python3` 之后名字变成 python3，旧判据
+    /// 让 kill_all 跳过自己的 sidecar ⇒ SIGTERM 关机后 sidecar 存活成孤儿。
+    #[cfg(unix)]
+    #[test]
+    fn own_child_matches_even_after_exec() {
+        use std::process::Command as C;
+        let mut child = C::new("/bin/sh")
+            .arg("-c")
+            .arg("exec sleep 30")
+            .spawn()
+            .expect("spawn sh");
+        let pid = child.id() as i32;
+        assert!(
+            alive_and_matches(pid, "/bin/sh"),
+            "自己的直系子进程必须匹配（exec 后名字已变）"
+        );
+        // 名字判据只对**非直系**进程生效（pid 复用防线）；直系子进程由 ppid 身份直接认定。
+        assert!(
+            alive_and_matches(pid, "php-fpm"),
+            "直系子进程身份优先于名字判据"
+        );
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
+    /// 启动期孤儿清理的「另一实例存活」判据：`--config` 与 `-c` 两种写法都必须认出
+    /// （旧实现只认 `--config` ⇒ `webserver -c cfg` 的实例的子进程会被误杀）。
+    #[test]
+    fn live_instance_detection_accepts_both_config_flags() {
+        for cmd in [
+            "/home/u/crucible/target/release/webserver --config /home/u/crucible/config.toml",
+            "/home/u/crucible/target/release/webserver -c /home/u/crucible/config.toml",
+            "webserver --config=/x/config.toml",
+            "webserver -c /x/config.toml -v",
+        ] {
+            assert!(cmdline_is_webserver_instance(cmd), "应判为存活实例: {cmd}");
+        }
+        for cmd in [
+            "/usr/bin/vim /home/u/crucible/config.toml",
+            "php-fpm -c /etc/php.ini",
+            "python3 server.py --config /x",
+            "/home/u/crucible/target/release/webserver --check-config",
+        ] {
+            assert!(!cmdline_is_webserver_instance(cmd), "不应判为存活实例: {cmd}");
+        }
     }
 }

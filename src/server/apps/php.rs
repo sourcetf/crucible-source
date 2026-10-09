@@ -636,6 +636,10 @@ pm.max_requests = 10000
     fs::write(&conf_path, conf).context("write php-fpm conf")?;
 
     let mut cmd = Command::new(&fpm_bin);
+    // 干净环境：php-fpm 是长驻进程，spawn 时刻可能落在别的应用的请求期 `.env` 窗口内。
+    // fpm 池默认 clear_env=yes（worker 环境会被清），但 master 自己会永久留下别人的密钥。
+    // 统一用「启动期基底」spawn（与 cgi_script / sidecar 同一判据）。
+    crate::server::apps::env_lock::apply_clean_env(&mut cmd, &[]);
     cmd.arg("-y")
         .arg(abs_path(&conf_path))
         .arg("-F") // foreground; we manage as child
@@ -685,6 +689,9 @@ async fn start_cgi(key: &str, app: &AppRouteConfig, state_dir: &Path) -> Result<
         let _ = fs::remove_file(&sock_path);
         let abs_sock = abs_path(&sock_path);
         let mut cmd = Command::new(&cgi_bin);
+        // 干净环境（同 fpm 路径）：php-cgi 的 worker 直接继承 spawn 时的 environ，
+        // 默认继承会把别的应用的请求期 `.env` 永久带上。
+        crate::server::apps::env_lock::apply_clean_env(&mut cmd, &[]);
         cmd.arg("-b")
             .arg(format!("{}", abs_sock.display()))
             .env("PHP_FCGI_CHILDREN", &workers)
@@ -725,6 +732,8 @@ async fn start_cgi(key: &str, app: &AppRouteConfig, state_dir: &Path) -> Result<
         let port = TCP_PORT_SEQ.fetch_add(1, Ordering::Relaxed);
         let bind = format!("0.0.0.0:{port}");
         let mut cmd = Command::new(&cgi_bin);
+        // 干净环境（同 unix 路径）。
+        crate::server::apps::env_lock::apply_clean_env(&mut cmd, &[]);
         cmd.arg("-b")
             .arg(&bind)
             .env("PHP_FCGI_CHILDREN", &workers)

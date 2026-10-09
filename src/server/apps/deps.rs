@@ -173,9 +173,24 @@ pub async fn try_cached(lc: &ListenerConfig, app: &AppRouteConfig) -> Result<Dep
 }
 
 /// 极简 .env 解析：忽略空行与 # 注释；KEY=VAL；值剥成对引号；KEY 仅允许 [A-Za-z0-9_]。
+///
+/// 非法 UTF-8 **不再整份丢弃**：`fs::read_to_string` 对「一个 Latin-1 字节」直接报错，
+/// 旧实现于是静默返回空表 —— 日志里什么都没有，应用却突然失去全部 `.env` 配置
+///（真机实测：`A=ok\nB=caf\xe9` 两个键都读不到）。改为按字节读 + lossy 解码（坏字节
+/// 变成 U+FFFD，行结构照常解析），并留一条 warn 便于排查。
 fn parse_env_file(p: &Path) -> Vec<(String, String)> {
-    let Ok(text) = fs::read_to_string(p) else {
+    let Ok(bytes) = fs::read(p) else {
         return Vec::new();
+    };
+    let text: std::borrow::Cow<'_, str> = match std::str::from_utf8(&bytes) {
+        Ok(t) => std::borrow::Cow::Borrowed(t),
+        Err(_) => {
+            log::warn!(
+                "deps: {} 不是合法 UTF-8 —— 按 lossy 解码继续解析（旧行为会整份 .env 静默失效）",
+                p.display()
+            );
+            String::from_utf8_lossy(&bytes)
+        }
     };
     let mut vars = Vec::new();
     for raw in text.lines() {
@@ -318,6 +333,12 @@ async fn ensure_app_deps(
     .with_context(|| format!("deps prep join {}", deps_dir.display()))??;
 
     let mut cmd = tokio::process::Command::new("sh");
+    // **干净环境**：init.sh 在**请求路径**上执行（冷缓存/改过 init.sh 或 .env 时），
+    // 而那一瞬间进程 env 里可能装着**另一个应用**的请求期 `.env`（env_lock 的窗口）。
+    // 默认继承 environ 会把别人的密钥交给 init.sh（真机实测：init.sh 的 `env` 里能看到
+    // 并发的 wsgi 应用的 WINDOWMARK/SECRET_A，还会被写进 deps/ 产物）。
+    // 用「启动期基底」构造 envp：运维环境照旧，请求期临时值一律不继承。
+    crate::server::apps::env_lock::apply_clean_env_tokio(&mut cmd, &[]);
     cmd.arg(init)
         .current_dir(docroot)
         .env("DEPS_DIR", deps_dir)

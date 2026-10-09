@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """accept-verify-upstream.py — 验收用本机上游（反向代理 / WebSocket 测试）。
 
-监听 127.0.0.1:PORT（默认 28099，可用 argv[1] 覆盖）。同时起一个 TLS 监听在 PORT+1
-（默认 28100），ALPN 广告 `h2,http/1.1` —— 用于验证代理回源「WS 到 h2 上游」时的
+监听 127.0.0.1:PORT（默认 29099，可用 argv[1] 覆盖）。同时起一个 TLS 监听在 PORT+1
+（默认 29100），ALPN 广告 `h2,http/1.1` —— 用于验证代理回源「WS 到 h2 上游」时的
 force_h1（即便上游广告 h2，也必须按 h1 讲话）。
 
 - GET/POST /proxy*  → 200，body 为收到的请求行 + 请求头（供检查请求头改写），
@@ -12,11 +12,11 @@ force_h1（即便上游广告 h2，也必须按 h1 讲话）。
 """
 import socket, sys, threading, ssl, os, time
 
-PORT = int(sys.argv[1]) if len(sys.argv) > 1 else 28099
+PORT = int(sys.argv[1]) if len(sys.argv) > 1 else 29099
 TLSPORT = PORT + 1
 BIND = "127.0.0.1"
 REPO = "/home/dev123/crucible-git"
-LOGDIR = "/home/dev123/scratch-verify3b/logs"
+LOGDIR = "/home/dev123/scratch-verify4/logs"
 
 
 def log_req(proto, head):

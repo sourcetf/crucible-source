@@ -348,6 +348,24 @@ async fn exec_dispatch(
     let rel = rel_script_path(app, path);
     let script = crate::server::admin_files::script_rel(&docroot, rel.trim_start_matches('/'))
         .map_err(|e| anyhow::anyhow!("script path rejected: {e:#}"))?;
+    // **非普通文件一律不交给引擎**：docroot 里存在 FIFO/字符设备/目录时，引擎侧多是
+    // `fopen`/`luaL_loadfile` 直接打开它 —— FIFO 无写端时 open() 会**永久阻塞**，
+    // 而 FFI 引擎调用没有墙钟超时，且调用期间持有宿主的 env 锁 ⇒ 一次请求就把
+    // **所有**依赖 env 锁的引擎（wsgi/asgi/lua/python/c/asp/aspnet…）永久挂死
+    // （真机实测：docroot 里一个 FIFO 的 `.aspx` 让随后 wsgi/asgi/lua 全部超时）。
+    // 这里在中央入口挡住，比逐个引擎补 `is_regular_file` 更完整（C 引擎仍各自保留
+    // 自己的检查作为纵深防御）。**目录不算**：无 `index` 配置且引擎无默认首页时
+    // `script` 会解析成 docroot 目录本身（c/go 样例就忽略 script），目录上 fopen 只会
+    // 返回 EISDIR，不会阻塞。文件**不存在**时也不做判断：cgi 引擎还会按
+    // docroot/index.cgi → cgi-bin/index.cgi 回落，语义不变。
+    if let Ok(md) = std::fs::metadata(&script) {
+        if !md.is_file() && !md.is_dir() {
+            bail!(
+                "script is not a regular file (refusing to exec): {}",
+                script.display()
+            );
+        }
+    }
     let port = lc.port;
     let server_name = lc.server_name.clone().unwrap_or_else(|| "crucible".into());
 

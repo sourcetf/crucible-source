@@ -132,6 +132,13 @@ async fn ensure_sidecar(key: &str, lc: &ListenerConfig, app: &AppRouteConfig) ->
     let log_file = fs::File::create(&log_path).context("sidecar.log")?;
 
     let mut cmd = Command::new(&deps_bin);
+    // **干净环境**：sidecar 是**长驻**进程，spawn 只发生在「缓存里没有 / 上一个死了」时，
+    // 而这个时刻完全可能落在**另一个应用**的请求期 `.env` 窗口内（进程 env 里装着别人的
+    // 密钥）。默认继承 environ 会把这些密钥永久烤进 sidecar 的环境（真机实测：wsgi 应用
+    // 的 .env 窗口里拉起 JSP sidecar，wrapper 里 `env` 能看到 WINDOWMARK/SECRET_A）。
+    // 用「启动期基底 + 本请求 .env（对 sidecar 为空）」构造 envp，运维环境照旧、
+    // 请求期临时值一律不继承。
+    crate::server::apps::env_lock::apply_clean_env(&mut cmd, &[]);
     cmd.current_dir(&docroot)
         .env("WEBSERVER_LISTEN_UNIX", sock.display().to_string())
         // 路由前缀：sidecar 自行决定是否剥离（JSP/Jetty 据此把 /jsp/x.jsp 映射到 docroot/x.jsp）。
@@ -178,6 +185,36 @@ async fn ensure_sidecar(key: &str, lc: &ListenerConfig, app: &AppRouteConfig) ->
 fn sock_alive(sock: &Path) -> bool {
     use std::os::unix::net::UnixStream;
     UnixStream::connect(sock).is_ok()
+}
+
+/// 代理超时后杀掉**受管**（`SIDECARS` 表里登记的）sidecar 进程，返回是否真的杀了。
+///
+/// 为什么必须杀（实测）：挂死的 sidecar（死锁 / SIGSTOP）仍在 listen，`sock_alive()`
+/// 的 connect 被内核 backlog 接住并成功 ⇒ 缓存判定「活着」，之后的每个请求都要再等满
+/// `SIDECAR_TIMEOUT` 才 502，**不会自愈**。杀掉后下一个请求会重新 spawn。
+///
+/// 只按 **sock 路径** 在受管表里找：显式 `apps[].socket`（运维的 Jetty）不在表里，
+/// 不会被误杀（那是别人管理的进程，宿主没有终止权）。SIGTERM → 短等 → SIGKILL → 回收
+/// 由 `child_registry::kill_child` 完成。
+#[cfg(unix)]
+fn kill_managed_sidecar_by_sock(sock: &Path) -> bool {
+    let key = {
+        let map = SIDECARS.lock();
+        map.iter().find(|(_, s)| s.sock == sock).map(|(k, _)| k.clone())
+    };
+    let Some(key) = key else {
+        return false;
+    };
+    let removed = SIDECARS.lock().remove(&key);
+    if let Some(mut dead) = removed {
+        log::warn!(
+            "native_http: sidecar {} 代理超时（客户端已 502）→ 终止受管进程，后续请求将重启",
+            dead.sock.display()
+        );
+        crate::server::apps::child_registry::kill_child(&mut dead.child);
+        return true;
+    }
+    false
 }
 
 #[cfg(unix)]
@@ -309,6 +346,13 @@ async fn proxy_unix(
     }
     // 整段一个 deadline（见 SIDECAR_TIMEOUT 说明）。超时后这条连接已不可复用，直接丢弃、
     // 不 checkin —— 否则一个卡死的 sidecar 连接会被放回池里毒化后续请求。
+    //
+    // 超时还必须**杀掉受管的 sidecar 进程**：挂死的进程（死锁/被 SIGSTOP）仍然占着监听
+    // socket，`sock_alive()` 的 connect 会落进 backlog 而成功 ⇒ 该 sidecar 在缓存里永远
+    // 「活着」，之后每个请求都要再等满 30s 才 502，**永不恢复**（真机实测：SIGSTOP 后两次
+    // 连续请求都是 30s+502，进程一直挂着）。杀掉之后下一个请求走 ensure_sidecar 重新拉起。
+    // 只动 SIDECARS 里登记的（宿主自己 spawn 的）进程；显式 `apps[].socket`
+    //（运维自己起的 Jetty）不在表里，绝不会被误杀。
     let (rparts, rbytes) = tokio::time::timeout(SIDECAR_TIMEOUT, async {
         let resp = sender.send_request(build()?).await.context("sidecar request")?;
         let (rparts, rbody) = resp.into_parts();
@@ -321,7 +365,10 @@ async fn proxy_unix(
         Ok::<_, anyhow::Error>((rparts, rbytes))
     })
     .await
-    .map_err(|_| anyhow::anyhow!("sidecar timeout after {SIDECAR_TIMEOUT:?}"))??;
+    .map_err(|_| {
+        kill_managed_sidecar_by_sock(sock);
+        anyhow::anyhow!("sidecar timeout after {SIDECAR_TIMEOUT:?}")
+    })??;
     checkin_unix(sock, sender);
     // 上游响应头必须净化后再透传：sidecar 是「挂在某个路径前缀下的应用」，它回的
     // `Content-Length`/`Transfer-Encoding` 与我们重建的 body 不符时会造成响应走私

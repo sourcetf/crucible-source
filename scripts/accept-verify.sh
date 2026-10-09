@@ -1,11 +1,11 @@
 #!/bin/sh
-# accept-verify.sh — 工号 1009 / agent-verify3b 黑盒验收一键跑（wave-6）。
+# accept-verify.sh — 工号 1009 / agent-verify4 黑盒验收一键跑（wave-7）。
 #   sh scripts/accept-verify.sh            # 全量：构建 + 起实例 + 上游 + 跑 HTTP/H2/H3/DNS + 扩展 + 汇总
 #   sh scripts/accept-verify.sh --no-build # 跳过 cargo build（用已有二进制）
-# 端口块 28000+；DNS 状态根独立；不碰别人的端口/进程。
+# 端口块 29000+；DNS 状态根独立；不碰别人的端口/进程。
 set -u
 REPO=/home/dev123/crucible-git
-SCRATCH=/home/dev123/scratch-verify3b
+SCRATCH=/home/dev123/scratch-verify4
 PY=python3
 
 cd "$REPO" || exit 2
@@ -73,13 +73,39 @@ printf 'Content-Type: text/plain\r\n\r\n'
 printf 'WINDOWMARK=%s SECRET_S=%s SECRET_A=%s\n' "${WINDOWMARK-<unset>}" "${SECRET_S-<unset>}" "${SECRET_A-<unset>}"
 CGI
 chmod +x "$SCRATCH"/env-www/*/index.cgi
+# cgi_script SCRIPT_NAME/PATH_INFO（wave-7）：脚本把三个 CGI 变量原样打印，供 h1/h2c 断言
+mkdir -p "$SCRATCH/env-www/cgis"
+cat > "$SCRATCH/env-www/cgis/index.cgi" <<'CGI'
+#!/bin/sh
+printf 'Content-Type: text/plain\r\n\r\n'
+printf 'SCRIPT_NAME=%s PATH_INFO=%s QUERY_STRING=%s\n' "${SCRIPT_NAME-<unset>}" "${PATH_INFO-<unset>}" "${QUERY_STRING-<unset>}"
+CGI
+chmod +x "$SCRATCH/env-www/cgis/index.cgi"
+# 假 ABI .so（wave-7）：若这两个 app 的 .so 被错误调用，脚会写 marker 文件
+mkdir -p "$SCRATCH/abi-www/old" "$SCRATCH/abi-www/bad"
+for d in old bad; do
+  printf '#!/bin/sh\necho "$0" >> "%s/abi-%s.marker"\nprintf "Content-Type: text/plain\\r\\n\\r\\nSHOULD-NEVER-RUN\\n"\n' \
+    "$SCRATCH" "$d" > "$SCRATCH/abi-www/$d/index.cgi"
+  chmod +x "$SCRATCH/abi-www/$d/index.cgi"
+done
+# 假 acme 客户端（wave-7 面板签发统一入口复核）：PATH 前置目录里的假 certbot
+mkdir -p "$SCRATCH/bin/acme-fake" "$SCRATCH/acme-fake-www"
+cat > "$SCRATCH/bin/acme-fake/certbot" <<EOF
+#!/bin/sh
+# accept-verify 假 certbot：被 acme::issue 的 run_client 调用时写 marker 并失败退出。
+echo "invoked: \$*" >> "$SCRATCH/tmp/acme-fake.marker"
+echo "fake certbot: refusing on purpose (accept-verify)" >&2
+exit 1
+EOF
+chmod +x "$SCRATCH/bin/acme-fake/certbot"
 # h3 GOAWAY 用：第二个 docroot（触发热重载的 root 变更）
 mkdir -p "$SCRATCH/www-h3dir2/sub"
 echo "h3dir2 index" > "$SCRATCH/www-h3dir2/index.html"
 # per-site 访问日志独立实例用（同 config 内 root 必须互不相同）
-mkdir -p "$SCRATCH/www-alog" "$SCRATCH/www-alog2"
+mkdir -p "$SCRATCH/www-alog" "$SCRATCH/www-alog2" "$SCRATCH/www-alog3"
 echo "alog" > "$SCRATCH/www-alog/index.html"
 echo "alog2" > "$SCRATCH/www-alog2/index.html"
+echo "alog3" > "$SCRATCH/www-alog3/index.html"
 # ETag/inode：一个用于原子替换的文件
 echo "etag-body-1" > "$SCRATCH/www-adv/etag.txt"
 # 符号链接索引绕过：symout/index.html -> docroot 外；symin/index.html -> docroot 内
@@ -118,25 +144,35 @@ if [ -f "$REPO/libs/app-engines/cgi/cgi_engine.c" ]; then
     || { echo "libapp_cgi.so BUILD FAILED"; exit 2; }
 fi
 
+# ── 假 ABI .so（wave-7：旧代缺 abi 符号 / 异版自报 99 —— 都必须在调用前被拒）──
+gcc -O2 -fPIC -shared -o "$SCRATCH/bin/libapp_fake_abi_old.so" scripts/accept-verify-fakeabi.c \
+    -DHAVE_ABI=0 -DMARKER_PATH="\"$SCRATCH/abi-old.marker\"" \
+  && echo "==> libapp_fake_abi_old.so: $(md5sum "$SCRATCH/bin/libapp_fake_abi_old.so")" \
+  || { echo "fake abi old BUILD FAILED"; exit 2; }
+gcc -O2 -fPIC -shared -o "$SCRATCH/bin/libapp_fake_abi_bad.so" scripts/accept-verify-fakeabi.c \
+    -DHAVE_ABI=1 -DABI_REPORT=99 -DMARKER_PATH="\"$SCRATCH/abi-bad.marker\"" \
+  && echo "==> libapp_fake_abi_bad.so: $(md5sum "$SCRATCH/bin/libapp_fake_abi_bad.so")" \
+  || { echo "fake abi bad BUILD FAILED"; exit 2; }
+
 # ── 生成配置（忠实于 config-test.toml，含 address_v6）──
 $PY scripts/accept-verify-genconf.py >/dev/null || exit 2
 # 另生成一份去掉 address_v6 的副本：绕开「双栈 [::] 绑定失败连带掐掉 h3 端点」这个
 # 环境/缺陷，用于真正验证 HTTP/3 协议面（见报告 verify-wave3）。
 sed '/address_v6 = "::"/d' "$SCRATCH/conf/config-verify.toml" > "$SCRATCH/conf/config-verify-nov6.toml"
 
-# ── 起上游（明文 28099 + TLS 28100）──
+# ── 起上游（明文 29099 + TLS 29100）──
 # 只杀**本端口**的上游：共享机上别的 agent 可能跑同名脚本（照抄的套件），
 # 宽泛的 `pkill -f accept-verify-upstream.py` 会互相误杀（实测发生）。
-pkill -f "accept-verify-upstream.py 28099" 2>/dev/null || true
+pkill -f "accept-verify-upstream.py 29099" 2>/dev/null || true
 sleep 0.3
-nohup $PY scripts/accept-verify-upstream.py 28099 >"$SCRATCH/logs/upstream.log" 2>&1 &
+nohup $PY scripts/accept-verify-upstream.py 29099 >"$SCRATCH/logs/upstream.log" 2>&1 &
 echo $! > "$SCRATCH/upstream.pid"
 sleep 0.5
 
 ensure_upstream() {
-  if ! curl -s -o /dev/null --max-time 3 "http://127.0.0.1:28099/proxy" 2>/dev/null; then
-    echo "WARN: 上游 28099 不在（被别的 agent 的 pkill 误杀？）→ 重启"
-    nohup $PY scripts/accept-verify-upstream.py 28099 >>"$SCRATCH/logs/upstream.log" 2>&1 &
+  if ! curl -s -o /dev/null --max-time 3 "http://127.0.0.1:29099/proxy" 2>/dev/null; then
+    echo "WARN: 上游 29099 不在（被别的 agent 的 pkill 误杀？）→ 重启"
+    nohup $PY scripts/accept-verify-upstream.py 29099 >>"$SCRATCH/logs/upstream.log" 2>&1 &
     echo $! > "$SCRATCH/upstream.pid"
     sleep 0.5
   fi
@@ -151,7 +187,7 @@ sleep 1
 # 每趟开始前探活，死了就重启，绝不让后续趟次跑在死实例上。
 ensure_up() {
   ensure_upstream
-  if ! curl -s -o /dev/null --max-time 2 "http://127.0.0.1:28081/" 2>/dev/null; then
+  if ! curl -s -o /dev/null --max-time 2 "http://127.0.0.1:29081/" 2>/dev/null; then
     echo "WARN: 实例在 $1 前消失（外部 SIGTERM？）→ 重启并用同一配置继续"
     tail -3 "$SCRATCH/logs/webserver.log" | cut -c1-160
     sh scripts/accept-verify-start.sh || { echo "RESTART FAILED"; exit 2; }
@@ -178,11 +214,38 @@ RC4=$?
 # ── PASS 2：去 address_v6 档 → HTTP/3 / DoT / DoH ──
 ACCEPT_CFG="$SCRATCH/conf/config-verify-nov6.toml" sh scripts/accept-verify-start.sh >/dev/null 2>&1
 sleep 1.5
-echo; echo "########## PASS2: HTTP/3 + DoT + DoH（去 address_v6 以启用 QUIC 端点）##########"
+# 假 named（UDP 29553）：本机没有 bind9，DoT/DoH 的正常递归路径没有应答者就会超时。
+# 起它之后，「DoT 回 DNS 报文 / DoH POST 返回 dns-message」不再是 SKIP，而是端到端验证。
+pkill -f "accept-verify-fakenamed.py 29553" 2>/dev/null || true
+sleep 0.2
+nohup $PY scripts/accept-verify-fakenamed.py 29553 >>"$SCRATCH/logs/fake-named.log" 2>&1 &
+echo $! > "$SCRATCH/fakenamed.pid"
+sleep 0.5
+echo; echo "########## PASS2: HTTP/3 + DoT + DoH（去 address_v6 以启用 QUIC 端点；假 named 已起）##########"
 $PY scripts/accept-verify-h3.py --json "$SCRATCH/accept-h3-results.json"
 RC2=$?
+
+# ── PASS 2.0：DNS ECS 转发/回显（假 named on :29553；ecs=true 档）──
+# 本机没有 named，正常递归只会超时；这里用假 named 给出真实应答，才能对「ECS 回显」
+# 做端到端黑盒判据（wave-7 复核点）。
+ensure_up "PASS2.0-ecs"
+echo; echo "########## PASS2.0: DNS ECS（DoT/DoH，假 named，ecs=true）##########"
+$PY scripts/accept-verify-dns.py --expect-ecs on --json "$SCRATCH/accept-dns-on-results.json"
+RC5=$?
+
+# ── PASS 2.1：ecs=false 档（独立配置；跑完恢复）──
+# [dns] ecs=false：出站剥离客户端 ECS、应答不回显（RFC 7871 语义完整）。
+ACCEPT_CFG="$SCRATCH/conf/config-verify-ecsoff.toml" sh scripts/accept-verify-start.sh >/dev/null 2>&1
+sleep 1.5
+echo; echo "########## PASS2.1: DNS ECS 关闭（ecs=false：不回显/不转发，假 named）##########"
+$PY scripts/accept-verify-dns.py --expect-ecs off --json "$SCRATCH/accept-dns-off-results.json"
+RC6=$?
+
+# 恢复主配置（去 v6 档），让日志/环境回到其余趟次一致的状态；停掉假 named
+ACCEPT_CFG="$SCRATCH/conf/config-verify-nov6.toml" sh scripts/accept-verify-start.sh >/dev/null 2>&1
+pkill -f "accept-verify-fakenamed.py 29553" 2>/dev/null || true
 
 echo; echo "########## 日志尾部 ##########"
 tail -5 "$SCRATCH/logs/webserver.log"
 
-exit $(( RC1 | RC2 | RC3 | RC4 ))
+exit $(( RC1 | RC2 | RC3 | RC4 | RC5 | RC6 ))

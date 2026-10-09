@@ -38,8 +38,23 @@ pub const RESET_IDLE_GRACE: Duration = Duration::from_secs(30);
 /// 与单文件上限取同一个值：既要**支持**文档承诺的单文件上限（否则 2GiB 的上限永远是空话、
 /// 1GiB 以上直接 507），又要给并发上传一个全局闸门。真正兜住磁盘的是下面的余量闸门。
 pub const MAX_INFLIGHT_BYTES: u64 = MAX_UPLOAD_BYTES;
-/// 同一来源 IP 的并发会话上限（防单机占满会话表，把正常用户挤成 503）。
+/// 同一来源 IP 的并发**在途**（正被某个请求持有）会话上限（防单机占满会话表/带宽，
+/// 把正常用户挤成 503）。
+///
+/// **只计在途请求，不计闲置的可续传会话**：后者若也计入，一个客户端只要经历 16 次
+/// 网络中断/畸形上传（每个都会留下一个等待续传的 `.part`），就会把自己在该 IP 上
+/// **未来整整 [`SESSION_TTL`]（1h）内的全部上传**打成 503 —— 单个客户端即可自锁
+/// （恶意者同样能借此占满 16 个槽位后让同 NAT 出口的其他用户全部 503）。实测复现：
+/// 8 次中断 + 8 次畸形后，同 IP 的正常 PUT（含全新文件名）全部 503，重启才恢复。
 pub const MAX_SESSIONS_PER_IP: usize = 16;
+/// 同一来源 IP 的**闲置**（无在途请求、等待续传）会话容量上限。
+///
+/// 闲置会话是断点续传的载体，不能按在途配额计；但也不能无界（每个会话占一个
+/// `.part` inode + 磁盘）。超过本上限时**淘汰该 IP 最旧的闲置会话**为新上传腾位置，
+/// 而**不是**拒绝新上传 —— 保证「经历了多次中断的客户端仍能开始新上传」这一可用性
+/// 不变量（被淘汰的会话后续续传会收到 409 + `X-Upload-Offset: 0` 从而从头再来，
+/// 只有在同一 IP 积累了 >64 个弃置会话时才会发生；正常客户端远低于此）。
+pub const MAX_IDLE_SESSIONS_PER_IP: usize = 64;
 /// 磁盘余量下限：低于它就不再接受新的写入（留出系统/日志/数据库的呼吸空间）。
 pub const MIN_FREE_BYTES: u64 = 512 * 1024 * 1024;
 
@@ -65,7 +80,8 @@ pub enum UploadErr {
 pub struct Session {
     /// 目标文件（调用方已做 containment 校验）。
     pub target: PathBuf,
-    /// 创建该会话的来源 IP：释放「每 IP 会话数」配额时要按它回收。
+    /// 创建该会话的来源 IP：统计「每 IP 在途会话数 / 闲置会话数」时按它归属
+    ///（配额判定直接扫描会话表，见 [`session_for`]）。
     owner: Option<std::net::IpAddr>,
     /// 同目录临时文件：保证 rename 原子（跨目录 rename 不是原子的）。
     pub tmp: PathBuf,
@@ -161,7 +177,12 @@ impl Session {
 static SESSIONS: Lazy<Mutex<HashMap<PathBuf, Arc<Session>>>> =
     Lazy::new(|| Mutex::new(HashMap::new()));
 
-/// 进程级预算：在飞字节数 + 每 IP 会话数（会话增删时同步维护）。
+/// 进程级预算：在飞字节数（会话增删时同步维护）。
+///
+/// 每来源 IP 的会话计数**不在这里**：权威来源是 [`SESSIONS`]（谁持有、谁闲置一目了然），
+/// 由 `session_for` 在建新会话时直接统计（表上限 256，扫描成本可忽略）。把计数放在
+/// 会话表里可以避免「增量维护与实际归属不一致」的双份状态 —— 上一版的 `by_ip` 就
+/// 只能按「会话存在」计数（无法区分在途/闲置），正是本次 DoS 的根因。
 #[derive(Default)]
 struct Budget {
     /// 已落盘字节（各会话 `received` 之和）。
@@ -172,7 +193,6 @@ struct Budget {
     /// 检查时必须 `inflight + reserved` 一起算。它只会**高估**（同一会话两个数都算），
     /// 高估是安全方向。我的第一版只检查不记账，被自己的单测抓出来。
     reserved: u64,
-    by_ip: HashMap<std::net::IpAddr, usize>,
 }
 
 static BUDGET: Lazy<Mutex<Budget>> = Lazy::new(|| Mutex::new(Budget::default()));
@@ -236,23 +256,17 @@ fn space_ok(target: &Path, want: u64) -> bool {
     }
 }
 
-/// 会话结束时回收预算（每 IP 计数 + 在飞字节 + **声明预留**）。
+/// 会话结束时回收预算（在飞字节 + **声明预留**）。
 ///
 /// 预留用 `sess.reserved`（可 swap 到 0 的计数）而不是 `sess.total`：预留可能在
 /// 请求结束时就已被 [`release_reservation`] 归还（超时/中断路径），这里再减同一个量会
 /// 把**别的**会话的预留减穿。swap 到 0 保证两边只减一次。
+///
+/// 每 IP 计数**不在这里**：它按「会话是否被在途请求持有」实时统计（见 [`Budget`]）。
 fn release_budget(sess: &Session) {
     let mut b = BUDGET.lock();
     b.inflight = b.inflight.saturating_sub(sess.received());
     b.reserved = b.reserved.saturating_sub(sess.reserved.swap(0, Ordering::Relaxed));
-    if let Some(ip) = sess.owner {
-        if let Some(c) = b.by_ip.get_mut(&ip) {
-            *c = c.saturating_sub(1);
-            if *c == 0 {
-                b.by_ip.remove(&ip);
-            }
-        }
-    }
 }
 
 /// 归还本会话的**声明预留**（`BUDGET.reserved`），幂等。
@@ -293,6 +307,43 @@ pub fn parse_content_range(v: &str) -> Option<(u64, u64, Option<u64>)> {
         t => Some(digits_u64(t)?),
     };
     Some((start, end, total))
+}
+
+/// 取会话表里**最旧的闲置会话**（`active == 0`，即没有任何在途请求持有它）。
+///
+/// `owner = Some(ip)` 时只在该 IP 的会话里找（每 IP 闲置容量淘汰用）；`None` 时是全表
+/// （表满淘汰用）。调用方需持有 [`SESSIONS`] 锁。
+fn oldest_idle(
+    map: &HashMap<PathBuf, Arc<Session>>,
+    owner: Option<std::net::IpAddr>,
+) -> Option<(PathBuf, Arc<Session>)> {
+    let mut best: Option<(PathBuf, Arc<Session>, Instant)> = None;
+    for (k, s) in map.iter() {
+        if owner.is_some() && s.owner != owner {
+            continue;
+        }
+        // 在途会话绝不能淘汰：它的 `.part` 正被 append/commit，删了会把合法上传打成 500。
+        if s.active.load(Ordering::Relaxed) > 0 {
+            continue;
+        }
+        let t = *s.touched.lock();
+        if best.as_ref().map_or(true, |(_, _, bt)| t < *bt) {
+            best = Some((k.clone(), Arc::clone(s), t));
+        }
+    }
+    best.map(|(k, s, _)| (k, s))
+}
+
+/// 淘汰一个**闲置**会话：删 `.part`、移出会话表、归还预算。
+///
+/// 调用方必须持有 [`SESSIONS`] 锁并已确认 `sess.active == 0`；这里仍按
+/// `SESSIONS → 会话锁 → BUDGET` 的固定锁序取会话锁（与 [`commit`]/[`abort`] 一致），
+/// 防止未来有人在淘汰路径上引入别的状态。
+fn evict_locked(map: &mut HashMap<PathBuf, Arc<Session>>, key: &PathBuf, sess: &Arc<Session>) {
+    let _g = sess.lock.lock();
+    let _ = std::fs::remove_file(&sess.tmp);
+    map.remove(key);
+    release_budget(sess);
 }
 
 /// 取（或新建）目标的上传会话。`start` 来自 `Content-Range`（无则 0 = 全量）。
@@ -389,8 +440,17 @@ pub fn session_for(
         // 没有会话却要求从中间续 → 只能从 0 开始（调用方回 409 + X-Upload-Offset: 0）。
         return Err(UploadErr::OffsetMismatch(0));
     }
+    // —— 会话表满：**淘汰全局最旧的闲置会话**，而不是直接 503 ——
+    //
+    // 旧行为（表满 256 就对所有新会话回 503）给了「用闲置会话把表占满、把所有人挡在
+    // 门外 1h」的 DoS 面。闲置会话的唯一价值是断点续传，而它已由每 IP 闲置上限与 1h
+    // TTL 兜底；表满时牺牲**最旧的一个闲置会话**换「新上传永远能开始」——可用性优先于
+    // 一个早已弃置的 `.part`。只有全部会话都在途（真容量耗尽）才回 503。
     if map.len() >= MAX_SESSIONS {
-        return Err(UploadErr::TooManySessions);
+        match oldest_idle(&map, None) {
+            Some((k, s)) => evict_locked(&mut map, &k, &s),
+            None => return Err(UploadErr::TooManySessions),
+        }
     }
     // 目标必须是文件（不是目录）：`with_file_name` 在目录上替换的是**路径最后一段**，
     // 于是目标为 docroot 本身（`PUT /`、`PUT /subdir/`）时，临时文件会落到
@@ -442,9 +502,30 @@ pub fn session_for(
         {
             return Err(UploadErr::NoSpace);
         }
-        if let Some(ip) = peer {
-            if b.by_ip.get(&ip).copied().unwrap_or(0) >= MAX_SESSIONS_PER_IP {
-                return Err(UploadErr::TooManySessions);
+    }
+    if let Some(ip) = peer {
+        // 在途配额：**只计正被请求持有**的会话（`active > 0`）。
+        //
+        // 闲置（等待续传）会话不占这个配额 —— 否则「16 次中断/畸形上传」就能让该 IP
+        // 在 1h 内**所有**上传恒回 503（实测复现；重启才恢复）。中断上传恰恰是断点续传
+        // 的正常输入，不能把它当成并发滥用。
+        let active_of_ip = map
+            .values()
+            .filter(|s| s.owner == Some(ip) && s.active.load(Ordering::Relaxed) > 0)
+            .count();
+        if active_of_ip >= MAX_SESSIONS_PER_IP {
+            return Err(UploadErr::TooManySessions);
+        }
+        // 闲置容量：每个闲置会话占一个 `.part` inode + 磁盘，必须有上限；但满了只
+        // **淘汰本 IP 最旧的闲置会话**，绝不因此拒绝新上传（可用性不变量）。被淘汰的
+        // 会话若再续传会收到 409 + `X-Upload-Offset: 0`（从头再来）。
+        let idle_of_ip = map
+            .values()
+            .filter(|s| s.owner == Some(ip) && s.active.load(Ordering::Relaxed) == 0)
+            .count();
+        if idle_of_ip >= MAX_IDLE_SESSIONS_PER_IP {
+            if let Some((k, s)) = oldest_idle(&map, Some(ip)) {
+                evict_locked(&mut map, &k, &s);
             }
         }
     }
@@ -472,9 +553,6 @@ pub fn session_for(
     {
         let mut b = BUDGET.lock();
         b.reserved = b.reserved.saturating_add(reserve);
-        if let Some(ip) = peer {
-            *b.by_ip.entry(ip).or_insert(0) += 1;
-        }
     }
     // 新会话同样是「本请求正持有」：与复用分支一致地记账（调用方 `Attach` 递减）。
     sess.active.fetch_add(1, Ordering::Relaxed);
@@ -793,9 +871,12 @@ fn upload_target(name: &str) -> std::path::PathBuf {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// 每来源 IP 的并发会话上限必须真的生效（否则单机就能把会话表占满、把别人挤成 503）。
+    /// 每来源 IP 的**在途**会话上限必须真的生效（否则单机就能把会话表占满、把别人挤成 503）。
+    ///
+    /// 关键不变量（本波 h1c 实测的 DoS 修复）：**闲置**（无在途请求）的可续传会话**不占**
+    /// 这个配额 —— 16 次中断/畸形上传留下的 16 个 `.part` 不得让该 IP 后续上传恒回 503。
     #[test]
-    fn per_ip_session_cap_is_enforced() {
+    fn per_ip_active_cap_counts_only_inflight() {
         let _g = serial();
         if !test_fs_has_room() {
             eprintln!("跳过：本机磁盘余量低于闸门阈值（{MIN_FREE_BYTES}），落盘用例无从验证");
@@ -809,6 +890,7 @@ fn upload_target(name: &str) -> std::path::PathBuf {
             let t = dir.join(format!("ipv{i}.bin"));
             opened.push(session_for(&t, 0, Some(1), Some(ip)).expect("前 N 个应放行"));
         }
+        // 全部仍在途（测试里没有 Attach 析构）→ 第 N+1 个必须拒。
         let over = dir.join("ipv-over.bin");
         match session_for(&over, 0, Some(1), Some(ip)) {
             Err(UploadErr::TooManySessions) => {}
@@ -817,7 +899,105 @@ fn upload_target(name: &str) -> std::path::PathBuf {
         // 换一个 IP 不受影响（不是全局串扰）
         let other_ip: std::net::IpAddr = "203.0.113.8".parse().unwrap();
         assert!(session_for(&dir.join("ipv-other.bin"), 0, Some(1), Some(other_ip)).is_ok());
-        // 清理（abort 会回收每 IP 计数与在飞字节）
+        // **闲置会话不占配额**：请求结束（Attach drop）后，同一 IP 的新上传必须放行，
+        // 而且**不删**这些闲置会话（断点续传的载体必须留着）。
+        for s in &opened {
+            let g = Attach::new(Arc::clone(s));
+            drop(g);
+        }
+        let fresh = dir.join("ipv-fresh.bin");
+        let n = session_for(&fresh, 0, Some(1), Some(ip))
+            .expect("16 个闲置的可续传会话不得把该 IP 的新上传挡成 503（h1c 实测的 DoS）");
+        // 闲置会话的 `.part` 仍在（没有被误删）
+        for i in 0..MAX_SESSIONS_PER_IP {
+            assert!(
+                dir.join(format!(".ipv{i}.bin.upload.part")).exists(),
+                "闲置会话 #{i} 的 .part 不应因新上传被删"
+            );
+        }
+        abort(&n);
+        for s in &opened {
+            abort(s);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 每 IP 的**闲置**容量上限：超过时淘汰该 IP 最旧的闲置会话，而**不是**拒绝新上传。
+    ///
+    /// 这是「经历多次中断的客户端仍能开始新上传」的可用性不变量；被淘汰的会话后续续传
+    /// 会拿到 `OffsetMismatch(0)`（调用方回 409 + X-Upload-Offset: 0，客户端从头再来）。
+    #[test]
+    fn idle_session_cap_evicts_oldest_without_rejecting_new() {
+        let _g = serial();
+        if !test_fs_has_room() {
+            eprintln!("跳过：本机磁盘余量低于闸门阈值（{MIN_FREE_BYTES}），落盘用例无从验证");
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("crucible-up-idle-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let ip: std::net::IpAddr = "203.0.113.11".parse().unwrap();
+        let mut opened = Vec::new();
+        for i in 0..MAX_IDLE_SESSIONS_PER_IP {
+            let t = dir.join(format!("idle{i}.bin"));
+            let s = session_for(&t, 0, Some(1), Some(ip)).expect("闲置会话也应放行");
+            {
+                let g = Attach::new(Arc::clone(&s)); // 请求结束 → 转为闲置
+                drop(g);
+            }
+            opened.push(s);
+        }
+        // 第一个（最旧）的 `.part` 此刻存在；再来一个新会话必须触发淘汰而不是 503。
+        let first_part = dir.join(".idle0.bin.upload.part");
+        assert!(first_part.exists(), "最旧会话的 .part 应存在");
+        let t = dir.join("idle-new.bin");
+        let n = session_for(&t, 0, Some(1), Some(ip))
+            .expect("闲置容量满时必须淘汰最旧闲置会话，而不是拒绝新上传");
+        {
+            let g = Attach::new(Arc::clone(&n));
+            drop(g);
+        }
+        assert!(
+            !first_part.exists(),
+            "超过闲置容量时应淘汰**最旧**的闲置会话（.idle0 的 .part 应被删除）"
+        );
+        // 被淘汰的会话再续传 → 只能从 0（调用方回 409）
+        match session_for(&dir.join("idle0.bin"), 1, Some(1), Some(ip)) {
+            Err(UploadErr::OffsetMismatch(0)) => {}
+            other => panic!("被淘汰的会话续传应从 0 重来，实际 {:?}", other.err()),
+        }
+        abort(&n);
+        for s in &opened {
+            abort(s);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 会话表**全局**满（`MAX_SESSIONS`）时同样优先淘汰最旧闲置会话：
+    /// 只有「全表都在途」才是真正的容量耗尽（503）。
+    #[test]
+    fn global_table_full_evicts_idle_instead_of_rejecting() {
+        let _g = serial();
+        if !test_fs_has_room() {
+            eprintln!("跳过：本机磁盘余量低于闸门阈值（{MIN_FREE_BYTES}），落盘用例无从验证");
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("crucible-up-gtable-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut opened = Vec::new();
+        // peer=None：绕开每 IP 闲置上限，专门构造“全局表满”场景。
+        for i in 0..MAX_SESSIONS {
+            let t = dir.join(format!("g{i}.bin"));
+            let s = session_for(&t, 0, None, None).expect("填表应放行");
+            {
+                let g = Attach::new(Arc::clone(&s)); // 全部转闲置
+                drop(g);
+            }
+            opened.push(s);
+        }
+        // 表满但全闲置 → 新会话应淘汰最旧闲置后放行（而不是 503）
+        let t = dir.join("g-new.bin");
+        let n = session_for(&t, 0, None, None).expect("表满且全闲置时应淘汰最旧闲置会话");
+        abort(&n);
         for s in &opened {
             abort(s);
         }
@@ -856,6 +1036,44 @@ fn upload_target(name: &str) -> std::path::PathBuf {
         for s in &opened {
             abort(s);
         }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `sweep_expired` 只回收**闲置**且超 TTL 的会话；**在途**会话即使 touched 已过 TTL
+    /// 也不能删 —— 否则一个 body 拖过 1h 的合法上传，其 `.part` 会被维护任务删掉，
+    /// 随后的 `append` 打开已删文件 → 500（把合法上传打成服务端错误）。
+    #[test]
+    fn sweep_skips_inflight_sessions() {
+        let _g = serial();
+        if !test_fs_has_room() {
+            eprintln!("跳过：本机磁盘余量低于闸门阈值（{MIN_FREE_BYTES}），落盘用例无从验证");
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("crucible-up-sweep-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let old = Instant::now() - (SESSION_TTL + Duration::from_secs(60));
+        // A：在途（Attach 持有，active==1）
+        let a = session_for(&dir.join("sweep-a.bin"), 0, Some(4), None).expect("a");
+        let g = Attach::new(Arc::clone(&a));
+        *a.touched.lock() = old;
+        // B：闲置（Attach 立即析构，active==0），同样超 TTL
+        let b = session_for(&dir.join("sweep-b.bin"), 0, Some(4), None).expect("b");
+        {
+            let g = Attach::new(Arc::clone(&b));
+            drop(g);
+        }
+        *b.touched.lock() = old;
+        let freed = sweep_expired();
+        assert!(freed >= 1, "超 TTL 的闲置会话应被 sweep（freed={freed}）");
+        assert!(!b.tmp.exists(), "闲置超时会话的 .part 应被清理");
+        assert!(
+            a.tmp.exists(),
+            "在途会话的 .part 不得被 sweep 误删（否则其 append 会 500）"
+        );
+        // A 仍可继续写（会话还在表里）
+        assert_eq!(append(&a, 0, b"abcd").unwrap(), 4);
+        drop(g);
+        abort(&a);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

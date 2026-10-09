@@ -291,6 +291,9 @@ fn ensure_runtime(key: &str) -> Result<()> {
     let log_file = fs::File::create(&log_path)?;
 
     let mut cmd = Command::new(&bin);
+    // 干净环境：go-shm-server 是长驻进程，spawn 时刻可能落在别的应用的请求期 `.env`
+    // 窗口内；默认继承 environ 会把别人的密钥永久烤进它的环境。
+    crate::server::apps::env_lock::apply_clean_env(&mut cmd, &[]);
     cmd.env("GO_SHM_FILE", &shm_path)
         .env("GO_SHM_NOTIFY_SOCKET", &notify_path)
         .stdin(Stdio::null())

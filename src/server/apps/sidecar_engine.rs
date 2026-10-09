@@ -229,6 +229,11 @@ pub(crate) async fn proxy_uds_simple(
         .context("build upstream req")?;
 
     // 整段一个 deadline：发送、响应头、响应体收集都算在内。
+    //
+    // 超时必须同时**终止受管的 sidecar 进程**（与 native_http 同一判据）：挂死的进程仍占着
+    // 监听 socket，`sock_alive` 恒真 ⇒ 该 sidecar 永远留在缓存里，之后每个请求都要等满
+    // 30s 才 502，永不自愈。杀掉后下一个请求重新拉起。显式 `apps[].socket`（运维自己起的
+    // Jetty）不在受管表里，不会被误杀。
     let (rparts, rbytes) = tokio::time::timeout(SIDECAR_TIMEOUT, async {
         let resp = sender
             .send_request(upstream)
@@ -243,8 +248,32 @@ pub(crate) async fn proxy_uds_simple(
         Ok::<_, anyhow::Error>((rparts, rbytes))
     })
     .await
-    .map_err(|_| anyhow::anyhow!("sidecar timeout after {SIDECAR_TIMEOUT:?}"))??;
+    .map_err(|_| {
+        kill_managed_sidecar_simple_by_sock(sock);
+        anyhow::anyhow!("sidecar timeout after {SIDECAR_TIMEOUT:?}")
+    })??;
     upstream_response(rparts, rbytes)
+}
+
+/// 代理超时后杀掉**受管**（`SIDECARS_SIMPLE` 表里登记的）sidecar 进程（见调用点说明）。
+#[cfg(unix)]
+fn kill_managed_sidecar_simple_by_sock(sock: &std::path::Path) -> bool {
+    let key = {
+        let map = SIDECARS_SIMPLE.lock();
+        map.iter().find(|(_, s)| s.sock == sock).map(|(k, _)| k.clone())
+    };
+    let Some(key) = key else {
+        return false;
+    };
+    if let Some(mut dead) = SIDECARS_SIMPLE.lock().remove(&key) {
+        log::warn!(
+            "sidecar(simple): {} 代理超时（客户端已 502）→ 终止受管进程，后续请求将重启",
+            dead.sock.display()
+        );
+        crate::server::apps::child_registry::kill_child(&mut dead.child);
+        return true;
+    }
+    false
 }
 
 #[cfg(unix)]
@@ -336,6 +365,10 @@ async fn ensure_sidecar_simple(
     let log_file = std::fs::File::create(&log_path).context("sidecar.log")?;
 
     let mut cmd = Command::new(&deps_bin);
+    // 干净环境（与 h1 `native_http::ensure_sidecar` 同一判据）：sidecar 是长驻进程，spawn
+    // 时刻可能落在别的应用的请求期 `.env` 窗口内 —— 默认继承 environ 会把别人的密钥永久
+    // 烤进 sidecar 环境。启动期基底 + 空请求 `.env`。
+    crate::server::apps::env_lock::apply_clean_env(&mut cmd, &[]);
     cmd.current_dir(&docroot)
         .env("WEBSERVER_LISTEN_UNIX", sock.display().to_string())
         // 与 h1 `native_http::ensure_sidecar` 同一套 env：sidecar（ruby 等）据此

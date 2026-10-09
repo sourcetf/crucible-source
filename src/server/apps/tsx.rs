@@ -684,6 +684,10 @@ fn read_capped<R: Read>(r: &mut Option<R>) -> String {
 /// 跑一次编译器：argv 直启、stdout/stderr 并发读走、超时 kill。
 fn spawn_tool(tool: &Tool, args: &[OsString], cwd: &Path) -> std::result::Result<(), String> {
     let mut cmd = Command::new(&tool.prog);
+    // 干净环境：编译器在**请求路径**上被拉起，而进程 env 里可能正装着别的应用的请求期
+    // `.env`（env_lock 窗口）。默认继承会把别人的密钥带进构建工具（以及它可能写出的
+    // 缓存/产物）。基底（PATH/HOME 等运维环境）照旧。
+    crate::server::apps::env_lock::apply_clean_env(&mut cmd, &[]);
     cmd.args(&tool.pre)
         .args(args)
         .current_dir(cwd)

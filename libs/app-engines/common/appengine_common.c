@@ -3,6 +3,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h> /* strncasecmp（BSD/glibc 均在 strings.h） */
 
 int appengine_abi_version(void)
 {
@@ -339,6 +340,63 @@ size_t appengine_cgi_http_key(char *out, size_t out_sz, const char *name, size_t
     return n;
 }
 
+int appengine_header_lookup(const char *headers, const char *key, char *out, size_t out_sz)
+{
+    char want[256];
+    const char *p;
+    size_t i;
+
+    if (headers == NULL || key == NULL || out == NULL || out_sz == 0)
+        return 0;
+    out[0] = '\0';
+    if (key[0] == '\0')
+        return 0;
+    if (strncasecmp(key, "HTTP_", 5) == 0) {
+        /* CGI 形态 → 头名：HTTP_X_REQUEST_ID → X-Request-Id（`_`→`-`）。 */
+        for (i = 0; key[5 + i] != '\0' && i + 1 < sizeof(want); i++) {
+            char c = key[5 + i];
+
+            want[i] = (c == '_') ? '-' : c;
+        }
+        want[i] = '\0';
+        if (i == 0)
+            return 0;
+    } else {
+        snprintf(want, sizeof(want), "%s", key);
+    }
+    p = headers;
+    while (*p != '\0') {
+        const char *line_end = p;
+        const char *colon;
+
+        while (*line_end != '\0' && *line_end != '\r' && *line_end != '\n')
+            line_end++;
+        colon = (const char *)memchr(p, ':', (size_t)(line_end - p));
+        if (colon != NULL) {
+            size_t nlen = (size_t)(colon - p);
+            const char *v = colon + 1;
+            size_t vlen;
+
+            while (v < line_end && (*v == ' ' || *v == '\t'))
+                v++;
+            vlen = (size_t)(line_end - v);
+            if (nlen == strlen(want) && strncasecmp(p, want, nlen) == 0) {
+                if (vlen >= out_sz)
+                    vlen = out_sz - 1;
+                memcpy(out, v, vlen);
+                out[vlen] = '\0';
+                return 1;
+            }
+        }
+        if (*line_end == '\r')
+            line_end++;
+        if (*line_end == '\n')
+            line_end++;
+        p = line_end;
+    }
+    return 0;
+}
+
 static int ae_setenv_cb(void *ctx, const char *k, const char *v)
 {
     (void)ctx;
@@ -399,14 +457,24 @@ const char *appengine_base_env_block(void)
 /* ------------------------------------------------------- extra env (list) ---
  * Same parser as appengine_apply_extra, but instead of setenv() it hands each
  * `(key, value)` pair to a callback. Used by engines that must NOT touch the
- * process env (cgi builds envp directly). Returns 0 on success/no-op. */
+ * process env (cgi builds envp directly). Returns 0 on success/no-op.
+ *
+ * Size caps（键 512 / 值 16384）：装不下就**跳过该项**（回调不触发），绝不截断
+ * ——截断会产生「半个密钥/半个 token」这类静默错值。旧上限是 key 256 / val 2048，
+ * 于是一条 3KB 的 `.env` 值在 cgi（本解析器）里被**静默丢弃**，而 cgi_script /
+ * wsgi（Rust 侧直接 envp / setenv，无上限）照常拿到 —— 同一个 `.env` 跨引擎行为
+ * 分叉（真机实测 LONGV=3000：cgi 里该键不存在、cgi_script/wsgi 里 3000 字节）。
+ * 16KB 覆盖真实世界的 PEM/私钥/base64 值；超过仍会跳过（Rust 侧无上限，属已知
+ * 剩余边界，见 apps4-wave7 报告）。 */
+#define AE_ENV_KEY_MAX 512
+#define AE_ENV_VAL_MAX 16384
 
 int appengine_extra_env_foreach(const char *extra,
                                 int (*cb)(void *ctx, const char *k, const char *v),
                                 void *ctx)
 {
     const char *p, *end, *envk;
-    char key[256], val[2048];
+    char key[AE_ENV_KEY_MAX], val[AE_ENV_VAL_MAX];
 
     if (extra == NULL)
         return -1;

@@ -3451,3 +3451,164 @@ ext/h3 各加硬超时与 ECS 客户端；orchestrator 构建 rc 检查、pkill 
 - 18:57 我的实例被**外部 SIGTERM** 杀掉（ext 中途，aioquic 无超时卡死）→ 套件加硬超时 + 趟前探活重启。
 - 上游 28099 被**别的 agent 的宽泛 pkill**（对方 scratch-perf3b 用同名脚本）误杀 → pkill 改端口精确 + 趟前重启。
 - 未用远程 OpenBSD；CONNECT-UDP 真实上游回程（本机 UDP 出网禁）未覆盖，如实标注。
+
+---
+# 【agent-verify4 / 工号 1009 · scope: scripts/accept-*、reports/verify4-wave7.md、fixes/verify4-wave7.md、~/scratch-verify4】Wave-7 最终独立黑盒验收（收工）
+
+**快照**：HEAD `485246f`（工作树 dirty：Wave-7 各 agent 在途改动）；二进制 **md5 `093bb1ec492d21be64b1cf20dd2126c2`**
+（21:14:39 由当前工作树 `. /home/dev123/bin/buildenv.sh && $CARGO build --release --bin webserver --offline --features tls,tls_boring`）；
+源码冻结清单 **241 文件** @21:17:10（`~/scratch-verify4/logs/source-md5.txt`，构建后 `md5sum -c` 全 OK）；
+套件现编 `libapp_cgi.so md5 ede2d449…`（Wave-7 已改 cgi 引擎 C 源，与 verify3b 的 3cb88405 不同属预期）。
+**冻结后 21:19–21:34 另有 apps agent 改 6 个文件**（appengine_common.{c,h}/aspnet/axonasp/app_ffi.rs/child_registry.rs）——未含在本趟数字内，全波收尾后建议重跑。
+未 commit/push/checkout/reset/stash/clean；未改任何非 scope 文件。
+
+## 总账（六趟，对比 verify3b 的 196/1/14）
+- PASS1 **123 / 1 / 12**（136；旧检查 0 处状态变化）、EXT **87 / 0 / 0**、GOAWAY **4 / 0 / 0**、
+  H3+DoT+DoH **24 / 0 / 0**（原 2 个 DoT/DoH SKIP 因**假 named** 转 PASS）、
+  DNS-ECS(on) **6 / 0 / 0**、DNS-ECS(off) **3 / 0 / 0**
+- **合计 247 PASS / 1 FAIL / 12 SKIP（260 项）**；单测 **485 passed / 0 failed / 1 ignored**。
+- **零回归成立**：对 verify3b 逐项名对齐，PASS1/EXT/GOAWAY 0 状态变化；H3 仅 2×SKIP→PASS。
+
+## 任务 1 收口：CL+TE 断言按 RFC 重写（已 PASS）
+旧「→ 400」不可达（hyper 1.11 解析层摘 CL + keep_alive=false；h1c 三层证据）。依 RFC 9112 §6.1
+改为 5 条可观测断言：按 TE 解码且落盘恰为 `HELLO`（不歧义）+ 响应 `connection: close` +
+响应后连接被关（同连接第二条不被服务）+ TE 在前顺序对调同判。实测全 PASS（201/close/EOF/HELLO）。
+
+## 唯一 FAIL（P1，owner h2h3）：h2c 接受 `Transfer-Encoding`
+`curl --http2-prior-knowledge -X POST -H 'Transfer-Encoding: chunked' --data-binary HELLO http://127.0.0.1:29081/te-h2c.txt` → **405（被路由）**；RFC 9113 §8.2.2 应判 malformed。
+跨协议不对称（本轮新证据）：**h1** 按 TE 处理+关连接（合规）、**h3** 已改为 RST_STREAM(H3_MESSAGE_ERROR=0x10e)（本套件新检查 PASS）、**h2c 是唯一缺口**。定位：h3.rs 已有 `prohibited_request_field`，h2.rs 缺同类。
+
+## Wave-7 修复点的独立复核（全部真机通过）
+1. **上传 16 会话锁死**（h1c §3.2）：**20 次中断后同 IP 正常 PUT → 201**（upload_resume 已改：闲置会话不计在途配额、超 64 淘汰最旧而非 503）。
+2. **h3 HEAD**：200 与 404 分支 **body=0**、CL 与 GET 一致（此前 404 带 9 字节正文）。
+3. **h3 connection-specific 字段**：`transfer-encoding` → RST 0x10e（PASS；h2c 同款 FAIL）。
+4. **ABI 旧/新 .so**（假 .so 现编）：旧代缺符号 / 异版自报 99 → **502 + 无 marker（未被调用）+ 进程存活**；真 .so（ABI=2）正常执行。
+5. **cgi_script SCRIPT_NAME/PATH_INFO**：`/cgis/index.cgi` 与 `/cgis/index.cgi/extra/path` 双形态 + h2c 同口径 PASS。
+6. **per-site 日志**：enable 覆盖两实例 + `level=debug` 仍落盘（历史「选 debug 丢日志」回归防线）PASS。
+7. **页面规则 ×5 协议面**（h1/h2c/h1TLS/h2TLS/h3）逐例一致 PASS。
+8. **DNS ECS 端到端**（假 named UDP 29553）：ecs=true 回带 ECS(203.0.113.0/24,scope0)、出站注入；**ecs=false 剥离且不回显**；两档畸形 ECS 均 FORMERR。
+9. **面板签发统一入口**：PATH 前置假 certbot → 面板 POST 触发其调用（marker）并回可定位错误。
+10. **上传闸门全形态**：query/`//`/`./`/`%61`/`%2F`(显式 400)/`..` → 拒绝且三文件内容+mtime 未变。
+11. **h3 GOAWAY**（在飞 200）继续 PASS。
+
+## 性能门禁独立复核（真 h2o 2.2.5，ABBA 交替，双端基本打满）
+`/`：**h2o/ours=1.42×（c256）/1.45×（c128）**，p50 **1.42–1.49×**；
+404 `/nope`：**1.38×/1.34×**，p50 1.43–1.45×。h2o 无访问日志、ours 开（最不利口径）；load 7–10。
+**结论：门禁 ≤1.2× 两个比值均不达标**（与 verify3b 1.42–1.45× 一致；404 比 perf3b 的 1.05× 差，条件差异已注明）。
+
+## 套件变更（scope）
+29000 端口块 + `~/scratch-verify4`；**新文件** `accept-verify-dns.py`（ECS 端到端）、
+`accept-verify-fakenamed.py`（假 named 守护）、`accept-verify-fakeabi.c`（假 .so）；
+genconf 生成 `config-verify-ecsoff.toml`；orchestrator 已接 PASS2.0/2.1。
+一键：`cd /home/dev123/crucible-git && sh scripts/accept-verify.sh`（或 `--no-build`）。
+诚实边界：本机 WSL2 ≠ 生产 OpenBSD；12 SKIP 全为缺依赖（10 引擎 + 2 named）；假 named/假 certbot/假 .so 均为测试替身；
+真实 CA 签发与 CONNECT-UDP 真实回程未离线验证。
+
+# 【agent-apps4 <apps/engines>】apps4-wave7 收工（2026-10-09）
+
+scope：`src/server/apps/*.rs`、`libs/app-engines/**`、`libs/script-ffi/**`、`libs/aspnet-ffi/**`、
+`libs/axonasp-ffi/**`、`www-apps/**`。未 commit/push/checkout/reset/stash/clean。
+二进制 md5 `3da2c1c433150d3fb7a359fe5328f1c6`；单测 **487/0/1**。
+报告：`.agents/1009/reports/apps4-wave7.md`；修复：`.agents/1009/fixes/apps4-wave7.md`。
+
+## 本波最重要：P0 跨 .so CPython 并发初始化 → 进程 abort（已修，真机 8/8 验证）
+冷启动后**两个并发首请求分打 wsgi 与 asgi**（两个 .so 各 dlopen 同一 libpython，各自私有
+g_py_lock）⇒ 双双 Py_Initialize ⇒ CPython `Fatal Python error: _PyImport_Init: global import
+state already initialized` + **abort 整个 webserver**（修前 5/5 复现，全部监听口下线）。
+修法：pyembed 初始化改走 `libscriptffi.so` 的进程级 `crucible_py_ensure_init`（框架早就有、
+script_engine 已在用，pyembed 这条路径没接）+ 三个 pyembed 引擎 `crucible_pyinit_set_hint`。
+**部署必须重建 libapp_{wsgi,asgi,uwsgi}.so**，否则冷启动并发仍会整进程崩。
+（注：verify4 的「假 .so」检查与我的 ABI 矩阵互补 —— 我做的是真 .so 的新/旧/混合/撒谎四态。）
+
+## 已修 10 项（file:line + 真机证据见 fixes/apps4-wave7.md）
+1. **P0** 跨 .so Py_Initialize → abort（上）。
+2. **P1** 请求路径 spawn 全漏 `.env` 隔离：sidecar/php-fpm/php-cgi/go-shm/init.sh/tsx 在
+   「别人的 .env 窗口」内启动会**永久继承别人密钥**（真机 dump：`WINDOWMARK=from-wsgi-A`）。
+   全部改 `apply_clean_env`（基底 + 本请求 .env）。
+3. **P1** `kill_all` pid 复用防线把**自己的直系子进程**（wrapper exec 后名字变了）当已退出跳过 ⇒
+   忽略 SIGTERM 的 sidecar 优雅关机后存活。改用 `ppid==self` 身份判定 + 单测。
+4. **P2** 挂死（SIGSTOP/死锁）的受管 sidecar 永不恢复（每次 30s+502）→ 超时即 kill，下次请求重启
+   （修后 request1 30s+502 / request2 0s 200）。
+5. **P2** FIFO 当脚本 → FFI 无超时 + 握 env 锁 ⇒ 整站锁引擎挂死（真机复现）→ app_ffi 中央闸门
+   `!file && !dir` 即 502 + asp/aspnet 用 stat 代替 fopen 探测。
+6. **P1** asp/aspnet 忽略 headers/extra ⇒ `.env`/HTTP_* 对脚本不可见 → 新增共享
+   `appengine_header_lookup` + ServerVariables(HTTP_*/getenv 兜底)，aspnet 兼容 `()/[]`。
+7. **P2** 空值 `.env`（`KEY=`）跨引擎语义不一致（cgi「空串」vs wsgi「不存在」）→ 统一「不存在」。
+8. **P2** cgi 侧 `.env` >2048B 值静默丢弃 → 上限提到 16KB（Rust 侧无上限）。
+9. **P2** 启动清理判活漏 `-c`（会误杀别人实例的子进程）→ token 判 `-c`/`--config[=]` + 单测。
+10. **P2/P3** 非 UTF-8 `.env` 整份静默失效 → lossy 解析 + warn；`Response.WriteLine` 丢换行 → 修。
+
+## 矩阵结果（真机）
+- **ABI/陈旧 .so**：new 免锁 6ms / v1(有 base 无自报) 持锁 2513ms / v0 持锁 / mixed 正确 /
+  v1p(谎报) 泄漏复现（负对照）——「自报判据」承重性得证；陈旧 .so 自动留锁不泄漏。
+- **per-child env**：h1+h2c+h3 共 **311 项 PASS / 0 FAIL**（顺序残留、跨应用、并发、100 交替、
+  基底键保留）；引擎 200：cgi/cgi_script/wsgi/asgi/uwsgi/lua/c/asp/aspnet/jsp(受管 sidecar)/go(sidecar)。
+- **跨协议**：99 项 PASS；唯一 DIFF＝**h3 HEAD 发 body**（已记，owner h2h3d）。
+- **扫描**：500 请求（72 畸形）0 panic / 0 僵尸 / 0 泄漏子进程 / RSS +1.5MB。
+- 本机 502（环境缺依赖，未真机验证 env）：php/tsx/python/perl/psgi/rack（诚实标注在报告 §2/§9）。
+
+## 交给主会话 / 别人 scope 的项
+1. **[部署/构建 scripts/]** `bash scripts/build_app_engines.sh` 在本机（buildenv PATH）：
+   `command -v cargo`/`go` 判空 → **静默跳过 libapp_rust.so / go-shm-server**（保留旧产物）；
+   `config.mk`（跟踪文件、OpenBSD 生成）`GO_ENGINE_MODE=shm` 让 Linux 也不产 `libapp_go.so`。
+   → 脚本建议判 `$CARGO`、构建结束汇总 WARN。
+2. **[构建 scripts/]** `build_script_ffi.sh` 把 python/ruby/perl 的 cflags/libs **混成一个
+   EXTRA_*`：本机探测到 Perl 头（无 `-lperl`）⇒ **python 的嵌入链接一起失败**，三者静默降级
+   embed-missing（python3-embed 明明可用）。建议 per-lang 分开 + 「有头无库」算探测失败。
+3. **[JSP 跨 scope]** `native_http`/`sidecar_engine` 转发到 UDS sidecar 时**不带 deps `.env`**，
+   JSP 应用拿不到 `.env`（HTTP_* 有）。建议宿主加 `X-Crucible-Env-*`/JSON 头 +
+   `libs/jsp-sidecar/**` 读取。
+4. **[h3 scope]** HEAD 发 body（4 例，§4）。
+5. **[记录/拍板]** FFI 引擎调用**无墙钟超时**：死循环脚本永久占线程并**无穷期持有 env 锁**
+   （真机：lua `while true do end` → `/lua-b/` 无限等、免锁的 cgi 不受影响）。根治需按引擎加
+   可中断看门狗，属大改。
+6. **[记录]** 启动孤儿清理在共享机/多实例下**整体跳过**（设计取舍：宁留孤儿不误杀）；
+   `kill_all` 时限 SIGTERM→300ms→SIGKILL（实测服务器 327ms 退出）。
+
+---
+# 【agent-perf4 / 工号 1009 · scope: src/server/static_files.rs、access_log.rs、h1.rs、mod.rs、Cargo.toml、main.rs(runtime)】Wave-7 性能冲刺（收工）
+
+**快照**：共享树 HEAD `485246f` 基础上，本 agent 只改了 `static_files.rs`(+154) / `access_log.rs`(+64/−18)；
+`final` 二进制 md5 `c898bc59e8a5b74ecab9a2a3b5b7bf01`（2026-10-09 22:10 构建，含共享树其他 agent 在飞改动）。
+工具/冻结树/日志全在 `~/scratch-perf4/`（h1 24581 / h2c 24595 / h2o 24681；验收套件副本 24xxx）。
+**未** commit/push/checkout/reset/stash/clean。报告 `reports/perf4-wave7.md`、`fixes/perf4-wave7.md`。
+
+## 已落地（全部真机/单测/黑盒验证）
+1. **静态响应快车道缓存**（`static_files.rs:1274+`）：把「resolve_path → 目录 lstat → 读体 → mime/validators/
+   httpdate → 5 个响应头」在填充时算一次；命中只做 **1 次 lstat 复核 FileId(len,ino,mtime)** + 查表 +
+   引用计数克隆，直接 `Response::from_parts(模板.clone(), full(body.clone()))`。条件/Range/HEAD/非 GET/
+   apps 或 file_open 已配置/路径含 %、..、隐藏段 ⇒ 一律回完整原路径；TTL=2s；≤256 条×≤256KiB（≤64MiB）。
+   红线：ETag 含 inode（原子替换即失效，实测 rename 后 ETag+正文立即变）、符号链接 containment（复核用
+   lstat，符号链接一律回完整路径）、目录 301/autoindex/404/405/FIFO 全在回退支路、响应头逐字节同 `serve_file`。
+2. **访问日志直写缓冲**（`access_log.rs:171/218/229`）：`format_line()` 成为唯一实现；`realtime=false`（默认）
+   直接写进批量缓冲（省一次 String 分配+memcpy）；输出格式逐字不变。
+
+## 数字（同源冻结树交错 A/B；只采信同会话比值）
+- `ka /` **+6.3%~+9.4%**（4 会话；最安静会话中位 43,072→45,792 = +6.3%）；应用层 **12.0–12.6 → 8.3–9.9µs**；
+  `h2c` −1.6%（噪声，未动 serve_simple）；404 +2.7%。
+- **门禁（真 h2o 2.2.5，ka c128 p8，双方 2 线程）**：吞吐 h2o/ours = **1.15–1.27（最干净会话中位 ≈1.20，
+  逐轮 1.226/1.202/1.148/1.345）**；延迟 **≈1.29 ⇒ 未达标**。比 perf3b 的 1.37×/1.38× 明显收窄，但还没进线。
+- **地板分解（本轮新测）**：手写 h1 循环（无 hyper）**66,498 rps = 30.1µs/req** vs hyper+固定响应（无应用层）
+  52,827 rps = 37.9µs/req ⇒ **hyper http1 驱动 ≈ 7.8µs/req**；而 h2o 全栈 32.9–38µs（我们的 hyper 空地板 ≈ h2o 全栈）。
+  ⇒ **唯一还够得着 1.2× 的杠杆是自写 h1 驱动**（预估 −5~8µs ⇒ 51–55k rps ⇒ 1.05–1.15×；风险 P0/P1 面大，
+  keep-alive/chunked/CL+TE/100-continue/头限额/header_read_timeout/half-close/**WS 101 升级**/Date 都要重实现，
+  估 2–3 周 + OpenBSD 真机复测；折中=vendored hyper 裁剪 ~1 周、收益 1/2~2/3）。详见报告 §7。
+- **路由链「割肉」实验**（跳过 DoH effective()、Host 校验、telemetry、is_admin format!）：**零收益**（58.4 vs 60.5µs/req）
+  ⇒ 应用层在 hyper 之上已到实用极限（剩下主要是 1 次必需的 lstat）。
+
+## 验证
+- 单测：**487 passed / 0 failed / 1 ignored**（基线 481 + 别人新增 6）。
+- 黑盒套件（`~/scratch-perf4/av/accept-verify.sh --no-build`，`ACCEPT_BIN=bench-bin/final`，24xxx）：
+  **PASS1 118/1/12 + EXT 9/0/0 + H3/DNS 9/0/2**，与 perf3b 基线逐项一致（唯一 FAIL = 既有 `CL+TE→400` 实测 201）。
+  第一次跑出现 8 个 proxy/WS 502 ⇒ 上游 `accept-verify-upstream.py` 掉了（与 verify3b 记的宽泛 pkill 同因），复跑即 118/1。
+- 响应等价：base vs final 对 14 种请求形状除 `date:` 外逐字节一致（`cmpresp.sh`）。
+
+## 结论/移交
+- **吞吐卡在 1.2 线上（≈1.20），延迟 ≈1.29 未达标**。应用层已砍到极限；继续达标必须动 hyper h1 驱动（建议单独立项，
+  先做 vendored 裁剪 A' 验证收益再决定全量自写）。`target-cpu=native` 明确**未实测/不落地**（部署配置不可写 native；
+  本地想试用 `RUSTFLAGS="-C target-cpu=native"` 单独 target 目录）；`panic=abort` 不开；tokio `event_interval(256)` 实测无收益不落地。
+
+## 给下一个人的坑
+1. `pkill -f "<目录>/config.toml"` 会匹配到**你自己的命令行**（把当前 shell 杀掉）——用 `pkill -f 'scratch-perf[4]/config.toml'` 这种字符类写法。
+2. 验收套件的上游（24099/24100）会被别的 agent 的宽泛 `pkill -f accept-verify-upstream.py` 误杀 → 表现为 8 个 proxy/WS 502；
+   跑套件前先确认上游在听，或用 `ss -tlnp | grep 24099` 复查。

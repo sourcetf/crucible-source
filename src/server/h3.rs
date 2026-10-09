@@ -206,9 +206,16 @@ mod imp {
         // `poll_fn`，状态全在 Connection 自身（`&mut self`），被 select! 丢弃的 future 不持有
         // 任何外部资源；`poll_accept_bidi` 走 `Stream::poll_next_unpin`（Pending 无副作用）
         // ⇒ 中途取消不丢请求流、不卡连接。
-        // 注意：初始 Receiver 必须**立即丢弃**（`_` 模式），否则 `send()` 永远至少有一个
-        // 接收者、`h3_graceful_endpoint_close` 的「无连接则不宽限」判定会失效。
-        let (shutdown_tx, _) = tokio::sync::broadcast::channel::<()>(16);
+        // **用 `watch<bool>` 而不是 `broadcast<()>`**：停机通知必须让**宽限窗口内新建的
+        // 连接**也看得到。broadcast 的接收者只能收到「订阅之后」的广播 —— 宽限期（5s）里
+        // 新到的 QUIC 连接订阅得太晚，收不到 GOAWAY，只会在 `ep.close()` 时被
+        // CONNECTION_CLOSE 掐断（真机复现：宽限期内建连 → `goaways=[]`、
+        // `terminated=CONNECTION_CLOSE("config changed")`）。`watch` 的接收者一订阅就能
+        // 读到当前值（`true` = 正在停机），于是 `handle_incoming` 入场自检即可**立即补发
+        // GOAWAY**（RFC 9114 §5.2 的优雅停机语义）。
+        // 注意：初始 Receiver 必须**立即丢弃**（`_` 模式），否则 `receiver_count()`
+        // 永远 ≥ 1、`h3_graceful_endpoint_close` 的「无连接则不宽限」判定会失效。
+        let (shutdown_tx, _) = tokio::sync::watch::channel(false);
         {
             let mut rx = cfg_rx.clone();
             let ep = endpoint.clone();
@@ -285,12 +292,15 @@ mod imp {
     ///
     /// 没有活跃连接时**不宽限**（配置/证书热重载在空闲时不额外等待）。
     async fn h3_graceful_endpoint_close(
-        tx: &tokio::sync::broadcast::Sender<()>,
+        tx: &tokio::sync::watch::Sender<bool>,
         ep: &quinn::Endpoint,
         reason: &[u8],
     ) {
-        // `broadcast::Sender::send` 返回 Err（无接收者）或 Ok(收到广播的接收者数)。
-        let receivers = tx.send(()).unwrap_or(0);
+        // 订阅者数 = 活跃 h3 连接数（每条 `handle_incoming` 持有一个 Receiver）。
+        // 先取数、再翻牌：翻牌之后新建的连接走「入场自检 → 立即 GOAWAY」，无需再宽限
+        //（它们最多被宽限结束时的 `ep.close()` 兜底收掉，且 GOAWAY 已经发出）。
+        let receivers = tx.receiver_count();
+        tx.send_replace(true);
         if receivers > 0 {
             log::info!(
                 "h3 graceful close: broadcast GOAWAY to {receivers} active connection(s), grace {}s",
@@ -412,7 +422,7 @@ mod imp {
         incoming: quinn::Incoming,
         live: Arc<LiveConfig>,
         lc: ListenerConfig,
-        mut shutdown_rx: tokio::sync::broadcast::Receiver<()>,
+        mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
     ) -> Result<()> {
         let connection = match incoming.await {
             Ok(c) => c,
@@ -469,18 +479,31 @@ mod imp {
         // `select!` 额外监听 shutdown 广播：配置/证书变更或 listener 被移除时，先给本连接
         // 发 H3 GOAWAY（RFC 9114 §5.2），再继续服务在飞请求。见 `serve` 里的长注释。
         let mut goaway_sent = false;
+        // **入场自检**：本连接若是在停机**宽限窗口内**建起来的，watch 的当前值已经是
+        // `true`（广播在订阅之前就发过了）—— broadcast 时代这种连接收不到任何通知，
+        // 只会在 `ep.close()` 时被 CONNECTION_CLOSE 掐断（真机复现）。watch 让新连接
+        // 一订阅就读到 `true`，于是这里立即补发 GOAWAY（RFC 9114 §5.2），
+        // 与宽限前建连的老连接同语义：告知「最后接受的请求 id」、新流被拒、连接保留到
+        // 宽限结束或客户端主动收尾。
+        if *shutdown_rx.borrow_and_update() {
+            goaway_sent = true;
+            log::info!(
+                "h3 peer={peer}: connection arrived inside the shutdown grace window; \
+                 sending H3 GOAWAY immediately"
+            );
+            if let Err(e) = server.shutdown(0).await {
+                log::debug!("h3 GOAWAY send failed peer={peer}: {e:#}");
+                return Ok(());
+            }
+        }
         loop {
             let accepted = tokio::select! {
                 biased;
-                r = shutdown_rx.recv() => {
-                    // Ok(()) 或 Lagged 都表示「上层要求优雅停机」；Closed 表示监督任务已退出。
-                    let shutdown = matches!(
-                        r,
-                        Ok(())
-                            | Err(tokio::sync::broadcast::error::RecvError::Lagged(_))
-                    );
-                    if !shutdown {
-                        break; // 广播发送端已消失：端点正在收尾，本连接交给 ep 关闭
+                r = shutdown_rx.changed() => {
+                    // Err = 发送端已消失（端点正在收尾，本连接交给 ep 关闭）；
+                    // Ok = 值从 false 变为 true（上层要求优雅停机）。
+                    if r.is_err() {
+                        break;
                     }
                     if !goaway_sent {
                         goaway_sent = true;
@@ -550,6 +573,25 @@ mod imp {
         Ok(())
     }
 
+    /// HEAD 感知的 DATA 发送：HEAD 请求的响应体一律不发（RFC 9110 §9.3.2）。
+    ///
+    /// 只给**早退分支**（503/413/鉴权拒绝）用：它们同样可能被 HEAD 命中，而 h1/h2 的
+    /// 这些分支由 hyper 在协议层吞掉 body；h3 侧若照发就又是「HEAD 有正文」。
+    /// 正常响应走 [`h3_send_response`]（那里已统一短路）。
+    async fn send_body_unless_head<S>(
+        send: &mut ::h3::server::RequestStream<S, Bytes>,
+        method: &str,
+        body: Bytes,
+    ) -> Result<(), ::h3::error::StreamError>
+    where
+        S: ::h3::quic::SendStream<Bytes>,
+    {
+        if method == "HEAD" {
+            return Ok(());
+        }
+        send.send_data(body).await
+    }
+
     /// 从 QUIC 连接取对端证书链（leaf 在前）。
     ///
     /// 之前这里在 `peer_identity()` 为 None 时**回退到服务器自己的证书**，
@@ -575,6 +617,43 @@ mod imp {
         Vec::new()
     }
 
+    /// RFC 9114 §4.2（与 RFC 9113 §8.2.2 同规）：HTTP/2/HTTP/3 的**连接特定字段**
+    /// （`connection` / `transfer-encoding` / `upgrade` / `keep-alive` / `proxy-connection`）
+    /// 一律禁用；`te` 是唯一例外，且只能取 `trailers`。违反即 malformed，
+    /// 按 RFC 9114 §4.1.2 用 `H3_MESSAGE_ERROR` 的**流错误**处置。
+    ///
+    /// 为什么必须由本仓库补：h2 侧上游 `h2 0.4` 在 HPACK 解码时就判 malformed
+    /// （`frame/headers.rs::load_hpack`，真机 raw 帧客户端发 `transfer-encoding: chunked`
+    /// → RST_STREAM(PROTOCOL_ERROR)），而 h3 0.0.8 只校验字段名全小写与伪头顺序，
+    /// **不查**这些被禁字段 —— 真机实测（修复前）：h3 上 `transfer-encoding: chunked` /
+    /// `connection: close` / `upgrade: h2c` / `proxy-connection: ...` / `te: gzip`
+    /// 全部被正常路由回 200，与 h2/h1 的宽严口径不一致。
+    ///
+    /// 比较口径与 h2 crate 逐字一致（`te` 值必须**恰好**是 `trailers`，不做 token 大小写
+    /// 归一），保证三协议同判据（`te: TRAILERS` 在 h2 上也是 RST）。
+    /// 返回违规字段名（供日志与单测）。
+    fn prohibited_request_field(headers: &http::HeaderMap) -> Option<&'static str> {
+        const PROHIBITED: [&str; 5] = [
+            "connection",
+            "transfer-encoding",
+            "upgrade",
+            "keep-alive",
+            "proxy-connection",
+        ];
+        for name in PROHIBITED {
+            if headers.contains_key(name) {
+                return Some(name);
+            }
+        }
+        // RFC 9113 §8.2.2 / RFC 9114 §4.2：`TE: trailers` 是唯一允许的形态。
+        for value in headers.get_all(http::header::TE).iter() {
+            if value.as_bytes() != b"trailers" {
+                return Some("te");
+            }
+        }
+        None
+    }
+
     async fn handle_resolver(
         resolver: ::h3::server::RequestResolver<::h3_quinn::Connection, Bytes>,
         live: Arc<LiveConfig>,
@@ -589,6 +668,26 @@ mod imp {
                 return Ok(());
             }
         };
+
+        // **任何路由/计费之前**先做报文合法性判定（RFC 9114 §4.1.2：malformed ⇒ 流错误）。
+        // 放在这里而不是 `handle_h3` 里：CONNECT-UDP 分支在 `handle_h3` 之前分流，
+        // 放后面会漏掉 CONNECT；放在闸门之前则畸形请求不吃在飞配额、也不记 telemetry
+        //（与 h2 侧 crate 在帧层直接 RST、根本到不了 handler 的行为对齐）。
+        if let Some(field) = prohibited_request_field(req.headers()) {
+            crate::server::log_throttle::warn_every(
+                "h3-prohibited-field",
+                std::time::Duration::from_secs(60),
+                &format!(
+                    "h3 malformed request peer={peer}: prohibited connection-specific field \
+                     `{field}` (RFC 9114 §4.2 / RFC 9113 §8.2.2) -> RST_STREAM H3_MESSAGE_ERROR"
+                ),
+            );
+            // 不读 body、不发响应：RESET_STREAM(H3_MESSAGE_ERROR) 结束该流（同 crate 对
+            // 大写字段名的处置，真机实测 0x10e）。
+            stream.stop_stream(::h3::error::Code::H3_MESSAGE_ERROR);
+            return Ok(());
+        }
+
         crate::server::telemetry::record_request();
 
         // **全局在飞闸门（仅普通请求）：先取名额，再收 body。**
@@ -619,9 +718,12 @@ mod imp {
                         .body(())
                         .unwrap();
                     let _ = stream.send_response(resp).await;
-                    let _ = stream
-                        .send_data(Bytes::from_static(b"server busy (h3 in-flight limit)\n"))
-                        .await;
+                    let _ = send_body_unless_head(
+                        &mut stream,
+                        req.method().as_str(),
+                        Bytes::from_static(b"server busy (h3 in-flight limit)\n"),
+                    )
+                    .await;
                     let _ = stream.finish().await;
                     crate::server::access_log::log_response(
                         &live,
@@ -818,9 +920,12 @@ mod imp {
                         .body(())
                         .unwrap();
                     let _ = stream.send_response(resp).await;
-                    let _ = stream
-                        .send_data(Bytes::from_static(b"server busy (h3 tunnel limit)\n"))
-                        .await;
+                    let _ = send_body_unless_head(
+                        &mut stream,
+                        req.method().as_str(),
+                        Bytes::from_static(b"server busy (h3 tunnel limit)\n"),
+                    )
+                    .await;
                     let _ = stream.finish().await;
                     crate::server::access_log::log_response(
                         &live,
@@ -929,7 +1034,12 @@ mod imp {
                     }
                     if let Ok(resp) = b.body(()) {
                         if stream.send_response(resp).await.is_ok() {
-                            let _ = stream.send_data(Bytes::from_static(msg.as_bytes())).await;
+                            let _ = send_body_unless_head(
+                                &mut stream,
+                                req.method().as_str(),
+                                Bytes::from_static(msg.as_bytes()),
+                            )
+                            .await;
                         }
                     }
                     let _ = stream.finish().await;
@@ -971,12 +1081,15 @@ mod imp {
                             .unwrap();
                         let _ = send_half.send_response(resp).await;
                         // 如实说明上限与出路（h1 是流式，上限 2GiB；分片上传见 §44）。
-                        let _ = send_half
-                            .send_data(Bytes::from_static(
+                        let _ = send_body_unless_head(
+                            &mut send_half,
+                            req.method().as_str(),
+                            Bytes::from_static(
                                 b"request body too large: h2/h3 single-request limit is 8MiB; \
 use chunked uploads (Content-Range) or HTTP/1.1 for larger bodies\n",
-                            ))
-                            .await;
+                            ),
+                        )
+                        .await;
                         let _ = send_half.finish().await;
                         return Ok(());
                     }
@@ -1061,6 +1174,18 @@ use chunked uploads (Content-Range) or HTTP/1.1 for larger bodies\n",
             let resp = Response::from_parts(parts, ());
             if let Err(e) = send.send_response(resp).await {
                 log::debug!("h3 send_response peer={peer}: {e:#}");
+                return;
+            }
+            // RFC 9110 §9.3.2：HEAD 响应 **MUST NOT** 带正文（与 GET 同头、不含内容）。
+            // h1/h2 由 hyper 在协议层吞掉 body（真机：`HEAD /cgia/` 在 h1/h2c 上 body 为空、
+            // 引擎给的 content-length 原样保留），h3 此前把引擎产出的 body 原样写进
+            // DATA 帧（真机：h3 `HEAD /cgia/` 回 209 字节正文）⇒ 跨协议不一致、违反 MUST。
+            // 这里在**唯一的响应发送出口**短路：HEADERS 已带全部头（含 content-length），
+            // 只是不发 DATA；FileSource 分支也一并跳过（顺带避免 `HEAD /big.bin` 的读放大）。
+            if method == "HEAD" {
+                if let Err(e) = send.finish().await {
+                    log::debug!("h3 HEAD finish peer={peer}: {e:#}");
+                }
                 return;
             }
             if let Some(src) = file_src {

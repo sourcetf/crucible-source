@@ -17,10 +17,69 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#ifdef _WIN32
+#define strcasecmp _stricmp
+#else
+#include <strings.h> /* strcasecmp（ServerVariables 的键名比较） */
+#endif
 
 static int g_ready;
 static void *g_hostfxr;
 static int g_hostfxr_ok;
+
+/* 请求上下文：ServerVariables 的取值来源（ABI 形参 + headers 块 + 进程环境）。
+ * 与 AxonASP 引擎同一套语义（`.env` 经宿主 env_lock 装进进程 env 后由 getenv 兜底读）。 */
+struct aspx_ctx {
+    const char *method;
+    const char *req_path;
+    const char *query;
+    const char *remote;
+    const char *server_name;
+    int server_port;
+    const char *headers;
+};
+
+static int aspx_server_variable(const struct aspx_ctx *c, const char *key,
+                                char *dst, size_t dst_len)
+{
+    const char *v;
+
+    dst[0] = '\0';
+    if (key == NULL || key[0] == '\0')
+        return 0;
+    if (strcasecmp(key, "PATH_INFO") == 0 || strcasecmp(key, "SCRIPT_NAME") == 0) {
+        snprintf(dst, dst_len, "%s", c->req_path != NULL ? c->req_path : "");
+        return 1;
+    }
+    if (strcasecmp(key, "QUERY_STRING") == 0) {
+        snprintf(dst, dst_len, "%s", c->query != NULL ? c->query : "");
+        return 1;
+    }
+    if (strcasecmp(key, "REQUEST_METHOD") == 0) {
+        snprintf(dst, dst_len, "%s", c->method != NULL ? c->method : "GET");
+        return 1;
+    }
+    if (strcasecmp(key, "REMOTE_ADDR") == 0) {
+        snprintf(dst, dst_len, "%s", c->remote != NULL ? c->remote : "");
+        return 1;
+    }
+    if (strcasecmp(key, "SERVER_NAME") == 0) {
+        snprintf(dst, dst_len, "%s", c->server_name != NULL ? c->server_name : "");
+        return 1;
+    }
+    if (strcasecmp(key, "SERVER_PORT") == 0) {
+        snprintf(dst, dst_len, "%d", c->server_port);
+        return 1;
+    }
+    if (appengine_header_lookup(c->headers, key, dst, dst_len))
+        return 1;
+    v = getenv(key);
+    if (v != NULL) {
+        snprintf(dst, dst_len, "%s", v);
+        return 1;
+    }
+    return 0;
+}
 
 /* Extract value of key= from a query string (first match). */
 static int query_get(const char *query, const char *key, char *out, size_t out_sz)
@@ -55,8 +114,15 @@ static int read_file(const char *path, char **out, size_t *out_len)
     FILE *f;
     long sz;
     char *buf;
+    struct stat st;
+
     *out = NULL;
     *out_len = 0;
+    /* 常规文件检查必须在 fopen 之前：FIFO/字符设备上 fopen 会**阻塞**（FIFO 无写端时
+     * open 一直等），而 FFI 引擎调用没有墙钟超时 —— docroot 里一个 FIFO 就能把线程池
+     * 线程永久钉住（cgi 引擎早有 is_regular_file 这道闸，这里补齐）。 */
+    if (path == NULL || stat(path, &st) != 0 || !S_ISREG(st.st_mode))
+        return -1;
     f = fopen(path, "rb");
     if (!f)
         return -1;
@@ -87,9 +153,11 @@ static int read_file(const char *path, char **out, size_t *out_len)
     return 0;
 }
 
-/* Expand <%= Request.QueryString("x") %> / <%= "literal" %> / bare QueryString. */
-static char *render_aspx(const char *src, size_t src_len, const char *query)
+/* Expand <%= Request.QueryString("x") %> / <%= "literal" %> / bare QueryString /
+ * <%= Request.ServerVariables("HTTP_HOST") %>（`()[]` 与单双引号均可）。 */
+static char *render_aspx(const struct aspx_ctx *ctx, const char *src, size_t src_len)
 {
+    const char *query = ctx->query;
     size_t cap = src_len + 256;
     char *out = (char *)malloc(cap);
     size_t o = 0;
@@ -127,7 +195,27 @@ static char *render_aspx(const char *src, size_t src_len, const char *query)
             }
 
             qval[0] = '\0';
-            if (strstr(expr, "QueryString")) {
+            if (strstr(expr, "ServerVariables")) {
+                /* Request.ServerVariables("HTTP_HOST") / ["WINDOWMARK"]：取引号里的键名。
+                 * 此前 aspx 表达式里没有 ServerVariables 分支 ⇒ 恒空（与 ASP 引擎同一
+                 * 缺陷；.env / HTTP_* 对应用的可见性跨引擎应一致）。 */
+                const char *q = strchr(expr, '"');
+                const char *q2;
+                if (!q)
+                    q = strchr(expr, '\'');
+                if (q) {
+                    char delim = *q;
+                    q++;
+                    q2 = strchr(q, delim);
+                    if (q2 && (size_t)(q2 - q) < 64) {
+                        char key[64];
+                        size_t kn = (size_t)(q2 - q);
+                        memcpy(key, q, kn);
+                        key[kn] = '\0';
+                        aspx_server_variable(ctx, key, qval, sizeof(qval));
+                    }
+                }
+            } else if (strstr(expr, "QueryString")) {
                 const char *q = strchr(expr, '"');
                 const char *q2;
                 if (!q)
@@ -198,22 +286,29 @@ static char *render_aspx(const char *src, size_t src_len, const char *query)
     return out;
 }
 
+/* 常规文件判定：**不能用 fopen 探测存在性** —— FIFO/字符设备上 fopen 会阻塞
+ *（FIFO 无写端时 open 一直等），而 FFI 引擎调用没有墙钟超时、调用期间还持有宿主的
+ * env 锁 ⇒ 一个 FIFO 就能把**所有**依赖 env 锁的引擎永久挂住（真机实测：
+ * `/aspnet-a/fifo.aspx` 让随后 wsgi/asgi/lua 全部超时）。 */
+static int is_regular_file(const char *p)
+{
+    struct stat st;
+
+    return p != NULL && p[0] != '\0' && stat(p, &st) == 0 && S_ISREG(st.st_mode);
+}
+
 static int resolve_aspx(const char *script, const char *docroot, const char *path,
                         char *filepath, size_t filepath_sz)
 {
     const char *name = script && script[0] ? script : NULL;
-    FILE *f;
 
     if (name) {
         /* 宿主（app_ffi）传进来的 `script` 是**已解析好的脚本路径**（已含 docroot），
          * 这里不能再 join docroot —— 否则变成 `docroot/docroot/x.aspx`，永远打不开，
          * 只能靠后面那条 index 兜底掩盖（而兜底正是软 404 的来源）。直接用。 */
         snprintf(filepath, filepath_sz, "%s", name);
-        f = fopen(filepath, "rb");
-        if (f) {
-            fclose(f);
+        if (is_regular_file(filepath))
             return 0;
-        }
     }
     /* Derive from request path: /foo.aspx → docroot/foo.aspx */
     if (path && path[0]) {
@@ -224,11 +319,8 @@ static int resolve_aspx(const char *script, const char *docroot, const char *pat
             snprintf(filepath, filepath_sz, "%s/%s", docroot, p);
         else
             snprintf(filepath, filepath_sz, "%s", p);
-        f = fopen(filepath, "rb");
-        if (f) {
-            fclose(f);
+        if (is_regular_file(filepath))
             return 0;
-        }
     }
     /* 不再回落 `docroot/index.aspx`：那会让 `/aspnet/<不存在的>.aspx` 返回首页内容
      * （软 404，URL 不变但内容是别的页面）。宿主侧对目录请求已把 script 解析成
@@ -274,16 +366,23 @@ int appengine_execute(
     char *raw = NULL;
     size_t raw_len = 0;
     char *rendered = NULL;
+    struct aspx_ctx ctx;
 
     (void)content_type;
     (void)body;
     (void)body_len;
-    (void)remote;
-    (void)server_name;
-    (void)server_port;
+    /* `extra`（.env JSON）不在这里解析：本引擎不自报 env 隔离，宿主已把 `.env`
+     * 装进**进程环境**后才调用，ServerVariables 的 getenv 兜底即可读到。 */
     (void)extra;
-    (void)headers;
-    (void)method;
+
+    memset(&ctx, 0, sizeof(ctx));
+    ctx.method = method;
+    ctx.req_path = path;
+    ctx.query = query;
+    ctx.remote = remote;
+    ctx.server_name = server_name;
+    ctx.server_port = server_port > 0 ? server_port : 80;
+    ctx.headers = headers;
 
     if (!g_ready || !out)
         return -1;
@@ -292,7 +391,7 @@ int appengine_execute(
 
     if (resolve_aspx(script, docroot, path, filepath, sizeof(filepath)) == 0 &&
         read_file(filepath, &raw, &raw_len) == 0 && raw) {
-        rendered = render_aspx(raw, raw_len, query ? query : "");
+        rendered = render_aspx(&ctx, raw, raw_len);
         free(raw);
         if (rendered) {
             /* Ensure smoke tests see a non-empty body even for empty templates. */
