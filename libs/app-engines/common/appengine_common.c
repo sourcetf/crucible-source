@@ -339,14 +339,77 @@ size_t appengine_cgi_http_key(char *out, size_t out_sz, const char *name, size_t
     return n;
 }
 
+static int ae_setenv_cb(void *ctx, const char *k, const char *v)
+{
+    (void)ctx;
+    setenv(k, v, 1);
+    return 0;
+}
+
 int appengine_apply_extra(const char *extra)
+{
+    return appengine_extra_env_foreach(extra, ae_setenv_cb, NULL);
+}
+
+/* ---------------------------------------------------------- base env block ---
+ * Optional host-provided snapshot of the **startup** process environment
+ * (`K=V\0K=V\0...\0`, double-NUL terminated), with no request-time `.env`.
+ * spawn-per-request engines (cgi) build their child env from this + the request
+ * `.env` instead of inheriting `environ`, so they never see another request's
+ * transient `.env` and need no global env lock. See appengine.h. */
+
+static char *g_base_env_block; /* malloc'd copy of the host block, or NULL */
+
+int appengine_set_base_env(const char *block)
+{
+    char *copy = NULL;
+
+    if (block != NULL) {
+        size_t n;
+
+        /* block is "K=V\0K=V\0...\0": strlen stops at the first NUL, so we must
+         * copy the whole thing including the trailing NUL run. The host always
+         * sends at least the final double-NUL; copy a bounded amount. */
+        /* Find the end: the first NUL that is not part of a "K=V" entry. */
+        const char *p = block;
+        while (*p != '\0')
+            p += strlen(p) + 1;
+        /* p now points AT the final NUL byte (the second NUL of the double-NUL
+         * terminator). `p - block` counts everything before it, so the block
+         * length is `(p - block) + 1` — the old `+ 2` copied one byte past the
+         * host's buffer (a heap overread; for an empty base env the host sends
+         * exactly one NUL, so `+ 2` read two bytes of which one was out of
+         * bounds). */
+        n = (size_t)(p - block) + 1;
+        copy = (char *)malloc(n);
+        if (copy == NULL)
+            return -1;
+        memcpy(copy, block, n);
+    }
+    free(g_base_env_block);
+    g_base_env_block = copy;
+    return 0;
+}
+
+const char *appengine_base_env_block(void)
+{
+    return g_base_env_block;
+}
+
+/* ------------------------------------------------------- extra env (list) ---
+ * Same parser as appengine_apply_extra, but instead of setenv() it hands each
+ * `(key, value)` pair to a callback. Used by engines that must NOT touch the
+ * process env (cgi builds envp directly). Returns 0 on success/no-op. */
+
+int appengine_extra_env_foreach(const char *extra,
+                                int (*cb)(void *ctx, const char *k, const char *v),
+                                void *ctx)
 {
     const char *p, *end, *envk;
     char key[256], val[2048];
 
     if (extra == NULL)
         return -1;
-    /* legacy：非 JSON（找不到 '{'）→ 纯引擎名，no-op。 */
     p = strchr(extra, '{');
     if (p == NULL)
         return 0;
@@ -372,12 +435,10 @@ int appengine_apply_extra(const char *extra)
             break;
         n = ae_json_string(kq, end, key, sizeof(key));
         if (n == 0) {
-            /* 键太长/含 NUL 时**跳过这个键**、继续解析它后面的值（键超长不是「后面全不要了」）。
-             * 与值那条同一理由；键在实践里很短，这里是防御性对称处理。 */
             n = ae_json_skip_string(kq, end);
             if (n == 0)
                 break;
-            key[0] = '\0'; /* 标记为「本项不落地」，值仍会被跳过 */
+            key[0] = '\0';
         }
         p = kq + n;
         while (p < end && (*p == ' ' || *p == ':'))
@@ -386,23 +447,17 @@ int appengine_apply_extra(const char *extra)
             break;
         n = ae_json_string(p, end, val, sizeof(val));
         if (n == 0) {
-            /* **不能 break**：`ae_json_string` 在「放不下」时返回 0，而这里最容易发生的
-             * 就是**值 ≥ sizeof(val)（2048 字节）** —— base64 密钥、长列表、内联 JSON 都很
-             * 容易超。原实现的 `break` 会把这之后**所有**变量一起丢掉：应用「莫名少了几
-             * 个环境变量」，而配置、日志、面板**全都正常**，没有任何一行线索（这是本项目
-             * 最忌讳的那类故障）。改为跳过这一项、继续解析后面的。
-             * 键也一样处理（键超长同样是「这一项不要了」，而不是「后面全不要了」）。 */
             n = ae_json_skip_string(p, end);
             if (n == 0)
-                break; /* 真的畸形了才停 */
+                break;
             p += n;
             continue;
         }
         p += n;
-        /* 键含 `=` 时 POSIX `setenv` 会失败（EINVAL）—— 显式跳过，别指望 libc 兜底
-         * （NUL 的情况已在 ae_json_string 里挡掉）。 */
-        if (key[0] != '\0' && strchr(key, '=') == NULL)
-            setenv(key, val, 1);
+        if (key[0] != '\0' && strchr(key, '=') == NULL) {
+            if (cb != NULL && cb(ctx, key, val) != 0)
+                break;
+        }
     }
     return 0;
 }

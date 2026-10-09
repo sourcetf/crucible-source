@@ -257,7 +257,7 @@ img.preview{max-width:100%;max-height:420px}
   <section class="tab" id="tab-pagerules">
     <div class="card">
       <h2>页面规则</h2>
-      <p class="hint">CDN 风格页面规则：redirect(可 "301:"/"307:"/"308:" 前缀)/block/rewrite/pass/cache/header。匹配按 match_url 前缀/通配。</p>
+      <p class="hint">CDN 风格页面规则：redirect(可 "301:"/"307:"/"308:" 前缀)/block/rewrite/pass/cache/header。匹配按 match_url 前缀/通配，另可按 host（*、a.example、*.example.com）/method（GET, HEAD）/header（X-Foo 或 X-Foo: bar）约束；priority 数值大者先评估。各维度留空 = 不约束。</p>
       <div class="row">
         <div><label>站点（端口）</label><select id="prPort"></select></div>
         <div><button class="act" id="btnPrLoad">载入</button><button class="act ghost" id="btnPrAdd">加一行</button><button class="act" id="btnPrSave">保存规则</button></div>
@@ -318,7 +318,7 @@ img.preview{max-width:100%;max-height:420px}
 
   <section class="tab" id="tab-accesslog">
     <div class="card">
-      <h2>访问日志</h2>
+      <h2>访问日志（全局）</h2>
       <div class="row">
         <div><label>启用</label><select id="logEnable"><option value="true">true</option><option value="false">false</option></select></div>
         <div><label>等级</label><select id="logLevel"><option>error</option><option>warn</option><option>info</option><option>debug</option><option>trace</option></select></div>
@@ -326,6 +326,18 @@ img.preview{max-width:100%;max-height:420px}
       </div>
       <button class="act" id="btnLogSave">保存访问日志</button>
       <pre id="logOut"></pre>
+    </div>
+    <div class="card">
+      <h2>每站覆盖（listeners.access_log）</h2>
+      <p class="hint">只覆盖显式选择的字段，其余字段继承上面的全局值（字段级继承）。三项全选「继承全局」= 删除该站覆盖。level 保留在配置/展示层（所有等级统一落盘，不做行级过滤）。</p>
+      <div class="row">
+        <div><label>站点端口</label><select id="alSitePort"></select></div>
+        <div><label>启用</label><select id="alSiteEnable"><option value="">继承全局</option><option value="true">true</option><option value="false">false</option></select></div>
+        <div><label>等级</label><select id="alSiteLevel"><option value="">继承全局</option><option>error</option><option>warn</option><option>info</option><option>debug</option><option>trace</option></select></div>
+        <div><label>实时（realtime）</label><select id="alSiteRealtime"><option value="">继承全局</option><option value="true">true</option><option value="false">false</option></select></div>
+        <div><button class="act" id="btnAlSiteSave">保存每站覆盖</button></div>
+      </div>
+      <pre id="alSiteOut"></pre>
     </div>
     <div class="card">
       <h3 class="sub">实时日志（GET /api/logs，内存环形缓冲）</h3>
@@ -1408,6 +1420,9 @@ function prRow(r){
     +'<td><select class="r-action">'+PR_ACTIONS.map(a=>'<option'+(a===(r.action||'redirect')?' selected':'')+'>'+a+'</option>').join('')+'</select></td>'
     +'<td><input class="r-target" value="'+esc(r.target||'')+'" placeholder="/new 或 301:https://… 或 Cache 指令"/></td>'
     +'<td><input class="r-prio" size="4" value="'+esc(String(r.priority==null?0:r.priority))+'" title="数值越大越先评估"/></td>'
+    +'<td><input class="r-host" value="'+esc(r.host||'')+'" placeholder="* / a.example / *.example.com（空=不限）"/></td>'
+    +'<td><input class="r-method" value="'+esc(r.method||'')+'" placeholder="GET, HEAD（空=不限）"/></td>'
+    +'<td><input class="r-header" value="'+esc(r.header||'')+'" placeholder="X-Foo 或 X-Foo: bar（空=不限）"/></td>'
     +'<td class="actions"><button class="act mini danger">删</button></td>';
   tr.querySelector('button.danger').onclick=()=>tr.remove();
   return tr;
@@ -1417,7 +1432,7 @@ function renderPr(){
   const wrap=$('prOut');
   if(!l){wrap.innerHTML='<p class="hint">无站点。</p>';return;}
   const table=document.createElement('table');table.className='data';
-  table.innerHTML='<thead><tr><th>match_url</th><th>action</th><th>target</th><th>priority</th><th></th></tr></thead>';
+  table.innerHTML='<thead><tr><th>match_url</th><th>action</th><th>target</th><th>priority</th><th>host</th><th>method</th><th>header</th><th></th></tr></thead>';
   const tb=document.createElement('tbody');
   (l.page_rules||[]).forEach(r=>tb.appendChild(prRow(r)));
   table.appendChild(tb);
@@ -1430,7 +1445,11 @@ function renderPr(){
         match_url:tr.querySelector('.r-match').value.trim(),
         action:tr.querySelector('.r-action').value,
         target:tr.querySelector('.r-target').value.trim()||null,
-        priority:parseInt(tr.querySelector('.r-prio').value,10)||0
+        priority:parseInt(tr.querySelector('.r-prio').value,10)||0,
+        // §16.11 维度：空串 = 不约束（后端也把空串视为未配置，不落盘）。
+        host:tr.querySelector('.r-host').value.trim()||null,
+        method:tr.querySelector('.r-method').value.trim()||null,
+        header:tr.querySelector('.r-header').value.trim()||null
       });
     });
     const r=await api('/api/page_rules/save',jpost({port:parseInt($('prPort').value,10),rules:rules}));
@@ -1549,6 +1568,17 @@ function initLogTab(){
   $('logEnable').value=String(al.enable!==false);
   $('logLevel').value=al.level||'info';
   $('logRealtime').value=String(!!al.realtime);
+  // 每站覆盖：端口下拉 + 从 CFG.listeners[].access_log 回显三态（'' = 继承全局）。
+  fillPortSelect($('alSitePort'),$('alSitePort').value);
+  $('alSitePort').onchange=renderAlSite;
+  renderAlSite();
+}
+function renderAlSite(){
+  const l=listenerByPort($('alSitePort').value)||{};
+  const ov=l.access_log||{};
+  $('alSiteEnable').value=(ov.enable===true||ov.enable===false)?String(ov.enable):'';
+  $('alSiteLevel').value=ov.level||'';
+  $('alSiteRealtime').value=(ov.realtime===true||ov.realtime===false)?String(ov.realtime):'';
 }
 $('btnLogSave').onclick=async()=>{
   const r=await api('/api/access_log/save',jpost({
@@ -1557,6 +1587,21 @@ $('btnLogSave').onclick=async()=>{
     realtime:$('logRealtime').value==='true'
   }));
   out('logOut',r.text,r.ok);toast(r.text,!r.ok);
+  if(r.ok)await loadCfg();
+};
+$('btnAlSiteSave').onclick=async()=>{
+  // '' = 继承全局 → 发 null（后端删该字段；三项全 null 时整段覆盖删除）。
+  const tri=id=>{const v=$(id).value;return v===''?null:v==='true';};
+  const lvl=$('alSiteLevel').value;
+  const port=parseInt($('alSitePort').value,10);
+  if(!port){toast('没有可选的站点',true);return;}
+  const r=await api('/api/access_log/site_save',jpost({
+    port:port,
+    enable:tri('alSiteEnable'),
+    level:lvl===''?null:lvl,
+    realtime:tri('alSiteRealtime')
+  }));
+  out('alSiteOut',r.text,r.ok);toast(r.text,!r.ok);
   if(r.ok)await loadCfg();
 };
 // 实时 tail：GET /api/logs?limit=N → {"lines":[...]}（access_log 内存环形缓冲）。

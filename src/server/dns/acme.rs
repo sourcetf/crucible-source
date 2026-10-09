@@ -187,6 +187,11 @@ static ISSUE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 /// 私钥也必须在：只有 `fullchain.pem`、私钥丢失/损坏时旧实现永远不会重新签发，
 /// DoT 拿着配不上对的材料握手失败。
 fn issue_if_missing(cfg: &AcmeCfg) -> anyhow::Result<()> {
+    // 面板「立即签发」与自动续期共用本函数：域名没填时给出可定位的错误
+    // （旧面板路径对空域名报 "unsafe domain \"\"" 之类，看不出是配置缺失）。
+    if cfg.domain.trim().is_empty() {
+        anyhow::bail!("[dns.acme] domain 未配置 —— 请先在面板填写证书域名");
+    }
     if safe_domain_segment(&cfg.domain).is_none() {
         anyhow::bail!("unsafe ACME domain {:?}", cfg.domain);
     }
@@ -261,6 +266,10 @@ fn issue(cfg: &AcmeCfg) -> anyhow::Result<()> {
     std::fs::create_dir_all(&out_dir)?;
     std::fs::create_dir_all(std::path::Path::new(&www).join(".well-known/acme-challenge"))?;
 
+    // 「客户端找到但执行失败」的清单：最终错误里必须区分「一个都没装」与
+    // 「装了但失败」。旧实现两种情况都报 `no acme client available` —— 面板按钮
+    // 明明有 acme.sh 却回「没有客户端」，真正原因（rateLimited 等）只在服务日志里。
+    let mut attempted: Vec<String> = Vec::new();
     // 1) acme.sh（用户目录安装或 /usr/local）；HOME 缺失时无法定位 ~/.acme.sh，跳过。
     // 走 env_lock 缓存读 HOME：本函数跑在 spawn_blocking 线程里，与请求路径上应用引擎
     // 的 setenv（perl/python/ruby 的 ENV 注入）并发 —— libc setenv 可能 realloc environ，
@@ -281,6 +290,7 @@ fn issue(cfg: &AcmeCfg) -> anyhow::Result<()> {
                 if run_client(&mut cmd, "acme.sh --issue").is_some() {
                     return install_acme_sh(&bin, &cfg.domain, &out_dir);
                 }
+                attempted.push(format!("acme.sh（{bin}）"));
             }
         }
     } else {
@@ -306,6 +316,7 @@ fn issue(cfg: &AcmeCfg) -> anyhow::Result<()> {
             ensure_installed(&out_dir, "acme-client")?;
             return Ok(());
         }
+        attempted.push(format!("acme-client（{bin}）"));
     }
     // 3) certbot：证书固定落在 /etc/letsencrypt/live/<domain>/，必须显式拷进 out_dir 并确认。
     if let Ok(found) = which("certbot") {
@@ -323,12 +334,23 @@ fn issue(cfg: &AcmeCfg) -> anyhow::Result<()> {
             ensure_installed(&out_dir, "certbot")?;
             return Ok(());
         }
+        attempted.push(format!("certbot（{found}）"));
     }
-    anyhow::bail!(
-        "no acme client available (tried acme.sh / acme-client / certbot) — \
-         手动模式：把证书放到 {} 与 {}，或在 dns.dot.cert/key 直接写路径",
+    let manual = format!(
+        "手动模式：把证书放到 {} 与 {}，或在 dns.dot.cert/key 直接写路径",
         out_dir.join("fullchain.pem").display(),
         out_dir.join("privkey.pem").display()
+    );
+    if attempted.is_empty() {
+        anyhow::bail!(
+            "no acme client available (tried acme.sh / acme-client / certbot) — {manual}"
+        );
+    }
+    // 找到但失败：失败原因（含 rateLimited 标记）已由 log_client_failure 写进服务日志，
+    // 这里把「是哪个客户端失败」带回面板，附上日志检索关键字。
+    anyhow::bail!(
+        "ACME 客户端已找到但执行失败：{}（stderr 尾部见服务日志 `dns-acme:` 行）—— {manual}",
+        attempted.join("、")
     )
 }
 
@@ -415,7 +437,9 @@ pub(crate) fn install_acme_sh(
 ) -> anyhow::Result<()> {
     // acme.sh 的安装/续期都以 HOME 为工作目录；HOME 缺失时 src_dir 会变成
     // `/.acme.sh/<domain>_ecc`（永远不存在）—— 直接给出可操作的错误。
-    let home = std::env::var("HOME").unwrap_or_default();
+    // 走 env_lock 缓存读：本函数从 spawn_blocking 线程调用，与请求路径上应用引擎的
+    // setenv 并发（裸 getenv 会踩 realloc 后的 environ，仓库已实测出同类 SIGSEGV）。
+    let home = crate::server::apps::env_lock::read_static_env("HOME").unwrap_or_default();
     if home.trim().is_empty() {
         anyhow::bail!("HOME 未设置，无法定位 acme.sh 工作目录（~/.acme.sh/{domain}_ecc）");
     }
@@ -443,16 +467,17 @@ pub(crate) fn install_acme_sh(
     Ok(())
 }
 
-/// 面板「立即签发」的统一入口（admin API 应改调它，替代自己拼 acme.sh 命令）：
+/// 面板「立即签发」的统一入口（admin API 改调它，替代自己拼 acme.sh 命令）：
 /// 与自动续期同一套 CA/参数（`--server letsencrypt`、`ec-256`，不带 `--force`），
 /// 并走同一个进程级互斥。证书仍有效时直接返回 Ok（不重复打 CA 限额）。
-#[allow(dead_code)] // 等待 admin_api 接线（跨文件需求）。
 pub fn issue_now(cfg: &AcmeCfg) -> anyhow::Result<()> {
     issue_if_missing(cfg)
 }
 
 fn which(name: &str) -> anyhow::Result<String> {
-    let path = std::env::var("PATH").unwrap_or_default();
+    // 走 env_lock 缓存读 PATH（同 issue()/install_acme_sh()）：本函数在 spawn_blocking
+    // 线程执行，裸 getenv 与请求路径的 setenv 并发会踩已释放的 environ。
+    let path = crate::server::apps::env_lock::read_static_env("PATH").unwrap_or_default();
     for dir in path.split(':') {
         let cand = std::path::Path::new(dir).join(name);
         if cand.is_file() {

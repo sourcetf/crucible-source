@@ -277,7 +277,7 @@ async fn simple_sidecar_dispatch(
 }
 
 /// `cgi_script` 的字节版：script 解析与 h1 `cgi_script::handle` 同一口径
-///（剥应用前缀 → `script_rel` 防穿越 → 必须存在），执行复用 `execute_binary`。
+///（剥应用前缀 → 最长「已存在文件」前缀定界 → PATH_INFO），执行复用 `execute_binary`。
 async fn cgi_script_simple(
     req: &Request<Bytes>,
     lc: &ListenerConfig,
@@ -285,13 +285,8 @@ async fn cgi_script_simple(
     peer: SocketAddr,
     deps_env: &deps::DepsEnv,
 ) -> anyhow::Result<Response<Bytes>> {
-    let docroot = app.docroot.clone().unwrap_or_else(|| lc.root.clone());
-    let rel = app_ffi::rel_script_path(app, req.uri().path());
-    let script = crate::server::admin_files::script_rel(&docroot, rel.trim_start_matches('/'))
-        .map_err(|e| anyhow::anyhow!("cgi_script script path: {e:#}"))?;
-    if !script.is_file() {
-        anyhow::bail!("cgi_script: script not found {}", script.display());
-    }
+    let (script, script_name, path_info) =
+        cgi_script::resolve_target(lc, app, req.uri().path())?;
     let resp = cgi_script::execute_binary(
         &script,
         req.method(),
@@ -300,8 +295,9 @@ async fn cgi_script_simple(
         req.body().clone(),
         &deps_env.vars,
         lc,
-        app,
         peer,
+        script_name,
+        path_info,
     )
     .await?;
     let (parts, body) = resp.into_parts();
@@ -686,6 +682,7 @@ mod script_rel_tests {
             quic_ecn: false,
             qmux: false,
             connect_udp: false,
+            access_log: None,
         }
     }
 

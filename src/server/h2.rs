@@ -221,6 +221,7 @@ where
                         None,
                         t0.elapsed(),
                         "busy",
+                        lc.access_log.as_ref(),
                     );
                     // 不读 body 直接回包：流关闭时 h2 会自动归还连接级窗口
                     // （recv.rs release_closed_capacity），不会占住连接窗口。
@@ -285,6 +286,7 @@ where
                             None,
                             t0.elapsed(),
                             "acl",
+                            lc.access_log.as_ref(),
                         );
                         let mut b = Response::builder().status(status);
                         if status == StatusCode::UNAUTHORIZED {
@@ -362,6 +364,8 @@ where
             let t0 = std::time::Instant::now();
             // HSTS 判定要在 handle_h2 之前取：lc 会被 move 进去。
             let is_https = lc.ssl.is_some();
+            // §16.12：每站访问日志覆盖也要在 move 之前取出（完成侧日志在下面）。
+            let access_override = lc.access_log.clone();
             let mut response = handle_h2(req, live.clone(), lc, peer).await;
             // 访问日志用的路径：与旧实现一致，记**改写前**的请求路径（改写发生在
             // handle_h2 内部的副本上，这里拿不到也不需要）。
@@ -399,6 +403,7 @@ where
                 Some(file_src.as_ref().map(|s| s.len).unwrap_or(data.len() as u64)),
                 t0.elapsed(),
                 engine,
+                access_override.as_ref(),
             );
             let end = file_src.is_none() && data.is_empty();
             if let Ok(mut send) = respond.send_response(Response::from_parts(parts, ()), end) {
@@ -1113,7 +1118,9 @@ async fn handle_h2(
     }
 
     // page_rules: block/redirect(apply_simple) + rewrite(路径改写) + cache/header(响应头)
-    if let Some((status, location)) = crate::server::page_rules::apply_simple(&lc, &path) {
+    if let Some((status, location)) =
+        crate::server::page_rules::apply_simple(&lc, &path, &crate::server::page_rules::MatchCtx::from_request(&req))
+    {
         if status == StatusCode::FORBIDDEN {
             return tag(
                 Response::builder()
@@ -1132,20 +1139,31 @@ async fn handle_h2(
             "rule",
         );
     }
-    if let Some(np) = crate::server::page_rules::rewrite_path(&lc, &path) {
-        let pq = match req.uri().query() {
-            Some(q) => format!("{np}?{q}"),
-            None => np,
-        };
-        if let Ok(u) = pq.parse() {
-            *req.uri_mut() = u;
+    // §16.11：host 维度的 owned 快照（必须在下面的 rewrite 改 `uri_mut()` 前取，
+    // 见 `from_request_with_host` 的说明）。
+    let pr_host = crate::server::page_rules::host_snapshot(&req);
+    {
+        let pr_ctx = crate::server::page_rules::MatchCtx::from_request(&req);
+        if let Some(np) = crate::server::page_rules::rewrite_path(&lc, &path, &pr_ctx) {
+            let pq = match req.uri().query() {
+                Some(q) => format!("{np}?{q}"),
+                None => np,
+            };
+            if let Ok(u) = pq.parse() {
+                *req.uri_mut() = u;
+            }
         }
     }
     // 改写后必须以新路径做后续判定与分发（同 h1 的修正：此前 pre/post 路径混用，
     // 会导致 would_handle/would_proxy 与真正 handler 看到的路径不一致）。
     let path = req.uri().path().to_string();
+    // host 快照必须在 `uri_mut()` 被换成相对形态**之前**取：h2 的 host 只存在于
+    // `:authority`（URI authority）里，客户端可以不发 Host 头 —— 改写后重建的 ctx
+    // 会拿不到 host，带 host 约束的 block/pass/header 规则静默不命中（h1 无此问题，
+    // 它的 Host 头始终在）。用快照保持三协议一致。
+    let pr_ctx = crate::server::page_rules::MatchCtx::from_request_with_host(&req, pr_host.as_deref());
     // P1-5：h1 的 pass_upstream（page rule pass 动作）在 h2 同样生效。
-    if let Some((murl, upstream)) = crate::server::page_rules::pass_upstream(&lc, &path) {
+    if let Some((murl, upstream)) = crate::server::page_rules::pass_upstream(&lc, &path, &pr_ctx) {
         // proxy_page_rule 需要 h1 体类型（Bytes）：先收齐（≤8MiB）。
         let req = match collect_bytes(req, REQUEST_BODY_CAP).await {
             Ok(r) => r,
@@ -1161,7 +1179,7 @@ async fn handle_h2(
         .await;
         return tag(collect_to_bytes(resp).await, "proxy");
     }
-    let resp_mods = crate::server::page_rules::response_headers(&lc, &path);
+    let resp_mods = crate::server::page_rules::response_headers(&lc, &path, &pr_ctx);
     let mut resp = h2_tail(req, live, lc, peer, path).await;
     for (name, value) in resp_mods {
         if let (Ok(nn), Ok(vv)) = (

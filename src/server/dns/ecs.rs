@@ -107,7 +107,9 @@ pub fn inject_ecs(msg: &[u8], client: IpAddr) -> Option<Vec<u8>> {
 /// 供调用方判定：查询里的 ECS 是否畸形（RFC 7871 §6/§7.2.1 应回 FORMERR）。
 ///
 /// 判据：同一 OPT 里出现多个 ECS option；FAMILY 不是 1/2；SOURCE 超出该族位宽；
-/// ADDRESS 字节数少于 SOURCE 所需、或超出该族完整长度；SOURCE 之外的尾随位非零。
+/// ADDRESS 字节数少于 SOURCE 所需、或超出该族完整长度；SOURCE 之外的尾随位非零；
+/// **OPT rdata 无法按 TLV 完整解析**（某 option 的 olen 越过 rdata 末尾 —— 即
+/// 「声明的长度与实际不符」，或尾部剩 1~3 字节凑不满 option 头）。
 pub fn malformed_ecs(msg: &[u8]) -> bool {
     let Some(off) = question_end(msg) else {
         return false;
@@ -116,10 +118,37 @@ pub fn malformed_ecs(msg: &[u8]) -> bool {
         return false;
     };
     let parsed = parse_options(&opt.rdata);
+    // 残留字节 = OPT rdata 畸形（RFC 6891 §6.1.2：option 必须 TLV 完整）。旧实现把它
+    // 当「未知 option 原样保留」照样转发 —— 于是「ECS option 声明长度与实际不符」这类
+    // 畸形输入被静默放行，永远拿不到 FORMERR。这里先判它。
+    if !parsed.tail.is_empty() {
+        return true;
+    }
     match parsed.ecs {
         Some(e) => parsed.ecs_count > 1 || !ecs_valid(&e),
         None => false,
     }
+}
+
+/// 构造对畸形 ECS/OPT 查询的 FORMERR 应答（RFC 7871 §7.2.1、RFC 1035 §4.1.1）。
+///
+/// 回显请求头与 QUESTION 段：QR=1、opcode 与 RD 原样保留、AA/TC 清零、RCODE=FORMERR(1)、
+/// AN/NS/ARCOUNT=0（**不**携带 OPT/ECS —— 对畸形输入不回 ECS）。查询头/问题段本身
+/// 无法定位（截断）时返回 None，调用方按上游错误处理。
+pub fn formerr_response(query: &[u8]) -> Option<Vec<u8>> {
+    let off = question_end(query)?;
+    if off < 12 {
+        return None;
+    }
+    let mut out = query[..off].to_vec();
+    // byte2：QR=1 | opcode(原样) | RD(原样)；AA/TC 清零（0x79 = opcode 0x78 | RD 0x01）。
+    out[2] = 0x80 | (query[2] & 0x79);
+    // byte3：RCODE=FORMERR(1)；RA=0（不宣称递归可用）。
+    out[3] = 0x01;
+    out[6..8].copy_from_slice(&0u16.to_be_bytes()); // ANCOUNT
+    out[8..10].copy_from_slice(&0u16.to_be_bytes()); // NSCOUNT
+    out[10..12].copy_from_slice(&0u16.to_be_bytes()); // ARCOUNT
+    Some(out)
 }
 
 /// RFC 7871 §7.2.2：客户端查询**带** ECS 时，应答必须回带 ECS option。
@@ -533,6 +562,47 @@ mod tests {
         assert!(malformed_ecs(&short));
         // 正常查询不带 ECS：不是畸形。
         assert!(!malformed_ecs(&minimal_query()));
+    }
+
+    /// 「option 声明长度与实际不符」：ECS option 的 olen 越过 OPT rdata 末尾 ⇒ 畸形。
+    #[test]
+    fn malformed_detects_truncated_option_length() {
+        // 手工拼 OPT rdata：ECS code=8, olen=40，但实际只跟 6 字节 ⇒ 越界。
+        let mut rdata = Vec::new();
+        rdata.extend_from_slice(&ECS_OPTION_CODE.to_be_bytes());
+        rdata.extend_from_slice(&40u16.to_be_bytes());
+        rdata.extend_from_slice(&[0, 1, 24, 0, 203, 0]); // 6 字节，远少于声明的 40
+        let q = query_with_opt(minimal_query(), &rdata);
+        assert!(malformed_ecs(&q), "ECS option 声明长度与实际不符必须判畸形");
+    }
+
+    /// FORMERR 应答：QR=1、RCODE=1、AN/NS/ARCOUNT=0、回显 QUESTION、opcode/RD 保留。
+    #[test]
+    fn formerr_response_is_well_formed() {
+        let mut q = minimal_query();
+        q[2] = 0x01; // RD
+        q[3] = 0x00;
+        let r = formerr_response(&q).expect("must build");
+        assert_eq!(r[0], q[0]);
+        assert_eq!(r[1], q[1]);
+        assert_eq!(r[2] & 0x80, 0x80, "QR 必须为 1");
+        assert_eq!(r[2] & 0x01, 0x01, "RD 保留");
+        assert_eq!(r[2] & 0x78, q[2] & 0x78, "opcode 保留");
+        assert_eq!(r[3] & 0x0F, 1, "RCODE=FORMERR(1)");
+        assert_eq!(u16::from_be_bytes([r[4], r[5]]), 1, "QDCOUNT 保留");
+        assert_eq!(u16::from_be_bytes([r[6], r[7]]), 0, "ANCOUNT=0");
+        assert_eq!(u16::from_be_bytes([r[8], r[9]]), 0, "NSCOUNT=0");
+        assert_eq!(u16::from_be_bytes([r[10], r[11]]), 0, "ARCOUNT=0（不回 OPT）");
+        // 问题段原样回显。
+        assert_eq!(&r[12..], &q[12..]);
+    }
+
+    /// 畸形查询（问题段被截断，无法定位 QUESTION 结尾）⇒ 无法构造 FORMERR。
+    #[test]
+    fn formerr_response_none_on_truncated_question() {
+        let mut q = minimal_query();
+        q.truncate(q.len() - 2); // 截断 A IN 的 4 字节尾部
+        assert!(formerr_response(&q).is_none());
     }
 
     /// 无 ECS 的查询：应答原样返回。

@@ -12,6 +12,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 /// Cap for non-streaming full-file reads (DoS guard). Larger files must use Range or fail.
 const MAX_FULL_READ: u64 = 16 * 1024 * 1024;
@@ -65,7 +66,12 @@ struct CanonEntry {
     at: std::time::Instant,
 }
 
-static CANON_CACHE: Lazy<Mutex<HashMap<(PathBuf, String), CanonEntry>>> =
+/// 两级缓存：`root → (解码后的相对路径 → CanonEntry)`。
+///
+/// 旧键是 `(PathBuf, String)`，命中时也要 `root.to_path_buf()` + `decoded.clone()`
+/// 两次堆分配。两级结构用 `&Path` / `&str` 查询（`HashMap` 的 `Borrow` 查找），
+/// 命中路径**零分配**；只有未命中（要插入新条目）时才分配。
+static CANON_CACHE: Lazy<Mutex<HashMap<PathBuf, HashMap<String, CanonEntry>>>> =
     Lazy::new(|| Mutex::new(HashMap::new()));
 
 /// 解析缓存 TTL 与容量（超过容量时整表清空，代价可忽略）。
@@ -163,6 +169,22 @@ pub async fn serve(req: &Request<Incoming>, lc: &ListenerConfig) -> Result<Respo
     }
     let path = req.uri().path();
     let fs_path = resolve_path(&lc.root, path)?;
+    // 快车道（性能）：URL 以 `/` 结尾 ⇒ **语义上必是目录**，可以直接探测索引文件
+    // （`directory_index` 内部一次 `lstat`），命中就省掉对目录本身的那次 `stat`
+    // —— `/` 基准路径上「解析 + 目录索引」共两次 syscall 里的第一次。
+    // 未命中（不存在 / 无索引 / 索引被引擎接管 / 非普通文件）一律**回退**到原来的
+    // `metadata` 路径，因此 301 / autoindex / 404 / 非普通文件（FIFO…）语义逐字不变：
+    // 目录 stat 仍然会做，只是当索引命中时不再白做一次。
+    if path.ends_with('/') {
+        if let Some((idx, idx_meta)) = directory_index(&fs_path, &lc.root) {
+            let mode = file_open_mode(lc, path);
+            let owned = apps_configured(lc)
+                && (engine_owns(lc, path, mode) || app_private_path(lc, path, mode));
+            if !owned {
+                return serve_file(req, &idx, &idx_meta, mode).await;
+            }
+        }
+    }
     let meta = fs::metadata(&fs_path)?;
     if meta.is_dir() {
         // 目录缺尾斜杠 → 301 补上（保留 query）。必须在 index/autoindex 之前：
@@ -604,7 +626,22 @@ pub async fn serve_simple<T>(req: &Request<T>, lc: &ListenerConfig) -> Result<Re
     }
     let path = req.uri().path();
     let mut fs_path = resolve_path(&lc.root, path)?;
-    let mut meta = fs::metadata(&fs_path)?;
+    // 快车道（同 h1::serve）：尾斜杠 URL 语义上必是目录 → 直接探测索引文件（一次
+    // `lstat`），命中即省掉对目录本身的一次 `stat`；未命中回退原 `metadata` 路径，
+    // 301 / autoindex / 404 / 非普通文件语义逐字不变。
+    let mut index_probed = false;
+    let mut meta = if path.ends_with('/') {
+        index_probed = true;
+        match directory_index(&fs_path, &lc.root) {
+            Some((idx, idx_meta)) => {
+                fs_path = idx;
+                idx_meta
+            }
+            None => fs::metadata(&fs_path)?, // 目录不存在 / 无索引 → 原语义
+        }
+    } else {
+        fs::metadata(&fs_path)?
+    };
     if meta.is_dir() {
         // 与 h1 一致：目录缺尾斜杠先 301（保留 query），再谈 index/autoindex。
         // 此前 h2/h3 完全没有这道跳转：`GET /dir` 直接回目录内容，页面相对链接全错。
@@ -617,9 +654,13 @@ pub async fn serve_simple<T>(req: &Request<T>, lc: &ListenerConfig) -> Result<Re
                 .unwrap());
         }
         // 与 h1 相同：index.html/index.htm 优先（否则 h1 与 h2/h3 行为不一致）。
-        if let Some((idx, idx_meta)) = directory_index(&fs_path, &lc.root) {
-            fs_path = idx;
-            meta = idx_meta;
+        // 尾斜杠快车道已对同一个目录探过索引（`dir_redirect_location` 对尾斜杠路径
+        // 必为 None，走到这里只可能是快车道的未命中分支）→ 不重复 lstat。
+        if !index_probed {
+            if let Some((idx, idx_meta)) = directory_index(&fs_path, &lc.root) {
+                fs_path = idx;
+                meta = idx_meta;
+            }
         }
     }
     if meta.is_dir() {
@@ -888,9 +929,10 @@ pub async fn serve_simple<T>(req: &Request<T>, lc: &ListenerConfig) -> Result<Re
 
 fn resolve_path(root: &Path, url_path: &str) -> Result<PathBuf> {
     let rel = url_path.trim_start_matches('/');
-    let decoded = percent_encoding::percent_decode_str(rel)
-        .decode_utf8_lossy()
-        .to_string();
+    // `Cow`：绝大多数 URL 不含 `%xx`（bench/站点常态），此时借用原切片、**零分配**；
+    // 只有缓存未命中要插入时才 `into_owned()` 一次。旧实现无条件 `.to_string()`，
+    // 每个请求（含全部缓存命中）白付一次堆分配。
+    let decoded = percent_encoding::percent_decode_str(rel).decode_utf8_lossy();
     // P2-1：显式穿越段一律拒绝（解码后再判一次，防 %2e%2e 绕过）。
     if decoded.split(['/','\\']).any(|seg| seg == "..") {
         bail!("path escape");
@@ -919,18 +961,19 @@ fn resolve_path(root: &Path, url_path: &str) -> Result<PathBuf> {
         }
         bail!("hidden path is not served");
     }
-    // 解析缓存：命中即返回（跳过 realpath/stat 链）。
-    let ckey = (root.to_path_buf(), decoded.clone());
+    // 解析缓存：命中即返回（跳过 realpath/stat 链）。用 `&Path`/`&str` 查询，命中零分配。
     {
         let now = std::time::Instant::now();
         let cache = CANON_CACHE.lock();
-        if let Some(e) = cache.get(&ckey) {
-            if now.duration_since(e.at) < CANON_TTL {
-                return Ok(e.canon.clone());
+        if let Some(inner) = cache.get(root) {
+            if let Some(e) = inner.get(&*decoded) {
+                if now.duration_since(e.at) < CANON_TTL {
+                    return Ok(e.canon.clone());
+                }
             }
         }
     }
-    let joined = root.join(&decoded);
+    let joined = root.join(&*decoded);
     let canon_root = canon_root_cached(root);
     // P2-1：symlink 经 canonicalize 解析后强制 containment——指向 root 外的符号链接
     // 一律拒绝；root 内互链允许（web 服务器惯例）。未存在路径按最深存在的父目录
@@ -954,17 +997,18 @@ fn resolve_path(root: &Path, url_path: &str) -> Result<PathBuf> {
         }
         canon_base
     };
-    if !canon.starts_with(&canon_root) {
+    if !canon.starts_with(&*canon_root) {
         bail!("path escape");
     }
     // 只有通过 containment 的结果才入缓存。
     {
         let mut cache = CANON_CACHE.lock();
-        if cache.len() >= CANON_CAP {
-            cache.clear();
+        let inner = cache.entry(root.to_path_buf()).or_default();
+        if inner.len() >= CANON_CAP {
+            inner.clear();
         }
-        cache.insert(
-            ckey,
+        inner.insert(
+            decoded.into_owned(),
             CanonEntry {
                 canon: canon.clone(),
                 at: std::time::Instant::now(),
@@ -975,8 +1019,11 @@ fn resolve_path(root: &Path, url_path: &str) -> Result<PathBuf> {
 }
 
 /// docroot 自身的 canonical 路径（缓存 + TTL；失败时退回原路径）。
-fn canon_root_cached(root: &Path) -> PathBuf {
-    static ROOT_CACHE: Lazy<Mutex<HashMap<PathBuf, (PathBuf, std::time::Instant)>>> =
+///
+/// 返回 `Arc<PathBuf>`：命中时只增引用计数，省掉旧实现每请求一次的 `PathBuf` 深拷贝
+/// （该函数在 `resolve_path` 与 `directory_index` 上各被调用一次，即每请求两次）。
+fn canon_root_cached(root: &Path) -> Arc<PathBuf> {
+    static ROOT_CACHE: Lazy<Mutex<HashMap<PathBuf, (Arc<PathBuf>, std::time::Instant)>>> =
         Lazy::new(|| Mutex::new(HashMap::new()));
     let now = std::time::Instant::now();
     if let Some((c, at)) = ROOT_CACHE.lock().get(root).cloned() {
@@ -984,10 +1031,10 @@ fn canon_root_cached(root: &Path) -> PathBuf {
             return c;
         }
     }
-    let c = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+    let c = Arc::new(root.canonicalize().unwrap_or_else(|_| root.to_path_buf()));
     ROOT_CACHE
         .lock()
-        .insert(root.to_path_buf(), (c.clone(), now));
+        .insert(root.to_path_buf(), (Arc::clone(&c), now));
     c
 }
 
@@ -1722,7 +1769,7 @@ fn directory_index(dir: &Path, root: &Path) -> Option<(PathBuf, fs::Metadata)> {
             continue; // 不存在 / 断链
         };
         if !lmeta.file_type().is_symlink() {
-            if lmeta.is_file() && p.starts_with(&canon_root) {
+            if lmeta.is_file() && p.starts_with(&*canon_root) {
                 return Some((p, lmeta));
             }
             continue;
@@ -1730,7 +1777,7 @@ fn directory_index(dir: &Path, root: &Path) -> Option<(PathBuf, fs::Metadata)> {
         let Ok(canon) = p.canonicalize() else {
             continue; // 断链
         };
-        if !canon.starts_with(&canon_root) {
+        if !canon.starts_with(&*canon_root) {
             log::debug!(
                 "static: 拒绝 root 外的目录索引符号链接 {} -> {}",
                 p.display(),

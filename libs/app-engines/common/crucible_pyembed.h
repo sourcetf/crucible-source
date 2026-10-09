@@ -21,8 +21,11 @@
  *   - 谁都不调用 Py_FinalizeEx：解释器随进程常驻，否则另一个 .so 的线程会在
  *     等 GIL 上永久阻塞。
  *   - 进程级互斥 g_py_lock 只串行化"初始化 / 应用缓存读写 / shutdown"，不覆盖应用
- *     执行（应用在锁外跑，避免应用回调本服务器时自锁）；锁序固定为 GIL → 锁，
- *     初始化路径只持锁不碰 GIL，故无 ABBA 死锁。
+ *     执行（应用在锁外跑）。**锁序固定为 g_py_lock → GIL**（两者都必须先锁后 GIL）：
+ *     g_py_lock 保护段里的 Python 调用（import/runpy/os.stat）会在内部释放 GIL，若某处
+ *     反过来持 GIL 等 g_py_lock 就是 ABBA 死锁 —— 实测冷启动 3 个并发带 `.env` 的
+ *     wsgi 请求即可永久卡死（见 `crucible_py_wsgi_request` 步骤 2 的说明）。应用执行期
+ *     **只持 GIL、不持 g_py_lock**，所以应用回调本服务器时不会与锁序成环。
  *   - 所有 Py* 调用（含 Py_DecRef）必须在持 GIL 期间完成，本文件按该顺序收尾。
  *
  * Py_ssize_t 假定为 long：目标平台是 LP64（openbsd/amd64、linux/amd64）。
@@ -493,7 +496,7 @@ extern char **environ;
 
 static void crucible_py_sync_environ_locked(void *restore_out)
 {
-    void *d, *os_mod, *envmap = NULL, *none = NULL;
+    void *d, *os_mod, *envmap = NULL, *snap = NULL, *none = NULL;
     char **e;
 
     if (g_py_state != 1)
@@ -506,8 +509,19 @@ static void crucible_py_sync_environ_locked(void *restore_out)
     os_mod = g_py.import_module("os");
     if (os_mod != NULL)
         envmap = g_py.object_get_attr_string(os_mod, "environ"); /* 借用 */
-    if (restore_out != NULL)
+    /* **必须查一个真正的 dict**：`os.environ` 是 `os._Environ`（MutableMapping），而
+     * `g_py.dict_get_item_string` 绑定的是 `PyDict_GetItemString` —— 对非 dict 恒返回
+     * NULL 且不设异常。旧实现直接拿它查 `os.environ`，于是**每个键都被记成「原本不
+     * 存在」**，请求结束的 `crucible_py_restore_environ` 就把 os.environ 的每个键都
+     * `__delitem__` —— 一次带 `.env` 的请求之后，嵌入式解释器的 os.environ 被**整表清空**
+     * （实测 ENV_LEN=0，PATH/HOME/LANG 全部消失，同进程后续所有请求受害）。
+     * `_Environ.copy()` 返回真 dict，用它做「请求前状态」的快照。 */
+    if (restore_out != NULL && envmap != NULL) {
+        snap = g_py.object_call_method(envmap, "copy", NULL);
+        if (snap == NULL)
+            crucible_py_clear_error();
         none = crucible_py_none_obj(); /* None 作「原本不存在」哨兵（env 值恒为 str） */
+    }
     for (e = environ; e != NULL && *e != NULL; e++) {
         const char *eq = strchr(*e, '=');
         char kbuf[128];
@@ -528,8 +542,8 @@ static void crucible_py_sync_environ_locked(void *restore_out)
         }
         (void)g_py.dict_set_item_string(d, kbuf, v);
         /* 记录请求前状态（此刻 os.environ 尚未 update）：只记「本次会改动」的键。 */
-        if (restore_out != NULL && envmap != NULL) {
-            void *prior = g_py.dict_get_item_string(envmap, kbuf); /* 借用，可能 NULL */
+        if (snap != NULL) {
+            void *prior = g_py.dict_get_item_string(snap, kbuf); /* 借用，可能 NULL */
             if (prior == NULL) {
                 if (none != NULL)
                     (void)g_py.dict_set_item_string(restore_out, kbuf, none);
@@ -547,6 +561,8 @@ static void crucible_py_sync_environ_locked(void *restore_out)
     }
     if (envmap != NULL)
         (void)g_py.object_call_method(envmap, "update", "O", d);
+    if (snap != NULL)
+        g_py.dec_ref(snap);
     if (os_mod != NULL)
         g_py.dec_ref(os_mod);
     crucible_py_clear_error();
@@ -581,7 +597,14 @@ static void crucible_py_restore_environ(void *restore)
                     else
                         g_py.dec_ref(r);
                 } else {
-                    (void)g_py.dict_set_item_string(envmap, ks, prior);
+                    /* **不能**用 `dict_set_item_string`：envmap 是 `os._Environ`，不是
+                     * dict，`PyDict_SetItemString` 对非 dict 直接失败（还原静默无效）。
+                     * 走 MutableMapping 的 `__setitem__`（与上面的 `__delitem__` 对称）。 */
+                    void *r = g_py.object_call_method(envmap, "__setitem__", "OO", k, prior);
+                    if (r == NULL)
+                        crucible_py_clear_error();
+                    else
+                        g_py.dec_ref(r);
                 }
             } else {
                 crucible_py_clear_error();
@@ -1016,8 +1039,20 @@ static int crucible_py_wsgi_request(const char *label, const char *script,
     }
     pthread_mutex_unlock(&g_py_lock);
 
-    /* 步骤 2：先拿 GIL 再拿锁（锁内只做 env 同步 + 应用加载/缓存，随即释放）。
-     * 应用本体在锁外执行：应用回调本服务器时不会自锁（GIL 在 I/O 期间会释放）。 */
+    /* 步骤 2：**先拿 g_py_lock、再拿 GIL**（全局锁序 = g_py_lock → GIL，与步骤 1 的
+     * 初始化路径同一方向）。
+     *
+     * 为什么不能「先 GIL 再锁」（旧写法）：g_py_lock 保护段里跑 Python
+     * （`crucible_py_wsgi_app_locked` 的 import/runpy/os.stat），CPython 会在这些调用里
+     * **释放 GIL**；此刻另一个线程可以拿到 GIL，然后为「app 加载」去等 g_py_lock ——
+     * 持锁者等 GIL、持 GIL 者等锁 = ABBA 死锁。实测（2026-10-09，冷启动、同一 app）：
+     * 3 个并发带 `.env` 的 `/wsgi-a/` 请求即把服务器永久卡死（两个池线程死锁持 Slot，
+     * env 锁的 active 组永不归零 ⇒ 所有走进程 env 的引擎一起停滞；lock-free 的
+     * cgi/cgi_script 仍可用）。锁序统一后等待关系不成环。
+     *
+     * 锁内仍只做 env 同步 + 应用加载/缓存，随即释放；应用本体在锁外（只持 GIL）执行 ——
+     * 应用回调本服务器时不会自锁（CPython 在阻塞 I/O 期间释放 GIL）。 */
+    pthread_mutex_lock(&g_py_lock);
     gil = g_py.gil_ensure();
     we_gil = 1;
     /* 带 .env 的请求才同步（env_dirty）——它同时建好「请求前状态」恢复表，请求结束
@@ -1026,7 +1061,6 @@ static int crucible_py_wsgi_request(const char *label, const char *script,
         restore = g_py.dict_new();
         crucible_py_sync_environ_locked(restore);
     }
-    pthread_mutex_lock(&g_py_lock);
     if (crucible_py_wsgi_app_locked(script, errbuf, sizeof(errbuf)) != 0) {
         pthread_mutex_unlock(&g_py_lock);
         rc = crucible_py_fail(out, "%s: %s", label, errbuf);

@@ -2,7 +2,7 @@
 """accept-verify.py — 工号 1009 黑盒验收套件（HTTP/1.x + HTTP/2 + 静态 + 上传 +
 autoindex + header 改写 + 限流 + ACL + 重定向 + 代理 + 应用引擎 + DNS 面板 + Admin API）。
 
-前提：先 `sh scripts/accept-verify-start.sh` 起实例（端口块 26000+），
+前提：先 `sh scripts/accept-verify-start.sh` 起实例（端口块 28000+），
 并 `python3 scripts/accept-verify-upstream.py &` 起本机上游。
 本脚本只做黑盒请求，不修任何东西。
 
@@ -13,23 +13,23 @@ import sys, os, json, socket, ssl, subprocess, time, re, base64, argparse
 
 REPO = "/home/dev123/crucible-git"
 HOST = "127.0.0.1"
-PLAIN = 26081     # h1+h2c 静态（qmux 明文）
-APPS = 26095      # 应用引擎
-TLS12 = 26445
-TLS13 = 26446
-PROD = 26443      # h1+h2+h3 + TLS + autoindex upload
-DOH = 26444
-ADV = 26090       # proxy + page_rules
-RATE = 26091
-AUTH = 26092
-IPACC = 26093
-UP = 26094        # upload + autoindex + 目录 301
-UPSTREAM = 26099
-TLSIP = 26096     # TLS + per-listener ip_access（扩展面）
-H3IP = 26097      # h1+h2+h3 + per-listener ip_access（扩展面）
+PLAIN = 28081     # h1+h2c 静态（qmux 明文）
+APPS = 28095      # 应用引擎
+TLS12 = 28445
+TLS13 = 28446
+PROD = 28443      # h1+h2+h3 + TLS + autoindex upload
+DOH = 28444
+ADV = 28090       # proxy + page_rules
+RATE = 28091
+AUTH = 28092
+IPACC = 28093
+UP = 28094        # upload + autoindex + 目录 301
+UPSTREAM = 28099
+TLSIP = 28096     # TLS + per-listener ip_access（扩展面）
+H3IP = 28097      # h1+h2+h3 + per-listener ip_access（扩展面）
 
 ADMIN = ("admin", "admin")
-TMP = "/home/dev123/scratch-verify2/tmp"
+TMP = "/home/dev123/scratch-verify3b/tmp"
 os.makedirs(TMP, exist_ok=True)
 
 RESULTS = []          # dict: area,name,status(PASS/FAIL/SKIP),severity,expected,observed,repro
@@ -146,7 +146,7 @@ def raw_h1(port, payload, read_timeout=5, maxread=65536):
 
 # ───────────────────────── 静态 / HTTP 语义 ─────────────────────────
 def test_static():
-    area("静态文件 / HTTP 语义 (h1 :26081)")
+    area("静态文件 / HTTP 语义 (h1 :28081)")
     c, h, b, _ = curl(port=PLAIN, path="/")
     rec("GET / → 200", c == 200, 200, c, f"curl -s http://127.0.0.1:{PLAIN}/")
     rec("Content-Length 存在且等于 body", h.get("content-length") == str(len(b)),
@@ -157,12 +157,12 @@ def test_static():
     # HTTP/1.0
     r = raw_h1(PLAIN, b"GET / HTTP/1.0\r\n\r\n")
     rec("HTTP/1.0 GET / 无 Host → 200", r.startswith(b"HTTP/1.0 200") or r.startswith(b"HTTP/1.1 200"),
-        "200", r.split(b"\r\n")[0][:40], "printf 'GET / HTTP/1.0\\r\\n\\r\\n' | nc 127.0.0.1 26081")
+        "200", r.split(b"\r\n")[0][:40], "printf 'GET / HTTP/1.0\\r\\n\\r\\n' | nc 127.0.0.1 28081")
 
     # HTTP/1.1 缺 Host → 400
     r = raw_h1(PLAIN, b"GET / HTTP/1.1\r\n\r\n")
     rec("HTTP/1.1 缺 Host → 400", b" 400" in r.split(b"\r\n")[0], "400", r.split(b"\r\n")[0][:40],
-        "printf 'GET / HTTP/1.1\\r\\n\\r\\n' | nc 127.0.0.1 26081", sev="P1", owner="h1")
+        "printf 'GET / HTTP/1.1\\r\\n\\r\\n' | nc 127.0.0.1 28081", sev="P1", owner="h1")
 
     # 目录无尾斜杠 → 301 且 Location 以 / 结尾
     c, h, b, _ = curl(port=UP, path="/sub")
@@ -227,7 +227,7 @@ def test_static():
 
 # ───────────────────────── HTTP/2 ─────────────────────────
 def test_h2():
-    area("HTTP/2 (h2c :26081 / TLS h2 :26443)")
+    area("HTTP/2 (h2c :28081 / TLS h2 :28443)")
     c, h, b, raw = curl(port=PLAIN, path="/", http2=True)
     rec("h2c GET / → 200", c == 200, 200, c, f"curl --http2-prior-knowledge http://127.0.0.1:{PLAIN}/",
         sev="P0", owner="h2h3")
@@ -259,7 +259,7 @@ def test_h2():
 
 # ───────────────────────── TLS ─────────────────────────
 def test_tls():
-    area("TLS (:26445 TLS1.2 / :26446 TLS1.3 / :26443)")
+    area("TLS (:28445 TLS1.2 / :28446 TLS1.3 / :28443)")
     c, h, b, raw = curl(port=TLS13, path="/", scheme="https")
     rec("TLS1.3 listener 200", c == 200, 200, c)
     # 版本协商：23446 prefer 1.3
@@ -294,7 +294,7 @@ def test_tls():
 
 # ───────────────────────── 上传 / 断点续传 ─────────────────────────
 def test_upload():
-    area("上传 / 断点续传 (:26094 PUT/PATCH)")
+    area("上传 / 断点续传 (:28094 PUT/PATCH)")
     name = f"/accept-{int(time.time())}.txt"
     payload = "hello-crucible-upload"
     c, h, b, _ = curl(port=UP, path=name, method="PUT", data=payload,
@@ -352,7 +352,7 @@ def test_upload():
 
 # ───────────────────────── header 改写 / 页面规则 / 代理 ─────────────────────────
 def test_adv():
-    area("页面规则 / 代理 / header 改写 (:26090)")
+    area("页面规则 / 代理 / header 改写 (:28090)")
     # rewrite /old/* → /new （rewrite_path 把 /old/<x> 映射为 /new/<x>）
     c, h, b, _ = curl(port=ADV, path="/old/index.html")
     rec("page_rule rewrite /old/* → /new", c == 200 and b"new content" in b,
@@ -409,7 +409,7 @@ def test_adv():
 
 # ───────────────────────── 限流 / ACL ─────────────────────────
 def test_acl():
-    area("限流 / ACL / basic auth (:26091/:26092/:26093)")
+    area("限流 / ACL / basic auth (:28091/:28092/:28093)")
     # rate limit
     codes = []
     for _ in range(15):
@@ -429,12 +429,12 @@ def test_acl():
     c, h, b, _ = curl(port=IPACC, path="/")
     rec("per-listener ip_access allow=[10/8] 拒 127.0.0.1", c == 403,
         "403 forbidden", c, sev="P1", owner="core",
-        repro=f"config [[listeners]] port=26093 [listeners.ip_access] allow=[10.0.0.0/8]; curl http://127.0.0.1:{IPACC}/")
+        repro=f"config [[listeners]] port=28093 [listeners.ip_access] allow=[10.0.0.0/8]; curl http://127.0.0.1:{IPACC}/")
 
 
 # ───────────────────────── 重定向 / HSTS ─────────────────────────
 def test_redirect_hsts():
-    area("重定向 / HSTS (:26445 port_reuse)")
+    area("重定向 / HSTS (:28445 port_reuse)")
     # 明文打到「port_reuse 且无 TLS 兄弟」的 listener 才应 301 到 https（config-test 无此形态，
     # 23445 有 TLS 兄弟 → 明文请求非 301 属正常，跳过）。open-redirect 用 Host 探测。
     # HSTS 头
@@ -470,7 +470,7 @@ def _recv_head(sock, timeout=8):
 
 
 def test_static_ext():
-    area("扩展·静态语义 (h1 :26090 / h1+h2c :26081)")
+    area("扩展·静态语义 (h1 :28090 / h1+h2c :28081)")
     # 符号链接索引绕过：symout/index.html -> docroot 外（应拒），symin/index.html -> 内（应服务）
     c, h, b, _ = curl(port=ADV, path="/symout/")
     rec("符号链接索引指向 docroot 外 → 拒绝", c in (403, 404) and b"OUTSIDE-SECRET" not in b,
@@ -489,7 +489,7 @@ def test_static_ext():
         import os as _os
         tmp = os.path.join(TMP, "etag.new")
         open(tmp, "w").write("etag-body-1")          # 同内容
-        _os.replace(tmp, "/home/dev123/scratch-verify2/www-adv/etag.txt")
+        _os.replace(tmp, "/home/dev123/scratch-verify3b/www-adv/etag.txt")
         replaced = True
         c2, h2, b2, _ = curl(port=ADV, path="/etag.txt")
         etag2 = h2.get("etag")
@@ -552,7 +552,7 @@ def test_static_ext():
 
 
 def test_upload_ext():
-    area("扩展·上传语义 (:26094)")
+    area("扩展·上传语义 (:28094)")
     # percent-decode：PUT /pct%2ddecode.txt → 落盘为 pct-decode.txt
     c, h, b, _ = curl(port=UP, path="/pct%2ddecode.txt", method="PUT", data="pct-ok")
     c2, h2, b2, _ = curl(port=UP, path="/pct-decode.txt")
@@ -601,7 +601,7 @@ def test_upload_ext():
 
 
 def test_request_smuggling():
-    area("扩展·请求定界 (h1 :26094)")
+    area("扩展·请求定界 (h1 :28094)")
     # Content-Length + Transfer-Encoding 同时出现 → 400（走私防御）
     payload = (f"PUT /smug1.txt HTTP/1.1\r\nHost: 127.0.0.1:{UP}\r\n"
                "Content-Length: 5\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nHELLO\r\n0\r\n\r\n")
@@ -643,7 +643,7 @@ def test_request_smuggling():
 
 def test_h2_authority():
     area("扩展·h2c/h3 authority 校验")
-    # h2c 明文（PLAIN 26081）：非法 Host → 400
+    # h2c 明文（PLAIN 28081）：非法 Host → 400
     for hv in ["..", "_"]:
         c, h, b, _ = curl(port=PLAIN, path="/", http2=True, headers=[f"Host: {hv}"])
         rec(f"h2c 非法 Host {hv!r} → 400", c == 400, 400, c,
@@ -660,7 +660,7 @@ def test_h2_authority():
 
 
 def test_proxy_ext():
-    area("扩展·代理错误映射 (:26090)")
+    area("扩展·代理错误映射 (:28090)")
     c, h, b, _ = curl(port=ADV, path="/dead/x", timeout=8)
     body = b.decode("latin1", "replace")
     leak = ("/home/dev123" in body) or ("crucible-git" in body) or ("/src/" in body)
@@ -694,7 +694,7 @@ def test_proxy_ext():
 
 
 def test_metrics():
-    area("扩展·/__metrics 鉴权 (:26095)")
+    area("扩展·/__metrics 鉴权 (:28095)")
     p = subprocess.run(["curl", "-sS", "--max-time", "8", "-o", "/dev/null", "-w", "%{http_code}",
                         f"http://{HOST}:{APPS}/__metrics"], capture_output=True)
     anon = p.stdout.decode().strip()
@@ -706,7 +706,7 @@ def test_metrics():
 
 
 def test_rule_order():
-    area("扩展·规则/限流组合顺序 (:26091)")
+    area("扩展·规则/限流组合顺序 (:28091)")
     # 限流窗口内：页面规则生效（block → 403；redirect → 301）
     time.sleep(1.5)  # 让令牌桶回满
     c, h, b, _ = curl(port=RATE, path="/blocked", timeout=4)
@@ -766,7 +766,7 @@ ENV_SKIP = {
 
 
 def test_apps():
-    area("应用引擎 (:26095)")
+    area("应用引擎 (:28095)")
     for path, slug, label in ENGINES:
         c, h, b, _ = curl(port=APPS, path=path + "/", timeout=20)
         body = b.decode("latin1", "replace")
@@ -800,7 +800,7 @@ def admin_req(method, sub, port=APPS, data=None, ct="application/json", auth=ADM
 
 
 def test_admin():
-    area("Admin API (:26095 /__admin)")
+    area("Admin API (:28095 /__admin)")
     # 无凭据
     p = subprocess.run(["curl", "-sS", "--max-time", "8", "-o", "/dev/null", "-w", "%{http_code}",
                         f"http://{HOST}:{APPS}/__admin/api/overview"], capture_output=True)
@@ -866,7 +866,7 @@ def test_admin():
 
 # ───────────────────────── DNS 面板 / DoH ─────────────────────────
 def test_dns():
-    area("DNS 面板 API / DoH (:26095 /__admin/api/dns)")
+    area("DNS 面板 API / DoH (:28095 /__admin/api/dns)")
     out, _ = admin_req("GET", "/api/dns/status")
     named_missing = '"named_running":false' in out.replace(" ", "")
     rec("dns status 可读", out.strip().startswith("{"), "JSON", out[:80], sev="P1", owner="dns")
@@ -896,7 +896,7 @@ def test_dns():
 
 def test_listeners():
     area("Listener 绑定 / 双栈 / H3 端点")
-    log = "/home/dev123/scratch-verify2/logs/webserver.log"
+    log = "/home/dev123/scratch-verify3b/logs/webserver.log"
     try:
         txt = open(log, encoding="utf-8", errors="replace").read()
     except Exception:
@@ -906,28 +906,28 @@ def test_listeners():
         "EADDRINUSE [::] (IPV6_V6ONLY 未设)" if bad_v6 else "ok",
         "config [[listeners]] address_v6=\"::\" + address=\"0.0.0.0\"; 启动日志出现 '有地址未能绑定: bind [::]:PORT: Address already in use'",
         sev="P1", owner="core")
-    # h3 UDP 端点（config 26443 http_versions 含 h3）
+    # h3 UDP 端点（config 28443 http_versions 含 h3）
     try:
         p = subprocess.run(["ss", "-lun"], capture_output=True, timeout=5)
         udp = p.stdout.decode()
     except Exception:
         udp = ""
-    h3_up = ":26443" in udp
-    rec("h3/QUIC UDP 端点已绑定 (26443)", h3_up, "ss -lun 有 :26443",
+    h3_up = ":28443" in udp
+    rec("h3/QUIC UDP 端点已绑定 (28443)", h3_up, "ss -lun 有 :28443",
         "bound" if h3_up else "no UDP socket",
-        "config 26443 http_versions=[h1,h2,h3]; ss -lun | grep 26443",
+        "config 28443 http_versions=[h1,h2,h3]; ss -lun | grep 28443",
         sev="P1", owner="h2h3")
 
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--json", default="/home/dev123/scratch-verify2/accept-results.json")
+    ap.add_argument("--json", default="/home/dev123/scratch-verify3b/accept-results.json")
     args = ap.parse_args()
 
     # 先确认实例活着
     c, _, _, _ = curl(port=PLAIN, path="/")
     if c is None:
-        print("FATAL: instance not up on 26081; run scripts/accept-verify-start.sh first")
+        print("FATAL: instance not up on 28081; run scripts/accept-verify-start.sh first")
         sys.exit(2)
 
     test_static()

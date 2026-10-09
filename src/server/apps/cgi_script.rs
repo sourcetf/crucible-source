@@ -45,6 +45,86 @@ fn kill_and_reap(child: &mut std::process::Child, pgid: i32, done: &AtomicBool) 
 /// 旧实现这三样都缺 —— 与 `cgi` 引擎（libapp_cgi.so，走 ABI headers + env_lock）行为分叉：
 /// 同一个 CGI 脚本在 `engine="cgi"` 下能读到 `HTTP_HOST`/`CONTENT_TYPE`/`.env`，在
 /// `engine="cgi_script"` 下全是空。
+/// 把「应用内相对请求路径」切成 **脚本 URL 路径** 与 **PATH_INFO**（CGI/1.1 §4.1.13/§4.1.5）。
+///
+/// 与 nginx/Apache 的 PATH_INFO 解析同一套：从**最长**前缀开始，`docroot/<前缀>` 是常规
+/// 文件的前缀就是脚本，其后剩余（必须以 `/` 开头或为空）是 PATH_INFO。
+///   * `/index.cgi`               → (`/index.cgi`, "")
+///   * `/index.cgi/extra/path`    → (`/index.cgi`, "/extra/path")
+///   * 无任何前缀成文件（含 `..`/隐藏段等被 `safe_join` 拒绝的形态）→ `None`（调用方 404）。
+///
+/// 目录请求的 index 回落由 `rel_script_path` 在此之前完成（`/cgis/` → `/index.cgi`）。
+fn split_path_info(docroot: &Path, rel: &str) -> Option<(String, String)> {
+    // 与旧实现同一条防穿越口径：`safe_join` 会拒 `..`/绝对路径/反斜杠/隐藏段。旧实现把
+    // **整条** rel 交给 safe_join 判一次；这里逐前缀判，故只要 rel 里出现 `..` 段就整体
+    // 拒绝（不在「PATH_INFO 里夹 `..`」上开新口子）。
+    if rel.split(['/', '\\']).any(|seg| seg == "..") {
+        return None;
+    }
+    let rel = if rel.starts_with('/') {
+        rel.to_string()
+    } else {
+        format!("/{rel}")
+    };
+    let mut end = rel.len();
+    while end > 0 {
+        let cand = &rel[..end];
+        if let Ok(p) = script_rel(docroot, cand.trim_start_matches('/')) {
+            if p.is_file() {
+                return Some((cand.to_string(), rel[end..].to_string()));
+            }
+        }
+        match rel[..end].rfind('/') {
+            Some(i) => end = i,
+            None => break,
+        }
+    }
+    None
+}
+
+/// 命中的**应用前缀**（`paths` 里最长匹配、尾斜杠已归一化）。catch-all（`paths` 为空或
+/// 不匹配）时为 `""`（此时脚本 URL 就是请求路径本身）。
+fn matched_app_prefix<'a>(app: &'a AppRouteConfig, path: &str) -> &'a str {
+    let mut best: Option<&str> = None;
+    for p in &app.paths {
+        let p = p.trim_end_matches('/');
+        if p.is_empty() {
+            continue;
+        }
+        if path == p || path.starts_with(&format!("{p}/")) {
+            if best.is_none_or(|b| p.len() > b.len()) {
+                best = Some(p);
+            }
+        }
+    }
+    best.unwrap_or("")
+}
+
+/// cgi_script 请求的脚本解析（h1 与 h2/h3 两条分发路径共用，保证跨协议同口径）：
+/// 返回 `(docroot 下的脚本绝对路径, SCRIPT_NAME, PATH_INFO)`。
+pub(crate) fn resolve_target(
+    lc: &ListenerConfig,
+    app: &AppRouteConfig,
+    path: &str,
+) -> Result<(std::path::PathBuf, String, String)> {
+    let docroot = app.docroot.clone().unwrap_or_else(|| lc.root.clone());
+    let rel = crate::server::apps::app_ffi::rel_script_path(app, path);
+    let (script_url_rel, path_info) = split_path_info(&docroot, &rel).ok_or_else(|| {
+        anyhow::anyhow!(
+            "cgi_script: script not found {}",
+            script_rel(&docroot, rel.trim_start_matches('/'))
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|_| rel.clone())
+        )
+    })?;
+    let script = script_rel(&docroot, script_url_rel.trim_start_matches('/'))
+        .context("cgi_script script path")?;
+    // CGI/1.1 §4.1.13：`SCRIPT_NAME` 是标识脚本的 **URI 路径**（如 `/cgis/index.cgi`），
+    // 不是脚本的文件系统路径。应用前缀（`paths`）+ 应用内脚本相对路径。
+    let script_name = format!("{}{}", matched_app_prefix(app, path), script_url_rel);
+    Ok((script, script_name, path_info))
+}
+
 pub async fn execute_binary(
     binary: &Path,
     method: &Method,
@@ -53,20 +133,18 @@ pub async fn execute_binary(
     body: Bytes,
     env_vars: &[(String, String)],
     lc: &ListenerConfig,
-    app: &AppRouteConfig,
     peer: SocketAddr,
+    script_name: String,
+    path_info: String,
 ) -> Result<Response<BoxBody>> {
-    let path = uri.path();
     let query = uri.query().unwrap_or("");
-    let docroot = app.docroot.clone().unwrap_or_else(|| lc.root.clone());
-    let script_name = script_rel(&docroot, path.trim_start_matches('/'))
-        .map_err(|e| anyhow::anyhow!("cgi script path rejected: {e:#}"))?;
+    // `SCRIPT_NAME`/`PATH_INFO` 由 [`resolve_target`] 解析后显式传入（h1 与 h2/h3 共用）。
     let port = lc.port;
     let server_name = lc.server_name.clone().unwrap_or_else(|| "localhost".into());
     let bin = binary.to_path_buf();
+    let script_filename = binary.display().to_string();
     let method = method.as_str().to_string();
     let query = query.to_string();
-    let path_info = path.to_string();
     let peer_s = peer.ip().to_string();
     // 请求头 + authority + .env 一并搬进阻塞任务（HeaderMap 是 Send+Sync，克隆开销小）。
     let headers = headers.clone();
@@ -75,6 +153,12 @@ pub async fn execute_binary(
 
     let raw = task::spawn_blocking(move || -> Result<Vec<u8>> {
         let mut cmd = Command::new(&bin);
+        // **干净环境**：先 `env_clear()` 再铺「启动期基底 + 本请求 `.env`」，最后下面用
+        // `.env()` 覆盖 CGI 变量。这样并发请求正在生效的临时 `.env`（进程 env 里的临时值）
+        // 绝不会被这个 CGI 子进程继承 —— 于是本引擎**无需**参与 `env_lock` 的进程 env 互斥，
+        // 一个慢的空请求也就不会挡住随后带 `.env` 的请求（见 env_lock 的说明）。
+        // 旧实现直接继承 `environ`（Command 默认），会把别的请求的 `.env` 一起带走。
+        crate::server::apps::env_lock::apply_clean_env(&mut cmd, &env_vars);
         cmd.stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
@@ -82,8 +166,8 @@ pub async fn execute_binary(
             .env("REQUEST_METHOD", &method)
             .env("PATH_INFO", &path_info)
             .env("QUERY_STRING", &query)
-            .env("SCRIPT_FILENAME", script_name.display().to_string())
-            .env("SCRIPT_NAME", script_name.display().to_string())
+            .env("SCRIPT_FILENAME", &script_filename)
+            .env("SCRIPT_NAME", &script_name)
             .env("REMOTE_ADDR", &peer_s)
             .env("SERVER_NAME", &server_name)
             .env("SERVER_PROTOCOL", "HTTP/1.1")
@@ -121,10 +205,8 @@ pub async fn execute_binary(
         {
             cmd.env("CONTENT_TYPE", ct);
         }
-        // .env（deps）变量：与 cgi/其它引擎一致并入 CGI 环境。
-        for (k, v) in &env_vars {
-            cmd.env(k, v);
-        }
+        // .env（deps）变量已由上面的 `apply_clean_env` 铺进子进程环境；这里不再重复
+        // `cmd.env` —— 否则应用 `.env` 里的同名键会覆盖上面的 CGI 变量（CGI 变量才是权威）。
         // 让脚本与**它的子进程**同属一个新进程组（组长 = 子进程 pid）。看门狗要杀的
         // 是**整组**而不是单个进程：`#!/bin/sh` 脚本里起 `sleep`/`cat` 这类子命令时，
         // 杀 shell 并不会杀掉孙进程，而孙进程**继承了 stdout 管道** ⇒ 我们这端永远等不到
@@ -231,17 +313,9 @@ pub async fn handle(
         .await
         .map_err(|e| anyhow::anyhow!("cgi_script: 请求体超出 {} 字节上限: {e}", crate::server::h1::APP_BODY_CAP))?
         .to_bytes();
-    let docroot = app.docroot.clone().unwrap_or_else(|| lc.root.clone());
-    // **必须剥离应用的 `paths` 前缀**（与 `app_ffi` 同一条路径）：应用配了
-    // `paths = ["/cs"]`、脚本在 `docroot/slow.cgi` 时，裸用 `uri.path()` 会去找
-    // `docroot/cs/slow.cgi` —— 必然「script not found」，于是 `cgi_script` 根本无法
-    // 与 `paths` 一起使用（实测复现）。`rel_script_path` 同时也负责目录请求回落到 index。
-    let rel = crate::server::apps::app_ffi::rel_script_path(app, parts.uri.path());
-    let script = script_rel(&docroot, rel.trim_start_matches('/'))
-        .context("cgi_script script path")?;
-    if !script.is_file() {
-        bail!("cgi_script: script not found {}", script.display());
-    }
+    // 脚本解析（剥应用前缀 → 最长「已存在文件」前缀定界 → PATH_INFO）与 h2/h3 的
+    // `apps::cgi_script_simple` 共用 [`resolve_target`]，保证跨协议同口径。
+    let (script, script_name, path_info) = resolve_target(lc, app, parts.uri.path())?;
     // .env（deps）变量随请求 extensions 下发（try_handle 注入），与 cgi 引擎一致并入脚本环境。
     let env_vars = parts
         .extensions
@@ -256,8 +330,9 @@ pub async fn handle(
         body_bytes,
         &env_vars,
         lc,
-        app,
         peer,
+        script_name,
+        path_info,
     )
     .await
 }
@@ -340,5 +415,71 @@ mod tests {
     fn parse_plain_body() {
         let r = parse_cgi_response(b"hello\n".to_vec()).unwrap();
         assert_eq!(r.status(), StatusCode::OK);
+    }
+
+    fn app_with_paths(paths: &[&str]) -> AppRouteConfig {
+        AppRouteConfig {
+            paths: paths.iter().map(|s| s.to_string()).collect(),
+            enabled: true,
+            engine: "cgi_script".into(),
+            socket: None,
+            extensions: vec!["cgi".into(), "".into()],
+            index: Some("index.cgi".into()),
+            php_bin: None,
+            workers: 1,
+            source_dir: None,
+            out_dir: None,
+            entry: vec![],
+            watch: false,
+            docroot: None,
+            lib: None,
+            deps_dir: None,
+            init_timeout_secs: None,
+            libc: None,
+        }
+    }
+
+    /// CGI/1.1 §4.1.13：`/cgis/index.cgi` → SCRIPT_NAME=/cgis/index.cgi、PATH_INFO=""；
+    /// `/cgis/index.cgi/extra/path` → PATH_INFO=/extra/path（本波修复点；旧实现在第二种
+    /// 形态上直接 404「script not found」，且 SCRIPT_NAME 是**文件系统路径**）。
+    #[test]
+    fn split_path_info_defines_script_and_tail() {
+        let dir = std::env::temp_dir().join(format!(
+            "crucible-cgis-ut-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("sub")).unwrap();
+        std::fs::write(dir.join("index.cgi"), b"#!/bin/sh\n").unwrap();
+        std::fs::write(dir.join("sub/run.cgi"), b"#!/bin/sh\n").unwrap();
+        assert_eq!(
+            split_path_info(&dir, "/index.cgi"),
+            Some(("/index.cgi".to_string(), String::new()))
+        );
+        assert_eq!(
+            split_path_info(&dir, "/index.cgi/extra/path"),
+            Some(("/index.cgi".to_string(), "/extra/path".to_string()))
+        );
+        // 子目录脚本 + 尾部
+        assert_eq!(
+            split_path_info(&dir, "/sub/run.cgi/a"),
+            Some(("/sub/run.cgi".to_string(), "/a".to_string()))
+        );
+        // 无任何前缀是文件 → None（调用方 404）
+        assert_eq!(split_path_info(&dir, "/nope.cgi"), None);
+        assert_eq!(split_path_info(&dir, "/index.cgi/../etc/passwd"), None, "`..` 整条拒绝");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 应用前缀取**最长**匹配（配置同时有 `/a` 与 `/a/b` 时不许错认），catch-all → 空前缀。
+    #[test]
+    fn matched_app_prefix_takes_longest() {
+        let app = app_with_paths(&["/a", "/a/b/"]);
+        assert_eq!(matched_app_prefix(&app, "/a/b/index.cgi"), "/a/b");
+        assert_eq!(matched_app_prefix(&app, "/a/index.cgi"), "/a");
+        assert_eq!(matched_app_prefix(&app, "/ax/index.cgi"), "");
+        let catch_all = app_with_paths(&[]);
+        assert_eq!(matched_app_prefix(&catch_all, "/cgis/index.cgi"), "");
     }
 }

@@ -365,16 +365,8 @@ async fn handle_inner(
                 }
             }
             p if p.ends_with("/api/dns/acme/issue") => {
-                let c = dc.acme.clone();
-                let r = tokio::task::spawn_blocking(move || {
-                    // 复用 issue_if_missing（有证书且未到期则 no-op）
-                    acme::cert_valid(&acme::cert_path(&c.domain));
-                    c
-                })
-                .await
-                .map_err(|e| e.to_string())?;
-                let _ = r;
-                // 真正的签发是阻塞外部工具调用，走 blocking
+                // 真正的签发是阻塞外部工具调用，走 blocking；与续期循环共用 issue_now
+                // （同一 CA/参数/互斥锁，证书未到期时 no-op）。
                 let c2 = dc.acme.clone();
                 let issued = tokio::task::spawn_blocking(move || acme_issue(&c2))
                     .await
@@ -655,38 +647,18 @@ fn status_json(dc: &DnsConfig) -> Result<Value, String> {
 
 
 /// 手动触发签发（admin POST /api/dns/acme/issue）。
+///
+/// 走 `acme::issue_now` —— 与自动续期循环**完全同一条路径**：同样的 CA/参数
+/// （acme.sh `--server letsencrypt` + `--keylength ec-256`，不带 `--force`）、同样的
+/// 工具链探测顺序（acme.sh 用户目录/`/usr/local` → acme-client → certbot）、同样的
+/// 安装确认（`ensure_installed`）。旧实现自己拼了一条 acme.sh 命令：只认
+/// `/usr/local/bin/acme.sh`、缺 `--server`（acme.sh 默认 CA 已是 ZeroSSL，与续期循环
+/// 的 Let's Encrypt 不是同一个 CA）、缺 `--keylength ec-256`（签出 RSA，与续期循环的
+/// ECC 不一致），还固定带 `--force`（面板可被反复点击刷 CA 限额）——面板签出的证书
+/// 与续期循环签出的可能**不是同一 CA/同一密钥类型**，换个环境还会「面板回 ok、其实没
+/// 有可用客户端」。统一入口后两边逐字节一致。
 fn acme_issue(c: &crate::server::dns::acme::AcmeCfg) -> Result<(), String> {
-    use std::process::Command;
-    // 与 acme::startup 相同的探测逻辑；这里同步执行并把错误回传面板
-    let domain = crate::server::dns::acme::safe_domain_segment(&c.domain)
-        .ok_or_else(|| format!("unsafe domain {:?}", c.domain))?
-        .to_string();
-    let webroot = c
-        .webroot
-        .clone()
-        .unwrap_or_else(|| crate::server::dns::acme::acme_root().join("www").display().to_string());
-    let out_dir = crate::server::dns::acme::acme_root().join(&domain);
-    std::fs::create_dir_all(&out_dir).map_err(|e| e.to_string())?;
-    for bin in ["/usr/local/bin/acme.sh"] {
-        if std::path::Path::new(bin).is_file() {
-            let st = Command::new(bin)
-                .arg("--issue")
-                .arg("-d").arg(&domain)
-                .arg("--webroot").arg(&webroot)
-                .arg("-m").arg(&c.email)
-                .arg("--force")
-                .status();
-            if st.map(|x| x.success()).unwrap_or(false) {
-                // `--issue` 只签不装：acme.sh 把产物留在 ~/.acme.sh/<domain>_ecc/，而 DoT
-                // 读的是 state/dns/acme/<domain>/fullchain.pem ⇒ 不装就等于「面板回 ok、
-                // 证书其实没到位」（DoT 静默回落 cert.pem/key.pem）。与 acme::issue 共用
-                // 同一个安装步骤，并确认文件真的落盘。
-                return crate::server::dns::acme::install_acme_sh(bin, &domain, &out_dir)
-                    .map_err(|e| e.to_string());
-            }
-        }
-    }
-    Err("no acme client (acme.sh/acme-client/certbot) — 请手动放置证书或安装工具".into())
+    crate::server::dns::acme::issue_now(c).map_err(|e| format!("{e:#}"))
 }
 
 /// `GET /api/dns/zones/export?name=<zone>` —— 按 RFC1035 导出单个分区（.zone 下载）。

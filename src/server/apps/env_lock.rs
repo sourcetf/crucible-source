@@ -106,6 +106,76 @@ static INNER: Lazy<Mutex<Inner>> = Lazy::new(|| {
 });
 static ENV_IDLE: Lazy<Condvar> = Lazy::new(Condvar::new);
 
+/// 启动期进程环境快照（**不含任何请求期临时 `.env`**）。
+///
+/// # 为什么需要它（这是「慢空请求挡住带 .env 请求」的根治面）
+///
+/// 进程 env 只有一个：临时把某个请求的 `.env` 装进去的那段时间，任何**继承 `environ`**
+/// 的子进程（cgi/cgi_script 的 fork+exec）都会把别人的 `.env` 一起继承走 —— 所以那些引擎
+/// 必须参与本模块的「至多一组 active」互斥；而互斥意味着一个慢的**空**请求会挡住随后
+/// 带 `.env` 的请求（sec2-wave5 的诚实边界，实测 4.7s）。
+///
+/// 让 spawn 类引擎改用「**启动期基底 + 本请求 `.env`**」构造子进程环境（`env_clear()` 后
+/// 逐条设置），子进程就既拿到运维环境、又**不可能**继承别的请求的临时值 —— 于是它们
+/// 完全无需参与互斥，慢请求自然不再挡住别人。C 侧（cgi 引擎）经 `appengine_set_base_env`
+/// 拿到同一份基底；Rust 侧（cgi_script）经 [`apply_clean_env`] 使用。
+static BASE_ENV: Lazy<Mutex<Option<Vec<(OsString, OsString)>>>> = Lazy::new(|| Mutex::new(None));
+
+/// 在**任何请求期 `.env` 安装之前**调用一次：把运维环境快照为 spawn 类引擎的干净基底。
+/// 幂等；未调用时首次访问会惰性快照（此时可能已含某请求的临时值 —— 故服务启动期应显式调用）。
+pub fn init_base_env() {
+    let mut g = BASE_ENV.lock();
+    if g.is_none() {
+        *g = Some(std::env::vars_os().collect());
+    }
+}
+
+/// 启动期基底环境（惰性快照的副本）。
+pub fn base_env() -> Vec<(OsString, OsString)> {
+    let mut g = BASE_ENV.lock();
+    if g.is_none() {
+        *g = Some(std::env::vars_os().collect());
+        log::debug!("env_lock: 惰性快照启动期基底环境（服务启动期应显式 init_base_env）");
+    }
+    g.as_ref().cloned().unwrap_or_default()
+}
+
+/// 用「启动期基底 + 本请求 `.env`」构造一个**干净**的子进程环境：先 `env_clear()` 再逐条
+/// 设置。这样并发请求正在生效的临时 `.env`（进程 env 里的临时值）**绝不会**被继承。
+///
+/// 语义：本请求 `.env` 覆盖同名基底键（后写胜出）；调用方随后可用 `cmd.env(...)` 追加
+/// 引擎专属变量（CGI 变量等），它们同样覆盖同名键。
+pub fn apply_clean_env(cmd: &mut std::process::Command, vars: &[(String, String)]) {
+    cmd.env_clear();
+    for (k, v) in base_env() {
+        cmd.env(k, v);
+    }
+    for (k, v) in vars {
+        cmd.env(k, v);
+    }
+}
+
+/// 把启动期基底环境编码为 C 侧 `appengine_set_base_env` 需要的块：
+/// `K=V\0K=V\0…\0`（双 NUL 结尾）。键含 `=`/NUL 或值含 NUL 的项跳过（与 `setenv` 语义一致）。
+#[cfg(unix)]
+pub fn base_env_block() -> Vec<u8> {
+    use std::os::unix::ffi::OsStrExt;
+    let mut out = Vec::new();
+    for (k, v) in base_env() {
+        let kb = k.as_bytes();
+        let vb = v.as_bytes();
+        if kb.is_empty() || kb.contains(&b'=') || kb.contains(&0) || vb.contains(&0) {
+            continue;
+        }
+        out.extend_from_slice(kb);
+        out.push(b'=');
+        out.extend_from_slice(vb);
+        out.push(0);
+    }
+    out.push(0);
+    out
+}
+
 /// 「本次调用可以依赖当前生效的临时环境」的凭证。
 ///
 /// 递减读者数，并在**最后一个离开者**那里恢复环境。用 `Drop` 而不是 `f()` 之后顺序恢复，

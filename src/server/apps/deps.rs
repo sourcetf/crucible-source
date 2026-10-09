@@ -409,6 +409,7 @@ mod tests {
             quic_ecn: false,
             qmux: false,
             connect_udp: false,
+            access_log: None,
         }
     }
 

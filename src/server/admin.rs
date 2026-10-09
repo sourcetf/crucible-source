@@ -514,6 +514,62 @@ async fn handle_inner(req: Request<Full<Bytes>>, live: Arc<LiveConfig>) -> Respo
         })
         .await;
     }
+    // §16.12 每站（listener）访问日志覆盖：`[listeners.access_log]`。
+    //
+    // **字段级继承**语义（与 config.rs::ListenerAccessLogConfig 一致）：JSON 里
+    // null/缺省 = 该字段继承全局（从 listener 覆盖表里删除）；三个字段全 null ⇒
+    // 整个覆盖段删除（完全继承全局）。这样「只想改 realtime」的站点不会把 enable
+    // 悄悄重置为默认 true（全局 disable 的站点被意外打开）。
+    if path.ends_with("/api/access_log/site_save") && method == Method::POST {
+        return with_json(req, |v| {
+            let port = match json_port(&v, "port") {
+                Ok(p) => p,
+                Err(resp) => return resp,
+            };
+            let mut t = toml::map::Map::new();
+            for key in ["enable", "realtime"] {
+                match v.get(key) {
+                    None | Some(Json::Null) => {}
+                    Some(x) => {
+                        let Some(b) = x.as_bool() else {
+                            return bad_request(format!(
+                                "{key} 必须是布尔或 null（null = 继承全局）"
+                            ));
+                        };
+                        t.insert(key.into(), toml::Value::Boolean(b));
+                    }
+                }
+            }
+            match v.get("level") {
+                None | Some(Json::Null) => {}
+                Some(x) => {
+                    let Some(s) = x.as_str() else {
+                        return bad_request("level 必须是字符串或 null（null = 继承全局）");
+                    };
+                    if !["error", "warn", "info", "debug", "trace"].contains(&s) {
+                        return text_err(StatusCode::BAD_REQUEST, "invalid level");
+                    }
+                    t.insert("level".into(), toml::Value::String(s.to_string()));
+                }
+            }
+            let mut tree = match cfg_edit::load_tree(live.path()) {
+                Ok(t) => t,
+                Err(e) => return text_err(StatusCode::BAD_REQUEST, format!("{e:#}")),
+            };
+            // 空表 = 全部继承 ⇒ 删除该 listener 的 access_log 键（别留空表：面板会显示
+            // 「有覆盖」而实际全继承，磁盘状态与语义不符）。
+            let value = if t.is_empty() {
+                None
+            } else {
+                Some(toml::Value::Table(t))
+            };
+            if let Err(e) = cfg_edit::set_listener_key(&mut tree, port, "access_log", value) {
+                return text_err(StatusCode::BAD_REQUEST, format!("{e:#}"));
+            }
+            finish_write(&live, &tree, "access_log site override saved")
+        })
+        .await;
+    }
     // 规格：syncookie / telemetry / admin 全局项——TOML 可配即可面板配。
     //
     // 这三条路由曾经整段丢失（admin.rs 被替换成一份少了它们的版本，残缺副本
@@ -1751,6 +1807,20 @@ fn save_page_rules(live: &Arc<LiveConfig>, v: &Json) -> Response<BoxBody> {
         if let Some(p) = r.get("priority").and_then(|x| x.as_i64()) {
             t.insert("priority".into(), toml::Value::Integer(p));
         }
+        // §16.11 匹配维度 host/method/header：选填；空串/纯空白视为「未配置」不落盘
+        // （避免写出空字段把「不约束」变成「约束空值」——运行期声明了空 host 的规则
+        // 永远不命中）。合法性由 check_page_rule 在写盘前统一校验。
+        for key in ["host", "method", "header"] {
+            if let Some(val) = r.get(key).and_then(|x| x.as_str()) {
+                let val = val.trim();
+                if !val.is_empty() {
+                    t.insert(
+                        key.into(),
+                        toml::Value::String(crate::server::page_rules::scrub_brand(val)),
+                    );
+                }
+            }
+        }
         out.push(toml::Value::Table(t));
     }
     let mut tree = match cfg_edit::load_tree(live.path()) {
@@ -2223,6 +2293,23 @@ fn check_page_rule(rule: &Json, idx: usize) -> Result<(), String> {
             return Err(format!("rule[{idx}].priority 必须是整数（当前 {p:?}）"));
         }
     }
+    // §16.11 匹配维度 host/method/header：运行期对非法值只会「不匹配」（不会 panic），
+    // 但那意味着面板存进去的规则**永不生效**且没有任何提示 —— 保存时按运行期同一口径
+    // 拒绝。null/缺省 = 不约束；显式写了就必须能生效。
+    for (key, check) in [
+        ("host", check_page_rule_host as fn(usize, &str) -> Result<(), String>),
+        ("method", check_page_rule_method as fn(usize, &str) -> Result<(), String>),
+        ("header", check_page_rule_header as fn(usize, &str) -> Result<(), String>),
+    ] {
+        if let Some(v) = rule.get(key) {
+            if !v.is_null() {
+                let Some(s) = v.as_str() else {
+                    return Err(format!("rule[{idx}].{key} 必须是字符串（当前 {v:?}）"));
+                };
+                check(idx, s)?;
+            }
+        }
+    }
     let target = rule.get("target").and_then(|t| t.as_str()).map(str::trim);
     if let Some(t) = target {
         if !t.is_empty() {
@@ -2277,6 +2364,106 @@ fn check_page_rule(rule: &Json, idx: usize) -> Result<(), String> {
         ));
     }
     Ok(())
+}
+
+/// §16.11 host 维度校验：`*` / 精确主机名 / `*.suffix` 通配；可带端口（运行期忽略）。
+/// 与 `page_rules::host_matches` 同一口径 —— 保存时能过、运行期就能命中。
+fn check_page_rule_host(idx: usize, host: &str) -> Result<(), String> {
+    let h = host.trim();
+    if h.is_empty() {
+        return Err(format!(
+            "rule[{idx}].host 不能为空（要匹配全部主机请写 \"*\"）"
+        ));
+    }
+    if h.len() > MAX_DNS_NAME_LEN + 8 {
+        return Err(format!(
+            "rule[{idx}].host 过长（{} > {}）",
+            h.len(),
+            MAX_DNS_NAME_LEN + 8
+        ));
+    }
+    if h == "*" {
+        return Ok(());
+    }
+    let body = h.strip_prefix("*.").unwrap_or(h);
+    // 剥端口（与 host_without_port 同口径）：IPv6 字面量 `[..]` 可跟 `:port`；
+    // 无括号形态最多一个冒号且后面必须是纯数字端口 —— 否则是无效主机名。
+    let name_and_rest: (&str, &str) = if let Some(r) = body.strip_prefix('[') {
+        let Some(end) = r.find(']') else {
+            return Err(format!("rule[{idx}].host 的 IPv6 字面量缺少 ']': {host:?}"));
+        };
+        (&body[..end + 2], &r[end + 1..])
+    } else {
+        match body.rsplit_once(':') {
+            Some((n, p)) if !n.contains(':') && !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()) => {
+                (n, "")
+            }
+            Some(_) => {
+                return Err(format!(
+                    "rule[{idx}].host 不合法（冒号后必须是纯数字端口）: {host:?}"
+                ))
+            }
+            None => (body, ""),
+        }
+    };
+    let (name, rest) = name_and_rest;
+    if name.is_empty() {
+        return Err(format!("rule[{idx}].host 缺少主机名: {host:?}"));
+    }
+    if !rest.is_empty() {
+        let digits = rest.strip_prefix(':').unwrap_or(rest);
+        if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+            return Err(format!("rule[{idx}].host 的端口部分必须全是数字: {host:?}"));
+        }
+    }
+    if name
+        .bytes()
+        .any(|b| !(b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'_' | b':' | b'[' | b']')))
+    {
+        return Err(format!(
+            "rule[{idx}].host 含非法字符（只允许字母/数字/./-/_/:/[]）: {host:?}"
+        ));
+    }
+    Ok(())
+}
+
+/// §16.11 方法维度校验：逗号分隔的 HTTP 方法（token），大小写不敏感；至少一个。
+fn check_page_rule_method(idx: usize, method: &str) -> Result<(), String> {
+    let toks: Vec<&str> = method
+        .split(',')
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+        .collect();
+    if toks.is_empty() {
+        return Err(format!(
+            "rule[{idx}].method 不能为空（至少一个方法，如 \"GET, HEAD\"）"
+        ));
+    }
+    if toks.len() > 16 {
+        return Err(format!(
+            "rule[{idx}].method 方法数过多（{} > 16）",
+            toks.len()
+        ));
+    }
+    for t in toks {
+        if t.len() > 32 || http::Method::from_bytes(t.as_bytes()).is_err() {
+            return Err(format!("rule[{idx}].method 含非法方法 token: {t:?}"));
+        }
+    }
+    Ok(())
+}
+
+/// §16.11 header 维度校验：`Name`（存在即命中）或 `Name: value`（值精确）。
+/// 头名必须是 RFC 9110 token；值沿用 `check_header_pair`（拒 CR/LF/控制字符/非 ASCII）。
+fn check_page_rule_header(idx: usize, spec: &str) -> Result<(), String> {
+    let (name, value) = match spec.split_once(':') {
+        Some((n, v)) => (n.trim(), v.trim()),
+        None => (spec.trim(), ""),
+    };
+    if name.is_empty() {
+        return Err(format!("rule[{idx}].header 缺少头名: {spec:?}"));
+    }
+    check_header_pair(&format!("rule[{idx}].header"), name, value)
 }
 
 /// 上游地址校验（proxy.rs 的 `upstream_parts`：必须是 http/https 且带 host）。
@@ -2921,15 +3108,24 @@ async fn handle_rules_api(
                         .as_deref()
                         .map(|t| json_str(&crate::server::page_rules::scrub_brand(t)))
                         .unwrap_or_else(|| "null".into());
+                    // §16.11 维度回显：面板据此填 host/method/header 输入框（缺省 null）。
+                    let opt_dims = |v: &Option<String>| {
+                        v.as_deref()
+                            .map(|x| json_str(&crate::server::page_rules::scrub_brand(x)))
+                            .unwrap_or_else(|| "null".into())
+                    };
                     // match_url 与 action/target 同一口径 scrub：旧配置/手写 toml 里的
                     // 品牌词不得经 GET 回显扩散到面板（保存入口早已 scrub）。
                     s.push_str(&format!(
-                        "{{\"idx\":{},\"match_url\":{},\"action\":{},\"target\":{},\"priority\":{}}}",
+                        "{{\"idx\":{},\"match_url\":{},\"action\":{},\"target\":{},\"priority\":{},\"host\":{},\"method\":{},\"header\":{}}}",
                         i,
                         json_str(&crate::server::page_rules::scrub_brand(&r.match_url)),
                         json_str(&crate::server::page_rules::scrub_brand(&r.action)),
                         target,
-                        r.priority
+                        r.priority,
+                        opt_dims(&r.host),
+                        opt_dims(&r.method),
+                        opt_dims(&r.header)
                     ));
                 }
             }
@@ -3054,6 +3250,19 @@ async fn handle_rules_api(
                 }
                 if let Some(p) = v.get("priority").and_then(|x| x.as_i64()) {
                     t.insert("priority".into(), toml::Value::Integer(p));
+                }
+                // §16.11 维度：与 save_page_rules 一致（选填，空串不落盘；合法性已由
+                // 上面的 check_page_rule 统一校验）。
+                for key in ["host", "method", "header"] {
+                    if let Some(val) = v.get(key).and_then(|x| x.as_str()) {
+                        let val = val.trim();
+                        if !val.is_empty() {
+                            t.insert(
+                                key.into(),
+                                toml::Value::String(crate::server::page_rules::scrub_brand(val)),
+                            );
+                        }
+                    }
                 }
                 toml::Value::Table(t)
             }
@@ -3215,6 +3424,44 @@ mod tests {
         // listener http_versions
         assert!(check_listener_json(&j(r#"{"port":9081,"http_versions":["h1","h4"]}"#)).is_err());
         assert!(check_listener_json(&j(r#"{"port":9081,"http_versions":["h1","H2","h3"]}"#)).is_ok());
+    }
+
+    /// §16.11 页面规则维度：能保存下来的 host/method/header 必须在运行期能生效
+    /// （保存即同一口径校验）；非法/永不适配的值点名拒绝，而不是静默存成死规则。
+    #[test]
+    fn page_rule_dimensions_are_validated() {
+        let ok = |extra: &str| {
+            check_page_rule(&j(&format!(r#"{{"match_url":"/x","action":"block"{extra}}}"#)), 0)
+        };
+        // host：通配/精确/带端口/IPv6 都可；空、空白、非法字符、坏端口被拒。
+        assert!(ok(r#","host":"*""#).is_ok());
+        assert!(ok(r#","host":"a.example""#).is_ok());
+        assert!(ok(r#","host":"*.example.com""#).is_ok());
+        assert!(ok(r#","host":"a.example:8443""#).is_ok());
+        assert!(ok(r#","host":"[::1]:80""#).is_ok());
+        assert!(ok(r#","host":"""#).is_err());
+        assert!(ok(r#","host":"   ""#).is_err());
+        assert!(ok(r#","host":"bad host""#).is_err());
+        assert!(ok(r#","host":"a.example:http""#).is_err());
+        assert!(ok(r#","host":"*.""#).is_err());
+        assert!(ok(r#","host":"[::1""#).is_err());
+        // method：逗号多值、大小写随意；空/非法 token 被拒。
+        assert!(ok(r#","method":"GET, HEAD""#).is_ok());
+        assert!(ok(r#","method":"get""#).is_ok());
+        assert!(ok(r#","method":"""#).is_err());
+        assert!(ok(r#","method":", ,""#).is_err());
+        assert!(ok(r#","method":"GE T""#).is_err());
+        // header：Name 或 Name: value；空名/CRLF 值/非法名被拒。
+        assert!(ok(r#","header":"X-Foo""#).is_ok());
+        assert!(ok(r#","header":"X-Foo: bar""#).is_ok());
+        assert!(ok(r#","header":"""#).is_err());
+        assert!(ok(r#","header":"Bad Name""#).is_err());
+        assert!(ok(r#","header":"X-Foo: a\r\nX-Evil: 1""#).is_err());
+        // 非字符串类型（数字/数组）也必须拒绝。
+        assert!(ok(r#","host":123"#).is_err());
+        assert!(ok(r#","method":["GET"]"#).is_err());
+        // null/缺省 = 不约束，合法。
+        assert!(ok(r#","host":null,"method":null,"header":null"#).is_ok());
     }
 
     /// 非法 CIDR：`access::cidr_or_exact` 把解析不了的条目当「不匹配」——

@@ -4,10 +4,12 @@
 //! —— 在响应完成侧统一记录（请求入口拿不到 status/bytes/duration）。
 //! engine 标签由 dispatch 各分支经响应 extensions 注入 [`EngineTag`]。
 
+use crate::config::{AccessLogConfig, ListenerAccessLogConfig};
 use crate::server::live_config::LiveConfig;
 use once_cell::sync::Lazy;
 use parking_lot::Mutex;
 use std::collections::VecDeque;
+use std::fmt::Write as _;
 use std::io::Write;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -66,6 +68,48 @@ pub fn flush_now() {
 #[derive(Clone, Copy)]
 pub struct EngineTag(pub &'static str);
 
+/// §16.12 **生效的**访问日志设置：全局 `[access_log]` 与每站（listener）覆盖
+/// **逐字段**合并后的结果（未配的字段继承全局，见 [`ListenerAccessLogConfig`]）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EffectiveAccessLog<'a> {
+    pub enable: bool,
+    pub level: &'a str,
+    pub realtime: bool,
+}
+
+/// 把全局配置与可选 listener 覆盖合并成生效值。
+///
+/// 语义（字段级继承）：`per` 为 `None` ⇒ 完全继承全局（旧配置行为逐字节不变）；
+/// `Some(p)` ⇒ 只覆盖 `p` 里显式配置的字段，未配的继承全局。
+///
+/// 特别注意 `enable`：全局 `enable=false` 时，一个只写了 `realtime=true` 的 listener
+/// 覆盖**不会**把 enable 意外变成 `true`（这正是每站配置用 `Option` 而非带默认值的
+/// `AccessLogConfig` 的原因——否则「只想开实时 tail」会把站点日志整体打开）。
+pub fn resolve<'a>(
+    global: &'a AccessLogConfig,
+    per: Option<&'a ListenerAccessLogConfig>,
+) -> EffectiveAccessLog<'a> {
+    match per {
+        None => EffectiveAccessLog {
+            enable: global.enable,
+            level: &global.level,
+            realtime: global.realtime,
+        },
+        Some(p) => EffectiveAccessLog {
+            enable: p.enable.unwrap_or(global.enable),
+            level: p.level.as_deref().unwrap_or(&global.level),
+            realtime: p.realtime.unwrap_or(global.realtime),
+        },
+    }
+}
+
+/// 记录一条访问日志（响应完成侧的唯一入口）。
+///
+/// `per` 是**服务该请求的 listener** 的覆盖（`None` = 完全继承全局）；调用方传
+/// `lc.access_log.as_ref()`——不能用端口反查，同端口可能有多个地址的 listener。
+///
+/// 每次调用取一次 `live.snapshot()`；热路径（h1 请求收口）已有快照的调用方应改用
+/// [`log_response_with`]，避免为日志再付一次锁/原子开销。
 #[allow(clippy::too_many_arguments)]
 pub fn log_response(
     live: &Arc<LiveConfig>,
@@ -77,9 +121,39 @@ pub fn log_response(
     bytes: Option<u64>,
     dur: Duration,
     engine: &str,
+    per: Option<&ListenerAccessLogConfig>,
 ) {
-    let cfg = live.snapshot();
-    if !cfg.access_log.enable {
+    log_response_with(
+        &live.snapshot(),
+        peer,
+        proto,
+        method,
+        path,
+        status,
+        bytes,
+        dur,
+        engine,
+        per,
+    );
+}
+
+/// 与 [`log_response`] 相同，但**复用调用方已取好的配置快照**（h1 的请求收口处
+/// 同一次 `live.snapshot()` 已供路由判定使用，日志不再重复取）。
+#[allow(clippy::too_many_arguments)]
+pub fn log_response_with(
+    snap: &crate::config::Config,
+    peer: SocketAddr,
+    proto: &str,
+    method: &str,
+    path: &str,
+    status: u16,
+    bytes: Option<u64>,
+    dur: Duration,
+    engine: &str,
+    per: Option<&ListenerAccessLogConfig>,
+) {
+    let eff = resolve(&snap.access_log, per);
+    if !eff.enable {
         return;
     }
     // 无 chrono 依赖：unix 秒.毫秒，足够 Admin tail 按序展示。
@@ -87,23 +161,32 @@ pub fn log_response(
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis())
         .unwrap_or(0);
-    let ts = format!("{}.{:03}", now / 1000, now % 1000);
-    let bytes_field = match bytes {
-        Some(n) => n.to_string(),
-        None => "-".to_string(),
-    };
+    // 只做**一次**格式化到一条 `String`（然后整行进批量缓冲）：旧实现每请求 4 次堆分配
+    // —— ts `format!` / bytes `to_string` / path 转义 `collect::<String>()` / 整行 `format!`。
+    // 字段顺序、转义规则与输出逐字不变（访问日志是审计证据，格式不能变）。
+    let mut line = String::with_capacity(path.len() + 64);
+    let _ = write!(line, "{}.{:03} {proto} {peer} \"{method} ", now / 1000, now % 1000);
     // `path` 是请求目标，**不能原样进引号字段**：一个含 `"` 的请求就能提前结束引号、
     // 把后面的字段伪造成任意内容（日志是审计证据，伪造一行等于污染审计）。
     // 换行/控制字符由 hyper 的 URI 校验挡住，这里的重点是引号与个别控制字符。
-    let path_esc: String = path
-        .chars()
-        .map(|c| if c == '"' || c == '\\' || (c as u32) < 0x20 { '\u{fffd}' } else { c })
-        .collect();
-    let line = format!(
-        "{ts} {proto} {peer} \"{method} {path_esc}\" {status} {bytes_field} {}ms {engine}",
-        dur.as_millis()
-    );
-    // 级别过滤：**所有**等级都走同一批量写路径。
+    for c in path.chars() {
+        if c == '"' || c == '\\' || (c as u32) < 0x20 {
+            line.push('\u{fffd}');
+        } else {
+            line.push(c);
+        }
+    }
+    line.push('"');
+    let _ = write!(line, " {status} ");
+    match bytes {
+        Some(n) => {
+            let _ = write!(line, "{n}");
+        }
+        None => line.push('-'),
+    }
+    let _ = write!(line, " {}ms {engine}", dur.as_millis());
+    // 级别过滤：**所有**等级都走同一批量写路径（`level` 仍逐站生效于配置/展示层，
+    // 但访问日志行本身没有严重级别语义——见下方注释）。
     //
     // 此前 `"debug" | "trace" => log::debug!("{line}")`：env_logger 的默认过滤是
     // `info`（`main.rs` 的 `default_filter_or("info")`，现场也没有 RUST_LOG），于是
@@ -121,7 +204,7 @@ pub fn log_response(
     if full {
         flush();
     }
-    if cfg.access_log.realtime {
+    if eff.realtime {
         let mut ring = RING.lock();
         if ring.len() >= 512 {
             ring.pop_front();
@@ -161,5 +244,64 @@ mod tests {
         let taken = { let mut b = ACCESS_BUF.lock(); std::mem::take(&mut *b) };
         assert_eq!(taken.len(), LINE.len() + 1);
         assert!(ACCESS_BUF.lock().is_empty());
+    }
+
+    /// §16.12 每站覆盖的字段级继承：未配的字段必须继承全局，配了的才覆盖。
+    #[test]
+    fn resolve_inherits_unset_fields_and_overrides_set_ones() {
+        let global = AccessLogConfig {
+            enable: true,
+            level: "info".into(),
+            realtime: false,
+        };
+        // 无覆盖 ⇒ 逐字段全局。
+        let eff = resolve(&global, None);
+        assert_eq!(eff, EffectiveAccessLog { enable: true, level: "info", realtime: false });
+        // 只配 realtime ⇒ enable/level 仍继承全局。
+        let per = ListenerAccessLogConfig {
+            enable: None,
+            level: None,
+            realtime: Some(true),
+        };
+        let eff = resolve(&global, Some(&per));
+        assert_eq!(eff, EffectiveAccessLog { enable: true, level: "info", realtime: true });
+        // 只配 level ⇒ enable/realtime 仍继承全局。
+        let per = ListenerAccessLogConfig {
+            enable: None,
+            level: Some("trace".into()),
+            realtime: None,
+        };
+        let eff = resolve(&global, Some(&per));
+        assert_eq!(eff, EffectiveAccessLog { enable: true, level: "trace", realtime: false });
+    }
+
+    /// 关键回归（Option 设计的理由）：全局 `enable=false` 时，listener 只写
+    /// `realtime=true` **不得**把 enable 意外变成 true。
+    #[test]
+    fn resolve_does_not_re_enable_when_only_realtime_set() {
+        let global = AccessLogConfig {
+            enable: false,
+            level: "warn".into(),
+            realtime: false,
+        };
+        let per = ListenerAccessLogConfig {
+            enable: None,
+            level: Some("debug".into()),
+            realtime: Some(true),
+        };
+        let eff = resolve(&global, Some(&per));
+        assert!(!eff.enable, "未显式配 enable 时必须继承全局 false");
+        assert_eq!(eff.level, "debug");
+        assert!(eff.realtime);
+        // 显式 enable=true 的覆盖则必须生效（每站可以单独打开）。
+        let per = ListenerAccessLogConfig {
+            enable: Some(true),
+            level: None,
+            realtime: None,
+        };
+        let eff = resolve(&global, Some(&per));
+        assert!(eff.enable, "显式 enable=true 必须覆盖全局 false");
+        assert_eq!(eff.level, "warn", "未配的 level 继承全局");
+        assert!(!eff.realtime, "未配的 realtime 继承全局");
     }
 }

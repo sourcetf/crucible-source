@@ -89,6 +89,39 @@ void appengine_result_free(AppEngineResult *out);
 
 void appengine_shutdown(void);
 
+/*
+ * Optional (host calls it via dlsym if present): supply the **base process
+ * environment** captured at webserver startup — a `K=V\0K=V\0...\0` block
+ * (double-NUL terminated), with NO request-time `.env` values in it.
+ *
+ * Why: spawn-per-request engines (cgi) fork+exec a child that must see the
+ * operator environment AND the current request's `.env`, but must NOT inherit
+ * some *other* request's transient `.env` (which the host temporarily installs
+ * into the process env under a global lock). Building the child env from this
+ * base block + the request `.env` (carried in `extra`) makes the engine
+ * independent of the process env, so it needs no lock and a slow request can
+ * never block another. Engines that do not implement it keep the old
+ * inherit-`environ` behavior (and the host keeps them under the lock).
+ */
+int appengine_set_base_env(const char *block);
+
+/*
+ * Optional (host calls it via dlsym after a successful appengine_set_base_env):
+ * the engine declares that it is **process-env free** — i.e. it builds every
+ * child's environment from `appengine_base_env_block()` + the request `.env`,
+ * never calls setenv()/putenv() for request data, and never lets a child inherit
+ * `environ`. Returns non-zero when true (0/absent = the engine still depends on
+ * the process environment).
+ *
+ * The host only skips the global env lock for engines that answer non-zero here.
+ * This must be a per-.so declaration rather than a host-side engine-name list:
+ * a stale `.so` (built before this behaviour existed) still links the shared
+ * `appengine_set_base_env` from appengine_common.c — the symbol being present
+ * does NOT prove the engine uses it, and treating such a `.so` as lock-free
+ * would silently reintroduce the cross-app `.env` leak.
+ */
+int appengine_env_isolation(void);
+
 #ifdef __cplusplus
 }
 #endif

@@ -189,6 +189,24 @@ fn default_log_level() -> String {
     "info".into()
 }
 
+/// §16.12 **每站（listener）** 访问日志覆盖。字段全部 `Option`，语义是**字段级**继承：
+/// 某字段未配 ⇒ 继承全局 `[access_log]`；配了就覆盖该字段。
+///
+/// 为什么用 `Option` 而不是直接复用 [`AccessLogConfig`]：后者字段有默认值
+/// （enable=true/level=info/realtime=false），若直接复用作 listener 字段，
+/// 一个只想改 `realtime` 的 listener 会把没写的 `enable` 悄悄重置为默认 `true`
+/// —— 全局 `enable=false` 的站点被「加一条覆盖」意外打开。字段级 `Option`
+/// 才能表达「未配则继承」。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ListenerAccessLogConfig {
+    #[serde(default)]
+    pub enable: Option<bool>,
+    #[serde(default)]
+    pub level: Option<String>,
+    #[serde(default)]
+    pub realtime: Option<bool>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct IpAccessConfig {
     #[serde(default)]
@@ -596,6 +614,13 @@ pub struct ListenerConfig {
     /// 而不是不配任何东西就存在。开启时建议同时配 `ip_access` / basic_auth。
     #[serde(default)]
     pub connect_udp: bool,
+    /// §16.12 **每站（listener）** 访问日志覆盖（enable/level/realtime）。
+    ///
+    /// `None` = 完全继承全局 `[access_log]`（旧配置零变化）；`Some` = 逐字段覆盖
+    /// （未写的字段继承全局）。此前访问日志**只有全局**，`[listeners.access_log]`
+    /// 会被 serde 静默忽略。判定入口见 `server::access_log::log_response`。
+    #[serde(default)]
+    pub access_log: Option<ListenerAccessLogConfig>,
 }
 
 impl Default for ListenerConfig {
@@ -622,6 +647,7 @@ impl Default for ListenerConfig {
             quic_ecn: false,
             qmux: false,
             connect_udp: false,
+            access_log: None,
         }
     }
 }
@@ -1043,6 +1069,22 @@ pub struct PageRuleConfig {
     /// 想「把某条规则提到前面」只能整体重排，这条给出显式手段。
     #[serde(default)]
     pub priority: i64,
+    /// §16.11 匹配维度 —— **host**：精确（大小写不敏感，忽略端口）/ `*.suffix`
+    /// 通配子域（含 apex）/ `*` 全匹配。缺省 `None` = 不约束 host。
+    ///
+    /// 这些维度（host/method/header）此前**完全没有**：评估只按 URL 前缀。它们必须
+    /// 由**所有协议**的请求上下文提供（h1/h2/h3 都能拿到 method/host/header），否则
+    /// 只在 h1 的 `apply` 里接维度会让 `{method:POST,action:block}` 在 h1 拦、h2/h3
+    /// 放行 —— 正是本项目要猎杀的跨协议不一致。见 `server::page_rules::MatchCtx`。
+    #[serde(default)]
+    pub host: Option<String>,
+    /// §16.11 匹配维度 —— **方法**：大小写不敏感，逗号分隔多值（如 `"GET, HEAD"`）。
+    #[serde(default)]
+    pub method: Option<String>,
+    /// §16.11 匹配维度 —— **请求头**：`Name`（存在即命中）或 `Name: value`
+    /// （值精确匹配）。头名大小写不敏感。
+    #[serde(default)]
+    pub header: Option<String>,
 }
 
 /// 兼容旧版 `[admin] username/password_hash` 扁平字段。

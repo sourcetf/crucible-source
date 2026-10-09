@@ -58,6 +58,11 @@ use std::sync::Arc;
 use tokio::net::TcpListener;
 
 pub async fn run(live: Arc<LiveConfig>) -> Result<()> {
+    // 启动期环境快照：spawn 类引擎（cgi/cgi_script）用它构造**干净**子进程环境
+    // （启动期基底 + 本请求 `.env`），从而不继承进程 env 里别人的临时 `.env`，
+    // 也就不必参与 env_lock 的进程 env 互斥（慢空请求不再挡住带 .env 的请求）。
+    // **必须在任何请求期 `.env` 安装之前**调用。
+    crate::server::apps::env_lock::init_base_env();
     // 热重载：每 2s 检查 config.toml mtime
     live_config::spawn_mtime_watcher(Arc::clone(&live), std::time::Duration::from_secs(2));
     crate::server::apps::reconcile_apps_runtime(&live);

@@ -222,9 +222,17 @@ fn canon_best_effort(p: &std::path::Path) -> PathBuf {
 /// 正常上传目录（如 `/up/`，不在任何 app docroot 内）不受影响。
 fn inside_any_app_docroot(lc: &ListenerConfig, target: &std::path::Path) -> Option<PathBuf> {
     for app in &lc.apps {
-        if !app.enabled {
+        // `enabled=false` **且**未显式配 docroot 的应用跳过：它当前不参与分发，且
+        // `app_docroot` 会退化成 listener root —— 把 root 算成「应用 docroot」就等于
+        // 把开了上传的端口上**所有**上传都回 403（等于关掉上传功能）。
+        if !app.enabled && app.docroot.is_none() {
             continue;
         }
+        // 显式配了 docroot 的应用**不管 enabled 与否**都算运行期目录：这些文件在应用
+        // 被重新启用（或该 docroot 被别的配置指到时）会被执行/注入 —— `init.sh` 被 `sh`、
+        // `deps/bin/index` 被 sidecar 拉起、`.env` 注入引擎环境。旧判据跳过 disabled 应用，
+        // 实测 `PUT /dapp/deps/bin/index` → **201**（落盘成功）——一条「先上传、后启用」的
+        // 定时 RCE。
         let dr = canon_best_effort(&crate::server::apps::deps::app_docroot(lc, app));
         // `Path::starts_with` 按**组件**比较：`/a/rusty` 不以 `/a/rust` 开头（不会误伤兄弟目录）。
         if target == dr || target.starts_with(&dr) {
@@ -910,7 +918,7 @@ root = "/tmp/site-b"
             server_name: None,
             ssl: None,
             file_open: FileOpenTable::default(),
-            apps: vec![app],
+            apps: vec![app.clone()],
             basic_auth: None,
             proxy_rules: vec![],
             page_rules: vec![],
@@ -922,6 +930,7 @@ root = "/tmp/site-b"
             quic_ecn: false,
             qmux: false,
             connect_udp: false,
+            access_log: None,
         };
         let t = |rel: &str| canon_best_effort(&base.join(rel));
         // docroot 内（含 init.sh / deps/bin/index 这类非可执行扩展名的运行期文件）→ 命中
@@ -934,6 +943,24 @@ root = "/tmp/site-b"
         assert!(inside_any_app_docroot(&lc, &t("up/x.txt")).is_none());
         // 组件级前缀相同的兄弟目录 → 放行（不得把 /rust 误当成 /rusty 的前缀）
         assert!(inside_any_app_docroot(&lc, &t("rusty/x.txt")).is_none());
+        // disabled 但**显式**配了 docroot 的应用同样受保护（先上传、后启用的定时 RCE）→ 命中
+        let mut disabled = app.clone();
+        disabled.enabled = false;
+        let lc_disabled = ListenerConfig {
+            apps: vec![disabled.clone()],
+            ..lc.clone()
+        };
+        assert!(inside_any_app_docroot(&lc_disabled, &t("rust/init.sh")).is_some());
+        assert!(inside_any_app_docroot(&lc_disabled, &t("rust/deps/bin/index")).is_some());
+        // disabled 且**未显式**配 docroot（docroot 会退化成 listener root）→ 跳过：
+        // 否则开了上传的端口上**所有**上传都会 403（等于把上传功能关掉）
+        let mut no_docroot = disabled;
+        no_docroot.docroot = None;
+        let lc_no = ListenerConfig {
+            apps: vec![no_docroot],
+            ..lc.clone()
+        };
+        assert!(inside_any_app_docroot(&lc_no, &t("up/x.txt")).is_none());
         let _ = std::fs::remove_dir_all(&base);
     }
 }

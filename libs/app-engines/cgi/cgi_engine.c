@@ -520,19 +520,144 @@ static void cgi_apply_output(AppEngineResult *out, crucible_buf *raw)
 
 /* ------------------------------------------------------------ 请求入口 --- */
 
-static int cgi_execute(const char *script, const char *method, const char *path,
-                       const char *query, const char *content_type, const char *body,
-                       size_t body_len, const char *remote, const char *server_name,
-                       int server_port, const char *headers, AppEngineResult *out)
+/* 本请求 .env（extra JSON 的 "env"）收集器：按**子进程**传，不 setenv（见
+ * appengine_set_base_env）。这样 cgi 不改进程 env，因而无需参与 host 的 env 锁，
+ * 慢请求也不会挡住带 .env 的请求。 */
+struct cgi_kv_list {
+    char **v;
+    size_t n, cap;
+    int oom;
+};
+
+static int cgi_kv_add(struct cgi_kv_list *l, char *kv)
+{
+    if (l->n == l->cap) {
+        size_t nc = l->cap != 0 ? l->cap * 2 : 16;
+        char **nv = (char **)realloc(l->v, nc * sizeof(char *));
+
+        if (nv == NULL) {
+            l->oom = 1;
+            return -1;
+        }
+        l->v = nv;
+        l->cap = nc;
+    }
+    l->v[l->n++] = kv;
+    return 0;
+}
+
+static int cgi_extra_cb(void *ctx, const char *k, const char *v)
+{
+    struct cgi_kv_list *l = (struct cgi_kv_list *)ctx;
+    char *kv = cgi_kv(k, v);
+
+    if (kv == NULL) {
+        l->oom = 1;
+        return 1;
+    }
+    if (cgi_kv_add(l, kv) != 0) {
+        free(kv);
+        return 1;
+    }
+    return 0;
+}
+
+static void cgi_kv_list_free(struct cgi_kv_list *l)
+{
+    size_t i;
+
+    for (i = 0; i < l->n; i++)
+        free(l->v[i]);
+    free(l->v);
+    l->v = NULL;
+    l->n = l->cap = 0;
+}
+
+/* 继承环境里，键若已由本请求 .env 提供则跳过（.env 覆盖基底同名键）。 */
+static int cgi_key_in_extra(const struct cgi_kv_list *extra, const char *entry)
+{
+    const char *eq = strchr(entry, '=');
+    size_t klen, i;
+
+    if (eq == NULL)
+        return 0;
+    klen = (size_t)(eq - entry);
+    for (i = 0; i < extra->n; i++) {
+        const char *eeq = strchr(extra->v[i], '=');
+
+        if (eeq != NULL && (size_t)(eeq - extra->v[i]) == klen &&
+            strncmp(extra->v[i], entry, klen) == 0)
+            return 1;
+    }
+    return 0;
+}
+
+/* CGI/1.1 §4.1.13 / §4.1.5：`SCRIPT_NAME` 是标识脚本的 **URI 路径**（如 `/cgi/index.cgi`），
+ * `PATH_INFO` 是脚本之后多余的路径（无则空串）。旧实现把 SCRIPT_NAME 设成脚本绝对路径、
+ * PATH_INFO 设成整条请求路径 —— 两者都不符合规范。这里用「脚本相对 docroot 的路径 srel
+ * 在请求 URL 里出现处」定界：命中则 SCRIPT_NAME=URL 前缀到 srel 末尾、PATH_INFO=其后；
+ * 未命中（index 回退/相对 docroot 无法判定）则 SCRIPT_NAME=整条 URL、PATH_INFO 为空。 */
+static void cgi_script_uri(const char *path, const char *docroot, const char *script,
+                           char *name_out, size_t name_sz, char *info_out, size_t info_sz)
+{
+    const char *srel = script;
+    size_t srel_len, dl;
+    const char *hit = NULL;
+
+    if (path == NULL || path[0] == '\0')
+        path = "/";
+    if (docroot != NULL && docroot[0] != '\0') {
+        dl = strlen(docroot);
+        if (strncmp(script, docroot, dl) == 0 && script[dl] == '/')
+            srel = script + dl;
+    }
+    srel_len = strlen(srel);
+    if (srel_len > 0) {
+        const char *scan = path;
+
+        while ((scan = strstr(scan, srel)) != NULL) {
+            char after = scan[srel_len];
+
+            if (after == '\0' || after == '/') {
+                hit = scan;
+                break;
+            }
+            scan++;
+        }
+    }
+    if (hit != NULL) {
+        size_t nlen = (size_t)(hit - path) + srel_len;
+
+        if (nlen >= name_sz)
+            nlen = name_sz - 1;
+        memcpy(name_out, path, nlen);
+        name_out[nlen] = '\0';
+        snprintf(info_out, info_sz, "%s", hit + srel_len);
+    } else {
+        snprintf(name_out, name_sz, "%s", path);
+        if (info_sz > 0)
+            info_out[0] = '\0';
+    }
+}
+
+static int cgi_execute(const char *script, const char *docroot, const char *method,
+                       const char *path, const char *query, const char *content_type,
+                       const char *body, size_t body_len, const char *remote,
+                       const char *server_name, int server_port, const char *headers,
+                       const char *extra, AppEngineResult *out)
 {
     crucible_buf raw, errbuf;
     char *own[12];
     size_t own_n = 0, nenv = 0, i;
     struct cgi_hdr_list hdrs;
+    struct cgi_kv_list extra_env;
     char **envp = NULL;
     char portbuf[16];
     char lenbuf[32];
     char why[256];
+    char script_name_uri[1024];
+    char path_info_uri[1024];
+    const char *base;
     cgi_proc proc;
     long exit_code = 0;
     int rc = -1;
@@ -541,6 +666,7 @@ static int cgi_execute(const char *script, const char *method, const char *path,
     memset(&errbuf, 0, sizeof(errbuf));
     memset(&proc, 0, sizeof(proc));
     memset(&hdrs, 0, sizeof(hdrs));
+    memset(&extra_env, 0, sizeof(extra_env));
     proc.in_fd = proc.out_fd = proc.err_fd = -1;
     why[0] = '\0';
     if (body == NULL)
@@ -553,14 +679,23 @@ static int cgi_execute(const char *script, const char *method, const char *path,
         goto cleanup;
     }
 
+    /* 本请求 .env（extra JSON 的 "env"）：按子进程传，**不 setenv**。 */
+    (void)appengine_extra_env_foreach(extra, cgi_extra_cb, &extra_env);
+    if (extra_env.oom) {
+        rc = cgi_fail(out, "cgi: 内存不足（构造 .env 环境）");
+        goto cleanup;
+    }
+
+    cgi_script_uri(path, docroot, script, script_name_uri, sizeof(script_name_uri),
+                   path_info_uri, sizeof(path_info_uri));
     snprintf(portbuf, sizeof(portbuf), "%d", server_port > 0 ? server_port : 80);
     snprintf(lenbuf, sizeof(lenbuf), "%lu", (unsigned long)body_len);
     own[own_n++] = cgi_kv("GATEWAY_INTERFACE", "CGI/1.1");
     own[own_n++] = cgi_kv("REQUEST_METHOD", method != NULL ? method : "GET");
-    own[own_n++] = cgi_kv("PATH_INFO", path != NULL ? path : "/");
+    own[own_n++] = cgi_kv("PATH_INFO", path_info_uri);
     own[own_n++] = cgi_kv("QUERY_STRING", query != NULL ? query : "");
     own[own_n++] = cgi_kv("SCRIPT_FILENAME", script);
-    own[own_n++] = cgi_kv("SCRIPT_NAME", script);
+    own[own_n++] = cgi_kv("SCRIPT_NAME", script_name_uri);
     own[own_n++] = cgi_kv("REMOTE_ADDR", remote != NULL ? remote : "");
     own[own_n++] = cgi_kv("SERVER_NAME", server_name != NULL && server_name[0] != '\0'
                                               ? server_name
@@ -577,24 +712,49 @@ static int cgi_execute(const char *script, const char *method, const char *path,
         }
     }
 
-    for (i = 0; environ != NULL && environ[i] != NULL; i++) {
-        if (!cgi_key_is_ours(environ[i]))
-            nenv++;
+    /* 子进程基底环境：优先用 host 提供的**启动期快照**（不含任何请求期临时 .env），
+     * 未提供时退回继承 `environ`（旧行为 —— 此时该引擎须由 host 置于 env 锁内）。 */
+    base = appengine_base_env_block();
+    if (base != NULL) {
+        const char *p = base;
+
+        while (*p != '\0') {
+            if (!cgi_key_is_ours(p) && !cgi_key_in_extra(&extra_env, p))
+                nenv++;
+            p += strlen(p) + 1;
+        }
+    } else {
+        for (i = 0; environ != NULL && environ[i] != NULL; i++) {
+            if (!cgi_key_is_ours(environ[i]) && !cgi_key_in_extra(&extra_env, environ[i]))
+                nenv++;
+        }
     }
-    envp = (char **)malloc(sizeof(char *) * (nenv + own_n + hdrs.n + 1));
+    envp = (char **)malloc(sizeof(char *) * (nenv + own_n + hdrs.n + extra_env.n + 1));
     if (envp == NULL) {
         rc = cgi_fail(out, "cgi: 内存不足（构造请求环境）");
         goto cleanup;
     }
     nenv = 0;
-    for (i = 0; environ != NULL && environ[i] != NULL; i++) {
-        if (!cgi_key_is_ours(environ[i]))
-            envp[nenv++] = environ[i];
+    if (base != NULL) {
+        const char *p = base;
+
+        while (*p != '\0') {
+            if (!cgi_key_is_ours(p) && !cgi_key_in_extra(&extra_env, p))
+                envp[nenv++] = (char *)p;
+            p += strlen(p) + 1;
+        }
+    } else {
+        for (i = 0; environ != NULL && environ[i] != NULL; i++) {
+            if (!cgi_key_is_ours(environ[i]) && !cgi_key_in_extra(&extra_env, environ[i]))
+                envp[nenv++] = environ[i];
+        }
     }
     for (i = 0; i < own_n; i++)
         envp[nenv++] = own[i];
     for (i = 0; i < hdrs.n; i++)
         envp[nenv++] = hdrs.v[i];
+    for (i = 0; i < extra_env.n; i++)
+        envp[nenv++] = extra_env.v[i];
     envp[nenv] = NULL;
 
     if (cgi_spawn(script, envp, &proc) != 0) {
@@ -625,6 +785,7 @@ cleanup:
     for (i = 0; i < hdrs.n; i++)
         free(hdrs.v[i]);
     free(hdrs.v);
+    cgi_kv_list_free(&extra_env);
     free(envp);
     crucible_buf_free(&raw);
     crucible_buf_free(&errbuf);
@@ -637,6 +798,19 @@ int appengine_init(const char *engine, const char *lib_hint)
     (void)lib_hint;
     g_inited = 1;
     return 0;
+}
+
+/* 宿主据此**跳过** env 锁（见 appengine.h 的说明）。本引擎满足两个条件：
+ *   1) cgi_execute 用 `appengine_base_env_block()`（启动期快照）+ 本请求 `extra`
+ *      里的 `.env` 构造**子进程** envp（envp 直接 fork+exec，不继承 `environ`）；
+ *   2) 全程不 `setenv`/`putenv`（`.env` 不再进进程环境，`appengine_apply_extra`
+ *      在本引擎里已无调用点）。
+ * 声明成独立符号而不是让宿主按引擎名硬编码：陈旧 .so 也链接了 common 里的
+ * `appengine_set_base_env`（符号存在 ≠ 引擎真的用它），按名放行会把跨应用 `.env`
+ * 泄漏重新引回来。 */
+int appengine_env_isolation(void)
+{
+    return 1;
 }
 
 int appengine_execute(
@@ -660,8 +834,8 @@ int appengine_execute(
 
     if (!g_inited || out == NULL)
         return -1;
-    /* P1-1：extra 携带的 .env 变量注入进程环境（子进程继承）；legacy 输入 no-op。 */
-    (void)appengine_apply_extra(extra);
+    /* .env 由 cgi_execute 按**子进程**传入 envp（不再 setenv）—— 见 appengine_set_base_env。
+     * 因此 cgi 引擎不改进程 env，无需 host 的 env 锁。 */
 
     use = resolve_script(script, docroot, pathbuf, sizeof(pathbuf));
     if (use == NULL)
@@ -670,8 +844,8 @@ int appengine_execute(
                         "cgi-bin/index.cgi）",
                         script != NULL ? script : "(null)",
                         docroot != NULL ? docroot : "(null)");
-    return cgi_execute(use, method, path, query, content_type, body, body_len, remote,
-                       server_name, server_port, headers, out);
+    return cgi_execute(use, docroot, method, path, query, content_type, body, body_len,
+                       remote, server_name, server_port, headers, extra, out);
 }
 
 void appengine_shutdown(void)

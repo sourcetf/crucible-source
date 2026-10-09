@@ -633,6 +633,7 @@ mod imp {
                         None,
                         t0.elapsed(),
                         "busy",
+                        lc.access_log.as_ref(),
                     );
                     return Ok(());
                 }
@@ -655,6 +656,7 @@ mod imp {
                     &mut stream,
                     &live,
                     peer,
+                    lc.access_log.as_ref(),
                     &path,
                     StatusCode::BAD_REQUEST,
                     t0,
@@ -674,6 +676,7 @@ mod imp {
                     &mut stream,
                     &live,
                     peer,
+                    lc.access_log.as_ref(),
                     &path,
                     StatusCode::FORBIDDEN,
                     t0,
@@ -695,6 +698,7 @@ mod imp {
                     &mut stream,
                     &live,
                     peer,
+                    lc.access_log.as_ref(),
                     &path,
                     StatusCode::FORBIDDEN,
                     t0,
@@ -720,6 +724,7 @@ mod imp {
                             &mut stream,
                             &live,
                             peer,
+                            lc.access_log.as_ref(),
                             &path,
                             StatusCode::TOO_MANY_REQUESTS,
                             t0,
@@ -742,6 +747,7 @@ mod imp {
                             &mut stream,
                             &live,
                             peer,
+                            lc.access_log.as_ref(),
                             &path,
                             StatusCode::UNAUTHORIZED,
                             t0,
@@ -756,6 +762,7 @@ mod imp {
                             &mut stream,
                             &live,
                             peer,
+                            lc.access_log.as_ref(),
                             &path,
                             StatusCode::TOO_MANY_REQUESTS,
                             t0,
@@ -825,11 +832,12 @@ mod imp {
                         None,
                         t0.elapsed(),
                         "busy",
+                        lc.access_log.as_ref(),
                     );
                     return Ok(());
                 }
             };
-            let r = proxy_connect_udp(&req, stream, &live, peer).await;
+            let r = proxy_connect_udp(&req, stream, &live, peer, lc.access_log.as_ref()).await;
             drop(permit);
             return r;
         }
@@ -907,6 +915,7 @@ mod imp {
                         None,
                         t0.elapsed(),
                         "acl",
+                        lc.access_log.as_ref(),
                     );
                     let mut b = Response::builder().status(status);
                     if status == StatusCode::UNAUTHORIZED {
@@ -976,6 +985,9 @@ use chunked uploads (Content-Range) or HTTP/1.1 for larger bodies\n",
                 }
             };
             let path = req.uri().path().to_string();
+            // §16.12：每站访问日志覆盖要在 `lc` 被 move 进 handle_h3 之前取出
+            // （完成侧日志在 h3_send_response 里）。
+            let access_override = lc.access_log.clone();
             let response = handle_h3(req, live.clone(), lc, peer).await;
             h3_send_response(
                 &mut send_half,
@@ -986,6 +998,7 @@ use chunked uploads (Content-Range) or HTTP/1.1 for larger bodies\n",
                 &path,
                 t0,
                 is_https,
+                access_override.as_ref(),
             )
             .await;
             Ok(())
@@ -1008,6 +1021,7 @@ use chunked uploads (Content-Range) or HTTP/1.1 for larger bodies\n",
         path: &str,
         t0: std::time::Instant,
         is_https: bool,
+        per: Option<&crate::config::ListenerAccessLogConfig>,
     ) where
         S: ::h3::quic::SendStream<Bytes>,
     {
@@ -1042,6 +1056,7 @@ use chunked uploads (Content-Range) or HTTP/1.1 for larger bodies\n",
                 Some(file_src.as_ref().map(|s| s.len).unwrap_or(body_out.len() as u64)),
                 t0.elapsed(),
                 engine,
+                per,
             );
             let resp = Response::from_parts(parts, ());
             if let Err(e) = send.send_response(resp).await {
@@ -1515,7 +1530,9 @@ use chunked uploads (Content-Range) or HTTP/1.1 for larger bodies",
         }
 
         // page_rules: block/redirect(apply_simple) + rewrite(路径改写) + cache/header(响应头)
-        if let Some((status, location)) = crate::server::page_rules::apply_simple(&lc, &path) {
+        if let Some((status, location)) =
+            crate::server::page_rules::apply_simple(&lc, &path, &crate::server::page_rules::MatchCtx::from_request(&req))
+        {
             if status == StatusCode::FORBIDDEN {
                 return tag(
                     Response::builder()
@@ -1534,19 +1551,29 @@ use chunked uploads (Content-Range) or HTTP/1.1 for larger bodies",
                 "rule",
             );
         }
-        if let Some(np) = crate::server::page_rules::rewrite_path(&lc, &path) {
-            let pq = match req.uri().query() {
-                Some(q) => format!("{np}?{q}"),
-                None => np,
-            };
-            if let Ok(u) = pq.parse() {
-                *req.uri_mut() = u;
+        // §16.11：host 维度的 owned 快照（必须在下面的 rewrite 改 `uri_mut()` 前取，
+        // 见 `from_request_with_host` 的说明）。
+        let pr_host = crate::server::page_rules::host_snapshot(&req);
+        {
+            let pr_ctx = crate::server::page_rules::MatchCtx::from_request(&req);
+            if let Some(np) = crate::server::page_rules::rewrite_path(&lc, &path, &pr_ctx) {
+                let pq = match req.uri().query() {
+                    Some(q) => format!("{np}?{q}"),
+                    None => np,
+                };
+                if let Ok(u) = pq.parse() {
+                    *req.uri_mut() = u;
+                }
             }
         }
         // 改写后以新路径做后续判定与分发（与 h1/h2 的修正一致）。
         let path = req.uri().path().to_string();
+        // host 用改写前的快照：h3 的 host 只存在于 `:authority`（URI authority），
+        // 客户端可以不发 Host 头；URI 被换成相对形态后 authority 消失，重建 ctx 会
+        // 丢 host ⇒ 带 host 约束的 block/pass/header 静默不命中（仅 h2/h3 的漏洞面）。
+        let pr_ctx = crate::server::page_rules::MatchCtx::from_request_with_host(&req, pr_host.as_deref());
         // P1-5：h1 的 pass_upstream（page rule pass 动作）在 h3 同样生效。
-        if let Some((murl, upstream)) = crate::server::page_rules::pass_upstream(&lc, &path) {
+        if let Some((murl, upstream)) = crate::server::page_rules::pass_upstream(&lc, &path, &pr_ctx) {
             // proxy_page_rule 需要 h1 体类型（Bytes）：先收齐（≤8MiB）。
             let req = match h3_collect_bytes(req, REQUEST_BODY_CAP).await {
                 Ok(r) => r,
@@ -1562,7 +1589,7 @@ use chunked uploads (Content-Range) or HTTP/1.1 for larger bodies",
             .await;
             return tag(collect_to_bytes(resp).await, "proxy");
         }
-        let resp_mods = crate::server::page_rules::response_headers(&lc, &path);
+        let resp_mods = crate::server::page_rules::response_headers(&lc, &path, &pr_ctx);
         let mut resp = h3_tail(req, live, lc, peer, &path).await;
         for (name, value) in resp_mods {
             if let (Ok(nn), Ok(vv)) = (
@@ -1666,6 +1693,7 @@ use chunked uploads (Content-Range) or HTTP/1.1 for larger bodies",
         mut stream: ::h3::server::RequestStream<::h3_quinn::BidiStream<Bytes>, Bytes>,
         live: &Arc<LiveConfig>,
         peer: SocketAddr,
+        per: Option<&crate::config::ListenerAccessLogConfig>,
     ) -> Result<()> {
         let t0 = std::time::Instant::now();
         let path = req.uri().path().to_string();
@@ -1694,6 +1722,7 @@ use chunked uploads (Content-Range) or HTTP/1.1 for larger bodies",
                 &mut stream,
                 live,
                 peer,
+                per,
                 &path,
                 StatusCode::NOT_IMPLEMENTED,
                 t0,
@@ -1727,6 +1756,7 @@ use chunked uploads (Content-Range) or HTTP/1.1 for larger bodies",
                     &mut stream,
                     live,
                     peer,
+                    per,
                     &path,
                     StatusCode::BAD_REQUEST,
                     t0,
@@ -1744,6 +1774,7 @@ use chunked uploads (Content-Range) or HTTP/1.1 for larger bodies",
                     &mut stream,
                     live,
                     peer,
+                    per,
                     &path,
                     StatusCode::FORBIDDEN,
                     t0,
@@ -1769,6 +1800,7 @@ use chunked uploads (Content-Range) or HTTP/1.1 for larger bodies",
                     &mut stream,
                     live,
                     peer,
+                    per,
                     &path,
                     StatusCode::BAD_GATEWAY,
                     t0,
@@ -1783,6 +1815,7 @@ use chunked uploads (Content-Range) or HTTP/1.1 for larger bodies",
                 &mut stream,
                 live,
                 peer,
+                per,
                 &path,
                 StatusCode::BAD_GATEWAY,
                 t0,
@@ -1820,6 +1853,7 @@ use chunked uploads (Content-Range) or HTTP/1.1 for larger bodies",
             None,
             t0.elapsed(),
             "connect-udp",
+            per,
         );
         log::info!("h3 CONNECT-UDP established peer={peer} target={target} path={path}");
 
@@ -1964,6 +1998,7 @@ use chunked uploads (Content-Range) or HTTP/1.1 for larger bodies",
         stream: &mut ::h3::server::RequestStream<::h3_quinn::BidiStream<Bytes>, Bytes>,
         live: &Arc<LiveConfig>,
         peer: SocketAddr,
+        per: Option<&crate::config::ListenerAccessLogConfig>,
         path: &str,
         status: StatusCode,
         t0: std::time::Instant,
@@ -1993,6 +2028,7 @@ use chunked uploads (Content-Range) or HTTP/1.1 for larger bodies",
             None,
             t0.elapsed(),
             "connect-udp",
+            per,
         );
     }
 

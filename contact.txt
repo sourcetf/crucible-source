@@ -3184,3 +3184,270 @@ scope：`src/server/h1.rs`、`src/server/dns/mod.rs`、`src/server/dns/dot_doh.r
 （恒 None 的 stub）不再 `.await`（−2~3µs）；③ `access_log::log_response` 去掉多余 `live.snapshot()`（跨 scope，
 `access_log.rs`，−0.3~2.5µs）。**三者全落地：`/` 50.7µs→~41µs→~48.8k rps→`h2o/ours≈1.04×`，有望压进 1.2×。**
 详见报告 §8。
+
+# 【agent-dns2b · `src/server/dns/**` Wave-6（工号 1009）】2026-10-09 收工
+
+接手 agent-dns2 断线半成品（面板立即签发统一 + malformed_ecs 接线），做完并真机验证；另修 1 条新发现。**未** commit/push/checkout/reset/stash/clean。
+- **F1 面板「立即签发」= 自动续期同一条命令**（收尾半成品）：`admin_api.rs:367-375/660-662` → `acme::issue_now` → `issue_if_missing` → `issue`（同一 CA/参数/落盘/`ISSUE_LOCK`；`spawn_blocking`）。
+  本轮补：空域名明确报错（`acme.rs:192-195`）；工具「找到但失败」不再谎报 "no acme client available"，改报 `ACME 客户端已找到但执行失败：acme.sh（…）（stderr 见服务日志 dns-acme:）`（`acme.rs:269-353`）。
+  **真机**（假 acme.sh 记 argv）：自动续期与面板点击两条 `--issue` 命令**逐字节一致**（`--server letsencrypt … --keylength ec-256`，无 `--force`，同 `LE_WORKING_DIR`）；证书有效时面板 no-op（不打 CA）；工具缺失/失败时错误可定位且已有证书 md5 不变。
+- **F2 畸形 ECS → FORMERR**（收尾半成品 + 去 `cfg.ecs` 门控）：`dot_doh.rs:73-79` 接线（DoT/DoH 唯一入口），`ecs.rs:113-152`（olen 与实际不符 / family 非法 / 重复 ECS / 地址超限 → FORMERR 应答）。
+  **真机** 11 用例 × DoH/DoT 全 PASS（8 类畸形 FORMERR、无 ECS/合法 ECS/COOKIE NOERROR+1 答、合法 ECS 应答仍回显 `(1,24,0,[203,0,113])`）；畸形查询到达上游的行数 delta=0；**负控**（关接线重编）8 条畸形全部 NOERROR ⇒ 证明 load-bearing。
+- **F3 `ecs=false` 不再回显 ECS**（新发现）：`dot_doh.rs:113-121` —— 关闭态已剥离出站 ECS，回显会误导下游缓存；真机 `ecs=false` 下合法 ECS 查询 `ar=0` 且上游收到的是剥离后的查询。
+- **Wave-2 回归复核**（真机）：ECS 应答回显、DoT `dot_listener_live` 热载（config 改 dot.port 26854→26857 不重启即生效、旧口关闭）、rdata/CNAME 校验、面板 401/403 越权负控 —— 均无回归；geo 线路上限与 `read_static_env` 静态+单测复核。
+- **测试**：共享树 `cargo test --release --bin webserver --offline --features tls,tls_boring` = **481 passed / 0 failed / 1 ignored**；冻结树（HEAD+本 scope）= **471 passed / 0 failed / 1 ignored**、release 构建 clean。
+- 未闭（交主会话，静态）：`inject_ecs` 对畸形 OPT 仍会注入默认 ECS（FORMERR 接线后不可达；建议 `tail` 非空即不注入）；直连 :53 的畸形 ECS 行为归 BIND（本机无 named 无法验）。
+- 报告：`.agents/1009/reports/dns2b-wave6.md`、`.agents/1009/fixes/dns2b-wave6.md`。本机无 named/dig → 依赖 BIND 的结论一律标「静态」。
+
+# 【agent-h1c · `src/server/h1.rs`+`access_log.rs`+`rate_limit.rs`+`basic_auth.rs`+`access.rs`+`log_throttle.rs` Wave-6（工号 1009）】2026-10-09 收工
+
+**本轮 `src/` 下 0 处改动**（理由见下）。**未** commit/push/checkout/reset/stash/clean；`h1.rs`/`access_log.rs`
+上另一 agent 的在途改动（每站日志、`MatchCtx` 短路）本轮**只读不改**，未冲突（开工时已 `git diff` 核对）。
+证据脚本/日志：`~/scratch-h1c/`（`finalprobe.py` + `logs/finalprobe.log` 为主证据）。
+构建指纹：新二进制 md5 `774f3bd934f4df1cae1f181f57c8c203`（当前工作树，`cargo build` 0 error，119 warnings）。
+
+## 1. 第一优先 [P2] CL+TE 并存 → **服务层不可达，无法在本 scope 修成 400**（三层证据）
+- hyper-1.11.1 `proto/h1/role.rs:269-296`：**两种字段顺序**下 CL 都被摘掉/不 append（`is_cl && con_len.take()
+  → headers.remove(CONTENT_LENGTH)`；CL 分支 `if is_te { continue; }`），`:351-353` 另置 `keep_alive=false`；
+  `http1::Builder` **无** CL/TE 严格性开关（选项全集见报告）。服务层 `contains_key(CONTENT_LENGTH)` 恒不成立。
+- 独立 hyper 复刻（`~/scratch-h1c/h1probe`，同 builder 选项）：服务层 `CONTENT_LENGTH visible=None`、
+  只剩 `transfer-encoding: chunked`；**纯 TE 对照不带 `connection: close`** ⇒ hyper 确实识别到 CL+TE，只是不暴露。
+- 真机（20805，真消费 body）：CL+TE（含 CL:0、两种顺序）→ `201 + connection: close` 且**同连接第二条请求
+  不被服务**；纯 chunked 对照两条都服务。⇒ RFC 9112 §6.1「MAY 按 TE 处理 + MUST 关连接」两条都满足。
+  重复 CL 异值 → 400（hyper 解析层，与 verify2 的 PASS 一致）。
+- 建议：① 验收检查 `CL+TE → 400` 改断言「TE 生效 + `Connection: close` + 连接确实关闭」；
+  ② 若坚持 400，只能走**解析层**（vendored hyper h1 parser，仓库已有 `libs/h2`/`libs/quinn-boring` 先例）——
+  我方不采纳 IO 层"头部嗅探"（影子解析器与 hyper 一旦分歧就是新走私面）。
+- 补充：本机作为中间层**不会把歧义转发出去**（`proxy.rs` 重建上游请求时剥离 `content-length`+hop-by-hop，
+  body 重新定界为 `Full<Bytes>`）⇒ P2 的硬化性质而非恒错。
+
+## 2. h1 边界逐条真机扫描：**全部正确**（报告 §2 表）
+分块（ext/合法 trailer 201；非法 trailer 名、`+5`、5000 位 size 行、缺 CRLF、截断 → 400；超大 size
+`ffffffffffffffff` → 恰好 60.0s 后 408，**有界**）；请求行（双空格/TAB/尾随空格 400、100KB→414、
+非 ASCII 放行、非法 UTF-8 400）；头（重复/非法 Host 400、101 行 431、600KB 单头 431、400KB 200 ⇒ 有界、
+CL `+`/`-`/超 u64 400、OWS 合法）；keep-alive（pipelining 顺序、`Connection: close`、HTTP/1.0 关 /
++keep-alive 复用、服务层 400 后连接可继续、**未读 body 后第二条请求正常（无 framing 错位）**、
+体读 408 后连接被关、**空闲 keep-alive 65s 后被服务端关闭**）；`OPTIONS *`/`CONNECT` → 405+Allow（记录）。
+
+## 3. 跨 scope 新发现（只记录，未改别人文件）
+1. **[h2h3 · P2] h2c 接受 `Transfer-Encoding`**（RFC 9113 §8.2.2 要求判 malformed）：真机
+   `curl --http2-prior-knowledge -H 'Transfer-Encoding: chunked'` → 405（被正常路由）；
+   vendored `libs/h2` 全树 0 处 TE 引用、`h2.rs` 也无 ⇒ 需 h2 侧收口。
+2. **[static/upload · P2] 上传 per-IP 会话配额 16 + 读失败保留会话（TTL 1h）** ⇒ 16 次中断/畸形上传可让
+   该 IP **所有**上传 503 最长 1h（真机：16 个残留 `.part` → 全部 503，重启即恢复；干净状态 200 条连续上传全 201）。
+3. **[h1/upload · P3] 超大 chunk size 60s 停顿**占 1 连接 + 1 permit；h1 `collect_body_capped` 与 h2 同语义
+   （仅帧间空闲，无最低速率）——要收口应三协议同做，本轮不改。
+
+## 4. scope 内复核：无功能性缺陷
+限流（429 无 `Retry-After` = RFC SHOULD/MAY，**要加必须三协议同加**，只改 h1 会造跨协议不一致；
+per_path 指纹桶/尾斜杠归一无回归；**专门算过**：超容量淘汰是"每 1562 个新键一次"的摊薄，非 CPU 放大点）；
+ACL（403 + fail-closed 空条目 + CIDR trim 同口径）；basic_auth（方案名大小写、退避第 9 次 429+`Retry-After:1`、
+admin 路径跳过站点口令、三协议都带 IP 退避 ⇒ 无旁路）；日志（真机 `GET /logmark"quote` → 日志里 `"` 变 U+FFFD；
+method 含 `"`/`\`/控制字符被 hyper 判 400 ⇒ 引号/CRLF 注入面闭合）。
+
+## 5. 诚实自曝
+第一版探针脚本 `req()` 在 head 已以 CRLF 结尾时多拼了一个 CRLF，导致 chunked 请求的第一个 chunk-size 行变空行
+⇒ 服务器回 400 "读取请求体失败"（**这是正确的**：畸形分块体必须拒）。我一度怀疑是上传路径缺陷，逐字节比对后
+确认是**探针错误**，已用正确帧全部重测 —— 该 400 不是缺陷，也不会进报告当发现。
+
+详细报告：`.agents/1009/reports/h1c-wave6.md`、`.agents/1009/fixes/h1c-wave6.md`。
+
+# 【agent-page2b 1009 · Wave-6 收尾：§16.11 页面规则维度 + §16.12 per-site 访问日志】
+
+scope：`src/server/page_rules.rs`、`access_log.rs`、`config.rs`、`admin.rs`、`admin_ui.html`、
+h1/h2/h3 里页面规则/访问日志相关行。未 commit/push/checkout/reset/stash/clean（临时 A/B 补丁已还原）。
+报告 `.agents/1009/reports/page2b-wave6.md`、修复 `.agents/1009/fixes/page2b-wave6.md`。
+构建 `~/scratch-page2b/target`；最终态单测 **481 passed / 0 failed / 1 ignored**、`cargo build --release` 通过。
+真机端口块 273xx（conf1/2/3），h3 用 aioquic 1.3.0。最终二进制 md5 `57f5dae5…`（`~/scratch-page2b/bin/ws-p2b`）。
+
+## 完成（真机验证）
+1. **§16.12 per-site 访问日志接线完成**（此前 `ListenerAccessLogConfig` 无人读的半成品）：
+   `access_log.rs` 新增 `resolve()`/`log_response_with(per)`；10 个调用点（h1:457/492、h2:224/289/368/406、
+   h3:636/835/918/990/1001 + `h3_send_response`/`proxy_connect_udp`/`connect_reject` 传参）全部串 listener 覆盖。
+   真机矩阵：`enable=false`→不记录；`realtime=true`→stderr+ring；只覆盖 level→继承；
+   **全局 enable=false + 只覆盖 realtime ⇒ 仍不记录（Option 设计目标；A/B 旧二进制确实会把 enable 误当默认开）**。
+   新端点 `POST /__admin/api/access_log/site_save`（admin.rs:523）null=继承、全 null=删段；UI 每站三态卡片。
+2. **§16.11 维度收尾 + 新修 P1 跨协议不一致**：核对 5 入口全部走 `rule_matches`+`MatchCtx`（11 调用点齐）。
+   新缺陷：h2/h3 的 host 只在 `:authority`，rewrite 改 `uri_mut()` 后重建 ctx 丢 host ⇒ 带 host 约束的
+   pass/response_headers/改写后 block 静默不命中（h1 免疫）。加 `host_snapshot`+`from_request_with_host`
+   （page_rules.rs:80/91；h2.rs:1144/1164；h3.rs:1556/1574）。A/B：nosnap 重编译 → h2c/h2TLS/h3 无
+   `X-Host-Matched`、h1/h1TLS 有；恢复后五协议全有、错 host 全无。真机矩阵 16 行 ×（h1/h2c/h1TLS/h2TLS/h3）
+   逐行一致（host 精确/通配/apex/边界、method、header 存在/值、priority=9 胜、无 priority 保序）。
+3. 面板往返（保存→重载→真机生效）：维度 GET 回显/save 落盘/快捷添加全通；非法值 400+指名；
+   超长 host(400字符)/header 值(5000)/method(20 项)/非字符串 400；UI key 与后端逐一比对（无浏览器人工点验）。
+4. panic 加固：`"*."` 曾因尾点折叠变成全匹配 → 现在不匹配；畸形规则直写 toml（13 条）+ 畸形请求均无 panic。
+
+## 交接 / 注意
+- `log_response` 现有两个入口（`&Arc<LiveConfig>` 版 + `log_response_with(&Config, …)` 快照版，与 agent-perf2 的 h1 复用合流），
+  两者都带 `per`；`resolve()` 是唯一继承判定点（有单测）。
+- 黑盒 `scripts/accept-verify.sh` **未跑**：他人 accept-verify 变体正占 28000+ 端口块/scratch-verify3b（pid 151681/151780），避让。
+- 共享树 19:0x 曾因 `upload_api.rs` 测试代码（他人）无法 `cargo test`；已恢复，最终 481 绿。
+- 遗留（非本 scope）：redirect target 的 `"302:"` 前缀不受支持（只认 301/307/308，其余整串进 Location），面板不拦 —— 另一议题。
+
+# 【agent-apps3b · `src/server/apps/**` `libs/app-engines/**` · Wave-6】2026-10-09 收工
+
+接手 apps3 被中断的半成品（引擎 `.env` 隔离/每子进程传 `.env` + `cgi_script` CGI 语义）：
+**读懂 → 补齐 → 真机验证**，报告 `.agents/1009/reports/apps3b-wave6.md`、
+修复 `.agents/1009/fixes/apps3b-wave6.md`。未 commit/push/checkout/reset/stash/clean；
+只改 scope 内文件。单测 **481 passed / 0 failed / 1 ignored**。
+
+## 修了 6 条（全部真机验证，除 F2 为 ASAN 验证）
+1. **[P1] 免锁判据改成 `.so` 自报**（`app_ffi.rs` + `appengine.h` + `cgi_engine.c`）：半成品按引擎名
+   硬编码 `cgi` 免锁，但 `appengine_set_base_env` 所有引擎 `.so` 都链接 —— 陈旧 `libapp_cgi.so`
+   （仍 setenv/继承 environ）会被当免锁 ⇒ 跨应用 `.env` 泄漏回归。新增可选符号
+   `appengine_env_isolation()`（只有真正按子进程传 .env 的 cgi 引擎提供），两者都成立才免锁。
+   真机：旧 .so 仍持锁（等 2.71s）→ 新 .so 0.010s。
+2. **[P1] `appengine_set_base_env` 拷贝 +2 越界读 1 字节**（`appengine_common.c:383`）：
+   ASAN `heap-buffer-overflow READ of size 2 ... 0 bytes after 1-byte region`（空基底 1 字节块）。
+3. **[P1] `cgi_script` SCRIPT_NAME/PATH_INFO 做完**（`cgi_script.rs` + `apps/mod.rs`）：h1/h2c/h3
+   共用 `resolve_target`；`/cgis/index.cgi`→SCRIPT_NAME=/cgis/index.cgi,PATH_INFO=""；
+   `/cgis/index.cgi/extra/path`→/extra/path；与 cgi 引擎同口径（目录回落一档差异已记录）。
+4. **[P1 新发现] pyembed `os.environ` 被整表清空**（`crucible_pyembed.h`）：apps2 的「还原」用
+   `PyDict_GetItemString(os.environ,…)`，而 os.environ 是 `os._Environ`（非 dict，恒 NULL）
+   ⇒ 每个键都记成「原本不存在」⇒ 请求结束删空 os.environ。真机 `ENV_LEN 52→54→0`（修前）vs
+   `52→54→52`（修后）。还原原值改走 `__setitem__`。
+5. **[P1 新发现] `g_py_lock` ↔ GIL ABBA 死锁**（`crucible_pyembed.h` 请求路径改「先锁后 GIL」）：
+   冷启动 **3 个**并发带 `.env` 的 wsgi 请求即永久卡死**全部**锁引擎（cgi/cgi_script 仍可用）。
+   定位：持 g_py_lock 做 app 加载时 CPython 释放 GIL，另一线程拿 GIL 后等 g_py_lock。
+   真机 A/B：修前 3/3 超时 + 全站停滞（500 请求扫描 110.4s/67 超时）；修后 n=3..24 全 200、
+   600 请求 0.3s、扫描 0.5s/0 超时。**pre-existing**（用 HEAD 版 header 构建的 .so 同样复现）。
+6. **[P2] 上传 docroot 闸门补 disabled-app 漏形态**（`upload_api.rs:223`）：`enabled=false` 但
+   显式配了 docroot 的应用不设防 ⇒ `PUT /dapp/deps/bin/index` 真机 **201**（先上传后启用的定时 RCE）；
+   改为「显式 docroot 不论 enabled 都拦，docroot=None 才跳过」，修后 403。
+
+## 真机验证（20800 h1+h2c 整站上传 / 20844 h1+h2+h3；`~/scratch-apps3b/`）
+- **(a)** 并发跨应用隔离：cgi/cgi_script/wsgi/asgi/lua 全部「无 .env 的 B 读不到 A 的键」；
+  两个不同 .env 的 cgi 请求并发总墙钟 1.02s（串行会 2s）且各看自己的值。
+- **(b)** sec2-wave5 的诚实边界**对 cgi/cgi_script 已消除**：慢空 cgi(sleep 3) 在飞时带 .env 的
+  `/cgia/` 2.713s → **0.010s**。**残余**：锁引擎之间仍串行（慢空 wsgi 挡带 .env wsgi 仍 2.70s），
+  根治要按引擎改成按子进程传 .env（未做，属大改）。
+- **(c)** `cgi_script` PATH_INFO 三协议一致（见上）；**(d)** `.env` 下发/`BASE_MARK` 基底传递/
+  POST body/HEAD/引擎 200 无回归。
+- **上传闸门**：26 项全 PASS（docroot/deps/bin/index/符号链接/大小写/percent-encode/点段/双斜杠/
+  裸 socket 的 `%2e%2e`→400）。注意 **curl 会自行规范化 URL**，`/apg/%2e%2e/x` 这类必须裸 socket 发。
+- **h1/h2c/h3 矩阵**：状态码+body+引擎标签全一致，唯一 DIFF 见下条。
+- **扫描**：500 请求（72 畸形）→ 0 panic / 0 僵尸 / 0 泄漏子进程，0.5s。
+
+## 跨 scope 点名（未改）
+- **h3 对 HEAD 的 app 引擎响应会发 body**（h1/h2c 为空；静态 HEAD 正常）：`src/server/h3.rs` 无任何
+  HEAD 处理，违反 RFC 9110 §9.3.2。证据：`h3 HEAD /cgis/index.cgi` 有 body、`h3 HEAD /hello.txt` 无。
+  owner: h3 scope。
+- 锁引擎（wsgi/asgi/uwsgi/lua/python/ruby/perl/c）之间仍受进程 env 锁串行（可用性，非正确性）。
+- `PUT/POST <app 认领路径>` 由引擎执行（不落盘）——sec2 §3.2 的 P2 观察仍成立。
+- `python`/`perl`/`psgi`/`php` 本机 502（embed-missing / 无 php 二进制）⇒ 其跨应用隔离与 PATH_INFO
+  未真机验证（静态）。
+
+## 环境（给协调员）
+- 引擎重建：`bash scripts/build_app_engines.sh`（**必须 bash**；`sh` 下 `[[ ]]` 失效会静默跳过分支，
+  并误报「Lua headers not found」）。本波重建了 `target/app-engines/` 全部 `.so`（perl/psgi 保持
+  embed-missing，与构建日志一致）。
+- 实例仍在本机运行（20800/20844）；`bash ~/scratch-apps3b/srv.sh stop` 可停。
+- 共享树 19:0x 曾因**我**新加的 upload_api 单测有 moved-value 编译错（19:39 已修）；最终 481 绿。
+- 期间他人 `pkill -x webserver` 会杀掉所有实例（我的验证被中断过一次），排障时留意。
+
+---
+
+# 【agent-perf3b 1009 · perf3b-wave6（半成品收尾 + 三步落地 + 真 h2o 门禁）】
+
+scope：`src/server/static_files.rs`、`src/server/h1.rs`、`src/server/access_log.rs`（本 agent 部分）。
+`src/server/mod.rs`/`Cargo.toml` 未改。**未** commit/push/checkout/reset/stash/clean。
+报告 `.agents/1009/reports/perf3b-wave6.md`、修复总结 `.agents/1009/fixes/perf3b-wave6.md`。
+工具/冻结树/日志全在 `~/scratch-perf3b/`（端口 24381 h1 / 24395 h2c / 24481 h2o；验收套件副本 24xxx）。
+
+## 已落地（全部真机/单测/黑盒验证）
+1. **perf3 半成品收尾**：`canon_root_cached→Arc<PathBuf>`、`CANON_CACHE` 两级表确认正确；
+   补完**尾斜杠快车道**（h1 `serve` 与 h2/h3 `serve_simple`：`/` 结尾 URL 直接探索引，省一次目录
+   `stat`；未命中回退原路径，301/autoindex/404/FIFO 语义不变）；`resolve_path` 的 percent-decode 改
+   `Cow`（命中零分配）。
+2. **路由链短路**：`lc.page_rules` 为空时不再构造 3 次 `MatchCtx`/跑 4 处空扫描；`admin_geoip::try_handle_public`
+   （恒 None 的 stub）不再每请求 `.await`（按文档契约加 `snap.geoip.enabled` 闸门）；请求配置快照只取一次
+   （去掉 `log_response` 内部那次 `live.snapshot()`）。
+3. **access_log**：行拼接 4 次分配 → 一次 `write!`（输出逐字不变）。**与该文件并发改动的
+   「每站访问日志」agent 的 API（`log_response_with` + `per`）已互相适配**。
+4. **加量**：h1 `serve_io_opts` 的 `lc` 改 `Arc` —— 去掉**每请求一次 `ListenerConfig` 深拷贝**。
+
+## 数字（冻结树同源 A/B；交替 3 轮取中位）
+- BASE（本轮改动全回退）vs FINAL：`ka /` **+7.8%**（40,739→43,898）、`404` +3.5%、`churn` +6.2%、
+  `h2c /` **+12.7%**（69,066→77,802）；p50 同步降（ka 3.23→3.02ms）。
+- 单变量隔离（4 变体同轮交错）：h2c 上 static ≈ +11.0%、log ≈ +1.7%、routing ≈ +0.7%（噪声）；
+  `Arc<ListenerConfig>` ≈ +2–4%（两种顺序对照）。
+- **门禁（真 h2o 2.2.5，ka c128 p8，双方 2 线程）**：`/` 双方都打满那轮 **吞吐 h2o/ours=1.37×、
+  延迟 ours/h2o=1.38×（59,195 rps/1.95 核 vs 43,165 rps/1.96 核）⇒ 未达标**；中位口径 1.19×/1.36×
+  （h2o 两轮未打满，1.37–1.53 核，中位低估 h2o）。`/nope`（404）：**1.05× / 1.19× ⇒ 达标**。
+  比 perf2 的 1.47×/1.51× 明显收窄；`/` 还差 ~13.6% 吞吐（需 49.3k，现 43.4k）。
+- **卡在哪（同会话差分）**：stub（进 handler 立即回 200）58,461 rps ≈ **33.5µs/req** ≈ h2o 全栈
+  32.9µs；应用层 ≈12.3µs。1.2× 要求应用层 ≤6µs（再砍一半）**或**把地板本身降下来（动 hyper/tokio
+  每请求成本，独立工程）。**「再抠 stat/alloc」到不了 1.2×** —— 这是本轮最硬的结论。
+
+## 验证
+- 单测（仓库内）：`cargo test --release --bin webserver --features tls,tls_boring` → **481 passed / 0 failed / 1 ignored**。
+- 黑盒套件（`~/scratch-perf3b/av/accept-verify.sh --no-build`，端口 24xxx，独立状态根）：
+  **BASE vs AFTER 逐项 0 差异**，PASS=118 FAIL=1 SKIP=12（+ext 9/0/0 +h3 9/0/2）。唯一 FAIL 是
+  `CL+TE → 400` 实测 201（hyper 既定处置，**BASE/AFTER 都失败**，非本轮引入，是否补显式 400 留给 h1 scope）。
+- 语义红线全过：ETag 含 inode（rename 替换后 ETag 变）、symlink containment（root 外拒/内允）、
+  目录 301、Range/条件/HEAD+Range/405/416。
+
+## 给下一个人的两个坑
+1. **两个不同源路径的树共用同一个 `CARGO_TARGET_DIR`，cargo 会误判「最新」直接复用另一个树的产物**
+   （BASE 构建 0.15s「完成」、md5 与 AFTER 相同）——每个树必须独立 target 目录。
+2. `restart.sh` 的 sleep 2 + 首次压测会受机器负载漂移影响；A/B 必须交替多轮取中位（本机共享 32 核，
+   load 0.5–11.5 波动）。
+
+---
+# 【agent-verify3b / 工号 1009 · scope: scripts/accept-*、reports/verify3b-wave6.md、fixes/verify3b-wave6.md、~/scratch-verify3b】Wave-6 独立黑盒验收（收工）
+
+**快照**：HEAD `704ba39`（工作树 dirty，Wave-5/6 agent + 主会话收尾）；二进制 **md5 `57f5dae5d72520ba585f8dc540cd4ba2`**
+（2026-10-09 20:01，`. /home/dev123/bin/buildenv.sh && $CARGO build --release --bin webserver --offline --features tls,tls_boring`，
+取自 `$CARGO_TARGET_DIR`）；源码 md5 清单 `~/scratch-verify3b/logs/source-md5.txt`（92 文件）。
+开工时（18:22）工作树**不可编译**（主会话正在收尾：`log_response_with` E0425 → h3 缺参 E0061 → `check_page_rule_*` E0425），
+等 3 分钟静默 + `cargo check` 通过后定版（20:01）；19:09 后源码未再改（`md5sum -c` 全 OK）。
+未 commit/push/checkout/reset/stash/clean；未改任何非 scope 文件。
+
+## 总账（对比 verify2 的 118/1/12 与合计 136/1/14）
+- PASS1：**118 / 1 / 12**（131 项；与基线**逐项一致**，同一 FAIL、同一 SKIP 集合）
+- PASS1.5 EXT：**58 / 0 / 0**（新增 ~49 条 Wave-5/6 功能检查）
+- PASS1.6 GOAWAY：**4 / 0 / 0**（新增）
+- PASS2 H3/DoT/DoH：**16 / 0 / 2**（新增 7 条 ECS 检查）
+- **合计 196 PASS / 1 FAIL / 14 SKIP（211 项）**；单测 **481 passed / 0 failed / 1 ignored**
+
+## Wave-5/6 新功能与半成品（全部黑盒通过，真机证据见报告 §2）
+1. **页面规则维度 host/method/header**：同一规则在 h1/h2c/h2TLS/h3 四面判定**一致**（403/404 逐例相同）；
+   维度取不到（HTTP/1.0 无 Host）→ **不匹配（404）**而非放宽；priority（/dup→308 /high）与旧配置（/order→301 /first）不回归。
+2. **per-site 访问日志**：28087 覆盖 `enable=false`（全局 true）→ 不落日志；未配 → 继承全局落日志；
+   独立实例全局 false + listener true → 该口落日志、未配口不落。**已接线**（主会话 19:05–19:09 完成收尾）。
+3. **per-child `.env`**：A(慢 .env) 在飞时 B(无 .env) 输出 `<unset>` 且 <1.5s 不等待；A+D 并发各自密钥不串；
+   慢空请求不再拖慢带 .env 请求（旧 4.7s 串行消失）；`cgi_script` 路径同样干净。`init_base_env` + 子进程 envp 生效。
+4. **dns ECS FORMERR**：4 种畸形 ECS（重复/长度越界/未知 family/地址过短）→ DoT **RCODE=1**；
+   正常 ECS/无 ECS 不受影响；DoH 畸形 → **200 + RCODE=1**（接线在 `udp_query_opts` 唯一入口）。
+5. **上传 RCE 闸门**：PUT `init.sh`/`.env`/`deps/bin/index`/符号链接/percent-encode/大小写/普通 txt → 全部 **403**
+   且**内容与 mtime 未变**；app docroot 外正常上传 2xx。
+6. **h3 GOAWAY**：空闲连接 GOAWAY@0.30s、之前未被 CONNECTION_CLOSE；在飞 `/slow` 期间收到 GOAWAY 且响应完整 200。
+7. **per-listener ip_access 三面**：明文 28093 / TLS h1+h2 28096 / h3 28097 → **403**；对照口 28094/28443/28098 → **200**。
+8. **面板 ACME**：`/api/dns/acme/issue` 空域名回「domain 未配置」⇒ 已走统一入口 `issue_now`（旧自拼命令会报 unsafe domain）。
+
+## 移交缺陷（详情 + 复现见 reports/verify3b-wave6.md §3、fixes/verify3b-wave6.md §2）
+- **[P2，仍开放] CL+TE 并存 → 201（应 400）** —— owner **h1**（与 verify2 的 V5-1 同一条，本轮复现）。
+- **[P2 流程，静态分析未真机验证] host 与 `target/app-engines/*.so` 必须同代重建** —— owner **apps/build**；
+  新 host 按引擎名判 `cgi` 可跳过 env_lock，依赖引擎有 `appengine_set_base_env`；当前仓库产物已重建（md5 与源码现编一致）故组合实测干净。
+- **[P3] GOAWAY 宽限窗口内新连接收不到 GOAWAY** —— owner **h2h3**（本人在飞用例首轮踩到）。
+- **[P3] h3 大写字段名 → RST_STREAM 0x10e（合规）而 h1/h2 宽容** —— owner **h2h3**，记档。
+- **[P3] 访问日志 `level` 对落盘无影响（有意）** —— 记档。
+
+## 性能门禁独立复核（真实数字）
+h2o 2.2.5（免 root deb，`num-threads:2`，无访问日志）vs ours（最终二进制，2 worker，访问日志开，同一 122B index.html）；
+客户端 = 复制的 perf2 `bench.py`，`ka`，交替 A/B 取中位：
+- **双端打满（c256 p12，cores≈1.97/1.98）**：`/` **h2o/ours=1.45×**、`ours/h2o(p50)=1.44×`（h2o 64.1k vs ours 44.2k）；
+  404 路径 1.31×/1.33×；静默机确认轮 `/` **1.42×/1.46×**（load 1.23）。
+- 客户端并发不足（c128）时 h2o 未打满（cores 1.4–1.6）→ 比值被低估（1.02–1.15×）。
+- **结论：与 perf2-wave5「≈1.4–1.5×」一致；门禁 ≤1.2× 仍不达标。** 原始日志 `~/scratch-verify3b/perf/logs/run_ab_round*.log`。
+
+## 套件变更（scope：`scripts/accept-*`）
+端口块 27000→**28000**、状态根 → **`~/scratch-verify3b`**；新增 **`accept-verify-goaway.py`**；
+genconf 加页面规则维度集/`/slow`/`/cga`+`.env` apps/`access_log` 覆盖 listener；
+ext/h3 各加硬超时与 ECS 客户端；orchestrator 构建 rc 检查、pkill 端口精确化、趟前探活重启、现编 `libapp_cgi.so`。
+一键：`cd /home/dev123/crucible-git && sh scripts/accept-verify.sh`（或 `--no-build`）。
+
+## 环境干扰（真实发生，已加固）
+- 18:57 我的实例被**外部 SIGTERM** 杀掉（ext 中途，aioquic 无超时卡死）→ 套件加硬超时 + 趟前探活重启。
+- 上游 28099 被**别的 agent 的宽泛 pkill**（对方 scratch-perf3b 用同名脚本）误杀 → pkill 改端口精确 + 趟前重启。
+- 未用远程 OpenBSD；CONNECT-UDP 真实上游回程（本机 UDP 出网禁）未覆盖，如实标注。

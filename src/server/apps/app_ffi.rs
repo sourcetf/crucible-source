@@ -59,6 +59,16 @@ type ExecFn = unsafe extern "C" fn(
 type FreeFn = unsafe extern "C" fn(*mut AppEngineResult);
 type ShutdownFn = unsafe extern "C" fn();
 type AbiVersionFn = unsafe extern "C" fn() -> c_int;
+/// 可选符号（见 `appengine.h`）：把**启动期基底环境**交给引擎。
+type SetBaseEnvFn = unsafe extern "C" fn(*const c_char) -> c_int;
+/// 可选符号（见 `appengine.h`）：引擎自报「不依赖进程 env」（子进程 envp 只由
+/// 基底 + 本请求 `.env` 拼出、从不 setenv、从不继承 `environ`）。非 0 = 是。
+///
+/// 用**引擎自报**而不是宿主按引擎名维护名单：陈旧 .so 同样链接了 common 里的
+/// `appengine_set_base_env`（符号在 ≠ 引擎真的用它），按名放行会让那只 .so 在
+/// 进程 env 锁外跑 ⇒ 跨应用 `.env` 泄漏回归。取自报后，陈旧 .so 缺这个符号 ⇒
+/// 自动留在锁内（正确性优先，只是少一点并发）。
+type EnvIsolationFn = unsafe extern "C" fn() -> c_int;
 
 /// Host-side ABI version. **Must** equal `APPENGINE_ABI_VERSION` in
 /// `libs/app-engines/include/appengine.h` (and in the go/rust plugin samples).
@@ -105,6 +115,17 @@ struct EngineLib {
     exec: ExecFn,
     free: FreeFn,
     shutdown: ShutdownFn,
+    /// 本 .so **自报**「不依赖进程 env」⇒ 宿主可以对它**跳过** [`env_lock`] 的进程 env 互斥。
+    ///
+    /// 判据（两个可选符号都成立）：`appengine_set_base_env` 调用成功（引擎拿到了启动期基底）
+    /// **且** `appengine_env_isolation()` 返回非 0（引擎声明它按子进程/子请求传 `.env`、
+    /// 从不 setenv、从不继承 `environ`）。
+    ///
+    /// 必须按 **每个 .so** 实测，不能按引擎名硬编码：声明 lock-free 的引擎配上一只**旧**
+    /// `.so`（仍旧 `appengine_apply_extra` → setenv + 继承 environ；但 common.c 里的
+    /// `appengine_set_base_env` 符号**照样存在**）时若跳锁，那只 .so 就会在别人 `.env`
+    /// 生效的窗口里读到别人的私密值 —— 跨应用泄漏又回来了。取自报后，这种 .so 自动留锁。
+    env_free: bool,
 }
 
 unsafe impl Send for EngineLib {}
@@ -341,13 +362,26 @@ async fn exec_dispatch(
     // P1-1：闭包必须持有 owned 环境变量（'static），在闭包内转 &[(&str,&str)]。
     let env_vars_owned: Vec<(String, String)> = env_vars.to_vec();
     let headers_owned: Vec<u8> = headers.to_vec();
+    // 该 .so **自报**「不依赖进程 env」（`appengine_env_isolation` + `appengine_set_base_env`
+    // 都成功，见 EngineLib::env_free）。只有这种 .so 才允许跳过 env_lock：
+    //   * 跳过 ⇒ 该引擎的子进程/子请求 env 完全由「启动期基底 + 本请求 .env」拼出，
+    //     一个慢的**空**请求不会挡住随后带 `.env` 的请求（见 env_lock 模块注释）；
+    //   * 不自报（含所有其它引擎、以及任何陈旧 .so）⇒ 留在锁内，跨应用 `.env` 隔离
+    //     不依赖引擎实现。
     let job = move || {
+        // 先按需装载（快路径 = 一次表查找）再决策：`env_free` 是 .so 的属性。
+        let lib = load_engine(&engine, &lib_path)?;
+        if lib.env_free {
+            return call_exec(
+                &lib, &engine, &script, &docroot, &m, &p, &q, &ct, &b, peer, port,
+                &server_name, &env_vars_owned, &headers_owned,
+            );
+        }
         let vars: Vec<(&str, &str)> = env_vars_owned
             .iter()
             .map(|(k, v)| (k.as_str(), v.as_str()))
             .collect();
         env_lock::with_temp_env_named(&engine, &vars, || {
-            let lib = load_engine(&engine, &lib_path)?;
             call_exec(
                 &lib, &engine, &script, &docroot, &m, &p, &q, &ct, &b, peer, port,
                 &server_name, &env_vars_owned, &headers_owned,
@@ -640,6 +674,40 @@ fn load_engine(engine: &str, lib_path: &PathBuf) -> Result<Arc<EngineLib>> {
     if rc != 0 {
         bail!("appengine_init failed: {rc}");
     }
+    // 可选符号 `appengine_set_base_env` + `appengine_env_isolation`：把**启动期基底环境**
+    // （不含任何请求期临时 .env）交给引擎，并要求引擎**明确自报**它按子进程/子请求传 `.env`。
+    // 只有两者都成立才允许对该 .so 跳过 env 锁（见 `EngineLib::env_free`）。
+    // 缺失 → 旧引擎行为完全不变（继续继承 environ + 由 host 置于锁内）。
+    let mut env_free = false;
+    #[cfg(unix)]
+    unsafe {
+        let set_ok = match lib.get::<SetBaseEnvFn>(b"appengine_set_base_env\0") {
+            Ok(set_base) => {
+                let block = env_lock::base_env_block();
+                // block 恒以 NUL 结尾（空基底时是单个 NUL），`as_ptr` 有效。
+                let brc = set_base(block.as_ptr() as *const c_char);
+                if brc != 0 {
+                    log::warn!(
+                        "appengine_set_base_env rc={brc} for {}（继续，引擎退回继承 environ ⇒ 该引擎留在 env 锁内）",
+                        lib_path.display()
+                    );
+                }
+                brc == 0
+            }
+            Err(_) => false,
+        };
+        if set_ok {
+            match lib.get::<EnvIsolationFn>(b"appengine_env_isolation\0") {
+                Ok(isolation) => env_free = isolation() != 0,
+                // 有 set_base_env 但没有自报符号：不认为是 lock-free（陈旧 .so 的典型形态）。
+                Err(_) => log::debug!(
+                    "engine {} 有 appengine_set_base_env 但未自报 appengine_env_isolation —— 留在 env 锁内（{}）",
+                    engine,
+                    lib_path.display()
+                ),
+            }
+        }
+    }
     let lib = Arc::new(EngineLib {
         engine: engine.to_string(),
         path: key.clone(),
@@ -649,6 +717,7 @@ fn load_engine(engine: &str, lib_path: &PathBuf) -> Result<Arc<EngineLib>> {
         exec,
         free,
         shutdown,
+        env_free,
     });
     LIBS.lock().insert(key, Arc::clone(&lib));
     Ok(lib)

@@ -31,6 +31,16 @@ int appengine_fill_hello(AppEngineResult *out, const char *engine_name, const ch
  * name) is a no-op. Returns 0 on success/no-op, -1 on bad arguments. */
 int appengine_apply_extra(const char *extra);
 
+/* Same parse as appengine_apply_extra, but hands each (key,value) to `cb`
+ * instead of calling setenv(). Used by engines that must not touch the process
+ * env (cgi builds its child envp directly). Returns 0 on success/no-op. */
+int appengine_extra_env_foreach(const char *extra,
+                                int (*cb)(void *ctx, const char *k, const char *v),
+                                void *ctx);
+
+/* The base-env block set via appengine_set_base_env(), or NULL if unset. */
+const char *appengine_base_env_block(void);
+
 /* ---------------------------------------------------------- request headers ---
  * ABI 请求头块（appengine_execute 的 headers 参数）：
  *   每行 `Name: Value`，行间 `\r\n`，可为 NULL/空。

@@ -61,6 +61,21 @@ pub async fn udp_query_opts(
     // RFC 7871 §7.2.2「查询带 ECS ⇒ 应答必须带 ECS」，而注入后的 wire 我们已经
     // 改过，不能拿它当「客户端到底带没带 ECS」的依据。
     let client_query = wire.clone();
+    // RFC 7871 §7.2.1：收到**畸形** ECS（未知 FAMILY、地址长度与 SOURCE 不符、同一 OPT
+    // 多个 ECS、option 声明长度与实际不符）时应回 FORMERR，而不是照常递归/权威应答。
+    // 判定**不看 `cfg.ecs`**：开关只决定「我们是否主动注入/剥离 ECS」，不改变 wire 的
+    // 合法性。关掉 ECS 时畸形 option 同样不可解析（strip_ecs_option 只能原样转发），
+    // 若在此跳过判定，畸形数据就会被静默泄给上游 —— 与 ecs.rs 模块文档「畸形 ECS 不
+    // 转发」相悖。无 ECS、无 OPT 的普通查询 malformed_ecs 返回 false，不受影响。
+    // 这是 DoT 与 DoH **唯一**的 DNS 报文入口（DoT→udp_query、DoH→udp_query_opts(..,true)），
+    // 接线在此即覆盖两条协议；DoH 侧 DNS 层错误仍以 HTTP 200 + wire 内 RCODE 表达
+    // （RFC 8484 §4.2），两条协议对外语义一致。
+    if super::ecs::malformed_ecs(&client_query) {
+        if let Some(resp) = super::ecs::formerr_response(&client_query) {
+            log::debug!("dns: malformed ECS → FORMERR ({} bytes)", client_query.len());
+            return Ok(resp);
+        }
+    }
     // ECS（RFC7871）：
     // - 开关开：v4 固定 /24、v6 /56，客户端自带 ECS 也重写（禁止 /32 出网）；
     // - 开关关：剥离客户端自带的 ECS option —— 否则「关」只关掉了注入，客户端 ECS
@@ -93,11 +108,17 @@ pub async fn udp_query_opts(
     // RFC 7871 §7.2.2（递归/中介侧）：客户端查询**带** ECS 时，应答**必须**回带 ECS
     // option。上游是本机 BIND 9 —— 它不实现 ECS、不会在应答里回 option，所以只能由
     // 本层按客户端原始查询回显（FAMILY/SOURCE/ADDRESS 与查询一致、SCOPE=0）。
-    // `apply_response_ecs` 在查询**没带** ECS 时原样返回，故这里可以无条件调用。
+    // `apply_response_ecs` 在查询**没带** ECS 时原样返回，不误加 option。
     // （此前该函数已写好但从未接线 —— 应答侧 ECS 等于没实现。）
+    // 但仅在 `cfg.ecs` 开启时回显：关掉 ECS 时刻意**剥离**了客户端 ECS、上游应答
+    // 与子网无关，若仍回一个 SCOPE=0 的 ECS option，等于告诉下游缓存「这条应答是按
+    // 该 /24 定制的」—— 是错误信息（报文里没有任何按子网定制的内容）。
     // 回显会加一个 OPT（约 11~15 字节）：UDP 收到的应答最大 65535，加上后可能越过
     // 65535 —— DoT 侧用 `answer.len() as u16` 写长度前缀，越界会静默截断成坏帧，
     // 因此越过上限时放弃回显（宁可少一个 option 也不能发坏帧）。
+    if !cfg.ecs {
+        return Ok(buf);
+    }
     let echoed = super::ecs::apply_response_ecs(&client_query, &buf);
     Ok(if echoed.len() <= 65535 { echoed } else { buf })
 }

@@ -391,9 +391,15 @@ where
     // （不改变正在处理的语义），之后连接关闭，客户端下一次请求会走新的 accept 路径拿到新配置。
     // 与 nginx reload 关掉 keepalive 同一语义；只在 listener 指纹真的变了时才触发。
     let gen0 = live.listeners_generation();
+    // `lc` 为整条连接（keep-alive 上的每个请求）共享且**不可变**：放进 `Arc` 之后
+    // service 闭包每请求只做一次引用计数克隆，而不是 `ListenerConfig` 的深拷贝
+    // （address/root/http_versions/apps/file_open/page_rules… 一串 String/Vec 的堆分配，
+    // 纯静态站点每请求也要 ~4 次 malloc/free）。语义不变：连接存活期内 listener 策略
+    // 本就固定（配置变更由下面的 generation 检测触发 Connection: close）。
+    let lc = Arc::new(lc);
     let svc = service_fn(move |req: Request<Incoming>| {
         let live = Arc::clone(&live);
-        let lc = lc.clone();
+        let lc = Arc::clone(&lc);
         async move {
             let mut resp = handle_request(req, live.clone(), lc, peer).await;
             if live.listeners_generation() != gen0 {
@@ -432,7 +438,7 @@ where
 pub async fn handle_request(
     req: Request<Incoming>,
     live: Arc<LiveConfig>,
-    lc: ListenerConfig,
+    lc: Arc<ListenerConfig>,
     peer: SocketAddr,
 ) -> Response<BoxBody> {
     // P1-11：访问日志在响应完成侧统一记录全字段（时间/method/status/bytes/duration/engine），
@@ -445,7 +451,15 @@ pub async fn handle_request(
     let method = req.method().clone();
     let path0 = req.uri().clone();
     let is_https = lc.ssl.is_some();
-    let mut resp = handle_request_inner(req, Arc::clone(&live), lc, peer).await;
+    // §16.12：每站访问日志覆盖（`[listeners.access_log]`）必须在 `lc` 被 move 进
+    // handle_request_inner 之前取出——收口处的全字段日志在响应完成侧，那时已经没有 lc。
+    // `None` = 完全继承全局 `[access_log]`。
+    let access_override = lc.access_log.clone();
+    // 配置快照**只取一次**：请求判定（handle_request_inner）与收口处的访问日志共用
+    // 同一份 `Arc<Config>`。旧实现两处各自 `live.snapshot()`（每次一把 RwLock 读锁 +
+    // Arc 克隆），访问日志那一份纯属多余 —— 请求路径上白付一次锁 + 原子操作。
+    let snap = live.snapshot();
+    let mut resp = handle_request_inner(req, Arc::clone(&live), Arc::clone(&snap), lc, peer).await;
     // 大文件（static 层的 FileSource 标记）在这里换成真正的流式 body：这是所有
     // 分支（acl/admin/apps/proxy/static/upload…）回包的**唯一**收口点。
     // 用 extensions 传来源而不是改 body 类型，是为了不动其它 ~30 处 `Response<BoxBody>`
@@ -473,8 +487,10 @@ pub async fn handle_request(
     // 流式/分块 body 返回 None（日志里显示 `-`）。此前这里硬编码 None，导致 h1 访问日志的
     // bytes 字段**恒为 `-`**，而 h2/h3 两条路径都已经在记真实长度 —— 同一字段随协议而异。
     let resp_bytes = hyper::body::Body::size_hint(resp.body()).exact();
-    crate::server::access_log::log_response(
-        &live,
+    // 复用上面那份快照（不在这里再 snapshot 一次，见 handle_request 顶部说明）。
+    // 末尾传本 listener 的 §16.12 访问日志覆盖（None = 继承全局）。
+    crate::server::access_log::log_response_with(
+        &snap,
         peer,
         "h1",
         method.as_str(),
@@ -483,6 +499,7 @@ pub async fn handle_request(
         resp_bytes,
         t0.elapsed(),
         engine,
+        access_override.as_ref(),
     );
     resp
 }
@@ -490,7 +507,8 @@ pub async fn handle_request(
 async fn handle_request_inner(
     req: Request<Incoming>,
     live: Arc<LiveConfig>,
-    lc: ListenerConfig,
+    snap: Arc<crate::config::Config>,
+    lc: Arc<ListenerConfig>,
     peer: SocketAddr,
 ) -> Response<BoxBody> {
     // RFC 9112 §3.2：HTTP/1.1 缺 Host / 多行 Host / 非法 Host 值一律 400。
@@ -515,9 +533,15 @@ async fn handle_request_inner(
     let path = req.uri().path().to_string();
     crate::server::telemetry::record_request();
 
-    let snap = live.snapshot();
-    if let Some(resp) = crate::server::admin_geoip::try_handle_public(&req, &live).await {
-        return tag(resp, "geoip");
+    // GeoIP 公共 API：`try_handle_public` 目前是恒 `None` 的 stub（安全策略：GeoIP API
+    // 只在 admin 面板鉴权后暴露）。旧实现每请求都 `.await` 一个必然立即返回 `None` 的
+    // future（建状态机 + poll）；这里按它的文档契约（“when `geoip.enabled`”）加一道
+    // 廉价闸门。当前语义不变（stub 恒 None）；若将来把它接成真实路由，注意 h2/h3 也从未
+    // 调用过它，接线时三协议要同改。
+    if snap.geoip.enabled {
+        if let Some(resp) = crate::server::admin_geoip::try_handle_public(&req, &live).await {
+            return tag(resp, "geoip");
+        }
     }
 
     // 请求路径：IP access → rate limit → metrics → DoH → basic auth → page_rules → admin → apps → proxy → static
@@ -822,56 +846,74 @@ async fn handle_request_inner(
     }
 
     let mut req = req;
+    // 页面规则（rewrite / redirect / block / pass / 响应头）**未配置时整段短路**：
+    // 空规则表下这四个入口全部恒为 None/空，但旧实现每请求仍要构造 3 次 `MatchCtx`
+    // （每次 `from_request`：method + URI authority/Host 头查找）并各跑一次空扫描 + 空
+    // `Vec` 收集。`lc.page_rules` 为空是纯静态/纯反代站点的常态。
+    let rules_on = !lc.page_rules.is_empty();
     // 改写之后必须以**新路径**做后续判定与分发。
-    // 此前把改写前的 path 传进 dispatch_tail，于是 `would_handle`/`would_proxy` 判断
-    // 的是一个路径、真正干活的 handler（apps::try_handle 内部自己重算 req.uri()）
+    // 此前把改写前的 path 传进 dispatch_tail，于是 `would_handle`/`would_proxy` 判断的
+    // 是一个路径、真正干活的 handler（apps::try_handle 内部自己重算 req.uri()）
     // 用的是另一个：改写命中时会错发 502「app dispatch returned empty」，
     // 或者把本该交给引擎的请求当静态文件发出去。
     //
     // 无 rewrite 命中时 `path` 不变，直接沿用已有的 owned String —— 省掉每请求一次
     // 多余的 `req.uri().path().to_string()` 堆分配（绝大多数请求都不带 rewrite 规则）。
-    let path = if let Some(np) = crate::server::page_rules::rewrite_path(&lc, &path) {
-        let pq = match req.uri().query() {
-            Some(q) => format!("{np}?{q}"),
-            None => np,
-        };
-        if let Ok(u) = pq.parse() {
-            *req.uri_mut() = u;
+    // rewrite 需要 method/host/header 判据；改完 URI 后引用失效 → 块内判定、块后重建。
+    let mut path = path;
+    if rules_on {
+        {
+            let pr_ctx = crate::server::page_rules::MatchCtx::from_request(&req);
+            if let Some(np) = crate::server::page_rules::rewrite_path(&lc, &path, &pr_ctx) {
+                let pq = match req.uri().query() {
+                    Some(q) => format!("{np}?{q}"),
+                    None => np,
+                };
+                if let Ok(u) = pq.parse() {
+                    *req.uri_mut() = u;
+                }
+                path = req.uri().path().to_string();
+            }
         }
-        req.uri().path().to_string()
+        if let Some(resp) = crate::server::page_rules::apply(&lc, &req) {
+            return tag(resp, "rule");
+        }
+        let pr_ctx = crate::server::page_rules::MatchCtx::from_request(&req);
+        if let Some((murl, upstream)) = crate::server::page_rules::pass_upstream(&lc, &path, &pr_ctx)
+        {
+            // 反代本就全量缓冲 body：这里收齐后转 Full 交反代（语义不变，见 proxy.rs）。
+            // 上限与 proxy.rs 一致（UPSTREAM_BODY_CAP）：无界 collect 会被超大 body 撑爆内存，
+            // 使 proxy.rs 内部的上限形同虚设。
+            // 收 body 前先按 Content-Length 廉价拒绝（避免 100 Continue / 白收）。
+            if content_length_too_large(req.headers(), UPSTREAM_BODY_CAP) {
+                return tag(
+                    body_read_response(BodyReadErr::TooLarge, "request body too large"),
+                    "proxy",
+                );
+            }
+            let (parts, body) = req.into_parts();
+            let bytes = match collect_body_capped(body, UPSTREAM_BODY_CAP).await {
+                Ok(b) => b,
+                Err(e) => return tag(body_read_response(e, "request body too large"), "proxy"),
+            };
+            let resp = crate::server::proxy::proxy_page_rule(
+                Request::from_parts(parts, Full::new(bytes)),
+                &murl,
+                &upstream,
+                peer.ip(),
+                lc.ssl.is_some(),
+            )
+            .await;
+            return tag(resp, "proxy");
+        }
+    }
+    // 未配置页面规则时不再构造 `MatchCtx` / 跑空扫描（见上面 rules_on 的说明）。
+    let resp_mods = if rules_on {
+        let pr_ctx = crate::server::page_rules::MatchCtx::from_request(&req);
+        crate::server::page_rules::response_headers(&lc, &path, &pr_ctx)
     } else {
-        path
+        Vec::new()
     };
-    if let Some(resp) = crate::server::page_rules::apply(&lc, &req) {
-        return tag(resp, "rule");
-    }
-    if let Some((murl, upstream)) = crate::server::page_rules::pass_upstream(&lc, &path) {
-        // 反代本就全量缓冲 body：这里收齐后转 Full 交反代（语义不变，见 proxy.rs）。
-        // 上限与 proxy.rs 一致（UPSTREAM_BODY_CAP）：无界 collect 会被超大 body 撑爆内存，
-        // 使 proxy.rs 内部的上限形同虚设。
-        // 收 body 前先按 Content-Length 廉价拒绝（避免 100 Continue / 白收）。
-        if content_length_too_large(req.headers(), UPSTREAM_BODY_CAP) {
-            return tag(
-                body_read_response(BodyReadErr::TooLarge, "request body too large"),
-                "proxy",
-            );
-        }
-        let (parts, body) = req.into_parts();
-        let bytes = match collect_body_capped(body, UPSTREAM_BODY_CAP).await {
-            Ok(b) => b,
-            Err(e) => return tag(body_read_response(e, "request body too large"), "proxy"),
-        };
-        let resp = crate::server::proxy::proxy_page_rule(
-            Request::from_parts(parts, Full::new(bytes)),
-            &murl,
-            &upstream,
-            peer.ip(),
-            lc.ssl.is_some(),
-        )
-        .await;
-        return tag(resp, "proxy");
-    }
-    let resp_mods = crate::server::page_rules::response_headers(&lc, &path);
     // `lc` 此后只用于读 `ssl` 标志：先取出该标志，把 lc **移进** dispatch_tail，
     // 省掉每请求一次 `ListenerConfig` 深拷贝（address/root/http_versions/apps/
     // page_rules… 一串 String/Vec/PathBuf 的堆分配）。
@@ -903,7 +945,7 @@ fn tag(resp: Response<BoxBody>, engine: &'static str) -> Response<BoxBody> {
 async fn dispatch_tail(
     req: Request<Incoming>,
     live: Arc<LiveConfig>,
-    lc: ListenerConfig,
+    lc: Arc<ListenerConfig>,
     peer: SocketAddr,
     path: String,
 ) -> Response<BoxBody> {
