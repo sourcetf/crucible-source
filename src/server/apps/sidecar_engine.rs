@@ -26,13 +26,23 @@ const SIDECAR_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 ///   * 空值（`.env` 的 `KEY=` = 「该键不存在」）不转发；
 ///   * 上限 64 键 / 16KiB，超出截断（防头膨胀）。
 ///
+/// **键仅大小写不同**（`.env` 里合法的 `KEY` 与 `key` 是**两个**环境变量，但 HTTP 头名
+/// 大小写不敏感 ⇒ 会生成同名头、sidecar 侧 `getHeader` 只能取到一条）——本函数在此定义
+/// 明确语义（P3）：
+///   * 值相同 ⇒ 只发**一条**（客户端看到的值与两个键都一致，无信息丢失，不记日志）；
+///   * 值不同 ⇒ **保留先出现的那个键**（= `.env` 文件顺序），后来的大小写变体**丢弃**并
+///     记一条节流 warn（不静默：运维能看到自己写了两个只差大小写的键，而头通道无法区分）。
+///   判定在**头通道**这一层完成（spawn env 通道不受影响：POSIX 环境变量大小写敏感，
+///   `KEY`/`key` 都会如实进进程 env）。
+///
 /// 只对 JSP/do 生效（见调用点）：c/go/rust 样例 sidecar 不读 env，凭空多发头反而可能
 /// 改动它们的响应（例如自行打印全部请求头）。
 pub(crate) fn env_forward_headers(vars: &[(String, String)]) -> Vec<(String, String)> {
     const MAX_KEYS: usize = 64;
     const MAX_BYTES: usize = 16 * 1024;
-    let mut out = Vec::new();
+    let mut out: Vec<(String, String)> = Vec::new();
     let mut used = 0usize;
+    let mut collisions: Vec<(String, String)> = Vec::new();
     for (k, v) in vars {
         if out.len() >= MAX_KEYS {
             break;
@@ -46,11 +56,33 @@ pub(crate) fn env_forward_headers(vars: &[(String, String)]) -> Vec<(String, Str
         }
         let enc = percent_encode_env_value(v);
         let name = format!("x-crucible-env-{}", k.to_ascii_lowercase());
+        // 大小写不同的同名键（HTTP 头名不区分大小写）：见上面的语义说明。
+        // 注意必须比较**编码前的原值**：`percent_encode_env_value` 是单射，比较编码值等价。
+        if let Some((_, prev)) = out.iter().find(|(n, _)| n == &name) {
+            if prev != &enc {
+                collisions.push((k.clone(), name.clone()));
+            }
+            continue;
+        }
         if used + name.len() + enc.len() + 2 > MAX_BYTES {
             break;
         }
         used += name.len() + enc.len() + 2;
         out.push((name, enc));
+    }
+    if !collisions.is_empty() {
+        let detail = collisions
+            .iter()
+            .map(|(k, n)| format!("{k} → {n}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        crate::server::log_throttle::warn_every(
+            "env-forward-case-collision",
+            std::time::Duration::from_secs(60),
+            &format!(
+                "sidecar env 头通道：.env 里存在仅大小写不同的键，头名大小写不敏感 ⇒ 保留先出现的那个，丢弃：{detail}"
+            ),
+        );
     }
     out
 }
@@ -171,7 +203,15 @@ pub async fn handle_with_fallback_simple(
             // 与 h1 侧同语义：自动 sidecar 同样剥掉路由前缀（sidecar 挂在 /ruby、/go
             // 这类前缀下，内部只认应用相对路径）。
             let target = crate::server::apps::app_ffi::rel_script_path(app, req.uri().path());
-            return proxy_uds_simple(req, &sock, peer, Some(target), &extra_headers).await;
+            // **受管 sidecar 只走 spawn env 通道**（h1 `native_http::try_handle` 传的就是
+            // `&[]`）：`.env` 已经在 spawn 时进了进程环境，这里再按请求发一遍
+            // `x-crucible-env-*` 有两个害处：
+            //   ① 同一 app 在 h1 上读不到 request attribute、在 h2/h3 上读得到 —— 跨协议
+            //      行为不一致（T6 真机复现：受管 `/jsp/` 的 `env-attribute` 在 h2c/h3 非空、
+            //      在 h1 为空）；
+            //   ② 每请求最多 64 头/16KiB 的纯重复开销。
+            // 显式 `apps[].socket`（上一分支）仍发头 —— 那条通道是运维进程 env 够不着的兜底。
+            return proxy_uds_simple(req, &sock, peer, Some(target), &[]).await;
         }
     }
     #[cfg(not(unix))]
@@ -394,17 +434,13 @@ struct SimpleSidecar {
 /// h2/h3 字节路径的 sidecar 注册表（键与 native_http 相同：port-app_idx-engine）。
 ///
 /// 与 native_http 的注册表并存：两边用**同一个 sock 路径**（`state/native/{key}/app.sock`），
-/// 且 spawn 前先 `sock_alive` 探测，所以一条协议先起的 sidecar 会被另一条复用；
-/// 只有「两条协议首次请求同时到达」的窄窗口可能各 spawn 一个（后启动的赢下 socket）。
-/// 彻底消除重复需要 native_http 暴露字节入口（跨组项，见工单总结）。
+/// spawn 前先 `sock_alive` 探测，所以一条协议先起的 sidecar 会被另一条复用；**并发首发**
+/// 这条窄窗由 [`crate::server::apps::native_http::sidecar_spawn_lock`] 关掉 —— 两条注册表
+/// 共用**同一把 per-sock 创建锁**，拿锁后重查（自己表 → `sock_alive`），因此同一时刻只有
+/// 一个 spawner 能走到 spawn（见该函数的说明）。
 #[cfg(unix)]
 static SIDECARS_SIMPLE: once_cell::sync::Lazy<
     parking_lot::Mutex<std::collections::HashMap<String, SimpleSidecar>>,
-> = once_cell::sync::Lazy::new(|| parking_lot::Mutex::new(std::collections::HashMap::new()));
-
-#[cfg(unix)]
-static SIMPLE_SPAWN_LOCKS: once_cell::sync::Lazy<
-    parking_lot::Mutex<std::collections::HashMap<String, std::sync::Arc<tokio::sync::Mutex<()>>>>,
 > = once_cell::sync::Lazy::new(|| parking_lot::Mutex::new(std::collections::HashMap::new()));
 
 /// 确保 `deps/bin/index` 持久 sidecar 已启动，返回其 UDS 路径。
@@ -454,11 +490,7 @@ async fn ensure_sidecar_simple(
         }
     }
 
-    let lock = SIMPLE_SPAWN_LOCKS
-        .lock()
-        .entry(key.clone())
-        .or_insert_with(|| std::sync::Arc::new(tokio::sync::Mutex::new(())))
-        .clone();
+    let lock = crate::server::apps::native_http::sidecar_spawn_lock(&sock);
     let _guard = lock.lock().await;
     // 等锁期间可能已被别人建好（或已由另一协议拉起）。
     {
@@ -468,6 +500,15 @@ async fn ensure_sidecar_simple(
                 return Ok(s.sock.clone());
             }
         }
+    }
+    // 等锁期间**另一条协议**（h1 的 `native_http::SIDECARS`）可能刚拉起同一个 sock：
+    // 同一把 per-sock 锁（[`native_http::sidecar_spawn_lock`]）保证对方的 spawn 已经完成、
+    // 且**已等到 sock 就绪**才释放锁（对方在锁内做 5s 就绪等待），所以这里 `sock_alive`
+    // 为真即代表「有人在服务」⇒ 复用。绝不 `remove_file` + 抢 spawn（那会偷走它的监听
+    // socket、把它变成无人回收的孤儿）。
+    if sock_alive(&sock) {
+        log::debug!("sidecar(simple): {key} 已由其它注册表拉起（sock 存活），复用");
+        return Ok(sock);
     }
     // 死条目 / 指纹或 docroot 变化的旧条目：杀进程再摘除（只删表会留下孤儿）。
     if let Some(mut dead) = SIDECARS_SIMPLE.lock().remove(&key) {
@@ -601,5 +642,69 @@ mod tests {
         assert!(!is_hop_by_hop("content-type"));
         assert!(is_client_forward_header("x-forwarded-for"));
         assert!(!is_client_forward_header("x-custom"));
+    }
+
+    /// `.env` → 头通道的编码/过滤/上限（与 apps5b 真机实测逐条对齐）。
+    #[test]
+    fn env_forward_headers_encodes_filters_and_caps() {
+        let v = |k: &str, val: &str| (k.to_string(), val.to_string());
+        let out = env_forward_headers(&[
+            v("A", "hello world"),
+            v("B", "a\"b"),
+            v("C", "中"),
+            v("EMPTY", ""),     // 空值 = 键不存在 ⇒ 不转发
+            v("HAS-DASH", "x"), // 非法键（- 不是 env 键字符）⇒ 不转发
+        ]);
+        assert_eq!(
+            out,
+            vec![
+                ("x-crucible-env-a".to_string(), "hello%20world".to_string()),
+                ("x-crucible-env-b".to_string(), "a%22b".to_string()),
+                ("x-crucible-env-c".to_string(), "%E4%B8%AD".to_string()),
+            ]
+        );
+        // 头名过滤只要求 `[A-Za-z0-9_]`（数字开头也放行）：`.env` 解析器（deps.rs）已经把
+        // `1BAD=x` 这类键拒掉了，这里不必重复一条会在两处漂移的规则。
+        assert_eq!(
+            env_forward_headers(&[v("1BAD", "x")]),
+            vec![("x-crucible-env-1bad".to_string(), "x".to_string())]
+        );
+        // 76 个键 → 恰好 64 条（上限生效，且无重复头名）
+        let many: Vec<(String, String)> = (0..76)
+            .map(|i| (format!("K{i}"), format!("v{i}")))
+            .collect();
+        let out = env_forward_headers(&many);
+        assert_eq!(out.len(), 64, "64 键上限");
+        let mut names: Vec<&String> = out.iter().map(|(n, _)| n).collect();
+        names.sort();
+        names.dedup();
+        assert_eq!(names.len(), 64, "不允许同名头");
+    }
+
+    /// `.env` 里仅大小写不同的键：HTTP 头名不区分大小写 ⇒ 必须**去重**，语义为
+    /// 「值相同只发一条；值不同保留先出现者」（P3 明确语义，见 `env_forward_headers`）。
+    #[test]
+    fn env_forward_headers_dedups_case_only_collisions() {
+        let v = |k: &str, val: &str| (k.to_string(), val.to_string());
+        // 值相同：只一条，无副作用
+        let out = env_forward_headers(&[v("KEY", "same"), v("key", "same"), v("Key", "same")]);
+        assert_eq!(out, vec![("x-crucible-env-key".to_string(), "same".to_string())]);
+        // 值不同：保留先出现的 KEY（.env 顺序），后出现的大小写变体丢弃
+        let out = env_forward_headers(&[v("KEY", "first"), v("key", "second")]);
+        assert_eq!(out, vec![("x-crucible-env-key".to_string(), "first".to_string())]);
+        // 反向顺序同样「先出现者胜」
+        let out = env_forward_headers(&[v("key", "lower-first"), v("KEY", "upper-second")]);
+        assert_eq!(
+            out,
+            vec![("x-crucible-env-key".to_string(), "lower-first".to_string())]
+        );
+        // 编码后再比较也不能漏判（同一原值不同大小写 + 非 ASCII 值）
+        let out = env_forward_headers(&[v("M", "a b"), v("m", "a%20b")]);
+        assert_eq!(out.len(), 1, "原值不同（一个空格、一个字面 %20）必须判为冲突: {out:?}");
+        assert_eq!(out[0].1, "a%20b");
+        // 大小写不同但值真的不同 → 仍然是单条（不会出现两条同名头）
+        let out = env_forward_headers(&[v("Db_Password", "p1"), v("db_password", "p2")]);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0], ("x-crucible-env-db_password".to_string(), "p1".to_string()));
     }
 }

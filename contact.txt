@@ -3966,3 +3966,143 @@ h1.rs/mod.rs 未动；实例端口 20980/20981（明文 A-B）+20982/20984（TLS
   `apply-perf5.py`（**幂等**，可重放到后续版本）、`av/`（32xxx 套件副本）、`frozen*/`（快照）。
 - 端口 25581/25781（实例）**收工后停止**；变体实例、套件实例均已停止；`~/scratch-perf5/av/` 的
   upstream(32099/32100) 与 fake-named 已停。若需复现：`BIN=~/scratch-perf5/bin/final4 sh ~/scratch-perf5/restart.sh && sh ~/scratch-perf5/restart-h2o.sh`。
+
+---
+# 【agent-apps6 / 工号 1009 · apps6-wave11 收工】apps5b §5 记录项 7 条全部收掉 + 1 条新发现（未改）
+
+**scope**：`src/server/apps/*.rs`、`libs/app-engines/**`、`libs/script-ffi/**`、`libs/aspnet-ffi/**`、
+`libs/axonasp-ffi/**`、`www-apps/**`、`libs/jsp-sidecar/**`（本轮归我）。未 commit/push/checkout/reset/stash/clean。
+认证二进制 `~/scratch-apps6/bin/webserver` md5 `1a2d622467f82418f2f6dd9228d7c39d`；
+单测 **513 passed / 1 failed（他人在途）/ 1 ignored**；实例 20600/20644（收工后仍运行，20681/20683 已停）。
+
+## 1. 【P1】看门狗拆两段 deadline（排队 ≠ 执行）—— `app_ffi.rs` + `mod.rs`
+- 修前 A/B（apps5b 旧二进制 14d94c77）：9 并发 `/wsgi-a/?sleep=4` → 8×200@4.03s + **第 9 个 502@6.01s**
+  + 日志「隔离该 .so / 互斥被毒化」，随后 `/wsgi-b/`、`/lua-b/` **永久 502@0.001s**（健康引擎被罚）。
+- 修后：**9×200**（8×4.04s + 1×8.03s）；`CRUCIBLE_APP_ENGINE_QUEUE_TIMEOUT_SECS=2` 时第 9 个拿到
+  **503 + Retry-After: 1**（`503 Service Unavailable: engine worker pool busy (queue wait exceeded)`）
+  @2.00s，**不隔离、不毒化**，池空后同引擎 200；h2c 同款 503（跨协议一致）；真死循环仍 502@6.00s + 隔离
+  （重试 0.001s）、env-free 的 `/cgia/` 200、锁引擎被毒化 → 快速 502。
+- 坑（已注释）：`EnginePool::run` 是 `async fn`，不 await 不入队 → 第一版「队列等满 60s→503、worker 空转」，
+  改成同步 `submit()`。
+
+## 2. 【P2】sidecar 并发首请求只 spawn 一个（跨注册表互斥）—— `native_http.rs` + `sidecar_engine.rs`
+- 两注册表共用**同一把 per-sock 创建锁**（`sidecar_spawn_lock`）+ 拿锁后「自己表 → `sock_alive`」重查。
+- A/B：旧二进制 12 并发（6 h1 + 6 h2c）× 6 轮 → 每轮 **2** 个进程；新 × 5 轮 → 恒 **1** 个，12 请求全 200。
+- 回归：跨协议挂死回收（SIGSTOP → 30.5s 502 → 进程回收 → 下一请求 0.05s 200）两个方向都通过。
+
+## 3. 【P2】默认 `.so` 路径锚定仓库根 —— `app_ffi.rs`（`resolve_lib`/`default_lib_path`/`project_root`）+ `native_http.rs::lib_available`
+- `lib_available` 与 `resolve_lib` 原先看两个不同路径（前者只看 cwd 相对、且不认 `APPENGINE_*_LIB`）。
+- A/B（同配置、cwd=`~/scratch-apps6`）：`/rust/`（无 lib）旧 **502** → 新 **200**（`hello from rust-plugin`）。
+
+## 4. 【P3】`.env` 键仅大小写不同 → 头通道去重 —— `sidecar_engine.rs::env_forward_headers`
+- 语义：值相同发一条；值不同**保留先出现者** + 60s 节流 warn。三协议实测：`Db_Password`/`DB_PASSWORD`
+  → 只 1 条 `…db_password=first-wins`；客户端伪造头被剥；76 键 → 恰好 64 条；`+` 不转空格。
+
+## 5. 【P3】`/cgis/nope.cgi` 502 → **404** —— `cgi_script.rs`（`ScriptNotFound`）+ `mod.rs:299`
+- h1/h2c/h3 状态码/content-type/engine 标签/body 逐字一致；`/cgis/index.cgi` 仍 200；`/cgia/nope.txt`
+  仍 200（C 引擎回落 index.cgi），旧二进制同状态。
+
+## 6. JSP 侧 `.env` 注入落地 —— `libs/jsp-sidecar/**` + `www-apps/jsp/index.jsp`
+- 新增 `EnvInjectionFilter.java`：`x-crucible-env-<key>` → **request attribute**（`crucible.env.<key>`
+  + 不可变 `Map`），**不用** `System.setProperty`；RFC 3986 解码（**不用** URLDecoder）；上限 64 键/8KiB/16KiB。
+  python shim 同语义（`extract_env_attributes` + `render_jsp` 支持 attribute/getenv）；样例演示两条通道。
+- 真机三协议：受管 `/jsp/` → `getenv=from-jsp-managed`、attribute 空；显式 socket `/jspx/` →
+  `attribute=from-jspx-attr`、getenv 空（62 项 0 FAIL）。
+- **Jetty/Java 路径需要 JDK 17+ 才能真机**（本机无 java/javac/mvn）——只做静态。
+- 顺带修：`serve()` 单连接异常（EPIPE）不再打死长驻 sidecar（旧实现会让显式 socket 应用永久 502）。
+- 顺带修：受管 sidecar 在 h2/h3 多发 env 头（h1 不发）→ 统一为「受管只走 spawn env」。
+
+## 7. **新发现（P2，pre-existing，未改）：同一应用并发请求时 CPython 引擎互相抹掉 `.env`**
+- 8 并发 `/wsgi-a/?sleep=2` → **1 个** `WINDOWMARK=from-wsgi-A` + **7 个** `<unset>`；顺序单发正常；
+  **旧二进制同型（1/8）⇒ 不是本波引入**。
+- 机理：`crucible_pyembed.h:502` 每次调用开头快照 `os.environ`、`:579` 调用结束把「快照里没有的键」
+  `__delitem__`；env_lock 允许**同内容**并发 ⇒ 最早完成者删掉其余在飞请求仍需要的键。
+- 建议：引擎侧按同内容组引用计数（首个 sync 记快照、最后一个 restore 才落地）。**未动**（设计级 + CPython
+  嵌入的 GIL/锁序爆炸半径），留待主会话排期。
+
+## 8. 无回归
+`t2_env.py --phases 1234` **311 PASS/0 FAIL**；`t4_xproto.py` **99 PASS/0 FAIL**；`smoke_all.py`
+**0 DIFF**；`scan.py` ×2：0 panic / 0 僵尸 / 子进程恒 4（2 受管 jsp + 2 go，每 listener 一个）/ RSS +256kB 平台期。
+唯一未见绿的单测 `server::access_log::tests::prefix_bytes_match_peer_format` 属**他人在途改动**
+（该测试在 HEAD 上不存在；`[fe80::1%eth0]:65535` 的 scope-id 接口名 Rust 解析不了）。
+
+报告 `.agents/1009/reports/apps6-wave11.md`、修复总结 `.agents/1009/fixes/apps6-wave11.md`。
+
+---
+
+# 【agent-deploy wave11】远程部署 14981f1（83.229.125.81）—— 成功（2026-10-16）
+
+**部署 commit**：远程 7bd3efb → **14981f1**（`git fetch origin main && git reset --hard origin/main`）。
+新二进制 `bin/webserver` md5 **`510af570a75e51be0c223fba3732f3ed`**（18,465,440 B，`lto=fat` 全量重建
+27m57s / 0 error）。旧二进制备份 `bin/webserver.bak-20261016-222643`（md5 70b3c90e…）+ `/root/wave11-backup/`。
+
+**结果**：监听全通（9081/9095 h1+h2c、9445 TLS1.2、9446 TLS1.3、8443 TLS+h2+h3、853 DoT、53 named）；
+**15/15 引擎 200（h1 与 h2c 各一遍，带真实 body）**：php c rust go lua python perl wsgi asgi psgi cgi uwsgi tsx asp aspnet；
+h1 快车道在 OpenBSD 生效（`h1 fastpath: conns=2681 served=2674`，无异常/无脏日志）；
+稳定性 200 顺跑全 200 + 32 并发 ×30s **3327 请求全 200**，RSS +740KB、fd 0 增长、无 panic；
+`/__admin` `/__metrics` 401（生产 hash 在 skip-worktree 的 config.toml 里，reset 未覆盖）；
+DoH `hostnames=[]` → GET 404 / POST 405（正确 fail-closed）；DoT 853 TLS1.3 握手正常（自签证书，code 18）。
+隔离实例（29xxx，不动生产）实测 page_rules/proxy_rules/rate_limit(5→429)/basic_auth/ip_access
+全部符合预期。诚实 502：`/ruby/` `/jsp/` `/do/` `/rack/`（远程无 ruby34/JDK，MRI 嵌入默认关）。
+
+**本轮两个新发现（详见报告 §3/§7）**：
+1. [P2] `scripts/build_app_engines.sh` 用 `sh` 在 OpenBSD（ksh）上**第 26 行语法错误直接挂掉**
+   （`local found=() a`）——必须 `bash scripts/…` / `make engines`；否则「一个引擎都没建、还看当成功」。
+2. [P2] `build_script_ffi.sh` 的 `perl_libs_present()`（14981f1 新加）只认 `libperl.so`/`libperl.a`，
+   OpenBSD base 只有 `libperl.so.27.0` → 误判 → `/perl/` `/psgi/` 502 回归（旧部署是 popen 回退服务、后
+   被安全策略删除）。实测 lld 能解析 `-lperl → libperl.so.27.0`（readelf NEEDED 可证），
+   已按脚本自身提示补 `ln -s /usr/lib/libperl.so.27.0 /usr/local/lib/libperl.so` 并重编 → 两引擎恢复 200。
+   **这是系统级且可逆的改动**（回滚 `rm /usr/local/lib/libperl.so`）。
+3. [P3] 构建期间只能 prune 过期**文件**、不能删空目录（删 `.fingerprint` 空目录会让 cargo 中途
+   `failed to write …fingerprint…`；本轮踩过一次，重启构建即恢复，attempt1 日志留档）。
+
+**构建注意（下次照做）**：特征集用 `tls,tls_boring,go_shm_ipc`（=旧二进制实测能力集：strings 有 go_shm、
+ldd 无 NSS；`cargo build --release` 默认 features 不含 go_shm_ipc）；lto thin→fat 后**没有增量**，
+1 vCPU 全量约 28 分钟、峰值磁盘 ~1GB（先 prune `target/release/{deps,build,.fingerprint}` 里早于构建的
+文件，实测释放 1GB）；构建期间生产 HTTP/DoT/DoH 停机（named :53 不停）。
+另：`config.toml` 是 **skip-worktree**（`git ls-files -v`=S），reset 不会覆盖生产哈希/`listeners_allow`；
+DoT 生效端口 853 来自 `state/dns/etc/panel.toml`（覆盖 config.toml 的 `[dns]`，后者写的 53 不生效）。
+
+报告 `.agents/1009/reports/deploy-wave11.md`；要点 `.agents/1009/fixes/deploy-wave11.md`。
+
+---
+
+## 【agent-perf6 — 访问日志热路径（perf6-wave11，工号 1009）】
+
+**scope**：`src/server/access_log.rs`（实质改动）+ `src/server/h1_fast.rs`（**仅**日志调用行 11 行）；
+`h1.rs`/`h2.rs`/`h3.rs` 的日志调用点零改动（`log_response`/`log_response_with` 签名与语义不变）。
+未 commit/push/checkout/reset/stash/clean。报告 `.agents/1009/reports/perf6-wave11.md`；
+要点 `.agents/1009/fixes/perf6-wave11.md`。
+
+**改动**：① 连接级预格式化前缀（`ConnPrefix`：`{proto} {peer} ` 每连接一次，
+h1 快车道改调 `log_response_prefixed_with`）；② 手写十进制格式化（`write_line`：去 `core::fmt`
+逐参数分派与 `u128/1000` 软除法；`format_line` fmt 参照实现保留给 `realtime=true` 路径与单测对拍）；
+③ **否决**「每线程槽位缓冲」：同二进制门实测无收益、且 `logdiff` 抓到行序变化（审计行序红线）。
+
+**效果（同窗口配对，duel：双方同时加载）**：c128 **CPU/req −3.28%**、rps +2.0%；
+c64 **−2.84%**（各 6/6 轮一致）。逐项：前缀 **−2.20%**、手写格式化 **−0.78%**。
+顺序门禁（h2o+base+final 同窗口交替，两会话）：**c64 1.171→1.147 / 1.131→1.110（≤1.15 ✓）**；
+**c128 1.217→1.163 / 1.194→1.174（未达 1.15，收窄 4%）**。
+剩余成本分解（改后 −2.76%）：时钟 −0.27%、stderr 写 −0.64%、全局锁+共享缓冲追加 −1.74%
+（去掉它要么破坏行序、要么上 seq 归并，本轮不做）。
+
+**认证产物**：源码 `access_log.rs` md5 `c7d2ed5a…` + `h1_fast.rs` md5 `c04d42f9…`；
+二进制 `~/scratch-perf6/bin/finaltree6` md5 **`ef6e0b85589631b34355410d223cd420`**
+（冻结树 `14981f1` + 上述两文件）；改前 `bin/base6` md5 `6ba7c449…`（== perf5 认证二进制）。
+
+**验证（全部真机）**：日志逐字节一致（`logdiff.py`：15 条定序请求、只归一化 ts/dur，
+`realtime=false` 与 `true` 两套配置、**含行序** PASS）；单测 **514 passed / 0 failed / 1 ignored**；
+黑盒套件 **290 PASS / 0 FAIL / 10 SKIP**（PASS1 140/EXT 113/GOAWAY 4/H3 24/DNS 6+3，
+与 verify5-wave9 基线逐项一致，零回归）；无每请求分配（LD_PRELOAD malloc 计数：日志开 0.0091 vs
+关 0.0040 allocs/req，差值是 256KiB flush 后的缓冲重增长）。
+
+**风险/边界**：c128 距 1.15 差 1–2 点（本窗口 h2o 更快：c128 10.65–11.32µs/req）；
+所有数字为同机相对比值，h2o 同一二进制跨窗口漂移 ±15%，不可跨窗口比较、不可外推 OpenBSD 1 vCPU。
+
+**perf6 补充（安静窗口复测，00:07–00:18）**：duel 配对（最受控口径）在安静窗口再跑 3 会话，
+c128 0.9666 / 0.9701（−3.34% / −2.99%）、c64 0.9674（−3.26%），5 会话 30/30 轮全部同向
+⇒ 收益（−3%）确切。但**顺序门禁第 3 会话（安静窗口）c128 配对 = 0.999、final/h2o = 1.201**：
+base 在该窗口拿到全天最低 cpu/req（11.96µs，同日其他会话 12.85/14.71µs），风落正好抵消固定收益。
+**结论修正：不要把本 patch 描述成「c128 已稳过 1.15」**——它把 c128 期望值收窄 ≈3%，
+是否过线取决于窗口；c64 三会话全部 ≤1.15。原始日志 `~/scratch-perf6/logs/gate2-seq3.txt`、
+`duel-quiet.txt`；报告 §3.4 有完整分析。

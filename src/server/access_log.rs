@@ -27,6 +27,10 @@ static RING: Lazy<Mutex<VecDeque<String>>> = Lazy::new(|| Mutex::new(VecDeque::w
 /// 现在：请求路径只做「拼一行 + memcpy 进进程级缓冲」，后台线程每 250ms（或缓冲超过
 /// 256KiB 时）用一次 write 落盘。部署时 stderr 被重定向到日志文件，因此落点不变；
 /// 管理面的「实时访问日志」读的是内存 RING，完全不受影响。
+///
+/// 缓冲保持**单一全局**（wave-11 评估过「每线程一个槽位」：c128 实测无可辨收益，
+/// 且会把不同线程的行按槽位分组落盘 —— 同一顺序客户端（例如验收脚本）看到的行
+/// 次序与改动前不同；访问日志是审计证据，行序可解释性优先，故不采用）。
 static ACCESS_BUF: Mutex<Vec<u8>> = Mutex::new(Vec::new());
 /// 缓冲上限，超过立即触发一次 flush（在请求线程里做）。
 const ACCESS_BUF_FLUSH_AT: usize = 256 * 1024;
@@ -103,6 +107,73 @@ pub fn resolve<'a>(
     }
 }
 
+// ---------------------------------------------------------------------------
+// 行前缀（`{proto} {peer} `）
+// ---------------------------------------------------------------------------
+
+/// 行前 `{proto} {peer} ` 这一段的来源。
+///
+/// * 热路径（h1 快车道）用连接级 [`ConnPrefix`]：**每连接格式化一次**，之后每请求
+///   只有一次 `memcpy`（`peer` 的 `SocketAddr` Display + 多次 `core::fmt` 分派从
+///   每请求一次降为每连接一次）；
+/// * h1 hyper 收口 / h2 / h3 的调用点保持原签名（每请求传 `proto` + `peer`），由
+///   [`ProtoPeer`] 每请求格式化一次（与 wave-10 行为逐字节相同，成本不变）。
+///
+/// 两种来源都把同一段字节写进同一行，单测把 [`ConnPrefix`] 与 `format!("{proto} {peer} ")`
+/// 逐字节对拍。
+trait LinePrefix {
+    /// 追加 `{proto} {peer} ` 字节（批量缓冲路径）。
+    fn write_bytes(&self, out: &mut Vec<u8>);
+    /// 追加同样的字节到任意 `fmt::Write`（realtime 路径与 fmt 参照实现）。
+    fn write_fmt(&self, out: &mut impl std::fmt::Write) -> std::fmt::Result;
+}
+
+/// 连接级预格式化前缀（`{proto} {peer} `）。
+pub struct ConnPrefix<'a> {
+    proto: &'a str,
+    peer: SocketAddr,
+    buf: Vec<u8>,
+}
+
+impl<'a> ConnPrefix<'a> {
+    /// 在一个连接的开头调用一次；之后每请求直接复用 [`Self::write_bytes`]。
+    pub fn new(proto: &'a str, peer: SocketAddr) -> Self {
+        let mut buf = Vec::with_capacity(proto.len() + 32);
+        {
+            let mut w = BufW(&mut buf);
+            // 与 [`format_line`] 的前缀段是**同一段格式串**（`{proto} {peer} `）。
+            let _ = write!(w, "{proto} {peer} ");
+        }
+        Self { proto, peer, buf }
+    }
+}
+
+impl LinePrefix for ConnPrefix<'_> {
+    #[inline]
+    fn write_bytes(&self, out: &mut Vec<u8>) {
+        out.extend_from_slice(&self.buf);
+    }
+    fn write_fmt(&self, out: &mut impl std::fmt::Write) -> std::fmt::Result {
+        write!(out, "{} {} ", self.proto, self.peer)
+    }
+}
+
+/// 每请求构造的 `{proto} {peer} `（非热路径调用点沿用原签名）。
+struct ProtoPeer<'a> {
+    proto: &'a str,
+    peer: SocketAddr,
+}
+
+impl LinePrefix for ProtoPeer<'_> {
+    #[inline]
+    fn write_bytes(&self, out: &mut Vec<u8>) {
+        let _ = write!(BufW(out), "{} {} ", self.proto, self.peer);
+    }
+    fn write_fmt(&self, out: &mut impl std::fmt::Write) -> std::fmt::Result {
+        write!(out, "{} {} ", self.proto, self.peer)
+    }
+}
+
 /// 记录一条访问日志（响应完成侧的唯一入口）。
 ///
 /// `per` 是**服务该请求的 listener** 的覆盖（`None` = 完全继承全局）；调用方传
@@ -152,6 +223,51 @@ pub fn log_response_with(
     engine: &str,
     per: Option<&ListenerAccessLogConfig>,
 ) {
+    log_line(
+        snap,
+        &ProtoPeer { proto, peer },
+        method,
+        path,
+        status,
+        bytes,
+        dur,
+        engine,
+        per,
+    );
+}
+
+/// 与 [`log_response_with`] 相同，但复用**连接级**预格式化前缀（h1 快车道热路径：
+/// `peer`/`proto` 每连接格式化一次，见 [`ConnPrefix`]）。
+#[allow(clippy::too_many_arguments)]
+pub fn log_response_prefixed_with(
+    snap: &crate::config::Config,
+    prefix: &ConnPrefix<'_>,
+    method: &str,
+    path: &str,
+    status: u16,
+    bytes: Option<u64>,
+    dur: Duration,
+    engine: &str,
+    per: Option<&ListenerAccessLogConfig>,
+) {
+    log_line(
+        snap, prefix, method, path, status, bytes, dur, engine, per,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+#[inline]
+fn log_line<P: LinePrefix>(
+    snap: &crate::config::Config,
+    prefix: &P,
+    method: &str,
+    path: &str,
+    status: u16,
+    bytes: Option<u64>,
+    dur: Duration,
+    engine: &str,
+    per: Option<&ListenerAccessLogConfig>,
+) {
     let eff = resolve(&snap.access_log, per);
     if !eff.enable {
         return;
@@ -161,39 +277,33 @@ pub fn log_response_with(
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis())
         .unwrap_or(0);
-    // 行格式化只有**一条实现**（[`format_line`]）：
-    // * `realtime=false`（默认）：**直接**写进批量缓冲（一条锁内路径，无中间 `String`）；
-    // * `realtime=true`：先写进 `String`（Admin 实时窗口要留一份），再追加进批量缓冲。
-    // 旧实现每请求 4 次堆分配（ts `format!` / bytes `to_string` / path 转义
-    // `collect::<String>()` / 整行 `format!`）。字段顺序、转义规则与输出逐字不变
-    // （访问日志是审计证据，格式不能变）。
+    let dur_ms = dur.as_millis();
     ensure_flusher();
     if !eff.realtime {
-        let mut b = ACCESS_BUF.lock();
-        {
-            let mut w = BufW(&mut b);
-            format_line(&mut w, now, proto, peer, method, path, status, bytes, dur, engine);
-        }
-        b.push(b'\n');
-        let full = b.len() >= ACCESS_BUF_FLUSH_AT;
-        drop(b);
+        // 行格式化只有**一条热路径实现**（[`write_line`]）：手写十进制 + 直接写进
+        // 批量缓冲（无中间 `String`、无 `core::fmt` 的逐参数动态分派）。
+        // 旧实现每请求 4 次堆分配（ts `format!` / bytes `to_string` / path 转义
+        // `collect::<String>()` / 整行 `format!`）——wave-7 去掉 `String`，wave-11
+        // 再去掉 `core::fmt`；字段顺序、转义规则与输出逐字不变（访问日志是审计证据，
+        // 格式不能变；单测 `fast_line_matches_fmt_line` 把 [`write_line`] 与 fmt 参照
+        // 实现逐字节对拍）。
+        let full = {
+            let mut b = ACCESS_BUF.lock();
+            write_line(&mut b, now, prefix, method, path, status, bytes, dur_ms, engine);
+            b.push(b'\n');
+            b.len() >= ACCESS_BUF_FLUSH_AT
+        };
         if full {
             flush();
         }
         return;
     }
+    // realtime=true：先写进 `String`（Admin 实时窗口要留一份），再追加进批量缓冲。
+    // 该路径不在吞吐热路径上，沿用 wave-7 的 fmt 单实现（[`format_line`]）。
     let mut line = String::with_capacity(path.len() + 64);
-    format_line(&mut line, now, proto, peer, method, path, status, bytes, dur, engine);
-    // 级别过滤：**所有**等级都走同一批量写路径（`level` 仍逐站生效于配置/展示层，
-    // 但访问日志行本身没有严重级别语义——见下方注释）。
-    //
-    // 此前 `"debug" | "trace" => log::debug!("{line}")`：env_logger 的默认过滤是
-    // `info`（`main.rs` 的 `default_filter_or("info")`，现场也没有 RUST_LOG），于是
-    // 把访问日志等级选成 `debug`/`trace`（面板下拉里就有这两个选项）会让**每一行
-    // 访问日志都被丢弃** —— 运维为了「看更多」而调低等级，结果一条都看不到，
-    // 且没有任何提示。访问日志的行本身没有严重级别语义（它记录的是每次请求），
-    // 所以等级只保留在配置/展示层，落盘路径统一。
-    ensure_flusher();
+    format_line(
+        &mut line, now, prefix, method, path, status, bytes, dur, engine,
+    );
     let full = {
         let mut b = ACCESS_BUF.lock();
         b.extend_from_slice(line.as_bytes());
@@ -203,7 +313,7 @@ pub fn log_response_with(
     if full {
         flush();
     }
-    if eff.realtime {
+    {
         let mut ring = RING.lock();
         if ring.len() >= 512 {
             ring.pop_front();
@@ -213,8 +323,8 @@ pub fn log_response_with(
 }
 
 /// 把访问日志行**直接**格式化进 `Vec<u8>`（`fmt::Write` 适配器）：
-/// `realtime=false`（默认）时省掉中间 `String`（每请求一次堆分配 + 一次整行 memcpy）。
-/// 格式函数与 realtime 路径共用同一条实现，字段/转义规则不可能分叉。
+/// 仅用于前缀段的**每连接/每请求一次**的 fmt 格式化（[`ConnPrefix::new`]、
+/// [`ProtoPeer`]）；行主体的热路径见 [`write_line`]。
 struct BufW<'a>(&'a mut Vec<u8>);
 impl std::fmt::Write for BufW<'_> {
     #[inline]
@@ -224,13 +334,105 @@ impl std::fmt::Write for BufW<'_> {
     }
 }
 
-/// 单条访问日志行的格式化（**唯一**实现；`out` 为 `String` 或 [`BufW`]）。
+// ---------------------------------------------------------------------------
+// 手写十进制（热路径：去 `core::fmt` 的逐参数动态分派与 u128 除法）
+// ---------------------------------------------------------------------------
+
+/// 十进制追加（u64；无 `core::fmt`）。
+#[inline]
+fn push_u64(out: &mut Vec<u8>, mut v: u64) {
+    let mut buf = [0u8; 20];
+    let mut i = buf.len();
+    loop {
+        i -= 1;
+        buf[i] = b'0' + (v % 10) as u8;
+        v /= 10;
+        if v == 0 {
+            break;
+        }
+    }
+    out.extend_from_slice(&buf[i..]);
+}
+
+/// 十进制追加（u128）。`SystemTime`/`Duration` 的实际值恒在 u64 范围内，走 u64
+/// 快路径（`u128 / 1000` 的软除法在**极端值**下才用 `core::fmt` 兜底，输出逐字相同）。
+#[inline]
+fn push_u128(out: &mut Vec<u8>, v: u128) {
+    if v <= u64::MAX as u128 {
+        push_u64(out, v as u64);
+        return;
+    }
+    let _ = write!(BufW(out), "{v}");
+}
+
+/// 单条访问日志行的格式化（热路径：直接进 `Vec<u8>`）。
+///
+/// 与 [`format_line`]（realtime 路径的 fmt 实现）**逐字节等价**：同一段前缀、
+/// 同一套转义规则、同一个字段顺序。单测 `fast_line_matches_fmt_line` 用同一张
+/// 输入表把两者对拍（含 `"` / `\` / 控制字符 / 非 ASCII 路径、超大整数、
+/// `bytes=None`、v4/v6 peer）。
 #[allow(clippy::too_many_arguments)]
-fn format_line(
+#[inline]
+fn write_line<P: LinePrefix>(
+    out: &mut Vec<u8>,
+    now_ms: u128,
+    prefix: &P,
+    method: &str,
+    path: &str,
+    status: u16,
+    bytes: Option<u64>,
+    dur_ms: u128,
+    engine: &str,
+) {
+    // `{}.{:03} `：秒 + 三位毫秒（零填充）。
+    let ms = if now_ms <= u64::MAX as u128 {
+        push_u64(out, (now_ms / 1000) as u64);
+        (now_ms % 1000) as u32
+    } else {
+        push_u128(out, now_ms / 1000);
+        (now_ms % 1000) as u32
+    };
+    out.push(b'.');
+    out.push(b'0' + (ms / 100) as u8);
+    out.push(b'0' + ((ms / 10) % 10) as u8);
+    out.push(b'0' + (ms % 10) as u8);
+    out.push(b' ');
+    prefix.write_bytes(out);
+    out.push(b'"');
+    out.extend_from_slice(method.as_bytes());
+    out.push(b' ');
+    // `path` 是请求目标，**不能原样进引号字段**：含 `"` 的请求能提前结束引号、
+    // 把后面的字段伪造成任意内容（日志是审计证据，伪造一行等于污染审计）。
+    for c in path.chars() {
+        if c == '"' || c == '\\' || (c as u32) < 0x20 {
+            out.extend_from_slice("\u{fffd}".as_bytes());
+        } else {
+            let mut tmp = [0u8; 4];
+            out.extend_from_slice(c.encode_utf8(&mut tmp).as_bytes());
+        }
+    }
+    out.push(b'"');
+    out.push(b' ');
+    push_u64(out, status as u64);
+    out.push(b' ');
+    match bytes {
+        Some(n) => push_u64(out, n),
+        None => out.push(b'-'),
+    }
+    out.push(b' ');
+    push_u128(out, dur_ms);
+    out.extend_from_slice(b"ms ");
+    out.extend_from_slice(engine.as_bytes());
+}
+
+/// 单条访问日志行的格式化（**fmt 参照实现**；realtime=true 路径使用，wave-7 起未改）。
+///
+/// 热路径（realtime=false）的实现是 [`write_line`] —— 两者由单测逐字节对齐。
+#[allow(clippy::too_many_arguments)]
+fn format_line<P: LinePrefix>(
     out: &mut impl std::fmt::Write,
     now_ms: u128,
-    proto: &str,
-    peer: SocketAddr,
+    prefix: &P,
     method: &str,
     path: &str,
     status: u16,
@@ -238,9 +440,11 @@ fn format_line(
     dur: Duration,
     engine: &str,
 ) {
-    let _ = write!(out, "{}.{:03} {proto} {peer} \"{method} ", now_ms / 1000, now_ms % 1000);
-    // `path` 是请求目标，**不能原样进引号字段**：含 `"` 的请求能提前结束引号、
-    // 把后面的字段伪造成任意内容（日志是审计证据，伪造一行等于污染审计）。
+    let _ = write!(out, "{}.{:03} ", now_ms / 1000, now_ms % 1000);
+    let _ = prefix.write_fmt(out);
+    let _ = out.write_char('"');
+    let _ = out.write_str(method);
+    let _ = out.write_char(' ');
     for c in path.chars() {
         if c == '"' || c == '\\' || (c as u32) < 0x20 {
             let _ = out.write_char('\u{fffd}');
@@ -351,5 +555,90 @@ mod tests {
         assert!(eff.enable, "显式 enable=true 必须覆盖全局 false");
         assert_eq!(eff.level, "warn", "未配的 level 继承全局");
         assert!(!eff.realtime, "未配的 realtime 继承全局");
+    }
+
+    /// 连接级前缀与逐请求 fmt 前缀（`format!("{proto} {peer} ")`）逐字节一致
+    /// （v4 带端口 / v6 带端口）——热路径复用的前提。
+    #[test]
+    fn prefix_bytes_match_peer_format() {
+        for peer in [
+            "127.0.0.1:34567".parse::<SocketAddr>().unwrap(),
+            "[::1]:8080".parse::<SocketAddr>().unwrap(),
+            // 作用域名只支持十进制 scope id（std 的 parser；`%eth0` 不合法）。
+            "[fe80::1%3]:65535".parse::<SocketAddr>().unwrap(),
+        ] {
+            for proto in ["h1", "h2", "h3"] {
+                let p = ConnPrefix::new(proto, peer);
+                let want = format!("{proto} {peer} ");
+                assert_eq!(p.buf, want.as_bytes(), "proto={proto} peer={peer}");
+                let mut v = Vec::new();
+                p.write_bytes(&mut v);
+                assert_eq!(v, want.as_bytes());
+                let mut s = String::new();
+                p.write_fmt(&mut s).unwrap();
+                assert_eq!(s, want);
+                // ProtoPeer（非热路径来源）必须产出同样的字节。
+                let pp = ProtoPeer { proto, peer };
+                let mut v = Vec::new();
+                pp.write_bytes(&mut v);
+                assert_eq!(v, want.as_bytes());
+                let mut s = String::new();
+                pp.write_fmt(&mut s).unwrap();
+                assert_eq!(s, want);
+            }
+        }
+    }
+
+    /// 热路径行格式化（[`write_line`]）与 fmt 参照实现（[`format_line`]）逐字节一致：
+    /// 访问日志是审计证据，格式不能变。表覆盖字段顺序/转义/None/超大整数/两位以上毫秒等。
+    #[test]
+    fn fast_line_matches_fmt_line() {
+        let peer: SocketAddr = "10.1.2.3:40001".parse().unwrap();
+        let cases: &[(&str, &str, u16, Option<u64>, u128, &str)] = &[
+            ("h1", "/", 200, Some(127), 1_786_000_000_123, "static"),
+            ("h1", "/index.html", 404, Some(0), 0, "http"),
+            ("h2", "/a?b=c", 304, None, 42, "static"),
+            ("h3", "/a\"b\\c", 500, Some(u64::MAX), 999, "proxy"),
+            ("h1", "/ctl\x01\x02\t", 200, Some(12345678901234567890), 1000, "app"),
+            ("h1", "/utf8/\u{4e2d}\u{6587}/\u{fffd}", 206, Some(1), 12_345_678, "upload"),
+            ("h1", "", 100, None, 0, "http"),
+            ("h1", "/\u{7f}", 418, Some(7), 7, "static"),
+        ];
+        for (proto, path, status, bytes, now_ms, engine) in cases {
+            for method in ["GET", "HEAD"] {
+                let p = ConnPrefix::new(proto, peer);
+                let mut fast = Vec::new();
+                write_line(&mut fast, *now_ms, &p, method, path, *status, *bytes, *now_ms % 100_000, engine);
+                let mut refl = String::new();
+                format_line(&mut refl, *now_ms, &p, method, path, *status, *bytes, Duration::from_millis((*now_ms % 100_000) as u64), engine);
+                assert_eq!(
+                    String::from_utf8(fast.clone()).expect("热路径输出必须是合法 UTF-8"),
+                    refl,
+                    "proto={proto} method={method} path={path:?}"
+                );
+                // 逐字节（含 UTF-8 编码）也相等。
+                assert_eq!(fast, refl.as_bytes());
+            }
+        }
+        // u128 超出 u64 的极端值：两条实现都必须一致（fmt 兜底分支）。
+        let p = ConnPrefix::new("h1", peer);
+        let huge = u128::MAX / 2;
+        let mut fast = Vec::new();
+        write_line(&mut fast, huge, &p, "GET", "/", 200, Some(1), 2, "http");
+        let mut refl = String::new();
+        format_line(&mut refl, huge, &p, "GET", "/", 200, Some(1), Duration::from_millis(2), "http");
+        assert_eq!(String::from_utf8(fast).unwrap(), refl);
+    }
+
+    /// 毫秒字段必须恒为 3 位零填充（`{:03}` 语义），秒字段不加前导零。
+    #[test]
+    fn millis_are_zero_padded() {
+        let p = ConnPrefix::new("h1", "127.0.0.1:1".parse().unwrap());
+        for (ms, want) in [(0u128, "7.000"), (7, "7.007"), (70, "7.070"), (700, "7.700")] {
+            let mut out = Vec::new();
+            write_line(&mut out, 7000 + ms, &p, "GET", "/", 200, Some(1), 0, "http");
+            let s = String::from_utf8(out).unwrap();
+            assert!(s.starts_with(&format!("{want} h1 127.0.0.1:1 ")), "{s}");
+        }
     }
 }

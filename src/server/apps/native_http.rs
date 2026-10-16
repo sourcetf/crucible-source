@@ -20,22 +20,30 @@ use std::time::Duration;
 static SIDECARS: Lazy<Mutex<HashMap<String, Sidecar>>> =
     Lazy::new(|| Mutex::new(HashMap::new()));
 
-/// 每个 key 一把「创建中」锁：并发首次请求只允许一个真正 spawn。
+/// **跨注册表**共享的「sidecar 创建中」锁：键 = **sock 路径**（见 [`sidecar_spawn_lock`]）。
 ///
-/// 没有它时，N 个并发的首次请求会各自走完 entire ensure 流程：每个都
-/// `remove_file(sock)` + spawn + 等到自己的 sock 就绪 —— 最后只有最后一个被登记进
-/// SIDECARS，前面几个进程直接变成没人管、也不再被复用的孤儿（且共用同一个 sock 路径，
-/// 后 spawn 的会把先 spawn 的 socket 覆盖掉）。
-/// key 的集合由配置决定（port-app_idx-engine），数量有界，无需淘汰。
+/// 为什么键是 sock 路径而不是 key 字符串：h1（本文件的 `SIDECARS`）与 h2/h3
+/// （`sidecar_engine::SIDECARS_SIMPLE`）各有自己的注册表，但服务**同一个** sock 路径
+/// （`state/native/{port-app_idx-engine}/app.sock`）。两条协议**同时**首次请求同一个应用时，
+/// 各自的注册表都查不到、`sock_alive` 都还是 false ⇒ 两边都走到 `remove_file`+spawn：
+/// 后 spawn 的把先 spawn 的监听 socket 抢走（`remove_file` + 重新 bind），先起的进程变成
+/// 谁也不管的孤儿，且两条注册表各记一个进程（真机：并发首发 count=2）。
+/// 同一把 per-sock 锁 + 拿锁后重查（自己表 → `sock_alive`）把窄窗关掉：同一时刻只有一个
+/// spawner 能走到 spawn，另一个拿锁后必然看到已 bind 的 sock ⇒ 复用。
+/// key 集合由配置决定（数量有界），无需淘汰。
 #[cfg(unix)]
-static SPAWN_LOCKS: Lazy<Mutex<HashMap<String, std::sync::Arc<tokio::sync::Mutex<()>>>>> =
+static SIDECAR_SPAWN_LOCKS: Lazy<Mutex<HashMap<PathBuf, std::sync::Arc<tokio::sync::Mutex<()>>>>> =
     Lazy::new(|| Mutex::new(HashMap::new()));
 
+/// 取（或建）某个 sock 路径的创建锁。
+///
+/// `pub(crate)`：`sidecar_engine::ensure_sidecar_simple`（h2/h3 字节路径）必须用**同一把**
+/// 锁 —— 两条注册表的互斥只能靠共享锁实现（各自的表看不见对方）。
 #[cfg(unix)]
-fn spawn_lock(key: &str) -> std::sync::Arc<tokio::sync::Mutex<()>> {
-    SPAWN_LOCKS
+pub(crate) fn sidecar_spawn_lock(sock: &Path) -> std::sync::Arc<tokio::sync::Mutex<()>> {
+    SIDECAR_SPAWN_LOCKS
         .lock()
-        .entry(key.to_string())
+        .entry(sock.to_path_buf())
         .or_insert_with(|| std::sync::Arc::new(tokio::sync::Mutex::new(())))
         .clone()
 }
@@ -113,6 +121,11 @@ async fn ensure_sidecar(
 ) -> Result<PathBuf> {
     let fp = env_fingerprint(env_vars);
     let docroot_current = abs_canon(&app.docroot.clone().unwrap_or_else(|| lc.root.clone()));
+    // state/sock 的计算必须**早于**创建锁：锁是按 **sock 路径**取的（跨注册表共享，
+    // 见 `sidecar_spawn_lock`）。mkdir 在锁外做无害（幂等）。
+    let state = abs_path(&PathBuf::from(format!("state/native/{key}")));
+    fs::create_dir_all(&state).context("mkdir native state")?;
+    let sock = abs_canon(&state.join("app.sock"));
     {
         let map = SIDECARS.lock();
         if let Some(s) = map.get(key) {
@@ -122,8 +135,10 @@ async fn ensure_sidecar(
         }
     }
     // 快路径未命中：串行化创建（拿锁后必须重查 SIDECARS —— 等锁期间可能已经有人建好了）。
-    // 这是并发首请求只 spawn 一个进程的关键。
-    let lock = spawn_lock(key);
+    // 这是并发首请求只 spawn 一个进程的关键；锁按 **sock 路径** 取，所以**另一条协议**
+    // （h2/h3 的 `SIDECARS_SIMPLE`）也在同一把锁上互斥 —— 只有这样才能关掉「两条注册表
+    // 同时首发各 spawn 一个」的窄窗（各自只看得到自己的表，共享锁是唯一交汇点）。
+    let lock = sidecar_spawn_lock(&sock);
     let _guard = lock.lock().await;
     {
         let map = SIDECARS.lock();
@@ -144,13 +159,13 @@ async fn ensure_sidecar(
     }
 
     let docroot = docroot_current;
-    let state = abs_path(&PathBuf::from(format!("state/native/{key}")));
-    fs::create_dir_all(&state).context("mkdir native state")?;
-    let sock = abs_canon(&state.join("app.sock"));
     // **别的协议/别的注册表**（h2/h3 的 `sidecar_engine::SIDECARS_SIMPLE`）已经在同一个
     // sock 路径上服务：直接复用它，**绝不** `remove_file` + 重新 spawn —— 那会偷走对方的
     // 监听 socket，把对方刚 spawn 的进程变成谁也不管的孤儿（实测：h2c 首请求起 sidecar 后
     // 首个 h1 请求会再 spawn 一个，旧进程泄漏到 webserver 退出；反复交替可无界堆积）。
+    //
+    // 跨注册表的并发首请求由 [`sidecar_spawn_lock`]（同一把 per-sock 锁）挡住：对方在锁内
+    // spawn 并**等到 sock 就绪**才释放锁，所以拿锁后这里看到的一定是「已 bind」的 sock。
     //
     // 诚实边界（与 `sidecar_engine::ensure_sidecar_simple` 同一取舍）：复用别人管的进程时
     // 无法核验它的 `.env` 指纹（env 在对方 spawn 时定型），因此「改了 `.env` 但只有对方
@@ -464,18 +479,23 @@ fn abs_path(p: &Path) -> PathBuf {
             .join(p)
     }
 }
-
 fn abs_canon(p: &Path) -> PathBuf {
     let a = abs_path(p);
     fs::canonicalize(&a).unwrap_or(a)
 }
 
 /// Whether a default/configured `.so` exists for in-process FFI.
+///
+/// **必须与 `app_ffi::resolve_lib` 走同一条解析链**（显式 `apps[].lib` → `APPENGINE_*_LIB`
+/// → `<仓库根>/target/app-engines/libapp_<e>.so`）：本函数决定「分发走 FFI 还是 sidecar/502」，
+/// `resolve_lib` 决定「实际 dlopen 哪只 .so」—— 两者看不同路径时（旧实现这里只看 **cwd 相对**
+/// 的 `target/app-engines/…`，且**不认** `APPENGINE_*_LIB`），运维用 `APPENGINE_*_LIB` 指路
+/// 或从非仓库根目录启动时，判活与加载会得出**相反**结论（真机：cwd=scratch 的实例里
+/// `/rust/`、`/c/` 三协议一致 502；配了 `APPENGINE_RUST_LIB` 时判活仍说「没有」）。
 pub fn lib_available(app: &AppRouteConfig, engine: &str) -> bool {
-    if let Some(p) = &app.lib {
-        return p.is_file();
-    }
-    project_path(&format!("target/app-engines/libapp_{engine}.so")).is_file()
+    crate::server::apps::app_ffi::resolve_lib(app, engine)
+        .map(|p| p.is_file())
+        .unwrap_or(false)
 }
 
 /// Sidecar binary from init.sh (`deps/bin/index`) for c/go/rust when FFI .so is unavailable.
@@ -542,8 +562,4 @@ pub async fn try_handle_uds(
         let target = uds_target_uri(app, req.uri());
         proxy_unix(req, &sock, peer, Some(target), extra_headers).await
     }
-}
-
-fn project_path(rel: &str) -> PathBuf {
-    abs_path(Path::new(rel))
 }

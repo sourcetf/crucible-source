@@ -954,6 +954,10 @@ where
     let mut miss_memo: Option<String> = None;
     let hsts = lc.ssl.is_some();
     let access_override = lc.access_log.clone();
+    // 连接级访问日志前缀（`h1 {peer} `）：peer 的 Display + `core::fmt` 从每请求一次
+    // 降为每连接一次（懒构造：日志关闭的连接不构造）。行内容与逐请求实现逐字节相同
+    // （见 `access_log::ConnPrefix` 与其单测）。
+    let mut log_prefix: Option<crate::server::access_log::ConnPrefix<'_>> = None;
 
     loop {
         let n = match read_head(&mut io, &mut buf, &mut scan_from, &mut sleep).await {
@@ -1105,10 +1109,11 @@ where
             return None;
         }
         crate::server::telemetry::record_request();
-        crate::server::access_log::log_response_with(
+        let log_prefix =
+            log_prefix.get_or_insert_with(|| crate::server::access_log::ConnPrefix::new("h1", peer));
+        crate::server::access_log::log_response_prefixed_with(
             &snap,
-            peer,
-            "h1",
+            log_prefix,
             method_str,
             &path_buf,
             200,

@@ -110,6 +110,14 @@ public final class JspSidecarMain {
                 DispatcherType.REQUEST, DispatcherType.FORWARD,
                 DispatcherType.INCLUDE, DispatcherType.ERROR));
 
+        // `.env` 请求头通道 → request attribute（显式 apps[].socket 场景；受管 sidecar 的
+        // .env 走 spawn env，不经这里）。顺序：与 EngineHeaderFilter 同属 REQUEST 链，
+        // 先注入属性再进 JSP（Jasper 编译出的 servlet 在属性已就位后才执行）。
+        FilterHolder env = new FilterHolder(EnvInjectionFilter.create());
+        webapp.addFilter(env, "/*", EnumSet.of(
+                DispatcherType.REQUEST, DispatcherType.FORWARD,
+                DispatcherType.INCLUDE, DispatcherType.ERROR));
+
         server.setHandler(webapp);
         server.start();
         System.err.println("jsp-jetty sidecar on " + sockPath + " docroot=" + docroot);

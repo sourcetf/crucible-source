@@ -182,6 +182,72 @@ fn engine_call_timeout() -> Option<Duration> {
     }
 }
 
+/// 单次 FFI 调用在**线程池队列里**的等待上限（与「引擎执行」上限分开的第二段 deadline）。
+///
+/// 为什么必须分开（P1，真机复现）：旧实现把「入池排队 + 引擎执行」算进同一个 deadline，
+/// 于是**池饱和时排队时间会冒充执行超时** —— 8 条合法长请求（各 4s）占满通用池后，第 9 个
+/// 请求排队 4s + 执行 4s（共 8s）> 6s ⇒ 判超时 ⇒ 隔离该 **健康** 引擎 + 毒化 env 锁
+///（之后 `/wsgi-b/` 0.5ms 502，只有重启能恢复）。排队**不是**「引擎卡死」的证据。
+///
+/// 默认与执行上限**同值**（即 `CRUCIBLE_APP_ENGINE_TIMEOUT_SECS`，保持既有容忍度），可用
+/// `CRUCIBLE_APP_ENGINE_QUEUE_TIMEOUT_SECS` 单独调小：池饱和时客户端尽快拿到**可重试的
+/// 503**，而不是等满执行上限。`0` = 不设排队上限（只受执行上限约束）。
+/// 执行上限被关闭（`CRUCIBLE_APP_ENGINE_TIMEOUT_SECS=0`）时默认也关闭排队上限。
+fn engine_queue_timeout() -> Option<Duration> {
+    let exec = engine_call_timeout();
+    match env_lock::read_static_env("CRUCIBLE_APP_ENGINE_QUEUE_TIMEOUT_SECS") {
+        None => exec,
+        Some(raw) => match raw.trim().parse::<u64>() {
+            Ok(0) => None,
+            Ok(n) => Some(Duration::from_secs(n)),
+            Err(_) => {
+                log::warn!(
+                    "app_ffi: CRUCIBLE_APP_ENGINE_QUEUE_TIMEOUT_SECS={raw:?} 不是合法秒数，回退（与执行上限同值）"
+                );
+                exec
+            }
+        },
+    }
+}
+
+/// 「在线程池队列里等待超过排队 deadline」的独立错误类型。
+///
+/// 调用方（`apps::engine_error` / `simple_engine_error`）据此回 **503 + Retry-After**
+/// 而不是通用 502：引擎**健康**，只是 worker 全被合法长请求占着 —— 这类失败是**可重试**的，
+/// 与「引擎卡死被隔离」（502，必须重启 webserver）必须区分。**不**隔离、**不**毒化 env 锁
+///（没有任何「引擎卡死」的证据）—— 见 `exec_dispatch` 的两段 deadline。
+#[derive(Debug)]
+pub struct EnginePoolBusy {
+    pub engine: String,
+    pub waited_secs: u64,
+}
+
+impl std::fmt::Display for EnginePoolBusy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "engine `{}` worker pool busy: queued longer than {}s",
+            self.engine, self.waited_secs
+        )
+    }
+}
+
+impl std::error::Error for EnginePoolBusy {}
+
+/// 排队超时的 503 响应体（h1 与 h2/h3 共用同一常量 ⇒ 跨协议逐字一致；不含服务器路径）。
+pub const ENGINE_BUSY_BODY: &str =
+    "503 Service Unavailable: engine worker pool busy (queue wait exceeded); retry shortly\n";
+
+/// 两段 deadline 的状态机取值（见 `exec_dispatch`）。
+///
+/// 只有 worker 会把 `Queued` 换成 `Started`（CAS，成功后才发 started 信号、并承诺执行）；
+/// 只有请求方会把 `Queued` 换成 `Cancelled`（排队超时的 CAS）。两个方向的 CAS 互斥，
+/// 因此不存在「客户端已收到 503 但引擎仍被调用（副作用已发生）」或「引擎已开始执行却
+/// 被当成排队超时」的模糊态。
+const CALL_QUEUED: u8 = 0;
+const CALL_STARTED: u8 = 1;
+const CALL_CANCELLED: u8 = 2;
+
 /// 超时后被隔离的 .so 集合（键 = lib 路径，与 [`LIBS`] 相同）。
 ///
 /// 超时后**不能**再调用同一只 .so：卡死的调用可能还在跑（我们无法安全地中断任意 C
@@ -458,7 +524,36 @@ async fn exec_dispatch(
         );
     }
     let quarantined_key = lib_key.clone();
+    // **两段 deadline 的状态机**（见 `engine_queue_timeout`）：`Queued` → 由 worker 在真正
+    // 开始执行时置 `Started`；请求方在排队超时时 CAS `Queued → Cancelled`。
+    //   * CAS 成功 ⇒ 调用**从未开始执行**，给客户端可重试的 503，绝不隔离/毒化；
+    //     作业随后被 worker 取出时看到 `Cancelled`，直接返回（不跑引擎、不碰 env 锁）。
+    //   * CAS 失败 ⇒ 排队与开始执行在超时边缘赛跑中「已开始」：调用取消不了，按执行
+    //     deadline 继续等结果（执行时钟从此刻起算，语义仍正确）。
+    let stage = Arc::new(std::sync::atomic::AtomicU8::new(CALL_QUEUED));
+    let stage_job = Arc::clone(&stage);
+    let (started_tx, started_rx) = tokio::sync::oneshot::channel::<()>();
+    let stage_engine = engine.clone();
     let job = move || {
+        // 排队结束、承诺执行：CAS `Queued → Started`。失败只可能是 `Cancelled`
+        // （请求方已就排队超时回了可重试的 503）⇒ 直接返回，不跑引擎、不碰 env 锁。
+        if stage_job
+            .compare_exchange(
+                CALL_QUEUED,
+                CALL_STARTED,
+                std::sync::atomic::Ordering::SeqCst,
+                std::sync::atomic::Ordering::SeqCst,
+            )
+            .is_err()
+        {
+            bail!(
+                "engine `{stage_engine}` call cancelled while queued \
+                 (client already received a retryable 503)"
+            );
+        }
+        // 通知「开始执行」：请求方据此把 deadline 从「排队」切到「执行」。
+        // （接收方可能已因排队超时放弃 ⇒ send 失败无害。）
+        let _ = started_tx.send(());
         // 先按需装载（快路径 = 一次表查找）再决策：`env_free` 是 .so 的属性。
         let lib = load_engine(&engine, &lib_path)?;
         // 二次检查：入池到执行之间，另一个并发调用可能刚被判定超时并隔离本 .so。
@@ -498,8 +593,53 @@ async fn exec_dispatch(
     } else {
         Arc::clone(&*GENERIC_POOL)
     };
-    // 看门狗：整段（入池排队 + 引擎执行）共用一个墙钟 deadline。
-    //
+    // **同步提交**（见 `EnginePool::submit`）：到这里作业已在队列里，第一段的「等 started」
+    // 才是真的在等排队。
+    let result_rx = pool.submit(job)?;
+    let exec_timeout = engine_call_timeout();
+    let queue_timeout = engine_queue_timeout();
+    if exec_timeout.is_none() && queue_timeout.is_none() {
+        // 看门狗整体关闭（两个上限都为 None）：回到「无限等」的旧行为。
+        return result_rx
+            .await
+            .map_err(|_| anyhow::anyhow!("engine worker dropped"))?;
+    }
+    // ---- 第一段：入池排队（见 `engine_queue_timeout` 的成因）----
+    if let Some(qt) = queue_timeout {
+        match tokio::time::timeout(qt, started_rx).await {
+            Ok(_) => {} // 已开始执行，进入第二段
+            Err(_) => {
+                if stage
+                    .compare_exchange(
+                        CALL_QUEUED,
+                        CALL_CANCELLED,
+                        std::sync::atomic::Ordering::SeqCst,
+                        std::sync::atomic::Ordering::SeqCst,
+                    )
+                    .is_ok()
+                {
+                    log::warn!(
+                        "app_ffi: engine `{engine_for_pool}` 在池队列里等待超过 {}s（worker 全被占）\
+                         → 该请求回可重试的 503；**不隔离**该引擎、**不毒化** env 锁（无卡死证据）",
+                        qt.as_secs()
+                    );
+                    return Err(anyhow::Error::new(EnginePoolBusy {
+                        engine: engine_for_pool.clone(),
+                        waited_secs: qt.as_secs(),
+                    }));
+                }
+                // 竞态：started 信号与排队超时同时发生（调用已在执行）⇒ 落到第二段，
+                // 按执行 deadline 等结果。
+                log::debug!(
+                    "app_ffi: engine `{engine_for_pool}` 排队超时与开始执行竞态 → 按执行 deadline 继续"
+                );
+            }
+        }
+    } else {
+        // 排队上限被显式关闭：无限等开始（执行上限仍然生效）。
+        let _ = started_rx.await;
+    }
+    // ---- 第二段：引擎执行（deadline **只**算执行）----
     // 超时的**取舍**（本方案的诚实边界）：
     //   * 卡死的 C 调用无法被安全中断（杀线程会在任意指令处损坏状态）⇒ 该 worker 线程
     //     被放弃，每只隔离的引擎最多泄漏一个线程；隔离后不会再有新调用占线程；
@@ -509,11 +649,13 @@ async fn exec_dispatch(
     //   * 自报 env-free 的 .so（cgi/cgi_script 这类子进程 envp 引擎）不碰进程 env，
     //     超时只隔离它自己，其它引擎（含其它 env-free 引擎）照常工作。
     // 正常长请求不受影响：只要在 deadline 内返回就与旧行为完全一致。
-    let run = pool.run(job);
-    match engine_call_timeout() {
-        None => Ok(run.await?),
-        Some(t) => match tokio::time::timeout(t, run).await {
-            Ok(r) => Ok(r?),
+    match exec_timeout {
+        None => result_rx
+            .await
+            .map_err(|_| anyhow::anyhow!("engine worker dropped"))?,
+        Some(t) => match tokio::time::timeout(t, result_rx).await {
+            Ok(Ok(r)) => Ok(r?),
+            Ok(Err(_recv)) => bail!("engine worker dropped"),
             Err(_elapsed) => {
                 quarantine(&lib_key, &engine_for_pool, t.as_secs());
                 if !lib_is_env_free(&lib_key) {
@@ -602,6 +744,11 @@ fn default_index(engine: &str) -> Option<&'static str> {
     }
 }
 
+/// 引擎 `.so` 的解析（唯一一条链，`native_http::lib_available` 也用它 —— 判活与加载
+/// 必须看**同一个**路径，否则「判活说没有、加载说找得到」会让分发走错分支）：
+///   1. 配置里的 `apps[].lib`（原样，运维负责）；
+///   2. 启动期环境变量 `APPENGINE_<ENGINE>_LIB`（原样）；
+///   3. 默认 `<仓库根>/target/app-engines/libapp_<engine>.so`（**绝对**路径，见 [`default_lib_path`]）。
 pub fn resolve_lib(app: &AppRouteConfig, engine: &str) -> Result<PathBuf> {
     if let Some(p) = &app.lib {
         return Ok(p.clone());
@@ -610,9 +757,34 @@ pub fn resolve_lib(app: &AppRouteConfig, engine: &str) -> Result<PathBuf> {
     if let Some(p) = env_lock::read_static_env(&env_key) {
         return Ok(PathBuf::from(p));
     }
-    Ok(PathBuf::from(format!(
-        "target/app-engines/libapp_{engine}.so"
-    )))
+    Ok(default_lib_path(engine))
+}
+
+/// 未显式配置 lib 时的默认路径：`<仓库根>/target/app-engines/libapp_<engine>.so`。
+///
+/// 为什么必须**锚定**而不是 cwd 相对（P2，真机形态）：旧实现是
+/// `PathBuf::from("target/app-engines/libapp_x.so")`（**相对路径**），`is_file()` 的结论
+/// 随进程 cwd 漂移 —— 从非仓库根目录启动的实例里 `/rust/`、`/c/` 这类**没写 lib** 的应用
+/// 三协议一致 502（判活失败 ⇒ 落到 sidecar/无后端），而从仓库根启动就正常。同一个配置文件
+/// 在两台机器/两种启动方式上行为不同，是配置无法表达的不确定性。
+///
+/// 锚点优先用编译期 `CARGO_MANIFEST_DIR`（构建该二进制时的仓库根，绝对路径、不随 cwd 漂移）。
+/// 「二进制被搬到别处部署」时该目录可能不存在，此时退回 cwd 相对（旧行为）——保证不是更差；
+/// 两种情况都返回**绝对路径**，判定只在调用时刻稳定。
+fn default_lib_path(engine: &str) -> PathBuf {
+    project_root()
+        .join("target")
+        .join("app-engines")
+        .join(format!("libapp_{engine}.so"))
+}
+
+/// `target/app-engines/` 的锚点：仓库根（见 [`default_lib_path`]）。
+fn project_root() -> PathBuf {
+    let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    if manifest.join("libs").join("app-engines").is_dir() {
+        return manifest;
+    }
+    std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
 }
 
 // ---------------------------------------------------------------- 线程池 (§7.3)
@@ -667,7 +839,12 @@ impl EnginePool {
         EnginePool { tx }
     }
 
-    async fn run<T, F>(&self, f: F) -> Result<T>
+    /// 提交一个引擎调用作业，返回「等结果」的接收端。
+    ///
+    /// **必须同步提交**：`submit` 一返回，作业就已经在池队列里（旧实现是 `async fn run`，
+    /// 只有被 poll 时才 `tx.send` —— 两段 deadline 里「排队阶段」必须真的在排队，否则
+    /// 「等 started 信号」永远等不到，作业也永远不会执行）。`Err` = 池已关闭。
+    fn submit<T, F>(&self, f: F) -> Result<tokio::sync::oneshot::Receiver<Result<T>>>
     where
         T: Send + 'static,
         F: FnOnce() -> Result<T> + Send + 'static,
@@ -678,7 +855,7 @@ impl EnginePool {
                 let _ = otx.send(f());
             }))
             .map_err(|_| anyhow::anyhow!("engine thread pool closed"))?;
-        orx.await.map_err(|_| anyhow::anyhow!("engine worker dropped"))?
+        Ok(orx)
     }
 }
 
@@ -1359,5 +1536,43 @@ mod status_and_rel_tests {
             "obs-text value must survive: {raw:?}"
         );
         assert!(!raw.contains(&0u8));
+    }
+
+    /// 默认 lib 路径必须是**绝对路径**（锚定仓库根），且 `lib_available`
+    /// （`native_http`）与它看的是同一条链 —— 否则 cwd≠仓库根时「判活说没有」。
+    #[test]
+    fn default_lib_path_is_absolute_and_anchored() {
+        let app = app_with_paths(&["/rust"]);
+        let p = resolve_lib(&app, "rust").expect("no err");
+        assert!(
+            p.is_absolute(),
+            "默认 lib 路径必须是绝对路径（不随 cwd 漂移）: {p:?}"
+        );
+        assert!(
+            p.to_string_lossy().ends_with("target/app-engines/libapp_rust.so"),
+            "{p:?}"
+        );
+        // 显式 apps[].lib 优先（原样返回，运维负责）
+        let mut app2 = app_with_paths(&["/rust"]);
+        app2.lib = Some(PathBuf::from("/tmp/custom.so"));
+        assert_eq!(
+            resolve_lib(&app2, "rust").unwrap(),
+            PathBuf::from("/tmp/custom.so")
+        );
+    }
+
+    /// 排队超时的错误类型必须能被调用方（`apps::engine_error`/`simple_engine_error`）
+    /// `downcast_ref` 认出（anyhow 链）—— 否则客户端会拿到 502 而不是可重试的 503。
+    #[test]
+    fn engine_pool_busy_is_downcastable() {
+        let e = anyhow::Error::new(EnginePoolBusy {
+            engine: "wsgi".into(),
+            waited_secs: 6,
+        });
+        let e = e.context("wrap 一层 context 也要认得出");
+        assert!(e.downcast_ref::<EnginePoolBusy>().is_some(), "{e:#}");
+        assert!(ENGINE_BUSY_BODY.starts_with("503 Service Unavailable"));
+        // 两段 deadline 的默认关系：没设 QUEUE 变量时与执行上限同值（60s）。
+        assert_eq!(engine_queue_timeout(), engine_call_timeout());
     }
 }

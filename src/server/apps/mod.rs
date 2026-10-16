@@ -10,6 +10,11 @@ pub mod aspnet;
 /// `proxy::try_proxy` 早就按这个口径处理（并写明了原因），本文件这十几处是漏网的。
 /// 细节只进本地日志（本项目明确要求「日志不要脱敏」，日志就是排障入口）。
 fn engine_error(engine: &str, e: &anyhow::Error) -> Response<BoxBody> {
+    // 排队超时（引擎线程池 worker 全被合法长请求占着）= **可重试**的 503 + Retry-After，
+    // 与「引擎卡死被隔离/不可用」的 502 严格区分：见 `app_ffi::EnginePoolBusy`。
+    if e.downcast_ref::<app_ffi::EnginePoolBusy>().is_some() {
+        return engine_busy(engine, e);
+    }
     // **必须节流**：这条是**每个失败请求一条**，而引擎失败完全由客户端决定（请求一个
     // 没构建/没嵌入解释器的引擎路由即可）。实测 40 次 `/tsx/` 写出 80 行 / 24KB
     // （≈600 字节/请求）—— 1000 req/s 就是 ~50GB/天，而本机磁盘长期 95%、日志是
@@ -278,6 +283,9 @@ async fn simple_sidecar_dispatch(
 
 /// `cgi_script` 的字节版：script 解析与 h1 `cgi_script::handle` 同一口径
 ///（剥应用前缀 → 最长「已存在文件」前缀定界 → PATH_INFO），执行复用 `execute_binary`。
+///
+/// 「脚本不存在」→ **404**（与 h1 逐字同一响应体，见 `cgi_script::script_not_found_response_simple`）；
+/// 其余失败仍是 502 引擎错误。
 async fn cgi_script_simple(
     req: &Request<Bytes>,
     lc: &ListenerConfig,
@@ -286,7 +294,18 @@ async fn cgi_script_simple(
     deps_env: &deps::DepsEnv,
 ) -> anyhow::Result<Response<Bytes>> {
     let (script, script_name, path_info) =
-        cgi_script::resolve_target(lc, app, req.uri().path())?;
+        match cgi_script::resolve_target(lc, app, req.uri().path()) {
+            Ok(t) => t,
+            Err(e) if cgi_script::is_script_not_found(&e) => {
+                crate::server::log_throttle::warn_every(
+                    "cgi-script-not-found",
+                    std::time::Duration::from_secs(60),
+                    &format!("{e:#}"),
+                );
+                return Ok(cgi_script::script_not_found_response_simple());
+            }
+            Err(e) => return Err(e),
+        };
     let resp = cgi_script::execute_binary(
         &script,
         req.method(),
@@ -308,6 +327,10 @@ async fn cgi_script_simple(
 /// 与 h1 `engine_error` 同一口径：`{e:#}`（绝对路径/后端文本）只进**本地节流日志**，
 /// 客户端拿固定 502 文本（simple 路径响应体是 `Bytes`）。
 fn simple_engine_error(engine: &str, e: &anyhow::Error) -> Response<Bytes> {
+    // 排队超时 → 与 h1 逐字一致的 503 + Retry-After（见 `engine_error` / `EnginePoolBusy`）。
+    if e.downcast_ref::<app_ffi::EnginePoolBusy>().is_some() {
+        return engine_busy_simple(engine, e);
+    }
     crate::server::log_throttle::warn_every(
         &format!("engine-err-simple::{engine}"),
         std::time::Duration::from_secs(60),
@@ -316,6 +339,40 @@ fn simple_engine_error(engine: &str, e: &anyhow::Error) -> Response<Bytes> {
     Response::builder()
         .status(StatusCode::BAD_GATEWAY)
         .body(Bytes::from_static(b"502 Bad Gateway (engine error)"))
+        .unwrap()
+}
+
+/// 引擎线程池**排队超时**的响应（h1）：503 + `Retry-After: 1`。
+///
+/// 语义（见 `app_ffi::EnginePoolBusy`）：引擎健康、只是 worker 全被合法长请求占着 ⇒
+/// 请求**可重试**；不隔离该引擎、不毒化 env 锁。因此绝不能并到 `engine_error` 的 502
+///（那是「引擎卡死/不可用，重启 webserver 才能恢复」）。细节只进节流日志。
+fn engine_busy(engine: &str, e: &anyhow::Error) -> Response<BoxBody> {
+    crate::server::log_throttle::warn_every(
+        &format!("engine-busy::{engine}"),
+        std::time::Duration::from_secs(60),
+        &format!("{engine} engine pool busy (retryable): {e:#}"),
+    );
+    Response::builder()
+        .status(StatusCode::SERVICE_UNAVAILABLE)
+        .header(http::header::CONTENT_TYPE, "text/plain; charset=utf-8")
+        .header(http::header::RETRY_AFTER, "1")
+        .body(full(app_ffi::ENGINE_BUSY_BODY))
+        .unwrap()
+}
+
+/// [`engine_busy`] 的字节版（h2/h3）：状态码/头/体与 h1 **逐字一致**（跨协议一致性）。
+fn engine_busy_simple(engine: &str, e: &anyhow::Error) -> Response<Bytes> {
+    crate::server::log_throttle::warn_every(
+        &format!("engine-busy-simple::{engine}"),
+        std::time::Duration::from_secs(60),
+        &format!("{engine} engine pool busy (simple path, retryable): {e:#}"),
+    );
+    Response::builder()
+        .status(StatusCode::SERVICE_UNAVAILABLE)
+        .header(http::header::CONTENT_TYPE, "text/plain; charset=utf-8")
+        .header(http::header::RETRY_AFTER, "1")
+        .body(Bytes::from_static(app_ffi::ENGINE_BUSY_BODY.as_bytes()))
         .unwrap()
 }
 

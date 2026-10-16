@@ -63,7 +63,68 @@ def _safe_under(doc: Path, rel: str) -> Path | None:
         return None
 
 
-def render_jsp(text: str, path: str, params: dict[str, str]) -> bytes:
+# ---------------------------------------------------------------------------
+# `.env` 注入（与 Java 侧 EnvInjectionFilter 同一套语义）
+# ---------------------------------------------------------------------------
+#
+# 宿主侧两条通道（src/server/apps/sidecar_engine.rs::env_forward_headers）：
+#   ① 受管 sidecar（deps/bin/index，本文件在 OpenBSD/默认 demo 下走这条）：宿主把
+#      **本 app 的 .env** 放进 spawn env ⇒ 进程环境里可见（os.environ；Java 侧 System.getenv）。
+#   ② 显式 apps[].socket（运维自己起的进程）：宿主够不着它的进程 env，改为按请求转发
+#      `x-crucible-env-<key 小写>` 头（percent-encoded 值）⇒ 变成 **request attribute**。
+#      宿主转发前会剥掉客户端自带的同名头 ⇒ 该通道无法被外部注入。
+# 为什么是 attribute 而不是全局 setenv：属性**每请求**独立、请求结束即消失；全局变量会被
+# 后一个请求覆盖且残留 ⇒ 跨请求/跨应用串味（apps5b 的结论）。
+ENV_HEADER_PREFIX = "x-crucible-env-"
+ENV_ATTR_PREFIX = "crucible.env."
+ENV_ATTR_MAP = "crucible.env"
+ENV_MAX_KEYS = 64
+ENV_MAX_KEY_LEN = 128
+ENV_MAX_VALUE_LEN = 8192
+ENV_MAX_TOTAL_BYTES = 16 * 1024
+
+
+def extract_env_attributes(hdrs: dict[str, str]) -> dict[str, str]:
+    """`x-crucible-env-*` 头 → request attribute 表（键 = 去掉前缀的**小写**形态）。
+
+    与 Java `EnvInjectionFilter` 逐条等价：值 percent-decode（UTF-8；非法转义按字面保留；
+    **不**把 `+` 当空格 —— RFC 3986，不是表单编码）；空值不注入（= 该键不存在）；上限
+    64 键 / 单值 8KiB / 合计 16KiB（与宿主侧同量级，纵深防御）。
+    `hdrs` 的键必须是已小写化的头名（见 `_parse_headers`）。
+    """
+    out: dict[str, str] = {}
+    total = 0
+    for name, value in hdrs.items():
+        if len(out) >= ENV_MAX_KEYS:
+            break
+        lower = name.lower()
+        if not lower.startswith(ENV_HEADER_PREFIX):
+            continue
+        key = lower[len(ENV_HEADER_PREFIX):]
+        if (
+            not key
+            or len(key) > ENV_MAX_KEY_LEN
+            or key in out
+            or not all(c.isascii() and (c.isalnum() or c == "_") for c in key)
+        ):
+            continue
+        val = urllib.parse.unquote(value, encoding="utf-8", errors="replace")
+        if not val or len(val) > ENV_MAX_VALUE_LEN:
+            continue
+        if total + len(key) + len(val) > ENV_MAX_TOTAL_BYTES:
+            break
+        total += len(key) + len(val)
+        out[key] = val
+    return out
+
+
+def render_jsp(
+    text: str,
+    path: str,
+    params: dict[str, str],
+    env_attrs: dict[str, str] | None = None,
+) -> bytes:
+    env_attrs = env_attrs or {}
     out: list[str] = []
     i = 0
     while i < len(text):
@@ -90,6 +151,31 @@ def render_jsp(text: str, path: str, params: dict[str, str]) -> bytes:
                 )
                 if m:
                     out.append(params.get(m.group(1), ""))
+                    continue
+                # request.getAttribute("crucible.env.<key>") —— 显式 socket 的 .env 通道
+                # （宿主转发头 → EnvInjectionFilter/extract_env_attributes 注入的属性）。
+                m = re.search(
+                    r'request\.getAttribute\s*\(\s*["\']([^"\']+)["\']\s*\)',
+                    expr,
+                    re.I,
+                )
+                if m:
+                    name = m.group(1)
+                    if name == ENV_ATTR_MAP:
+                        out.append("")
+                    elif name.startswith(ENV_ATTR_PREFIX):
+                        out.append(env_attrs.get(name[len(ENV_ATTR_PREFIX):], ""))
+                    else:
+                        out.append("")
+                    continue
+                # System.getenv("KEY") —— 受管 sidecar 的 spawn env 通道（进程环境）。
+                m = re.search(
+                    r'System\.getenv\s*\(\s*["\']([^"\']+)["\']\s*\)',
+                    expr,
+                    re.I,
+                )
+                if m:
+                    out.append(os.environ.get(m.group(1), ""))
                     continue
                 # string literal
                 if (expr.startswith('"') and expr.endswith('"')) or (
@@ -159,6 +245,7 @@ class ActionBridge:
         params: dict[str, str],
         doc: Path,
         rel: str,
+        env_attrs: dict[str, str] | None = None,
     ) -> tuple[bytes, bytes, bytes]:
         """Return (status, content_type, body)."""
         base = self._basename(rel or path)
@@ -177,7 +264,7 @@ class ActionBridge:
             jsp = _safe_under(doc, rel_jsp)
             if jsp and jsp.is_file():
                 text = jsp.read_text(encoding="utf-8", errors="replace")
-                body = render_jsp(text, path, params)
+                body = render_jsp(text, path, params, env_attrs)
                 return (
                     b"200 OK",
                     b"text/html; charset=utf-8",
@@ -241,6 +328,9 @@ def handle_request(raw: bytes) -> bytes:
         method = parts[0] if parts else "GET"
         raw_path = parts[1] if len(parts) > 1 else "/"
         hdrs = _parse_headers(lines)
+        # `.env` 请求头通道 → request attribute（显式 socket 场景；受管 sidecar 的 .env
+        # 走 spawn env，环境变量里已可见）。见 extract_env_attributes 的说明。
+        env_attrs = extract_env_attributes(hdrs)
         params = _query_params(raw_path)
         form = _form_params(body_raw, hdrs.get("content-type", ""))
         # Form body overrides query on key clash (CGI-ish).
@@ -254,7 +344,12 @@ def handle_request(raw: bytes) -> bytes:
 
         if ActionBridge.matches(path) or ActionBridge.matches(rel):
             status, ctype, body_out = ActionBridge().handle(
-                path=path, method=method, params=params, doc=doc, rel=rel
+                path=path,
+                method=method,
+                params=params,
+                doc=doc,
+                rel=rel,
+                env_attrs=env_attrs,
             )
             engine = b"jsp-actionbridge"
         else:
@@ -265,7 +360,7 @@ def handle_request(raw: bytes) -> bytes:
                 jsp = _safe_under(doc, "index.jsp")
             if jsp and jsp.is_file() and jsp.suffix.lower() in (".jsp", ".jspx"):
                 text = jsp.read_text(encoding="utf-8", errors="replace")
-                body_out = render_jsp(text, path, params)
+                body_out = render_jsp(text, path, params, env_attrs)
                 ctype = b"text/html; charset=utf-8"
                 status = b"200 OK"
                 engine = b"jsp-sidecar"
@@ -322,16 +417,35 @@ def serve(sock_path: str) -> None:
     sys.stderr.flush()
     while True:
         conn, _ = srv.accept()
+        # **单连接异常绝不允许打死 sidecar**：本进程是长驻的，宿主对显式 socket 的
+        # sidecar 没有重启权（那是运维的进程）—— 客户端提前断开（EPIPE/ECONNRESET，
+        # 例如宿主代理侧超时后关闭）会从 `sendall` 抛出，旧实现会让整个 listener
+        # 退出（socket 文件还在但 connect 被拒 ⇒ 该应用之后**永久 502**，只有人工重启）。
+        # accept 本身（不会因连接异常抛出）留在 try 外：真出错（EMFILE 等）应快速失败。
         try:
-            data = read_http_request(conn)
-            if data:
-                conn.sendall(handle_request(data))
+            _serve_one(conn)
+        except Exception as e:  # noqa: BLE001 —— 长驻进程的兜底
+            try:
+                sys.stderr.write(f"jsp sidecar: connection error (kept serving): {e!r}\n")
+                sys.stderr.flush()
+            except OSError:
+                pass
         finally:
             try:
                 conn.shutdown(socket.SHUT_RDWR)
             except OSError:
                 pass
-            conn.close()
+            try:
+                conn.close()
+            except OSError:
+                pass
+
+
+def _serve_one(conn: socket.socket) -> None:
+    """处理一条连接（异常由 [`serve`] 兜住，不影响后续连接）。"""
+    data = read_http_request(conn)
+    if data:
+        conn.sendall(handle_request(data))
 
 
 def main() -> int:

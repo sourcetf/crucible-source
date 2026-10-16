@@ -100,6 +100,55 @@ fn matched_app_prefix<'a>(app: &'a AppRouteConfig, path: &str) -> &'a str {
     best.unwrap_or("")
 }
 
+/// 「请求的脚本在 docroot 下不存在」的独立错误类型。
+///
+/// 调用方（h1 `handle` 与 h2/h3 的 `apps::cgi_script_simple`）据此回 **404**，而不是通用
+/// 「500/502 引擎错误」。CGI 惯例（Apache/nginx+fcgiwrap）：请求的脚本文件不存在就是
+/// **404 Not Found**，与「引擎执行失败（脚本崩溃/输出违规）」的 502 是两类故障。
+/// 旧实现把两种情况合并成 502（真机：`/cgis/nope.cgi` → 502），而同一台机上 `cgi` 引擎
+/// （C 侧 libapp_cgi.so）对缺失脚本已经回 404 —— 两个 CGI 引擎对同一形态给不同状态码，
+/// 客户端无法区分「脚本没写」与「后端坏了」。错误详情（绝对路径）仍只进本地节流日志。
+#[derive(Debug)]
+pub(crate) struct ScriptNotFound {
+    pub path: String,
+}
+
+impl std::fmt::Display for ScriptNotFound {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "cgi_script: script not found {}", self.path)
+    }
+}
+
+impl std::error::Error for ScriptNotFound {}
+
+/// 404 响应体（h1 与 h2/h3 **共用同一常量** ⇒ 跨协议逐字一致；不含服务器路径）。
+pub(crate) const SCRIPT_NOT_FOUND_BODY: &str = "404 Not Found (cgi_script: script not found)\n";
+
+/// `Result` 的 Err 是否为「脚本不存在」（见 [`ScriptNotFound`]）。
+pub(crate) fn is_script_not_found(e: &anyhow::Error) -> bool {
+    e.downcast_ref::<ScriptNotFound>().is_some()
+}
+
+/// 缺失脚本的统一 404（h1 路径）。
+pub(crate) fn script_not_found_response() -> Response<BoxBody> {
+    Response::builder()
+        .status(StatusCode::NOT_FOUND)
+        .header(http::header::CONTENT_TYPE, "text/plain; charset=utf-8")
+        .header("X-Crucible-Engine", "cgi_script")
+        .body(full(SCRIPT_NOT_FOUND_BODY))
+        .unwrap()
+}
+
+/// 缺失脚本的统一 404（h2/h3 字节路径）。
+pub(crate) fn script_not_found_response_simple() -> Response<Bytes> {
+    Response::builder()
+        .status(StatusCode::NOT_FOUND)
+        .header(http::header::CONTENT_TYPE, "text/plain; charset=utf-8")
+        .header("X-Crucible-Engine", "cgi_script")
+        .body(Bytes::from_static(SCRIPT_NOT_FOUND_BODY.as_bytes()))
+        .unwrap()
+}
+
 /// cgi_script 请求的脚本解析（h1 与 h2/h3 两条分发路径共用，保证跨协议同口径）：
 /// 返回 `(docroot 下的脚本绝对路径, SCRIPT_NAME, PATH_INFO)`。
 pub(crate) fn resolve_target(
@@ -110,12 +159,12 @@ pub(crate) fn resolve_target(
     let docroot = app.docroot.clone().unwrap_or_else(|| lc.root.clone());
     let rel = crate::server::apps::app_ffi::rel_script_path(app, path);
     let (script_url_rel, path_info) = split_path_info(&docroot, &rel).ok_or_else(|| {
-        anyhow::anyhow!(
-            "cgi_script: script not found {}",
-            script_rel(&docroot, rel.trim_start_matches('/'))
+        // 独立错误类型 ⇒ 调用方回 404（见 `ScriptNotFound` 说明）。
+        anyhow::Error::new(ScriptNotFound {
+            path: script_rel(&docroot, rel.trim_start_matches('/'))
                 .map(|p| p.display().to_string())
-                .unwrap_or_else(|_| rel.clone())
-        )
+                .unwrap_or_else(|_| rel.clone()),
+        })
     })?;
     let script = script_rel(&docroot, script_url_rel.trim_start_matches('/'))
         .context("cgi_script script path")?;
@@ -315,7 +364,19 @@ pub async fn handle(
         .to_bytes();
     // 脚本解析（剥应用前缀 → 最长「已存在文件」前缀定界 → PATH_INFO）与 h2/h3 的
     // `apps::cgi_script_simple` 共用 [`resolve_target`]，保证跨协议同口径。
-    let (script, script_name, path_info) = resolve_target(lc, app, parts.uri.path())?;
+    // 「脚本不存在」= **404**（CGI 惯例，与 cgi 引擎口径一致），不是 502 引擎错误。
+    let (script, script_name, path_info) = match resolve_target(lc, app, parts.uri.path()) {
+        Ok(t) => t,
+        Err(e) if is_script_not_found(&e) => {
+            crate::server::log_throttle::warn_every(
+                "cgi-script-not-found",
+                std::time::Duration::from_secs(60),
+                &format!("{e:#}"),
+            );
+            return Ok(script_not_found_response());
+        }
+        Err(e) => return Err(e),
+    };
     // .env（deps）变量随请求 extensions 下发（try_handle 注入），与 cgi 引擎一致并入脚本环境。
     let env_vars = parts
         .extensions
@@ -481,5 +542,69 @@ mod tests {
         assert_eq!(matched_app_prefix(&app, "/ax/index.cgi"), "");
         let catch_all = app_with_paths(&[]);
         assert_eq!(matched_app_prefix(&catch_all, "/cgis/index.cgi"), "");
+    }
+
+    /// 缺失脚本必须是**可识别**的独立错误（调用方据此回 404 而不是 502 引擎错误），
+    /// 且 404 响应在 h1 与 h2/h3 两条路径上逐字一致（状态码/头/体），不泄露绝对路径。
+    #[test]
+    fn missing_script_is_a_distinct_404_signal() {
+        let dir = std::env::temp_dir().join(format!(
+            "crucible-cgis-404-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("index.cgi"), b"#!/bin/sh\necho hi\n").unwrap();
+        let lc = crate::config::ListenerConfig {
+            address: "127.0.0.1".into(),
+            address_v6: None,
+            port: 19300,
+            root: dir.clone(),
+            autoindex: crate::config::AutoindexConfig::default(),
+            http_versions: vec!["h1".into()],
+            server_name: None,
+            ssl: None,
+            file_open: crate::config::FileOpenTable::default(),
+            apps: vec![],
+            basic_auth: None,
+            proxy_rules: vec![],
+            page_rules: vec![],
+            status_path: None,
+            port_reuse: false,
+            rate_limit: None,
+            ip_access: None,
+            l4_forward: None,
+            quic_ecn: false,
+            qmux: false,
+            connect_udp: false,
+            access_log: None,
+        };
+        let app = app_with_paths(&["/cgis"]);
+        // 存在 → Ok（正常路径不受影响）
+        assert!(resolve_target(&lc, &app, "/cgis/index.cgi").is_ok());
+        // 目录回落：app.index = index.cgi 存在 ⇒ 也 Ok（回落语义不变）
+        assert!(resolve_target(&lc, &app, "/cgis/").is_ok());
+        // 不存在 → `ScriptNotFound`（调用方 downcast 后回 404）
+        let e = resolve_target(&lc, &app, "/cgis/nope.cgi").expect_err("must be missing");
+        assert!(is_script_not_found(&e), "{e:#}");
+        // `..` 穿越被拒 ⇒ 同一「脚本不存在」语义（404），不泄露绝对路径
+        let e3 = resolve_target(&lc, &app, "/cgis/a/../../etc/passwd").expect_err("escape");
+        assert!(is_script_not_found(&e3), "{e3:#}");
+        // h1 / h2h3 两条响应逐字一致
+        let h1 = script_not_found_response();
+        let simple = script_not_found_response_simple();
+        assert_eq!(h1.status(), StatusCode::NOT_FOUND);
+        assert_eq!(simple.status(), StatusCode::NOT_FOUND);
+        assert_eq!(
+            h1.headers().get(http::header::CONTENT_TYPE),
+            simple.headers().get(http::header::CONTENT_TYPE)
+        );
+        assert_eq!(
+            h1.headers().get("x-crucible-engine"),
+            simple.headers().get("x-crucible-engine")
+        );
+        assert!(!SCRIPT_NOT_FOUND_BODY.contains(&dir.display().to_string()));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
