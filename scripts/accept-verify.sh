@@ -1,11 +1,11 @@
 #!/bin/sh
-# accept-verify.sh — 工号 1009 / agent-verify4 黑盒验收一键跑（wave-7）。
+# accept-verify.sh — 工号 1009 / agent-verify5 黑盒验收一键跑（wave-9）。
 #   sh scripts/accept-verify.sh            # 全量：构建 + 起实例 + 上游 + 跑 HTTP/H2/H3/DNS + 扩展 + 汇总
 #   sh scripts/accept-verify.sh --no-build # 跳过 cargo build（用已有二进制）
-# 端口块 29000+；DNS 状态根独立；不碰别人的端口/进程。
+# 端口块 31000+；DNS 状态根独立；不碰别人的端口/进程。
 set -u
 REPO=/home/dev123/crucible-git
-SCRATCH=/home/dev123/scratch-verify4
+SCRATCH=/home/dev123/scratch-verify5
 PY=python3
 
 cd "$REPO" || exit 2
@@ -16,7 +16,7 @@ mkdir -p "$SCRATCH/www-adv/new" "$SCRATCH/www-adv/old" "$SCRATCH/www-rate" \
          "$SCRATCH/www-auth" "$SCRATCH/www-ip" "$SCRATCH/www-up/sub" "$SCRATCH/www-up/php" \
          "$SCRATCH/www-up/listing/sub" "$SCRATCH/outside" "$SCRATCH/www-adv/symout" \
          "$SCRATCH/www-adv/symin" "$SCRATCH/www-tlsip" "$SCRATCH/www-h3ip" \
-         "$SCRATCH/www-h3dir/sub"
+         "$SCRATCH/www-h3dir/sub" "$SCRATCH/www-up2"
 echo "adv index" > "$SCRATCH/www-adv/index.html"
 echo "new content" > "$SCRATCH/www-adv/new/index.html"
 echo "rate ok" > "$SCRATCH/www-rate/index.html"
@@ -40,6 +40,22 @@ chmod +x "$SCRATCH/www-up/cga/deps/bin/index"
 printf '#!/bin/sh\necho cga-index\n' > "$SCRATCH/www-up/cga/index.cgi"
 chmod +x "$SCRATCH/www-up/cga/index.cgi"
 ln -sfn cga "$SCRATCH/www-up/link"
+# wave-9 / wave-8 复核：in-root 符号链接**别名**绕过三道路径闸门（upload3-wave8 §3 的 P2）。
+# 别名预先存在于上传 docroot（运营方常见 `latest -> releases/x` 形态），请求 URL 人畜无害，
+# 而 `safe_join` 对已存在目标 canonicalize 后落盘命中的却是受保护文件：
+#   aliasenv -> .env        （隐藏段闸门应拦；修前 201 且 .env 被改写）
+#   aliasphp -> shellX.php  （可执行扩展名闸门应拦；修前 201 且 PHP 落进 .php = webshell 面）
+#   aliasnormal.txt -> inner.txt（对照：别名→普通文件在设计上放行，等价直接写，不得误伤）
+printf 'SECRET_ORIGINAL\n' > "$SCRATCH/www-up/.env"
+printf 'ORIGINAL_PHP\n' > "$SCRATCH/www-up/shellX.php"
+printf 'INNER_ORIG\n' > "$SCRATCH/www-up/inner.txt"
+ln -sfn .env "$SCRATCH/www-up/aliasenv"
+ln -sfn shellX.php "$SCRATCH/www-up/aliasphp"
+ln -sfn inner.txt "$SCRATCH/www-up/aliasnormal.txt"
+# 第二上传口（31083）的独立 docroot —— config 校验拒绝同 root 多 listener
+echo "up2 index" > "$SCRATCH/www-up2/index.html"
+# 快车道 A/B 用：>SMALL_FILE_MAX(256KB) 的大文件必须安全回退（快车道只缓存小文件）
+python3 -c "open('$SCRATCH/www-up2/big.bin','wb').write(b'Z'*300000)"
 # per-child .env：a=带 .env 慢(2s) b=无 .env 快 c=无 .env 慢(3s) d=带 .env 快 s=cgi_script 带 .env
 for d in a b c d s; do mkdir -p "$SCRATCH/env-www/$d/deps"; done
 printf 'WINDOWMARK=from-app-A\nSECRET_A=a-only-secret\n' > "$SCRATCH/env-www/a/.env"
@@ -118,7 +134,11 @@ python3 -c "open('$SCRATCH/www-adv/range.txt','wb').write(b'A'*1000+b'B'*1000)"
 
 # ── 构建（可选）──
 if [ "${1:-}" != "--no-build" ]; then
+  # ACCEPT_TARGET_DIR：调用方可指定**独立** CARGO_TARGET_DIR（verify5 用
+  # ~/scratch-verify5/target；共享 buildenv 的默认 target 会与别的 agent 撞车）。
   . /home/dev123/bin/buildenv.sh
+  CARGO_TARGET_DIR=${ACCEPT_TARGET_DIR:-$CARGO_TARGET_DIR}
+  export CARGO_TARGET_DIR
   export CARGO_BUILD_JOBS=8
   echo "==> cargo build (release, tls,tls_boring) into $CARGO_TARGET_DIR"
   $CARGO build --release --bin webserver --offline --features tls,tls_boring >"$SCRATCH/logs/build.log" 2>&1
@@ -160,19 +180,19 @@ $PY scripts/accept-verify-genconf.py >/dev/null || exit 2
 # 环境/缺陷，用于真正验证 HTTP/3 协议面（见报告 verify-wave3）。
 sed '/address_v6 = "::"/d' "$SCRATCH/conf/config-verify.toml" > "$SCRATCH/conf/config-verify-nov6.toml"
 
-# ── 起上游（明文 29099 + TLS 29100）──
+# ── 起上游（明文 31099 + TLS 31100）──
 # 只杀**本端口**的上游：共享机上别的 agent 可能跑同名脚本（照抄的套件），
 # 宽泛的 `pkill -f accept-verify-upstream.py` 会互相误杀（实测发生）。
-pkill -f "accept-verify-upstream.py 29099" 2>/dev/null || true
+pkill -f "accept-verify-upstream.py 31099" 2>/dev/null || true
 sleep 0.3
-nohup $PY scripts/accept-verify-upstream.py 29099 >"$SCRATCH/logs/upstream.log" 2>&1 &
+nohup $PY scripts/accept-verify-upstream.py 31099 >"$SCRATCH/logs/upstream.log" 2>&1 &
 echo $! > "$SCRATCH/upstream.pid"
 sleep 0.5
 
 ensure_upstream() {
-  if ! curl -s -o /dev/null --max-time 3 "http://127.0.0.1:29099/proxy" 2>/dev/null; then
-    echo "WARN: 上游 29099 不在（被别的 agent 的 pkill 误杀？）→ 重启"
-    nohup $PY scripts/accept-verify-upstream.py 29099 >>"$SCRATCH/logs/upstream.log" 2>&1 &
+  if ! curl -s -o /dev/null --max-time 3 "http://127.0.0.1:31099/proxy" 2>/dev/null; then
+    echo "WARN: 上游 31099 不在（被别的 agent 的 pkill 误杀？）→ 重启"
+    nohup $PY scripts/accept-verify-upstream.py 31099 >>"$SCRATCH/logs/upstream.log" 2>&1 &
     echo $! > "$SCRATCH/upstream.pid"
     sleep 0.5
   fi
@@ -187,7 +207,7 @@ sleep 1
 # 每趟开始前探活，死了就重启，绝不让后续趟次跑在死实例上。
 ensure_up() {
   ensure_upstream
-  if ! curl -s -o /dev/null --max-time 2 "http://127.0.0.1:29081/" 2>/dev/null; then
+  if ! curl -s -o /dev/null --max-time 2 "http://127.0.0.1:31081/" 2>/dev/null; then
     echo "WARN: 实例在 $1 前消失（外部 SIGTERM？）→ 重启并用同一配置继续"
     tail -3 "$SCRATCH/logs/webserver.log" | cut -c1-160
     sh scripts/accept-verify-start.sh || { echo "RESTART FAILED"; exit 2; }
@@ -214,18 +234,18 @@ RC4=$?
 # ── PASS 2：去 address_v6 档 → HTTP/3 / DoT / DoH ──
 ACCEPT_CFG="$SCRATCH/conf/config-verify-nov6.toml" sh scripts/accept-verify-start.sh >/dev/null 2>&1
 sleep 1.5
-# 假 named（UDP 29553）：本机没有 bind9，DoT/DoH 的正常递归路径没有应答者就会超时。
+# 假 named（UDP 31553）：本机没有 bind9，DoT/DoH 的正常递归路径没有应答者就会超时。
 # 起它之后，「DoT 回 DNS 报文 / DoH POST 返回 dns-message」不再是 SKIP，而是端到端验证。
-pkill -f "accept-verify-fakenamed.py 29553" 2>/dev/null || true
+pkill -f "accept-verify-fakenamed.py 31553" 2>/dev/null || true
 sleep 0.2
-nohup $PY scripts/accept-verify-fakenamed.py 29553 >>"$SCRATCH/logs/fake-named.log" 2>&1 &
+nohup $PY scripts/accept-verify-fakenamed.py 31553 >>"$SCRATCH/logs/fake-named.log" 2>&1 &
 echo $! > "$SCRATCH/fakenamed.pid"
 sleep 0.5
 echo; echo "########## PASS2: HTTP/3 + DoT + DoH（去 address_v6 以启用 QUIC 端点；假 named 已起）##########"
 $PY scripts/accept-verify-h3.py --json "$SCRATCH/accept-h3-results.json"
 RC2=$?
 
-# ── PASS 2.0：DNS ECS 转发/回显（假 named on :29553；ecs=true 档）──
+# ── PASS 2.0：DNS ECS 转发/回显（假 named on :31553；ecs=true 档）──
 # 本机没有 named，正常递归只会超时；这里用假 named 给出真实应答，才能对「ECS 回显」
 # 做端到端黑盒判据（wave-7 复核点）。
 ensure_up "PASS2.0-ecs"
@@ -243,7 +263,7 @@ RC6=$?
 
 # 恢复主配置（去 v6 档），让日志/环境回到其余趟次一致的状态；停掉假 named
 ACCEPT_CFG="$SCRATCH/conf/config-verify-nov6.toml" sh scripts/accept-verify-start.sh >/dev/null 2>&1
-pkill -f "accept-verify-fakenamed.py 29553" 2>/dev/null || true
+pkill -f "accept-verify-fakenamed.py 31553" 2>/dev/null || true
 
 echo; echo "########## 日志尾部 ##########"
 tail -5 "$SCRATCH/logs/webserver.log"

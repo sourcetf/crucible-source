@@ -123,6 +123,16 @@ pub fn spawn_tracked(cmd: &mut Command, name: &str) -> Result<Child> {
 /// 先 SIGTERM 让 fpm/sidecar 优雅退出并清理 socket，再 SIGKILL 兜底。
 pub fn kill_child(child: &mut Child) {
     let pid = child.id() as i32;
+    // 已经退出的句柄：只回收，**不**向该 pid 发信号。
+    // 为什么要先判：pid 在「子进程已退出、但句柄还存着」的窗口里可能已被内核复用给
+    // 无关进程（长运行期 + 频繁重启 sidecar/php 的场景），`kill(pid, SIGTERM)` 会误伤
+    // 它。`try_wait` 命中「已退出」就只剩 wait 回收这一步；仍在跑（Ok(None)）或
+    // 状态不可知（Err，例如被别处 wait 过）时维持旧路径（SIGTERM → SIGKILL）。
+    if let Ok(Some(_)) = child.try_wait() {
+        let _ = child.wait();
+        unregister(pid);
+        return;
+    }
     let _ = unsafe { libc::kill(pid, libc::SIGTERM) };
     for _ in 0..10 {
         match child.try_wait() {

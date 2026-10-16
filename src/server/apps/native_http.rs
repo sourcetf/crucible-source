@@ -44,47 +44,80 @@ struct Sidecar {
     sock: PathBuf,
     #[allow(dead_code)]
     child: Child,
+    /// 启动该 sidecar 时应用的 `.env`（指纹）与 docroot。
+    ///
+    /// 长驻 sidecar 的进程 env 只在 spawn 时定型：`.env` 改动或配置重载换了 app
+    /// （app_idx 相同但 docroot 不同）后，旧进程必须重启，否则「新配置 + 旧环境/旧 docroot」
+    /// 会一直服务下去（跨应用错配 + .env 陈旧）。指纹不同即杀旧拉新。
+    env_fp: u64,
+    docroot: PathBuf,
+}
+
+/// `.env` 变量集的内容指纹（与键序无关；进程内比较用）。
+///
+/// 为什么不用「配置里的 .env 路径 mtime」：deps 的 `.env` 解析结果才是真正装进环境的
+/// 东西（含引号剥离/空值语义），指纹直接对**最终键值**做，和 `apply_clean_env` 的实际
+/// 输入严格等价。
+pub(crate) fn env_fingerprint(vars: &[(String, String)]) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut sorted: Vec<(&str, &str)> = vars.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+    sorted.sort_unstable();
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    for (k, v) in sorted {
+        k.hash(&mut h);
+        // 分隔符参与哈希：防止 ("A","BC") 与 ("AB","C") 拼出同一指纹。
+        0xffu8.hash(&mut h);
+        v.hash(&mut h);
+    }
+    h.finish()
 }
 
 /// Try FFI-less native sidecar for c/go/rust when `.so` is missing.
+///
+/// `env_vars` = 本请求 app 的 `.env`（deps 解析结果）。长驻 sidecar 在 spawn 时把它装进
+/// 进程 env（**启动期基底 + 本 app 的 .env**，见 `apply_clean_env`），JSP/Jetty 这类
+/// 读 `System.getenv` 的应用由此看到自己的 `.env`（此前一律拿空集：应用环境里没有
+/// 自己的键）。`.env` 变化（内容指纹不同）或 docroot 变化 → 杀旧拉新。
 pub async fn try_handle(
     req: Request<Incoming>,
     lc: &ListenerConfig,
     app: &AppRouteConfig,
     peer: SocketAddr,
     app_idx: usize,
+    env_vars: &[(String, String)],
 ) -> Result<Response<BoxBody>> {
     #[cfg(not(unix))]
     {
-        let _ = (req, lc, app, peer, app_idx);
+        let _ = (req, lc, app, peer, app_idx, env_vars);
         bail!("native_http sidecar requires Unix (OpenBSD/Linux)");
     }
 
     #[cfg(unix)]
     {
         let key = format!("{}-{}-{}", lc.port, app_idx, app.engine);
-        ensure_sidecar(&key, lc, app).await?;
-        let sock = {
-            let map = SIDECARS.lock();
-            map.get(&key)
-                .map(|s| s.sock.clone())
-                .context("sidecar missing")?
-        };
+        let sock = ensure_sidecar(&key, lc, app, env_vars).await?;
         // 两条分支必须同语义：显式 socket 与自动探测的 `deps/bin/index` 都剥掉应用
         // 路由前缀（sidecar 挂在 `/jsp`、`/go` 这类前缀下，内部只认应用相对路径）。
         // 样例应用（c/go/rust）不回读请求路径做路由，剥前缀同样安全。
         let target = uds_target_uri(app, req.uri());
-        proxy_unix(req, &sock, peer, Some(target)).await
+        proxy_unix(req, &sock, peer, Some(target), &[]).await
     }
 }
 
 #[cfg(unix)]
-async fn ensure_sidecar(key: &str, lc: &ListenerConfig, app: &AppRouteConfig) -> Result<()> {
+async fn ensure_sidecar(
+    key: &str,
+    lc: &ListenerConfig,
+    app: &AppRouteConfig,
+    env_vars: &[(String, String)],
+) -> Result<PathBuf> {
+    let fp = env_fingerprint(env_vars);
+    let docroot_current = abs_canon(&app.docroot.clone().unwrap_or_else(|| lc.root.clone()));
     {
         let map = SIDECARS.lock();
         if let Some(s) = map.get(key) {
-            if sock_alive(&s.sock) {
-                return Ok(());
+            if sock_alive(&s.sock) && s.env_fp == fp && s.docroot == docroot_current {
+                return Ok(s.sock.clone());
             }
         }
     }
@@ -95,22 +128,39 @@ async fn ensure_sidecar(key: &str, lc: &ListenerConfig, app: &AppRouteConfig) ->
     {
         let map = SIDECARS.lock();
         if let Some(s) = map.get(key) {
-            if sock_alive(&s.sock) {
-                return Ok(());
+            if sock_alive(&s.sock) && s.env_fp == fp && s.docroot == docroot_current {
+                return Ok(s.sock.clone());
             }
         }
     }
     // Remove dead entry（顺带收掉它的子进程：只从表里删掉等于把它变成没人管的孤儿，
-    // sock 死了不代表进程已经退出）。
+    // sock 死了不代表进程已经退出）。**指纹/docroot 变化**也走这里：旧进程带着旧 `.env`
+    // 或旧 docroot，必须回收重建（否则跨应用错配会一直服务下去）。
     if let Some(mut dead) = SIDECARS.lock().remove(key) {
+        log::info!(
+            "native_http: sidecar {key} 需要重启（.env 指纹或 docroot 变化 / sock 不可用），回收旧进程"
+        );
         crate::server::apps::child_registry::kill_child(&mut dead.child);
     }
 
-    let docroot = app
-        .docroot
-        .clone()
-        .unwrap_or_else(|| lc.root.clone());
-    let docroot = abs_canon(&docroot);
+    let docroot = docroot_current;
+    let state = abs_path(&PathBuf::from(format!("state/native/{key}")));
+    fs::create_dir_all(&state).context("mkdir native state")?;
+    let sock = abs_canon(&state.join("app.sock"));
+    // **别的协议/别的注册表**（h2/h3 的 `sidecar_engine::SIDECARS_SIMPLE`）已经在同一个
+    // sock 路径上服务：直接复用它，**绝不** `remove_file` + 重新 spawn —— 那会偷走对方的
+    // 监听 socket，把对方刚 spawn 的进程变成谁也不管的孤儿（实测：h2c 首请求起 sidecar 后
+    // 首个 h1 请求会再 spawn 一个，旧进程泄漏到 webserver 退出；反复交替可无界堆积）。
+    //
+    // 诚实边界（与 `sidecar_engine::ensure_sidecar_simple` 同一取舍）：复用别人管的进程时
+    // 无法核验它的 `.env` 指纹（env 在对方 spawn 时定型），因此「改了 `.env` 但只有对方
+    // 协议先请求」的窗口里可能短暂沿用旧环境；下一次**自己表里**的指纹检查或超时回收会
+    // 纠正。宁可短暂陈旧，也不制造无人回收的孤儿进程。
+    if sock_alive(&sock) {
+        log::debug!("native_http: sidecar {key} 已由其它注册表拉起（sock 存活），复用");
+        return Ok(sock);
+    }
+
     let deps_bin = app
         .deps_dir
         .clone()
@@ -124,9 +174,6 @@ async fn ensure_sidecar(key: &str, lc: &ListenerConfig, app: &AppRouteConfig) ->
         );
     }
 
-    let state = abs_path(&PathBuf::from(format!("state/native/{key}")));
-    fs::create_dir_all(&state).context("mkdir native state")?;
-    let sock = abs_canon(&state.join("app.sock"));
     let _ = fs::remove_file(&sock);
     let log_path = state.join("sidecar.log");
     let log_file = fs::File::create(&log_path).context("sidecar.log")?;
@@ -136,9 +183,10 @@ async fn ensure_sidecar(key: &str, lc: &ListenerConfig, app: &AppRouteConfig) ->
     // 而这个时刻完全可能落在**另一个应用**的请求期 `.env` 窗口内（进程 env 里装着别人的
     // 密钥）。默认继承 environ 会把这些密钥永久烤进 sidecar 的环境（真机实测：wsgi 应用
     // 的 .env 窗口里拉起 JSP sidecar，wrapper 里 `env` 能看到 WINDOWMARK/SECRET_A）。
-    // 用「启动期基底 + 本请求 .env（对 sidecar 为空）」构造 envp，运维环境照旧、
-    // 请求期临时值一律不继承。
-    crate::server::apps::env_lock::apply_clean_env(&mut cmd, &[]);
+    // 用「启动期基底 + **本 app 的 .env**」构造 envp：运维环境照旧、别人的请求期临时值
+    // 一律不继承，而本 app 自己的键（JSP 的 `System.getenv`、ruby sidecar 的 `ENV`）
+    // 可见 —— 这正是 §7.9 要求的「.env 注入引擎执行环境」。
+    crate::server::apps::env_lock::apply_clean_env(&mut cmd, env_vars);
     cmd.current_dir(&docroot)
         .env("WEBSERVER_LISTEN_UNIX", sock.display().to_string())
         // 路由前缀：sidecar 自行决定是否剥离（JSP/Jetty 据此把 /jsp/x.jsp 映射到 docroot/x.jsp）。
@@ -163,9 +211,11 @@ async fn ensure_sidecar(key: &str, lc: &ListenerConfig, app: &AppRouteConfig) ->
                 Sidecar {
                     sock: sock.clone(),
                     child,
+                    env_fp: fp,
+                    docroot: docroot.clone(),
                 },
             );
-            return Ok(());
+            return Ok(sock);
         }
         tokio::time::sleep(Duration::from_millis(40)).await;
     }
@@ -197,7 +247,7 @@ fn sock_alive(sock: &Path) -> bool {
 /// 不会被误杀（那是别人管理的进程，宿主没有终止权）。SIGTERM → 短等 → SIGKILL → 回收
 /// 由 `child_registry::kill_child` 完成。
 #[cfg(unix)]
-fn kill_managed_sidecar_by_sock(sock: &Path) -> bool {
+pub(crate) fn kill_managed_sidecar_by_sock(sock: &Path) -> bool {
     let key = {
         let map = SIDECARS.lock();
         map.iter().find(|(_, s)| s.sock == sock).map(|(k, _)| k.clone())
@@ -298,6 +348,7 @@ async fn proxy_unix(
     sock: &Path,
     peer: SocketAddr,
     target: Option<http::Uri>,
+    extra_headers: &[(String, String)],
 ) -> Result<Response<BoxBody>> {
     use hyper::client::conn::http1;
 
@@ -317,19 +368,27 @@ async fn proxy_unix(
             .method(parts.method.clone())
             .uri(target.clone());
         for (k, v) in parts.headers.iter() {
+            let lower = k.as_str().to_ascii_lowercase();
             // **丢弃客户端自带的转发头**，否则客户端可以把任意 IP 放在最左边，
             // 后端拿它做日志/ACL 就是伪造点（proxy.rs 的 WS 路径早就是「跳过再写」，
             // 这里此前是「追加语义」，把客户端值原样传下去了）。
+            // `x-crucible-env-*` 同理：只能由宿主按本 app 的 deps 生成（见 extra_headers）。
             if matches!(
-                k.as_str(),
+                lower.as_str(),
                 "x-forwarded-for" | "x-forwarded-proto" | "x-forwarded-host" | "x-real-ip"
-            ) {
+            ) || lower.starts_with("x-crucible-env-")
+            {
                 continue;
             }
             builder = builder.header(k, v);
         }
         // 只写真实 peer（sidecar 是本地应用后端，它要的就是「谁连到了 webserver」）。
         builder = builder.header("x-forwarded-for", peer_ip.clone());
+        // `.env` 转发头（只由宿主根据本 app 的 deps 生成；见 sidecar_engine 的
+        // `env_forward_headers`）。对这些头同样先写覆盖：客户端伪造无效。
+        for (k, v) in extra_headers {
+            builder = builder.header(k.as_str(), v.as_str());
+        }
         builder.body(Full::new(bytes.clone()))
             .context("build upstream req")
     };
@@ -366,7 +425,13 @@ async fn proxy_unix(
     })
     .await
     .map_err(|_| {
-        kill_managed_sidecar_by_sock(sock);
+        // 跨协议兜底：sidecar 也可能是 h2/h3 字节路径（sidecar_engine 注册表）拉起的，
+        // 它挂在同一个 sock 路径上。只杀自己表里的话，这条协议在「对方起的进程挂死」时
+        // 永远不自愈（反向同理，见 sidecar_engine::proxy_uds_simple）。任一侧杀成功后，
+        // 下一个请求（任一协议）都会重新拉起。
+        if !kill_managed_sidecar_by_sock(sock) {
+            crate::server::apps::sidecar_engine::kill_managed_sidecar_simple_by_sock(sock);
+        }
         anyhow::anyhow!("sidecar timeout after {SIDECAR_TIMEOUT:?}")
     })??;
     checkin_unix(sock, sender);
@@ -456,21 +521,26 @@ pub fn uds_socket_path(app: &AppRouteConfig) -> Option<PathBuf> {
 }
 
 /// Proxy one request to a pre-started UDS HTTP sidecar (`apps[].socket`).
+///
+/// 显式 socket 是**运维自己起的**进程（如 Jetty）：宿主无法再注入它的进程 env，因此
+/// 本 app 的 `.env` 以 `x-crucible-env-<key>` 请求头（percent-encoded 值）转发，
+/// 由 sidecar 侧自行读取（约定见 `sidecar_engine::env_forward_headers`）。
 pub async fn try_handle_uds(
     req: Request<Incoming>,
     app: &AppRouteConfig,
     peer: SocketAddr,
+    extra_headers: &[(String, String)],
 ) -> Result<Response<BoxBody>> {
     #[cfg(not(unix))]
     {
-        let _ = (req, app, peer);
+        let _ = (req, app, peer, extra_headers);
         bail!("UDS sidecar requires Unix (OpenBSD/Linux)");
     }
     #[cfg(unix)]
     {
         let sock = uds_socket_path(app).context("apps[].socket missing")?;
         let target = uds_target_uri(app, req.uri());
-        proxy_unix(req, &sock, peer, Some(target)).await
+        proxy_unix(req, &sock, peer, Some(target), extra_headers).await
     }
 }
 

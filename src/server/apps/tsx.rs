@@ -1227,7 +1227,9 @@ pub async fn handle(
             .map(|s| !s.trim().is_empty())
             .unwrap_or(false);
         if socket_configured && native_http::uds_socket_available(app) {
-            return native_http::try_handle_uds(req, app, peer).await;
+            // tsx 的显式 socket（运维自己的 node 侧车）不接 `x-crucible-env-*` 约定
+            // （Node 侧无对应消费方），传空表保持「只转发请求头」的原语义。
+            return native_http::try_handle_uds(req, app, peer, &[]).await;
         }
     }
 
@@ -1300,11 +1302,13 @@ pub async fn handle_bytes(
             let sock = native_http::uds_socket_path(app)
                 .ok_or_else(|| anyhow::anyhow!("apps[].socket missing"))?;
             let target = crate::server::apps::app_ffi::rel_script_path(app, req.uri().path());
+            // 与 h1 一致：tsx 不接 `x-crucible-env-*` 约定 → 空转发头表。
             return crate::server::apps::sidecar_engine::proxy_uds_simple(
                 req,
                 &sock,
                 peer,
                 Some(target),
+                &[],
             )
             .await;
         }

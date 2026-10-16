@@ -3739,3 +3739,230 @@ task3_scan.py、task3b_extra.py + logs-*.txt）。
   仓库内新增仅 `bench/gobench.go`、`bench/spec_gate.sh`（`bench/**` scope）；**src/ 零改动**；未 commit。
 - 资产：`~/scratch-bench/{frozen,work,target,target-work,h2o,logs/*.log}`；端口 24081/24095/24781 收工后释放
   （如需复现：`sh ~/scratch-bench/restart.sh && sh ~/scratch-bench/restart-h2o.sh`）。
+
+---
+# 【agent-verify5 / 工号 1009 · Wave-9 最终验收收工】（2026-10-10 02:30）
+
+**快照**：HEAD `fb94b22`；工作树含 wave-9 在途 WIP（fastpath：`h1.rs`/`h1_fast.rs`/`mod.rs`；
+apps env 重构 6 文件）。认证快照 B = `~/scratch-verify5/frozen-w9/`（01:49 冻结，216 文件 md5 清单
+`logs/frozen-w9-md5.txt`）+ 验收方在**副本**上补的 3 行最小编译补丁（共享树未动）。认证二进制
+`~/scratch-verify5/bin/webserver` md5 `65bcdd6103c7315a201cd6b05e216350`。对照快照 A（无 fastpath，
+md5 `c0854d69…`）功能状态完全一致。未 commit/push/checkout/reset/stash/clean；未改 src/libs。
+
+## 0. 总账（认证快照 B）
+- PASS1 **140/0/10**；EXT **113/0/0**；GOAWAY 4/0/0；H3 24/0/0；DNS ECS on/off 6+3/0/0
+  ⇒ **合计 290 PASS / 0 FAIL / 10 SKIP（300 项）**，对 verify4 基线 247/1/12（260 项）零回归
+  （A/B 两快照逐项零差异，`logs/compare-run1b-vs-run2.txt`）。
+- 单测 **499 passed / 2 failed / 1 ignored**（502 条；2 条失败见 §2）。
+- 性能（规格条件、双方 2 线程、127B、gobench+spec_gate）：**c64 = 1.17（PASS ≤1.2）**、
+  **c128 = ~1.22（边缘不达标，中位 9 对）**；延迟比 c64 1.16 / c128 ~1.22；c128 CPU/req
+  ours 15.03–15.47µs vs h2o 12.35–12.55µs（双方各 1.95–1.96 核打满）。fastpath 上线把
+  c64 1.34→1.17、c128 1.44→1.22（同方法对照）。
+
+## 1. 核心收口：h2c TE 原唯一 FAIL → raw 帧探针（0 FAIL 达成）
+- 套件已删 curl TE 检查、改 **零依赖 raw HPACK 帧探针**（`accept-verify.py::_h2_raw_exchange`）：
+  h2c 与 h2(TLS) 的 `transfer-encoding`/`connection` → **RST_STREAM(1)**、`te: trailers` → 进路由、
+  无额外字段 → 进路由；8/8 PASS（注释含 curl 抑制 TE 的字节级证据）。wave-8 h2h3e 结论在套件内落地。
+
+## 2. 点名给 owner 的在途问题（本 agent 未修，纪律所限）
+- **[P0 · agent-fastpath] 共享树当前不编译**：`src/server/h1.rs:466 error[E0425] half_close`——
+  `serve_hyper` 缺 `half_close: bool` 形参与 425/430 两处实参透传。验收方只在 frozen-w9 副本补了
+  这 3 行以完成黑盒（二进制 md5 如上）；**修复落地后请重跑 `sh scripts/accept-verify.sh` 复核**。
+- **[P1 · agent-fastpath] 2 条单测失败（分析为测试侧 bug）**：`h1_fast::tests::head_end_scan`
+  （期望 Some(11) 与 exclusive 语义矛盾，实现返回 Some(7) 正确）、
+  `fallback_returns_untouched_bytes`（与 LF 参考串比，应比 CRLF 实发字节；生产回退字节原样）。
+- fastpath 黑盒行为：`CRUCIBLE_H1_FASTPATH=1|0` 两态在 keep-alive/HTTP1.0/HEAD/Range/404/300KB
+  大文件/访问日志 7 面**逐项零差异**；frozen 二进制实测命中（日志
+  `h1 fastpath: conns=200 served=200 …`，`~/scratch-verify5/logs/fp-engage.log`）。
+
+## 3. Wave-8 面复核（全 PASS）
+- h2/h3 请求字段统一判据（见 §1）；上传**符号链接别名闸门**：`PUT /aliasenv`(→.env)、
+  `/aliasphp`(→.php) **403 且目标未变**，别名→普通文件对照仍 201（不误伤）；
+- 上传配额：**24 次中断后仍 201**；**16 在途（31094+31083 各 8）→ 第 17 个 503 +
+  `Retry-After: 5`** 且响应体为「会话过多」（= 会话配额，非端口闸门）；释放后恢复 201。
+
+## 4. 套件/端口（给后续 agent）
+- `scripts/accept-*` 迁至 **31000 块 + `~/scratch-verify5`**（避开 24000/26000/28000/29000；
+  含新增 31083 第二上传口、31082 fastpath A/B 独立实例、`ACCEPT_TARGET_DIR=` 支持）。
+- 本 agent 实例收工后已停（suite/perf 进程终止；端口 31xxx 释放）。复现：
+  `ACCEPT_TARGET_DIR=$HOME/scratch-verify5/target sh scripts/accept-verify.sh`（先修 §2 的 P0）。
+- 报告 `reports/verify5-wave9.md`、修复总结 `fixes/verify5-wave9.md`；原始日志/JSON 全在
+  `~/scratch-verify5/{logs,perf/logs,frozen-w9}/`。
+
+---
+# 【agent-apps5b / 工号 1009 · Wave-10 应用引擎面收工】（2026-10-16 20:15）
+
+**角色**：接手被中断的 agent-apps5 在途改动（已落在工作树、无报告）：读懂 + 真机验证 + 补完。
+**scope**：`src/server/apps/*.rs`、`libs/app-engines/**`、`libs/script-ffi/**`、`libs/aspnet-ffi/**`、
+`libs/axonasp-ffi/**`、`www-apps/**`、`scripts/build_app_engines.sh`、`scripts/build_script_ffi.sh`。
+**未** git commit/push/checkout/reset/stash/clean；报告 `reports/apps5b-wave10.md`、
+修复 `fixes/apps5b-wave10.md`。
+
+- 二进制 md5 `14d94c770456fe1846a37687df671ab0`（`~/scratch-apps5b/bin/webserver`，含本波全部
+  改动）；单测 **504 passed / 0 failed / 1 ignored**；实例 20500/20544/20581 收工已停、端口释放。
+
+## 1. 在途改动验证（apps5 留下，全部真机过）
+- **build 脚本**：缺 go/cargo 跑 `build_app_engines.sh` **exit=1** 且结尾点名「旧产物仍在」；
+  `--allow-missing`/`CRUCIBLE_ALLOW_MISSING_ENGINES=1` → exit=0；正常 exit=0。
+  `build_script_ffi.sh` 每语言 flags 已分离：`libapp_python.so` 21712→36032B、真实链
+  `libpython3.14`（Py_Initialize undef=1），perl/psgi/scriptffi **不含** python 符号（修前混用
+  ⇒ perl 的 `-lperl` 缺失把 python 一起拖挂成 embed-missing）。
+- **app_ffi 看门狗**（默认 60s，`CRUCIBLE_APP_ENGINE_TIMEOUT_SECS` 可调/0=关）：4s 长请求 200
+  不受影响；`while true do end` 的 lua 6.0s→502+永久隔离，重试 0.5ms 502；env-free 的 cgi
+  不受影响；锁引擎因 env 锁毒化 0.5ms 502。**限制（已实机复现）**：排队时间算进 deadline，
+  池饱和时**健康**引擎的第 9 个排队请求也会超时→误隔离（8×4s 并发 OK、第 9 个 6.0s 502
+  且毒化）；建议拆两个 deadline（见报告 §5.1，需作者拍板）。
+- **env_lock 毒化 / child_registry kill_child try_wait 早退**：静态+单测+运行路径，均通过。
+- **native_http/sidecar_engine 的 .env 指纹重启 + `.env` 进 spawn env**：改 `.env`→仅该 app
+  sidecar 重建生效；wsgi `.env` 窗口内 spawn 的 JSP sidecar 环境 = 基底 + 本 app 键（无他人
+  密钥）；挂死 sidecar 30.5s→502→下一请求 84ms 200 自动重启。
+
+## 2. 本波新修（2 条 P2，file:line 见 fixes 报告）
+- **跨协议挂死 sidecar 不自愈**（h1 起、h2/h3 挂死时 h2c 连续两次 30s+502 永不自愈）→ 两条
+  超时路径互为兜底（跨注册表回收）。修后 h2c 独立自愈：30.5s+502→84ms 200；反向同。
+- **跨协议重复 spawn + 孤儿泄漏**（h2c 起 sidecar → 改 `.env` → h1 请求会偷 sock 再拉一个，
+  实测 2 进程并存，孤儿无界堆积）→ h1 spawn 前「外部 sock 存活即复用」。修后 count=1。
+
+## 3. JSP `.env` 转发（apps4 交回项）——host 侧两条通道全通
+- 受管 sidecar（`deps/bin/index`）：宿主 spawn 时装「基底+本 app .env」⇒ Jetty `System.getenv`
+  直接可见（h1/h2c/h3 都实测 200 + spawn dump 正确）。
+- 显式 `apps[].socket`（运维自己的 Jetty，进程 env 够不着）：请求头 `x-crucible-env-<key>`
+  （percent-encoded，64 键/16KiB 上限；空值不转发；客户端伪造被剥——已实测）。h1/h2c/h3 三协议
+  同结果。**Jetty 侧消费（Filter 放进 request attribute，勿放 System.setProperty）与权衡见
+  报告 §2；`libs/jsp-sidecar/**` 未改（非本 scope）。**
+
+## 4. 矩阵回归（全绿）
+- t2_env（apps4 资产，端口已迁）：phases12 **105/0**；phases34（含 h1 每引擎 **100 次 A/B 交替**、
+  h2c/h3 维度）**206/0**。
+- t4_xproto：**99/0**（h3 HEAD 已无 body，apps4 记录的 h3-HEAD 问题已被 h3 组修掉）。
+- 自建 `smoke_all.py`：22 路径 × h1/h2c/h3 状态码+引擎标签 **0 DIFF**。
+- ABI 矩阵 5 档：new 免锁 / v1、v0 留锁（2.5s 诚实等待）/ mixed 正确 / v1p 谎报负对照按设计泄漏
+  （证明自报判据承重）。
+- 畸形并发 500 请求 ×2：0 panic / 0 僵尸 / RSS 36.6→36.9MB 平台期（+256kB）。
+
+## 5. 记录项（未修，owner/建议见报告 §5）
+- 看门狗「排队计入 deadline」误隔离健康引擎（建议拆两段 deadline）。
+- sidecar 首请求并发窄窗仍可能双 spawn（spawn 锁不共享，本波只把「必然」变「小概率」）。
+- `native_http::lib_available` 未配 `lib` 时按 **cwd 相对** 找 `target/app-engines/*.so`
+  （cwd≠仓库根的实例里 `/rust/` 等三协议一致 502；生产从仓库根启动无此问题）。
+- `.env` 键仅大小写不同 → 转发头同名（同 app 内部，非跨应用泄漏）。
+- `/cgis/nope.cgi`（已路由的缺失脚本）→ 502 通用文案（三协议一致，非本波引入）。
+- 复现资产：`~/scratch-apps5b/{bin,conf,www,shim,logs,abi}`（`logs/*-w10.*` 为原始证据）。
+
+# 【agent-fastsec · src/server/h1_fast.rs（h1 静态快车道）· wave-10 对抗性安全测试】
+（工号 1009；报告：.agents/1009/reports/fastsec-wave10.md；修复：fixes/fastsec-wave10.md。
+未做任何 git 写操作；只改 src/server/h1_fast.rs（wave-9 新建的未跟踪文件），
+h1.rs/mod.rs 未动；实例端口 20980/20981（明文 A-B）+20982/20984（TLS A-B），配置在
+~/scratch-fastsec/，全部脚本与原始日志也在那里。）
+
+## 1. 发现并修复 3 个真缺陷（都在 h1_fast.rs 内，均已补单测）
+- **F1 [P1] HTTP/1.0 + `Connection: keep-alive` 被误当恒关**：旧代码在 1.0 上无条件
+  `keep_alive=false`（注释断言「hyper 对 1.0 一律 disable」，实测为错）。后果：响应缺
+  `connection: keep-alive` 且**关闭连接**，该客户端同连接上管道化的第二个请求被**静默丢弃**
+  （hyper 会保持连接并补该头）。修：1.0 逐行赋值结果照用 + 新增 `head_10_ka` 响应变体
+  + 1.0+KA 恒不关（复刻 hyper 在换代时也会覆盖 close 的实测行为）。
+  证据：14 条 1.0-KA 形状修前 5 处 A/B DIFF → 修后 0。
+- **F2 [P1] 裸 LF 收尾的请求头（`\n\n`）**：只认 `\r\n\r\n` ⇒ 一直等到 30s 头读预算耗尽且
+  **一个字节都不发**，而 hyper/httparse 接受裸 LF（立刻 200/400/404）。
+  修：`scan_head` 发现裸 LF 立即回退（已读字节原样交回 hyper）。
+  证据：`eol.lf-only`/`eol.mixed-1`/`eol.lfcr-instead` 修前 DIFF → 修后一致；8 条 LF 变体全绿。
+- **F3 [P1] `Connection` 值含 obs-text（≥0x80）**：hyper `connection_has` 先 `to_str()`，
+  任一非 visible-ASCII 字节就**放弃整条值**（= 无 token）；快车道逐字节找 token ⇒ 结论相反。
+  1.1 `Connection: \xff, close`：快车道关连接并丢管道化第二请求（hyper 保持并两条都服务）；
+  1.0 `Connection: \xff, keep-alive`：快车道多回一条（hyper 按 1.0 默认关闭）。
+  修：该分支遇 ≥0x80 字节即回退。证据：4 形状修前 DIFF → 修后一致。
+
+## 2. 对抗矩阵结果（真机双实例，同一份裸-socket 脚本）
+- 走私/歧义矩阵：**422 次交换（204 形状 × 裸发+管道化探针）/ 0 差异**（状态行/头/body/
+  连接是否关闭/第二请求是否被服务 全一致）。覆盖 obs-fold、NUL/控制字符、TAB/多空格、
+  LF-only 与混用 EOL、8KB/64KB/1MB 请求行、头行 99/101/200、头名非法、重复 Host、
+  absolute-form 冲突、CL 12 变体、TE 9 变体、Connection 17 变体、1.0/无 Host、非 GET/HEAD、
+  Expect/Upgrade/Range/If-*、CL.TE/TE.CL/TE.TE/双 CL 等走私经典。
+- 字节回放边界：**115 次交换 / 1 差异**（逐字符切点、终止符拆 4 段、逐字节发、20 连管道化、
+  20KB 头、100KB body、回退中途接管）——唯一差异见下。
+- TLS 面 10/10 一致（HSTS `max-age=31536000`，无 includeSubDomains;preload）；路径闸门
+  （/__admin、/__metrics、DoH、状态页）9/9 一致；响应编码/缓存变异 29/29（含 3200 次 Date 采样、
+  1440 次并发模板请求、原地改写/rename/删除/变目录/变符号链接/替换 index）。
+- 慢速与资源：slowloris 32.0s vs 32.0s、空闲回收 29.7s vs 29.7s、半个头 30.0s vs 30.0s；
+  300 并发全服务；1000 连接 fd 10→310→10 无泄漏。
+- 计数器归因（逐相位）：正常 GET served=50/50、404 → fb_miss=50、POST/裸 LF/混用 EOL →
+  fb_parse=50、/__admin → fb_gate=50；`CRUCIBLE_H1_FASTPATH=0` 实例从不输出计数行。
+- 单测：全量 **506 passed / 0 failed / 1 ignored**（h1_fast 11→16 条）。
+
+## 3. 未闭差异（2 类，均**只影响时序**，字节级无差异；P3 记录不修）
+- **D1 客户端 FIN 半关闭竞态**：快车道对已解析请求恒写响应（12/12），hyper 在
+  `allow_half_close=false` 下可能丢掉已生成未写出的响应（同形状实测 0–10/12，两个方向都
+  随机）⇒ 无法对齐（要匹配只能写前探 FIN，会随机丢响应）。两态都关连接、都只服务该请求。
+- **D2 未收尾的畸形头**（不发 `\r\n\r\n`）：hyper 对请求行/头名非法字节**立刻** 400（10/20 形状），
+  快车道等到 30s 头预算耗尽。机理已定位到 hyper `h1/role.rs::is_complete_fast`：报错时机由
+  **读边界**决定（同一串字节经 ReplayIo 立刻 400、走 socket 一直等，本机 6/6 复现）⇒ 回退必然
+  重排读边界，两种时机原理上不可同时对齐；对齐需复刻 httparse 错误延迟剖面（半个解析器，
+  违反本模块教条）。补上结束符后两者响应字节完全一致。影响面：仅「畸形且永不收尾」的连接，
+  占用上限 30s 与 hyper 对合法未收尾请求相同 ⇒ 无资源放大、不可能走私。
+- **跨 scope 观察 O1（owner: static）**：原地改写文件 + `os.utime` 还原 mtime ⇒
+  `static_files::FAST_CACHE` 身份（len+ino+mtime）不变，**TTL 过期重填后仍是旧视图**
+  （开/关两态完全一致，非快车道引入）。
+
+## 4. 并发编辑须知（同文件）
+本轮进行中另有 agent 在同一文件落了**性能向**改动（`Entry::is_stale_at` + `lookup(..., now)`
+省一次 `Instant::now()`、零分配 `is_admin_path_fast` 替换 `access::is_admin_path`，自带与实现
+逐项对拍的 `admin_path_matches_access_impl` 单测）。本 agent 的最终认证二进制
+（21:00:36 +0800）**晚于**该改动（20:55:18 +0800）⇒ 上文全部数字都是**合并后**状态的实测；
+两套改动无互相覆盖（本 agent 只动解析/回退/关闭语义，对方只动缓存时钟与闸门判据的
+无分配版本）。只验证了对方改动的可观测行为（`/__admin*` 9 条闸门 A/B 全一致、与 TTL
+相关的 29 项编码/变异检查全过），**未**审核其性能收益。若再有人改 `h1_fast.rs`，请重跑
+`~/scratch-fastsec/{run_item13,run_item2,run_item5,run_item6_gates}.py` 复验。
+
+补充：本 agent 的 4 个验证实例**仍在运行**（明文 20980 开 / 20981 关，TLS 20982 开 / 20984 关），
+如需释放：`sh ~/scratch-fastsec/stop.sh && kill $(cat ~/scratch-fastsec/on-tls.pid) $(cat ~/scratch-fastsec/off-tls.pid)`；
+重跑实验：`sh ~/scratch-fastsec/restart.sh && sh ~/scratch-fastsec/restart-tls.sh`。
+
+---
+# 【agent-perf5 / 工号 1009 · perf5-wave10 收工】h1 快车道微优化：**c64 1.10、c128 1.13–1.18（双达标，c128 贴线）**
+
+**scope**：`src/server/h1_fast.rs`（唯一改动文件，性能项；安全/回退语义未放宽）。未 commit/push/checkout/reset/stash/clean；未动别人 scope。
+认证二进制 `~/scratch-perf5/bin/final4` md5 `6ba7c4499e094147de2be18f7827072c`（= 共享树
+`src/server/h1_fast.rs` md5 `bdffc0cc…` 构建；重编验证 md5 逐位相同）。本 patch 与 **agent-fastsec**
+同轮对 `h1_fast.rs` 的正确性修复（1.0+KA / 裸 LF / Connection obs-text）**已在同一文件里合并**，互不冲突。
+
+## 0. 门禁（同机、双方 2 线程、127B、gobench（wrk 形状）、交替轮中位；改前基线 c64 1.188 / c128 1.239）
+- **c64 d10**（6 轮，cores 1.76–1.82）：吞吐 **1.100**、延迟 **1.096**、CPU/req 比 1.118 ⇒ PASS。
+- **c128 d8**（两次会话 6+5 轮，cores ≥1.9）：**1.181 / 1.128**（吞吐），延迟 **1.189 / 1.132**，
+  CPU/req 比 **1.176 / 1.125** ⇒ **PASS（贴线）**。逐轮离散 0.88–1.39（共享机 load 6–11 漂移），
+  诚实边界见报告 §5：h2o 处于历史最好状态（9.87µs/req）时 c128 会在 1.19–1.23，**没有裕量**。
+- **净收益（配对 ABBA，同窗口，独立复现两次）**：c128 **−0.51 / −0.58µs/req（−3.7%/−4.2%）**、
+  c64 **−0.71µs/req（−4.5%）**。
+
+## 1. 落地（4 项语义等价微优化 + 1 项字节对齐 + 1 项记账；`h1_fast.rs`）
+1. **30s 头读定时器**：每请求 `timeout_at`（注册+取消）→ 每连接一个 `Sleep`、每请求 `reset`
+   （−0.33µs；语义「一个请求头 30s 总预算」逐项不变，真机 3 例计时 30.0s/30.0s/30.0s）。
+2. **零分配管理路径判定** `is_admin_path_fast`（与 `access::is_admin_path` 逐字等价，单测 8×17 用例对齐；−0.17µs）。
+3. **TTL 时钟复用**（`lookup(..., t0)`，省一次 `Instant::now`）。
+4. **连接级 last-entry 复用**（同路径免全局锁+哈希；lstat 复核/TTL 一个不少）。
+5. **0 字节文件不进快车道**：hyper 对空 body 的 GET 会把 `content-length: 0` 挪到响应头**末尾**
+   （HEAD 留原位）——A/B 逐字节对拍暴露的**既有差异**，改为回退 hyper。
+6. **本连接「不可服务路径」备忘**：404/目录等路径不再每请求白做一次静态解析。
+
+## 2. 差分实测（c128，供后续 agent）
+去掉项的成本：**访问日志 −0.39…−0.88µs/req（剩余最大块，`access_log.rs` 非 perf5 scope，建议 owner
+评估「连接级前缀 + 手写 itoa」或「线程本地暂存缓冲」，预估再回收 0.2–0.4µs ⇒ c128 ≈1.09–1.12）」**；
+定时器 −0.21…−0.68；闸门 −0.10…−0.38；lstat 复核 ~−0.2（红线，不可动）。写路径已是每请求 1 次
+`write_all`（无 writev 空间）；快车道每请求 0 spawn、3 syscall（读+lstat+写，与 h2o 同量级）。
+
+## 3. 回归（全绿）
+- 单测 **506 passed / 0 failed / 1 ignored**（基线 501；+1 为本 patch 的 `admin_path_matches_access_impl`）。
+- 黑盒套件（**32xxx 端口块**副本 `~/scratch-perf5/av/`，`--no-build`、`ACCEPT_BIN=bin/final4`）：
+  PASS1 **140/0/10**、EXT **113/0/0**、GOAWAY 4/0/0、H3 24/0/0、DNS 6+3/0/0 = **290 PASS / 0 FAIL / 10 SKIP**
+  与 verify5-wave9 基线逐项一致（零回归）。首跑 7 条 proxy 502 = 上游被别的 agent 宽泛 pkill 误杀
+  （perf4 已记同款），拉起上游复跑全绿。
+- 快车道 ON/OFF **逐字节对拍 46/47**（47 形状：keep-alive/管线/1.0±ka/Range/条件/Expect/TE/Upgrade/
+  非法 Host/LF-only/obs-fold/空文件×5/编码穿越/大文件…）。唯一差异 = `GET / + 立即 half-close`：
+  快车道回 200、hyper（`allow_half_close=false`）不回字节（h1.rs:320 已述，单向更可用，未改）。
+
+## 4. 交付与资产
+- 报告 `.agents/1009/reports/perf5-wave10.md`、修复总结 `.agents/1009/fixes/perf5-wave10.md`。
+- `~/scratch-perf5/`：`bin/{base,w10-base,w10-perf,final4}`、`logs/gate-*.log`（逐轮 load）、
+  `logs/ab-*.txt`、`logs/var*.log`、`gate.sh|sum.py|variants.sh|ab.py|shapes.py|timeout_test.py`、
+  `apply-perf5.py`（**幂等**，可重放到后续版本）、`av/`（32xxx 套件副本）、`frozen*/`（快照）。
+- 端口 25581/25781（实例）**收工后停止**；变体实例、套件实例均已停止；`~/scratch-perf5/av/` 的
+  upstream(32099/32100) 与 fake-named 已停。若需复现：`BIN=~/scratch-perf5/bin/final4 sh ~/scratch-perf5/restart.sh && sh ~/scratch-perf5/restart-h2o.sh`。

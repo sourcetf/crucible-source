@@ -106,6 +106,35 @@ static INNER: Lazy<Mutex<Inner>> = Lazy::new(|| {
 });
 static ENV_IDLE: Lazy<Condvar> = Lazy::new(Condvar::new);
 
+/// 看门狗毒化标志：某个 FFI 调用超过墙钟时限仍未返回（`app_ffi` 判定）时置位。
+///
+/// 为什么必须毒化而不是「继续等」：超时的调用可能**永远不返回**（死循环/死锁），而它是
+/// 在持有某组临时进程 env 的情况下卡住的 —— 它的 [`Slot`] 永不 Drop ⇒ `active` 永不归零
+/// ⇒ 之后所有需要 env 锁的引擎（wsgi/lua/asp/… 任何非自报 env-free 的 .so）的请求会**永久
+/// 排队**（整站挂死，真机已复现 FIFO 引起的这一形态）。毒化让后来者**快速失败**（502）而不是
+/// 无限等待 —— fail-closed：宁可明确报不可用，也不给出「可能读到错误 env」的假运行。
+///
+/// 恢复方式 = 重启 webserver：进程内无法安全中断任意 C 代码（杀线程会在任意指令处损坏
+/// 堆/解释器状态）。见 `app_ffi` 的看门狗（`CRUCIBLE_APP_ENGINE_TIMEOUT_SECS`）。
+static POISONED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// 毒化 env 锁并唤醒所有等待者（幂等；由超时路径调用）。
+pub fn poison(reason: &str) {
+    let first = !POISONED.swap(true, std::sync::atomic::Ordering::SeqCst);
+    if first {
+        log::error!(
+            "env_lock: 进程 env 互斥被毒化（{reason}）—— 之后所有依赖进程 env 的引擎将立即 502；\
+             恢复需重启 webserver（无法安全中断卡死的 C 调用）"
+        );
+        let _st = INNER.lock();
+        ENV_IDLE.notify_all();
+    }
+}
+
+pub fn is_poisoned() -> bool {
+    POISONED.load(std::sync::atomic::Ordering::SeqCst)
+}
+
 /// 启动期进程环境快照（**不含任何请求期临时 `.env`**）。
 ///
 /// # 为什么需要它（这是「慢空请求挡住带 .env 请求」的根治面）
@@ -228,7 +257,7 @@ impl Drop for Slot {
     }
 }
 
-pub fn with_temp_env_named<T, F>(engine: &str, vars: &[(&str, &str)], f: F) -> T
+pub fn with_temp_env_named<T, F>(engine: &str, vars: &[(&str, &str)], f: F) -> Result<T, String>
 where
     F: FnOnce() -> T,
 {
@@ -246,17 +275,27 @@ where
     //     §13.8 的 sleep-CGI DoS **不回归**（下面 `empty_requests_are_concurrent` 用例守着）；
     //   * 代价：空组 active 时非空组要等它退干净（反之亦然）—— 这是「进程 env 只有一个」
     //     的固有约束，无法既保证 B 看不到 A 的值、又让两组真正并发。
-    let _slot = enter(engine, vars);
-    f()
+    //
+    // 返回值：`Err` = env 锁已被看门狗毒化（有调用超时且永不返回，见 [`poison`]）；
+    // 调用方必须**快速失败**（502），绝不能在这里阻塞等待。
+    let _slot = enter(engine, vars)?;
+    Ok(f())
 }
 
 /// 取得「依赖某组临时环境」的资格。
 ///
-/// 恒返回 [`Slot`]：空变量也参与互斥（见 [`with_temp_env_named`] 的说明）。
-fn enter(engine: &str, vars: &[(&str, &str)]) -> Slot {
+/// 返回 `Err` 表示 env 锁已被看门狗毒化（见 [`poison`]）：此时**不能**进入闭包 ——
+/// 活动组可能被一个永不返回的调用永久占着。
+fn enter(engine: &str, vars: &[(&str, &str)]) -> Result<Slot, String> {
     let g = normalized(vars);
     let mut st = INNER.lock();
     loop {
+        if POISONED.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(
+                "env lock poisoned by an engine wall-clock timeout; restart webserver to recover"
+                    .to_string(),
+            );
+        }
         // ① 内容相同 + 没人在等换组 + 环境确实还是那组 → 直接加入：不写环境，故与同内容并发。
         let joinable = match &st.active {
             Some(active) => {
@@ -266,7 +305,7 @@ fn enter(engine: &str, vars: &[(&str, &str)]) -> Slot {
         };
         if joinable {
             st.inflight += 1;
-            return Slot;
+            return Ok(Slot);
         }
         // ② 有别的组生效中，或有人等着换组：进程 env 只有一个，只能等这一组连同它的读者
         //    一起退干净（`drain_requested` 让同内容的新调用也不再续命，缩短这个等待）。
@@ -281,7 +320,7 @@ fn enter(engine: &str, vars: &[(&str, &str)]) -> Slot {
         st.active = Some(Active { group, prev });
         st.inflight = 1;
         st.drain_requested = false;
-        return Slot;
+        return Ok(Slot);
     }
 }
 
@@ -360,6 +399,11 @@ mod tests {
     use super::*;
     use std::sync::mpsc::{channel, RecvTimeoutError};
     use std::time::Duration;
+
+    /// 测试辅助：本进程内 env 锁不会被毒化（毒化只由 app_ffi 看门狗在真实超时时触发）。
+    fn lock_env<T>(engine: &str, vars: &[(&str, &str)], f: impl FnOnce() -> T) -> T {
+        with_temp_env_named(engine, vars, f).expect("env lock poisoned in unit tests")
+    }
 
     /// 进程 env 是全局的：一个用例「生效中的组」会挡住另一个用例的安装（这是被测语义），
     /// 所以本模块的用例必须串行跑（不是被测代码需要的锁）。
@@ -457,7 +501,7 @@ mod tests {
         let (tx_entered, rx_entered) = channel::<()>();
         let (tx_release, rx_release) = channel::<()>();
         let first = std::thread::spawn(move || {
-            with_temp_env_named(ENGINE, &[(KEY, "v1")], || {
+            lock_env(ENGINE, &[(KEY, "v1")], || {
                 tx_entered.send(()).unwrap();
                 rx_release.recv().unwrap();
             });
@@ -469,7 +513,7 @@ mod tests {
         // 内容完全相同：第二个调用必须**不被阻塞**（旧实现按引擎名加锁 → 这里会超时）。
         let (tx_second, rx_second) = channel::<Option<String>>();
         let second = std::thread::spawn(move || {
-            with_temp_env_named(ENGINE, &[(KEY, "v1")], || {
+            lock_env(ENGINE, &[(KEY, "v1")], || {
                 tx_second.send(std::env::var(KEY).ok()).unwrap();
             });
         });
@@ -497,7 +541,7 @@ mod tests {
         let (tx1, rx1) = channel::<()>();
         let (tx_rel, rx_rel) = channel::<()>();
         let first = std::thread::spawn(move || {
-            with_temp_env_named(ENGINE, &[(KEY, "a")], || {
+            lock_env(ENGINE, &[(KEY, "a")], || {
                 tx1.send(()).unwrap();
                 rx_rel.recv().unwrap();
                 assert_eq!(std::env::var(KEY).unwrap(), "a", "自己那组期间必须看到自己的值");
@@ -508,7 +552,7 @@ mod tests {
 
         let (tx2, rx2) = channel::<Option<String>>();
         let second = std::thread::spawn(move || {
-            with_temp_env_named(ENGINE, &[(KEY, "b")], || {
+            lock_env(ENGINE, &[(KEY, "b")], || {
                 tx2.send(std::env::var(KEY).ok()).unwrap();
             });
         });
@@ -541,7 +585,7 @@ mod tests {
         let (tx, rx) = channel::<()>();
         let (tx_rel, rx_rel) = channel::<()>();
         let holder = std::thread::spawn(move || {
-            with_temp_env_named("ut-eng-a", &[(KEY, "same")], || {
+            lock_env("ut-eng-a", &[(KEY, "same")], || {
                 tx.send(()).unwrap();
                 rx_rel.recv().unwrap();
             });
@@ -550,7 +594,7 @@ mod tests {
 
         let (tx2, rx2) = channel::<Option<String>>();
         let other = std::thread::spawn(move || {
-            with_temp_env_named("ut-eng-b", &[(KEY, "same")], || {
+            lock_env("ut-eng-b", &[(KEY, "same")], || {
                 tx2.send(std::env::var(KEY).ok()).unwrap();
             });
         });
@@ -578,7 +622,7 @@ mod tests {
 
         let (tx, rx) = channel::<Option<String>>();
         let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            with_temp_env_named(ENGINE, &[(KEY, "boom")], || {
+            lock_env(ENGINE, &[(KEY, "boom")], || {
                 tx.send(std::env::var(KEY).ok()).unwrap();
                 panic!("用例故意 panic（验证临时环境会被 Drop 恢复）");
             })
@@ -601,7 +645,7 @@ mod tests {
         std::env::remove_var(HOLDER);
 
         // 正常/提前 return：返回后必须恢复
-        let out = with_temp_env_named(ENGINE, &[(KEY, "x")], || {
+        let out = lock_env(ENGINE, &[(KEY, "x")], || {
             assert_eq!(std::env::var(KEY).unwrap(), "x");
             7
         });
@@ -610,13 +654,13 @@ mod tests {
 
         // 原本已存在的变量：恢复要变回原值（不是删掉）
         std::env::set_var(KEY, "orig");
-        with_temp_env_named(ENGINE, &[(KEY, "tmp")], || {
+        lock_env(ENGINE, &[(KEY, "tmp")], || {
             assert_eq!(std::env::var(KEY).unwrap(), "tmp");
         });
         assert_eq!(std::env::var(KEY).unwrap(), "orig");
 
         // 空值项 = 确保不存在（沿用旧语义），恢复同样要回原值
-        with_temp_env_named(ENGINE, &[(KEY, "")], || {
+        lock_env(ENGINE, &[(KEY, "")], || {
             assert!(std::env::var_os(KEY).is_none());
         });
         assert_eq!(std::env::var(KEY).unwrap(), "orig");
@@ -628,7 +672,7 @@ mod tests {
         let (tx, rx) = channel::<()>();
         let (tx_rel, rx_rel) = channel::<()>();
         let holder = std::thread::spawn(move || {
-            with_temp_env_named("ut-holder", &[(HOLDER, "h")], || {
+            lock_env("ut-holder", &[(HOLDER, "h")], || {
                 tx.send(()).unwrap();
                 rx_rel.recv().unwrap();
             });
@@ -637,7 +681,7 @@ mod tests {
 
         let (tx2, rx2) = channel::<Option<String>>();
         let empty = std::thread::spawn(move || {
-            with_temp_env_named("ut-empty", &[], || {
+            lock_env("ut-empty", &[], || {
                 tx2.send(std::env::var(HOLDER).ok()).unwrap();
             });
         });
@@ -668,7 +712,7 @@ mod tests {
         let (tx_release, rx_release) = channel::<()>();
         // 两个「无 .env」请求、**不同引擎**（模拟 /cgi/ 与 /php/ 的空请求）。
         let first = std::thread::spawn(move || {
-            with_temp_env_named("ut-empty-a", &[], || {
+            lock_env("ut-empty-a", &[], || {
                 tx_entered.send(()).unwrap();
                 rx_release.recv().unwrap();
             });
@@ -679,7 +723,7 @@ mod tests {
 
         let (tx2, rx2) = channel::<()>();
         let second = std::thread::spawn(move || {
-            with_temp_env_named("ut-empty-b", &[], || {
+            lock_env("ut-empty-b", &[], || {
                 tx2.send(()).unwrap();
             });
         });

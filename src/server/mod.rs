@@ -26,6 +26,9 @@ pub mod basic_auth;
 pub mod dns;
 pub mod geoip_panel;
 pub mod h1;
+// wave-9（agent-fastpath）：h1 静态请求快车道（hybrid：纯静态 listener 的 keep-alive
+// GET/HEAD 走自写循环 + 预编码字节；其余请求/连接原样回退 hyper）。见模块头注释。
+pub mod h1_fast;
 // 已删除：h1_static.rs 是死代码（无调用者），且一旦接线会绕过 static_files 的全部加固
 pub mod h2;
 pub mod h3;

@@ -1,6 +1,43 @@
 #!/usr/bin/env bash
 # Build Crucible app-engine artifacts (reads GO_ENGINE_MODE from configure: ffi|shm).
+#
+# 默认行为：**缺工具链 = 失败**。旧实现遇 `command -v go` / `command -v cargo` 判空就
+# 打印一行 WARN 静默跳过，于是「rust/go 没重建但 target/app-engines 里还留着旧 .so」——
+# 运维以为建好了，实际跑的是旧产物（host 的 ABI 校验只会把它 502 掉，功能面等于缺引擎）。
+# 现在：所有工具链缺失/构建失败在结尾**集中汇总并非零退出**；显式
+# `--allow-missing`（或 CRUCIBLE_ALLOW_MISSING_ENGINES=1）才允许降级为警告并退出 0。
 set -euo pipefail
+
+ALLOW_MISSING=0
+for _arg in "$@"; do
+  case "${_arg}" in
+    --allow-missing) ALLOW_MISSING=1 ;;
+    -h|--help)
+      echo "usage: $0 [--allow-missing]"
+      echo "  --allow-missing  缺 go/cargo 等工具链时只告警（退出 0），默认非零退出"
+      exit 0
+      ;;
+    *) echo "WARN: unknown argument '${_arg}'（忽略；可用 --allow-missing）" >&2 ;;
+  esac
+done
+[[ "${CRUCIBLE_ALLOW_MISSING_ENGINES:-0}" == "1" ]] && ALLOW_MISSING=1
+
+# 缺工具链 / 构建失败的汇总（结尾统一处理）。
+MISSING_TOOLCHAIN=()
+BUILD_FAILURES=()
+
+note_missing_tool() {
+  local tool="$1"; shift
+  local found=() a
+  for a in "$@"; do
+    [[ -e "${OUT}/${a}" ]] && found+=("${a}")
+  done
+  if [[ ${#found[@]} -gt 0 ]]; then
+    MISSING_TOOLCHAIN+=("${tool} — 对应产物**未重建，旧产物仍在**：${found[*]}（旧 .so 会被 host ABI 校验挡下，但千万别当成新构建）")
+  else
+    MISSING_TOOLCHAIN+=("${tool} — 对应产物缺失（该引擎将走 sidecar 或 502）")
+  fi
+}
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 OUT="${ROOT}/target/app-engines"
@@ -341,17 +378,26 @@ done
 
 echo "==> building Go engine (${GO_ENGINE_MODE})"
 HOST_OS="$(uname -s | tr "[:upper:]" "[:lower:]")"
-if command -v go >/dev/null 2>&1; then
+# go 的位置：$GO 优先（buildenv 一类环境导出绝对路径），其次 PATH。
+GO_BIN="${GO:-}"
+if [[ -z "${GO_BIN}" ]] && command -v go >/dev/null 2>&1; then
+  GO_BIN="$(command -v go)"
+fi
+[[ -x "${GO_BIN}" ]] || GO_BIN=""
+if [[ -n "${GO_BIN}" ]]; then
   # OpenBSD: Go has no -buildmode=c-shared/c-archive on amd64. Production path is
   # go-shm-server (shared-memory IPC). Linux uses in-process FFI libapp_go.so.
   if [[ "${GO_ENGINE_MODE}" == shm || "${HOST_OS}" == openbsd ]]; then
     SHM_BIN="${OUT}/go-shm-server"
     mkdir -p "${OUT}"
-    (
+    if (
       cd "${GO_SHM_DIR}"
-      CGO_ENABLED=0 go build -o "${SHM_BIN}" .
-    )
-    echo "built ${SHM_BIN} (shared-memory IPC server; OpenBSD production Go path)"
+      CGO_ENABLED=0 "${GO_BIN}" build -o "${SHM_BIN}" .
+    ); then
+      echo "built ${SHM_BIN} (shared-memory IPC server; OpenBSD production Go path)"
+    else
+      BUILD_FAILURES+=("go-shm-server 构建失败（go build 返回非零，见上方输出）")
+    fi
     if [[ "${HOST_OS}" == openbsd ]]; then
       cat > "${OUT}/README-go-openbsd.txt" <<EOF
 Crucible Go app engine on OpenBSD
@@ -379,23 +425,35 @@ EOF
     # Linux / ffi: in-process FFI .so (spec §7.3)
     if (
       cd "${SAMPLES}/go-plugin"
-      CGO_ENABLED=1 go build -buildmode=c-shared -o "${OUT}/libapp_go.so" .
+      CGO_ENABLED=1 "${GO_BIN}" build -buildmode=c-shared -o "${OUT}/libapp_go.so" .
     ); then
       echo "built ${OUT}/libapp_go.so (c-shared FFI)"
     else
+      BUILD_FAILURES+=("go c-shared build 失败（libapp_go.so 未重建）")
       echo "WARN: go c-shared build failed" >&2
     fi
   fi
 else
-  echo "WARN: go not found" >&2
+  echo "WARN: go not found（\$GO / PATH 都没有可执行的 go）" >&2
+  note_missing_tool "go" libapp_go.so go-shm-server
 fi
 
 echo "==> building libapp_rust.so"
-if command -v cargo >/dev/null 2>&1; then
-  (
+# cargo 的位置：$CARGO 优先（buildenv 只导出 $CARGO 绝对路径、不一定改 PATH ——
+# 旧实现的 `command -v cargo` 在这种环境下判空，直接静默跳过 rust 引擎），
+# 其次 PATH，最后 ~/.cargo/bin。
+CARGO_BIN="${CARGO:-}"
+if [[ ! -x "${CARGO_BIN}" ]]; then
+  CARGO_BIN="$(command -v cargo 2>/dev/null || true)"
+fi
+if [[ ! -x "${CARGO_BIN}" ]] && [[ -x "${HOME}/.cargo/bin/cargo" ]]; then
+  CARGO_BIN="${HOME}/.cargo/bin/cargo"
+fi
+if [[ -x "${CARGO_BIN}" ]]; then
+  if (
     unset CARGO_TARGET_DIR || true
     cd "${SAMPLES}/rust-plugin"
-    cargo build --release
+    "${CARGO_BIN}" build --release
     SO=""
     for cand in \
       "${SAMPLES}/rust-plugin/target/release/libapp_rust.so" \
@@ -410,17 +468,50 @@ if command -v cargo >/dev/null 2>&1; then
       cp -f "${SO}" "${OUT}/libapp_rust.so"
     else
       echo "WARN: libapp_rust.so not found" >&2
+      exit 3
     fi
-  )
+  ); then
+    :
+  else
+    rc=$?
+    if [[ ${rc} -eq 3 ]]; then
+      BUILD_FAILURES+=("cargo 构建成功但没有产出 libapp_rust.so")
+    else
+      BUILD_FAILURES+=("cargo build 失败（rc=${rc}）")
+    fi
+  fi
 else
-  echo "WARN: cargo not found" >&2
+  echo "WARN: cargo not found（\$CARGO / PATH / ~/.cargo/bin 都没有可执行的 cargo）" >&2
+  note_missing_tool "cargo" libapp_rust.so
 fi
 
 echo "==> building auxiliary FFI libs (script-ffi / aspnet / axonasp / jsp)"
-bash "${ROOT}/scripts/build_script_ffi.sh" || true
-bash "${ROOT}/scripts/build_aspnet_ffi.sh" || true
-bash "${ROOT}/scripts/build_axonasp_ffi.sh" || true
-bash "${ROOT}/scripts/build_jsp_sidecar.sh" || true
+bash "${ROOT}/scripts/build_script_ffi.sh" || BUILD_FAILURES+=("build_script_ffi.sh 返回非零（见上方输出）")
+bash "${ROOT}/scripts/build_aspnet_ffi.sh" || BUILD_FAILURES+=("build_aspnet_ffi.sh 返回非零")
+bash "${ROOT}/scripts/build_axonasp_ffi.sh" || BUILD_FAILURES+=("build_axonasp_ffi.sh 返回非零")
+bash "${ROOT}/scripts/build_jsp_sidecar.sh" || BUILD_FAILURES+=("build_jsp_sidecar.sh 返回非零")
 
 echo "==> done. artifacts in ${OUT}"
 ls -la "${OUT}" || true
+
+# 结尾汇总：**缺工具链 / 构建失败一律非零退出**（除非显式 --allow-missing）。
+# 这是「静默跳过 → 以为建好了其实是旧 .so」的防线：脚本退出码必须能代表
+# 「target/app-engines 里每一个该有这个运行时的引擎都刚刚被重建过」。
+if [[ ${#MISSING_TOOLCHAIN[@]} -gt 0 || ${#BUILD_FAILURES[@]} -gt 0 ]]; then
+  echo "" >&2
+  echo "============ 引擎构建不完整（可能留着旧 .so）============" >&2
+  for m in "${MISSING_TOOLCHAIN[@]}"; do
+    echo "  MISSING: ${m}" >&2
+  done
+  for x in "${BUILD_FAILURES[@]}"; do
+    echo "  FAILED : ${x}" >&2
+  done
+  echo "  危害：失败的引擎不会覆盖 target/app-engines 下的旧产物；用旧 .so 跑等于" >&2
+  echo "        功能/修复都停留在旧构建（host ABI 校验只会把它 502 掉，不会静默执行）。" >&2
+  if [[ "${ALLOW_MISSING}" == "1" ]]; then
+    echo "  --allow-missing 已指定：降级为警告，继续。" >&2
+  else
+    echo "  确认接受降级时再显式传：$0 --allow-missing（或 CRUCIBLE_ALLOW_MISSING_ENGINES=1）" >&2
+    exit 1
+  fi
+fi

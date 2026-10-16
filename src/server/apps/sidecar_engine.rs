@@ -15,6 +15,64 @@ use std::net::SocketAddr;
 /// 此前这条路径完全裸奔（proxy/fastcgi/CGI 都有各自超时）。
 const SIDECAR_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
+/// `.env` → `x-crucible-env-<key>` 转发头（percent-encoded 值）。
+///
+/// 为什么需要：显式 `apps[].socket` 是**运维自己起的** Jetty 进程，宿主无法再注入
+/// 它的进程 env；受管 sidecar（deps/bin/index）则已经由 spawn env 携带本 app 的 `.env`
+/// （`native_http::ensure_sidecar`），这里是给「进程 env 够不着」的显式 socket 兜一条
+/// 请求级通道。约定：
+///   * 头名 `x-crucible-env-<key 的小写>`（.env key 只允许 `[A-Za-z0-9_]`，天然合法 token）；
+///   * 值 percent-encode（`A-Za-z0-9-._~` 之外全部 `%XX`），与 URL 编码同义，ASCII 安全；
+///   * 空值（`.env` 的 `KEY=` = 「该键不存在」）不转发；
+///   * 上限 64 键 / 16KiB，超出截断（防头膨胀）。
+///
+/// 只对 JSP/do 生效（见调用点）：c/go/rust 样例 sidecar 不读 env，凭空多发头反而可能
+/// 改动它们的响应（例如自行打印全部请求头）。
+pub(crate) fn env_forward_headers(vars: &[(String, String)]) -> Vec<(String, String)> {
+    const MAX_KEYS: usize = 64;
+    const MAX_BYTES: usize = 16 * 1024;
+    let mut out = Vec::new();
+    let mut used = 0usize;
+    for (k, v) in vars {
+        if out.len() >= MAX_KEYS {
+            break;
+        }
+        if k.is_empty()
+            || k.len() > 128
+            || !k.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
+            || v.is_empty()
+        {
+            continue;
+        }
+        let enc = percent_encode_env_value(v);
+        let name = format!("x-crucible-env-{}", k.to_ascii_lowercase());
+        if used + name.len() + enc.len() + 2 > MAX_BYTES {
+            break;
+        }
+        used += name.len() + enc.len() + 2;
+        out.push((name, enc));
+    }
+    out
+}
+
+fn percent_encode_env_value(v: &str) -> String {
+    let mut out = String::with_capacity(v.len());
+    for b in v.bytes() {
+        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b'~') {
+            out.push(b as char);
+        } else {
+            out.push('%');
+            out.push_str(&format!("{b:02X}"));
+        }
+    }
+    out
+}
+
+/// JSP/do 是否需要 `.env` 请求头通道（见 [`env_forward_headers`]）。
+fn engine_forwards_env_headers(engine: &str) -> bool {
+    matches!(engine, "jsp" | "do")
+}
+
 pub async fn handle_with_fallback(
     req: Request<Incoming>,
     lc: &ListenerConfig,
@@ -24,6 +82,19 @@ pub async fn handle_with_fallback(
     engine: &str,
     stub_body: &str,
 ) -> Result<Response<BoxBody>> {
+    // 本 app 的 `.env`（deps 解析结果，`try_handle` 注入到 extensions）：
+    //   * 受管 sidecar 在 spawn 时装进它的进程 env（本 app 的键在 `System.getenv`/`ENV` 可见）；
+    //   * 显式 socket 另发 `x-crucible-env-*` 请求头（进程 env 够不着的兜底通道）。
+    let env_vars: Vec<(String, String)> = req
+        .extensions()
+        .get::<DepsEnv>()
+        .map(|d| (*d.vars).clone())
+        .unwrap_or_default();
+    let extra_headers: Vec<(String, String)> = if engine_forwards_env_headers(engine) {
+        env_forward_headers(&env_vars)
+    } else {
+        Vec::new()
+    };
     if native_http::lib_available(app, engine) {
         return app_ffi::execute(req, lc, app, peer).await;
     }
@@ -40,13 +111,13 @@ pub async fn handle_with_fallback(
     // 的 socket 会照旧往下落到 sidecar 分支（与今天完全一致）。只有「显式配了、而且真的能连」
     // 的时候才会抢在自动探测之前 —— 那本来就是运维写在配置里的意图。
     if native_http::uds_socket_available(app) {
-        return native_http::try_handle_uds(req, app, peer).await;
+        return native_http::try_handle_uds(req, app, peer, &extra_headers).await;
     }
     if native_http::sidecar_available(app, lc) {
-        return native_http::try_handle(req, lc, app, peer, app_idx).await;
+        return native_http::try_handle(req, lc, app, peer, app_idx, &env_vars).await;
     }
     // No FFI .so and no sidecar/UDS — do not pretend success.
-    let _ = stub_body;
+    let _ = (stub_body, extra_headers);
     Ok(Response::builder()
         .status(StatusCode::BAD_GATEWAY)
         .header(http::header::CONTENT_TYPE, "text/plain; charset=utf-8")
@@ -76,6 +147,14 @@ pub async fn handle_with_fallback_simple(
         let outcome = app_ffi::execute_simple(req, lc, app, peer, deps).await?;
         return Ok(app_ffi::simple_response_from_outcome(outcome));
     }
+    // 与 h1 同口径：本 app 的 `.env` 进受管 sidecar 的 spawn env；显式 socket（Jetty，
+    // 进程 env 够不着）走 `x-crucible-env-*` 请求头通道（见 `env_forward_headers`）。
+    let env_vars: Vec<(String, String)> = (*deps.vars).clone();
+    let extra_headers: Vec<(String, String)> = if engine_forwards_env_headers(engine) {
+        env_forward_headers(&env_vars)
+    } else {
+        Vec::new()
+    };
     // 与 h1 同序：显式配置的 socket（活着才算）优先，其次自动探测的 sidecar。
     #[cfg(unix)]
     {
@@ -85,19 +164,19 @@ pub async fn handle_with_fallback_simple(
             // WebAppContext 是 `/`，原样发 `/jsp/index.jsp` 会让它去 docroot/jsp/ 找文件，
             // 恒 404（与 h1 侧 native_http::try_handle_uds 同一判据）。
             let target = crate::server::apps::app_ffi::rel_script_path(app, req.uri().path());
-            return proxy_uds_simple(req, &sock, peer, Some(target)).await;
+            return proxy_uds_simple(req, &sock, peer, Some(target), &extra_headers).await;
         }
         if native_http::sidecar_available(app, lc) {
-            let sock = ensure_sidecar_simple(lc, app, app_idx).await?;
+            let sock = ensure_sidecar_simple(lc, app, app_idx, &env_vars).await?;
             // 与 h1 侧同语义：自动 sidecar 同样剥掉路由前缀（sidecar 挂在 /ruby、/go
             // 这类前缀下，内部只认应用相对路径）。
             let target = crate::server::apps::app_ffi::rel_script_path(app, req.uri().path());
-            return proxy_uds_simple(req, &sock, peer, Some(target)).await;
+            return proxy_uds_simple(req, &sock, peer, Some(target), &extra_headers).await;
         }
     }
     #[cfg(not(unix))]
     {
-        let _ = (req, lc, app, peer, app_idx, deps);
+        let _ = (req, lc, app, peer, app_idx, deps, env_vars, extra_headers);
     }
     // 「无后端可用」是**引擎不可用**（配置/构建问题），与 h1 `handle_with_fallback` 同口径：
     // 返回一个固定的 502 **响应**（而不是 Err）—— Err 会被 `simple_engine_error` 换成通用
@@ -174,6 +253,7 @@ pub(crate) async fn proxy_uds_simple(
     sock: &std::path::Path,
     peer: SocketAddr,
     path_override: Option<String>,
+    extra_headers: &[(String, String)],
 ) -> Result<Response<Bytes>> {
     use hyper::client::conn::http1;
     use http_body_util::BodyExt as _;
@@ -213,7 +293,12 @@ pub(crate) async fn proxy_uds_simple(
         if lower == "host" {
             has_host = true;
         }
-        if is_client_forward_header(&lower) || is_hop_by_hop(&lower) {
+        // `x-crucible-env-*` 一律**丢弃客户端值**：它只能由宿主按本 app 的 deps 生成，
+        // 透传/追加等于让客户端伪造应用环境（下面 extra_headers 后写生效）。
+        if is_client_forward_header(&lower)
+            || is_hop_by_hop(&lower)
+            || lower.starts_with("x-crucible-env-")
+        {
             continue;
         }
         builder = builder.header(k, v);
@@ -224,6 +309,12 @@ pub(crate) async fn proxy_uds_simple(
         }
     }
     builder = builder.header("x-forwarded-for", peer.ip().to_string());
+    // `.env` 转发头（显式 socket 的 Jetty 进程 env 够不着的兜底通道）。客户端同名头在
+    // 上面的复制循环里已被丢弃（`x-crucible-env-*` 前缀），这里写的是宿主按本 app 的
+    // deps 生成的值，客户端无法伪造。
+    for (k, v) in extra_headers {
+        builder = builder.header(k.as_str(), v.as_str());
+    }
     let upstream = builder
         .body(http_body_util::Full::new(req.body().clone()))
         .context("build upstream req")?;
@@ -249,15 +340,24 @@ pub(crate) async fn proxy_uds_simple(
     })
     .await
     .map_err(|_| {
-        kill_managed_sidecar_simple_by_sock(sock);
+        // 跨协议兜底（与 native_http 对称）：还活着但挂死的 sidecar 可能登记在 h1 的
+        // `native_http::SIDECARS` 表里（同一个 sock 路径）。只杀自己表里的话，h2/h3 在
+        // 「h1 起的进程挂死」时每个请求都要等满 30s 且**永不自愈**（真机实测）。
+        if !kill_managed_sidecar_simple_by_sock(sock) {
+            crate::server::apps::native_http::kill_managed_sidecar_by_sock(sock);
+        }
         anyhow::anyhow!("sidecar timeout after {SIDECAR_TIMEOUT:?}")
     })??;
     upstream_response(rparts, rbytes)
 }
 
 /// 代理超时后杀掉**受管**（`SIDECARS_SIMPLE` 表里登记的）sidecar 进程（见调用点说明）。
+///
+/// `pub(crate)`：h1 的 `native_http::proxy_unix` 也会在超时时回调它 —— 两条协议共用同一个
+/// sock 路径，sidecar 可能记在**对方**的表里；只杀自己表里的会让本协议在「对方起的进程
+/// 挂死」时永不自愈（实测：h1 起、被 SIGSTOP 的 JSP sidecar，h2c 连续两次都是 30s+502）。
 #[cfg(unix)]
-fn kill_managed_sidecar_simple_by_sock(sock: &std::path::Path) -> bool {
+pub(crate) fn kill_managed_sidecar_simple_by_sock(sock: &std::path::Path) -> bool {
     let key = {
         let map = SIDECARS_SIMPLE.lock();
         map.iter().find(|(_, s)| s.sock == sock).map(|(k, _)| k.clone())
@@ -285,6 +385,10 @@ fn sock_alive(sock: &std::path::Path) -> bool {
 struct SimpleSidecar {
     sock: std::path::PathBuf,
     child: std::process::Child,
+    /// 与 `native_http::Sidecar` 同判据：`.env` 指纹 / docroot 变了就重启（长驻进程的
+    /// env 与 cwd 只在 spawn 时定型）。
+    env_fp: u64,
+    docroot: std::path::PathBuf,
 }
 
 /// h2/h3 字节路径的 sidecar 注册表（键与 native_http 相同：port-app_idx-engine）。
@@ -311,6 +415,7 @@ async fn ensure_sidecar_simple(
     lc: &ListenerConfig,
     app: &AppRouteConfig,
     app_idx: usize,
+    env_vars: &[(String, String)],
 ) -> Result<std::path::PathBuf> {
     use std::process::{Command, Stdio};
     use std::time::{Duration, Instant};
@@ -319,16 +424,31 @@ async fn ensure_sidecar_simple(
     let state = abs_path(&std::path::PathBuf::from(format!("state/native/{key}")));
     std::fs::create_dir_all(&state).context("mkdir native state")?;
     let sock = abs_canon(&state.join("app.sock"));
+    let fp = native_http::env_fingerprint(env_vars);
+    let docroot_desired = abs_canon(&app.docroot.clone().unwrap_or_else(|| lc.root.clone()));
 
     // 别的协议（h1）或本注册表之外的实例已经把这个 socket 起好了：直接复用，
     // 绝不能 remove_file 抢走它。
+    //
+    // 注意：本函数只负责「sock 活着且指纹一致」的复用判断 —— 跨协议复用的 sidecar
+    // 若指纹不同（.env 变了），本协议这一侧无法确认对方进程的 env，直接从 socket
+    // 连过去也可能拿到旧环境；但杀别人管的进程更危险（对方表里仍记着它），因此这里
+    // 保持「sock_alive 即复用」的既有语义，只在**自己表里**做指纹重启。
     if sock_alive(&sock) {
-        return Ok(sock);
+        let owned_ok = {
+            let map = SIDECARS_SIMPLE.lock();
+            map.get(&key)
+                .map(|s| s.env_fp == fp && s.docroot == docroot_desired)
+                .unwrap_or(true)
+        };
+        if owned_ok {
+            return Ok(sock);
+        }
     }
     {
         let map = SIDECARS_SIMPLE.lock();
         if let Some(s) = map.get(&key) {
-            if sock_alive(&s.sock) {
+            if sock_alive(&s.sock) && s.env_fp == fp && s.docroot == docroot_desired {
                 return Ok(s.sock.clone());
             }
         }
@@ -341,25 +461,22 @@ async fn ensure_sidecar_simple(
         .clone();
     let _guard = lock.lock().await;
     // 等锁期间可能已被别人建好（或已由另一协议拉起）。
-    if sock_alive(&sock) {
-        return Ok(sock);
-    }
     {
         let map = SIDECARS_SIMPLE.lock();
         if let Some(s) = map.get(&key) {
-            if sock_alive(&s.sock) {
+            if sock_alive(&s.sock) && s.env_fp == fp && s.docroot == docroot_desired {
                 return Ok(s.sock.clone());
             }
         }
     }
-    // 死条目：杀进程再摘除（只删表会留下孤儿）。
+    // 死条目 / 指纹或 docroot 变化的旧条目：杀进程再摘除（只删表会留下孤儿）。
     if let Some(mut dead) = SIDECARS_SIMPLE.lock().remove(&key) {
         crate::server::apps::child_registry::kill_child(&mut dead.child);
     }
 
     let deps_bin = native_http::sidecar_binary(app, lc)
         .context("native sidecar binary missing: deps/bin/index (no CGI fallback)")?;
-    let docroot = abs_canon(&app.docroot.clone().unwrap_or_else(|| lc.root.clone()));
+    let docroot = docroot_desired;
     let _ = std::fs::remove_file(&sock);
     let log_path = state.join("sidecar.log");
     let log_file = std::fs::File::create(&log_path).context("sidecar.log")?;
@@ -367,8 +484,9 @@ async fn ensure_sidecar_simple(
     let mut cmd = Command::new(&deps_bin);
     // 干净环境（与 h1 `native_http::ensure_sidecar` 同一判据）：sidecar 是长驻进程，spawn
     // 时刻可能落在别的应用的请求期 `.env` 窗口内 —— 默认继承 environ 会把别人的密钥永久
-    // 烤进 sidecar 环境。启动期基底 + 空请求 `.env`。
-    crate::server::apps::env_lock::apply_clean_env(&mut cmd, &[]);
+    // 烤进 sidecar 环境。启动期基底 + **本 app 的 .env**（本 app 的键对 JSP/Jetty、
+    // ruby sidecar 等可见；别人的请求期临时值一律不继承）。
+    crate::server::apps::env_lock::apply_clean_env(&mut cmd, env_vars);
     cmd.current_dir(&docroot)
         .env("WEBSERVER_LISTEN_UNIX", sock.display().to_string())
         // 与 h1 `native_http::ensure_sidecar` 同一套 env：sidecar（ruby 等）据此
@@ -395,6 +513,8 @@ async fn ensure_sidecar_simple(
                 SimpleSidecar {
                     sock: sock.clone(),
                     child,
+                    env_fp: fp,
+                    docroot: docroot.clone(),
                 },
             );
             return Ok(sock);

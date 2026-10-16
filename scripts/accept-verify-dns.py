@@ -2,7 +2,7 @@
 """accept-verify-dns.py — wave-7 独立复核：DoT/DoH 的 ECS 转发与回显（不依赖本机 named）。
 
 本机没有 `named`（缺 bind9），DoT/DoH 的正常递归路径只会超时。这里在**本进程**起一个
-「假 named」UDP 应答器，绑在配置里的 named 端口（默认 29553，即 `dns::port_or_default()`
+「假 named」UDP 应答器，绑在配置里的 named 端口（默认 31553，即 `dns::port_or_default()`
 在该测试配置下的值）：本进程 DoT/DoH 层把查询 forwarding 到它，它回一条最小 A 应答，
 并把**收到的查询 wire**（含/不含 ECS）逐条记到 JSON 日志。于是可以做端到端的黑盒判据：
 
@@ -24,10 +24,10 @@
 import argparse, asyncio, json, os, socket, ssl, struct, sys, threading, time
 
 HOST = "127.0.0.1"
-DOT_PORT = 29853
-DOH_PORT = 29444
-NAMED_PORT = 29553            # 配置里显式写的 named 端口（genconf: port = 29553）
-SCRATCH = "/home/dev123/scratch-verify4"
+DOT_PORT = 31853
+DOH_PORT = 31444
+NAMED_PORT = 31553            # 配置里显式写的 named 端口（genconf: port = 31553）
+SCRATCH = "/home/dev123/scratch-verify5"
 NAMED_LOG = os.path.join(SCRATCH, "tmp", "fake-named.log")
 
 RESULTS = []
@@ -252,7 +252,7 @@ def test_ecs_on():
     rc = _rcode(resp) if resp else None
     ecs = find_ecs(resp) if resp else None
     rec(area, "DoT+ECS：收到 RCODE=0 应答（假 named 转发生效）", rc == 0, "RCODE=0",
-        f"rcode={rc} len={len(resp)}", "python DoT 客户端 + 假 named on :29553", sev="P1")
+        f"rcode={rc} len={len(resp)}", "python DoT 客户端 + 假 named on :31553", sev="P1")
     ok_echo = (ecs is not None and ecs[0] == 1 and ecs[1] == 24 and ecs[2] == 0
                and ecs[3] == b"\xcb\x00\x71")
     rec(area, "DoT+ECS：应答回带 ECS(203.0.113.0/24,SCOPE=0)（RFC 7871 §7.2.2）",

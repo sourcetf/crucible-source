@@ -1,21 +1,21 @@
 #!/usr/bin/env python3
 """accept-verify-h3.py — HTTP/3 + DoT 报文黑盒检查（用 aioquic / 自写 TLS，不依赖 dig/named）。
 
-- H3 GET https://127.0.0.1:29443/  （ALPN h3，SNI prod-test.crucible.local）
+- H3 GET https://127.0.0.1:31443/  （ALPN h3，SNI prod-test.crucible.local）
 - H3 目录无尾斜杠 → 期望与 h1 一致（301）
-- DoT  TLS 握手到 127.0.0.1:29853（named 缺失 → 报文层可能超时，只验握手/端口）
-- DoH  POST https://127.0.0.1:29444/dns-query（Host: crucible.local，application/dns-message）
+- DoT  TLS 握手到 127.0.0.1:31853（named 缺失 → 报文层可能超时，只验握手/端口）
+- DoH  POST https://127.0.0.1:31444/dns-query（Host: crucible.local，application/dns-message）
 
 用法: python3 scripts/accept-verify-h3.py [--json out.json]
 """
 import asyncio, sys, json, os, socket, ssl, struct, subprocess, time
 
 HOST = "127.0.0.1"
-H3_PORT = 29443
-H3_DIR_PORT = 29098
-DOH_PORT = 29444
-DOT_PORT = 29853
-TMP = "/home/dev123/scratch-verify4/tmp"
+H3_PORT = 31443
+H3_DIR_PORT = 31098
+DOH_PORT = 31444
+DOT_PORT = 31853
+TMP = "/home/dev123/scratch-verify5/tmp"
 os.makedirs(TMP, exist_ok=True)
 
 RESULTS = []
@@ -89,7 +89,7 @@ async def h3_get(path, authority=f"127.0.0.1:{H3_PORT}", alpn="h3", port=None, m
 
 
 def test_h3():
-    area = "HTTP/3 (:29443)"
+    area = "HTTP/3 (:31443)"
     try:
         st, hd, body = asyncio.run(h3_get("/"))
         rec(area, "h3 GET / → 200", st == 200, 200, st, sev="P1", owner="h2h3",
@@ -117,7 +117,7 @@ def test_h3():
                 repro=f"aioquic h3 GET / with :authority: {av}")
         except Exception as e:
             rec(area, f"h3 非法 authority {av!r} → 400", False, 400, f"exc {e!r}", sev="P1", owner="h2h3")
-    # h3 目录无尾斜杠 → 301（专用 listener 29098，root 含 sub/）
+    # h3 目录无尾斜杠 → 301（专用 listener 31098，root 含 sub/）
     try:
         st, hd, body = asyncio.run(h3_get("/sub", authority=f"{HOST}:{H3_DIR_PORT}",
                                           alpn="h3", port=H3_DIR_PORT))
@@ -129,7 +129,7 @@ def test_h3():
 
 def test_h3_head():
     """wave-7：h3 HEAD（RFC 9110 §9.3.2：与 GET 同状态/同头部，**无 body**）。"""
-    area = "HTTP/3 HEAD (:29443)"
+    area = "HTTP/3 HEAD (:31443)"
     # h1 对照（同一文件）
     p = subprocess.run(["curl", "-sS", "-I", "-k", "--max-time", "8",
                         f"https://{HOST}:{H3_PORT}/index.html"], capture_output=True, timeout=12)
@@ -226,7 +226,7 @@ async def h3_probe_raw(extra_headers, path="/", authority=None, timeout=6.0):
 def test_h3_prohibited_field():
     """wave-7 新接线复核：h3 请求带 connection-specific 字段（Transfer-Encoding）。
     RFC 9114 §4.2 + RFC 9113 §8.2.2：必须判 malformed（H3_MESSAGE_ERROR=0x10e RST_STREAM），
-    不进路由。对照给 h2c 的同款检查（:29081，目前仍被放行 —— 见报告缺陷清单）。"""
+    不进路由。对照给 h2c 的同款检查（:31081，目前仍被放行 —— 见报告缺陷清单）。"""
     area = "HTTP/3·connection-specific 字段（RFC 9114 §4.2）"
     try:
         st, resets, term, sid = asyncio.run(h3_probe_raw([("transfer-encoding", "chunked")]))
@@ -250,7 +250,7 @@ def dns_query(name="example.com"):
 
 
 def test_dot():
-    area = "DoT (:29853)"
+    area = "DoT (:31853)"
     try:
         raw = socket.create_connection((HOST, DOT_PORT), timeout=5)
         ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
@@ -280,7 +280,7 @@ def test_dot():
 
 # ── DoH ──
 def test_doh():
-    area = "DoH (:29444)"
+    area = "DoH (:31444)"
     import base64, urllib.request
     q = dns_query("example.com")
     ctx = ssl._create_unverified_context()
@@ -334,7 +334,7 @@ def _rcode(msg):
     return msg[3] & 0x0F if len(msg) >= 4 else None
 
 
-def dot_exchange(msg, port=29853, timeout=7):
+def dot_exchange(msg, port=31853, timeout=7):
     """DoT 单次往返；返回响应字节或 b""（超时/无应答）。"""
     raw = socket.create_connection((HOST, port), timeout=5)
     ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
@@ -372,7 +372,7 @@ def dot_exchange(msg, port=29853, timeout=7):
 
 
 def test_ecs_formerr():
-    area = "DoT·畸形 ECS → FORMERR（:29853）"
+    area = "DoT·畸形 ECS → FORMERR（:31853）"
     malformed = [
         ("同一 OPT 内两个 ECS", _ecs_opt() + _ecs_opt()),
         ("option 声明长度越过 rdata 末尾", struct.pack(">HH", 8, 40) + b"\x00\x01\x18\x00\xcb\x00"),
@@ -404,11 +404,11 @@ def test_ecs_formerr():
 
 
 def test_doh_ecs_formerr():
-    area = "DoH·畸形 ECS → FORMERR（:29444）"
+    area = "DoH·畸形 ECS → FORMERR（:31444）"
     import urllib.request
     ctx = ssl._create_unverified_context()
     q = _q_with_opt(rdata=_ecs_opt() + _ecs_opt())
-    req = urllib.request.Request(f"https://{HOST}:29444/dns-query", data=q,
+    req = urllib.request.Request(f"https://{HOST}:31444/dns-query", data=q,
                                  headers={"Content-Type": "application/dns-message",
                                           "Host": "crucible.local"})
     try:
@@ -417,7 +417,7 @@ def test_doh_ecs_formerr():
         rc = _rcode(body) if len(body) >= 4 else None
         rec(area, "DoH POST 畸形 ECS → 200 + RCODE=FORMERR", r.status == 200 and rc == 1,
             "200 + RCODE=1", f"{r.status} rcode={rc}",
-            "urllib POST 畸形 ECS 查询到 https://127.0.0.1:29444/dns-query", sev="P1", owner="dns")
+            "urllib POST 畸形 ECS 查询到 https://127.0.0.1:31444/dns-query", sev="P1", owner="dns")
     except urllib.error.HTTPError as e:
         rec(area, "DoH POST 畸形 ECS → 200 + RCODE=FORMERR", False, "200 + RCODE=1",
             f"HTTP {e.code}", sev="P1", owner="dns", skip=(e.code in (502, 503, 500)))
@@ -427,7 +427,7 @@ def test_doh_ecs_formerr():
 
 
 def main():
-    out = "/home/dev123/scratch-verify4/accept-h3-results.json"
+    out = "/home/dev123/scratch-verify5/accept-h3-results.json"
     if "--json" in sys.argv:
         out = sys.argv[sys.argv.index("--json") + 1]
     test_h3()

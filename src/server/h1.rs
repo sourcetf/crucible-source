@@ -226,7 +226,10 @@ fn port_value_ok(p: &str) -> bool {
 ///
 /// 保守校验：挡住空白、控制字符、userinfo（`@`）、路径分隔符等会造成歧义的值；
 /// 不追求严格 DNS 语法（保留 `_`，避免误伤带下划线的内部主机名）。
-fn is_valid_host_value(v: &str) -> bool {
+///
+/// `pub(crate)`：wave-9 的 h1 快车道（`server::h1_fast`）在自写解析里**复用同一函数**
+/// 做 Host 校验 —— 快慢两条路的 Host 判据必须逐字一致，不允许第二份实现。
+pub(crate) fn is_valid_host_value(v: &str) -> bool {
     if v.is_empty() || v.len() > 255 || v != v.trim() {
         return false;
     }
@@ -397,6 +400,48 @@ where
     // 纯静态站点每请求也要 ~4 次 malloc/free）。语义不变：连接存活期内 listener 策略
     // 本就固定（配置变更由下面的 generation 检测触发 Connection: close）。
     let lc = Arc::new(lc);
+
+    // ── wave-9「h1 静态快车道」（agent-fastpath）：纯静态 listener 上的 keep-alive
+    // GET/HEAD 由自写循环处理（见 `server::h1_fast` 的模块说明：手写解析 + 预编码
+    // 响应字节 + 1 次 lstat 复核，绕开 hyper 的连接驱动/对象模型）。设计上**保守**：
+    // 任何快车道不完全理解的请求（body/CL/TE、Expect、Upgrade/WS、Range/条件请求、
+    // 非 GET/HEAD、非法/多行 Host、admin/DoH/telemetry/状态页路径、以及解析歧义）
+    // 都连同「已读但未处理的字节」原样交回下面的 hyper 路径 —— 回退路径行为与改动前
+    // 完全相同，只是不提速。`CRUCIBLE_H1_FASTPATH=0` 可进程级关闭（见 h1_fast::enabled）。
+    // QMux（`half_close = true`）绝不走快车道：它的「FIN 与请求同段到达」时序由 hyper 的
+    // `half_close(true)` 处理（见 serve_tls_half_close 的说明），快车道不复制该语义。
+    if !half_close
+        && crate::server::h1_fast::enabled()
+        && crate::server::h1_fast::conn_eligible(&lc)
+    {
+        let raw = io.into_inner();
+        match crate::server::h1_fast::serve(raw, Arc::clone(&live), Arc::clone(&lc), peer, gen0)
+            .await
+        {
+            // 快车道把这条连接处理完了（正常关闭/对端断开/空闲超时）。
+            None => return Ok(()),
+            // 回退：已读字节由 ReplayIo 先喂给 hyper，之后的流量透传。
+            Some(replay) => {
+                return serve_hyper(TokioIo::new(replay), live, lc, peer, gen0, half_close).await;
+            }
+        }
+    }
+
+    serve_hyper(io, live, lc, peer, gen0, half_close).await
+}
+
+/// hyper 收口路径：`serve_io_opts` 的原始实现（wave-9 起被快车道包装，但**逻辑未动**）。
+async fn serve_hyper<IO>(
+    io: TokioIo<IO>,
+    live: Arc<LiveConfig>,
+    lc: Arc<ListenerConfig>,
+    peer: SocketAddr,
+    gen0: u64,
+    half_close: bool,
+) -> Result<()>
+where
+    IO: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
     let svc = service_fn(move |req: Request<Incoming>| {
         let live = Arc::clone(&live);
         let lc = Arc::clone(&lc);

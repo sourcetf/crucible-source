@@ -3,6 +3,10 @@
 # Prefers in-process interpreters when headers are found:
 #   -DCRUCIBLE_HAVE_PYTHON / -DCRUCIBLE_HAVE_RUBY / -DCRUCIBLE_HAVE_PERL
 # Missing headers: library builds but execute() fails closed (no popen).
+#
+# 语言 flag **按语言隔离**（PY_* / RB_* / PL_*）：每只 libapp_<lang>.so 只拿自己语言的
+# cflags/libs。混用（旧 EXTRA_* 写法）会让「一个语言的链接失败」拖挂**所有**语言 ——
+# 实测：perl 的 -lperl 不可用 ⇒ python3-embed 明明可用却一起降级为 embed-missing。
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 OUT="${ROOT}/target/app-engines"
@@ -19,24 +23,32 @@ fi
 
 CFLAGS="-O2 -fPIC -I${INC} -I${COMMON}"
 LDFLAGS="-shared -fPIC"
-EXTRA_CFLAGS=""
-EXTRA_LIBS=""
-# 语言专属的编译/链接参数：psgi 只该拿 Perl 的、rack 只该拿 Ruby 的。
-# 混用 EXTRA_CFLAGS 会让 libapp_psgi.so 也链上 libpython/libruby（无害但会掩盖
-# 「到底探测到了什么」），所以单独留一份。
+# 语言专属的编译/链接参数。**必须按语言分开**：
+#
+# 旧实现把三种解释器的 cflags/libs 累加进同一个 EXTRA_CFLAGS/EXTRA_LIBS，然后
+# `for lang in python ruby perl` 用同一套参数编译三只 .so。后果（本机实测，
+# logs/before-build-scriptffi.log）：只要**任一**语言的链接参数不可用，三只 .so 全部
+# 降级为 embed-missing。典型：本机 perl 头在（ExtUtils::Embed 探测成功）但
+# `-lperl` 找不到（Debian 只装 libperl.so.5.40 无开发符号链接）⇒ libapp_python.so
+# 的链接也带 `-lperl` ⇒ `cannot find -lperl` ⇒ **python3-embed 明明可用却被降级**。
+# 分开之后每个 .so 只拿自己语言的 flag：一个语言的失败不再拖挂其它语言。
+PY_CFLAGS=""; PY_LIBS=""
 PL_CFLAGS=""; PL_LIBS=""
 RB_CFLAGS=""; RB_LIBS=""
 
+# 记录「有头无库/链接失败」的降级项，结束时汇总（避免在几百行编译输出里被淹没）。
+DEGRADED=()
+
 detect_python() {
   if pkg-config --exists python3-embed 2>/dev/null; then
-    EXTRA_CFLAGS="${EXTRA_CFLAGS} $(pkg-config --cflags python3-embed) -DCRUCIBLE_HAVE_PYTHON"
-    EXTRA_LIBS="${EXTRA_LIBS} $(pkg-config --libs python3-embed)"
+    PY_CFLAGS="$(pkg-config --cflags python3-embed) -DCRUCIBLE_HAVE_PYTHON"
+    PY_LIBS="$(pkg-config --libs python3-embed)"
     echo "    in-process Python via python3-embed"
     return 0
   fi
   if pkg-config --exists python3 2>/dev/null; then
-    EXTRA_CFLAGS="${EXTRA_CFLAGS} $(pkg-config --cflags python3) -DCRUCIBLE_HAVE_PYTHON"
-    EXTRA_LIBS="${EXTRA_LIBS} $(pkg-config --libs python3)"
+    PY_CFLAGS="$(pkg-config --cflags python3) -DCRUCIBLE_HAVE_PYTHON"
+    PY_LIBS="$(pkg-config --libs python3)"
     echo "    in-process Python via python3"
     return 0
   fi
@@ -48,8 +60,8 @@ detect_python() {
       if [[ -f "${f}" ]]; then
         local idir
         idir="$(dirname "${f}")"
-        EXTRA_CFLAGS="${EXTRA_CFLAGS} -I${idir} -DCRUCIBLE_HAVE_PYTHON"
-        EXTRA_LIBS="${EXTRA_LIBS} -lpython3"
+        PY_CFLAGS="-I${idir} -DCRUCIBLE_HAVE_PYTHON"
+        PY_LIBS="-lpython3"
         echo "    in-process Python headers at ${f}"
         return 0
       fi
@@ -69,9 +81,7 @@ detect_ruby() {
     return 1
   fi
   if pkg-config --exists ruby 2>/dev/null; then
-    EXTRA_CFLAGS="${EXTRA_CFLAGS} $(pkg-config --cflags ruby) -DCRUCIBLE_HAVE_RUBY"
-    EXTRA_LIBS="${EXTRA_LIBS} $(pkg-config --libs ruby)"
-    RB_CFLAGS="$(pkg-config --cflags ruby)"
+    RB_CFLAGS="$(pkg-config --cflags ruby) -DCRUCIBLE_HAVE_RUBY"
     RB_LIBS="$(pkg-config --libs ruby)"
     echo "    in-process Ruby via pkg-config"
     return 0
@@ -92,9 +102,8 @@ detect_ruby() {
     if [[ -n "${hdr}" && -f "${hdr}/ruby.h" ]]; then
       RB_CFLAGS="-I${hdr}"
       [[ -n "${arch}" ]] && RB_CFLAGS="${RB_CFLAGS} -I${arch}"
+      RB_CFLAGS="${RB_CFLAGS} -DCRUCIBLE_HAVE_RUBY"
       RB_LIBS="${libs:--lruby}"
-      EXTRA_CFLAGS="${EXTRA_CFLAGS} ${RB_CFLAGS} -DCRUCIBLE_HAVE_RUBY"
-      EXTRA_LIBS="${EXTRA_LIBS} ${RB_LIBS}"
       echo "    in-process Ruby (${rb}) headers at ${hdr}"
       return 0
     fi
@@ -111,14 +120,33 @@ detect_ruby() {
       local ver
       ver="$(basename "${d}" | sed -E 's/^ruby-([0-9]+)\.([0-9]+).*/\1\2/')"
       RB_LIBS="-lruby${ver}"
-      EXTRA_CFLAGS="${EXTRA_CFLAGS} ${RB_CFLAGS} -DCRUCIBLE_HAVE_RUBY"
-      EXTRA_LIBS="${EXTRA_LIBS} ${RB_LIBS}"
+      RB_CFLAGS="${RB_CFLAGS} -DCRUCIBLE_HAVE_RUBY"
       echo "    in-process Ruby headers at ${d} (lib=${RB_LIBS})"
       return 0
     fi
   done
   echo "    Ruby headers missing → embed-missing (no popen) for ruby"
   return 1
+}
+
+# 「有头无库」探测（Perl）：ExtUtils::Embed 可能给出 -lperl，但发行版只装了
+# libperl.so.<ver> 而没有开发用的 libperl.so 符号链接（Debian/Ubuntu 常见）。
+# 此时编译期成功、链接期 `cannot find -lperl` —— 提前把话说清楚，避免排障时
+# 以为「探测成功 = 能编出来」。
+perl_libs_present() {
+  local ldopts="$1" dir lib_name found=0
+  # 链接器对 `-lperl` 只认 libperl.so / libperl.a 这两个名字（版本化文件名
+  # libperl.so.5.40 不足以满足 -l，除非存在同目录的符号链接）。所以这里也只查
+  # 这两个名字：查 .so.* 会把「只装了运行时而没有开发符号链接」误判为可用。
+  for dir in $(printf '%s\n' "${ldopts}" | tr ' ' '\n' | sed -n 's/^-L//p') \
+             /usr/local/lib /usr/lib /usr/lib64 /usr/lib/x86_64-linux-gnu; do
+    [[ -d "${dir}" ]] || continue
+    for lib_name in "${dir}"/libperl.so "${dir}"/libperl.a; do
+      [[ -e "${lib_name}" ]] && { found=1; break; }
+    done
+    [[ "${found}" -eq 1 ]] && break
+  done
+  [[ "${found}" -eq 1 ]]
 }
 
 detect_perl() {
@@ -128,9 +156,12 @@ detect_perl() {
     local ld
     ld="$(perl -MExtUtils::Embed -e 'ldopts' 2>/dev/null || true)"
     if echo "${cflags}" | grep -q -- '-I'; then
-      EXTRA_CFLAGS="${EXTRA_CFLAGS} ${cflags} -DCRUCIBLE_HAVE_PERL"
-      EXTRA_LIBS="${EXTRA_LIBS} ${ld}"
-      PL_CFLAGS="${cflags}"
+      if ! perl_libs_present "${ld}"; then
+        echo "WARN: Perl 头文件在（${cflags}）但链接库缺失：ldopts 里的 -lperl 在 -L 目录与默认库目录下都找不到 libperl.so / libperl.a —— perl/psgi 链接会失败并降级 embed-missing（安装 perl 开发包或 libperl 符号链接可修）" >&2
+        DEGRADED+=("perl (headers present, -lperl missing → embed-missing)")
+        return 1
+      fi
+      PL_CFLAGS="${cflags} -DCRUCIBLE_HAVE_PERL"
       PL_LIBS="${ld}"
       echo "    in-process Perl via ExtUtils::Embed"
       return 0
@@ -146,24 +177,32 @@ detect_ruby || true
 detect_perl || true
 
 echo "==> building libscriptffi.so"
-${CC} ${CFLAGS} ${EXTRA_CFLAGS} ${LDFLAGS} -o "${OUT}/libscriptffi.so" \
-  "${SRC}/scriptffi.c" ${EXTRA_LIBS} || \
+# libscriptffi.so 是各嵌入式 CPython 引擎的**共享初始化协调点**
+#（crucible_py_ensure_init；crucible_pyinit.h 明确要求「不引用任何链接期 Py_* 符号」）。
+# 它不需要、也不应该链接任何解释器：旧实现把三种解释器的 flag 一起塞进来，反而让
+# 「任一解释器链接失败」连共享锁一起拖挂（本机实测：-lperl 找不到 → 整只降级）。
 ${CC} ${CFLAGS} ${LDFLAGS} -o "${OUT}/libscriptffi.so" "${SRC}/scriptffi.c"
 
-for lang in python ruby perl; do
-  echo "==> building libapp_${lang}.so (script_engine; flags=${EXTRA_CFLAGS:-(embed-missing)})"
-  if ! ${CC} ${CFLAGS} ${EXTRA_CFLAGS} -DCRUCIBLE_SCRIPT_LANG='"'"${lang}"'"' ${LDFLAGS} \
-    -o "${OUT}/libapp_${lang}.so" \
-    "${SRC}/script_engine.c" \
-    "${COMMON}/appengine_common.c" \
-    ${EXTRA_LIBS}; then
+build_script_engine() {
+  local lang="$1" lflags="$2" llibs="$3"
+  local src="${SRC}/script_engine.c"
+  echo "==> building libapp_${lang}.so (script_engine; flags=${lflags:-(embed-missing)})"
+  if [[ -n "${lflags}" ]]; then
+    if ${CC} ${CFLAGS} ${lflags} -DCRUCIBLE_SCRIPT_LANG='"'"${lang}"'"' ${LDFLAGS} \
+      -o "${OUT}/libapp_${lang}.so" "${src}" "${COMMON}/appengine_common.c" ${llibs}; then
+      return 0
+    fi
     echo "WARN: in-process link failed for ${lang}; rebuilding without embeds (fail-closed)" >&2
-    ${CC} ${CFLAGS} -DCRUCIBLE_SCRIPT_LANG='"'"${lang}"'"' ${LDFLAGS} \
-      -o "${OUT}/libapp_${lang}.so" \
-      "${SRC}/script_engine.c" \
-      "${COMMON}/appengine_common.c"
+    DEGRADED+=("${lang} (in-process link failed → embed-missing)")
   fi
-done
+  ${CC} ${CFLAGS} -DCRUCIBLE_SCRIPT_LANG='"'"${lang}"'"' ${LDFLAGS} \
+    -o "${OUT}/libapp_${lang}.so" "${src}" "${COMMON}/appengine_common.c"
+}
+
+# 每只 .so 只拿**自己语言**的 flag（见文件头注释：混用会让一个语言的链接失败拖挂全部）。
+build_script_engine python "${PY_CFLAGS}" "${PY_LIBS}"
+build_script_engine ruby   "${RB_CFLAGS}" "${RB_LIBS}"
+build_script_engine perl   "${PL_CFLAGS}" "${PL_LIBS}"
 
 # Ruby embed 关闭时：**删掉**可能残留的 libapp_ruby.so。
 # 为什么删而不是留 stub：`native_http::lib_available()` 判的是「文件是否存在」，
@@ -192,11 +231,15 @@ build_extra_engine() {
   echo "==> building libapp_${name}.so (in-process ${have})"
   if ! ${CC} ${CFLAGS} ${cflags} ${LDFLAGS} -o "${OUT}/libapp_${name}.so" "${src}" "${COMMON}/appengine_common.c" "${COMMON}/appengine_util.c" ${libs}; then
     echo "WARN: in-process link failed for ${name}; keeping previous artifact" >&2
+    DEGRADED+=("${name} (in-process link failed → keeping previous artifact)")
     return 0
   fi
 }
 
-build_extra_engine psgi "${ROOT}/libs/app-engines/psgi/psgi_engine.c" "${PL_CFLAGS}${PL_CFLAGS:+-DCRUCIBLE_HAVE_PERL}" "${PL_LIBS}" "Perl"
+# PL_CFLAGS 自身已含 -DCRUCIBLE_HAVE_PERL（旧写法再拼一次且**无空格**，
+# 最后一个 -I 会被拼坏成 `...-DCRUCIBLE_HAVE_PERL` —— build_app_engines.sh 对
+# RB_CFLAGS 的同款坑有详细注释）。
+build_extra_engine psgi "${ROOT}/libs/app-engines/psgi/psgi_engine.c" "${PL_CFLAGS}" "${PL_LIBS}" "Perl"
 
 # rack（嵌入式 MRI）：**默认不启用**，构建诚实失败版。
 #
@@ -216,3 +259,18 @@ build_extra_engine psgi "${ROOT}/libs/app-engines/psgi/psgi_engine.c" "${PL_CFLA
 build_extra_engine rack "${ROOT}/libs/app-engines/rack/rack_engine.c" "" "" "Ruby-disabled"
 
 echo "built ${OUT}/libscriptffi.so libapp_{python,ruby,perl,psgi,rack}.so"
+
+# 降级汇总：把散落在几百行编译输出里的 embed-missing / 链接失败集中列一次。
+# （降级本身是**显式失败**：请求 502 + 日志写明原因，不是静默假成功；但「探测到了
+#   解释器却因链接问题降级」排障时很容易看漏，所以汇总。）
+INPROCESS_OK=()
+[[ -n "${PY_CFLAGS}" ]] && INPROCESS_OK+=("python")
+[[ -n "${RB_CFLAGS}" ]] && INPROCESS_OK+=("ruby")
+[[ -n "${PL_CFLAGS}" ]] && INPROCESS_OK+=("perl")
+if [[ ${#DEGRADED[@]} -gt 0 ]]; then
+  echo "---- script-ffi 降级汇总（各语言 flag 已隔离，互不拖挂）----" >&2
+  for d in "${DEGRADED[@]}"; do
+    echo "  WARN: ${d}" >&2
+  done
+fi
+echo "in-process 解释器可用: ${INPROCESS_OK[*]:-（none）}"

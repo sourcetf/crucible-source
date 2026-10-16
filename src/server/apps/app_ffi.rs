@@ -22,12 +22,13 @@ use http_body_util::BodyExt;
 use hyper::body::Incoming;
 use once_cell::sync::Lazy;
 use parking_lot::Mutex;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ffi::{CStr, CString};
 use std::net::SocketAddr;
 use std::os::raw::{c_char, c_int, c_void};
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 #[repr(C)]
 struct AppEngineResult {
@@ -151,6 +152,67 @@ static LIBS: Lazy<Mutex<HashMap<String, Arc<EngineLib>>>> =
 /// 分路径加锁既消除重复装载，又不让不同引擎互相阻塞。
 static LOAD_LOCKS: Lazy<Mutex<HashMap<String, Arc<Mutex<()>>>>> =
     Lazy::new(|| Mutex::new(HashMap::new()));
+
+// ------------------------------------------------------------------ 看门狗（墙钟）
+
+/// 单次 FFI 调用的墙钟上限。
+///
+/// 背景：`appengine_execute` 是**同步** C 调用，一个死循环/自死锁的引擎会永久占住
+/// worker 线程；若它同时持有宿主 env 锁（非自报 env-free 的引擎），整站锁引擎都会
+/// 排队到永远（真机：`while true do end` 的 lua 让其它锁引擎全部超时）。
+///
+/// 默认 60s（与 fastcgi 的 FCGI_TIMEOUT 同量级；cgi/sidecar 是 30s），
+/// `CRUCIBLE_APP_ENGINE_TIMEOUT_SECS=0` 关闭看门狗（回到「无限等」的旧行为）。
+/// 调大可以容纳「正常的长请求」，但代价是卡死时等待更久。
+const ENGINE_WATCHDOG_DEFAULT_SECS: u64 = 60;
+
+fn engine_call_timeout() -> Option<Duration> {
+    match env_lock::read_static_env("CRUCIBLE_APP_ENGINE_TIMEOUT_SECS") {
+        None => Some(Duration::from_secs(ENGINE_WATCHDOG_DEFAULT_SECS)),
+        Some(raw) => match raw.trim().parse::<u64>() {
+            Ok(0) => None,
+            Ok(n) => Some(Duration::from_secs(n)),
+            Err(_) => {
+                log::warn!(
+                    "app_ffi: CRUCIBLE_APP_ENGINE_TIMEOUT_SECS={raw:?} 不是合法秒数，回退默认 {ENGINE_WATCHDOG_DEFAULT_SECS}s"
+                );
+                Some(Duration::from_secs(ENGINE_WATCHDOG_DEFAULT_SECS))
+            }
+        },
+    }
+}
+
+/// 超时后被隔离的 .so 集合（键 = lib 路径，与 [`LIBS`] 相同）。
+///
+/// 超时后**不能**再调用同一只 .so：卡死的调用可能还在跑（我们无法安全地中断任意 C
+/// 代码——杀线程会在任意指令处损坏堆/解释器状态），再并发进来只会把损失放大。
+/// 隔离是**永久**的（fail-closed）：该引擎后续请求立即 502，恢复靠重启 webserver。
+/// 只损失这一只 .so；其它引擎（含自报 env-free 的 cgi）不受影响。
+static QUARANTINED: Lazy<Mutex<HashSet<String>>> = Lazy::new(|| Mutex::new(HashSet::new()));
+
+fn is_quarantined(lib_key: &str) -> bool {
+    QUARANTINED.lock().contains(lib_key)
+}
+
+fn quarantine(lib_key: &str, engine: &str, secs: u64) {
+    let first = QUARANTINED.lock().insert(lib_key.to_string());
+    if first {
+        log::error!(
+            "app_ffi: engine `{engine}` ({lib_key}) 单次调用超过 {secs}s 未返回 → **隔离该 .so**。\
+             卡死调用继续占着它的 worker 线程（进程内无法安全终止），但该引擎的新请求会立即 502；\
+             若它持有 env 锁，锁已毒化（其它引擎同样快速 502）。重启 webserver 恢复。"
+        );
+    }
+}
+
+/// 该 .so 是否自报 env-free（用于决定超时是否毒化 env 锁）。
+/// 装载尚未完成时（卡在 dlopen/init）取不到，按「非 env-free」处理（保守毒化）。
+fn lib_is_env_free(lib_key: &str) -> bool {
+    LIBS.lock()
+        .get(lib_key)
+        .map(|l| l.env_free)
+        .unwrap_or(false)
+}
 
 /// §7.2 引擎单次执行的结果（状态码 + 头块 + body）。
 pub struct ExecOutcome {
@@ -386,9 +448,26 @@ async fn exec_dispatch(
     //     一个慢的**空**请求不会挡住随后带 `.env` 的请求（见 env_lock 模块注释）；
     //   * 不自报（含所有其它引擎、以及任何陈旧 .so）⇒ 留在锁内，跨应用 `.env` 隔离
     //     不依赖引擎实现。
+    //
+    // 入池前先拒绝已被看门狗隔离的 .so：快速 502，不占 worker、不让请求排队。
+    let lib_key = lib_path.to_string_lossy().into_owned();
+    if is_quarantined(&lib_key) {
+        bail!(
+            "engine `{engine}` is quarantined (a previous call exceeded the wall clock); \
+             restart webserver to recover"
+        );
+    }
+    let quarantined_key = lib_key.clone();
     let job = move || {
         // 先按需装载（快路径 = 一次表查找）再决策：`env_free` 是 .so 的属性。
         let lib = load_engine(&engine, &lib_path)?;
+        // 二次检查：入池到执行之间，另一个并发调用可能刚被判定超时并隔离本 .so。
+        if is_quarantined(&quarantined_key) {
+            bail!(
+                "engine `{engine}` is quarantined (a previous call exceeded the wall clock); \
+                 restart webserver to recover"
+            );
+        }
         if lib.env_free {
             return call_exec(
                 &lib, &engine, &script, &docroot, &m, &p, &q, &ct, &b, peer, port,
@@ -399,21 +478,57 @@ async fn exec_dispatch(
             .iter()
             .map(|(k, v)| (k.as_str(), v.as_str()))
             .collect();
-        env_lock::with_temp_env_named(&engine, &vars, || {
+        match env_lock::with_temp_env_named(&engine, &vars, || {
             call_exec(
                 &lib, &engine, &script, &docroot, &m, &p, &q, &ct, &b, peer, port,
                 &server_name, &env_vars_owned, &headers_owned,
             )
-        })
+        }) {
+            Ok(r) => r,
+            // env 锁被看门狗毒化：快速失败，**不进入等待**（活动组可能被永不返回的调用占着）。
+            Err(e) => bail!("engine `{engine}` unavailable: {e}"),
+        }
     };
-    if serial {
+    let pool: Arc<EnginePool> = if serial {
         // rack/psgi：串行单线程池（解释器非线程安全）。
-        Ok(serial_pool(&engine_for_pool).run(job).await?)
+        serial_pool(&engine_for_pool)
     } else if let Some(n) = dedicated_pool_threads(&engine_for_pool) {
         // cgi：独立窄池（见 dedicated_pool_threads），不占通用池、也不被通用池拖累。
-        Ok(named_pool(&engine_for_pool, n).run(job).await?)
+        named_pool(&engine_for_pool, n)
     } else {
-        Ok(GENERIC_POOL.run(job).await?)
+        Arc::clone(&*GENERIC_POOL)
+    };
+    // 看门狗：整段（入池排队 + 引擎执行）共用一个墙钟 deadline。
+    //
+    // 超时的**取舍**（本方案的诚实边界）：
+    //   * 卡死的 C 调用无法被安全中断（杀线程会在任意指令处损坏状态）⇒ 该 worker 线程
+    //     被放弃，每只隔离的引擎最多泄漏一个线程；隔离后不会再有新调用占线程；
+    //   * 非自报 env-free 的引擎在超时时可能还持有宿主的进程 env 锁（Slot 永不 Drop），
+    //     因此**毒化** env 锁：之后依赖 env 锁的引擎立即 502，绝不阻塞等待、也绝不
+    //     在「可能装着别人 .env」的进程 env 上继续运行；
+    //   * 自报 env-free 的 .so（cgi/cgi_script 这类子进程 envp 引擎）不碰进程 env，
+    //     超时只隔离它自己，其它引擎（含其它 env-free 引擎）照常工作。
+    // 正常长请求不受影响：只要在 deadline 内返回就与旧行为完全一致。
+    let run = pool.run(job);
+    match engine_call_timeout() {
+        None => Ok(run.await?),
+        Some(t) => match tokio::time::timeout(t, run).await {
+            Ok(r) => Ok(r?),
+            Err(_elapsed) => {
+                quarantine(&lib_key, &engine_for_pool, t.as_secs());
+                if !lib_is_env_free(&lib_key) {
+                    env_lock::poison(&format!(
+                        "engine `{engine_for_pool}` exceeded {}s wall clock while holding the process-env lock",
+                        t.as_secs()
+                    ));
+                }
+                bail!(
+                    "engine `{engine_for_pool}` exceeded {}s wall clock — quarantined \
+                     (the stuck thread cannot be safely killed; restart webserver to recover)",
+                    t.as_secs()
+                )
+            }
+        },
     }
 }
 
@@ -508,8 +623,8 @@ struct EnginePool {
     tx: std::sync::mpsc::Sender<PoolJob>,
 }
 
-static GENERIC_POOL: Lazy<EnginePool> =
-    Lazy::new(|| EnginePool::start(generic_pool_threads(), "appffi"));
+static GENERIC_POOL: Lazy<Arc<EnginePool>> =
+    Lazy::new(|| Arc::new(EnginePool::start(generic_pool_threads(), "appffi")));
 /// 命名池表：键是 `引擎#线程数`（既是 rack/psgi 的串行池，也是 cgi 那类独立窄池）。
 static SERIAL_POOLS: Lazy<Mutex<HashMap<String, Arc<EnginePool>>>> =
     Lazy::new(|| Mutex::new(HashMap::new()));
