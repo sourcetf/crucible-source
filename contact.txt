@@ -4194,3 +4194,84 @@ env_lock 负责；「归零判定 + 恢复」整体在窗口锁临界区里做�
 实例：**21700**（修复版，我的基座）与 **21704/21746**（apps6 树 + 修复引擎）收工保持运行；
 21702（旧引擎对照）已停。设施全在 `~/scratch-pyenv/`（`srv.sh`/`probe.py`/`hammer.py`/`stress.py`/`logs/`）。
 详见 `.agents/1009/reports/pyenv-wave12.md` 与 `.agents/1009/fixes/pyenv-wave12.md`。
+
+---
+
+# 【agent-build2 / 工号 1009 · Wave-13】三条跨 scope 交回项收工（2026-10-17）
+
+**改的文件**：`libs/app-engines/psgi/psgi_engine.c`（+6/−1）、
+`libs/script-ffi/script_engine.c`（+230/−21）、`scripts/build_aspnet_ffi.sh`（+4/−1）、
+`scripts/build_axonasp_ffi.sh`（+4/−1）。`crucible_pyembed.h` **未改**（无需，pyenv 修复原样保留）。
+未 commit/push/checkout/reset/stash/clean；测试设施全在 `~/scratch-build2/`（端口 20900）。
+
+**① 【P1】`psgi_engine.c:264` `hv_iterkey` 类型错 → 修**：`STRLEN klen` → `I32 klen`
+（`vlen` 仍 `STRLEN` 给 `SvPV`）。GCC 15 复现修前
+`error: passing argument 3 of 'Perl_hv_iterkey' from incompatible pointer type` rc=1 → 修后 rc=0；
+`sh scripts/build_script_ffi.sh` 产出 `libapp_psgi.so` 35448 B / 17 个 `Perl_` 符号 /
+`NEEDED=libperl.so.5.40`，`/psgi/` **200**（本机 Debian 无 `libperl.so` 符号链接，
+本地验证用 `LIBRARY_PATH=~/scratch-build2/perllib`；不设时脚本诚实降级，属既有行为）。
+
+**② 【P2】两个辅助构建脚本不认 `CRUCIBLE_APP_ENGINES_OUT` → 修**：
+`build_aspnet_ffi.sh:8` / `build_axonasp_ffi.sh:8` 改为
+`OUT="${CRUCIBLE_APP_ENGINES_OUT:-${ROOT}/target/app-engines}"`。实测
+`CRUCIBLE_APP_ENGINES_OUT=/tmp/x sh scripts/build_aspnet_ffi.sh`（及 axonasp）只写 `/tmp/x`；
+现役 `target/app-engines/{libaspnet_ffi,libapp_aspnet,libapp_asp}.so` 的 **md5 与 mtime 均未变**
+（`md5sum -c` 三个 OK）。观察（pre-existing，未改）：这两个脚本没有主脚本的 bash re-exec 头，
+`sh` 调用会打印一行 `[[: not found`（非致命；官方调用点是 `bash`）。
+
+**③ 【P2】`python` 脚本引擎应用看不到自己的 `.env` → 修**：根因 = `appengine_execute` 丢弃
+`extra` + 每请求 envdict 只有 CGI 变量 + `_CrucibleEnv` 回退到 import 期快照的全局 `os.environ`
+（看不到 env_lock 的 setenv）。修复两层：a) `extra` 透传，用 `appengine_extra_env_foreach`
+把本请求 `.env` 写进 TLS 覆盖表（`KEY=` 空值用 `None` 占位 ⇒ 视为不存在，`in/copy/len` 一致）；
+b) 首次安装 shim 时清理初始化快照里**本请求**的 `.env` 键（有启动期基底值则还原），并修掉
+首次安装的并发竞态（mutex+cond，等待者先 `Py_BEGIN_ALLOW_THREADS` 再等 —— 否则 8 并发冷启动
+会把 `os.environ` 套成 8 层代理）。真机（20900）：`/py-a/` → `HELLO=from-py-A`（`os.environ.get`
+与 `os.getenv` 都有）、`/py-b/` → `from-py-B`、`/py-c/` → `<unset>`；冷启动 8 并发 **8/8**（3 轮）、
+随后 C 无残值；8×A 8/8 wall 2.02s、8×A+8×B 16/16 各自正确、A/C/B 混合 24/24；
+长压 20 轮 × 8 并发 **160/160 bad=0**。与 pyenv 的窗口修复零冲突（`crucible_pyembed.h` 未动）。
+回归：`$CARGO check` rc=0；`$CARGO test --release --bin webserver --offline --features tls,tls_boring`
+→ **514 passed / 0 failed / 1 ignored**。
+
+**未做/边界**：OpenBSD 真机本轮未跑（改动不依赖平台特性）；`build_jsp_sidecar.sh` 对
+`state/jsp` 的写入未改（不在本任务点名范围，dry-run 语义需主会话拍板）；「wsgi 先初始化再访问
+python 无 .env 应用」的跨引擎残留组合未端到端验证（pre-existing 边界）。
+详见 `.agents/1009/reports/build2-wave13.md` 与 `.agents/1009/fixes/build2-wave13.md`。
+
+---
+
+# 【agent-verify6 / 工号 1009 · Wave-12 最终验收（收口）】2026-10-17 11:34–12:10
+
+**认证快照**：`HEAD f3ae947`（`f3ae947f758b101d811376d49b459d24efd79b5c`），二进制
+`~/scratch-verify6/bin/webserver` md5 `b6b23f8ee159f6b8cf626bc0da1b3ce0`（18,696,848 B，
+`--offline --features tls,tls_boring`）。Rust 侧与上一轮 `0980bfe` 逐位相同；wave-12 只改 C 头/脚本。
+
+**结论（给用户）**
+- 功能：**293 PASS / 0 FAIL / 10 SKIP**（PASS1 140/0/10、EXT 113/0/0、GOAWAY 7/0/0、H3 24/0/0、
+  DNS 6+3/0/0）。对上一轮 290/0/10 **逐检查项零回归**（149+113+4+24+6+3 个公共名状态 0 差异；
+  GOAWAY +3 为本轮新增宽限窗口覆盖）。10 个 SKIP 全为环境缺依赖（8 引擎 + named）。
+- 单测：**514 passed / 0 failed / 1 ignored**。
+- 快车道对抗：**107 组交换 / 0 差异**（Wave-10 三个 P1 专项 7+5+5 全 ON==OFF；裸 LF 时延 0.0s；
+  走私矩阵 80 形状 + 深水区 10 用例）。
+- 性能（规格口径，双方 2 线程，ours 日志开、h2o 无日志）：**c64 1.096–1.143（稳过）；c128
+  1.171（duel）/1.182–1.192（顺序）——本机口径双达标，但 c128 裕量仍薄**（最差单轮 1.433 系
+  h2o 窗口风落）。跨窗口绝对值不可比，只采信中位/同窗口配对。
+- 部署：生产 OpenBSD 仍 `14981f1`（md5 `510af570…`，pid 59448），本轮 `f3ae947` **未部署**。
+  远程只读复核：15/15 引擎 200；ruby/rack 即时 502、jsp/do 5.03s 502（无 ruby34/JDK，诚实降级）；
+  h3/h2c/DoT 可用；`/__admin` `/__metrics` 401。
+
+**本 agent 改动**：仅 `scripts/accept-verify-goaway.py`（配置路径改为从 `/proc/<pid>/cmdline`
+解析，修独立重跑误报 5 FAIL 的测量装置问题）；报告 `reports/verify6-wave12.md`、
+`fixes/verify6-wave12.md`。未 commit/push/checkout/reset/stash/clean；未改 src/libs/Cargo；
+远程只读；所有测试实例已停、端口已释放。
+
+**在途 WIP（另一 agent，未提交，已独立复核）**：`script_engine.c`（python 引擎 `.env` 已可见：
+`PYA WINDOWMARK=from-py-A`）、`psgi_engine.c:261`（`STRLEN klen`→`I32 klen`，GCC14+ 可编译）、
+`build_aspnet/axonasp_ffi.sh`（`CRUCIBLE_APP_ENGINES_OUT` 已生效，产物落指定目录）。
+CPython 并发 `.env`（pyembed 同步窗口，已在 HEAD）：36901 实例 8/8、16/16、32/32 全绿，
+asgi/uwsgi/h2c 全绿，100 轮交替无残留。**这 3 项 WIP 待主会话提交后重跑套件收口。**
+
+**剩余 P2**：c128 裕量薄；CONNECT-UDP 真实往返未验证（UDP 出网）；ACME 真机未验证；生产落后
+`0980bfe`/`f3ae947`；远程 ruby/jsp/do/rack 诚实 502。**P3**：双编码文件名（201，字面名落盘，
+非穿越）；`bytes 0-0/0`（400）；日志 `level` display-only；h3 大写字段 RST 0x10e（RFC 合规）；
+h3 GOAWAY 宽限窗口已收口（套件 7/7）；h3 重载后 UDP 重绑最坏 5s 空窗（本轮新观察）；
+FIN 竞态/畸形头时序（有意不改）；static mtime 缓存。

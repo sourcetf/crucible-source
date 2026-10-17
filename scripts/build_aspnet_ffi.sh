@@ -2,7 +2,10 @@
 # Build ASP.NET hostfxr FFI stub + libapp_aspnet.so (appengine ABI).
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-OUT="${ROOT}/target/app-engines"
+# 产物目录：默认 ${ROOT}/target/app-engines，可用 CRUCIBLE_APP_ENGINES_OUT 覆盖
+# （与 build_app_engines.sh / build_script_ffi.sh 同一套语义；否则被主构建脚本调用时
+#  dry-run/自定义 OUT 仍会重写现役产物）。
+OUT="${CRUCIBLE_APP_ENGINES_OUT:-${ROOT}/target/app-engines}"
 SRC="${ROOT}/libs/aspnet-ffi"
 INC="${ROOT}/libs/app-engines/include"
 COMMON="${ROOT}/libs/app-engines/common"

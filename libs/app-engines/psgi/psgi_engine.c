@@ -257,7 +257,12 @@ static void psgi_emit_headers(crucible_buf *out, SV *hsv)
 
         (void)hv_iterinit(hv);
         while ((he = hv_iternext(hv)) != NULL) {
-            STRLEN klen = 0, vlen = 0;
+            /* hv_iterkey() 的第 3 参是 I32*（Perl_hv_iterkey 原型），不是 STRLEN*：
+             * GCC 14+ 把 incompatible-pointer-types 当默认 error ⇒ 用 STRLEN 会直接
+             * 编不过（OpenBSD clang 只是 warning，所以生产没暴露）。vlen 仍是
+             * SvPV 需要的 STRLEN。 */
+            I32 klen = 0;
+            STRLEN vlen = 0;
             char *k = hv_iterkey(he, &klen);
             char *v = SvPV(hv_iterval(hv, he), vlen);
 

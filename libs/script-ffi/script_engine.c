@@ -170,7 +170,10 @@ static const char *g_shim_src =
     "    def __getitem__(self, k):\n"
     "        ov = self._ov()\n"
     "        if ov is not None and k in ov:\n"
-    "            return ov[k]\n"
+    "            v = ov[k]\n"
+    "            if v is None:\n"
+    "                raise KeyError(k)\n"
+    "            return v\n"
     "        return self._real[k]\n"
     "    def __setitem__(self, k, v):\n"
     "        ov = self._ov()\n"
@@ -190,7 +193,8 @@ static const char *g_shim_src =
     "        if ov is not None:\n"
     "            for k in ov:\n"
     "                seen.add(k)\n"
-    "                yield k\n"
+    "                if ov[k] is not None:\n"
+    "                    yield k\n"
     "        for k in self._real:\n"
     "            if k not in seen:\n"
     "                yield k\n"
@@ -198,12 +202,23 @@ static const char *g_shim_src =
     "        ov = self._ov()\n"
     "        if ov is None:\n"
     "            return len(self._real)\n"
-    "        return len(set(ov) | set(self._real))\n"
+    "        n = len(self._real)\n"
+    "        for k in ov:\n"
+    "            if ov[k] is None:\n"
+    "                if k in self._real:\n"
+    "                    n -= 1\n"
+    "            elif k not in self._real:\n"
+    "                n += 1\n"
+    "        return n\n"
     "    def copy(self):\n"
     "        d = dict(self._real)\n"
     "        ov = self._ov()\n"
     "        if ov is not None:\n"
-    "            d.update(ov)\n"
+    "            for k, v in ov.items():\n"
+    "                if v is None:\n"
+    "                    d.pop(k, None)\n"
+    "                else:\n"
+    "                    d[k] = v\n"
     "        return d\n"
     "_cos.environ = _CrucibleEnv(_cos.environ)\n"
     "_csys.stdout = _CrucibleOut(_csys.stdout)\n"
@@ -220,21 +235,150 @@ static const char *g_shim_src =
 static PyObject *g_shim_set;   /* _cr_set(out, inp, env) */
 static PyObject *g_shim_clear; /* _cr_clear() */
 
-/* 安装 shim；失败返回 -1（已经带着异常，调用方清掉并显式报错）。 */
-static int python_shim_install(void)
+/* ---- 首次安装 shim 时清理 os.environ 的「初始化快照」----
+ *
+ * CPython 的 os.environ 是 import 时从 posix.environ 拷出的**快照**（_data），
+ * 之后的 setenv 它看不见。嵌入解释器在**第一个请求**里才 Py_Initialize —— 那一刻
+ * env_lock 正把该请求的 .env 装在 C environ 里，于是这些键被永久烤进 os.environ
+ * 的视图。请求级 TLS 覆盖表（_CrucibleEnv）能让每个请求看到自己的 .env，但
+ * **没有 .env 的请求**会回退到这份陈旧视图 ⇒ 看到别的应用的键（真机：/py-c/
+ * 读到 from-py-A）。这里在首次安装 shim 时把**本请求**的 .env 键从真实视图里
+ * 抹掉（有启动期基底值的还原成基底值），给解释器一个干净基线。
+ *
+ * 只操作 _data（PyDict_DelItem/SetItem），**不** unsetenv：C environ 里 .env 键
+ * 的安装/卸载只归 Rust env_lock 管（与 pyembed 的同步窗口同一纪律）。
+ * 键值是 fsencode 后的 bytes（POSIX _Environ 的命名空间）。 */
+static const char *py_base_env_lookup(const char *key, size_t klen)
+{
+    const char *base = appengine_base_env_block();
+    const char *p;
+
+    if (base == NULL)
+        return NULL;
+    for (p = base; *p != '\0'; p += strlen(p) + 1) {
+        const char *eq = strchr(p, '=');
+
+        if (eq != NULL && (size_t)(eq - p) == klen && memcmp(p, key, klen) == 0)
+            return eq + 1;
+    }
+    return NULL;
+}
+
+static int py_env_scrub_cb(void *ctx, const char *k, const char *v)
+{
+    PyObject *data = (PyObject *)ctx;
+    PyObject *key, *val;
+    const char *bv;
+
+    (void)v;
+    if (data == NULL || k == NULL)
+        return 1;
+    key = PyBytes_FromString(k);
+    if (key == NULL) {
+        PyErr_Clear();
+        return 0;
+    }
+    bv = py_base_env_lookup(k, strlen(k));
+    if (bv != NULL) {
+        val = PyBytes_FromString(bv);
+        if (val != NULL) {
+            if (PyDict_SetItem(data, key, val) != 0)
+                PyErr_Clear();
+            Py_DECREF(val);
+        } else {
+            PyErr_Clear();
+        }
+    } else if (PyDict_DelItem(data, key) != 0) {
+        PyErr_Clear(); /* 键本来就不在视图里 */
+    }
+    Py_DECREF(key);
+    return 0;
+}
+
+/* 取解释器真实的 os.environ 底层 dict（代理形态沿 `_real` 链向下找 `_data`，
+ * 最多 16 层防御）；返回新引用。 */
+static PyObject *py_real_environ_data(void)
+{
+    PyObject *os_mod, *env, *cur, *data = NULL;
+    int depth;
+
+    os_mod = PyImport_ImportModule("os");
+    if (os_mod == NULL) {
+        PyErr_Clear();
+        return NULL;
+    }
+    env = PyObject_GetAttrString(os_mod, "environ");
+    Py_DECREF(os_mod);
+    if (env == NULL) {
+        PyErr_Clear();
+        return NULL;
+    }
+    cur = env; /* 所有权转给 cur */
+    for (depth = 0; depth < 16 && cur != NULL; depth++) {
+        PyObject *next;
+
+        data = PyObject_GetAttrString(cur, "_data");
+        if (data != NULL)
+            break;
+        PyErr_Clear();
+        next = PyObject_GetAttrString(cur, "_real"); /* _CrucibleEnv 代理 */
+        Py_DECREF(cur);
+        cur = next;
+        if (cur == NULL)
+            PyErr_Clear();
+    }
+    Py_XDECREF(cur);
+    if (data == NULL)
+        PyErr_Clear();
+    return data;
+}
+
+/* 安装 shim；失败返回 -1（已经带着异常，调用方清掉并显式报错）。
+ * extra 仅用于**首次**安装时清理初始化快照（见上）。 */
+#ifndef _WIN32
+/* 首次安装的并发保护：guard 与「写 g_shim_set」之间隔着 PyRun_StringFlags，
+ * 而字节码执行会在 switch interval 处释放 GIL —— 并发冷启动时多个线程都会看到
+ * g_shim_set==NULL，各自执行一遍 shim 源码：os.environ 被套上 N 层 _CrucibleEnv
+ * （每层有自己的 _c_tls 命名空间），请求级覆盖表只对其中一层生效，且层数随
+ * 并发首请求无界增长。这里用 mutex+cond 串行化；等待者必须**先放 GIL** 再等，
+ * 否则持 GIL 等 mutex、持有者又需要 GIL 才能跑完 PyRun ⇒ ABBA 死锁。 */
+static pthread_mutex_t g_shim_mtx = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t g_shim_cond = PTHREAD_COND_INITIALIZER;
+static int g_shim_state; /* 0=未安装/失败 1=安装中 2=已安装 */
+#endif
+
+static int python_shim_install(const char *extra)
 {
     PyObject *ns, *r;
+    int rc = 0;
 
     if (g_shim_set != NULL)
         return 0;
+#ifndef _WIN32
+    pthread_mutex_lock(&g_shim_mtx);
+    while (g_shim_state == 1) {
+        Py_BEGIN_ALLOW_THREADS
+        pthread_cond_wait(&g_shim_cond, &g_shim_mtx);
+        Py_END_ALLOW_THREADS
+    }
+    if (g_shim_state == 2) {
+        pthread_mutex_unlock(&g_shim_mtx);
+        return 0;
+    }
+    g_shim_state = 1;
+    pthread_mutex_unlock(&g_shim_mtx);
+#endif
     ns = PyDict_New();
-    if (ns == NULL)
-        return -1;
+    if (ns == NULL) {
+        rc = -1;
+        goto out;
+    }
     r = PyRun_StringFlags(g_shim_src, Py_file_input, ns, ns, NULL);
     if (r == NULL) {
         PyErr_Print();
         Py_DECREF(ns);
-        return -1;
+        rc = -1;
+        goto out;
     }
     Py_DECREF(r);
     g_shim_set = PyDict_GetItemString(ns, "_cr_set");     /* 借用 */
@@ -242,12 +386,31 @@ static int python_shim_install(void)
     if (g_shim_set == NULL || g_shim_clear == NULL) {
         Py_DECREF(ns);
         fprintf(stderr, "scriptffi: python 隔离 shim 缺少入口函数\n");
-        return -1;
+        rc = -1;
+        goto out;
     }
     Py_INCREF(g_shim_set);
     Py_INCREF(g_shim_clear);
     Py_DECREF(ns); /* 函数对象经 __globals__ 自持 shim 命名空间 */
-    return 0;
+
+    /* 只在首次安装（= 解释器初始化后的第一个请求）做一次：把本请求的 .env
+     * 从真实 os.environ 快照里清掉，避免后续无 .env 的应用看到残值。 */
+    {
+        PyObject *data = py_real_environ_data();
+
+        if (data != NULL) {
+            (void)appengine_extra_env_foreach(extra, py_env_scrub_cb, data);
+            Py_DECREF(data);
+        }
+    }
+out:
+#ifndef _WIN32
+    pthread_mutex_lock(&g_shim_mtx);
+    g_shim_state = (rc == 0) ? 2 : 0; /* 失败回到 0：下一个请求可重试（旧语义） */
+    pthread_cond_broadcast(&g_shim_cond);
+    pthread_mutex_unlock(&g_shim_mtx);
+#endif
+    return rc;
 }
 
 /* 脚本所在目录（写进 out，返回 out 或 NULL）。 */
@@ -307,10 +470,52 @@ static int py_env_put_http_cb(void *ctx, const char *name, size_t name_len,
     return 0;
 }
 
+/* extra JSON 的 "env"（本请求 .env）→ 本线程环境覆盖表（TLS，见 _CrucibleEnv）。
+ *
+ * 为什么必须在这里补：Rust 侧把 .env 装进的是 **C environ**（env_lock 的 setenv），
+ * 而 CPython 的 os.environ 是 import 时从 posix.environ 建出的缓存映射，之后的
+ * setenv 它看不见 —— 所以脚本里 os.environ/os.getenv 读不到自己的 .env（wsgi/asgi
+ * 走 pyembed 的同步窗口，cgi 直接构造子进程 envp，只有 python 脚本引擎漏了）。
+ * 这里按请求落进 TLS 覆盖表：不碰进程 env、不碰解释器全局 os.environ 的 _data，
+ * 因此同组 8 并发各自都能看到、不同组互不污染、请求结束即消失（无残值）。
+ *
+ * `.env` 的 `KEY=`（空值）= 该键不存在（与 env_lock::install 的 remove_var 及
+ * cgi 子进程 envp 语义一致）：用 Python None 占位，_CrucibleEnv 读到 None 抛
+ * KeyError 且**不回退**到真实 os.environ（基底里若有同名键也必须视为已删除）。 */
+struct py_extra_env_ctx {
+    PyObject *env;
+};
+
+static int py_extra_env_cb(void *ctx, const char *k, const char *v)
+{
+    struct py_extra_env_ctx *c = (struct py_extra_env_ctx *)ctx;
+    PyObject *o;
+
+    if (c == NULL || c->env == NULL || k == NULL)
+        return 1;
+    if (v == NULL || v[0] == '\0') {
+        o = Py_None;
+        Py_INCREF(o);
+    } else {
+        /* .env 值按 UTF-8 + surrogateescape 落地（与 os.environ 对非 UTF-8 的
+         * fsdecode 语义一致；纯 UTF-8 时行为不变）。 */
+        o = PyUnicode_DecodeUTF8(v, (Py_ssize_t)strlen(v), "surrogateescape");
+        if (o == NULL) {
+            PyErr_Clear();
+            return 0;
+        }
+    }
+    if (PyDict_SetItemString(c->env, k, o) != 0)
+        PyErr_Clear();
+    Py_DECREF(o);
+    return 0;
+}
+
 static int run_python_inprocess(const char *script, const char *method, const char *path,
                                 const char *query, const char *content_type,
                                 const char *body, size_t body_len, const char *remote,
-                                const char *headers, char **out_body, size_t *out_len)
+                                const char *headers, const char *extra, char **out_body,
+                                size_t *out_len)
 {
     FILE *fp = NULL;
     PyObject *io_mod = NULL, *buf = NULL, *stdin_obj = NULL, *envdict = NULL;
@@ -334,7 +539,7 @@ static int run_python_inprocess(const char *script, const char *method, const ch
     }
     gil = PyGILState_Ensure(); /* 每请求拿 GIL；与 wsgi/asgi/uwsgi 共用同一解释器 */
 
-    if (python_shim_install() != 0)
+    if (python_shim_install(extra) != 0)
         goto done;
     PyErr_Clear();
 
@@ -370,6 +575,14 @@ static int run_python_inprocess(const char *script, const char *method, const ch
 
         hctx.env = envdict;
         (void)appengine_headers_foreach(headers, py_env_put_http_cb, &hctx);
+    }
+    /* 本请求 .env（extra JSON 的 "env"）→ 同一张 TLS 覆盖表。
+     * 放在 CGI/HTTP_* 之后：与 cgi 引擎的 envp 顺序一致（.env 同名键优先）。 */
+    {
+        struct py_extra_env_ctx ectx;
+
+        ectx.env = envdict;
+        (void)appengine_extra_env_foreach(extra, py_extra_env_cb, &ectx);
     }
 
     /* 挂 TLS 捕获（第三次失败也不致命：脚本仍能跑，只是没有请求上下文）。 */
@@ -951,13 +1164,14 @@ static int run_perl_inprocess(const char *script, const char *method, const char
 static int run_lang(const char *lang, const char *script, const char *method, const char *path,
                     const char *query, const char *content_type, const char *body,
                     size_t body_len, const char *remote, const char *headers,
-                    char **out_body, size_t *out_len, const char **mode_out)
+                    const char *extra, char **out_body, size_t *out_len,
+                    const char **mode_out)
 {
     if (strcmp(lang, "python") == 0) {
 #if defined(CRUCIBLE_HAVE_PYTHON)
         *mode_out = "inprocess-python";
         return run_python_inprocess(script, method, path, query, content_type, body, body_len,
-                                    remote, headers, out_body, out_len);
+                                    remote, headers, extra, out_body, out_len);
 #else
         *mode_out = "embed-missing";
         fprintf(stderr,
@@ -1034,10 +1248,11 @@ int appengine_execute(
 
     /* content_type/body/body_len 已转发给 run_lang（此前被 (void) 丢弃 ⇒
      * python/ruby/perl 三个嵌入引擎都看不到 POST body 与 Content-Type）。
-     * headers 同样透传 → run_*_inprocess 落地 HTTP_*（CGI 语义）。 */
+     * headers 同样透传 → run_*_inprocess 落地 HTTP_*（CGI 语义）。
+     * extra 里的 .env 也透传：python 的 os.environ 是 import 期缓存，看不到 Rust
+     * 侧 setenv，必须按请求落进 TLS 覆盖表（见 py_extra_env_cb）。 */
     (void)server_name;
     (void)server_port;
-    (void)extra; /* .env 变量：Rust 侧已注入进程环境；嵌入解释器共用进程环境 */
 
     if (!g_ready || !out)
         return -1;
@@ -1057,7 +1272,7 @@ int appengine_execute(
 
     {
         int rc = run_lang(lang, resolved, method, path, query, content_type, body, body_len,
-                          remote, headers, &result, &result_len, &mode);
+                          remote, headers, extra, &result, &result_len, &mode);
         if (rc != 0) {
             free(result);
             /* -2 = 脚本**跑起来了但抛了异常**（python 侧约定，见 run_python_inprocess）。

@@ -20,11 +20,31 @@ import asyncio, json, os, re, signal, ssl, subprocess, sys, time
 HOST = "127.0.0.1"
 PORT = 36098
 SCRATCH = "/home/dev123/scratch-verify6"
-CFG = os.path.join(SCRATCH, "conf", "config-verify.toml")
 AUTHORITY = f"{HOST}:{PORT}"
 OLD_ROOT = f"{SCRATCH}/www-h3dir"
 NEW_ROOT = f"{SCRATCH}/www-h3dir2"
 PIDF = os.path.join(SCRATCH, "webserver.pid")
+
+
+def running_cfg():
+    """从 /proc/<pid>/cmdline 取**当前进程实际用的**配置文件。
+
+    套件收尾（PASS2/PASS2.1）会把实例换成 `config-verify-nov6.toml`；若这里写死
+    `config-verify.toml`，独立重跑会编辑一个没人读的文件 + SIGHUP，观测到「没有
+    GOAWAY」——那是测量装置问题，不是产品行为（verify6-wave12 实测踩到）。
+    """
+    try:
+        pid = int(open(PIDF).read().strip())
+        parts = open(f"/proc/{pid}/cmdline", "rb").read().split(b"\0")
+        for i, p in enumerate(parts):
+            if p == b"--config" and i + 1 < len(parts):
+                return parts[i + 1].decode()
+    except OSError:
+        pass
+    return os.path.join(SCRATCH, "conf", "config-verify.toml")
+
+
+CFG = running_cfg()
 
 RESULTS = []
 
