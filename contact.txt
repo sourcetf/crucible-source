@@ -4275,3 +4275,41 @@ asgi/uwsgi/h2c 全绿，100 轮交替无残留。**这 3 项 WIP 待主会话提
 非穿越）；`bytes 0-0/0`（400）；日志 `level` display-only；h3 大写字段 RST 0x10e（RFC 合规）；
 h3 GOAWAY 宽限窗口已收口（套件 7/7）；h3 重载后 UDP 重绑最坏 5s 空窗（本轮新观察）；
 FIN 竞态/畸形头时序（有意不改）；static mtime 缓存。
+
+---
+
+# 【agent-spec3 / 工号 1009 · Wave-13 规格矩阵终版】2026-10-17
+
+**任务**：基于当前工作树把 `.agents/1009/reports/spec-matrix.md`（Wave-5 之前写的 §3–§23 矩阵）
+刷新到终版，并输出「仍未实现/未验证」终版清单。
+
+**认证快照**：`HEAD c3cbb47`（工作树 clean）。`cargo check --release --bin webserver
+--offline --features tls,tls_boring` → **rc=0 / 0.76s**。逐条重新 grep/读码，证据全部换成
+当前 `文件:行号`；未改任何产品代码，未 commit/push/checkout/reset/stash/clean。
+
+**矩阵主要状态变化（已就地更新，未删章节结构）**
+- §16.1 per-listener `ip_access`：P1 缺口 → **已修**（`config.rs:562-574`、`listener.rs:48`，h1/h2/h3 全接线）。
+- §16.11 页面规则：priority + host/method/header **已完整**，五入口同判据；仍缺全局规则与 country 维度。
+- §16.12 每站访问日志：**已全链路接线**（`config.rs:201-208/619-623`、`access_log.rs:78-105`，10 个调用点）。
+- §7.9/§16.8 引擎 env 隔离：ABI v2 自报 `appengine_env_isolation` + 每子进程 envp + CPython 同步窗口；
+  看门狗改两段 deadline；sidecar per-sock 单例 + 跨协议回收；JSP `.env` 两条通道。
+- §16.2/§10 上传闸门：app docroot 兜底（含 disabled+docroot）+ 符号链接别名复核；配额只计在途 + 闲置淘汰。
+- §16.17 h3：GOAWAY 宽限窗口、HEAD 无 body、connection-specific 字段 RST 0x10e 均已修。
+- §22 h1 快车道：`h1_fast.rs` 默认开、`CRUCIBLE_H1_FASTPATH=0` 可关；**规格条件 c64 1.096–1.143 /
+  c128 1.171–1.192，双达标但 c128 裕量薄**（verify6-wave12）。
+- §19 构建脚本：ksh/dash 自 re-exec、Perl 真实链接探测、`CRUCIBLE_APP_ENGINES_OUT`；psgi GCC14+ 类型错、
+  python 引擎 `.env` 均已修（buildfix/build2）。
+
+**仍未实现/未验证（详见 `spec-matrix-notes.md` §A）**
+- 代码未完整：全局页面规则、country 匹配、`trust_self_signed` 无自定义根、`prefer_tls13` 空开关、
+  无 cookie 会话、上传 405 Allow 漏 POST、`lto="fat"` 默认偏离规格、`port_reuse` 非 SO_REUSEPORT、
+  GeoIP 路径增益硬编码/Rust-Python 合并口径不一致/死代码、C 样例非 pthread native sidecar。
+- 环境无法验证：NSS/TomCrypt/OpenBSD busy_poll/syncookie/1vCPU、named、JDK、ruby、真实 CA ACME、
+  真实 OCSP responder、ECH 端到端、CONNECT-UDP 真实回程、h2c 饱和/TLS 矩阵/生产 RPS、GeoIP 数据质量。
+- 已知残余风险：c128 裕量薄、CONNECT-UDP 往返、h3 重载后 UDP 重绑 5s 空窗、python 跨引擎 `.env` 组合、
+  CPython `_data` 实现细节、ASGI 全局缓存/sys.path 污染、看门狗无法中断卡死 C 调用、
+  fat LTO 默认、静态缓存 mtime 还原、双编码字面名、h1 FIN 竞态、访问日志 level display-only、
+  生产部署仍落后 `14981f1`（未含 wave-11/12/13）。
+
+**交付**：`.agents/1009/reports/spec-matrix.md`（终版）、`spec-matrix-notes.md`（终版清单+方法论）、
+本节。未跑长任务/未改产品代码；所有性能数字引用 verify6-wave12 认证快照。
