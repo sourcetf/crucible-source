@@ -6,7 +6,7 @@
   1. 空闲连接收到 GOAWAY（且 GOAWAY 之前连接未被 CONNECTION_CLOSE 掐断）；
   2. **在飞请求**（/slow 经代理到 2s 慢上游）在触发后仍拿到完整 200 响应。
 
-触发方式：改本套件**自己 scratch 里**的 config-verify.toml（把 31098 listener 的 root
+触发方式：改本套件**自己 scratch 里**的 config-verify.toml（把 36098 listener 的 root
 从 www-h3dir 换成 www-h3dir2 —— 指纹变化）+ SIGHUP；测完恢复原文件。
 （证书文件用仓库共享 cert.pem，绝不 touch。）
 
@@ -18,8 +18,8 @@ aioquic 的 H3Connection 会静默忽略 control stream 上的 GOAWAY，因此�
 import asyncio, json, os, re, signal, ssl, subprocess, sys, time
 
 HOST = "127.0.0.1"
-PORT = 31098
-SCRATCH = "/home/dev123/scratch-verify5"
+PORT = 36098
+SCRATCH = "/home/dev123/scratch-verify6"
 CFG = os.path.join(SCRATCH, "conf", "config-verify.toml")
 AUTHORITY = f"{HOST}:{PORT}"
 OLD_ROOT = f"{SCRATCH}/www-h3dir"
@@ -61,6 +61,7 @@ def make_client():
             self.ctrl = {}
             self.ctrl_type = {}
             self.goaways = []
+            self.goaway_at = None
             self.resets = {}
             self.terminated = None
 
@@ -94,6 +95,7 @@ def make_client():
                     mid, _ = read_varint(raw, off3)
                     if mid not in self.goaways:
                         self.goaways.append(mid)
+                        self.goaway_at = time.time()
                 off = off3 + flen
 
         def quic_event_received(self, event):
@@ -151,7 +153,7 @@ def status_of(slot):
 
 
 def trigger_reload(old=OLD_ROOT, new=NEW_ROOT):
-    """把 31098 listener 的 root 换掉（指纹变化）+ SIGHUP。返回 (ok, msg)。"""
+    """把 36098 listener 的 root 换掉（指纹变化）+ SIGHUP。返回 (ok, msg)。"""
     try:
         s = open(CFG).read()
     except Exception as e:
@@ -226,7 +228,7 @@ async def scenario(inflight: bool, wait_s=20.0):
 
 
 def test_idle():
-    area = "扩展·h3 GOAWAY（空闲连接 :31098）"
+    area = "扩展·h3 GOAWAY（空闲连接 :36098）"
     try:
         r = asyncio.run(scenario(inflight=False))
     except Exception as e:
@@ -235,7 +237,7 @@ def test_idle():
     got = bool(r["goaway"])
     rec(area, "空闲连接收到 H3 GOAWAY（配置变更）", got, "GOAWAY frame",
         f"goaways={r['goaway']} t={r['t_goaway']} terminated={r['terminated']}",
-        "改 scratch config 的 31098 root + SIGHUP；aioquic 自解析 control stream",
+        "改 scratch config 的 36098 root + SIGHUP；aioquic 自解析 control stream",
         sev="P1", owner="h2h3")
     rec(area, "GOAWAY 之前连接未被 CONNECTION_CLOSE 掐断", got and r["terminated"] is None,
         "no CONNECTION_CLOSE before GOAWAY",
@@ -243,7 +245,7 @@ def test_idle():
 
 
 def test_inflight():
-    area = "扩展·h3 GOAWAY（在飞请求 :31098/slow）"
+    area = "扩展·h3 GOAWAY（在飞请求 :36098/slow）"
     try:
         r = asyncio.run(scenario(inflight=True, wait_s=25.0))
     except Exception as e:
@@ -256,8 +258,79 @@ def test_inflight():
         f"status={r['status']} terminated={r['terminated']}", sev="P0", owner="h2h3")
 
 
+async def scenario_grace_window(delay=2.2, wait_s=20.0):
+    """宽限窗口内**新建连接**（wave-12 收口项，原 verify3b P3-1 / h2h3e-wave8 §3）。
+
+    `h3_graceful_endpoint_close` 只在「广播时存在活跃连接」时才宽限 5s，所以：
+      1) 先建长活连接 A（保证 receivers ≥ 1）；
+      2) 触发重载（root 互换 + SIGHUP）；
+      3) 等 delay 秒（广播已发生、ep.close() 未到）后再建连接 B；
+      4) B 应被**入场自检**立即补发 GOAWAY（h3.rs 的 "arrived inside the shutdown grace
+         window" 分支），其首条请求（stream id 0 ≤ GOAWAY max_id）仍按 crate
+         grace-interval 语义被服务（RFC 9114 §5.2 可解释），宽限结束后以 0x0 收尾。
+    """
+    async def _inner():
+        from aioquic.asyncio.client import connect
+        from aioquic.quic.configuration import QuicConfiguration
+
+        cfg = QuicConfiguration(alpn_protocols=["h3"], is_client=True)
+        cfg.verify_mode = ssl.CERT_NONE
+        ClientA = make_client()
+        out = {}
+        async with connect(HOST, PORT, configuration=cfg, create_protocol=ClientA) as a:
+            await a.ping()
+            sid = a.send_get("/")
+            await a.wait_resp(sid, seconds=6.0)
+            ok, msg = trigger_reload()
+            out["trigger"] = f"ok={ok} {msg}"
+            t0 = time.time()
+            await asyncio.sleep(delay)
+            ClientB = make_client()
+            async with connect(HOST, PORT, configuration=cfg, create_protocol=ClientB) as b:
+                out["b_connect_after"] = round(time.time() - t0, 3)
+                sidb = b.send_get("/")
+                rb = await b.wait_resp(sidb, seconds=6.0)
+                out["b_status"] = status_of(rb)
+                out["b_goaway_at_connect"] = (round(b.goaway_at - t0, 3)
+                                              if b.goaway_at else None)
+                for _ in range(80):
+                    await asyncio.sleep(0.1)
+                    b.transmit()
+                    if b.terminated is not None:
+                        break
+                out["b_goaways"] = list(b.goaways)
+                out["b_terminated"] = None if b.terminated is None else b.terminated.error_code
+            # 收 A（老连接）
+            for _ in range(60):
+                await asyncio.sleep(0.1)
+                a.transmit()
+                if a.terminated is not None:
+                    break
+            out["a_goaways"] = list(a.goaways)
+        return out
+    return await asyncio.wait_for(_inner(), timeout=wait_s + 25)
+
+
+def test_grace_window():
+    area = "扩展·h3 GOAWAY（宽限窗口内新连接 :36098）"
+    try:
+        r = asyncio.run(scenario_grace_window())
+    except Exception as e:
+        rec(area, "宽限窗口内新建连接收到 GOAWAY", False, "GOAWAY frame", f"exc {e!r}",
+            owner="h2h3")
+        return
+    rec(area, "宽限窗口内新建连接收到 GOAWAY（入场自检）", bool(r.get("b_goaways")),
+        "GOAWAY frame", f"b_goaways={r.get('b_goaways')} t={r.get('b_goaway_at_connect')} "
+                        f"connect_after={r.get('b_connect_after')}", owner="h2h3")
+    rec(area, "宽限窗口内首条请求（stream id 0）仍被服务", r.get("b_status") == 200, 200,
+        f"status={r.get('b_status')} terminated={r.get('b_terminated')} "
+        f"({r.get('trigger')})", owner="h2h3")
+    rec(area, "宽限结束后新连接以 0x0 正常收尾（非超时/非 RST）", r.get("b_terminated") == 0,
+        0, f"terminated={r.get('b_terminated')}", owner="h2h3")
+
+
 def probe_ok(timeout_each=6.0):
-    """探测 31098 的 h3 端点是否已（重新）就绪：GET / → 200。"""
+    """探测 36098 的 h3 端点是否已（重新）就绪：GET / → 200。"""
     async def _p():
         from aioquic.asyncio.client import connect
         from aioquic.quic.configuration import QuicConfiguration
@@ -302,7 +375,7 @@ def wait_h3_ready(total=40.0):
 
 def upstream_ok():
     """h1(https) 打同一个 listener 的 /slow：200 说明套件上游活着（否则 502）。
-    注意 31098 是 **TLS** listener，必须 https（明文打它是 TLS 握手错误 → 000）。"""
+    注意 36098 是 **TLS** listener，必须 https（明文打它是 TLS 握手错误 → 000）。"""
     try:
         import ssl, urllib.request
         ctx = ssl._create_unverified_context()
@@ -325,15 +398,22 @@ def main():
     ready = wait_h3_ready()
     print(f"[goaway] endpoint re-ready after restore: {ready}")
     if not upstream_ok():
-        rec("扩展·h3 GOAWAY（在飞请求 :31098/slow）", "在飞请求期间收到 H3 GOAWAY", False,
-            "GOAWAY frame", "上游 31099 /slow 不可达（外部误杀？）", owner="h2h3", skip=True)
-        rec("扩展·h3 GOAWAY（在飞请求 :31098/slow）", "在飞 /slow 请求仍拿到完整 200（响应不被截断）",
-            False, 200, "上游 31099 /slow 不可达", owner="h2h3", skip=True)
+        rec("扩展·h3 GOAWAY（在飞请求 :36098/slow）", "在飞请求期间收到 H3 GOAWAY", False,
+            "GOAWAY frame", "上游 36099 /slow 不可达（外部误杀？）", owner="h2h3", skip=True)
+        rec("扩展·h3 GOAWAY（在飞请求 :36098/slow）", "在飞 /slow 请求仍拿到完整 200（响应不被截断）",
+            False, 200, "上游 36099 /slow 不可达", owner="h2h3", skip=True)
     else:
         try:
             test_inflight()
         finally:
             restore_reload()
+    # ── 宽限窗口内新连接（wave-12 收口项）：需要端点已恢复 + 一条长活连接撑开宽限 ──
+    ready2 = wait_h3_ready()
+    print(f"[goaway] endpoint re-ready before grace-window test: {ready2}")
+    try:
+        test_grace_window()
+    finally:
+        restore_reload()
     npass = sum(1 for r in RESULTS if r["status"] == "PASS")
     nfail = sum(1 for r in RESULTS if r["status"] == "FAIL")
     nskip = sum(1 for r in RESULTS if r["status"] == "SKIP")

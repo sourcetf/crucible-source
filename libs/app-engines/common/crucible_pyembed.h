@@ -69,6 +69,13 @@ typedef struct {
     void *(*dict_new)(void);                                  /* PyDict_New */
     int (*dict_set_item_string)(void *, const char *, void *); /* PyDict_SetItemString */
     void *(*dict_get_item_string)(void *, const char *);       /* PyDict_GetItemString */
+    /* bytes 键版的 PyDict_* 三件套：`os.environ` 的底层 `_data` 在 POSIX 上是
+     * fsencode 后的 bytes 键值（用 str 键会写进另一个命名空间，`os.environ[k]`
+     * 看不见），而且它们是**纯 C**（不执行字节码、不释放 GIL）—— os.environ 同步
+     * 窗口的恢复必须在持窗口锁时不可抢占，见 sync_environ 段的说明。 */
+    void *(*dict_get_item)(void *, void *);                    /* PyDict_GetItem（借用） */
+    int (*dict_set_item)(void *, void *, void *);              /* PyDict_SetItem */
+    int (*dict_del_item)(void *, void *);                      /* PyDict_DelItem */
     void *(*bytes_from_string_and_size)(const char *, long);   /* PyBytes_FromStringAndSize */
     int (*bytes_as_string_and_size)(void *, char **, long *);  /* PyBytes_AsStringAndSize */
     void *(*unicode_from_string_and_size)(const char *, long); /* PyUnicode_FromStringAndSize */
@@ -473,153 +480,287 @@ static void crucible_py_append_seq(crucible_buf *bb, void *seq)
     }
 }
 
-/* 把 C 层 environ 同步进 Python 的 os.environ，并把「请求前状态」记进 restore_out。
+/* ═══════════════════ os.environ 同步窗口（同内容组共享 + 引用计数） ═══════════════════
  *
  * 场景：Rust 侧把 .env / deps 变量经 env_lock::with_temp_env_named（setenv）注入
- * C environ，但 Python 的 os.environ 是 posix 模块 import 时构建的缓存映射，
- * 看不到之后的 setenv（旧实现每请求 spawn python3，子进程天然继承 env；嵌入后
- * 必须显式同步，否则 .env 变量对 WSGI 应用不可见）。
+ * C environ，但 Python 的 os.environ 是 posix 模块 import 时构建的缓存映射，看不到
+ * 之后的 setenv（旧实现每请求 spawn python3，子进程天然继承 env；嵌入后必须显式
+ * 同步，否则 .env 变量对 WSGI/ASGI/uWSGI 应用不可见）。
  *
- * 关键：os.environ 是独立缓存，必须与 C environ 保持一致；而 Rust 的
- * env_lock::restore 会在请求结束把本请求的 .env 键从 C environ 移除。若不同步清理，
- * A 应用 .env 的值会在 os.environ 里**永久残留**，同进程内后续任何应用
- * （wsgi/asgi/uwsgi 共用同一解释器）都能读到 A 的私密 .env —— 跨应用环境泄漏。
+ * **缺陷一**（apps6-wave11 §7.1 记录，pre-existing，本波修复）：同一「同内容组」的
+ * 并发请求是被**允许并发**的（env_lock 的设计：同引擎 + 归一化后同一份键值 → 天然
+ * 并发），而 os.environ 是解释器全局的。旧实现每个请求各记一份「请求前状态」、各自
+ * 恢复一次 ⇒ 最早完成的那个把 .env 键 `__delitem__` 掉时，其余仍在飞的同组请求
+ * （sleep 之后才读 os.environ 的）读到 `<unset>`。实测 8 并发 `/wsgi-a/?sleep=2`
+ * → 1 有值 / 7 `<unset>`。修法：把「请求前状态」变成**窗口** —— 第一个 env_dirty
+ * 请求开窗并记账，同组并发请求共享这份账，**最后一个离开者**才恢复
+ * （与 Rust env_lock 的 `Slot::drop` 完全对称）。
  *
- * 本实现把「清理」放到请求结束：`restore_out`（一个 dict）记录本次同步**会改动**的
- * 键及其请求前状态（原值 str，或 None 表示原本不存在）。请求结束时调用
- * crucible_py_restore_environ(restore_out) 还原 os.environ，与 Rust 对 C environ 的
- * restore 对称。这样做的两个好处：
- *   1) 「无 .env」的请求（env_dirty=0）不需要遍历 C environ —— 那条路径拿不到
- *      env_lock，遍历 environ 会与别的请求的 setenv 竞争 environ 数组的 realloc
- *      （见 env_lock.rs 对 setenv/getenv 竞争的说明）；
- *   2) 应用在请求内对**其他**键的改动不受影响（只还原本次同步动过的键）。
+ * **缺陷二**（本波压力测试才暴露，30 轮 × 8 并发里偶发 `<unset>`）：若恢复放在窗口
+ * 锁之外、且用 Python 层的 `os.environ.__delitem__` 做，恢复过程会执行字节码、可能
+ * 释放 GIL；此刻新到的同组请求（env_lock 侧只是「加入」而不重装环境）可以
+ * 「重开窗口 + 同步」，随后被仍在飞的旧恢复把刚装上的键删掉 —— 同一个 `<unset>`。
+ * 修法两条：
+ *   a) 恢复**整体在窗口锁临界区内**执行（`crucible_py_envwin_leave`），于是
+ *      「引用计数归零 + 恢复」对新窗口的开窗（`crucible_py_envwin_enter`）**原子**；
+ *   b) 临界区内**只做纯 C 操作**（绝不执行 Python 字节码、绝不释放 GIL）—— 否则
+ *      等锁者（持 GIL）与持锁者（需要 GIL 才能继续 Python 调用）会成 ABBA 死锁，
+ *      即 apps3b-wave6 §6.3 那个死锁的同类形态。
  *
- * 并发安全性：只在 env_dirty 请求里调用（Rust 侧持 env_lock，内容非空才拿锁），
- * 因此本函数遍历 environ 期间不会有另一个 .env 正在 setenv。
+ * 把同步/恢复直接落到 `os.environ` 的**底层真 dict**（`os._Environ._data`：键值是
+ * `fsencode` 后的 bytes）正是为此：
+ *   * PyDict_* 对 bytes 键值是**纯 C**（不执行字节码、不释放 GIL），满足 (b)；
+ *   * 不走 `_Environ.__setitem__/__delitem__` ⇒ **不 putenv/unsetenv**。这点很关键：
+ *     C environ 里 .env 键的安装/卸载**只由 Rust env_lock 负责**，旧实现经
+ *     `__delitem__` 把键从 C environ 一并删掉，既让 env_lock 的 `env_is()` 判据
+ *     失真（后来者无法「加入」而被迫整组等 drain），又放大了缺陷二的窗口（C environ
+ *     与 os.environ 两侧被删的时机不同）。
+ *   分工因此很干净：C environ ⇄（Rust env_lock）；os.environ 视图 ⇄（本窗口）；
+ *   两者只在「同步」方向交汇（C environ → 视图）。`os.environ[k]=v`（应用自己写）
+ *   仍走 CPython 原语义（putenv + _data），未动；`os.getenv` 读的也是这个视图。
+ *
+ * 并发/锁序（不可违反）：窗口状态由 `g_py_envwin_lock` 保护，而**所有**取该锁的地方
+ * 都在**已持有 GIL** 时进入，临界区内不调用任何可能释放 GIL / 执行 Python 代码的
+ * API（只允许 bytes 对象创建、PyDict_*、Py_IncRef/Py_DecRef 于 bytes/str、free）。
+ * 既有锁序 `g_py_lock → GIL` 不变，本锁在 GIL 之内，与任何「持本锁等 GIL」的情形
+ * 不成环。
+ *
+ * 局限性（诚实记录）：
+ *   1) 若应用把 os.environ 换成既无 `_data` 也无 `_real` 的对象（script-ffi 的
+ *      python 引擎会把 os.environ 换成线程感知代理 `_CrucibleEnv`，它有 `_real`），
+ *      同步会**跳过**：宁可该应用看不到 .env，也不能在没有记账的情况下改写环境
+ *      （那会把 .env 键永久留在视图里，泄漏给后续应用 —— apps3b §6.1 的整表清空
+ *      是同一类事故）；
+ *   2) 「请求前状态」里的先验值以 Python 对象持有（引用计数）。若应用往 `_data` 里
+ *      塞过自定义对象，恢复时的 DECREF 可能执行用户析构代码（释放 GIL）—— 只影响
+ *      「应用自己动了 os.environ 内部结构」这种自伤场景，正常 .env 路径上先验值恒为
+ *      bytes/str。
  */
 extern char **environ;
 
-static void crucible_py_sync_environ_locked(void *restore_out)
+/* 一条「请求前状态」：键 + 窗口开启前 os.environ 视图里的值（NULL = 原本不存在）。 */
+typedef struct crucible_py_envprior {
+    char *key;  /* C environ 的键字节原样（NUL 结尾） */
+    void *prior; /* Python 对象（新引用）或 NULL */
+    struct crucible_py_envprior *next;
+} crucible_py_envprior;
+
+static pthread_mutex_t g_py_envwin_lock = PTHREAD_MUTEX_INITIALIZER;
+static unsigned long g_py_envwin_refs; /* 已登记的在飞 env_dirty 请求数 */
+static crucible_py_envprior *g_py_envwin_head; /* 窗口共享的记账链（refs>0 时有效） */
+static crucible_py_envprior *g_py_envwin_tail;
+static void *g_py_envwin_view; /* 窗口的 os.environ 底层 dict（新引用） */
+
+/* 取 `os.environ` 的底层真 dict（`_data`；代理形态退回 `_real._data`）。
+ * 返回**新引用**（调用方 dec_ref）或 NULL。 */
+static void *crucible_py_env_view(void)
 {
-    void *d, *os_mod, *envmap = NULL, *snap = NULL, *none = NULL;
+    void *os_mod, *envmap, *real, *data;
+
+    if (g_py_state != 1)
+        return NULL;
+    os_mod = g_py.import_module("os");
+    if (os_mod == NULL) {
+        crucible_py_clear_error();
+        return NULL;
+    }
+    envmap = g_py.object_get_attr_string(os_mod, "environ");
+    g_py.dec_ref(os_mod);
+    if (envmap == NULL) {
+        crucible_py_clear_error();
+        return NULL;
+    }
+    data = g_py.object_get_attr_string(envmap, "_data");
+    if (data == NULL) {
+        crucible_py_clear_error();
+        real = g_py.object_get_attr_string(envmap, "_real"); /* shim 代理 */
+        if (real != NULL) {
+            data = g_py.object_get_attr_string(real, "_data");
+            g_py.dec_ref(real);
+        }
+    }
+    g_py.dec_ref(envmap);
+    if (data == NULL)
+        crucible_py_clear_error();
+    return data;
+}
+
+/* 把底层 dict 交给窗口持有（新引用）。返回 1 = 窗口接管（调用方不得 dec_ref）。 */
+static int crucible_py_envwin_set_view(void *view)
+{
+    int took = 0;
+
+    pthread_mutex_lock(&g_py_envwin_lock);
+    if (g_py_envwin_view == NULL) {
+        g_py_envwin_view = view;
+        took = 1;
+    }
+    pthread_mutex_unlock(&g_py_envwin_lock);
+    return took;
+}
+
+/* 窗口当前的底层 dict（**借用**；NULL = 尚无）。调用方必须已登记（refs>0）。 */
+static void *crucible_py_envwin_view_get(void)
+{
+    void *v;
+
+    pthread_mutex_lock(&g_py_envwin_lock);
+    v = g_py_envwin_view;
+    pthread_mutex_unlock(&g_py_envwin_lock);
+    return v;
+}
+
+/* 记账：只在键尚未记账时追加（第一个发现差异的请求记下的就是「窗口开启前」的值）。
+ * 须持 GIL；链表操作在窗口锁内，纯 C。 */
+static void crucible_py_envwin_record(const char *key, size_t klen, void *prior)
+{
+    crucible_py_envprior *node, *it;
+    char *kcopy;
+
+    kcopy = (char *)malloc(klen + 1);
+    if (kcopy == NULL)
+        return;
+    memcpy(kcopy, key, klen);
+    kcopy[klen] = '\0';
+    node = (crucible_py_envprior *)malloc(sizeof(*node));
+    if (node == NULL) {
+        free(kcopy);
+        return;
+    }
+    node->key = kcopy;
+    node->prior = NULL;
+    node->next = NULL;
+
+    pthread_mutex_lock(&g_py_envwin_lock);
+    for (it = g_py_envwin_head; it != NULL; it = it->next) {
+        if (strcmp(it->key, kcopy) == 0) { /* 已记过：第一次记账胜出 */
+            pthread_mutex_unlock(&g_py_envwin_lock);
+            free(kcopy);
+            free(node);
+            return;
+        }
+    }
+    if (prior != NULL) {
+        g_py.inc_ref(prior); /* Py_IncRef 是纯 C */
+        node->prior = prior;
+    }
+    if (g_py_envwin_tail != NULL)
+        g_py_envwin_tail->next = node;
+    else
+        g_py_envwin_head = node;
+    g_py_envwin_tail = node;
+    pthread_mutex_unlock(&g_py_envwin_lock);
+}
+
+/* 登记本请求（须持 GIL）。返回 0 = 已登记（请求结束必须 envwin_leave），-1 = 未登记。 */
+static int crucible_py_envwin_enter(void)
+{
+    pthread_mutex_lock(&g_py_envwin_lock);
+    g_py_envwin_refs++;
+    pthread_mutex_unlock(&g_py_envwin_lock);
+    return 0;
+}
+
+/* 把 C environ 同步进 os.environ 视图（并记账）。由已登记的 env_dirty 请求调用：
+ * Rust 侧持 env_lock，本函数遍历 environ 期间不会有另一个 .env 正在 setenv。
+ *
+ * 须持 GIL。写视图用 bytes 键值（`_data` 的命名空间）—— 用 str 键会写到另一个
+ * 命名空间，`os.environ[k]` 看不见（实测确认）。 */
+static void crucible_py_sync_environ_locked(void)
+{
+    void *view, *own = NULL, *keyobj, *valobj, *prev;
     char **e;
 
     if (g_py_state != 1)
         return;
-    d = g_py.dict_new();
-    if (d == NULL) {
-        crucible_py_clear_error();
-        return;
-    }
-    os_mod = g_py.import_module("os");
-    if (os_mod != NULL)
-        envmap = g_py.object_get_attr_string(os_mod, "environ"); /* 借用 */
-    /* **必须查一个真正的 dict**：`os.environ` 是 `os._Environ`（MutableMapping），而
-     * `g_py.dict_get_item_string` 绑定的是 `PyDict_GetItemString` —— 对非 dict 恒返回
-     * NULL 且不设异常。旧实现直接拿它查 `os.environ`，于是**每个键都被记成「原本不
-     * 存在」**，请求结束的 `crucible_py_restore_environ` 就把 os.environ 的每个键都
-     * `__delitem__` —— 一次带 `.env` 的请求之后，嵌入式解释器的 os.environ 被**整表清空**
-     * （实测 ENV_LEN=0，PATH/HOME/LANG 全部消失，同进程后续所有请求受害）。
-     * `_Environ.copy()` 返回真 dict，用它做「请求前状态」的快照。 */
-    if (restore_out != NULL && envmap != NULL) {
-        snap = g_py.object_call_method(envmap, "copy", NULL);
-        if (snap == NULL)
-            crucible_py_clear_error();
-        none = crucible_py_none_obj(); /* None 作「原本不存在」哨兵（env 值恒为 str） */
+    view = crucible_py_envwin_view_get(); /* 借用：本请求已登记 ⇒ 窗口不会被清 */
+    if (view == NULL) {
+        own = crucible_py_env_view(); /* 新引用 */
+        if (own == NULL)
+            return;
+        view = own;
+        if (crucible_py_envwin_set_view(own))
+            own = NULL; /* 所有权转移给窗口（本函数不再 dec_ref） */
     }
     for (e = environ; e != NULL && *e != NULL; e++) {
         const char *eq = strchr(*e, '=');
-        char kbuf[128];
-        size_t klen;
-        void *v;
+        const char *kb;
+        size_t klen, vlen;
+        char *ps = NULL;
+        long pn = 0;
 
         if (eq == NULL || eq == *e)
             continue;
+        kb = *e;
         klen = (size_t)(eq - *e);
-        if (klen >= sizeof(kbuf))
-            continue;
-        memcpy(kbuf, *e, klen);
-        kbuf[klen] = '\0';
-        v = g_py.unicode_from_string_and_size(eq + 1, (long)strlen(eq + 1));
-        if (v == NULL) {
+        vlen = strlen(eq + 1);
+        keyobj = g_py.bytes_from_string_and_size(kb, (long)klen);
+        if (keyobj == NULL) {
             crucible_py_clear_error();
             continue;
         }
-        (void)g_py.dict_set_item_string(d, kbuf, v);
-        /* 记录请求前状态（此刻 os.environ 尚未 update）：只记「本次会改动」的键。 */
-        if (snap != NULL) {
-            void *prior = g_py.dict_get_item_string(snap, kbuf); /* 借用，可能 NULL */
-            if (prior == NULL) {
-                if (none != NULL)
-                    (void)g_py.dict_set_item_string(restore_out, kbuf, none);
-            } else {
-                const char *ps = crucible_py_text(prior, NULL, NULL);
-                if (ps == NULL || strcmp(ps, eq + 1) != 0) {
-                    g_py.inc_ref(prior);
-                    (void)g_py.dict_set_item_string(restore_out, kbuf, prior);
-                    g_py.dec_ref(prior);
-                }
-                crucible_py_clear_error();
-            }
+        prev = g_py.dict_get_item(view, keyobj); /* 借用；非 dict 恒 NULL（见文件头） */
+        if (prev != NULL && g_py.bytes_as_string_and_size(prev, &ps, &pn) == 0 &&
+            (size_t)pn == vlen && memcmp(ps, eq + 1, vlen) == 0) {
+            /* 视图已经与 C environ 一致：不写、不记账（保留既有先验，幂等） */
+            g_py.dec_ref(keyobj);
+            crucible_py_clear_error();
+            continue;
         }
-        g_py.dec_ref(v);
+        crucible_py_clear_error();
+        crucible_py_envwin_record(kb, klen, prev);
+        valobj = g_py.bytes_from_string_and_size(eq + 1, (long)vlen);
+        if (valobj == NULL) {
+            crucible_py_clear_error();
+        } else {
+            if (g_py.dict_set_item(view, keyobj, valobj) != 0)
+                crucible_py_clear_error();
+            g_py.dec_ref(valobj);
+        }
+        g_py.dec_ref(keyobj);
     }
-    if (envmap != NULL)
-        (void)g_py.object_call_method(envmap, "update", "O", d);
-    if (snap != NULL)
-        g_py.dec_ref(snap);
-    if (os_mod != NULL)
-        g_py.dec_ref(os_mod);
-    crucible_py_clear_error();
-    g_py.dec_ref(d);
+    crucible_py_xdecref(own);
 }
 
-/* 请求结束：把 os.environ 还原到 crucible_py_sync_environ_locked 记录的请求前状态。
- * 须持 GIL。restore 为 NULL（无 .env 的请求）时 no-op。 */
-static void crucible_py_restore_environ(void *restore)
+/* 请求结束（须持 GIL）：引用计数归零的**最后一个离开者**在本函数里恢复视图。
+ *
+ * **整个「归零判定 + 恢复」都在窗口锁内**（缺陷二 a）：否则新窗口可能在恢复还没
+ * 跑完时开出来并完成同步，随后被这份旧恢复删掉键。临界区纯 C（缺陷二 b）。 */
+static void crucible_py_envwin_leave(void)
 {
-    void *os_mod, *envmap, *it, *k, *none;
+    crucible_py_envprior *list;
+    void *view;
 
-    if (restore == NULL || g_py_state != 1)
-        return;
-    os_mod = g_py.import_module("os");
-    if (os_mod == NULL) {
-        crucible_py_clear_error();
-        return;
+    pthread_mutex_lock(&g_py_envwin_lock);
+    if (g_py_envwin_refs > 0)
+        g_py_envwin_refs--;
+    if (g_py_envwin_refs > 0) {
+        pthread_mutex_unlock(&g_py_envwin_lock);
+        return; /* 还有同组请求在飞：保留视图（它们还要读） */
     }
-    envmap = g_py.object_get_attr_string(os_mod, "environ"); /* 借用 */
-    none = crucible_py_none_obj();
-    it = g_py.object_get_iter(restore);
-    if (envmap != NULL && it != NULL) {
-        while ((k = g_py.iter_next(it)) != NULL) {
-            const char *ks = g_py.unicode_as_utf8_and_size(k, NULL);
-            if (ks != NULL) {
-                void *prior = g_py.dict_get_item_string(restore, ks); /* 借用 */
-                if (prior == NULL || prior == none) {
-                    void *r = g_py.object_call_method(envmap, "__delitem__", "O", k);
-                    if (r == NULL)
-                        crucible_py_clear_error();
-                    else
-                        g_py.dec_ref(r);
-                } else {
-                    /* **不能**用 `dict_set_item_string`：envmap 是 `os._Environ`，不是
-                     * dict，`PyDict_SetItemString` 对非 dict 直接失败（还原静默无效）。
-                     * 走 MutableMapping 的 `__setitem__`（与上面的 `__delitem__` 对称）。 */
-                    void *r = g_py.object_call_method(envmap, "__setitem__", "OO", k, prior);
-                    if (r == NULL)
-                        crucible_py_clear_error();
-                    else
-                        g_py.dec_ref(r);
-                }
-            } else {
-                crucible_py_clear_error();
-            }
-            g_py.dec_ref(k);
+    list = g_py_envwin_head;
+    view = g_py_envwin_view;
+    g_py_envwin_head = NULL;
+    g_py_envwin_tail = NULL;
+    g_py_envwin_view = NULL;
+    while (list != NULL) {
+        crucible_py_envprior *next = list->next;
+        void *keyobj =
+            g_py.bytes_from_string_and_size(list->key, (long)strlen(list->key));
+        if (keyobj != NULL && view != NULL) {
+            int rc = list->prior == NULL ? g_py.dict_del_item(view, keyobj)
+                                         : g_py.dict_set_item(view, keyobj, list->prior);
+            if (rc != 0)
+                crucible_py_clear_error(); /* 键已被应用删掉等：恢复语义允许 */
         }
+        crucible_py_xdecref(keyobj);
+        crucible_py_xdecref(list->prior);
+        free(list->key);
+        free(list);
+        list = next;
     }
-    crucible_py_clear_error();
-    crucible_py_xdecref(it);
-    g_py.dec_ref(os_mod);
+    pthread_mutex_unlock(&g_py_envwin_lock);
+    crucible_py_xdecref(view); /* 引用释放放在锁外（dealloc 不占窗口锁） */
 }
 
 /* 引擎级失败：填 out->error 并返回 -1（app_ffi 把它变成 502 文本，不会假装成功）。 */
@@ -750,6 +891,9 @@ static int crucible_py_init_locked(char *err, size_t errsz)
     CRUCIBLE_PY_LOAD(dict_new, "PyDict_New");
     CRUCIBLE_PY_LOAD(dict_set_item_string, "PyDict_SetItemString");
     CRUCIBLE_PY_LOAD(dict_get_item_string, "PyDict_GetItemString");
+    CRUCIBLE_PY_LOAD(dict_get_item, "PyDict_GetItem");
+    CRUCIBLE_PY_LOAD(dict_set_item, "PyDict_SetItem");
+    CRUCIBLE_PY_LOAD(dict_del_item, "PyDict_DelItem");
     CRUCIBLE_PY_LOAD(bytes_from_string_and_size, "PyBytes_FromStringAndSize");
     CRUCIBLE_PY_LOAD(bytes_as_string_and_size, "PyBytes_AsStringAndSize");
     CRUCIBLE_PY_LOAD(unicode_from_string_and_size, "PyUnicode_FromStringAndSize");
@@ -1043,10 +1187,9 @@ static int crucible_py_wsgi_request(const char *label, const char *script,
     char lenbuf[32];
     char hostbuf[320];
     char *trace = NULL;
-    int gil = 0, rc = -1, we_gil = 0;
+    int gil = 0, rc = -1, we_gil = 0, envwin = 0;
     void *app = NULL;
     void *environ = NULL, *args = NULL, *sr = NULL, *result = NULL, *it = NULL;
-    void *restore = NULL; /* .env 同步的「请求前状态」恢复表（见 sync_environ） */
     void *state = NULL, *write_fn = NULL, *io = NULL, *pybody = NULL, *wsgi_in = NULL;
     void *sys_mod = NULL, *sys_err = NULL, *tmp = NULL, *st = NULL, *close_fn = NULL;
     void *true_obj = NULL, *false_obj = NULL, *bools = NULL;
@@ -1088,11 +1231,11 @@ static int crucible_py_wsgi_request(const char *label, const char *script,
     pthread_mutex_lock(&g_py_lock);
     gil = g_py.gil_ensure();
     we_gil = 1;
-    /* 带 .env 的请求才同步（env_dirty）——它同时建好「请求前状态」恢复表，请求结束
-     * 在 done: 里还原 os.environ（否则该 .env 的键会永久残留，泄漏给后续应用）。 */
-    if (env_dirty) {
-        restore = g_py.dict_new();
-        crucible_py_sync_environ_locked(restore);
+    /* 带 .env 的请求才同步（env_dirty）——先登记进「同内容组」的 os.environ 同步窗口，
+     * 再同步：同组并发请求共享一份请求前状态，**最后一个离开者**才恢复（见 envwin 段）。 */
+    if (env_dirty && crucible_py_envwin_enter() == 0) {
+        envwin = 1;
+        crucible_py_sync_environ_locked();
     }
     if (crucible_py_wsgi_app_locked(script, errbuf, sizeof(errbuf)) != 0) {
         pthread_mutex_unlock(&g_py_lock);
@@ -1294,10 +1437,12 @@ static int crucible_py_wsgi_request(const char *label, const char *script,
 
 done:
     /* 先释放 Python 引用（须持 GIL），再释放 GIL。锁在步骤 2 末尾已释放。 */
-    /* 还原 .env 注入的 os.environ 键（须在释放 GIL 之前；与 Rust 对 C environ 的
-     * restore 对称）——否则这些键会永久留在 os.environ，泄漏给后续应用。 */
-    crucible_py_restore_environ(restore);
-    crucible_py_xdecref(restore);
+    /* 窗口引用计数退场（须在释放 GIL 之前；与 Rust env_lock 的 `Slot::drop` 对称）：
+     * 最后一个同组请求离开时才把 os.environ 还原到窗口开启前的状态 —— 否则这些键
+     * 会永久留在 os.environ（泄漏给后续应用），或被先走的同组请求提前删掉
+     * （本修复就是后者：并发同组请求互相抹掉 .env）。 */
+    if (envwin)
+        crucible_py_envwin_leave();
     crucible_py_xdecref(app);
     crucible_py_xdecref(environ);
     crucible_py_xdecref(args);
@@ -1439,9 +1584,9 @@ static int crucible_py_asgi_request(const char *label, const char *script,
     char hostbuf[320];
     char *htmp = NULL;
     char *trace = NULL;
-    int gil = 0, rc = -1, we_gil = 0;
+    int gil = 0, rc = -1, we_gil = 0, envwin = 0;
     void *g = NULL, *res = NULL, *pybody = NULL, *drv = NULL, *st = NULL, *hd = NULL;
-    void *bdy = NULL, *portobj = NULL, *pyheaders = NULL, *restore = NULL;
+    void *bdy = NULL, *portobj = NULL, *pyheaders = NULL;
     const char *srv = server_name != NULL && server_name[0] != '\0' ? server_name : "crucible";
     int port = server_port > 0 ? server_port : 80;
 
@@ -1469,10 +1614,11 @@ static int crucible_py_asgi_request(const char *label, const char *script,
     /* 步骤 2：只持 GIL（驱动在每请求独立命名空间里跑，无共享可变状态，不占进程锁）。 */
     gil = g_py.gil_ensure();
     we_gil = 1;
-    /* 带 .env 的请求才同步，并建恢复表（理由同 WSGI 路径）。 */
-    if (env_dirty) {
-        restore = g_py.dict_new();
-        crucible_py_sync_environ_locked(restore);
+    /* 带 .env 的请求才同步，并登记进「同内容组」的 os.environ 同步窗口（理由同 WSGI
+     * 路径：并发同组请求共享请求前状态，最后一个离开者才恢复）。 */
+    if (env_dirty && crucible_py_envwin_enter() == 0) {
+        envwin = 1;
+        crucible_py_sync_environ_locked();
     }
 
     if (port == 80)
@@ -1550,9 +1696,9 @@ static int crucible_py_asgi_request(const char *label, const char *script,
     rc = 0;
 
 done:
-    /* 还原 .env 注入的 os.environ 键（须在释放 GIL 之前；理由同 WSGI 路径）。 */
-    crucible_py_restore_environ(restore);
-    crucible_py_xdecref(restore);
+    /* 窗口引用计数退场（须在释放 GIL 之前；理由同 WSGI 路径：最后一个离开者恢复）。 */
+    if (envwin)
+        crucible_py_envwin_leave();
     crucible_py_xdecref(drv);
     crucible_py_xdecref(pybody);
     crucible_py_xdecref(portobj);

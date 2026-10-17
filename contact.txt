@@ -4106,3 +4106,91 @@ base 在该窗口拿到全天最低 cpu/req（11.96µs，同日其他会话 12.8
 **结论修正：不要把本 patch 描述成「c128 已稳过 1.15」**——它把 c128 期望值收窄 ≈3%，
 是否过线取决于窗口；c64 三会话全部 ≤1.15。原始日志 `~/scratch-perf6/logs/gate2-seq3.txt`、
 `duel-quiet.txt`；报告 §3.4 有完整分析。
+
+---
+
+# 【agent-buildfix / 工号 1009 · Wave-12】构建脚本两个 P2 收工：ksh 跑不了 + perl 探测误判（2026-10-17）
+
+**改的文件（只这两个）**：`scripts/build_app_engines.sh`（+55/−4，md5 `8dbf2b358ff0824aa7daae3374805a28`）、
+`scripts/build_script_ffi.sh`（+90/−25，md5 `092522b21b799b7fa2dd3977d1bf5908`）。
+未 commit/push/checkout/reset/stash/clean；`Makefile`/文档未改（仓库里没有 `sh scripts/build_*` 调用点）。
+
+**① 【P2】ksh 语法错误 → 修**：脚本第一段可执行代码加解释器自检：非 bash 就
+`exec bash "$0" "$@"`（先 exec，后面的 bash-only 语法永远不会被 ksh 解析到）；没有 bash 时给可读
+FATAL（`pkg_add bash` / `bash $0 $*`）。复现→修复：本机 dash `Syntax error: "(" unexpected` rc=2、
+远程 OpenBSD `scripts/build_app_engines.sh[26]: syntax error: '(' unexpected` rc=1 →
+**远程 ksh 全量构建 `ksh run rc=0`**（`/bin/sh`=ksh，`BASH_VERSION=[]`），`sh`/`bash` 两拼法都通。
+
+**② 【P2】`perl_libs_present()` 误判 → 修**：删掉按文件名找 `libperl.so`/`libperl.a` 的启发式，
+改成 `perl_link_probe()` —— **用真实构建 flags 试链一只空 .so**（失败时打印链接器输出）。
+真机决定性证据：用 cc 包装器屏蔽 `-L/usr/local/lib`、只留 versioned-only 目录（等价「无 workaround」）
+跑修复版脚本 → `in-process Perl via ExtUtils::Embed (link probe OK)`，
+`libapp_perl.so` 24088 B / 13 个 `Perl_` 符号 / **`DT_NEEDED=libperl.so.27.0`** / `ldd→/usr/lib/libperl.so.27.0`，
+`libapp_psgi.so` 17 个符号 / 同样 `libperl.so.27.0`。⇒ **部署不再需要 `ln -s libperl.so.27.0 libperl.so`**。
+
+**③ 顺带**：`CRUCIBLE_APP_ENGINES_OUT` 产物目录覆盖（本轮真机验证靠它做到零破坏）；
+CC 缺失可读 FATAL；`set -u` 下 `${HOME:-}` 修复。复核 `--allow-missing`/退出码（默认 rc=1 + MISSING 点名、
+allow-missing rc=0，本地+远程实测）；`build_libtomcrypt.sh`/`build_boringssl.sh` 为 POSIX-clean，无需改。
+
+**交回（跨 scope）**：1) `libs/app-engines/psgi/psgi_engine.c:261` `hv_iterkey(he,&klen)` 类型错
+（GCC14+ 默认 error，本地 psgi 嵌入构建失败；OpenBSD clang 仅 warning）；2) `build_aspnet_ffi.sh:5`、
+`build_axonasp_ffi.sh:38` 不认 `CRUCIBLE_APP_ENGINES_OUT`（dry-run 仍重写 3 个现役 .so，本轮已按 md5 还原）；
+3) ⚠️ **现役机 workaround 链接不能直接删**：现役 `libapp_perl.so`/`libapp_psgi.so` 的
+`DT_NEEDED=libperl.so`（运行期依赖 `/usr/local/lib/libperl.so`）；正确顺序 = 摘链接 → 用修复版脚本重建
+（产物变 `libperl.so.27.0`）→ 重启 → `/perl/` 200。
+
+**远程验证边界**：锁定 `/tmp/remote-build.lock` 内完成，未换 `bin/webserver`、现役
+`target/app-engines` 聚合 md5 前后一致（`e47b1704…`）、临时脚本已删/`build_script_ffi.sh` 已还原
+（md5 `52945e2a…`）、锁已释放、零残留。事故（诚实）：我自写的测试 cc 包装器过滤循环写成无限循环，
+远程空转至 OOM 自杀（2 次 `internal error: unable to allocate memory`，ssh 丢失后半段输出）；
+事后核对现役进程/引擎/服务无损（pid 59448 未变、四个引擎 200、swap 峰值痕迹 4%），第二轮已修并本地验证。
+详见 `.agents/1009/reports/buildfix-wave12.md`（§6 有从零构建完整命令序列）与
+`.agents/1009/fixes/buildfix-wave12.md`。
+
+---
+
+# 【agent-pyenv / 工号 1009 · Wave-12】CPython 嵌入引擎「并发同组请求互相抹掉 .env」P2 收工（2026-10-17）
+
+**改的文件**：`libs/app-engines/common/crucible_pyembed.h`（+282/−136）、
+`libs/app-engines/wsgi/pyembed_envwin_selftest.c`（新增回归自测，不参与构建）。
+**未改**：`src/server/apps/env_lock.rs`（锁本身是对的，缺陷在 C 侧解释器全局 os.environ 视图的
+生命周期）、`libs/script-ffi/*`、`libs/app-engines/{wsgi,asgi,uwsgi}/*.c`。
+未 commit/push/checkout/reset/stash/clean；`target/app-engines/` 已用官方脚本重建（wsgi/asgi/uwsgi）。
+
+**修复**：`os.environ` **同步窗口** —— 同内容组并发请求共享一份「请求前状态」+ 引用计数，
+**最后一个离开者**才恢复（与 Rust `env_lock` 的 `Slot::drop` 对称）；同步/恢复直接操作
+`os._Environ._data`（bytes 键，新增 `PyDict_GetItem/SetItem/DelItem` 三个 dlsym 符号），**纯 C**
+（不执行字节码、不释放 GIL）**且不再 putenv/unsetenv** —— C environ 的安装/卸载从此只由 Rust
+env_lock 负责；「归零判定 + 恢复」整体在窗口锁临界区里做（原子）。锁序仍是 `g_py_lock → GIL`，
+窗口锁只在持 GIL 时进入、临界区不等待 ⇒ 无 ABBA。
+
+**关键证据（真机 A/B，同二进制只换 .so）**：
+* 8/16/32 并发 `/wsgi-a/?sleep=2`：before **1/8、2/16、4/32 有值** → fixed **全 8/8、16/16、32/32**；
+  asgi/uwsgi/h2c 同型全绿；不同组并发各看自己的值；无 `.env` 请求恒 `<unset>`（ENV_LEN 恒 47）。
+* 长压 hammer（16 线程随机混合）：before 同组高并发 **1099/2815 失败（46.5%）** → fixed
+  **0/6026、0/2958、0/354、0/272、0/238**。
+* apps6 四套验收在「apps6 的 www 树 + 配置副本 + 我的修复引擎」上重跑：**t2 311/0**、
+  t4 FAIL=0、smoke DIFF=0、check_wave11 0 FAIL、scan 0 panic；`$CARGO test` **514/0/1**（Rust 零改动）。
+* 时延不回归：单发 p50 0.7ms；8×sleep2 同组 wall 2.01s（并发度未变）。
+* 仓库内自测：HEAD 版 1/8 FAIL、修复版 8/8 与 32/32 PASS（`libs/app-engines/wsgi/pyembed_envwin_selftest.c`，
+  文件头有构建/运行命令，可直接当 CI 哨兵）。
+
+**本波新发现并修掉的第二层竞态（诚实记录）**：第一版「窗口 + 锁外 Python 层恢复」在 30 轮 × 8 并发
+压力下仍偶发 21/240 次 `<unset>`（恢复执行字节码时释放 GIL，与「新窗口开窗 + 同步」交错）——
+最终实现把恢复整体搬进窗口锁并纯 C 化才关闭；任何人把恢复改回 Python 层/移出临界区 = 回退本修复。
+
+**交回（未改，请拍板/派单）**：
+1. 【P2，pre-existing】`python`（script-ffi）引擎的应用看不到自己的 `.env`：
+   `libs/script-ffi/script_engine.c:1040` 刻意不读 extra，`:355-367` 的每请求 envdict 只有 CGI 变量，
+   `os.environ`/`os.getenv` 走 `_CrucibleEnv` 回退到从未被同步的全局视图 ⇒ `GET /python-a/` 恒
+   `PYA WINDOWMARK=<unset>`（before/fixed 逐字一致）。修法方向 + 影响见报告 §4.2。
+2. 【记录】`libs/app-engines/common/crucible_pyembed.h` 的 ASGI 缓存放在**解释器全局**
+   `sys.modules['__crucible_asgi_cache__']`（应用可读写，可替换别的应用的 app 对象）；
+   `sys.path` 每次重载 `insert(0, …)` 只增不减（跨应用 import 可见）；ASGI 不加 sys.path
+   （asgi 应用无法 import 同目录模块）。均为 pre-existing，报告 §5.3/§5.4 有细节。
+3. 【边界】`apps[].lib` 指向**不同 .so 文件但引擎名相同**且 `.env` 内容相同 → env_lock 当同组并发，
+   而窗口按 .so 私有 ⇒ 仍可能双窗口（罕见配置；修前同样坏）。报告 §5.5。
+
+实例：**21700**（修复版，我的基座）与 **21704/21746**（apps6 树 + 修复引擎）收工保持运行；
+21702（旧引擎对照）已停。设施全在 `~/scratch-pyenv/`（`srv.sh`/`probe.py`/`hammer.py`/`stress.py`/`logs/`）。
+详见 `.agents/1009/reports/pyenv-wave12.md` 与 `.agents/1009/fixes/pyenv-wave12.md`。

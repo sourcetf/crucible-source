@@ -6,6 +6,47 @@
 # 运维以为建好了，实际跑的是旧产物（host 的 ABI 校验只会把它 502 掉，功能面等于缺引擎）。
 # 现在：所有工具链缺失/构建失败在结尾**集中汇总并非零退出**；显式
 # `--allow-missing`（或 CRUCIBLE_ALLOW_MISSING_ENGINES=1）才允许降级为警告并退出 0。
+#
+# 产物目录：默认 ${ROOT}/target/app-engines，可用 CRUCIBLE_APP_ENGINES_OUT 覆盖
+# （远程真机验证/CI 想在不碰现役 .so 的前提下跑一遍构建时用这个）。
+#
+# ---------------------------------------------------------------------------
+# 解释器自检 —— 必须是文件里**第一段可执行代码**：本脚本用 bash 语法（数组、[[ ]]）。
+# OpenBSD 的 /bin/sh 是 ksh：`sh scripts/build_app_engines.sh` 在 ksh 下解析到第一个
+# bash-only 语法（`local found=() a`）就 `syntax error: '(' unexpected` 直接退出
+# （实测 OpenBSD 7.9，2026-10-16 部署，一个引擎都没建，极易被当成构建成功）。
+# ksh/dash 都是「逐条解析、逐条执行」，所以只要在最前面 exec 到 bash，后面的
+# bash-only 语法根本没机会被解析。缺少 bash 时给出可读错误而不是语法错误。
+# ---------------------------------------------------------------------------
+if [ -z "${BASH_VERSION:-}" ]; then
+  _cr_bash=""
+  for _cr_cand in bash /usr/local/bin/bash /usr/bin/bash /bin/bash; do
+    # 绝对路径候选同时用 -x 复核：`command -v /abs/path` 在各家 ksh 上行为不一。
+    if command -v "${_cr_cand}" >/dev/null 2>&1 || [ -x "${_cr_cand}" ]; then
+      _cr_bash="${_cr_cand}"; break
+    fi
+  done
+  # 只有「可读且带 #! 的脚本文件」才敢再 exec：`sh < script` 时 $0 是 sh 自己，
+  # 对二进制再 exec 只会得到 "cannot execute binary file"。
+  _cr_self=""
+  if [ -f "$0" ] && [ -r "$0" ]; then
+    IFS= read -r _cr_line < "$0" 2>/dev/null || _cr_line=""
+    case "${_cr_line}" in '#!'*) _cr_self="$0" ;; esac
+  fi
+  if [ -z "${_cr_bash}" ]; then
+    echo "FATAL: $0 需要 bash（本脚本用数组/[[ ]] 语法，ksh/sh 不支持）。" >&2
+    echo "       当前解释器没有 BASH_VERSION，PATH 里也找不到 bash。" >&2
+    echo "       OpenBSD: pkg_add bash；或显式调用: bash $0 $*" >&2
+    exit 1
+  fi
+  if [ -z "${_cr_self}" ]; then
+    echo "FATAL: $0 需要 bash（本脚本用数组/[[ ]] 语法），但无法自动重新执行：" >&2
+    echo "       \"$0\" 不是可读的脚本文件（例如把脚本管道进 sh）；请先落盘再执行：bash <脚本路径>" >&2
+    exit 1
+  fi
+  echo "==> 检测到非 bash 解释器，自动改用 ${_cr_bash} 重新执行 ${_cr_self}" >&2
+  exec "${_cr_bash}" "${_cr_self}" "$@"
+fi
 set -euo pipefail
 
 ALLOW_MISSING=0
@@ -15,6 +56,9 @@ for _arg in "$@"; do
     -h|--help)
       echo "usage: $0 [--allow-missing]"
       echo "  --allow-missing  缺 go/cargo 等工具链时只告警（退出 0），默认非零退出"
+      echo "  环境变量：CRUCIBLE_APP_ENGINES_OUT=<dir>  指定产物目录（默认 <root>/target/app-engines）"
+      echo "            CRUCIBLE_ALLOW_MISSING_ENGINES=1 同 --allow-missing"
+      echo "  本脚本需要 bash（OpenBSD 的 /bin/sh 是 ksh）：用 sh 调用会自动 re-exec 到 bash。"
       exit 0
       ;;
     *) echo "WARN: unknown argument '${_arg}'（忽略；可用 --allow-missing）" >&2 ;;
@@ -40,7 +84,7 @@ note_missing_tool() {
 }
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-OUT="${ROOT}/target/app-engines"
+OUT="${CRUCIBLE_APP_ENGINES_OUT:-${ROOT}/target/app-engines}"
 INC="${ROOT}/libs/app-engines/include"
 COMMON="${ROOT}/libs/app-engines/common"
 SAMPLES="${ROOT}/libs/app-engines/samples"
@@ -63,6 +107,13 @@ elif command -v gcc >/dev/null 2>&1; then
 else
   CC=cc
 fi
+# 编译器的可读前置检查：没有它的话 ${CC} 会在第一条编译命令处
+# `cc: not found` + set -e 直接退出 127，看不出是谁的问题。
+if ! command -v "${CC}" >/dev/null 2>&1; then
+  echo "FATAL: C 编译器 '${CC}' 不存在（\$CC / PATH 里都没有）；无法构建任何引擎。" >&2
+  echo "       OpenBSD: 装了 base 的 cc，或 pkg_add gcc；也可显式 CC=/path/to/cc $0" >&2
+  exit 1
+fi
 
 mkdir -p "${OUT}"
 
@@ -73,7 +124,7 @@ CFLAGS="-O2 -fPIC -pthread -Wall -Werror=implicit-function-declaration -I${INC} 
 LDFLAGS="-shared -fPIC -pthread"
 COMMON_SRC="${COMMON}/appengine_common.c ${COMMON}/appengine_util.c"
 
-echo "==> GO_ENGINE_MODE=${GO_ENGINE_MODE}"
+echo "==> GO_ENGINE_MODE=${GO_ENGINE_MODE}  OUT=${OUT}"
 
 echo "==> building libapp_c.so (CC=${CC})"
 ${CC} ${CFLAGS} ${LDFLAGS} \
@@ -446,8 +497,8 @@ CARGO_BIN="${CARGO:-}"
 if [[ ! -x "${CARGO_BIN}" ]]; then
   CARGO_BIN="$(command -v cargo 2>/dev/null || true)"
 fi
-if [[ ! -x "${CARGO_BIN}" ]] && [[ -x "${HOME}/.cargo/bin/cargo" ]]; then
-  CARGO_BIN="${HOME}/.cargo/bin/cargo"
+if [[ ! -x "${CARGO_BIN}" ]] && [[ -x "${HOME:-}/.cargo/bin/cargo" ]]; then
+  CARGO_BIN="${HOME:-}/.cargo/bin/cargo"
 fi
 if [[ -x "${CARGO_BIN}" ]]; then
   if (

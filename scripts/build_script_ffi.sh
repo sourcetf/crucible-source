@@ -7,9 +7,46 @@
 # 语言 flag **按语言隔离**（PY_* / RB_* / PL_*）：每只 libapp_<lang>.so 只拿自己语言的
 # cflags/libs。混用（旧 EXTRA_* 写法）会让「一个语言的链接失败」拖挂**所有**语言 ——
 # 实测：perl 的 -lperl 不可用 ⇒ python3-embed 明明可用却一起降级为 embed-missing。
+#
+# 产物目录：默认 ${ROOT}/target/app-engines，可用 CRUCIBLE_APP_ENGINES_OUT 覆盖
+# （build_app_engines.sh 会透传，远程真机验证/CI 可用它在不碰现役 .so 的前提下试建）。
+#
+# 解释器自检 —— 必须是文件里**第一段可执行代码**（理由同 build_app_engines.sh）：
+# OpenBSD 的 /bin/sh 是 ksh，`sh scripts/build_script_ffi.sh` 会在解析到 bash-only
+# 语法时报 syntax error 退出（本脚本有 `local x=()`/`[[ ]]`）。这里先 exec 到 bash。
+# ---------------------------------------------------------------------------
+if [ -z "${BASH_VERSION:-}" ]; then
+  _cr_bash=""
+  for _cr_cand in bash /usr/local/bin/bash /usr/bin/bash /bin/bash; do
+    # 绝对路径候选同时用 -x 复核：`command -v /abs/path` 在各家 ksh 上行为不一。
+    if command -v "${_cr_cand}" >/dev/null 2>&1 || [ -x "${_cr_cand}" ]; then
+      _cr_bash="${_cr_cand}"; break
+    fi
+  done
+  # 只有「可读且带 #! 的脚本文件」才敢再 exec：`sh < script` 时 $0 是 sh 自己，
+  # 对二进制再 exec 只会得到 "cannot execute binary file"。
+  _cr_self=""
+  if [ -f "$0" ] && [ -r "$0" ]; then
+    IFS= read -r _cr_line < "$0" 2>/dev/null || _cr_line=""
+    case "${_cr_line}" in '#!'*) _cr_self="$0" ;; esac
+  fi
+  if [ -z "${_cr_bash}" ]; then
+    echo "FATAL: $0 需要 bash（本脚本用数组/[[ ]] 语法，ksh/sh 不支持）。" >&2
+    echo "       当前解释器没有 BASH_VERSION，PATH 里也找不到 bash。" >&2
+    echo "       OpenBSD: pkg_add bash；或显式调用: bash $0 $*" >&2
+    exit 1
+  fi
+  if [ -z "${_cr_self}" ]; then
+    echo "FATAL: $0 需要 bash（本脚本用数组/[[ ]] 语法），但无法自动重新执行：" >&2
+    echo "       \"$0\" 不是可读的脚本文件（例如把脚本管道进 sh）；请先落盘再执行：bash <脚本路径>" >&2
+    exit 1
+  fi
+  echo "==> 检测到非 bash 解释器，自动改用 ${_cr_bash} 重新执行 ${_cr_self}" >&2
+  exec "${_cr_bash}" "${_cr_self}" "$@"
+fi
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-OUT="${ROOT}/target/app-engines"
+OUT="${CRUCIBLE_APP_ENGINES_OUT:-${ROOT}/target/app-engines}"
 SRC="${ROOT}/libs/script-ffi"
 INC="${ROOT}/libs/app-engines/include"
 COMMON="${ROOT}/libs/app-engines/common"
@@ -19,6 +56,12 @@ mkdir -p "${OUT}"
 export PATH="/usr/local/bin:/usr/bin:/bin:${PATH:-}"
 if [[ -x /usr/local/bin/gcc ]]; then
   CC=/usr/local/bin/gcc
+fi
+# 编译器的可读前置检查（否则第一条编译命令 `cc: not found` + set -e 退出 127）。
+if ! command -v "${CC}" >/dev/null 2>&1; then
+  echo "FATAL: C 编译器 '${CC}' 不存在（\$CC / PATH 里都没有）；无法构建 script-ffi。" >&2
+  echo "       OpenBSD: 装了 base 的 cc，或 pkg_add gcc；也可显式 CC=/path/to/cc $0" >&2
+  exit 1
 fi
 
 CFLAGS="-O2 -fPIC -I${INC} -I${COMMON}"
@@ -129,41 +172,63 @@ detect_ruby() {
   return 1
 }
 
-# 「有头无库」探测（Perl）：ExtUtils::Embed 可能给出 -lperl，但发行版只装了
-# libperl.so.<ver> 而没有开发用的 libperl.so 符号链接（Debian/Ubuntu 常见）。
-# 此时编译期成功、链接期 `cannot find -lperl` —— 提前把话说清楚，避免排障时
-# 以为「探测成功 = 能编出来」。
-perl_libs_present() {
-  local ldopts="$1" dir lib_name found=0
-  # 链接器对 `-lperl` 只认 libperl.so / libperl.a 这两个名字（版本化文件名
-  # libperl.so.5.40 不足以满足 -l，除非存在同目录的符号链接）。所以这里也只查
-  # 这两个名字：查 .so.* 会把「只装了运行时而没有开发符号链接」误判为可用。
-  for dir in $(printf '%s\n' "${ldopts}" | tr ' ' '\n' | sed -n 's/^-L//p') \
-             /usr/local/lib /usr/lib /usr/lib64 /usr/lib/x86_64-linux-gnu; do
-    [[ -d "${dir}" ]] || continue
-    for lib_name in "${dir}"/libperl.so "${dir}"/libperl.a; do
-      [[ -e "${lib_name}" ]] && { found=1; break; }
-    done
-    [[ "${found}" -eq 1 ]] && break
-  done
-  [[ "${found}" -eq 1 ]]
+# 「能不能真的链上」探测（Perl）：ExtUtils::Embed 只描述**期望**的 flags，不代表本机
+# 链接器一定解析得动。旧实现按**文件名**找 libperl.so / libperl.a，在 OpenBSD 上误判：
+#   OpenBSD base perl 只有 /usr/lib/libperl.so.27.0，**没有** libperl.so 开发符号链接，
+#   但该平台的 ld 本来就能把 `-lperl` 解析到 libperl.so.27.0（部署实测 -lperl 链接 rc=0、
+#   DT_NEEDED=libperl.so.27.0）。旧守卫据此判「库缺失」→ perl/psgi 降级 embed-missing
+#   → /perl/ /psgi/ **502 回归**（2026-10-16 部署实录；当时靠手工
+#   `ln -s /usr/lib/libperl.so.27.0 /usr/local/lib/libperl.so` 才恢复 —— 这个 workaround
+#   不该是部署步骤）。
+# 现在改成**实际试链**：用与真正构建完全相同的 flags 编一只空 .so。判据与真实构建同源：
+#   - OpenBSD（ld 认版本化 .so）：成功 → 保持 in-process Perl；
+#   - Debian 只有 libperl.so.5.40、GNU ld 又只认 libperl.so：如实失败 → 降级（并打印
+#     链接器输出的末几行，不再靠猜文件名）。
+perl_link_probe() {
+  local ldopts="$1" tmpdir rc=0
+  tmpdir="$(mktemp -d "${TMPDIR:-/tmp}/crucible-perlprobe.XXXXXX" 2>/dev/null || true)"
+  if [[ -z "${tmpdir}" || ! -d "${tmpdir}" ]]; then
+    # 临时目录都建不出来：不做判定，交给真正的构建（它会诚实地成功/失败）。
+    echo "    NOTE: mktemp -d 不可用，跳过 Perl 试链（由实际构建决定）" >&2
+    return 0
+  fi
+  printf 'int main(void){return 0;}\n' > "${tmpdir}/probe.c"
+  # shellcheck disable=SC2086  # flag 串必须按空白拆开
+  ${CC} ${CFLAGS} ${PL_CFLAGS} ${LDFLAGS} -o "${tmpdir}/probe.so" "${tmpdir}/probe.c" ${ldopts} \
+    >"${tmpdir}/link.log" 2>&1 || rc=$?
+  if [[ ${rc} -eq 0 ]]; then
+    rm -rf "${tmpdir}"
+    return 0
+  fi
+  PERL_PROBE_LOG="${tmpdir}/link.log"   # 失败时保留（很小）供排障
+  return 1
 }
 
 detect_perl() {
   if command -v perl >/dev/null 2>&1; then
-    local cflags
+    local cflags ld
     cflags="$(perl -MExtUtils::Embed -e 'ccopts' 2>/dev/null || true)"
-    local ld
     ld="$(perl -MExtUtils::Embed -e 'ldopts' 2>/dev/null || true)"
     if echo "${cflags}" | grep -q -- '-I'; then
-      if ! perl_libs_present "${ld}"; then
-        echo "WARN: Perl 头文件在（${cflags}）但链接库缺失：ldopts 里的 -lperl 在 -L 目录与默认库目录下都找不到 libperl.so / libperl.a —— perl/psgi 链接会失败并降级 embed-missing（安装 perl 开发包或 libperl 符号链接可修）" >&2
-        DEGRADED+=("perl (headers present, -lperl missing → embed-missing)")
+      if ! printf '%s\n' "${ld}" | grep -q -- '-lperl'; then
+        echo "WARN: Perl 头文件在（${cflags}）但 ExtUtils::Embed ldopts 里没有 -lperl（'${ld}'）—— 链接期必然缺 Perl_* 库，降级 embed-missing。" >&2
+        DEGRADED+=("perl (headers present, ldopts 无 -lperl → embed-missing)")
         return 1
       fi
       PL_CFLAGS="${cflags} -DCRUCIBLE_HAVE_PERL"
       PL_LIBS="${ld}"
-      echo "    in-process Perl via ExtUtils::Embed"
+      if ! perl_link_probe "${ld}"; then
+        echo "WARN: Perl 头文件在（${cflags}），但用真实构建 flags 试链空 .so **失败** → perl/psgi 降级 embed-missing（不 spawn、不假成功）。" >&2
+        echo "      ldopts=${ld}" >&2
+        echo "      链接器输出（末 5 行；完整日志 ${PERL_PROBE_LOG:-<none>}）：" >&2
+        tail -n 5 "${PERL_PROBE_LOG:-/dev/null}" >&2 || true
+        echo "      说明：只有 libperl.so.<ver> 而无 libperl.so 符号链接时，装 perl 开发包即可；OpenBSD 的 ld 能直接解析版本化库，无需补链接。" >&2
+        DEGRADED+=("perl (headers present, real link probe failed → embed-missing)")
+        PL_CFLAGS=""
+        PL_LIBS=""
+        return 1
+      fi
+      echo "    in-process Perl via ExtUtils::Embed (link probe OK)"
       return 0
     fi
   fi
