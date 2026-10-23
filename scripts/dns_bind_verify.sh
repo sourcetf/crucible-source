@@ -32,7 +32,8 @@ UP=$((BASE + 54))
 ROOTM=$((BASE + 56))
 HTTP_ROOT=$((BASE + 80))
 WORK=${DNSV_DIR:-${TMPDIR:-/tmp}/dnsbind-verify-$$}
-BIN=${DNSV_BIN:-$ROOT/target/release/webserver}
+# 优先用当前 cargo target（buildenv.sh 设置的 CARGO_TARGET_DIR），再退回仓库 target。
+BIN=${DNSV_BIN:-${CARGO_TARGET_DIR:-$ROOT/target}/release/webserver}
 CLIENT="$ROOT/scripts/dns_verify_client.py"
 AUTH="admin:admin"
 PASS=0
@@ -61,7 +62,12 @@ cleanup() {
   for p in $(pgrep -f "udp_fake.py|dns_verify_client.py fake" 2>/dev/null || true); do
     kill "$p" 2>/dev/null || true
   done
-  rm -rf "$WORK"
+  # DNSV_KEEP=1 保留现场（named.conf/zone/日志/acme 材料），便于报告取证。
+  if [ "${DNSV_KEEP:-0}" = "1" ]; then
+    echo "== 现场保留（DNSV_KEEP=1）：$WORK =="
+  else
+    rm -rf "$WORK"
+  fi
 }
 trap cleanup EXIT INT TERM
 
@@ -405,21 +411,30 @@ PY
   expect_json "DoT no-ECS response has no ECS" "$(python3 "$CLIENT" dot "$DOT" "$WORK/certs/dot-cert.pem" dot.test verify.test)" 'd.get("ecs")==[]'
   expect_json "DoT ECS echoes scope 0" "$(python3 "$CLIENT" dot "$DOT" "$WORK/certs/dot-cert.pem" dot.test verify.test 1:203.0.113:24)" 'd.get("ecs") and d["ecs"][0]["source"]==24'
 
-  # ECS 发送：geo 线路把 127.0.0.1 转到 127.0.0.2，伪上游抓包
-  post /api/dns/geo '{"geo":{"enabled":true,"lines":[{"name":"l0","cidrs":["127.0.0.1/32"]}]}}' >/dev/null
+  # ECS 发送（出站 wire）。**不能**再用 geo 把查询引到 127.0.0.2 上的伪上游：
+  # 测试模式现在也会让 named 监听 127.0.0.(2+i)（否则 geo 线路上的 DoT/DoH 会
+  # ICMP 不可达），且 BIND 9.20 在递归/转发时会丢弃未知 EDNS option（ECS 到不了
+  # 真实上游 —— 见报告里的负控）。这里验证的是**本进程 DoT/DoH 层注入的 ECS**：
+  # 停掉 named，让伪上游直接占用 `[dns] port`，DoT/DoH 的转发目标就是它。
+  rndc -c "$WORK/basic/etc/rndc.conf" stop >/dev/null 2>&1 || true
+  for i in $(seq 1 40); do port_free "$DNS" && break; sleep 0.25; done
+  python3 "$CLIENT" fake 127.0.0.1 "$DNS" "$WORK/ecs-capture.log" >/dev/null 2>&1 & PIDS+=("$!")
   sleep 1
-  python3 "$CLIENT" fake 127.0.0.2 "$DNS" "$WORK/ecs-capture.log" >/dev/null 2>&1 & PIDS+=("$!")
-  sleep 1
-  python3 "$CLIENT" doh doh.test "$TLS" "$WORK/certs/doh-cert.pem" POST verify.test >/dev/null 2>&1
-  python3 "$CLIENT" dot "$DOT" "$WORK/certs/dot-cert.pem" dot.test verify.test >/dev/null 2>&1
+  python3 "$CLIENT" doh doh.test "$TLS" "$WORK/certs/doh-cert.pem" POST verify.test 1:203.0.113:24 >/dev/null 2>&1
+  python3 "$CLIENT" dot "$DOT" "$WORK/certs/dot-cert.pem" dot.test verify.test 1:203.0.113:24 >/dev/null 2>&1
   sleep 1
   for p in $(pgrep -f "dns_verify_client.py fake" 2>/dev/null || true); do kill "$p" 2>/dev/null || true; done
   local captured
   captured=$(python3 "$CLIENT" decode "$WORK/ecs-capture.log")
   [ "$(printf '%s\n' "$captured" | grep -c '"ecs": \[{"family": 1, "source": 24')" -ge 2 ] \
-    && ok "ECS injected for DoH+DoT (upstream capture /24)" \
+    && ok "ECS injected for DoH+DoT (injector wire capture /24)" \
     || bad "ECS injection capture: $captured"
-  post /api/dns/geo '{"geo":{"enabled":false,"lines":[]}}' >/dev/null
+  # 拉起 named（面板 reload 走 reconcile）
+  post /api/dns/reload '{}' >/dev/null
+  for i in $(seq 1 40); do
+    api /api/dns/status | grep -q '"named_running":true' && break; sleep 0.25
+  done
+  expect "named restored after ECS injector test" "$(api /api/dns/status)" '"named_running":true'
 
   # 递归模式 + ACL
   post /api/dns/forwarders "{\"forwarders\":[\"127.0.0.1:$UP\"],\"forward_policy\":\"only\"}" >/dev/null
@@ -622,13 +637,120 @@ EOF
   stop_server acme
 }
 
+# ---------------------------------------------------------------- Stage D geo（netns）
+# 分线路的 fwd view 依赖 named 在 127.0.0.(2+i) 上真的有 socket。Linux 上这些地址
+# 不是 `ip addr` 列出的接口地址，BIND 会**静默跳过**（真机：named.conf 写了
+# 127.0.0.2，`ss` 里只有 127.0.0.1）；OpenBSD 由 reconcile 里的 ifconfig alias 补。
+# 因此本机验证在 user+net namespace 里补 alias 后跑完整链路（named → fwd view）。
+stage_d_geo() {
+  echo "===== Stage D: geo 分线路（named view 端到端，netns） ====="
+  if ! need unshare || ! need ip || ! unshare -Urn true 2>/dev/null; then
+    skip "geo netns：unshare -Urn / ip 不可用（生产 OpenBSD 用 ifconfig lo0 alias，见报告）"
+    return 0
+  fi
+  cat > "$WORK/netns-geo.sh" <<EOS
+#!/bin/bash
+set -u
+ip link set lo up
+for i in 2 3 4; do ip addr add 127.0.0.\$i/32 dev lo 2>/dev/null || true; done
+export PATH=/home/dev123/local/usr/bin:/home/dev123/local/usr/sbin:\$PATH
+export LD_LIBRARY_PATH=/home/dev123/local/usr/lib/x86_64-linux-gnu:/home/dev123/local/usr/lib\${LD_LIBRARY_PATH:+:\$LD_LIBRARY_PATH}
+T="$WORK/netns"; mkdir -p \$T/{www,www-tls,home,state}
+API=http://127.0.0.1:25595/__admin
+post(){ curl -s -u admin:admin -H 'Content-Type: application/json' -d "\$2" "\$API\$1"; echo; }
+cat > \$T/cfg.toml <<EOF
+[access_log]
+enable = false
+[admin]
+realm = "dnsbind"
+path = "/__admin"
+[[admin.users]]
+username = "admin"
+password_hash = "\\\$argon2id\\\$v=19\\\$m=19456,t=2,p=1\\\$E/RLobwgix2BWMRMT++urA\\\$yEympjJtiDh0ezwSQsnkbsfYAoSzeDAHYw3EsUMBsj4"
+[dns]
+enabled = true
+listen_addr = "127.0.0.1"
+port = 25553
+rndc_port = 25953
+test_mode = true
+recursion_acl = ["127.0.0.0/8"]
+axfr_out_acl = ["127.0.0.1"]
+[dns.modes]
+root = false
+recursive = false
+authoritative = true
+[dns.dot]
+enabled = true
+port = 25555
+cert = "$WORK/certs/dot-cert.pem"
+key = "$WORK/certs/dot-key.pem"
+allow = ["127.0.0.0/8"]
+rate_per_sec = 1000
+burst = 1000
+[[listeners]]
+address = "127.0.0.1"
+port = 25595
+root = "\$T/www"
+http_versions = ["h1"]
+EOF
+CRUCIBLE_DNS_STATE_ROOT=\$T/state HOME=\$T/home CRUCIBLE_NAMED_USER= "$BIN" --config \$T/cfg.toml > \$T/server.log 2>&1 &
+SP=\$!
+trap 'kill \$SP 2>/dev/null; rndc -c \$T/state/etc/rndc.conf stop >/dev/null 2>&1 || true' EXIT
+for i in \$(seq 1 40); do curl -sf -m 1 -u admin:admin \$API/api/dns/status >/dev/null && break; sleep 0.5; done
+post /api/dns/zones '{"action":"add","name":"geo.test","kind":"master"}' >/dev/null
+# 运行时启用 geo：必须触发 named 重启并 bind 127.0.0.2/.3
+post /api/dns/geo '{"geo":{"enabled":true,"lines":[{"name":"l0","cidrs":["127.0.0.1/32"]},{"name":"l1","cidrs":["127.0.0.3/32"]}]}}' >/dev/null
+for i in \$(seq 1 30); do grep -q "restarting named" \$T/server.log && break; sleep 0.5; done
+sleep 6
+got=\$(ss -lunp 2>/dev/null | grep 25553 | awk '{print \$4}' | sort -u | tr '\n' ' ')
+case "\$got" in *127.0.0.2:25553*) echo "PASS: geo named binds 127.0.0.2";; *) echo "FAIL: geo listeners: \$got";; esac
+case "\$got" in *127.0.0.3:25553*) echo "PASS: geo named binds 127.0.0.3";; *) echo "FAIL: geo listeners: \$got";; esac
+post /api/dns/records '{"zone":"geo.test","name":"www","rtype":"A","ttl":300,"rdata":"192.0.2.10","line":"l0"}' >/dev/null
+post /api/dns/records '{"zone":"geo.test","name":"www","rtype":"A","ttl":300,"rdata":"192.0.2.11","line":"l1"}' >/dev/null
+post /api/dns/records '{"zone":"geo.test","name":"www","rtype":"A","ttl":300,"rdata":"192.0.2.99"}' >/dev/null
+a1=\$(dig -b 127.0.0.1 @127.0.0.1 -p 25553 www.geo.test A +short +time=3 +tries=1)
+a2=\$(dig -b 127.0.0.3 @127.0.0.1 -p 25553 www.geo.test A +short +time=3 +tries=1)
+a3=\$(dig -b 127.0.0.4 @127.0.0.1 -p 25553 www.geo.test A +short +time=3 +tries=1)
+[ "\$a1" = "192.0.2.10" ] && echo "PASS: view l0 (.1) -> \$a1" || echo "FAIL: view l0 (.1) -> \$a1"
+[ "\$a2" = "192.0.2.11" ] && echo "PASS: view l1 (.3) -> \$a2" || echo "FAIL: view l1 (.3) -> \$a2"
+[ "\$a3" = "192.0.2.99" ] && echo "PASS: default (.4) -> \$a3" || echo "FAIL: default (.4) -> \$a3"
+# DoT .1（源地址即 peer IP）走 fwd-l0
+python3 "$CLIENT" dot 25555 "$WORK/certs/dot-cert.pem" dot.test www.geo.test > "\$T/dot1.json" 2>&1
+grep -q '"c000020a"' "\$T/dot1.json" && echo "PASS: DoT .1 -> 192.0.2.10" || echo "FAIL: DoT .1: \$(cat \$T/dot1.json)"
+# DoT .3 需要源地址绑定
+python3 - <<'PY' > "\$T/dot3.json" 2>&1
+import socket,ssl,struct,sys
+sys.path.insert(0,'$ROOT/scripts')
+import dns_verify_client as c
+w=c.build_query('www.geo.test')
+s=socket.socket(); s.bind(('127.0.0.3',0)); s.settimeout(5); s.connect(('127.0.0.1',25555))
+ctx=ssl._create_unverified_context(); t=ctx.wrap_socket(s,server_hostname='dot.test')
+t.sendall(struct.pack('>H',len(w))+w)
+h=t.recv(2); n=struct.unpack('>H',h)[0]; d=b''
+while len(d)<n: d+=t.recv(n-len(d))
+t.close(); print(c.parse(d))
+PY
+grep -q 'c000020b' "\$T/dot3.json" && echo "PASS: DoT .3 -> 192.0.2.11" || echo "FAIL: DoT .3: \$(cat \$T/dot3.json)"
+EOS
+  chmod +x "$WORK/netns-geo.sh"
+  if ! unshare -Urn bash "$WORK/netns-geo.sh" > "$WORK/netns-geo.log" 2>&1; then
+    bad "geo netns e2e 运行失败（见 $WORK/netns-geo.log）"
+  elif grep -q '^FAIL' "$WORK/netns-geo.log"; then
+    bad "geo netns e2e（见 $WORK/netns-geo.log）"
+  else
+    ok "geo netns e2e（named l0/l1/default + DoT 源地址分流）"
+  fi
+  sed -n '1,20p' "$WORK/netns-geo.log" | sed 's/^/  /'
+}
+
 # ---------------------------------------------------------------- main
 preflight
 mkcerts
 stage_a || true
 stage_b || true
 stage_c || true
+stage_d_geo || true
 echo "=================================================================="
 echo "DNS real-machine verification: PASS=$PASS FAIL=$FAIL SKIP=$SKIP"
-echo "work dir: $WORK (removed on exit)"
+if [ "${DNSV_KEEP:-0}" = "1" ]; then echo "work dir kept: $WORK"; else echo "work dir: $WORK (removed on exit)"; fi
 [ "$FAIL" -eq 0 ]

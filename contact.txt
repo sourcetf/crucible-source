@@ -4542,3 +4542,108 @@ tsx 单测 8/8、php 单测 3/3）。最终二进制 md5 `aed8f21f1b402cc68f35d5
 `--port 33700` → **38 checks, 0 failed**。构建/安装/验证三项均已固化为脚本：
 `scripts/install_app_runtimes.sh`、`scripts/build_app_engines.sh`、
 `scripts/verify_app_engines.py`。
+
+---
+
+# 【agent-dnsbind2 / 工号 1009 · Wave-15】DNS 全链路真机跑通（BIND 9.20 + pebble ACME）（2026-10-23）
+
+**scope**：`src/server/dns/**`、`scripts/dns_*.sh`。未 commit/push/checkout/reset/stash/clean；
+实例已停（23653/23753/23743/25053/25753/27053/27095/22853/22855/22895 等已释放）。
+
+**一句话**：上一波 dnsbind 的代码在本机用真 BIND/pebble 全链路跑通；一条命令
+`sh scripts/dns_verify.sh --real` → **PASS=72 FAIL=0 SKIP=0（rc=0）**；全量单测
+**541 passed / 0 failed / 1 ignored**。
+真机暴露并修复 **7 条**（P1×4、P2×3）+ 2 条脚本/默认值问题，详见
+`.agents/1009/reports/dnsbind2-wave15.md` 与 `.agents/1009/fixes/dnsbind2-wave15.md`。
+
+**修的（都有真机前后对照）**
+1. **[P1] `DnsModes::default()` authoritative=false**：最小 `[dns] enabled=true` 配置不声明任何
+   用户 zone，dig 全 REFUSED（与注释「默认 true」相反）。手写 Default 与 serde 字段默认对齐。
+   真机修后 `status.modes.authoritative=true`、min.test SOA 可查。
+2. **[P1] DNSSEC 轮换永不触发**：`dnssec_key_list` 按 readdir 顺序合并 `.key/.state`，`.key` 的
+   `; Activate:` 覆盖 KASP `.state` 的 `Active:`；把 ZSK Active 拨旧后 50s 无任何轮换日志。
+   改为 `.private→.key→.state` 固定顺序、state 权威、KSK/ZSK 两标志联合判角色。
+   修后 30s 内 `generated new ZSK ...`。
+3. **[P1] 轮换无界生成**：旧 key 在 KASP retire 前每天再生成一把（真机 2→4 DNSKEY）。
+   新增「同 zone/角色已有更新 Active 的 key ⇒ 跳过」；修后 4→4（跳过），老化最新 key 只 +1，
+   清节流再等 35s 仍不增。
+4. **[P1] 运行时监听地址不生效**：`rndc reconfig` 不重开 listen socket，面板开 geo 线路后
+   named 仍只 bind 127.0.0.1，DoT/DoH 发往 127.0.0.2 即不可达；test_mode 还直接不 bind 分线路地址。
+   加 `listen_fingerprint`，变化时 `rndc stop` + 重新拉起；test_mode 也 bind 127.0.0.(2+i)。
+   netns 内验证 named 真 bind .2/.3，l0/l1/default 与 DoT 源地址分流全对。
+5. **[P2] 嵌套配置 Default 与 serde 默认相反**：dnssec alg=""、nsec3/cds=false、rootzone
+   url="" / enabled=false、doh.path=""、acme.renew_days=0、mmdb.sync_days=0。逐结构手写 Default。
+6. **[P2] named `-g` 忽略 logging 配置**：named.log 恒 0 字节；长期进程改 `-f`，修后
+   basic/dnssec/acme 的 named.log 16KB–89KB、stderr 0。
+7. **[P2] 记录名双后缀**：面板传 `hello.verify.test` 生成 `hello.verify.test.verify.test.`；
+   新增 `normalize_record_name`，修后原名字可查（旧 DB 行不迁移）。
+8. **[P2] `scripts/dns_verify.sh --real` 用 sh 跑 bash 脚本**（dash 语法错误）→ 改 bash/直接执行；
+   `dns_bind_verify.sh` 新增 Stage D（geo netns）、ECS 注入测试改为停 named + 伪上游占用
+   `[dns] port`、`DNSV_KEEP=1` 保留现场、端口预检覆盖派生端口。
+
+**真机证据（保留）**：`/home/dev123/scratch-dnsbind2/final-run.log`（PASS=72）、
+`/home/dev123/scratch-dnsbind2/evidence/`（t1 三模式/AXFR/IXFR/DoT/DoH、t2 DNSSEC+轮换、
+t4 最小配置默认值、nsec-ed25519、netns-geo、acme-run/fail-backoff、ecs-through-bind）、
+`/home/dev123/scratch-dnsbind2/work-final/`（named.conf/zone/log/keys/acme/pebble 现场）。
+
+**未闭（交主会话/后续，不是本轮静默放过）**
+- **ECS 到真实上游 FAIL**：BIND 9.20 不实现 ECS，递归/转发时丢弃该 option；伪上游只收到
+  COOKIE。DoT/DoH 注入 wire 与应答回显均正确，但要满足「递归传 ECS」需换 Unbound
+  `send-client-subnet` 或 Rust 侧递归。证据 `evidence/ecs-through-bind.txt`。
+- `rotation_days=0` 作为「立即轮换一次」未实现（0 被校验拒绝以防 BIND 拒载 lifetime 0d；
+  本轮用 key Active 老化等价触发轮换并验证双签/无中断 `n=498 bad=0`）。
+- 需求 6 的 master `also-notify` 未实现（slave `allow-notify` 已实现）；`ns1 A 127.0.0.1`
+  自动胶水记录；DoT 443 SNI 复用；ACME dns-01（当前 HTTP-01）；UI 记录类型仍含 SOA；
+  ACME 失败日志尾部是 HTML（面板错误可定位，exit code 7）。
+
+---
+
+# 【agent-verify7 / 工号 1009 · Wave-15】最终验收（2026-10-23 16:39–18:15）
+
+**scope**：`scripts/accept-*`、`.agents/1009/reports/verify7-wave15.md`、`.agents/1009/fixes/verify7-wave15.md`。
+**纪律**：未 commit/push/checkout/reset/stash/clean；未改 `src/`/`libs/`/`Cargo.*`；未碰其他 agent 的
+在途 WIP（DNS 文件 17:22–18:02 的改动原样保留）。所有测试实例/上游/假 named 已停。
+
+**认证快照**：`HEAD e79dfb4`（wave-14 收口提交，71 文件）。二进制
+`~/scratch-verify7/bin/webserver` md5 **`3892dec7701212baa3047f2d4f6096c9`**（20,458,000 B，
+`--features tls,tls_boring`，`lto=thin`）。引擎 `.so` 16:45 用当前树重建（JSP jar 7,792,763 B）。
+单测 **541 passed / 0 failed / 1 ignored**。
+
+**全量套件（迁到 ~/scratch-verify7 + 38000 端口块）**：
+**302 PASS / 0 FAIL / 0 SKIP** = PASS1 149/0/0 + EXT 113/0/0 + GOAWAY 7/0/0 + H3/DoT/DoH 24/0/0 +
+DNS ECS 6/0/0 + 3/0/0。对 verify6（293/0/10）公共检查名状态差异 **0**；10 个 SKIP 中 8 个引擎 +
+dns zone 转 PASS，另一条「named 未运行」检查在 named 可用时不再产生（故总项 302 vs 303）。
+
+**新能力（全真机）**：
+- **19 引擎 × h1+h2c = 38/38 200**，body 均为样例：JSP/do **真 Jetty 11.0.24**（`server: Jetty(11.0.24)`）、
+  ASP.NET **真 hostfxr**（`x-crucible-engine: aspnet-hostfxr`、`managed=.NET 10.0.13`）、
+  Go **c-shared FFI**（`hello from go app-engine ffi`、10 个 `appengine_*` 符号、无 `go-shm-server`）。
+- **遗留 TLS**：`test_tls_stacks.sh` **PASS=7 FAIL=0**（TLS1.3/1.2 + SSLv3 + v2compat 完整握手 +
+  SSLv2 完整握手 + 截断探针存活）；默认构建 **ldd 无 NSS/NSPR、strings 0 命中、legacy=none**，
+  同一脚本 PASS=4 FAIL=3（仅现代 TLS 通过，属隔离预期）。
+- **全局页面规则+country**：16/16。全局规则在 3 个 listener/6 个协议面全部生效；每站规则不外溢；
+  CN 命中 / US 不命中 / `!CN` / JP 源地址 / 无 GeoIP fail-closed 全对。
+- **Admin 会话**：20/20（明文不发 cookie、TLS `__Host-…Secure;HttpOnly;SameSite=Strict`、仅 cookie
+  鉴权、Basic 兼容、伪造/无凭据 401、跨站+Sec-Fetch-Site 403、登出失效、进程重启失效、TTL 8h）。
+- **日志**：10/10。与 wave-12 旧二进制 **11/11 行逐字节一致**（只归一 ts/dur）；五协议行一致；
+  **16×500=8000 行、0 逆序、每线程 500 行**。
+
+**性能（wrk/h2load 已装；细节见报告 §4）**：
+- 规格 h1 门禁 **按 wrk 口径未过**：c64 吞吐 1.382 / 延迟 1.523；c128 1.285 / 1.399（>1.2）。
+  **同窗口 wave-12 旧二进制对照 1.353 / 1.218** ⇒ 不是本波回归；同窗口 gobench 口径 **PASS**
+  （1.116 / 1.140）。请主会话裁定门禁客户端口径。
+- h2load h2c：c64 m1 ours 51.2k vs h2o 92.1k；c64 m10 78.7k vs 368.8k（wave-12 同形状，非本波）。
+- 引擎 RPS 门槛 **PASS**：rust 22.6k（≥11k）、c 22.4k、go 21.6k（≥9k）；rust 延迟/static **2.30
+  （<1.1 未过）**，wave-12 对照 2.657（既有）。
+
+**部署**：远程 OpenBSD 只读复核仍 `HEAD c8ca3ff`、`bin/webserver` md5 `3df1480d…`（2026-10-17），
+**`e79dfb4` 未部署**；远程 ruby/jsp/do/rack 502 的已知状态不变（无用户级运行时）。
+
+**未闭项**：wrk 门禁 / h2 多路复用 / rust 延迟、远程部署、远程 502、Ruby 嵌入默认关、
+TomCrypt SSLv2 非完整线协议、遗留栈 4 线程/无握手 deadline、CONNECT-UDP/ACME 未验、
+h1_fast 2s 缓存、child_registry ps 语义、在途 DNS WIP 未认证。逐条 owner/复现见
+`.agents/1009/reports/verify7-wave15.md` §5。
+
+**资产**：`~/scratch-verify7/{bin,target,target-legacy,target-fat,logs,conf,perf}` + `matrix.py` /
+`page_rules_test.py` / `admin_session_test.py` / `logcheck.py` / `perf_final.py`；
+`scripts/accept-*` 端口/scratch 迁移 + start.sh 增加 runtime_env 继承。

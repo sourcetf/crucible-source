@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """accept-verify-genconf.py — 从仓库 config-test.toml 生成隔离的验收配置。
 
-- 端口整体平移到 36000+ 块（不碰 19095/18443/55555 等别人可能占用的口，
+- 端口整体平移到 38000+ 块（不碰 19095/18443/55555 等别人可能占用的口，
   也避开 24000/26000/28000/29000 等其它 agent/历史轮的端口块）
-- DNS 端口显式化（36553/36153/36853），避免与别的 agent 的 5353/1953 撞
+- DNS 端口显式化（38553/38153/38853），避免与别的 agent 的 5353/1953 撞
 - root / docroot / lib / ssl 材料 改为绝对路径：这些字段在 `Config::resolve_paths`
   里按**配置文件所在目录**解析，而我们希望配置放在自己的 scratch 目录。
 - geoip db_path / dns.dot / app.socket 保持相对（按进程 cwd=仓库根 解析）。
@@ -17,16 +17,16 @@ import re, sys, os
 
 REPO = "/home/dev123/crucible-git"
 SRC = os.path.join(REPO, "config-test.toml")
-# 工号 1009 / agent-verify5（wave-9）：端口块 36000+，状态根 scratch-verify6
+# 工号 1009 / agent-verify5（wave-9）：端口块 38000+，状态根 scratch-verify7
 # —— 按本波任务书要求避开 24000/26000/28000/29000 段（历史 verify 轮的 29xxx 与
 # 其它 agent 的 20xxx/21xxx/24xxx 均不冲突）。
-OUT = sys.argv[1] if len(sys.argv) > 1 else "/home/dev123/scratch-verify6/conf/config-verify.toml"
-SCRATCH = "/home/dev123/scratch-verify6"
+OUT = sys.argv[1] if len(sys.argv) > 1 else "/home/dev123/scratch-verify7/conf/config-verify.toml"
+SCRATCH = "/home/dev123/scratch-verify7"
 
 PORTMAP = {
-    "19095": "36095", "19081": "36081", "19445": "36445", "19446": "36446",
-    "18443": "36443", "18444": "36444", "55556": "36556", "55555": "36555",
-    "11853": "36853",
+    "19095": "38095", "19081": "38081", "19445": "38445", "19446": "38446",
+    "18443": "38443", "18444": "38444", "55556": "38556", "55555": "38555",
+    "11853": "38853",
 }
 
 src = open(SRC).read()
@@ -34,7 +34,7 @@ for k, v in PORTMAP.items():
     src = re.sub(r"(?<![0-9])" + k + r"(?![0-9])", v, src)
 
 # 显式 DNS 端口
-src = src.replace("test_mode = true", "test_mode = true\nport = 36553\nrndc_port = 36153", 1)
+src = src.replace("test_mode = true", "test_mode = true\nport = 38553\nrndc_port = 38153", 1)
 
 # 需要绝对化的路径键（值形如 "xxx"，非绝对路径才加前缀）
 ABS_KEYS = ("root", "docroot", "lib", "cert", "cert_ec", "key", "key_ec", "ech_keys")
@@ -54,31 +54,31 @@ ADV = f"""
 # proxy + page_rules + 响应/请求头改写
 [[listeners]]
 address = "127.0.0.1"
-port = 36090
+port = 38090
 root = "{SCRATCH}/www-adv"
 http_versions = ["h1", "h2"]
 server_name = "adv.crucible.local"
 
 [[listeners.proxy_rules]]
 path = "/proxy"
-upstream = "http://127.0.0.1:36099"
+upstream = "http://127.0.0.1:38099"
 modify_request_headers = {{ X-Added-Req = "req-yes" }}
 modify_response_headers = {{ X-Added-Resp = "resp-yes" }}
 
 [[listeners.proxy_rules]]
 path = "/ws"
-upstream = "http://127.0.0.1:36099"
+upstream = "http://127.0.0.1:38099"
 
 # WS 到 TLS h2 上游（上游 ALPN 广告 h2,http/1.1）——验证 force_h1（回源强制 h1）
 [[listeners.proxy_rules]]
 path = "/wss"
-upstream = "https://127.0.0.1:36100"
+upstream = "https://127.0.0.1:38100"
 ssl_mode = "no_verify"
 
 # 代理到「无人在听」的上游 —— 验证错误映射不泄露内部路径
 [[listeners.proxy_rules]]
 path = "/dead"
-upstream = "http://127.0.0.1:36199"
+upstream = "http://127.0.0.1:38199"
 
 [[listeners.page_rules]]
 match_url = "/old/*"
@@ -100,7 +100,7 @@ match_url = "/blocked*"
 action = "block"
 
 # §16.11 页面规则**匹配维度**（wave-6 独立复核：host/method/header）。
-# 同一条规则必须在 h1/h2c（本 listener）与 h2(TLS)/h3（36098 listener）上判定一致；
+# 同一条规则必须在 h1/h2c（本 listener）与 h2(TLS)/h3（38098 listener）上判定一致；
 # 判据见 page_rules.rs::rule_matches —— 维度缺失＝不匹配（绝不放宽成 path-only）。
 [[listeners.page_rules]]
 match_url = "/dimmeth*"
@@ -158,7 +158,7 @@ target = "308:/second"
 # 上传 + autoindex + 目录 301（root 含子目录；php app 用于 webshell 上传拦截探测）
 [[listeners]]
 address = "127.0.0.1"
-port = 36094
+port = 38094
 root = "{SCRATCH}/www-up"
 http_versions = ["h1", "h2"]
 server_name = "up.crucible.local"
@@ -273,13 +273,13 @@ index = "index.cgi"
 docroot = "{SCRATCH}/abi-www/bad"
 lib = "{SCRATCH}/bin/libapp_fake_abi_bad.so"
 
-# ── 第二上传口（wave-9 / wave-8 配额复核）：与 36094 同进程、不同 listener ──
-# 用途：per-IP 会话配额是**跨端口按来源 IP** 计的。ext 用「36094 八个 + 36083 八个
+# ── 第二上传口（wave-9 / wave-8 配额复核）：与 38094 同进程、不同 listener ──
+# 用途：per-IP 会话配额是**跨端口按来源 IP** 计的。ext 用「38094 八个 + 38083 八个
 # 在途」构造 16 在途，使第 17 个在**两个端口的 upload_threads 闸门都未满**的前提下
 # 撞到 MAX_SESSIONS_PER_IP=16 → 503 + Retry-After: 5（精确指向会话配额，而非端口闸门）。
 [[listeners]]
 address = "127.0.0.1"
-port = 36083
+port = 38083
 root = "{SCRATCH}/www-up2"
 http_versions = ["h1", "h2"]
 server_name = "up2.crucible.local"
@@ -293,7 +293,7 @@ upload_threads = 16
 # 限流：5 req/s，burst 5
 [[listeners]]
 address = "127.0.0.1"
-port = 36091
+port = 38091
 root = "{SCRATCH}/www-rate"
 http_versions = ["h1"]
 
@@ -315,7 +315,7 @@ target = "301:https://example.com/rd"
 # 站点级 basic auth（口令 admin，复用 config-test 的 argon2id 哈希）
 [[listeners]]
 address = "127.0.0.1"
-port = 36092
+port = 38092
 root = "{SCRATCH}/www-auth"
 http_versions = ["h1"]
 
@@ -327,7 +327,7 @@ password_hash = "$argon2id$v=19$m=19456,t=2,p=1$E/RLobwgix2BWMRMT++urA$yEympjJti
 # ip_access（明文）：只允许 10.0.0.0/8（本机 127.0.0.1 应被拒）——per-listener 档位
 [[listeners]]
 address = "127.0.0.1"
-port = 36093
+port = 38093
 root = "{SCRATCH}/www-ip"
 http_versions = ["h1"]
 
@@ -340,7 +340,7 @@ deny = []
 # （root 必须与其他 listener 不同：config 校验拒绝「同 root 多 listener」。）
 [[listeners]]
 address = "127.0.0.1"
-port = 36087
+port = 38087
 root = "{SCRATCH}/www-alog"
 http_versions = ["h1"]
 
@@ -353,7 +353,7 @@ enable = false
 # 出现在 webserver.log（由 ext 套件断言）。root 必须与其它 listener 不同。
 [[listeners]]
 address = "127.0.0.1"
-port = 36088
+port = 38088
 root = "{SCRATCH}/www-alog3"
 http_versions = ["h1"]
 
@@ -363,7 +363,7 @@ level = "debug"
 # —— 用来回归 per-listener 档位在 TLS 面是否已接线。
 [[listeners]]
 address = "127.0.0.1"
-port = 36096
+port = 38096
 root = "{SCRATCH}/www-tlsip"
 http_versions = ["h1", "h2"]
 server_name = "tlsip.crucible.local"
@@ -380,7 +380,7 @@ deny = []
 # ip_access（h3 面）：h1+h2+h3 + TLS，per-listener ip_access 只允许 10/8。
 [[listeners]]
 address = "127.0.0.1"
-port = 36097
+port = 38097
 root = "{SCRATCH}/www-h3ip"
 http_versions = ["h1", "h2", "h3"]
 server_name = "h3ip.crucible.local"
@@ -398,7 +398,7 @@ deny = []
 # 另承载：页面规则维度（h1/h2TLS/h3 三面同判）与 h3 GOAWAY 在飞请求（/slow 慢上游）。
 [[listeners]]
 address = "127.0.0.1"
-port = 36098
+port = 38098
 root = "{SCRATCH}/www-h3dir"
 http_versions = ["h1", "h2", "h3"]
 server_name = "h3dir.crucible.local"
@@ -410,7 +410,7 @@ versions = ["TLSv1.2", "TLSv1.3"]
 
 [[listeners.proxy_rules]]
 path = "/slow"
-upstream = "http://127.0.0.1:36099"
+upstream = "http://127.0.0.1:38099"
 
 [[listeners.page_rules]]
 match_url = "/dimmeth*"

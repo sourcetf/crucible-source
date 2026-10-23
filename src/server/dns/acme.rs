@@ -19,7 +19,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 /// ACME 配置（[dns.acme]）。
-#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct AcmeCfg {
     #[serde(default)]
     pub enabled: bool,
@@ -54,6 +54,24 @@ pub struct AcmeCfg {
 
 fn default_renew_days() -> u64 {
     60
+}
+
+// 整节缺失时 serde 走 `Default::default()`，必须与字段级默认一致：
+// derive 的 Default 给 renew_days=0（status 面板显示 0，语义上等于「每次检查都续期」），
+// 与文档默认 60 天相反。
+impl Default for AcmeCfg {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            domain: String::new(),
+            email: String::new(),
+            webroot: None,
+            renew_days: default_renew_days(),
+            server: None,
+            insecure: false,
+            http_port: 0,
+        }
+    }
 }
 
 pub fn acme_root() -> PathBuf {

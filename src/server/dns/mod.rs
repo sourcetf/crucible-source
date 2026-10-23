@@ -205,7 +205,7 @@ fn orphan_https_names(auto_https: &[(String, String)], zones: &[ZoneRow]) -> Vec
         .collect()
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DnsModes {
     /// 根服务器模式：服务 root zone（权威 "."）
     #[serde(default)]
@@ -222,7 +222,20 @@ pub struct DnsModes {
     pub authoritative: bool,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+/// 必须与上面各字段的 `#[serde(default = ...)]` 一致。
+///
+/// 为什么不能 derive：`#[serde(default)] pub modes: DnsModes` 在**整节缺失**时调用
+/// `Default::default()`（而不是逐字段跑 serde 默认）。derive 的 Default 全是 `false`，
+/// 于是最小配置 `[dns] enabled=true`（不写 `[dns.modes]`）得到 `authoritative=false`
+/// —— named 能起来、面板显示 ok，但**不声明任何用户 zone**，所有查询 REFUSED。
+/// 真机实测：加区成功、`dig` 返回 REFUSED，与文档写的「默认权威开」相反。
+impl Default for DnsModes {
+    fn default() -> Self {
+        Self { root: false, recursive: false, authoritative: default_true() }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DnssecCfg {
     #[serde(default)]
     pub enabled: bool,
@@ -253,6 +266,27 @@ pub struct DnssecCfg {
     pub cds: bool,
 }
 
+// 同样必须与字段级 serde 默认一致（整节缺失走这里）。
+// 真机实测：不写 `[dns.dnssec]` 时 `status.dnssec` 是 `algorithm="" / nsec3=false /
+// cds=false / rotation_days=0`，与文档默认（ECDSA P-256、NSEC3 开、CDS 开、30 天）
+// 相反；面板若把这份状态原样保存，就会写出一个 named 拒载的 `algorithm ""` 策略。
+impl Default for DnssecCfg {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            algorithm: default_dnssec_alg(),
+            rotation_enabled: false,
+            rotation_days: default_rotation_days(),
+            ksk_lifetime_days: None,
+            keys: Vec::new(),
+            nsec3: default_true(),
+            nsec3_iterations: 0,
+            nsec3_optout: false,
+            cds: default_true(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DnsKeyCfg {
     /// ksk | zsk | csk
@@ -270,7 +304,7 @@ pub struct RpzRule {
     pub value: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GeoCfg {
     #[serde(default)]
     pub enabled: bool,
@@ -282,7 +316,13 @@ pub struct GeoCfg {
     pub mmdb: GeoMmdbCfg,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+impl Default for GeoCfg {
+    fn default() -> Self {
+        Self { enabled: false, lines: Vec::new(), mmdb: GeoMmdbCfg::default() }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GeoMmdbCfg {
     /// libmaxminddb 解析 MMDB；空 path 且 license_key 非空 → 自动下载 GeoLite2-City + GeoLite2-ASN
     #[serde(default)]
@@ -308,6 +348,22 @@ pub struct GeoMmdbCfg {
 
 pub fn default_geo_sync_days() -> u64 {
     7
+}
+
+// 与字段级 serde 默认一致：整节缺失时 `sync_days` 必须是 7（derive 会给 0 =
+// 永不自动同步），否则「配了 license_key 却从不下载」在面板上完全看不出原因。
+impl Default for GeoMmdbCfg {
+    fn default() -> Self {
+        Self {
+            db_path_city: String::new(),
+            db_path_asn: String::new(),
+            license_key: String::new(),
+            sync_days: default_geo_sync_days(),
+            asn_to_line: Vec::new(),
+            country_to_line: Vec::new(),
+            isp_contains: Vec::new(),
+        }
+    }
 }
 
 impl GeoMmdbCfg {
@@ -372,7 +428,7 @@ pub struct DotCfg {
     pub max_conns: usize,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DohCfg {
     #[serde(default)]
     pub enabled: bool,
@@ -383,7 +439,15 @@ pub struct DohCfg {
     pub hostnames: Vec<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+impl Default for DohCfg {
+    fn default() -> Self {
+        // 整节缺失时必须仍是 `/dns-query`：空串会让 `doh_path_ok` 直接 fail-closed，
+        // 面板显示 DoH 已启用、实际 404（derive 的 Default 就是空串）。
+        Self { enabled: false, path: default_doh_path(), hostnames: Vec::new() }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RootZoneCfg {
     /// 刷新频率小时数，默认 24（需求 2 默认 daily）
     #[serde(default = "default_root_refresh_hours")]
@@ -397,6 +461,21 @@ pub struct RootZoneCfg {
     /// 默认 true：需求 2 要求「默认 daily」自动增量更新。
     #[serde(default = "default_true")]
     pub enabled: bool,
+}
+
+/// 与字段级 serde 默认一致。真机实测（最小配置 `[dns] enabled=true`）：
+/// derive 的 Default 给出 `url="" / refresh_hours=0 / enabled=false`，于是
+/// 「root 模式默认每天从 internic 增量更新」（需求 2）实际**永不发生**，
+/// 且面板 status 把空 URL 原样显示给运维。整节缺失时必须回落文档默认值。
+impl Default for RootZoneCfg {
+    fn default() -> Self {
+        Self {
+            refresh_hours: default_root_refresh_hours(),
+            url: default_root_url(),
+            axfr_servers: Vec::new(),
+            enabled: default_true(),
+        }
+    }
 }
 
 fn default_listen_addr() -> String {
@@ -1336,6 +1415,29 @@ fn check_zone_snippet(zone: &str, recs: &[RecordRow]) -> Result<()> {
     }
 }
 
+/// 记录名归一成「分区内相对名」：`@` / 空 / 顶点 → `@`；带分区后缀的绝对名去掉后缀。
+///
+/// 为什么必须有：zone 文件用 `$ORIGIN <zone>.`，记录名是**相对名**原样拼进去。
+/// 面板/API 若传 `www.example.com`（很自然，用户复制 dig 的名字），旧实现会生成
+/// `www.example.com.example.com.` —— 面板显示成功、`dig www.example.com` 查不到，
+/// 只有查那个双后缀名才有结果（真机实测）。导入路径 `parse_zone_text` 早就做了
+/// 同样的归一（见 admin_api.rs），手动添加路径漏了；两条入口现在同一判据。
+fn normalize_record_name(name: &str, zone: &str) -> String {
+    let n = name.trim().trim_end_matches('.');
+    let z = zone.trim().trim_end_matches('.').to_ascii_lowercase();
+    let nl = n.to_ascii_lowercase();
+    if nl.is_empty() || nl == "@" || (!z.is_empty() && nl == z) {
+        return "@".into();
+    }
+    if !z.is_empty() {
+        let suffix = format!(".{z}");
+        if nl.len() > suffix.len() && nl.ends_with(&suffix) {
+            return n[..n.len() - z.len() - 1].to_string();
+        }
+    }
+    n.to_string()
+}
+
 fn add_record_impl(
     zone: &str,
     line: &str,
@@ -1348,6 +1450,8 @@ fn add_record_impl(
     if !valid_name(zone) {
         bail!("bad zone name {zone:?}");
     }
+    let name_owned = normalize_record_name(name, zone);
+    let name = name_owned.as_str();
     if !valid_name(name) {
         bail!("bad record name {name:?}");
     }
@@ -1379,7 +1483,7 @@ fn add_record_impl(
     // CNAME 共存（RFC1034 §3.6.2）：顶点 CNAME 与自动 SOA/NS 冲突，同名既有 CNAME
     // 又加其它类型（或反之）同样让 named 以 "CNAME and other data" 拒载整个分区。
     let conn = store()?;
-    if rtype_u == "CNAME" && (name == "@" || name.is_empty()) {
+    if rtype_u == "CNAME" && name == "@" {
         bail!("顶点（@）不能是 CNAME：与模块自动生成的 SOA/NS 冲突，named 会拒载整个分区");
     }
     {
@@ -1780,8 +1884,17 @@ pub fn kasp_strict() -> bool {
 /// 127.0.0.2..N 同理显式列出（需要 lo0 alias 才会真的建出 socket）。
 fn listen_lists(addr: &str, test_mode: bool, geo_lines: usize) -> (String, String) {
     if test_mode {
-        // 测试模式固定 loopback（见 DnsConfig::test_mode 注释）
-        return ("127.0.0.1;".to_string(), "none;".to_string());
+        // 测试模式固定 loopback（见 DnsConfig::test_mode 注释），但**必须同时带上
+        // 分线路的 127.0.0.(2+i)**：`resolve_fwd_dest` 会把命中线路的 DoT/DoH 查询
+        // 发往 127.0.0.(2+i)，若 named 没在这些地址上 listen，UDP 会立刻 ICMP
+        // port-unreachable（真机表现：DoT 连接被关、`short DoT length prefix`；
+        // DoH 502，而面板一切正常）。生产模式（test_mode=false）本来就会 bind 它们；
+        // 测试模式此前只 bind 127.0.0.1，于是「开 geo 的测试实例」整个 DoT/DoH 失效。
+        let mut v4 = String::from("127.0.0.1;");
+        for i in 0..geo_lines.min(MAX_GEO_LINES) {
+            v4.push_str(&format!(" 127.0.0.{};", 2 + i));
+        }
+        return (v4, "none;".to_string());
     }
     let a = addr.trim();
     let (v4, v6): (String, String) = match a {
@@ -3138,6 +3251,26 @@ fn rndc(cfg: &DnsConfig, args: &[&str]) -> Result<String> {
 /// 单次 reconcile 只阻塞几秒，且本函数不会被自己递归调用。
 static RECONCILE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+/// `listen-on` / `controls` 的指纹（变化必须**重启** named，`rndc reconfig` 不重开 socket）。
+///
+/// BIND 的 `rndc reconfig` 只重读 zone/view/ACL 等配置，**不会**为 `listen-on` /
+/// `listen-on-v6` / `controls` 新增或删除监听 socket（BIND ARM 明确要求这些改动重启）。
+/// 真机复现：测试模式开一条 geo 线路后，named.conf 已写成
+/// `listen-on { 127.0.0.1; 127.0.0.2; };`，`ss` 里仍只有 127.0.0.1:23653，DoT/DoH 转发到
+/// 127.0.0.2 立刻 ICMP 不可达 —— 面板显示 geo 线路已启用，实际整条线路失效。
+/// 因此把会影响监听 socket 的字段做成指纹，变了就 `rndc stop` 再拉起。
+/// （hostname/zone/ACL/RPZ 等仍走 reconfig，不重启。）
+fn listen_fingerprint(cfg: &DnsConfig) -> String {
+    format!(
+        "{}|{}|{}|{}|{}",
+        cfg.listen_addr.trim(),
+        cfg.port_or_default(),
+        cfg.rndc_port_or_default(),
+        cfg.test_mode,
+        cfg.geo.lines.len().min(MAX_GEO_LINES)
+    )
+}
+
 /// reconcile：落盘 → 校验（探活法，named 已在跑则跳过）→ 确保进程 → reload。
 pub fn reconcile(cfg: &DnsConfig) -> Result<()> {
     if !cfg.enabled {
@@ -3152,7 +3285,28 @@ pub fn reconcile(cfg: &DnsConfig) -> Result<()> {
             log::warn!("dns: geoip auto-sync failed: {e:#}");
         }
     }
-    let alive = named_alive(cfg);
+    let fp = listen_fingerprint(cfg);
+    let prev_fp = meta_get("listen_fp").ok().flatten();
+    let mut alive = named_alive(cfg);
+    let mut listen_restart_pending = false;
+    if alive && prev_fp.as_deref().is_some_and(|p| p != fp) {
+        // 监听地址/端口变了：reconfig 不会 rebind，必须重启。
+        log::info!(
+            "dns: listen config changed ({} → {}) → restarting named（reconfig 不重开 socket）",
+            prev_fp.as_deref().unwrap_or("?"),
+            fp
+        );
+        let _ = rndc(cfg, &["stop"]);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while std::time::Instant::now() < deadline && named_alive(cfg) {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        alive = named_alive(cfg);
+        if alive {
+            listen_restart_pending = true;
+            log::warn!("dns: named 未在 5s 内停止 —— 监听地址变更可能未生效（看门狗会再试）");
+        }
+    }
     if !alive {
         // 探活校验只在 named 未运行时做（避免探针端口冲突假阴性）；
         // 失败自动降级重试一次（去掉 9.20 未确证语句，见 validate 的 strict 参数）
@@ -3178,13 +3332,17 @@ pub fn reconcile(cfg: &DnsConfig) -> Result<()> {
                     .status();
             }
         }
-        // named daemonize fork (OpenBSD) fails writing pidfile → use -g foreground
+        // named daemonize fork (OpenBSD) fails writing pidfile → run in foreground
         // + detached stdio so named survives parent (webserver) exit (需求 12).
-        // named 必须用 -g 前台跑（OpenBSD 上 daemonize 写 pidfile 会失败），
-        // 但 BIND 的 -g 会**强制所有日志走 stderr、忽略 logging 配置里的 file channel**。
-        // 再把 stderr 丢给 /dev/null，就等于**整台 DNS 服务没有任何日志** ——
-        // 「从区没加载」「zone 不重载」这类问题完全无从排查（实测踩过：named.log
-        // 自 9/9 起再没被写过）。改为追加写到 state/dns/log/named.stderr.log。
+        //
+        // 必须用 **`-f`** 而不是 `-g`：两者都不 daemonize，但 `-g` 会强制所有日志走
+        // stderr 并**忽略 logging 配置里的 file channel**（真机 named 日志原文：
+        // "not using config file logging statement for logging due to -g option"）——
+        // 于是 named.conf 里精心配置的 `log/named.log` 恒为 0 字节，「从区没加载」
+        // 「zone 不重载」这类问题只能去翻一个和配置无关的 stderr 副本。
+        // `-f` 前台运行且遵循 logging 配置（实测 named.log 立即有
+        // "command channel listening ..." 等行）；stderr 仍然重定向到
+        // named.stderr.log，保留「logging 配置生效前的早期错误」。
         let derr = state_root().join("log").join("named.stderr.log");
         if let Some(d) = derr.parent() {
             let _ = std::fs::create_dir_all(d);
@@ -3194,7 +3352,7 @@ pub fn reconcile(cfg: &DnsConfig) -> Result<()> {
         apply_named_user(&mut cmd);
         cmd.arg("-c")
             .arg(&conf)
-            .arg("-g")
+            .arg("-f")
             .stdin(std::process::Stdio::null());
         match logf {
             Some(f) => {
@@ -3238,11 +3396,19 @@ pub fn reconcile(cfg: &DnsConfig) -> Result<()> {
         }
     }
     // reconfig + reload 缺一不可（BIND 语义）：
-    // - reconfig：应用 listen-on / view / 新增删除 zone（reload 不读这些）
+    // - reconfig：应用 view / 新增删除 zone / ACL（reload 不读这些）
     // - reload：重读已存在 zone 的新 serial 内容（reconfig 不重读文件内容）
+    // 注意 listen-on/controls 的变更走上面的「指纹变化 → 重启」路径，
+    // `rndc reconfig` 本身不会重开监听 socket。
     let rc = rndc(cfg, &["reconfig"]);
     let rl = rndc(cfg, &["reload"]);
     rc.and(rl)?;
+    // 只有真正成功后才记住指纹：重启/拉起失败时下次还应该按「需要重启」处理。
+    if listen_restart_pending {
+        log::warn!("dns: 监听配置已变更但 named 未重启成功，保留旧指纹以便下一轮重试");
+    } else if let Err(e) = meta_set("listen_fp", &fp) {
+        log::warn!("dns: 记录 listen 指纹失败: {e:#}");
+    }
     Ok(())
 }
 
@@ -3620,94 +3786,128 @@ pub fn dnssec_key_list() -> Vec<DnssecKeyInfo> {
     let kp = state_root().join("keys");
     let mut map: std::collections::BTreeMap<String, DnssecKeyInfo> = std::collections::BTreeMap::new();
     if !kp.is_dir() { return Vec::new(); }
+    // **处理顺序必须固定**：同一把 key 的 `.key` / `.private` / `.state` 三个文件
+    // 共享一个 map 条目，后面的会覆盖前面的字段。`read_dir` 的返回顺序由文件系统
+    // 决定（与文件创建顺序有关，不可依赖）。真机实测：
+    //   - `.key` 里的 `; Activate:` 注释覆盖了 `.state` 里被改旧的 `Active:`；
+    //     于是 `dnssec_check_and_rotate` 看到「key 还很新」，**轮换永不触发**
+    //     （把 KASP 的 Active 改成 2026-08-01 后等 50s 仍无 generated new ZSK）；
+    //   - `.key` 已把 role 设成 ZSK，`.state` 的 `ZSK: yes` 又走 else 分支把它
+    //     改成了 CSK。
+    // KASP 的 `.state` 是权威状态（BIND 自己维护的 key timing），必须在最后处理；
+    // `.key` 提供 flags/algorithm/DNSKEY 行，`.private` 只是占位。
+    let mut files: Vec<(u8, String)> = Vec::new();
     if let Ok(entries) = std::fs::read_dir(&kp) {
         for e in entries.flatten() {
             let fname = e.file_name().to_string_lossy().to_string();
             if !dnssec_is_keyfile(&fname) { continue; }
-            let is_state = fname.ends_with(".state");
-            let stem = if is_state {
-                fname.strip_suffix(".state").unwrap_or(&fname)
-            } else if fname.ends_with(".private") {
-                fname.strip_suffix(".private").unwrap_or(&fname)
+            let rank = if fname.ends_with(".state") {
+                2
+            } else if fname.ends_with(".key") {
+                1
             } else {
-                fname.strip_suffix(".key").unwrap_or(&fname)
+                0 // .private
             };
-            let content = std::fs::read_to_string(kp.join(&fname)).unwrap_or_default();
-            let mut info = map.entry(stem.to_string()).or_insert_with(|| DnssecKeyInfo {
-                filename: format!("{}.key", stem),
-                zone: String::new(),
-                role: String::new(),
-                algorithm: String::new(),
-                tag: String::new(),
-                flags: 0,
-                keytype: String::new(),
-                created: String::new(),
-                published: String::new(),
-                active: String::new(),
-                retired: String::new(),
-                removed: String::new(),
-                state_file: format!("{}.state", stem),
-                dnskeystate: String::new(),
-                goalstate: String::new(),
-            });
-            if is_state {
-                for line in content.lines() {
-                    if let Some(v) = parse_state_value(line, "KSK") {
-                        if v == "yes" { info.role = "KSK".into(); }
-                    }
-                    if let Some(v) = parse_state_value(line, "ZSK") {
-                        if v == "yes" {
-                            if info.role.is_empty() { info.role = "ZSK".into(); }
-                            else { info.role = "CSK".into(); }
-                        }
-                    }
-                    if let Some(v) = parse_state_value(line, "Generated") { info.created = v; }
-                    if let Some(v) = parse_state_value(line, "Published") { info.published = v; }
-                    if let Some(v) = parse_state_value(line, "Active") { info.active = v; }
-                    if let Some(v) = parse_state_value(line, "Retired") { info.retired = v; }
-                    if let Some(v) = parse_state_value(line, "Removed") { info.removed = v; }
-                    if let Some(v) = parse_state_value(line, "DNSKEYState") { info.dnskeystate = v; }
-                    if let Some(v) = parse_state_value(line, "GoalState") { info.goalstate = v; }
+            files.push((rank, fname));
+        }
+    }
+    files.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+    for (_rank, fname) in files {
+        let is_state = fname.ends_with(".state");
+        let stem = if is_state {
+            fname.strip_suffix(".state").unwrap_or(&fname)
+        } else if fname.ends_with(".private") {
+            fname.strip_suffix(".private").unwrap_or(&fname)
+        } else {
+            fname.strip_suffix(".key").unwrap_or(&fname)
+        };
+        let content = std::fs::read_to_string(kp.join(&fname)).unwrap_or_default();
+        let mut info = map.entry(stem.to_string()).or_insert_with(|| DnssecKeyInfo {
+            filename: format!("{}.key", stem),
+            zone: String::new(),
+            role: String::new(),
+            algorithm: String::new(),
+            tag: String::new(),
+            flags: 0,
+            keytype: String::new(),
+            created: String::new(),
+            published: String::new(),
+            active: String::new(),
+            retired: String::new(),
+            removed: String::new(),
+            state_file: format!("{}.state", stem),
+            dnskeystate: String::new(),
+            goalstate: String::new(),
+        });
+        // 从文件名解析 zone/tag/算法号：三个文件都能给出，且比内容解析稳定。
+        if let Some((zone, tag, alg)) = dnssec_parse_key_filename(&info.filename) {
+            info.zone = zone;
+            info.tag = tag;
+            info.keytype = alg;
+        }
+        if is_state {
+            // KASP 状态是权威：KSK/ZSK 两个标志一起决定角色（都 yes = CSK），
+            // 不能因为 `.key` 已经填过 role 就把普通 ZSK 误判成 CSK。
+            let mut ksk = false;
+            let mut zsk = false;
+            for line in content.lines() {
+                if let Some(v) = parse_state_value(line, "KSK") {
+                    ksk = v.trim() == "yes";
                 }
-            } else {
-                for line in content.lines() {
-                    if line.contains("key-signing key") {
-                        info.role = "KSK".into();
-                    } else if line.contains("zone-signing key") && info.role.is_empty() {
-                        info.role = "ZSK".into();
-                    }
-                    if let Some(v) = parse_key_comment(line, "Created") { info.created = v; }
-                    if let Some(v) = parse_key_comment(line, "Publish") { info.published = v; }
-                    if let Some(v) = parse_key_comment(line, "Activate") { info.active = v; }
-                    if let Some(v) = parse_key_comment(line, "Inactive") { info.retired = v; }
-                    if let Some(v) = parse_key_comment(line, "Delete") { info.removed = v; }
+                if let Some(v) = parse_state_value(line, "ZSK") {
+                    zsk = v.trim() == "yes";
                 }
-                for line in content.lines() {
-                    if line.contains(" IN DNSKEY ") {
-                        let parts: Vec<&str> = line.split_whitespace().collect();
-                        // 按 token 定位，不写死下标：`.key` 里的 DNSKEY 行可能是
-                        // `name. TTL IN DNSKEY flags proto alg key`（keygen 传了 -L 就是
-                        // 这种），也可能没有 TTL 段。写死 parts[2]/parts[4] 在两种形态下
-                        // 分别取到 "IN"/"DNSKEY" 或 flags/proto，于是面板里 flags 恒为 0、
-                        // algorithm 变成数字（flags）。
-                        if let Some(i) = parts
-                            .iter()
-                            .position(|p| p.eq_ignore_ascii_case("DNSKEY"))
-                        {
-                            if let Some(f) = parts.get(i + 1).and_then(|x| x.parse::<u16>().ok()) {
-                                info.flags = f;
-                            }
-                            if let Some(a) = parts.get(i + 3) {
-                                info.algorithm = a.to_string();
-                            }
+            }
+            match (ksk, zsk) {
+                (true, true) => info.role = "CSK".into(),
+                (true, false) => info.role = "KSK".into(),
+                (false, true) => info.role = "ZSK".into(),
+                (false, false) => {} // .state 没写标志时保留 .key 的判断
+            }
+            for line in content.lines() {
+                // 时间戳以 .state 为准：BIND 的 inline-signing / KASP 会把 Activated、
+                // Retired、Removed 往前推，而 `.key` 里的注释是创建时的静态值。
+                if let Some(v) = parse_state_value(line, "Generated") { info.created = v; }
+                if let Some(v) = parse_state_value(line, "Published") { info.published = v; }
+                if let Some(v) = parse_state_value(line, "Active") { info.active = v; }
+                if let Some(v) = parse_state_value(line, "Retired") { info.retired = v; }
+                if let Some(v) = parse_state_value(line, "Removed") { info.removed = v; }
+                if let Some(v) = parse_state_value(line, "DNSKEYState") { info.dnskeystate = v; }
+                if let Some(v) = parse_state_value(line, "GoalState") { info.goalstate = v; }
+            }
+        } else {
+            for line in content.lines() {
+                if line.contains("key-signing key") {
+                    info.role = "KSK".into();
+                } else if line.contains("zone-signing key") {
+                    info.role = "ZSK".into();
+                }
+                if let Some(v) = parse_key_comment(line, "Created") { info.created = v; }
+                if let Some(v) = parse_key_comment(line, "Publish") { info.published = v; }
+                if let Some(v) = parse_key_comment(line, "Activate") { info.active = v; }
+                if let Some(v) = parse_key_comment(line, "Inactive") { info.retired = v; }
+                if let Some(v) = parse_key_comment(line, "Delete") { info.removed = v; }
+            }
+            for line in content.lines() {
+                if line.contains(" IN DNSKEY ") {
+                    let parts: Vec<&str> = line.split_whitespace().collect();
+                    // 按 token 定位，不写死下标：`.key` 里的 DNSKEY 行可能是
+                    // `name. TTL IN DNSKEY flags proto alg key`（keygen 传了 -L 就是
+                    // 这种），也可能没有 TTL 段。写死 parts[2]/parts[4] 在两种形态下
+                    // 分别取到 "IN"/"DNSKEY" 或 flags/proto，于是面板里 flags 恒为 0、
+                    // algorithm 变成数字（flags）。
+                    if let Some(i) = parts
+                        .iter()
+                        .position(|p| p.eq_ignore_ascii_case("DNSKEY"))
+                    {
+                        if let Some(f) = parts.get(i + 1).and_then(|x| x.parse::<u16>().ok()) {
+                            info.flags = f;
                         }
-                        if let Some((zone, tag, alg)) = dnssec_parse_key_filename(&info.filename) {
-                            info.zone = zone;
-                            info.tag = tag;
-                            info.keytype = alg;
+                        if let Some(a) = parts.get(i + 3) {
+                            info.algorithm = a.to_string();
                         }
-                        break;
                     }
+                    break;
                 }
             }
         }
@@ -3802,6 +4002,20 @@ pub fn dnssec_check_and_rotate(cfg: &DnsConfig, dc: &DnsConfig) -> Result<Vec<Ds
         } else if role == "ZSK" || role == "CSK" {
             let zsk_threshold = lifetime_secs.saturating_sub(7 * 86400);
             if age_secs > zsk_threshold {
+                // **一轮 rollover 只生成一把替代键**：旧 key 会在「到期」状态停留很久
+                // （KASP 要先发布新 DNSKEY、等 TTL 传播、再 retire/remove 旧 key），
+                // 期间每一轮检查都会命中 `age > threshold`。如果只靠下面 24h 的 meta
+                // 节流，仍会「每天生成一把」，一个月就能堆出 20+ 把 ZSK，DNSKEY 应答
+                // 与 keys/ 目录无界增长。真机实测：两次把 Active 拨旧后，DNSKEY 从
+                // 2 条涨到 4 条（KSK + 3×ZSK），而 KASP 里两把旧 ZSK 都还是 hidden/due。
+                // 已经有同 zone、同角色、Active 更新的 key ⇒ 本轮已经生成过，跳过。
+                if active_ts > 0 && has_newer_replacement(&keys, key, active_ts) {
+                    log::debug!(
+                        "dnssec: {} tag={} is due but a newer replacement already exists — skip generating another",
+                        role, key.tag
+                    );
+                    continue;
+                }
                 // 节流（必须有）：maintenance_loop 每 30s 调一次本函数，而「临近过期」
                 // 这个条件在新 key 被 BIND 真正接管、旧 key 被删掉之前**每一轮都成立**。
                 // 旧实现于是每 30s 又生成一把新 key（≈2880 把/天，可持续数周），
@@ -3846,6 +4060,20 @@ pub fn dnssec_check_and_rotate(cfg: &DnsConfig, dc: &DnsConfig) -> Result<Vec<Ds
         }
     }
     Ok(need_ds)
+}
+
+/// 同一 zone / 角色是否已经存在比 `active_ts` 更新的 key。
+///
+/// 用途见 [`dnssec_check_and_rotate`]：旧 key 在 KASP 退休前会长期处于「到期」状态，
+/// 不能用它作为「再生成一把」的依据；只要已有更新的同角色 key，就说明本轮 rollover
+/// 已经生成过替代键。
+fn has_newer_replacement(keys: &[DnssecKeyInfo], key: &DnssecKeyInfo, active_ts: u64) -> bool {
+    keys.iter().any(|k| {
+        !k.tag.eq_ignore_ascii_case(&key.tag)
+            && k.zone.eq_ignore_ascii_case(&key.zone)
+            && k.role.eq_ignore_ascii_case(&key.role)
+            && parse_dnssec_time(&k.active) > active_ts
+    })
 }
 
 /// 解析 DNSSEC .key 文件中的 YYYYMMDDHHMMSS 时间戳 → unix epoch
@@ -4550,6 +4778,19 @@ mod listen_lists_tests {
         );
     }
 
+    /// 测试模式 + geo：named 也必须 bind 分线路 loopback，否则 resolve_fwd_dest
+    /// 把 DoT/DoH 查询发到没人监听的 127.0.0.2.. ⇒ UDP ICMP 不可达、查询全失败
+    /// （真机：DoT `short DoT length prefix`、DoH 502）。
+    #[test]
+    fn test_mode_still_binds_geo_line_loopbacks() {
+        let (v4, v6) = listen_lists("0.0.0.0", true, 2);
+        assert!(v4.starts_with("127.0.0.1;"), "{v4}");
+        assert!(v4.contains("127.0.0.2;") && v4.contains("127.0.0.3;"), "{v4}");
+        assert_eq!(v6, "none;");
+        // 没有线路时保持原样（不多 bind 一个地址）。
+        assert_eq!(listen_lists("0.0.0.0", true, 0).0, "127.0.0.1;");
+    }
+
     #[test]
     fn geo_line_loopbacks_are_listed_explicitly() {
         let (v4, _) = listen_lists("127.0.0.1", false, 2);
@@ -5129,6 +5370,41 @@ mod dns_hardening_tests {
         assert!(batch_cname_conflict(&mixed).is_some());
     }
 
+    /// 轮换去重：只要同 zone/角色已有更新的 Active，就不得再生成第二把（否则旧 key
+    /// 在 KASP 退休前会每天多一把 ZSK）。真机：两次拨旧 Active 导致 DNSKEY 2→4。
+    #[test]
+    fn rotation_skips_when_a_newer_same_role_key_exists() {
+        fn key(tag: &str, role: &str, active: &str) -> DnssecKeyInfo {
+            DnssecKeyInfo {
+                filename: format!("Ksigned.test.+013+{tag}.key"),
+                zone: "signed.test".into(),
+                role: role.into(),
+                algorithm: "13".into(),
+                tag: tag.into(),
+                flags: 256,
+                keytype: "013".into(),
+                created: String::new(),
+                published: String::new(),
+                active: active.into(),
+                retired: String::new(),
+                removed: String::new(),
+                state_file: String::new(),
+                dnskeystate: String::new(),
+                goalstate: String::new(),
+            }
+        }
+        let old = key("100", "ZSK", "20260801000000");
+        let new = key("200", "ZSK", "20261023093056");
+        let ksk = key("300", "KSK", "20261023090516");
+        let old_ts = parse_dnssec_time(&old.active);
+        assert!(has_newer_replacement(&[old.clone(), new.clone(), ksk.clone()], &old, old_ts));
+        // 最新那把自己没有「更新的同角色 key」⇒ 允许生成下一轮。
+        let new_ts = parse_dnssec_time(&new.active);
+        assert!(!has_newer_replacement(&[old.clone(), new.clone(), ksk.clone()], &new, new_ts));
+        // 角色/zone 不同的 key 不能算替代。
+        assert!(!has_newer_replacement(&[old.clone(), ksk.clone()], &old, old_ts));
+    }
+
     /// P2：geo 线路数超上限（MAX_GEO_LINES）必须在保存前拒绝 —— 超出部分没有
     /// fwd view / listen socket / lo0 alias，客户端会静默落到 default 拿到错误线路。
     #[test]
@@ -5147,5 +5423,52 @@ mod dns_hardening_tests {
         );
         c.geo.lines.truncate(MAX_GEO_LINES);
         assert!(check_config_strings(&c).is_ok(), "正好上限必须放行");
+    }
+
+    /// 记录名归一：面板/API 传绝对名时不能生成 `www.example.com.example.com.`。
+    #[test]
+    fn record_name_is_normalized_into_zone() {
+        assert_eq!(normalize_record_name("@", "example.com"), "@");
+        assert_eq!(normalize_record_name("", "example.com"), "@");
+        assert_eq!(normalize_record_name("example.com", "example.com"), "@");
+        assert_eq!(normalize_record_name("example.com.", "example.com"), "@");
+        assert_eq!(
+            normalize_record_name("www.example.com", "example.com"),
+            "www"
+        );
+        assert_eq!(
+            normalize_record_name("www.example.com.", "example.com"),
+            "www"
+        );
+        assert_eq!(
+            normalize_record_name("a.b.example.com", "example.com"),
+            "a.b"
+        );
+        // 不是该分区的后缀不能误删（`notexample.com` 不能变成 `not`）。
+        assert_eq!(
+            normalize_record_name("notexample.com", "example.com"),
+            "notexample.com"
+        );
+        assert_eq!(normalize_record_name("_sip._tcp", "example.com"), "_sip._tcp");
+    }
+
+    /// 最小配置（不写 `[dns.modes]` / `[dns.dnssec]` / `[dns.rootzone]`）必须回落到
+    /// 文档默认：权威开、NSEC3 开、CDS 开、rootzone URL/24h/自动刷新开。
+    /// 这些在整节缺失时走 `Default::default()`（derive 会给全 false/空串）。
+    #[test]
+    fn minimal_config_defaults_match_documented_behavior() {
+        let c = DnsConfig::default();
+        assert!(c.modes.authoritative, "默认必须服务用户 zone（否则 dig REFUSED）");
+        assert!(!c.modes.root && !c.modes.recursive);
+        assert_eq!(c.dnssec.algorithm, "ECDSAP256SHA256");
+        assert_eq!(c.dnssec.rotation_days, 30);
+        assert!(c.dnssec.nsec3, "NSEC3 默认开（需求 5）");
+        assert!(c.dnssec.cds, "CDS/CDNSKEY 默认发布（需求 8）");
+        assert_eq!(c.doh.path, "/dns-query");
+        assert_eq!(c.rootzone.refresh_hours, 24);
+        assert!(c.rootzone.url.contains("internic.net"), "rootzone URL 默认值丢失");
+        assert!(c.rootzone.enabled, "root zone 默认 daily 自动刷新（需求 2）");
+        assert_eq!(c.acme.renew_days, 60);
+        assert_eq!(c.geo.mmdb.sync_days, 7);
     }
 }

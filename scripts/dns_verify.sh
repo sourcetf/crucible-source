@@ -5,7 +5,12 @@ set -u
 if [ "${1:-}" = "--real" ]; then
     shift
     SELF_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
-    exec sh "$SELF_DIR/dns_bind_verify.sh" "$@"
+    # dns_bind_verify.sh 用了 bash 数组/ local / 进程替换：不能 `sh` 跑（dash 直接报
+    # `Syntax error: "(" unexpected`）。有 bash 用 bash，否则交给 shebang。
+    if command -v bash >/dev/null 2>&1; then
+        exec bash "$SELF_DIR/dns_bind_verify.sh" "$@"
+    fi
+    exec "$SELF_DIR/dns_bind_verify.sh" "$@"
 fi
 BASE="${1:-http://127.0.0.1:19095/__admin}"
 AUTH="${2:-admin:admin}"
