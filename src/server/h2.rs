@@ -260,7 +260,7 @@ where
                 let snap = live.snapshot();
                 if crate::server::access::is_admin_path(&snap.admin.path, parts.uri.path()) {
                     let t0 = std::time::Instant::now();
-                    use crate::server::basic_auth::{admin_gate, retry_after_secs, AdminGate};
+                    use crate::server::basic_auth::{admin_gate_path, retry_after_secs, AdminGate};
                     // (状态码, Retry-After, 文案)；None = 已过鉴权门，交给 admin::handle
                     // 判定顺序与 h1/h3 的「ACL → CSRF → 鉴权门」一致：ACL 是**无状态**的
                     // 纯判定，提前到收 body 之前做不会影响限流计数，因此这里先补判一次；
@@ -279,7 +279,7 @@ where
                             let (st, msg) = crate::server::access::cross_site_response();
                             Some((st, None, msg))
                         } else {
-                            match admin_gate(&parts.headers, &snap.admin, peer.ip()) {
+                            match admin_gate_path(&parts.headers, &snap.admin, peer.ip(), parts.uri.path()) {
                                 AdminGate::Proceed => None,
                                 AdminGate::Unauthorized => Some((
                                     StatusCode::UNAUTHORIZED,
@@ -1164,7 +1164,7 @@ async fn handle_h2(
             Ok(r) => r,
             Err(resp) => return tag(resp, "admin"),
         };
-        let resp = crate::server::admin::handle(req.map(Full::new), live).await;
+        let resp = crate::server::admin::handle(req.map(Full::new), live, lc.ssl.is_some(), peer.ip()).await;
         // 兜底记账（与 h1 同语义）：鉴权与失败退避已在 admin_gate 里完成，这里只在
         // 「过了门却仍回 401」（两次校验之间配置被热重载）时补记一次。
         crate::server::basic_auth::note_admin_result(peer.ip(), resp.status());
@@ -1176,7 +1176,7 @@ async fn handle_h2(
 
     // page_rules: block/redirect(apply_simple) + rewrite(路径改写) + cache/header(响应头)
     if let Some((status, location)) =
-        crate::server::page_rules::apply_simple(&lc, &path, &crate::server::page_rules::MatchCtx::from_request(&req))
+        crate::server::page_rules::apply_simple(&lc, &path, &crate::server::page_rules::MatchCtx::from_request_with_peer(&req, peer.ip(), &lc))
     {
         if status == StatusCode::FORBIDDEN {
             return tag(
@@ -1200,7 +1200,7 @@ async fn handle_h2(
     // 见 `from_request_with_host` 的说明）。
     let pr_host = crate::server::page_rules::host_snapshot(&req);
     {
-        let pr_ctx = crate::server::page_rules::MatchCtx::from_request(&req);
+        let pr_ctx = crate::server::page_rules::MatchCtx::from_request_with_peer(&req, peer.ip(), &lc);
         if let Some(np) = crate::server::page_rules::rewrite_path(&lc, &path, &pr_ctx) {
             let pq = match req.uri().query() {
                 Some(q) => format!("{np}?{q}"),
@@ -1218,7 +1218,12 @@ async fn handle_h2(
     // `:authority`（URI authority）里，客户端可以不发 Host 头 —— 改写后重建的 ctx
     // 会拿不到 host，带 host 约束的 block/pass/header 规则静默不命中（h1 无此问题，
     // 它的 Host 头始终在）。用快照保持三协议一致。
-    let pr_ctx = crate::server::page_rules::MatchCtx::from_request_with_host(&req, pr_host.as_deref());
+    let pr_ctx = crate::server::page_rules::MatchCtx::from_request_with_host_and_peer(
+        &req,
+        pr_host.as_deref(),
+        peer.ip(),
+        &lc,
+    );
     // P1-5：h1 的 pass_upstream（page rule pass 动作）在 h2 同样生效。
     if let Some((murl, upstream)) = crate::server::page_rules::pass_upstream(&lc, &path, &pr_ctx) {
         // proxy_page_rule 需要 h1 体类型（Bytes）：先收齐（≤8MiB）。

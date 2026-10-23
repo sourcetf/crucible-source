@@ -922,13 +922,107 @@ fn upload_target(name: &str) -> std::path::PathBuf {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// 闲置容量淘汰**不得误删在途会话**（本 IP 的 `.part` 正被 append/commit）。
+    ///
+    /// 场景：一个合法上传正在写（active>0），同 IP 另有 64 个闲置的可续传会话；再来一个
+    /// 新上传触发「淘汰最旧闲置」。`oldest_idle` 必须跳过在途会话 —— 否则合法上传的
+    /// `.part` 被删，后续 `append` 打开已删文件 → 500（数据未损坏，但把合法上传打成服务端错误）。
+    #[test]
+    fn idle_eviction_skips_inflight_sessions() {
+        let _g = serial();
+        if !test_fs_has_room() {
+            eprintln!("跳过：本机磁盘余量低于闸门阈值（{MIN_FREE_BYTES}），落盘用例无从验证");
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("crucible-up-evict-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let ip: std::net::IpAddr = "203.0.113.21".parse().unwrap();
+        // 在途会话（session_for 已 +1，测试里不再建 Attach ⇒ active 恒为 1）
+        let inflight = session_for(&dir.join("inflight.bin"), 0, Some(4), Some(ip))
+            .expect("在途会话应放行");
+        assert_eq!(append(&inflight, 0, b"ab").unwrap(), 2);
+        assert!(inflight.tmp.exists());
+        // 同 IP 填满闲置容量
+        let mut idles = Vec::new();
+        for i in 0..MAX_IDLE_SESSIONS_PER_IP {
+            let s = session_for(&dir.join(format!("idle-x{i}.bin")), 0, Some(1), Some(ip))
+                .expect("闲置会话应放行");
+            {
+                let g = Attach::new(Arc::clone(&s));
+                drop(g);
+            }
+            idles.push(s);
+        }
+        // 再开一个：触发「淘汰本 IP 最旧闲置」，但在途会话必须被跳过
+        let n = session_for(&dir.join("new-after-evict.bin"), 0, Some(1), Some(ip))
+            .expect("闲置满时淘汰最旧闲置，不得拒绝新上传");
+        assert!(
+            inflight.tmp.exists(),
+            "在途会话的 .part 不得被闲置淘汰误删（否则其 append 会 500）"
+        );
+        assert_eq!(
+            append(&inflight, 2, b"cd").unwrap(),
+            4,
+            "在途会话被淘汰后仍能续写（.part 未被删）"
+        );
+        // 清理：归还 active 计数再 abort
+        {
+            let g = Attach::new(Arc::clone(&n));
+            drop(g);
+        }
+        abort(&n);
+        {
+            let g = Attach::new(Arc::clone(&inflight));
+            drop(g);
+        }
+        abort(&inflight);
+        for s in &idles {
+            abort(s);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 同目标不同 IP：会话按**目标**归属，第二个 IP 不会新建会话、也不占它自己的配额；
+    /// 第一个 IP 的请求在途时必须 409（按当前偏移续传），断开后第二个 IP 可复用会话收尾。
+    #[test]
+    fn same_target_different_ip_reuses_session() {
+        let _g = serial();
+        if !test_fs_has_room() {
+            eprintln!("跳过：本机磁盘余量低于闸门阈值（{MIN_FREE_BYTES}），落盘用例无从验证");
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("crucible-up-xip-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let ip_a: std::net::IpAddr = "203.0.113.31".parse().unwrap();
+        let ip_b: std::net::IpAddr = "203.0.113.32".parse().unwrap();
+        let t = dir.join("shared.bin");
+        let a = session_for(&t, 0, Some(8), Some(ip_a)).expect("A 开始");
+        assert_eq!(append(&a, 0, b"aaaa").unwrap(), 4);
+        // A 在途：B 同目标（同 total）必须按偏移 409，而不是共享会话或撞配额 503
+        match session_for(&t, 0, Some(8), Some(ip_b)) {
+            Err(UploadErr::OffsetMismatch(4)) => {}
+            Err(other) => panic!("期望 OffsetMismatch(4)（409），实得 {other:?}"),
+            Ok(_) => panic!("期望 409，实得 Ok —— 两个 IP 并发共享了同一会话"),
+        }
+        // A 请求结束（Attach drop）→ B 可按当前偏移续传（会话复用，owner 不变）
+        {
+            let g = Attach::new(Arc::clone(&a));
+            drop(g);
+        }
+        let b = session_for(&t, 4, Some(8), Some(ip_b)).expect("A 释放后 B 可续传");
+        assert!(Arc::ptr_eq(&a, &b), "同目标必须复用同一个会话");
+        assert_eq!(append(&b, 4, b"bbbb").unwrap(), 8);
+        commit(&b).expect("commit");
+        assert_eq!(std::fs::read(&t).unwrap(), b"aaaabbbb");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// 每 IP 的**闲置**容量上限：超过时淘汰该 IP 最旧的闲置会话，而**不是**拒绝新上传。
     ///
     /// 这是「经历多次中断的客户端仍能开始新上传」的可用性不变量；被淘汰的会话后续续传
     /// 会拿到 `OffsetMismatch(0)`（调用方回 409 + X-Upload-Offset: 0，客户端从头再来）。
     #[test]
-    fn idle_session_cap_evicts_oldest_without_rejecting_new() {
-        let _g = serial();
+    fn idle_session_cap_evicts_oldest_without_rejecting_new() {        let _g = serial();
         if !test_fs_has_room() {
             eprintln!("跳过：本机磁盘余量低于闸门阈值（{MIN_FREE_BYTES}），落盘用例无从验证");
             return;

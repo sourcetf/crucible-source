@@ -827,7 +827,7 @@ async fn handle_request_inner(
         // admin::handle 里那次同凭据的校验会命中 basic_auth 的成功备忘（见该处说明），
         // 所以合法管理请求**只跑一次** argon2id，换来的是「任意垃圾凭据也能占住
         // 32MiB/请求」这条放大路径被彻底掐掉。
-        match crate::server::basic_auth::admin_gate(req.headers(), &snap.admin, peer.ip()) {
+        match crate::server::basic_auth::admin_gate_path(req.headers(), &snap.admin, peer.ip(), &path) {
             crate::server::basic_auth::AdminGate::Proceed => {}
             crate::server::basic_auth::AdminGate::Unauthorized => {
                 return tag(
@@ -880,6 +880,8 @@ async fn handle_request_inner(
         let mut resp = crate::server::admin::handle(
             Request::from_parts(parts, Full::new(bytes)),
             live,
+            lc.ssl.is_some(),
+            peer.ip(),
         )
         .await;
         // 兜底记账：失败计数/退避已在 admin_gate 完成，这里只在「过了门却仍回 401」
@@ -895,7 +897,7 @@ async fn handle_request_inner(
     // 空规则表下这四个入口全部恒为 None/空，但旧实现每请求仍要构造 3 次 `MatchCtx`
     // （每次 `from_request`：method + URI authority/Host 头查找）并各跑一次空扫描 + 空
     // `Vec` 收集。`lc.page_rules` 为空是纯静态/纯反代站点的常态。
-    let rules_on = !lc.page_rules.is_empty();
+    let rules_on = crate::server::page_rules::has_rules(&lc);
     // 改写之后必须以**新路径**做后续判定与分发。
     // 此前把改写前的 path 传进 dispatch_tail，于是 `would_handle`/`would_proxy` 判断的
     // 是一个路径、真正干活的 handler（apps::try_handle 内部自己重算 req.uri()）
@@ -908,7 +910,7 @@ async fn handle_request_inner(
     let mut path = path;
     if rules_on {
         {
-            let pr_ctx = crate::server::page_rules::MatchCtx::from_request(&req);
+            let pr_ctx = crate::server::page_rules::MatchCtx::from_request_with_peer(&req, peer.ip(), &lc);
             if let Some(np) = crate::server::page_rules::rewrite_path(&lc, &path, &pr_ctx) {
                 let pq = match req.uri().query() {
                     Some(q) => format!("{np}?{q}"),
@@ -920,10 +922,14 @@ async fn handle_request_inner(
                 path = req.uri().path().to_string();
             }
         }
-        if let Some(resp) = crate::server::page_rules::apply(&lc, &req) {
+        if let Some(resp) = crate::server::page_rules::apply(
+            &lc,
+            &req,
+            &crate::server::page_rules::MatchCtx::from_request_with_peer(&req, peer.ip(), &lc),
+        ) {
             return tag(resp, "rule");
         }
-        let pr_ctx = crate::server::page_rules::MatchCtx::from_request(&req);
+        let pr_ctx = crate::server::page_rules::MatchCtx::from_request_with_peer(&req, peer.ip(), &lc);
         if let Some((murl, upstream)) = crate::server::page_rules::pass_upstream(&lc, &path, &pr_ctx)
         {
             // 反代本就全量缓冲 body：这里收齐后转 Full 交反代（语义不变，见 proxy.rs）。
@@ -954,7 +960,7 @@ async fn handle_request_inner(
     }
     // 未配置页面规则时不再构造 `MatchCtx` / 跑空扫描（见上面 rules_on 的说明）。
     let resp_mods = if rules_on {
-        let pr_ctx = crate::server::page_rules::MatchCtx::from_request(&req);
+        let pr_ctx = crate::server::page_rules::MatchCtx::from_request_with_peer(&req, peer.ip(), &lc);
         crate::server::page_rules::response_headers(&lc, &path, &pr_ctx)
     } else {
         Vec::new()

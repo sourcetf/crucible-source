@@ -8,10 +8,12 @@ use crate::config::{AccessLogConfig, ListenerAccessLogConfig};
 use crate::server::live_config::LiveConfig;
 use once_cell::sync::Lazy;
 use parking_lot::Mutex;
+use std::cell::UnsafeCell;
 use std::collections::VecDeque;
 use std::fmt::Write as _;
 use std::io::Write;
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -28,14 +30,338 @@ static RING: Lazy<Mutex<VecDeque<String>>> = Lazy::new(|| Mutex::new(VecDeque::w
 /// 256KiB 时）用一次 write 落盘。部署时 stderr 被重定向到日志文件，因此落点不变；
 /// 管理面的「实时访问日志」读的是内存 RING，完全不受影响。
 ///
-/// 缓冲保持**单一全局**（wave-11 评估过「每线程一个槽位」：c128 实测无可辨收益，
-/// 且会把不同线程的行按槽位分组落盘 —— 同一顺序客户端（例如验收脚本）看到的行
-/// 次序与改动前不同；访问日志是审计证据，行序可解释性优先，故不采用）。
-static ACCESS_BUF: Mutex<Vec<u8>> = Mutex::new(Vec::new());
+/// wave-14 起写入侧换成**顺序提交槽**（[`Ring`]）：每请求领一个完成序号、
+/// 格式化进独占槽（无全局锁、无每请求分配），drainer 严格按序号把槽搬进这里
+/// 的进程级缓冲。行序仍等于请求完成顺序（审计证据），但每请求不再争同一把
+/// Mutex / 同一个 Vec。wave-11 评估过的「每线程一个缓冲」会改变行序，**不采用**。
 /// 缓冲上限，超过立即触发一次 flush（在请求线程里做）。
 const ACCESS_BUF_FLUSH_AT: usize = 256 * 1024;
 /// 后台 flush 间隔。
 const ACCESS_FLUSH_EVERY: Duration = Duration::from_millis(250);
+
+// ---------------------------------------------------------------------------
+// 顺序提交槽（wave-14）：去掉「全局 Mutex + 共享 Vec 追加」的跨核争用
+// ---------------------------------------------------------------------------
+//
+// 为什么不用 `Mutex<Vec<u8>>` 直接写：perf6 的差分实测把剩余日志成本拆成
+// 时钟 −0.27% / 落盘 I/O −0.64% / **全局 Mutex + 共享 Vec 追加 −1.74%**。
+// 两三个 worker 线程每请求都要锁同一个 mutex 并改同一个 Vec 的 len/ptr，
+// 这是纯跨 CCD 的 cache-line ping-pong，格式化本身反而是本地的。
+//
+// 但不能退回「每线程一个缓冲」：perf6 用 `logdiff` 实测到行序变化（同一条
+// 300KB 请求的行被排到文件最后），访问日志是审计证据，**行序必须等于
+// 请求完成（log 调用）顺序**。
+//
+// 本实现：每个写者先从全局 `next_seq` 领一个**完成序号**（这一次 fetch_add
+// 就是每请求唯一的跨线程原子写），把整行格式化进自己独占的槽（无锁、无分配）；
+// 然后按序号发布长度。只有「当前队头」的写者（或后台 flusher）会把槽按序
+// 搬进批量缓冲并落盘。因此：
+//   * 行序 == 领号顺序 == log 调用顺序（与改动前锁内追加的顺序语义一致）；
+//   * 格式化、memcpy 都在线程本地/独占 cache line 上，不再争全局锁；
+//   * 槽是预分配的固定数组 —— 没有每请求堆分配；
+//   * 超长行（> SLOT_CAP）走 spill：等队头轮到自己后直接按序写缓冲（此时才
+//     分配一个临时 Vec；门禁负载不会触发）。
+const SLOT_CAP: usize = 1024;
+const SLOT_COUNT: usize = 64;
+const SLOT_MASK: usize = SLOT_COUNT - 1;
+/// `Slot::len` 的空槽标记（真实行远小于 4GiB）。
+const SLOT_EMPTY: u32 = u32::MAX;
+
+struct Slot {
+    /// 已格式化的字节数；`SLOT_EMPTY` = 槽空闲。Release 发布、Acquire 消费。
+    len: AtomicU32,
+    /// 写者独占：发布 `len` 之后 lease 结束；drain 侧只在 acquire-load 到非空
+    /// `len` 后读这块内存。没有任何时刻两个线程同时读写同一个 slot。
+    buf: UnsafeCell<[u8; SLOT_CAP]>,
+}
+
+impl Slot {
+    const fn new() -> Self {
+        Self {
+            len: AtomicU32::new(SLOT_EMPTY),
+            buf: UnsafeCell::new([0u8; SLOT_CAP]),
+        }
+    }
+}
+
+// 安全性：见上 —— 每个 seq 同一时刻只有一个写者，drain 侧在 `len` 的
+// release/acquire 之后才读 `buf`，读的 seq 与写者一一对应；且 `drained`
+// 的推进保证槽在被复用前已经 drain 完。
+unsafe impl Sync for Slot {}
+
+/// 按完成序号保序的批量缓冲。生产用一个进程级实例（[`ORDERED`]）；单测各自
+/// `Ring::new` 一个实例（槽数组 `Box::leak`），互不干扰 —— 全局缓冲会被后台
+/// flusher 或别的用例的日志抢走，无法做确定性断言。
+struct Ring {
+    slots: &'static [Slot],
+    /// 下一个要分配的完成序号（单调，不回绕）。
+    next_seq: AtomicU64,
+    /// 所有 `< drained` 的行都已经搬进 `buf`（或已落盘）。
+    drained: AtomicU64,
+    /// 批量落盘缓冲；同时充当 drain 串行化锁：队头写者 `try_lock` 成功就直接
+    /// 原地追加（旧版另有一把 drain 锁，队头每请求要多付一次 CAS）。
+    buf: Mutex<Vec<u8>>,
+    /// 只给「落盘」用：保证两次 flush 的 stderr 写入顺序 == 取走数据的顺序。
+    /// 正常 append 路径不碰它。
+    writing: Mutex<()>,
+}
+
+impl Ring {
+    const fn new(slots: &'static [Slot]) -> Self {
+        Self {
+            slots,
+            next_seq: AtomicU64::new(0),
+            drained: AtomicU64::new(0),
+            buf: Mutex::new(Vec::new()),
+            writing: Mutex::new(()),
+        }
+    }
+
+    #[inline]
+    fn slot(&self, seq: u64) -> &Slot {
+        &self.slots[(seq as usize) & SLOT_MASK]
+    }
+
+    /// 等待槽位可复用（环形缓冲已绕一圈且该序号已 drain）。正常路径 seq 远小于
+    /// `drained + SLOT_COUNT`，这里只做一次比较。
+    ///
+    /// 环形缓冲满时**由等待者自己推进 drain**（顺序仍由队头决定）：队头写者
+    /// 恰好被抢占/错过唤醒时，仅靠「队头写者顺手 drain」会永久卡住。这里让任何
+    /// 需要槽位的线程都能兜底搬运；若队头槽尚未发布，`drain_ready` 会立刻返回，
+    /// 循环让出 CPU 等那个写者发布。
+    #[inline]
+    fn wait_for_slot(&self, seq: u64) {
+        if seq < SLOT_COUNT as u64 {
+            return;
+        }
+        while self.drained.load(Ordering::Acquire) + SLOT_COUNT as u64 <= seq {
+            if let Some(mut b) = self.buf.try_lock() {
+                let _ = self.drain_ready(&mut b);
+            } else {
+                std::thread::yield_now();
+            }
+        }
+    }
+
+    /// 把已就绪的槽按 seq 顺序追加到 `out`（调用方必须持有 `buf` 锁）。
+    /// 返回缓冲是否达到批量落盘阈值。
+    fn drain_ready(&self, out: &mut Vec<u8>) -> bool {
+        // 最多两轮：第二轮重新读 `next_seq`，把「第一轮快照之后才发布」的行也
+        // 顺手搬走（否则它们要等到环形缓冲满或 250ms flusher 才被处理）。
+        // 上限两轮是刻意的：突发流量下不把 drainer 永久钉在循环里。
+        for _pass in 0..2 {
+            let mut head = self.drained.load(Ordering::Relaxed);
+            let end = self.next_seq.load(Ordering::Acquire);
+            if head >= end {
+                break;
+            }
+            let mut blocked = false;
+            while head < end {
+                let slot = self.slot(head);
+                let len = slot.len.load(Ordering::Acquire);
+                if len == SLOT_EMPTY {
+                    // 行还没发布（写者被抢占）——停在这里，等它发布后自己来 drain。
+                    blocked = true;
+                    break;
+                }
+                debug_assert!((len as usize) <= SLOT_CAP);
+                let bytes = unsafe { &*slot.buf.get() };
+                out.extend_from_slice(&bytes[..len as usize]);
+                out.push(b'\n');
+                slot.len.store(SLOT_EMPTY, Ordering::Relaxed);
+                head += 1;
+                self.drained.store(head, Ordering::Release);
+            }
+            if blocked {
+                break;
+            }
+        }
+        out.len() >= ACCESS_BUF_FLUSH_AT
+    }
+
+    /// 取走 `buf` 并写 stderr。`writing` 把「取数据 + 写数据」串成一个整体，
+    /// 即使两个线程同时越过阈值/flusher 到期，落盘字节顺序也不会倒置。
+    fn write_out(&self) {
+        let _w = self.writing.lock();
+        let data = {
+            let mut b = self.buf.lock();
+            if b.is_empty() {
+                return;
+            }
+            std::mem::take(&mut *b)
+        };
+        let mut err = std::io::stderr().lock();
+        let _ = err.write_all(&data);
+        let _ = err.flush();
+    }
+
+    /// 队头写者（或 spill）在发布后调用：抢到 `buf` 就把连续就绪的行搬走；
+    /// 抢不到说明另一个线程正在搬，直接返回（对方会继续，见 drain_ready 的
+    /// 队头推进逻辑）。
+    fn drain_here(&self) {
+        if let Some(mut b) = self.buf.try_lock() {
+            let full = self.drain_ready(&mut b);
+            drop(b);
+            if full {
+                self.write_out();
+            }
+        }
+    }
+
+    fn flush(&self) {
+        // flusher 是 250ms 周期，也是「行已提交但队头写者恰好被抢占」时的
+        // 兜底 drainer：先搬槽，再整块落盘。
+        {
+            let mut b = self.buf.lock();
+            let _ = self.drain_ready(&mut b);
+        }
+        self.write_out();
+    }
+
+    /// 超长行（> SLOT_CAP）的按序直写：等队头轮到自己，再在 `buf` 锁内直接追加。
+    /// 调用方已把该 seq 的槽标记为空（drain 侧不会跳过它，因为它正好是队头时
+    /// `drained` 会停在这里）。
+    #[allow(clippy::too_many_arguments)]
+    fn spill_line<P: LinePrefix>(
+        &self,
+        seq: u64,
+        now_ms: u128,
+        prefix: &P,
+        method: &str,
+        path: &str,
+        status: u16,
+        bytes: Option<u64>,
+        dur_ms: u128,
+        engine: &str,
+    ) {
+        let mut line = Vec::with_capacity(SLOT_CAP * 2);
+        write_line(&mut line, now_ms, prefix, method, path, status, bytes, dur_ms, engine);
+        while self.drained.load(Ordering::Acquire) != seq {
+            std::thread::yield_now();
+        }
+        let full = {
+            let mut b = self.buf.lock();
+            b.extend_from_slice(&line);
+            b.push(b'\n');
+            // 行已经进缓冲，drained 才能前移（`< drained` 的行都在 buf 里的不变量）。
+            self.drained.store(seq + 1, Ordering::Release);
+            b.len() >= ACCESS_BUF_FLUSH_AT
+        };
+        if full {
+            self.write_out();
+        }
+        // 继续把后面已经就绪的行搬走（不能留给 250ms flusher）。
+        let mut b = self.buf.lock();
+        let _ = self.drain_ready(&mut b);
+    }
+
+    /// 与 [`Ring::spill_line`] 相同，但用于 realtime 路径已经格式化好的行。
+    fn spill_bytes(&self, seq: u64, line: &[u8]) {
+        while self.drained.load(Ordering::Acquire) != seq {
+            std::thread::yield_now();
+        }
+        let full = {
+            let mut b = self.buf.lock();
+            b.extend_from_slice(line);
+            b.push(b'\n');
+            self.drained.store(seq + 1, Ordering::Release);
+            b.len() >= ACCESS_BUF_FLUSH_AT
+        };
+        if full {
+            self.write_out();
+        }
+        let mut b = self.buf.lock();
+        let _ = self.drain_ready(&mut b);
+    }
+
+    /// 热路径：格式化进独占槽 -> 发布 -> 若自己是队头则顺手 drain。
+    #[allow(clippy::too_many_arguments)]
+    fn commit_line<P: LinePrefix>(
+        &self,
+        now_ms: u128,
+        prefix: &P,
+        method: &str,
+        path: &str,
+        status: u16,
+        bytes: Option<u64>,
+        dur_ms: u128,
+        engine: &str,
+    ) {
+        let seq = self.next_seq.fetch_add(1, Ordering::Relaxed);
+        self.wait_for_slot(seq);
+        let slot = self.slot(seq);
+        let mut guard = SeqGuard {
+            slot,
+            published: false,
+        };
+        let (len, overflow) = {
+            // SAFETY: 这个 seq 的槽在发布前由本线程独占（见 `Slot` 的 Sync 说明）。
+            let buf = unsafe { &mut *slot.buf.get() };
+            let mut w = SlotW::new(buf);
+            write_line(&mut w, now_ms, prefix, method, path, status, bytes, dur_ms, engine);
+            (w.len, w.overflow)
+        };
+        if overflow {
+            // 超长行：槽留空，等队头轮到自己后直写（保持顺序；仅此路径分配）。
+            slot.len.store(SLOT_EMPTY, Ordering::Release);
+            guard.published = true;
+            self.spill_line(seq, now_ms, prefix, method, path, status, bytes, dur_ms, engine);
+        } else {
+            slot.len.store(len as u32, Ordering::Release);
+            guard.published = true;
+            if self.drained.load(Ordering::Acquire) == seq {
+                self.drain_here();
+            }
+        }
+    }
+
+    /// 提交一段已经格式化好的行（realtime=true 路径）。
+    fn commit_slice(&self, line: &[u8]) {
+        let seq = self.next_seq.fetch_add(1, Ordering::Relaxed);
+        self.wait_for_slot(seq);
+        let slot = self.slot(seq);
+        if line.len() <= SLOT_CAP {
+            let buf = unsafe { &mut *slot.buf.get() };
+            buf[..line.len()].copy_from_slice(line);
+            slot.len.store(line.len() as u32, Ordering::Release);
+            if self.drained.load(Ordering::Acquire) == seq {
+                self.drain_here();
+            }
+        } else {
+            slot.len.store(SLOT_EMPTY, Ordering::Release);
+            self.spill_bytes(seq, line);
+        }
+    }
+
+    /// 单测：取走缓冲 + 继续 drain 剩余已就绪的槽（模拟 flusher 的兜底）。
+    #[cfg(test)]
+    fn take_all(&self, out: &mut Vec<u8>) {
+        let mut b = self.buf.lock();
+        let _ = self.drain_ready(&mut b);
+        out.extend_from_slice(&b);
+        b.clear();
+    }
+}
+
+static SLOTS: [Slot; SLOT_COUNT] = [const { Slot::new() }; SLOT_COUNT];
+/// 进程级顺序批量缓冲（生产路径）。
+static ORDERED: Ring = Ring::new(&SLOTS);
+
+/// 格式化过程中 panic 时也必须发布槽（否则 `drained` 永远停在它，环形缓冲
+/// 绕一圈后所有日志调用都会卡住）。正常路径不会触发。
+struct SeqGuard<'a> {
+    slot: &'a Slot,
+    published: bool,
+}
+
+impl Drop for SeqGuard<'_> {
+    fn drop(&mut self) {
+        if !self.published {
+            self.slot.len.store(0, Ordering::Release);
+        }
+    }
+}
+
 
 fn ensure_flusher() {
     static ONCE: std::sync::Once = std::sync::Once::new();
@@ -50,16 +376,8 @@ fn ensure_flusher() {
 }
 
 fn flush() {
-    let data = {
-        let mut b = ACCESS_BUF.lock();
-        if b.is_empty() {
-            return;
-        }
-        std::mem::take(&mut *b)
-    };
-    let mut err = std::io::stderr().lock();
-    let _ = err.write_all(&data);
-    let _ = err.flush();
+    // 先搬顺序槽里已就绪的行，再整块落盘（见 [`Ring::flush`]）。
+    ORDERED.flush();
 }
 
 /// 立即把缓冲里的访问日志刷到 stderr（进程退出路径调用，避免丢最后 ≤250ms 的行）。
@@ -121,9 +439,67 @@ pub fn resolve<'a>(
 ///
 /// 两种来源都把同一段字节写进同一行，单测把 [`ConnPrefix`] 与 `format!("{proto} {peer} ")`
 /// 逐字节对拍。
+/// 单行格式化的目标（`Vec<u8>` 或顺序槽里的固定缓冲）。两个实现都提供
+/// 无格式化的字节追加，热路径不经过 `core::fmt`。
+trait ByteSink {
+    fn push_byte(&mut self, b: u8);
+    fn push_slice(&mut self, s: &[u8]);
+}
+
+impl ByteSink for Vec<u8> {
+    #[inline]
+    fn push_byte(&mut self, b: u8) {
+        self.push(b);
+    }
+    #[inline]
+    fn push_slice(&mut self, s: &[u8]) {
+        self.extend_from_slice(s);
+    }
+}
+
+/// 写进顺序槽的固定缓冲。容量不足时只置 overflow，不在热路径上 panic/分配。
+struct SlotW<'a> {
+    buf: &'a mut [u8],
+    len: usize,
+    overflow: bool,
+}
+
+impl<'a> SlotW<'a> {
+    #[inline]
+    fn new(buf: &'a mut [u8]) -> Self {
+        Self {
+            buf,
+            len: 0,
+            overflow: false,
+        }
+    }
+}
+
+impl ByteSink for SlotW<'_> {
+    #[inline]
+    fn push_byte(&mut self, b: u8) {
+        if self.len < self.buf.len() {
+            self.buf[self.len] = b;
+            self.len += 1;
+        } else {
+            self.overflow = true;
+        }
+    }
+    #[inline]
+    fn push_slice(&mut self, s: &[u8]) {
+        match self.len.checked_add(s.len()) {
+            Some(end) if end <= self.buf.len() => {
+                self.buf[self.len..end].copy_from_slice(s);
+                self.len = end;
+            }
+            _ => self.overflow = true,
+        }
+    }
+}
+
 trait LinePrefix {
     /// 追加 `{proto} {peer} ` 字节（批量缓冲路径）。
-    fn write_bytes(&self, out: &mut Vec<u8>);
+    fn write_bytes<S: ByteSink>(&self, out: &mut S);
     /// 追加同样的字节到任意 `fmt::Write`（realtime 路径与 fmt 参照实现）。
     fn write_fmt(&self, out: &mut impl std::fmt::Write) -> std::fmt::Result;
 }
@@ -140,7 +516,7 @@ impl<'a> ConnPrefix<'a> {
     pub fn new(proto: &'a str, peer: SocketAddr) -> Self {
         let mut buf = Vec::with_capacity(proto.len() + 32);
         {
-            let mut w = BufW(&mut buf);
+            let mut w = FmtW(&mut buf);
             // 与 [`format_line`] 的前缀段是**同一段格式串**（`{proto} {peer} `）。
             let _ = write!(w, "{proto} {peer} ");
         }
@@ -150,8 +526,8 @@ impl<'a> ConnPrefix<'a> {
 
 impl LinePrefix for ConnPrefix<'_> {
     #[inline]
-    fn write_bytes(&self, out: &mut Vec<u8>) {
-        out.extend_from_slice(&self.buf);
+    fn write_bytes<S: ByteSink>(&self, out: &mut S) {
+        out.push_slice(&self.buf);
     }
     fn write_fmt(&self, out: &mut impl std::fmt::Write) -> std::fmt::Result {
         write!(out, "{} {} ", self.proto, self.peer)
@@ -166,8 +542,8 @@ struct ProtoPeer<'a> {
 
 impl LinePrefix for ProtoPeer<'_> {
     #[inline]
-    fn write_bytes(&self, out: &mut Vec<u8>) {
-        let _ = write!(BufW(out), "{} {} ", self.proto, self.peer);
+    fn write_bytes<S: ByteSink>(&self, out: &mut S) {
+        let _ = write!(FmtW(out), "{} {} ", self.proto, self.peer);
     }
     fn write_fmt(&self, out: &mut impl std::fmt::Write) -> std::fmt::Result {
         write!(out, "{} {} ", self.proto, self.peer)
@@ -281,38 +657,26 @@ fn log_line<P: LinePrefix>(
     ensure_flusher();
     if !eff.realtime {
         // 行格式化只有**一条热路径实现**（[`write_line`]）：手写十进制 + 直接写进
-        // 批量缓冲（无中间 `String`、无 `core::fmt` 的逐参数动态分派）。
+        // 顺序槽（无中间 `String`、无 `core::fmt` 的逐参数动态分派、无全局锁）。
         // 旧实现每请求 4 次堆分配（ts `format!` / bytes `to_string` / path 转义
         // `collect::<String>()` / 整行 `format!`）——wave-7 去掉 `String`，wave-11
-        // 再去掉 `core::fmt`；字段顺序、转义规则与输出逐字不变（访问日志是审计证据，
-        // 格式不能变；单测 `fast_line_matches_fmt_line` 把 [`write_line`] 与 fmt 参照
-        // 实现逐字节对拍）。
-        let full = {
-            let mut b = ACCESS_BUF.lock();
-            write_line(&mut b, now, prefix, method, path, status, bytes, dur_ms, engine);
-            b.push(b'\n');
-            b.len() >= ACCESS_BUF_FLUSH_AT
-        };
-        if full {
-            flush();
-        }
+        // 再去掉 `core::fmt`，wave-14 去掉「全局 Mutex + 共享 Vec 追加」。字段顺序、
+        // 转义规则与输出逐字不变（访问日志是审计证据，格式不能变；单测
+        // `fast_line_matches_fmt_line` 把 [`write_line`] 与 fmt 参照实现逐字节对拍，
+        // `slot_lines_preserve_completion_order` 锁定行序）。
+        ORDERED.commit_line(
+            now, prefix, method, path, status, bytes, dur_ms, engine,
+        );
         return;
     }
-    // realtime=true：先写进 `String`（Admin 实时窗口要留一份），再追加进批量缓冲。
-    // 该路径不在吞吐热路径上，沿用 wave-7 的 fmt 单实现（[`format_line`]）。
+    // realtime=true：先写进 `String`（Admin 实时窗口要留一份），再按同一顺序
+    // 提交进批量缓冲。该路径不在吞吐热路径上，沿用 wave-7 的 fmt 单实现
+    // （[`format_line`]）。
     let mut line = String::with_capacity(path.len() + 64);
     format_line(
         &mut line, now, prefix, method, path, status, bytes, dur, engine,
     );
-    let full = {
-        let mut b = ACCESS_BUF.lock();
-        b.extend_from_slice(line.as_bytes());
-        b.push(b'\n');
-        b.len() >= ACCESS_BUF_FLUSH_AT
-    };
-    if full {
-        flush();
-    }
+    ORDERED.commit_slice(line.as_bytes());
     {
         let mut ring = RING.lock();
         if ring.len() >= 512 {
@@ -322,14 +686,14 @@ fn log_line<P: LinePrefix>(
     }
 }
 
-/// 把访问日志行**直接**格式化进 `Vec<u8>`（`fmt::Write` 适配器）：
+/// `fmt::Write` 适配器：把 fmt 输出接进任意 [`ByteSink`]。
 /// 仅用于前缀段的**每连接/每请求一次**的 fmt 格式化（[`ConnPrefix::new`]、
 /// [`ProtoPeer`]）；行主体的热路径见 [`write_line`]。
-struct BufW<'a>(&'a mut Vec<u8>);
-impl std::fmt::Write for BufW<'_> {
+struct FmtW<'a, S: ByteSink>(&'a mut S);
+impl<S: ByteSink> std::fmt::Write for FmtW<'_, S> {
     #[inline]
     fn write_str(&mut self, s: &str) -> std::fmt::Result {
-        self.0.extend_from_slice(s.as_bytes());
+        self.0.push_slice(s.as_bytes());
         Ok(())
     }
 }
@@ -340,7 +704,7 @@ impl std::fmt::Write for BufW<'_> {
 
 /// 十进制追加（u64；无 `core::fmt`）。
 #[inline]
-fn push_u64(out: &mut Vec<u8>, mut v: u64) {
+fn push_u64<S: ByteSink>(out: &mut S, mut v: u64) {
     let mut buf = [0u8; 20];
     let mut i = buf.len();
     loop {
@@ -351,18 +715,29 @@ fn push_u64(out: &mut Vec<u8>, mut v: u64) {
             break;
         }
     }
-    out.extend_from_slice(&buf[i..]);
+    out.push_slice(&buf[i..]);
 }
 
 /// 十进制追加（u128）。`SystemTime`/`Duration` 的实际值恒在 u64 范围内，走 u64
-/// 快路径（`u128 / 1000` 的软除法在**极端值**下才用 `core::fmt` 兜底，输出逐字相同）。
+/// 快路径；极端值用同一套手写循环（u128 软除法只在这个不会发生的分支里）。
 #[inline]
-fn push_u128(out: &mut Vec<u8>, v: u128) {
+fn push_u128<S: ByteSink>(out: &mut S, v: u128) {
     if v <= u64::MAX as u128 {
         push_u64(out, v as u64);
         return;
     }
-    let _ = write!(BufW(out), "{v}");
+    let mut buf = [0u8; 40];
+    let mut i = buf.len();
+    let mut v = v;
+    loop {
+        i -= 1;
+        buf[i] = b'0' + (v % 10) as u8;
+        v /= 10;
+        if v == 0 {
+            break;
+        }
+    }
+    out.push_slice(&buf[i..]);
 }
 
 /// 单条访问日志行的格式化（热路径：直接进 `Vec<u8>`）。
@@ -373,8 +748,8 @@ fn push_u128(out: &mut Vec<u8>, v: u128) {
 /// `bytes=None`、v4/v6 peer）。
 #[allow(clippy::too_many_arguments)]
 #[inline]
-fn write_line<P: LinePrefix>(
-    out: &mut Vec<u8>,
+fn write_line<S: ByteSink, P: LinePrefix>(
+    out: &mut S,
     now_ms: u128,
     prefix: &P,
     method: &str,
@@ -392,37 +767,37 @@ fn write_line<P: LinePrefix>(
         push_u128(out, now_ms / 1000);
         (now_ms % 1000) as u32
     };
-    out.push(b'.');
-    out.push(b'0' + (ms / 100) as u8);
-    out.push(b'0' + ((ms / 10) % 10) as u8);
-    out.push(b'0' + (ms % 10) as u8);
-    out.push(b' ');
+    out.push_byte(b'.');
+    out.push_byte(b'0' + (ms / 100) as u8);
+    out.push_byte(b'0' + ((ms / 10) % 10) as u8);
+    out.push_byte(b'0' + (ms % 10) as u8);
+    out.push_byte(b' ');
     prefix.write_bytes(out);
-    out.push(b'"');
-    out.extend_from_slice(method.as_bytes());
-    out.push(b' ');
+    out.push_byte(b'"');
+    out.push_slice(method.as_bytes());
+    out.push_byte(b' ');
     // `path` 是请求目标，**不能原样进引号字段**：含 `"` 的请求能提前结束引号、
     // 把后面的字段伪造成任意内容（日志是审计证据，伪造一行等于污染审计）。
     for c in path.chars() {
         if c == '"' || c == '\\' || (c as u32) < 0x20 {
-            out.extend_from_slice("\u{fffd}".as_bytes());
+            out.push_slice("\u{fffd}".as_bytes());
         } else {
             let mut tmp = [0u8; 4];
-            out.extend_from_slice(c.encode_utf8(&mut tmp).as_bytes());
+            out.push_slice(c.encode_utf8(&mut tmp).as_bytes());
         }
     }
-    out.push(b'"');
-    out.push(b' ');
+    out.push_byte(b'"');
+    out.push_byte(b' ');
     push_u64(out, status as u64);
-    out.push(b' ');
+    out.push_byte(b' ');
     match bytes {
         Some(n) => push_u64(out, n),
-        None => out.push(b'-'),
+        None => out.push_byte(b'-'),
     }
-    out.push(b' ');
+    out.push_byte(b' ');
     push_u128(out, dur_ms);
-    out.extend_from_slice(b"ms ");
-    out.extend_from_slice(engine.as_bytes());
+    out.push_slice(b"ms ");
+    out.push_slice(engine.as_bytes());
 }
 
 /// 单条访问日志行的格式化（**fmt 参照实现**；realtime=true 路径使用，wave-7 起未改）。
@@ -476,26 +851,95 @@ pub fn recent_lines(limit: usize) -> Vec<String> {
 mod tests {
     use super::*;
 
+    /// 单测专用实例：独立槽数组 + 独立缓冲，不受全局 `ORDERED` / 后台
+    /// flusher / 其它用例日志的干扰（全局缓冲无法做确定性断言）。
+    fn new_test_ring() -> &'static Ring {
+        let slots: Vec<Slot> = (0..SLOT_COUNT).map(|_| Slot::new()).collect();
+        let slots: &'static [Slot] = Box::leak(slots.into_boxed_slice());
+        Box::leak(Box::new(Ring::new(slots)))
+    }
+
+    fn ring_lines(ring: &Ring) -> Vec<u8> {
+        let mut v = Vec::new();
+        ring.take_all(&mut v);
+        v
+    }
+
     /// 批量写路径不能改变**行内容**：拼进去的必须是同一行 + 单个换行，
     /// 且 flush 之后缓冲清空（否则会重复落盘）。
     #[test]
     fn buffered_lines_are_exact_and_flush_clears() {
+        let ring = new_test_ring();
         // 不启动后台线程，直接检查缓冲语义
         const LINE: &str = "1788 h1 127.0.0.1:1 \"GET /\" 200 127 1ms static";
         {
-            let mut b = ACCESS_BUF.lock();
+            let mut b = ring.buf.lock();
             b.clear();
             b.extend_from_slice(LINE.as_bytes());
             b.push(b'\n');
         }
-        let snapshot = ACCESS_BUF.lock().clone();
+        let snapshot = ring.buf.lock().clone();
         assert_eq!(snapshot.len(), LINE.len() + 1);
         assert_eq!(snapshot.last(), Some(&b'\n'));
         assert_eq!(snapshot.iter().filter(|c| **c == b'\n').count(), 1);
         // flush 只取走数据、不销毁缓冲（容量保留），且再次调用是空操作。
-        let taken = { let mut b = ACCESS_BUF.lock(); std::mem::take(&mut *b) };
+        let taken = { let mut b = ring.buf.lock(); std::mem::take(&mut *b) };
         assert_eq!(taken.len(), LINE.len() + 1);
-        assert!(ACCESS_BUF.lock().is_empty());
+        assert!(ring.buf.lock().is_empty());
+    }
+
+    /// wave-14 的硬约束：多线程提交后，落盘行序必须等于**领号（完成）顺序**，
+    /// 每个线程内部的行序当然也必须保持；不丢行、不重复、不撕裂。
+    #[test]
+    fn slot_lines_preserve_completion_order() {
+        let ring = new_test_ring();
+        let threads = 4usize;
+        let per = 500usize;
+        let mut hs = Vec::new();
+        for t in 0..threads {
+            hs.push(std::thread::spawn(move || {
+                for i in 0..per {
+                    let line = format!("T{t}:{i}");
+                    ring.commit_slice(line.as_bytes());
+                }
+            }));
+        }
+        for h in hs {
+            h.join().unwrap();
+        }
+        let all = ring_lines(ring);
+        let text = String::from_utf8(all).expect("日志必须是合法 UTF-8");
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), threads * per, "行数必须一条不少");
+        let mut next = vec![0usize; threads];
+        for l in &lines {
+            let (t, i) = l.split_once(':').expect("行格式 T{t}:{i}");
+            let t: usize = t[1..].parse().unwrap();
+            let i: usize = i.parse().unwrap();
+            assert_eq!(i, next[t], "线程 {t} 的行序被打乱：见到 {i}，期望 {}", next[t]);
+            next[t] += 1;
+        }
+        for (t, n) in next.iter().enumerate() {
+            assert_eq!(*n, per, "线程 {t} 有丢行");
+        }
+    }
+
+    /// 超长行（> SLOT_CAP）走 spill 时也必须严格按序，且内容逐字节完整。
+    #[test]
+    fn oversized_line_spills_in_order() {
+        let ring = new_test_ring();
+        ring.commit_slice(b"before");
+        let big = vec![b'x'; SLOT_CAP + 200];
+        ring.commit_slice(&big);
+        ring.commit_slice(b"after");
+        let all = ring_lines(ring);
+        let text = String::from_utf8(all).expect("日志必须是合法 UTF-8");
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), 3, "spill 行不能丢/不能拆");
+        assert_eq!(lines[0], "before");
+        assert_eq!(lines[1].len(), SLOT_CAP + 200);
+        assert!(lines[1].bytes().all(|b| b == b'x'));
+        assert_eq!(lines[2], "after");
     }
 
     /// §16.12 每站覆盖的字段级继承：未配的字段必须继承全局，配了的才覆盖。

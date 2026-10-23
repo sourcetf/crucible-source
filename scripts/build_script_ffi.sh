@@ -46,6 +46,8 @@ if [ -z "${BASH_VERSION:-}" ]; then
 fi
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+# shellcheck source=scripts/runtime_env.sh
+. "${ROOT}/scripts/runtime_env.sh"
 OUT="${CRUCIBLE_APP_ENGINES_OUT:-${ROOT}/target/app-engines}"
 SRC="${ROOT}/libs/script-ffi"
 INC="${ROOT}/libs/app-engines/include"
@@ -115,39 +117,61 @@ detect_python() {
 }
 
 detect_ruby() {
-  # **默认关闭**：嵌入式 MRI 在 OpenBSD + Ruby 3.4 上启动阶段就 rb_bug → SIGSEGV 整个
-  # webserver 进程（script_engine.c 里的专用 MRI 线程 + RUBY_INIT_STACK + 最小 prelude
-  # 都试过，core 栈一致：sigsegv → rb_bug_for_fatal_signal → ruby_default_signal）。
-  # 与 rack 引擎同款风险，因此同样做成显式开关；稳定的 /ruby/ 路径是常驻 Ruby sidecar。
+  # 始终**探测**（rack 的 MRI 嵌入由独立的 CRUCIBLE_ENABLE_RACK_EMBED 控制；
+  # 脚本引擎 ruby 用不用 RB_* 由下面的 CRUCIBLE_ENABLE_RUBY_EMBED 决定）。
+  # 历史：嵌入式 MRI 在 OpenBSD + Ruby 3.4 上启动阶段就 rb_bug → SIGSEGV 整个
+  # webserver 进程（script_engine.c 里的专用 MRI 线程 + RUBY_INIT_STACK + 最小
+  # prelude 都试过，core 栈一致：sigsegv → rb_bug_for_fatal_signal →
+  # ruby_default_signal）。稳定的 /ruby/ 路径是常驻 Ruby sidecar。
   if [[ "${CRUCIBLE_ENABLE_RUBY_EMBED:-0}" != "1" ]]; then
-    echo "    Ruby embed disabled by default (CRUCIBLE_ENABLE_RUBY_EMBED=1 to opt in) → embed-missing (no popen)"
-    return 1
+    echo "    Ruby script-engine embed disabled by default (CRUCIBLE_ENABLE_RUBY_EMBED=1 to opt in); 仍探测 RB_* 供 rack 使用"
   fi
-  if pkg-config --exists ruby 2>/dev/null; then
-    RB_CFLAGS="$(pkg-config --cflags ruby) -DCRUCIBLE_HAVE_RUBY"
-    RB_LIBS="$(pkg-config --libs ruby)"
-    echo "    in-process Ruby via pkg-config"
-    return 0
-  fi
-  # OpenBSD 的 ruby 端口装的是**版本化**二进制（ruby34/ruby33…），没有 `ruby` 这个名字，
-  # 所以 `command -v ruby` 探测在目标机上恒失败——这正是 libapp_rack.so 一直 embed-missing
-  # 的原因。这里按版本号逐个试。
+  # OpenBSD 的 ruby 端口装的是**版本化**二进制（ruby34/ruby33…），没有 `ruby` 这个名字；
+  # Debian/Ubuntu 用户级解包也只有 ruby3.3 + update-alternatives 符号链接（install_app_runtimes.sh
+  # 会补 ruby → ruby3.x）。按版本号逐个试。
   local rb=""
   local cand
-  for cand in ruby ruby34 ruby33 ruby32 ruby31; do
+  for cand in ruby ruby3.4 ruby34 ruby3.3 ruby33 ruby3.2 ruby32 ruby3.1 ruby31; do
     if command -v "${cand}" >/dev/null 2>&1; then rb="${cand}"; break; fi
   done
   if [[ -n "${rb}" ]]; then
-    local hdr arch libs
+    local hdr arch libs libdir
     hdr="$(${rb} -rrbconfig -e 'print RbConfig::CONFIG["rubyhdrdir"]' 2>/dev/null || true)"
     arch="$(${rb} -rrbconfig -e 'print RbConfig::CONFIG["rubyarchhdrdir"]' 2>/dev/null || true)"
     libs="$(${rb} -rrbconfig -e 'print RbConfig::CONFIG["LIBRUBYARG_SHARED"]' 2>/dev/null || true)"
+    libdir="$(${rb} -rrbconfig -e 'print RbConfig::CONFIG["libdir"]' 2>/dev/null || true)"
     if [[ -n "${hdr}" && -f "${hdr}/ruby.h" ]]; then
       RB_CFLAGS="-I${hdr}"
       [[ -n "${arch}" ]] && RB_CFLAGS="${RB_CFLAGS} -I${arch}"
       RB_CFLAGS="${RB_CFLAGS} -DCRUCIBLE_HAVE_RUBY"
       RB_LIBS="${libs:--lruby}"
-      echo "    in-process Ruby (${rb}) headers at ${hdr}"
+      # 用户级解包（aptlocal → ~/local）时 rbconfig 里的 libdir 仍是编译期 /usr/lib/...，
+      # 但真实 libruby 在 ~/local/usr/lib/x86_64-linux-gnu。优先用**真实存在**的目录，
+      # 并加 -rpath：宿主 dlopen(libapp_rack.so) 时 DT_NEEDED=libruby-3.3.so.1 才能解析
+      #（不然只靠 LD_LIBRARY_PATH，运维漏设就 502）。
+      local d real=""
+      for d in "${CRUCIBLE_RUNTIME_ROOT:-$HOME/local}/usr/lib/x86_64-linux-gnu" \
+               "${libdir}" \
+               /usr/lib/x86_64-linux-gnu /usr/local/lib /usr/lib; do
+        [[ -n "${d}" && -d "${d}" ]] || continue
+        if compgen -G "${d}/libruby*.so*" >/dev/null 2>&1; then real="${d}"; break; fi
+      done
+      if [[ -n "${real}" ]]; then
+        RB_LIBS="-L${real} ${RB_LIBS} -Wl,-rpath,${real}"
+      fi
+      echo "    in-process Ruby (${rb}) headers at ${hdr} libs=${RB_LIBS}"
+      return 0
+    fi
+  fi
+  if pkg-config --exists ruby 2>/dev/null; then
+    # 只在 pkg-config 指出的头文件**真的存在**时才采纳：用户级解包场景里
+    # pkg-config 可能指向系统的 /usr/include/ruby-3.3.0（未装），链接期才炸。
+    local pc_hdr
+    pc_hdr="$(pkg-config --cflags ruby 2>/dev/null | tr ' ' '\n' | sed -n 's/^-I//p' | head -n1)"
+    if [[ -n "${pc_hdr}" && -f "${pc_hdr}/ruby.h" ]]; then
+      RB_CFLAGS="$(pkg-config --cflags ruby) -DCRUCIBLE_HAVE_RUBY"
+      RB_LIBS="$(pkg-config --libs ruby)"
+      echo "    in-process Ruby via pkg-config"
       return 0
     fi
   fi
@@ -217,12 +241,28 @@ detect_perl() {
       fi
       PL_CFLAGS="${cflags} -DCRUCIBLE_HAVE_PERL"
       PL_LIBS="${ld}"
-      if ! perl_link_probe "${ld}"; then
+      # 用户级 libperl-dev（aptlocal → ~/local/usr/lib/x86_64-linux-gnu/libperl.so）
+      # 不在链接器默认搜索路径里：ExtUtils::Embed 的 ldopts 只写 `-lperl`（无 -L）。
+      # 找到真实 libperl.so 就补 -L + rpath；否则维持原判据（OpenBSD lld 能直接解析
+      # 版本化库，不需要 -L，也不受影响）。
+      local pl_extra="" pl_dir
+      for pl_dir in "${CRUCIBLE_RUNTIME_ROOT:-$HOME/local}/usr/lib/x86_64-linux-gnu" \
+                     "${CRUCIBLE_RUNTIME_ROOT:-$HOME/local}/usr/lib" \
+                     /usr/lib/x86_64-linux-gnu /usr/local/lib /usr/lib; do
+        if [[ -e "${pl_dir}/libperl.so" || -e "${pl_dir}/libperl.a" ]]; then
+          pl_extra="-L${pl_dir} -Wl,-rpath,${pl_dir}"
+          break
+        fi
+      done
+      if [[ -n "${pl_extra}" ]]; then
+        PL_LIBS="${pl_extra} ${PL_LIBS}"
+      fi
+      if ! perl_link_probe "${PL_LIBS}"; then
         echo "WARN: Perl 头文件在（${cflags}），但用真实构建 flags 试链空 .so **失败** → perl/psgi 降级 embed-missing（不 spawn、不假成功）。" >&2
-        echo "      ldopts=${ld}" >&2
+        echo "      ldopts=${PL_LIBS}" >&2
         echo "      链接器输出（末 5 行；完整日志 ${PERL_PROBE_LOG:-<none>}）：" >&2
         tail -n 5 "${PERL_PROBE_LOG:-/dev/null}" >&2 || true
-        echo "      说明：只有 libperl.so.<ver> 而无 libperl.so 符号链接时，装 perl 开发包即可；OpenBSD 的 ld 能直接解析版本化库，无需补链接。" >&2
+        echo "      说明：只有 libperl.so.<ver> 而无 libperl.so 符号链接时，装 perl 开发包即可（用户级：aptlocal.sh install-deps libperl-dev）；OpenBSD 的 ld 能直接解析版本化库，无需补链接。" >&2
         DEGRADED+=("perl (headers present, real link probe failed → embed-missing)")
         PL_CFLAGS=""
         PL_LIBS=""
@@ -266,7 +306,12 @@ build_script_engine() {
 
 # 每只 .so 只拿**自己语言**的 flag（见文件头注释：混用会让一个语言的链接失败拖挂全部）。
 build_script_engine python "${PY_CFLAGS}" "${PY_LIBS}"
-build_script_engine ruby   "${RB_CFLAGS}" "${RB_LIBS}"
+if [[ "${CRUCIBLE_ENABLE_RUBY_EMBED:-0}" == "1" ]]; then
+  build_script_engine ruby "${RB_CFLAGS}" "${RB_LIBS}"
+else
+  # 脚本引擎默认不嵌入 MRI（见 detect_ruby 注释）；RB_* 仍供 rack 使用。
+  build_script_engine ruby "" ""
+fi
 build_script_engine perl   "${PL_CFLAGS}" "${PL_LIBS}"
 
 # Ruby embed 关闭时：**删掉**可能残留的 libapp_ruby.so。
@@ -301,9 +346,21 @@ build_extra_engine() {
   fi
 }
 
-# PL_CFLAGS 自身已含 -DCRUCIBLE_HAVE_PERL（旧写法再拼一次且**无空格**，
-# 最后一个 -I 会被拼坏成 `...-DCRUCIBLE_HAVE_PERL` —— build_app_engines.sh 对
-# RB_CFLAGS 的同款坑有详细注释）。
+# 没有嵌入标志时的「诚实失败」构建：**必须真编一只 stub**（覆盖掉上一次可能
+# 留下的嵌入式产物）。旧行为是 cflags 为空就 return，结果「默认关」的构建会把
+# 之前 CRUCIBLE_ENABLE_*=1 构建的 .so 原样留在 target/app-engines —— 运维以为
+# 已退回安全版，实际还在跑嵌入式解释器。
+build_extra_engine_stub() {
+  local name="$1" src="$2"
+  if [[ ! -f "${src}" ]]; then
+    echo "    skip ${name}: ${src} missing"
+    return 0
+  fi
+  echo "==> building libapp_${name}.so (embed-missing / honest failure)"
+  ${CC} ${CFLAGS} ${LDFLAGS} -o "${OUT}/libapp_${name}.so" "${src}" \
+    "${COMMON}/appengine_common.c" "${COMMON}/appengine_util.c"
+}
+
 build_extra_engine psgi "${ROOT}/libs/app-engines/psgi/psgi_engine.c" "${PL_CFLAGS}" "${PL_LIBS}" "Perl"
 
 # rack（嵌入式 MRI）：**默认不启用**，构建诚实失败版。
@@ -319,9 +376,28 @@ build_extra_engine psgi "${ROOT}/libs/app-engines/psgi/psgi_engine.c" "${PL_CFLA
 #
 # 启用条件（谁修谁验）：把引擎改成「所有 Ruby 调用都经过一个专用的 Ruby 线程」
 # （或每次调用用 rb_thread_call_with_gvl 包裹），并跑通
-# `curl /rack/` 之后至少 5 分钟不崩 + 连续 1000 次请求。届时把下面这行的参数换成
-# "${RB_CFLAGS}${RB_CFLAGS:+-DCRUCIBLE_HAVE_RUBY}" "${RB_LIBS}" "Ruby" 即可。
-build_extra_engine rack "${ROOT}/libs/app-engines/rack/rack_engine.c" "" "" "Ruby-disabled"
+# `curl /rack/` 之后至少 5 分钟不崩 + 连续 1000 次请求。
+#
+# 2026-10-23（runtimes-wave14）：装了 ruby 3.3.8 + ruby-dev 后做了 A/B：
+#   Linux / Ubuntu 26.04（Ruby 3.3.8，libruby-3.3.so.3.3，rack 3.2.4）：
+#     1000 次顺序 + 400 次 32 并发（/rack/）全部 200，进程存活、无 crash；
+#   生产 OpenBSD + Ruby 3.4 历史上是「返回 200 后数秒~数十秒 SIGSEGV 整个进程」。
+# 因此默认策略按**平台**：Linux 默认开（否则 /rack/ 只有 502，规格 §7.3 不可用），
+# OpenBSD 默认关（保持诚实失败 + 已知崩溃证据）；始终可用 CRUCIBLE_ENABLE_RACK_EMBED
+# 显式覆盖（0/1）。
+RACK_EMBED_DEFAULT=0
+case "$(uname -s)" in
+  Linux) RACK_EMBED_DEFAULT=1 ;;
+esac
+RACK_EMBED="${CRUCIBLE_ENABLE_RACK_EMBED:-${RACK_EMBED_DEFAULT}}"
+if [[ "${RACK_EMBED}" == "1" && -n "${RB_CFLAGS}" ]]; then
+  build_extra_engine rack "${ROOT}/libs/app-engines/rack/rack_engine.c" "${RB_CFLAGS}" "${RB_LIBS}" "Ruby"
+else
+  if [[ "${RACK_EMBED}" == "1" ]]; then
+    echo "WARN: CRUCIBLE_ENABLE_RACK_EMBED=1 但未探测到 ruby 头文件/库 → rack 构建诚实失败版" >&2
+  fi
+  build_extra_engine_stub rack "${ROOT}/libs/app-engines/rack/rack_engine.c"
+fi
 
 echo "built ${OUT}/libscriptffi.so libapp_{python,ruby,perl,psgi,rack}.so"
 
@@ -330,8 +406,10 @@ echo "built ${OUT}/libscriptffi.so libapp_{python,ruby,perl,psgi,rack}.so"
 #   解释器却因链接问题降级」排障时很容易看漏，所以汇总。）
 INPROCESS_OK=()
 [[ -n "${PY_CFLAGS}" ]] && INPROCESS_OK+=("python")
-[[ -n "${RB_CFLAGS}" ]] && INPROCESS_OK+=("ruby")
+# ruby 只在脚本引擎开关打开时才算「可用」（RB_* 探测成功也可能只供 rack 用）。
+[[ -n "${RB_CFLAGS}" && "${CRUCIBLE_ENABLE_RUBY_EMBED:-0}" == "1" ]] && INPROCESS_OK+=("ruby")
 [[ -n "${PL_CFLAGS}" ]] && INPROCESS_OK+=("perl")
+[[ -n "${RB_CFLAGS}" && "${RACK_EMBED:-0}" == "1" ]] && INPROCESS_OK+=("rack")
 if [[ ${#DEGRADED[@]} -gt 0 ]]; then
   echo "---- script-ffi 降级汇总（各语言 flag 已隔离，互不拖挂）----" >&2
   for d in "${DEGRADED[@]}"; do

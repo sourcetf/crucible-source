@@ -15,14 +15,19 @@
 #include <unistd.h>
 
 #ifdef CRUCIBLE_HAVE_TOMCRYPT
-/* Force ARGTYPE=2 for this TU so any LTC_ARGCHK macro expansion returns errors
- * instead of abort(). The linked libtomcrypt.a must also be built with ARGTYPE=2
- * (see scripts/build_libtomcrypt.sh / build.rs). Incomplete SSLv2 probes must
- * never kill the webserver process. */
+/* Force ARGTYPE=4 for this TU so LTC_ARGCHK returns CRYPT_INVALID_ARG instead of
+ * abort()/continuing. The linked libtomcrypt.a must be built with the same value
+ * (see scripts/build_libtomcrypt.sh / build.rs).
+ *
+ * **ARGTYPE 编号（1.18.2 与 master 一致）**：
+ *   0 = crypt_argchk() → abort, 1 = assert(), 2 = 打印 warning 后**继续**,
+ *   3 = 空操作, 4 = return CRYPT_INVALID_ARG。
+ * 旧代码误用 2：实测 NULL 参数会打印 "warning: ARGCHK failed" 后带着 NULL
+ * 指针继续跑 → SIGSEGV（未完成 SSLv2 探针可远程打死 webserver）。必须用 4。 */
 #ifdef ARGTYPE
 #undef ARGTYPE
 #endif
-#define ARGTYPE 2
+#define ARGTYPE 4
 #include <tomcrypt.h>
 /* LibTomMath descriptor — required before rsa_import / mp ops. */
 extern const ltc_math_descriptor ltm_desc;
@@ -130,9 +135,16 @@ static int sslv2_derive_keys(crucible_tomcrypt_conn *c) {
             return -1;
         }
     }
-    /* RC4_128_WITH_MD5: client-write = first 16, server-write = next 16. */
-    memcpy(c->client_write_key, material, 16);
-    memcpy(c->server_write_key, material + 16, 16);
+    /* SSLv2 key schedule (draft-hickman-netscape-ssl-00 §1.2), RC4_128_MD5:
+     *   CLIENT-READ-KEY  = MD5(master || "0" || challenge || conn_id)
+     *   CLIENT-WRITE-KEY = MD5(master || "1" || challenge || conn_id)
+     *   SERVER-READ-KEY  = CLIENT-WRITE-KEY
+     *   SERVER-WRITE-KEY = CLIENT-READ-KEY
+     * 旧代码把前 16 字节当 client-write（即把 "0"/"1" 用反了）：对端若按规范
+     * 用 "1" 加密客户端记录，服务端会用 "0" 解密，第一帧就 MAC/数据全错。
+     * 这里按规范取：client_write = "1" 段，server_write = "0" 段。 */
+    memcpy(c->client_write_key, material + 16, 16);
+    memcpy(c->server_write_key, material, 16);
     if (rc4_stream_setup(&c->rc4_read, c->client_write_key, 16) != CRYPT_OK) {
         return -1;
     }

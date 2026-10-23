@@ -9,11 +9,28 @@ unset CARGO_TARGET_DIR || true
 export CARGO_TARGET_DIR="${ROOT}/target"
 
 RESTART=0
+# 规格 §22.8：默认 thin LTO；`--fat` 是可选加速档（fat 曾 bus error/OOM，且
+# 1 vCPU 生产机整轮重链 ~28 分钟）。用 cargo 的 profile 环境变量覆盖
+# Cargo.toml，避免为了切换 profile 改仓库文件。
+LTO_MODE="${CARGO_PROFILE_RELEASE_LTO:-thin}"
 for a in "$@"; do
   case "$a" in
     --restart) RESTART=1 ;;
+    --fat) LTO_MODE=fat ;;
+    --thin) LTO_MODE=thin ;;
+    -h|--help)
+      echo "usage: $0 [--fat|--thin] [--restart]"
+      echo "  --fat     override release LTO to fat (spec default is thin)"
+      echo "  --restart install bin/webserver and restart via /etc/rc.local"
+      exit 0 ;;
   esac
 done
+case "$LTO_MODE" in
+  fat|thin) export CARGO_PROFILE_RELEASE_LTO="$LTO_MODE" ;;
+  off|false|none) export CARGO_PROFILE_RELEASE_LTO="off" ;;
+  *) echo "[build] unknown LTO mode: $LTO_MODE (use --fat/--thin)" >&2; exit 2 ;;
+esac
+echo "[build] LTO=${CARGO_PROFILE_RELEASE_LTO} (spec default: thin; --fat optional)"
 
 echo "[build] release with features from config.mk / CARGO_FEATURES"
 if [[ -f "${ROOT}/config.mk" ]]; then

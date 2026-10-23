@@ -4334,3 +4334,211 @@ FIN 竞态/畸形头时序（有意不改）；static mtime 缓存。
 
 **改动**：仅 `.agents/1009/reports/verify6-wave12.md`（新增 §10 + P2-6 状态更新）、
 `.agents/1009/fixes/verify6-wave12.md`（§5）、本节。未 commit/push；实例已停、端口已释放。
+
+---
+
+# 【agent-runtimes / 工号 1009 · scope: 应用运行时安装 + www-apps/libs(jsp/aspnet)/构建脚本】2026-10-23 02:2x UTC
+
+**任务**：用户级装齐应用运行时，让 19 个引擎在真机全部 200（含此前 502 的 jsp/do/ruby/rack/
+tsx/aspnet/perl/psgi/php），并把安装/构建/验证固化成脚本。
+
+**结果**：**19/19 引擎 × h1+h2c = 38/38 200**（body 来自对应样例）；1900 顺序 + 200 并发
+混合扫描 0 失败、进程存活。真 Jetty（`x-crucible-engine: jsp-jetty`）、真 hostfxr
+（`aspnet-hostfxr`，`.NET 10.0.13`）、Go c-shared FFI（`hello from go app-engine ffi`，
+无 go sidecar）、Perl/PSGI/Rack 进程内嵌入、PHP php-fpm 全部实测。
+
+**装了什么（`~/local`，2.3GB，无 root）**：PHP 8.5.4(fpm/cli/cgi)、Ruby 3.3.8+ruby-dev+
+rack 3.2.4、Perl 5.40.1+libperl-dev/libperl5.40、OpenJDK 17.0.20.1+Maven 3.9.12、
+Node v22.22.1（官方 tarball；apt node 不可重定位）+npm 10.9.4+esbuild 0.27.2、
+.NET SDK 10.0.113/runtime 10.0.13/hostfxr 10.0.13、Go 1.26.8（系统）。
+
+**新增/改动（本 agent scope）**：
+- 新增 `scripts/install_app_runtimes.sh`（幂等安装+校验）、`scripts/runtime_env.sh`
+  （PATH/LD_LIBRARY_PATH/JAVA_HOME/DOTNET_ROOT/GEM_PATH/RUBYLIB + Maven 自愈）、
+  `scripts/build_aspnet_managed_sample.sh`、`libs/aspnet-ffi/managed/**`。
+- 构建脚本：`build_app_engines.sh`（config.mk 仅 TARGET_OS==本机时采纳、Lua 检查修
+  pipefail 假失败、rack 交给 scriptffi）；`build_script_ffi.sh`（Ruby/Perl -L/-rpath、
+  rack 平台默认 Linux 开/OpenBSD 关、stub 重建）；`build_jsp_sidecar.sh`（Maven 失败
+  非零、校验 jar、SIGPIPE）；`build_aspnet_ffi.sh`/`build_axonasp_ffi.sh`。
+- 引擎修复：**php.rs 非 root fpm `group=nobody` 起不来（P0，/php/ 502）**；
+  **嵌入式 Perl ithreads 缺 `PERL_SET_CONTEXT` → h2c 请求 SIGSEGV 打死进程（P0）**；
+  Ruby 嵌入 `rb_gv_set(rb_intern())` 编译错误（P1）；ASP.NET 从未调用 hostfxr +
+  `UNMANAGEDCALLERSONLY_METHOD` 哨兵（P1）；JSP init/launcher Java 探测 + python 兜底；
+  `www-apps/go/init.sh` 改 POSIX sh；TSX 依赖装 docroot/node_modules。
+- **Ruby 嵌入默认仍关**：修好编译后真机第 13 个请求 SIGABRT（core 500MB，
+  `dmesg ... signal 6`）；`/ruby/` 走 sidecar 200。
+- **Rack 嵌入**：Linux 1000 顺序 + 400 并发全 200 → Linux 默认开；OpenBSD 默认关。
+
+**注意**：`src/server/apps/php.rs` **不在任务书列举的 5 个 Rust 文件里**，但不改
+`/php/` 无法 200（非 root 环境必现）；改动仅 `geteuid()==0` 才写 user/group 四行。
+共享树中他人未提交改动未触碰；未 commit/push/checkout/reset/stash/clean。
+
+**交付**：`.agents/1009/reports/runtimes-wave14.md`、`.agents/1009/fixes/runtimes-wave14.md`。
+证据：`~/scratch-runtimes/logs/{evidence.txt,jsp-env-channels.txt}`、`core.211601`、
+`build-engines-final2.log`。实例：`~/scratch-runtimes/srv.sh restart`（端口 33700），
+矩阵：`python3 ~/scratch-runtimes/matrix.py both`。
+
+---
+
+# 【agent-p2fix / 工号 1009 · Wave-14 残余 P2/P3 修复】2026-10-23
+
+**scope**：`src/server/apps/{app_ffi,env_lock,native_http,sidecar_engine}.rs`、`src/server/h3.rs`、
+`libs/script-ffi/{script_engine,scriptffi}.c`、`libs/app-engines/common/{crucible_pyinit.h,crucible_pyembed.h}`。
+**认证**：`HEAD cb05d2a` + 仅本 agent 的 9 文件 diff（隔离树 `~/scratch-p2fix/test-src`，二进制
+md5 `25ba7ef5324bb1d3f030142337e5d692`）；共享树另有他人 WIP，未卷入认证；共享树
+`cargo check --release --bin webserver --offline --features tls,tls_boring` → **rc=0**。
+未 commit/push/checkout/reset/stash/clean；实例已全停，端口已释放。
+
+**六条（全部真机验证，细节见 `.agents/1009/reports/p2fix-wave14.md`、`fixes/p2fix-wave14.md`）**
+1. **[P2] 看门狗线程/核**：超时放弃 worker 后**补 1 条替补**（上限 32/池）。21 次超时：
+   Threads 12→13 恒定、RSS 24064→24320kB 恒定；健康 `/py-a/` 200；卡死线程仍烧 1 核（不可回收，
+   已如实记录）。`logs/watchdog-20.txt`
+2. **[P2] h3 UDP 重绑**：`SO_REUSEADDR` + serve 内 20ms×900ms 重试 + `wait_idle`。10 次强制重载
+   （restart×11，含 1 次 sanity）：319 探针 **0 失败**，最大不可用 **0.135s**，最终 200，无 `retry in 5s`。
+   `logs/h3-reload.txt`
+3. **[P2] env_lock 同族排队**：`libapp_python.so` 自报 `appengine_env_isolation=1`（ruby/perl 仍 0），
+   请求期视图=启动期基底+TLS 覆盖表。慢空 python 在飞 → `/py-a/`（带 .env）：**2602.8ms → 1.5ms**；
+   慢空 wsgi → `/py-a/`：2602.7ms → **2.0ms**。同族 wsgi→wsgi 仍 2602ms（进程 env 固有，边界）。
+   `logs/env-probe-{new,before}.txt`
+4. **[P2] ASGI/CPython 全局态**：ASGI 缓存改 C 侧私有 dict（`__cr_cache`，不再进 sys.modules）；
+   sys.path 每请求「去重插入 + 只撤回自己那一项」。200×`/asgi-a/` NPATH 恒定=8、同目录 import OK；
+   恶意应用污染旧键后：BEFORE asgi-a=**500**，NEW=**200**。
+5. **[P2] python 跨引擎 .env 残留**：新增 `crucible_py_ensure_init2`（共享初始化锁内回调，只有真正
+   执行 Py_Initialize 的那次触发），把 `_data` 对齐到启动期基底；v1 保留 ⇒ 旧 .so 兼容。复现序列
+   （lua 带 .env 在飞 → 首次 wsgi 加载初始化 → py-c）：BEFORE `WINDOWMARK=from-lua-A`（NENV=59），
+   NEW `<unset>`（NENV=57）。`logs/cross-engine-residual.txt`
+6. **[P3] sidecar 外部注册表指纹**：spawn 后就绪写 `<sock>.envfp`；跨注册表复用前核验，不一致
+   → 两注册表摘除回收 + 重建。h1 `.env=D` PID 442581 → 改 E → h3 重启 PID 442587 → 随后 3 次
+   h1/h3 均复用 442587（无抖动）。`logs/sidecar-fp.txt`
+
+**回归**：单测（HEAD+本 diff）**516 passed / 0 failed / 1 ignored**（514 基线 + 3 新增；
+1 条环境性失败被 `--skip`，见下）；协议矩阵 9 应用 × h1/h2c/h1-TLS/h2-TLS/h3 **全同**（`logs/matrix.txt`）；
+env 顺序/并发/重叠全 PASS；h2c 8×A+8×B、h3 6×A+6×B 并发 0 bad。
+**官方黑盒套件未跑**：另一 wave-14 agent 的套件实例正占用 36xxx（pid 301722），且共享树 WIP 未收敛；
+建议主会话收敛后补跑。
+
+**部署前必做**：`bash scripts/build_app_engines.sh` 重建引擎。本波产物只落 `~/scratch-p2fix/engines`
+（为不覆盖正在被别家实例使用的 `target/app-engines/`）；旧 .so 无新符号 ⇒ 第 3/5 条不生效。
+
+**跨 scope 发现（未改）**：`src/server/apps/child_registry.rs:266-275` `ps_command` 用
+`ps -axww -o command= -p <pid>`，procps 下 `-p` 被 `-ax` 覆盖 → 返回整张进程表（实测 144 行；
+本机 38 个 php-fpm）。`alive_and_matches` 的 pid 复用防线因此失效，单测
+`kill_all_matches_guard_semantics` 在共享机必失败（HEAD 亦失败，非本波引入）。建议去掉 `-axww`。
+
+---
+
+# 【agent-static3 / 工号 1009 · Wave-14】静态/上传残余收口（2026-10-23）
+
+**scope**：`src/server/static_files.rs`、`upload_api.rs`、`upload_resume.rs`（只改这三个）。
+**纪律**：未 commit/push/checkout/reset/stash/clean；未回退任何人的改动；实例已停、端口已释放。
+
+**修（真机验证）**
+1. **双编码文件名**：`%252e%252e%252f…` 不再以字面名落盘 → **400**（判据：一次 decode 必须是
+   percent-decode 不动点；`100%.txt` 等正常 `%` 名不受影响）。6 变体 h1 + h2 实测；单编码穿越仍 400。
+2. **`Content-Range: bytes 0-0/0`**：裁定 **400**（RFC 9110 §14.4 声明非法；空文件走 `CL:0`）。
+   与 `bytes */0`(400)、`0-0/1`(201)、`0-0/*`(202) 对照，h1/h2 一致；未改代码，补注释+矩阵。
+3. **405 `Allow`**：上传端点 `PUT, POST, PATCH`；静态层在上传面动态列
+   `GET, HEAD, PUT, POST, PATCH`（`upload_api::allows_path` 与分发同判据），普通静态仍 `GET, HEAD`；
+   h1 与 h2c 逐字一致。
+4. **静态缓存「原地改写+还原 mtime」**：`FileId` 加 **ctime**（SMALL_CACHE + FAST_CACHE）。
+   h2c / h1(fastpath OFF) TTL 内立即新内容、原子替换新、未变命中。**ETag 仍是四字段**
+   （`h1_fast::parse_etag_id` 契约，加字段会让快车道全部回退）。
+5. **配额复核**：24 中断后 201、16 在途 503+RA(5)/端口闸门 503+RA(1)、70 闲置淘汰到 63 且不拒新、
+   同 IP 不同目标计入、同目标不同 IP 409→续传 201；+2 条单测（淘汰不误删在途、跨 IP 复用会话）。
+
+**回归**：单测 **519 passed / 0 failed / 1 ignored**（基线 514 + 5 条新测）；65/65 裸 socket 探针；
+全量套件 **296 PASS / 1 偶发 access-log FAIL / 6 SKIP**（PASS1 144/0/6、EXT 112/1、
+GOAWAY 7/0、H3+DNS 24/0、ECS 6/0+3/0；基线 293/0/10）。
+
+**跨 scope 残余（未改，已写报告 §8）**
+- `h1_fast.rs` 自己的 2s 响应缓存仍只比 `(len,ino,mtime)`：默认 h1 上该形态旧视图从**无限期**
+  缩短为**≤2s**（跨 TTL 重填已被 ctime 纠正），TTL 内仍旧。建议 `Id`/`id_of` 加 ctime、
+  填充处改用 lstat 身份。ETag 加 ctime 需同步 `parse_etag_id`（同为 h1_fast scope）。
+- `apps/child_registry.rs`：`ps -axww … -p <pid>` 在本机 WSL procps 上忽略 `-p`、返回整张进程表
+  （实测 `-p 1` 输出 37 行 php-fpm）→ `alive_and_matches` 防误杀判据在 Linux 上失效；
+  单测因此需 PATH 垫片才 519/0。建议 `ps -ww` 去 `-a/-x` 或读 `/proc`。
+- 套件 1 条 access_log 检查偶发（孤立复跑 PASS），与 static/upload 无关。
+
+**交付**：`.agents/1009/reports/static3-wave14.md`、`.agents/1009/fixes/static3-wave14.md`、本节。
+源码 md5：static_files `deed3939…`、upload_api `775453b1…`、upload_resume `3d18c548…`。
+
+---
+
+# 【agent-legacytls / 工号 1009 · Wave-14】NSS + TomCrypt 遗留栈真机构建/握手（2026-10-23）
+
+**scope**：`libs/tls-nss/**`、`libs/tls-tomcrypt/**`、`src/server/tls/{tls_nss,tls_tomcrypt,mod,accept,client_hello,legacy_io}.rs`、`build.rs`（遗留栈段）、`scripts/{build_libtomcrypt.sh,test_tls_stacks.sh,test_sslv2_probe.py,tls_probe.py}`。
+**纪律**：未 commit/push/checkout/reset/stash/clean；未回退任何人的改动；实例已停（27543/27544/27545/27546/27547/27548 均已释放）。
+
+**结论：两条遗留栈在本机（WSL Linux）真正构建 + 完整握手 + HTTP 200，默认构建零加载。**
+
+**修（真机验证）**
+1. **[P0] libtomcrypt ARGTYPE=2 → 4**（`build_libtomcrypt.sh`、`build.rs:186`、`tc_shim.c:30`）：
+   1.18.2/master 的编号里 2 = 打印 warning 后**继续**，ARGCHK 失败会带着 NULL 指针跑 →
+   实测 `rsa_import(NULL)` 段错误(139)；4 才是 return CRYPT_INVALID_ARG。构建脚本新增运行期自检
+   （`ARGTYPE=4 verified — rsa_import(NULL) returned CRYPT_INVALID_ARG`）与旧库识别。
+2. **[P0] NSS relay 用 Unix socketpair → 真实服务里 100% 失败**（`legacy_io.rs`）：
+   `PR_ImportTCPSocket` 接受 AF_UNIX，但 NSS 握手途中按 TCP 处理，返回
+   `PR_ADDRESS_NOT_SUPPORTED_ERROR (-5985)` → `crucible_nss_accept` 恒 null。改为**回环 TCP 对**。
+3. **[P0] 桥接线程在非阻塞 TCP fd 上**（`legacy_io.rs`）：`tokio into_std()` 保留 O_NONBLOCK，
+   `std::io::copy` 首次 WouldBlock 即退出 → TCP→relay 单向死。显式 `set_nonblocking(false)`。
+4. **[P1] SSLv2 密钥调度 "0"/"1" 用反**（`tc_shim.c:136-147`）：按规范
+   CLIENT-WRITE=MD5("1"…)、SERVER-WRITE=MD5("0"…)，同步改 `scripts/test_sslv2_probe.py`。
+5. **[P1] 无 root 构建**（`build.rs`、`build_libtomcrypt.sh`）：NSS_PREFIX/~local 头路径探测；
+   GitHub 不通时回退清华 Ubuntu 源码池；libtommath.a 自动发现并复制到 `target/tls-libs/`。
+6. **[P2] 验证工具**：`tls_probe.py` 新增纯标准库 `sslv3`/`v2compat` 完整握手客户端（本机
+   OpenSSL 3.5 无 SSLv3）；`test_sslv2_probe.py --handshake` 完整 SSLv2；`test_tls_stacks.sh`
+   一键跑两条遗留栈 + 主路径回归 + 分流证据。
+
+**证据（本机 2026-10-23 实跑）**
+- `cargo build --release --features tls,tls_boring,tls_nss,tls_tomcrypt` rc=0（20,942,232 B）；
+  `ldd` → libnss3/libssl3/libnspr4/libnssutil3。
+- `test_tls_stacks.sh`：`PASS=7 FAIL=0`；TLS1.3/1.2 OK、`sslv3`/`v2compat` 完整握手
+  （SSL 3.0 / RC4_128_MD5 / finished=verified / HTTP 200）、SSLv2 完整握手
+  （0x0002 / 010080 / HTTP 200）、截断探针后进程存活。
+- 分流日志：`wire=Boring stack=Boring`、`wire=Nss stack=Nss`、`wire=TomCrypt stack=TomCrypt`，
+  `legacy=nss,tomcrypt`。
+- 默认构建（不带两 feature）：`ldd` 无 NSS/NSPR、`strings` 命中 0、运行 `legacy=none`；
+  SSLv3/v2compat → `stack=Boring`（UNSUPPORTED_PROTOCOL），SSLv2 → soft-drop；TLS1.3 正常。
+- 稳定性：NSS 顺序 50/50、SSLv3 并发 10/10、SSLv2 顺序+并发 20/20；RSS 10.5→9.5 MB、fd 10→10；
+  两 shim 的 ASAN 构建 0 error；`cargo test ... tls::` 43 passed / 0 failed。
+
+**依赖安装（无 root，写进报告）**：
+`aptlocal.sh install-deps libnss3-dev`、`aptlocal.sh install libtommath-dev`；
+`export NSS_PREFIX=$HOME/local/usr`；`sh scripts/build_libtomcrypt.sh`；
+`cargo build ... --features tls,tls_boring,tls_nss,tls_tomcrypt`。
+
+**跨 scope / 未修**：TomCrypt SSLv2 无 SERVER-VERIFY/CLIENT-FINISHED/SERVER-FINISHED，
+真实老客户端互操作未验证（读方向 MAC 只剥不校验；写方向零 padding MAC 合法）；遗留栈每连接
+4 OS 线程 + NSS 握手无 deadline（tls-core P2，需改 C API）。`nightly_complete.sh` /
+`sleep_complete.sh` 的 `rc4_stream_setup` 符号在 1.18.2 仍存在，本轮未破坏。
+
+**交付**：`.agents/1009/reports/legacytls-wave14.md`、`.agents/1009/fixes/legacytls-wave14.md`、本节。
+
+**收尾集成复核（共享树）**：其他 agent 的 WIP 已可编译后，`cargo check --release --bin webserver
+--features tls,tls_boring` → **rc=0（10.34s）**；`cargo test`（PATH 垫片修正 WSL `ps -p` 语义）
+→ **535 passed / 1 failed / 1 ignored**，唯一 failed = `dns_hardening_tests::
+secondary_clauses_writes_acl_and_refresh`（dns scope 在途 WIP）；`static_files`/`upload_api`/
+`upload_resume` 全部用例（含本 agent 5 条新测）**全绿**。修后源码 md5 已更新为
+upload_api `054c26247cd21aba9ab8ce7c8a50fcd5`（仅一行缩进修正；static_files/upload_resume 不变）。
+
+**【agent-runtimes 补记 2026-10-23 02:4x UTC】** 收尾又修一条暴露缺陷：`tsx.rs` 的
+`Cached::Ok` 只存指纹、不校验产物文件，`rm -rf www-apps/tsx/dist` 后 `/tsx/` 会
+永久 404 到重启（真机复现）。现在记录产物清单并在缓存命中前逐个 `is_file()`，
+删除后首个请求自动重编译（真机 200；新增单测 `cached_ok_invalidates_when_product_missing`，
+tsx 单测 8/8、php 单测 3/3）。最终二进制 md5 `aed8f21f1b402cc68f35d52ded01d454`
+（2026-10-23 10:31），最终 `matrix.py both` = **38/38 PASS**；实例保持运行
+（33700，`~/scratch-runtimes/srv.sh`）。注意：**不要在有实例运行时重编 target/app-engines
+下的 .so**（覆盖 mmap 中的 .so 会让运行进程 SIGBUS；本轮收尾曾因此产生一个 core）。
+
+**补记 2**：`www-apps/ruby/init.sh` 增加 `~/local/usr/bin/ruby` 绝对兜底，并把
+`LD_LIBRARY_PATH`/`RUBYLIB` 写进生成的 `deps/bin/index`。原因：deps/ 是 docroot 级，
+共享 `www-apps/**` 的另一个实例（PATH 无 `~/local`）重建 ruby deps 时会删掉
+`deps/bin/index`，把本机 `/ruby/` 打回 502（本轮真机遇到）。剥离环境
+（`env -i PATH=/usr/bin:/bin`）直连 wrapper → `200 hello from ruby path=/`；
+最终矩阵仍 **38/38 PASS**。
+
+**补记 3**：新增仓库内验证脚本 `scripts/verify_app_engines.py`（19 路由 × h1/h2c，
+可选 `--tls`，校验状态码 + 样例特征串 + 引擎标签，退出码可进 CI）。本机
+`--port 33700` → **38 checks, 0 failed**。构建/安装/验证三项均已固化为脚本：
+`scripts/install_app_runtimes.sh`、`scripts/build_app_engines.sh`、
+`scripts/verify_app_engines.py`。

@@ -171,13 +171,33 @@ async fn handle_inner(
                         if let Some(why) = super::batch_cname_conflict(&batch) {
                             return Err(why);
                         }
+                        // 整批交给 BIND 的权威判据验一次（与 add_record 的逐条校验
+                        // 同源，但批量只跑一个进程）。必须在 del_zone_records 之前：
+                        // replace 模式下写到一半失败会留下空分区。
+                        let rows: Vec<super::RecordRow> = recs
+                            .iter()
+                            .map(|r| super::RecordRow {
+                                id: 0,
+                                zone: name.clone(),
+                                line: String::new(),
+                                name: r.name.clone(),
+                                rtype: r.rtype.to_ascii_uppercase(),
+                                ttl: i64::from(r.ttl),
+                                rdata: r.rdata.clone(),
+                            })
+                            .collect();
+                        super::check_zone_snippet(&name, &rows)
+                            .map_err(|e| format!("{e:#}"))?;
                         if mode == "replace" {
                             del_zone_records(&name).map_err(|e| e.to_string())?;
                         }
                         let mut n = 0usize;
                         for r in &recs {
-                            add_record(&name, "", &r.name, &r.rtype, r.ttl, &r.rdata)
-                                .map_err(|e| e.to_string())?;
+                            // 批量已验过整份 zone，逐条不再 fork named-checkzone。
+                            super::add_record_unchecked(
+                                &name, "", &r.name, &r.rtype, r.ttl, &r.rdata,
+                            )
+                            .map_err(|e| e.to_string())?;
                             n += 1;
                         }
                         // 本 match 各分支统一返回 ()（函数尾部回 {"ok":true}），

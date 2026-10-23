@@ -163,17 +163,20 @@ static const char *g_shim_src =
     "    def __getattr__(self, name):\n"
     "        return getattr(self._real, name)\n"
     "class _CrucibleEnv(_cabc.MutableMapping):\n"
-    "    def __init__(self, real):\n"
+    "    def __init__(self, real, base):\n"
     "        self._real = real\n"
+    "        self._base = base\n"
     "    def _ov(self):\n"
     "        return getattr(_c_tls, 'env', None)\n"
     "    def __getitem__(self, k):\n"
     "        ov = self._ov()\n"
-    "        if ov is not None and k in ov:\n"
-    "            v = ov[k]\n"
-    "            if v is None:\n"
-    "                raise KeyError(k)\n"
-    "            return v\n"
+    "        if ov is not None:\n"
+    "            if k in ov:\n"
+    "                v = ov[k]\n"
+    "                if v is None:\n"
+    "                    raise KeyError(k)\n"
+    "                return v\n"
+    "            return self._base[k]\n"
     "        return self._real[k]\n"
     "    def __setitem__(self, k, v):\n"
     "        ov = self._ov()\n"
@@ -183,35 +186,22 @@ static const char *g_shim_src =
     "            self._real[k] = v\n"
     "    def __delitem__(self, k):\n"
     "        ov = self._ov()\n"
-    "        if ov is not None and k in ov:\n"
-    "            del ov[k]\n"
+    "        if ov is not None:\n"
+    "            ov[k] = None\n"
     "            return\n"
     "        del self._real[k]\n"
     "    def __iter__(self):\n"
     "        ov = self._ov()\n"
-    "        seen = set()\n"
-    "        if ov is not None:\n"
-    "            for k in ov:\n"
-    "                seen.add(k)\n"
-    "                if ov[k] is not None:\n"
-    "                    yield k\n"
-    "        for k in self._real:\n"
-    "            if k not in seen:\n"
-    "                yield k\n"
+    "        if ov is None:\n"
+    "            return iter(self._real)\n"
+    "        return iter(self._merged_dict())\n"
     "    def __len__(self):\n"
     "        ov = self._ov()\n"
     "        if ov is None:\n"
     "            return len(self._real)\n"
-    "        n = len(self._real)\n"
-    "        for k in ov:\n"
-    "            if ov[k] is None:\n"
-    "                if k in self._real:\n"
-    "                    n -= 1\n"
-    "            elif k not in self._real:\n"
-    "                n += 1\n"
-    "        return n\n"
-    "    def copy(self):\n"
-    "        d = dict(self._real)\n"
+    "        return len(self._merged_dict())\n"
+    "    def _merged_dict(self):\n"
+    "        d = dict(self._base)\n"
     "        ov = self._ov()\n"
     "        if ov is not None:\n"
     "            for k, v in ov.items():\n"
@@ -220,7 +210,10 @@ static const char *g_shim_src =
     "                else:\n"
     "                    d[k] = v\n"
     "        return d\n"
-    "_cos.environ = _CrucibleEnv(_cos.environ)\n"
+    "    def copy(self):\n"
+    "        ov = self._ov()\n"
+    "        return self._merged_dict() if ov is not None else dict(self._real)\n"
+    "_cos.environ = _CrucibleEnv(_cos.environ, _crucible_base)\n"
     "_csys.stdout = _CrucibleOut(_csys.stdout)\n"
     "_csys.stdin = _CrucibleIn(_csys.stdin)\n"
     "def _cr_set(out, inp, env):\n"
@@ -235,20 +228,29 @@ static const char *g_shim_src =
 static PyObject *g_shim_set;   /* _cr_set(out, inp, env) */
 static PyObject *g_shim_clear; /* _cr_clear() */
 
-/* ---- 首次安装 shim 时清理 os.environ 的「初始化快照」----
+/* ---- 解释器全局 os.environ 视图 ↔ 启动期基底 ----
  *
  * CPython 的 os.environ 是 import 时从 posix.environ 拷出的**快照**（_data），
  * 之后的 setenv 它看不见。嵌入解释器在**第一个请求**里才 Py_Initialize —— 那一刻
- * env_lock 正把该请求的 .env 装在 C environ 里，于是这些键被永久烤进 os.environ
- * 的视图。请求级 TLS 覆盖表（_CrucibleEnv）能让每个请求看到自己的 .env，但
- * **没有 .env 的请求**会回退到这份陈旧视图 ⇒ 看到别的应用的键（真机：/py-c/
- * 读到 from-py-A）。这里在首次安装 shim 时把**本请求**的 .env 键从真实视图里
- * 抹掉（有启动期基底值的还原成基底值），给解释器一个干净基线。
+ * 进程 env 里可能装着**别的引擎**（wsgi/asgi/uwsgi）请求期 `.env`，于是这些键被
+ * 永久烤进 os.environ 的视图。旧实现只在首次安装 shim 时清理**本请求**的键：
+ * 别的引擎留下的键（本请求没有的不删）会一直留在视图里 —— 真机组合：
+ * wsgi 带 `.env` 先跑过，随后 python 引擎的「无 .env」应用读到 `WINDOWMARK=...`。
  *
- * 只操作 _data（PyDict_DelItem/SetItem），**不** unsetenv：C environ 里 .env 键
- * 的安装/卸载只归 Rust env_lock 管（与 pyembed 的同步窗口同一纪律）。
+ * 正确语义：**真正执行 Py_Initialize 的那一刻**（在共享初始化锁内，见
+ * py_env_scrub_on_init）把视图对齐到「启动期基底」（appengine_set_base_env 交来的
+ * 快照，绝不含任何请求期 .env）：
+ *   * 视图里不在基底中的键 → 删除（初始化瞬间装进 C environ 的请求期 .env）；
+ *   * 基底键与视图值不同/缺失 → 写回基底值（运维环境照旧可见）。
+ * 为什么是「初始化时一次」而不是每请求：每请求清理会在别的引擎（wsgi/asgi）
+ * 同步窗口写入后把它们刚写的键删掉（跨引擎 `<unset>` 竞态）；初始化时锁内的
+ * 清理则天然互斥（等待初始化的引擎还没开始同步）。
+ * 本请求 `.env` 不写进视图：它只进线程本地覆盖表（见 py_extra_env_cb），并发请求
+ * 之间不串值。整个函数只碰 `_data`（PyDict_*，纯 C），不 putenv/unsetenv ——
+ * C environ 的安装/卸载只归宿主的 env_lock 管（与 pyembed 的同步窗口同一纪律）。
  * 键值是 fsencode 后的 bytes（POSIX _Environ 的命名空间）。 */
-static const char *py_base_env_lookup(const char *key, size_t klen)
+#ifndef _WIN32
+static const char *py_base_env_lookup(const char *key, size_t klen, size_t *vlen)
 {
     const char *base = appengine_base_env_block();
     const char *p;
@@ -258,41 +260,52 @@ static const char *py_base_env_lookup(const char *key, size_t klen)
     for (p = base; *p != '\0'; p += strlen(p) + 1) {
         const char *eq = strchr(p, '=');
 
-        if (eq != NULL && (size_t)(eq - p) == klen && memcmp(p, key, klen) == 0)
+        if (eq != NULL && (size_t)(eq - p) == klen && memcmp(p, key, klen) == 0) {
+            if (vlen != NULL)
+                *vlen = strlen(eq + 1);
             return eq + 1;
+        }
     }
     return NULL;
 }
 
-static int py_env_scrub_cb(void *ctx, const char *k, const char *v)
+/* 启动期基底 → Python dict（str 键值）。shim 的请求期环境视图只读它（+ TLS 覆盖
+ * 表），**不回退到全局 `_data`** —— 后者可能正装着别的引擎（wsgi/asgi）的 `.env`
+ * 窗口值，而 python 引擎自报 env-free 后会与它们并发执行（读别人的秘密）。
+ * 须持 GIL。 */
+static PyObject *py_base_env_dict(void)
 {
-    PyObject *data = (PyObject *)ctx;
-    PyObject *key, *val;
-    const char *bv;
+    const char *base = appengine_base_env_block();
+    const char *p;
+    PyObject *d;
 
-    (void)v;
-    if (data == NULL || k == NULL)
-        return 1;
-    key = PyBytes_FromString(k);
-    if (key == NULL) {
+    d = PyDict_New();
+    if (d == NULL) {
         PyErr_Clear();
-        return 0;
+        return NULL;
     }
-    bv = py_base_env_lookup(k, strlen(k));
-    if (bv != NULL) {
-        val = PyBytes_FromString(bv);
-        if (val != NULL) {
-            if (PyDict_SetItem(data, key, val) != 0)
+    for (p = base; base != NULL && *p != '\0'; p += strlen(p) + 1) {
+        const char *eq = strchr(p, '=');
+        PyObject *k, *v;
+
+        if (eq == NULL || eq == p)
+            continue;
+        k = PyUnicode_FromStringAndSize(p, (Py_ssize_t)(eq - p));
+        if (k == NULL) {
+            PyErr_Clear();
+            continue;
+        }
+        v = PyUnicode_FromString(eq + 1);
+        if (v != NULL) {
+            if (PyDict_SetItem(d, k, v) != 0)
                 PyErr_Clear();
-            Py_DECREF(val);
+            Py_DECREF(v);
         } else {
             PyErr_Clear();
         }
-    } else if (PyDict_DelItem(data, key) != 0) {
-        PyErr_Clear(); /* 键本来就不在视图里 */
+        Py_DECREF(k);
     }
-    Py_DECREF(key);
-    return 0;
+    return d;
 }
 
 /* 取解释器真实的 os.environ 底层 dict（代理形态沿 `_real` 链向下找 `_data`，
@@ -333,6 +346,103 @@ static PyObject *py_real_environ_data(void)
     return data;
 }
 
+/* 把 os.environ 视图对齐到启动期基底（见上面的长注释）。须持 GIL。 */
+static void py_env_reconcile_to_base(void)
+{
+    PyObject *data;
+    PyObject *keys;
+    Py_ssize_t i, n;
+    const char *base;
+
+    base = appengine_base_env_block();
+    if (base == NULL)
+        return; /* 宿主未提供基底（旧宿主）：保持旧行为，绝不清空视图 */
+    data = py_real_environ_data();
+    if (data == NULL)
+        return;
+    keys = PyDict_Keys(data);
+    if (keys == NULL) {
+        PyErr_Clear();
+        Py_DECREF(data);
+        return;
+    }
+    n = PyList_GET_SIZE(keys);
+    for (i = 0; i < n; i++) {
+        PyObject *key = PyList_GET_ITEM(keys, i); /* 借用 */
+        PyObject *cur;
+        const char *k, *bv;
+        Py_ssize_t klen;
+        size_t vlen = 0;
+
+        if (!PyBytes_Check(key))
+            continue; /* 非 POSIX 形态（例如 Windows 大写化）：不碰 */
+        k = PyBytes_AS_STRING(key);
+        klen = PyBytes_GET_SIZE(key);
+        bv = py_base_env_lookup(k, (size_t)klen, &vlen);
+        if (bv == NULL) {
+            if (PyDict_DelItem(data, key) != 0)
+                PyErr_Clear();
+            continue;
+        }
+        cur = PyDict_GetItem(data, key); /* 借用 */
+        if (cur != NULL && PyBytes_Check(cur)) {
+            char *cs = NULL;
+            Py_ssize_t cn = 0;
+
+            if (PyBytes_AsStringAndSize(cur, &cs, &cn) == 0 && (size_t)cn == vlen &&
+                memcmp(cs, bv, vlen) == 0)
+                continue; /* 已与基底一致 */
+        }
+        PyErr_Clear();
+        {
+            PyObject *val = PyBytes_FromStringAndSize(bv, (Py_ssize_t)vlen);
+
+            if (val == NULL) {
+                PyErr_Clear();
+                continue;
+            }
+            if (PyDict_SetItem(data, key, val) != 0)
+                PyErr_Clear();
+            Py_DECREF(val);
+        }
+    }
+    Py_DECREF(keys);
+    /* 基底里有、视图里没有的键：补上（无 .env 的应用仍要看到运维环境）。 */
+    {
+        const char *p;
+
+        for (p = base; *p != '\0'; p += strlen(p) + 1) {
+            const char *eq = strchr(p, '=');
+            PyObject *key, *val;
+
+            if (eq == NULL || eq == p)
+                continue;
+            key = PyBytes_FromStringAndSize(p, (Py_ssize_t)(eq - p));
+            if (key == NULL) {
+                PyErr_Clear();
+                continue;
+            }
+            if (PyDict_Contains(data, key) == 1) {
+                Py_DECREF(key);
+                continue;
+            }
+            PyErr_Clear();
+            val = PyBytes_FromString(eq + 1);
+            if (val != NULL) {
+                if (PyDict_SetItem(data, key, val) != 0)
+                    PyErr_Clear();
+                Py_DECREF(val);
+            } else {
+                PyErr_Clear();
+            }
+            Py_DECREF(key);
+        }
+    }
+    PyErr_Clear();
+    Py_DECREF(data);
+}
+#endif /* !_WIN32 */
+
 /* 安装 shim；失败返回 -1（已经带着异常，调用方清掉并显式报错）。
  * extra 仅用于**首次**安装时清理初始化快照（见上）。 */
 #ifndef _WIN32
@@ -352,6 +462,7 @@ static int python_shim_install(const char *extra)
     PyObject *ns, *r;
     int rc = 0;
 
+    (void)extra; /* 请求级 .env 由 TLS 覆盖表负责；视图对齐见 py_env_scrub_on_init */
     if (g_shim_set != NULL)
         return 0;
 #ifndef _WIN32
@@ -373,6 +484,22 @@ static int python_shim_install(const char *extra)
         rc = -1;
         goto out;
     }
+    /* shim 源码引用 `_crucible_base`（启动期基底；请求期视图 = 它 + TLS 覆盖表）。 */
+    {
+        PyObject *base = NULL;
+#ifndef _WIN32
+        base = py_base_env_dict();
+#endif
+        if (base == NULL)
+            base = PyDict_New();
+        if (base != NULL) {
+            if (PyDict_SetItemString(ns, "_crucible_base", base) != 0)
+                PyErr_Clear();
+            Py_DECREF(base);
+        } else {
+            PyErr_Clear();
+        }
+    }
     r = PyRun_StringFlags(g_shim_src, Py_file_input, ns, ns, NULL);
     if (r == NULL) {
         PyErr_Print();
@@ -393,16 +520,9 @@ static int python_shim_install(const char *extra)
     Py_INCREF(g_shim_clear);
     Py_DECREF(ns); /* 函数对象经 __globals__ 自持 shim 命名空间 */
 
-    /* 只在首次安装（= 解释器初始化后的第一个请求）做一次：把本请求的 .env
-     * 从真实 os.environ 快照里清掉，避免后续无 .env 的应用看到残值。 */
-    {
-        PyObject *data = py_real_environ_data();
-
-        if (data != NULL) {
-            (void)appengine_extra_env_foreach(extra, py_env_scrub_cb, data);
-            Py_DECREF(data);
-        }
-    }
+    /* 解释器视图的清理不在这里做：它由**真正执行 Py_Initialize 的那一次**在共享
+     * 初始化锁内完成（见 py_env_scrub_on_init / py_env_reconcile_to_base）—— 只清
+     * 本请求键的旧做法会让别的引擎先初始化时留下的 .env 残值永久可见。 */
 out:
 #ifndef _WIN32
     pthread_mutex_lock(&g_shim_mtx);
@@ -412,6 +532,29 @@ out:
 #endif
     return rc;
 }
+
+/* 初始化回调（crucible_pyinit_ensure_cb 的 v2 形状）：在共享初始化锁内、初始化
+ * 线程已 SaveThread 之后调用 —— 这里自己取/放 GIL。**只在真正执行 Py_Initialize
+ * 的那一次**运行，因此不会与其它引擎在飞的 `.env` 窗口竞速（等待初始化的引擎
+ * 还被挡在锁外，尚未同步视图）。 */
+#ifndef _WIN32
+static void py_env_scrub_on_init(void)
+{
+    PyGILState_STATE gil;
+
+    if (!Py_IsInitialized())
+        return;
+    gil = PyGILState_Ensure();
+    py_env_reconcile_to_base();
+    PyGILState_Release(gil);
+}
+#endif /* !_WIN32 */
+
+#ifdef _WIN32
+#define CRUCIBLE_PY_SCRUB_ON_INIT NULL
+#else
+#define CRUCIBLE_PY_SCRUB_ON_INIT py_env_scrub_on_init
+#endif
 
 /* 脚本所在目录（写进 out，返回 out 或 NULL）。 */
 static const char *script_dirname(const char *path, char *out, size_t outsz)
@@ -531,9 +674,9 @@ static int run_python_inprocess(const char *script, const char *method, const ch
     /* 跨 .so 共享初始化锁：并发冷启动只有一个线程真正 Py_Initialize。
      * PyEval_SaveThread 的返回类型是 PyThreadState*，共享 ABI 用 void*（宽度一致）；
      * 新 GCC（15）把「函数指针类型不兼容」从告警升级为错误，故显式转换。 */
-    if (crucible_pyinit_ensure(Py_IsInitialized, Py_Initialize,
-                               (void *(*)(void))PyEval_SaveThread, errbuf,
-                               sizeof(errbuf)) != 0) {
+    if (crucible_pyinit_ensure_cb(Py_IsInitialized, Py_Initialize,
+                                  (void *(*)(void))PyEval_SaveThread,
+                                  CRUCIBLE_PY_SCRUB_ON_INIT, errbuf, sizeof(errbuf)) != 0) {
         fprintf(stderr, "scriptffi: CPython 初始化失败: %s\n", errbuf);
         return -1;
     }
@@ -826,8 +969,11 @@ static int ruby_exec_job(struct ruby_job *job)
             (void)appengine_headers_foreach(headers, ruby_env_put_http_cb, &hctx);
         }
     }
-    /* 请求体 → $__crucible_body（rb_str_new 显式长度，NUL 不截断）→ $stdin。 */
-    rb_gv_set(rb_intern("$__crucible_body"),
+    /* 请求体 → $__crucible_body（rb_str_new 显式长度，NUL 不截断）→ $stdin。
+     * 注意 rb_gv_set 的形参是 **const char***（不是 ID）：旧代码传 rb_intern(...)
+     * 在 Ruby 3.3 头文件 + GCC 14+（int-conversion 默认报错）下直接编译失败，
+     * 导致 CRUCIBLE_ENABLE_RUBY_EMBED=1 永远只能降级 embed-missing。 */
+    rb_gv_set("$__crucible_body",
               rb_str_new(body != NULL ? body : "", (long)body_len));
     /* Capture $stdout with StringIO when available; else eval and stringify.
      * 请求结束（eval 的 ensure）恢复 $stdout/$stdin，不把捕获缓冲留在全局。 */
@@ -1082,6 +1228,14 @@ static int run_perl_inprocess(const char *script, const char *method, const char
         my_perl = perl_alloc();
         perl_construct(my_perl);
     }
+    /* Debian/Ubuntu 的 perl 是 **ithreads** 构建：解释器指针/PL_* 是**每线程**的
+     * TLS（`PL_curinterp`）。app_ffi 的通用池有 4..8 个线程，第一次请求在哪个
+     * 线程建解释器、后续请求很可能落到别的线程 —— 只加互斥锁**不够**：没有
+     * PERL_SET_CONTEXT 的线程 `PL_curinterp == NULL`，下一次 PL_* 访问就在
+     * libperl 里 SIGSEGV（真机 2026-10-23：h1 第一次 200，随后 h2c 请求
+     * `segfault at 0x40 in libperl.so.5.40`，整个 webserver 被打死）。
+     * 每次进入锁后都显式 set：线程无关、幂等（非 ithreads 构建上是 no-op）。 */
+    PERL_SET_CONTEXT(my_perl);
     {
         char *args[] = {"", (char *)script};
         perl_parse(my_perl, NULL, 2, args, NULL);
@@ -1306,6 +1460,29 @@ int appengine_execute(
     appengine_result_set_body(out, result, result_len);
     free(result);
     return 0;
+}
+
+/*
+ * `.env` 隔离自报（可选符号，见 appengine.h）。
+ *
+ * 只有 **python** 构建可以回答 1：它把每请求 `.env` 从 `extra` JSON 直接落进
+ * 线程本地覆盖表（`_CrucibleEnv`），并把解释器全局 `os.environ` 视图对齐到
+ * 启动期基底（`py_env_reconcile_to_base`）—— 请求数据从不经进程 env，故无需
+ * 宿主的全局 env 锁，慢的「无 .env」请求也不会再挡住随后带 `.env` 的 python 请求。
+ *
+ * ruby/perl 构建仍以进程 ENV 为唯一 `.env` 通道（`run_*_inprocess` 不解析 extra），
+ * 必须留在 env 锁内。没有编译期语言（按扩展名推断的通用 .so）同样保守地回答 0。
+ *
+ * 诚实边界：它声明的是**引擎自身**不读写 environ 承载请求数据；应用代码自己调
+ * `os.putenv`/`ctypes` 直接改 C environ 属应用自伤（与 cgi 的 env_isolation 同类）。
+ */
+int appengine_env_isolation(void)
+{
+#if defined(CRUCIBLE_HAVE_PYTHON) && defined(CRUCIBLE_SCRIPT_LANG)
+    return strcmp(CRUCIBLE_SCRIPT_LANG, "python") == 0 ? 1 : 0;
+#else
+    return 0;
+#endif
 }
 
 void appengine_shutdown(void) { g_ready = 0; }

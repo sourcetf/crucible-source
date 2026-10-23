@@ -579,6 +579,7 @@ mod tests {
             qmux: false,
             connect_udp: false,
             access_log: None,
+            ..Default::default()
         };
         let app = app_with_paths(&["/cgis"]);
         // 存在 → Ok（正常路径不受影响）

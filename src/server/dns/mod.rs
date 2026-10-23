@@ -785,11 +785,37 @@ fn valid_acl_item(s: &str) -> bool {
     false
 }
 
-/// 递归上游转发器（`forwarders { ...; };`）的单项：只接受 IPv4/IPv6 字面量。
-/// BIND 的 forwarders 列表里没有主机名/端口写法，拼错会让 named 拒载整份配置。
-fn valid_forwarder(s: &str) -> bool {
+/// 递归上游转发器（`forwarders { ...; };`）的单项。
+///
+/// BIND 9.20 的 forwarders 支持 `address [port <n>]`；此前这里只接受裸 IP，
+/// 于是「上游在非 53 端口」（容器化/本地递归器/测试用伪上游）**无法配置** ——
+/// 面板保存直接报 bad forwarder，只能把测试环境的上游硬塞到 53。现在接受
+/// `ip`、`ip:port`、`[v6]:port`（与 slave primaries 同一套写法），输出时翻译成
+/// BIND 的 `ip port N`（见 [`forwarder_for_named`]）。
+fn forwarder_for_named(s: &str) -> Option<String> {
     let s = s.trim();
-    !s.is_empty() && s.parse::<std::net::IpAddr>().is_ok()
+    if s.parse::<std::net::IpAddr>().is_ok() {
+        return Some(s.to_string());
+    }
+    if let Some(rest) = s.strip_prefix('[') {
+        if let Some((ip, port)) = rest.split_once("]:") {
+            if ip.parse::<std::net::Ipv6Addr>().is_ok() && port.parse::<u16>().is_ok() {
+                return Some(format!("{ip} port {port}"));
+            }
+        }
+        return None;
+    }
+    // 裸 IPv6 已在上面的 parse::<IpAddr> 分支处理；这里只剩 IPv4:port
+    if let Some((ip, port)) = s.rsplit_once(':') {
+        if ip.parse::<std::net::Ipv4Addr>().is_ok() && port.parse::<u16>().is_ok() {
+            return Some(format!("{ip} port {port}"));
+        }
+    }
+    None
+}
+
+fn valid_forwarder(s: &str) -> bool {
+    forwarder_for_named(s).is_some()
 }
 
 /// slave primaries：host 或 host:port / [ipv6]:port；拒绝 named.conf 元字符。
@@ -1131,6 +1157,16 @@ pub fn list_secondary_records(zone: &str) -> Result<Vec<RecordRow>> {
 /// 且判据无歧义的几类：A/AAAA 必须是 IP 字面量，CNAME/NS/PTR 的目标必须是合法域名。
 pub(crate) fn validate_record_rdata(rtype: &str, rdata: &str) -> Result<()> {
     let d = rdata.trim();
+    let toks: Vec<&str> = d.split_whitespace().collect();
+    // 域名目标：允许尾点、大小写无关；下划线（DKIM/服务记录）与 `*` 在 valid_name 里合法。
+    let domain_ok = |s: &str| valid_name(s.trim_end_matches('.'));
+    let hex_ok = |s: &str| !s.is_empty() && s.len() % 2 == 0 && s.bytes().all(|b| b.is_ascii_hexdigit());
+    let b64_ok = |s: &str| {
+        !s.is_empty()
+            && s.bytes().all(|b| {
+                b.is_ascii_alphanumeric() || matches!(b, b'+' | b'/' | b'=' | b'-' | b'_')
+            })
+    };
     match rtype.trim().to_ascii_uppercase().as_str() {
         "A" => {
             if d.parse::<std::net::Ipv4Addr>().is_err() {
@@ -1146,6 +1182,74 @@ pub(crate) fn validate_record_rdata(rtype: &str, rdata: &str) -> Result<()> {
             let target = d.trim_end_matches('.');
             if !valid_name(target) {
                 bail!("{rtype} 记录的目标不是合法域名（收到 {rdata:?}）");
+            }
+        }
+        // MX / SRV 的 rdata 是多字段的：只写一个数字（漏掉目标）会让 named 以
+        // "MX record mail is invalid" 拒载**整个分区**，而旧实现完全不校验这类。
+        "MX" => {
+            if toks.len() != 2 {
+                bail!("MX 记录的 rdata 必须是「优先级 目标域名」（收到 {rdata:?}）");
+            }
+            if toks[0].parse::<u16>().is_err() {
+                bail!("MX 优先级必须是 0..65535（收到 {:?}）", toks[0]);
+            }
+            if !domain_ok(toks[1]) {
+                bail!("MX 目标不是合法域名（收到 {:?}）", toks[1]);
+            }
+        }
+        "SRV" => {
+            if toks.len() != 4 {
+                bail!("SRV 记录的 rdata 必须是「优先级 权重 端口 目标」（收到 {rdata:?}）");
+            }
+            if toks[..3].iter().any(|t| t.parse::<u16>().is_err()) {
+                bail!("SRV 的前三个字段必须是 0..65535 的数字（收到 {rdata:?}）");
+            }
+            // 目标 "." 表示「服务不提供」（RFC 2782 合法）
+            if toks[3] != "." && !domain_ok(toks[3]) {
+                bail!("SRV 目标不是合法域名（收到 {:?}）", toks[3]);
+            }
+        }
+        "CAA" => {
+            if toks.len() < 3 || toks[0].parse::<u8>().is_err() {
+                bail!("CAA 记录的 rdata 必须是「flags tag 值」（收到 {rdata:?}）");
+            }
+            if toks[1].is_empty()
+                || !toks[1].bytes().all(|b| b.is_ascii_alphanumeric())
+            {
+                bail!("CAA tag 只能是字母数字（收到 {:?}）", toks[1]);
+            }
+        }
+        "TLSA" => {
+            if toks.len() != 4 || toks[..3].iter().any(|t| t.parse::<u8>().is_err()) {
+                bail!("TLSA 记录的 rdata 必须是「usage selector matching 证书数据」（收到 {rdata:?}）");
+            }
+            let data: String = toks[3..].join("");
+            if !hex_ok(&data) {
+                bail!("TLSA 证书数据必须是偶数长度的十六进制（收到 {:?}）", toks[3]);
+            }
+        }
+        "DS" | "CDS" => {
+            if toks.len() != 4
+                || toks[0].parse::<u16>().is_err()
+                || toks[1].parse::<u8>().is_err()
+                || toks[2].parse::<u8>().is_err()
+            {
+                bail!("{rtype} 记录的 rdata 必须是「keytag 算法 摘要类型 摘要」（收到 {rdata:?}）");
+            }
+            if !hex_ok(toks[3]) {
+                bail!("{rtype} 摘要必须是偶数长度的十六进制（收到 {:?}）", toks[3]);
+            }
+        }
+        "DNSKEY" | "CDNSKEY" => {
+            if toks.len() != 4
+                || toks[0].parse::<u16>().is_err()
+                || toks[1].parse::<u8>().is_err()
+                || toks[2].parse::<u8>().is_err()
+            {
+                bail!("{rtype} 记录的 rdata 必须是「flags 协议 算法 公钥」（收到 {rdata:?}）");
+            }
+            if !b64_ok(toks[3]) {
+                bail!("{rtype} 公钥必须是 base64（收到 {:?}）", toks[3]);
             }
         }
         _ => {}
@@ -1187,7 +1291,60 @@ pub(crate) fn batch_cname_conflict(recs: &[(String, String)]) -> Option<String> 
     None
 }
 
-pub fn add_record(zone: &str, line: &str, name: &str, rtype: &str, ttl: u32, rdata: &str) -> Result<()> {
+/// 用 `named-checkzone` 校验「按当前/候选记录集生成出来的 zone 文本」。
+///
+/// 为什么必须做：`validate_record_rdata` 只能覆盖判据无歧义的字段；而 rdata 是**逐行
+/// 拼进** master 文件的文本，`MX` 少写目标、`SRV` 权重写成字母、`CAA` 引号不配对等
+/// 任何一处都会让 named 以 "not loaded due to errors" 拒载**整个分区**，而
+/// `rndc reload` 仍然返回成功、面板回 `{"ok":true}` —— 从面板看一切正常，dig 查什么
+/// 都是 SERVFAIL。`named-checkzone` 是 BIND 自己的权威判据，在**写库之前**跑一遍，
+/// 把「静默拒载」变成面板可见的错误。
+///
+/// 工具缺失时返回 Ok（跳过）：生产 OpenBSD base 与各 Linux 发行版的 bind9-utils 都带
+/// 它；不能因为测试机没装就让所有记录写入失败（此时仍有按类型校验兜底）。
+fn check_zone_snippet(zone: &str, recs: &[RecordRow]) -> Result<()> {
+    let bin = checkzone_bin();
+    if !Path::new(&bin).is_file() {
+        return Ok(());
+    }
+    let z = zone.trim_end_matches('.');
+    let text = gen_zone_file_monotonic_ext(z, "master", recs, None, &[]);
+    let dir = state_root().join("tmp");
+    std::fs::create_dir_all(&dir)?;
+    let tmp = tmp_path_for(&dir.join("checkzone.zone"));
+    write_new_0600(&tmp, text.as_bytes())?;
+    let out = std::process::Command::new(&bin)
+        .args(["-o", "/dev/null", z])
+        .arg(&tmp)
+        .output();
+    let _ = std::fs::remove_file(&tmp);
+    match out {
+        Ok(o) if o.status.success() => Ok(()),
+        Ok(o) => {
+            // named-checkzone 的错误常常打在 stdout（"dns_rdata_fromtext: file:line:
+            // near 'x': extra input text"），stderr 可能为空 —— 两路都收，否则面板只看到
+            // 一个没有任何信息的 "named-checkzone 拒绝"（真实机踩过）。
+            let mut msg = String::from_utf8_lossy(&o.stderr).into_owned();
+            msg.push_str(&String::from_utf8_lossy(&o.stdout));
+            bail!(
+                "named-checkzone 拒绝该记录（{bin}）：{}",
+                last_lines(msg.trim(), 6)
+            );
+        }
+        // 工具存在但无法执行（权限/架构）：不要因此拒绝所有写入，交给按类型校验。
+        Err(_) => Ok(()),
+    }
+}
+
+fn add_record_impl(
+    zone: &str,
+    line: &str,
+    name: &str,
+    rtype: &str,
+    ttl: u32,
+    rdata: &str,
+    check_zone: bool,
+) -> Result<()> {
     if !valid_name(zone) {
         bail!("bad zone name {zone:?}");
     }
@@ -1241,11 +1398,47 @@ pub fn add_record(zone: &str, line: &str, name: &str, rtype: &str, ttl: u32, rda
             bail!("{name} 已有 CNAME 记录，不能再添加其它类型（RFC1034 §3.6.2，named 会拒载整个分区）");
         }
     }
+    // BIND 权威判据：把「现有记录 + 候选记录」生成成一份临时 zone，用
+    // named-checkzone 验一遍。放在 INSERT 之前 —— 坏记录不入库，不会留下
+    // 「每次 reconcile 都失败、只能手工删库」的毒行。
+    if check_zone {
+        let mut candidate: Vec<RecordRow> = list_records(zone)?
+            .into_iter()
+            .filter(|r| r.line == line)
+            .collect();
+        candidate.push(RecordRow {
+            id: 0,
+            zone: zone.to_string(),
+            line: line.to_string(),
+            name: name.to_string(),
+            rtype: rtype_u.clone(),
+            ttl: i64::from(ttl),
+            rdata: rdata.to_string(),
+        });
+        check_zone_snippet(zone, &candidate)?;
+    }
     conn.execute(
         "INSERT INTO records(zone,line,name,rtype,ttl,rdata) VALUES(?1,?2,?3,?4,?5,?6)",
         rusqlite::params![zone, line, name, &rtype_u, ttl as i64, rdata],
     )?;
     Ok(())
+}
+
+pub fn add_record(zone: &str, line: &str, name: &str, rtype: &str, ttl: u32, rdata: &str) -> Result<()> {
+    add_record_impl(zone, line, name, rtype, ttl, rdata, true)
+}
+
+/// 批量导入专用：跳过逐条 `named-checkzone`（导入方在**删旧记录之前**对整批跑一次）。
+/// 其它校验（类型/rdata/CNAME 共存）与 [`add_record`] 完全相同。
+pub(super) fn add_record_unchecked(
+    zone: &str,
+    line: &str,
+    name: &str,
+    rtype: &str,
+    ttl: u32,
+    rdata: &str,
+) -> Result<()> {
+    add_record_impl(zone, line, name, rtype, ttl, rdata, false)
 }
 
 pub fn del_record(id: i64) -> Result<()> {
@@ -1634,8 +1827,7 @@ fn forwarders_clause(cfg: &DnsConfig) -> String {
     let items: Vec<String> = cfg
         .forwarders
         .iter()
-        .map(|s| s.trim())
-        .filter(|s| valid_forwarder(s))
+        .filter_map(|s| forwarder_for_named(s))
         .map(|s| format!("{s};"))
         .collect();
     if items.is_empty() {
@@ -1672,9 +1864,14 @@ fn secondary_clauses(z: &ZoneRow) -> String {
         s.push_str(&format!(" allow-notify {{ {list} }}; allow-transfer {{ {list} }};"));
     }
     if (1..=8760).contains(&z.refresh_hours) {
+        // BIND 的 zone 级 `min-refresh-time`/`max-refresh-time` 只接受**数字**（秒），
+        // 不接受 `1h` 这类 duration 单位 —— 旧实现写成 `{}h`，于是**任何** slave 分区
+        // 都会让 named-checkconf / rndc reconfig 报
+        // `expected number near '1h'`，整份 named.conf 不生效（不只是该从区）。
+        // 真实机复现：面板添加 slave.test 后 reconfig 返回 unexpected token。
+        let secs = z.refresh_hours.saturating_mul(3600);
         s.push_str(&format!(
-            " min-refresh-time {}h; max-refresh-time {}h;",
-            z.refresh_hours, z.refresh_hours
+            " min-refresh-time {secs}; max-refresh-time {secs};"
         ));
     }
     s
@@ -1733,7 +1930,7 @@ pub fn gen_named_conf(cfg: &DnsConfig, zones: &[ZoneRow]) -> String {
     // AXFR 传出全局白名单（需求 6）；ixfr 增量语义；minimal-responses 提吞吐
     // key-directory 属 options 层（9.20 dnssec-policy 内不接受，named -g 探活证实）
     s.push_str(&format!(
-        "\n  allow-query {{ any; }};\n  allow-transfer {};\n  dnssec-validation auto;\n  minimal-responses yes;\n  ixfr-from-differences yes;\n  key-directory \"{}\";\n}};\n",
+        "\n  allow-query {{ any; }};\n  allow-transfer {};\n  dnssec-validation auto;\n  minimal-responses yes;\n  masterfile-format text;\n  ixfr-from-differences yes;\n  key-directory \"{}\";\n}};\n",
         acl_or(&cfg.axfr_out_acl, "none"),
         state_root().join("keys").display()
     ));
@@ -2204,9 +2401,15 @@ fn set_mode_0600(p: &Path) -> std::io::Result<()> {
     std::fs::set_permissions(p, std::fs::Permissions::from_mode(0o600))
 }
 
-/// 递归 chown 给 _bind（named 运行账户）；失败不致命（仅 OpenBSD 有 _bind）。
+/// 递归 chown 给 named 的运行账户；失败不致命（未配置运行账户时是空操作）。
 fn chown_bind(p: &Path) {
-    let _ = std::process::Command::new("chown").arg("-R").arg("_bind:_bind").arg(p).status();
+    if let Some(u) = named_user() {
+        let _ = std::process::Command::new("chown")
+            .arg("-R")
+            .arg(format!("{u}:{u}"))
+            .arg(p)
+            .status();
+    }
 }
 #[cfg(not(unix))]
 fn set_mode_0600(_p: &Path) -> std::io::Result<()> {
@@ -2287,7 +2490,13 @@ pub(crate) fn check_config_strings(cfg: &DnsConfig) -> Result<()> {
         }
     }
     if let Some(bad) = cfg.forwarders.iter().find(|f| !valid_forwarder(f)) {
-        bail!("bad forwarder {bad:?}（只接受 IPv4/IPv6 字面量）");
+        bail!("bad forwarder {bad:?}（只接受 ip、ip:port、[v6]:port）");
+    }
+    // root zone 的 AXFR 源会被拼进 `dig @host`（并用 split_host_port 拆端口）。
+    // 未校验时一个带空格/引号的字符串会让 dig 收到意外 argv（配置来自面板/手改
+    // panel.toml）；用与 slave primaries 相同的判据在保存前拒绝。
+    if let Some(bad) = cfg.rootzone.axfr_servers.iter().find(|s| !valid_primary(s)) {
+        bail!("bad rootzone.axfr_servers 项 {bad:?}（host 或 host:port，IP/主机名）");
     }
     let mut seen_lines: std::collections::HashSet<String> = std::collections::HashSet::new();
     // 线路数上限：索引 0..MAX_GEO_LINES-1 映射到 127.0.0.2..127.0.0.(1+MAX_GEO_LINES)。
@@ -2423,10 +2632,15 @@ pub fn write_all(cfg: &DnsConfig) -> Result<Vec<(String, PathBuf)>> {
         }
     }
     let conf = gen_named_conf(cfg, &zones);
+    // 落盘前用 BIND 解析器验一遍：在跑的 named 不会被 reconfig 打断/停在旧配置，
+    // 生成器语法错误直接回面板（见 check_named_conf_text 的注释）。
+    check_named_conf_text(&conf)?;
     let conf_path = etc.join("named.conf");
-    // _bind 只需读；0600 会拒读 → 0640 + 属主 _bind。权限/属主在 rename **之前**设好，
-    // 避免出现「新 named.conf 已是 umask 权限」的窗口（里面有 rndc 密钥）。
-    write_atomic(&conf_path, conf.as_bytes(), 0o640, Some("_bind"))?;
+    // named 运行账户只需读；0600 会拒读 → 0640 + 属主（仅配置了运行账户时）。
+    // 权限/属主在 rename **之前**设好，避免出现「新 named.conf 已是 umask 权限」的窗口
+    // （里面有 rndc 密钥）。
+    let owner = named_user();
+    write_atomic(&conf_path, conf.as_bytes(), 0o640, owner.as_deref())?;
 
     let secret = load_or_make_secret();
     let rndc_port = cfg.rndc_port_or_default();
@@ -2638,16 +2852,16 @@ pub fn validate(cfg: &DnsConfig, strict: bool) -> Result<()> {
     KASP_STRICT.store(strict, std::sync::atomic::Ordering::Relaxed);
     write_all(cfg)?;
     let conf = state_root().join("etc/named.conf");
-    let mut child = std::process::Command::new(NAMED_BIN)
-        .arg("-u")
-        .arg("_bind")
+    let mut probe = std::process::Command::new(named_bin());
+    apply_named_user(&mut probe);
+    let mut child = probe
         .arg("-c")
         .arg(&conf)
         .arg("-g")
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .spawn()
-        .context("probe spawn named")?;
+        .with_context(|| format!("probe spawn named（{}）", named_bin()))?;
     std::thread::sleep(std::time::Duration::from_millis(1200));
     match child.try_wait() {
         Ok(Some(st)) => {
@@ -2672,9 +2886,188 @@ fn last_lines(s: &str, n: usize) -> String {
     lines[start..].join("\n")
 }
 
-const NAMED_BIN: &str = "/usr/local/sbin/named";
-const RNDC_BIN: &str = "/usr/local/sbin/rndc";
-const KEYGEN_BIN: &str = "/usr/local/bin/dnssec-keygen";
+/// 外部 BIND 工具的路径发现：显式环境变量 → 平台标准路径 → `PATH` 搜索。
+///
+/// 为什么不能写死 `/usr/local/sbin/named`：OpenBSD base 的工具在 `/usr/sbin`，
+/// Linux 发行版在 `/usr/sbin` 或 `/usr/bin`，用户级安装（aptlocal/自编译）在
+/// `$HOME/local/...`。写死路径时「named 装好了却永远 spawn 失败」，面板每次保存
+/// 都回 `probe spawn named`，错误信息完全看不出是路径问题 —— 跨平台部署与
+/// 真机测试 100% 中招。环境变量优先级最高，便于测试/非标准前缀部署。
+///
+/// 读取走 `env_lock::read_static_env`：本函数会在 `reconcile`（可能由面板请求线程
+/// 触发）被调用，而应用引擎会在请求期 `setenv`；裸 `getenv` 有已实测的 SIGSEGV 面。
+fn tool_path(env_key: &str, name: &str, fallbacks: &[&str]) -> String {
+    if let Some(v) = crate::server::apps::env_lock::read_static_env(env_key) {
+        let v = v.trim();
+        if !v.is_empty() {
+            return v.to_string();
+        }
+    }
+    for p in fallbacks {
+        if Path::new(p).is_file() {
+            return (*p).to_string();
+        }
+    }
+    if let Some(path) = crate::server::apps::env_lock::read_static_env("PATH") {
+        for dir in path.split(':') {
+            if dir.is_empty() {
+                continue;
+            }
+            let cand = Path::new(dir).join(name);
+            if cand.is_file() {
+                return cand.display().to_string();
+            }
+        }
+    }
+    fallbacks
+        .first()
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| name.to_string())
+}
+
+fn named_bin() -> String {
+    tool_path(
+        "CRUCIBLE_NAMED_BIN",
+        "named",
+        &["/usr/local/sbin/named", "/usr/sbin/named", "/usr/bin/named"],
+    )
+}
+fn rndc_bin() -> String {
+    tool_path(
+        "CRUCIBLE_RNDC_BIN",
+        "rndc",
+        &["/usr/local/sbin/rndc", "/usr/sbin/rndc", "/usr/bin/rndc"],
+    )
+}
+fn keygen_bin() -> String {
+    tool_path(
+        "CRUCIBLE_KEYGEN_BIN",
+        "dnssec-keygen",
+        &[
+            "/usr/local/bin/dnssec-keygen",
+            "/usr/sbin/dnssec-keygen",
+            "/usr/bin/dnssec-keygen",
+        ],
+    )
+}
+fn dig_bin() -> String {
+    tool_path(
+        "CRUCIBLE_DIG_BIN",
+        "dig",
+        &["/usr/local/bin/dig", "/usr/bin/dig", "/usr/sbin/dig"],
+    )
+}
+fn checkzone_bin() -> String {
+    tool_path(
+        "CRUCIBLE_CHECKZONE_BIN",
+        "named-checkzone",
+        &[
+            "/usr/local/sbin/named-checkzone",
+            "/usr/sbin/named-checkzone",
+            "/usr/bin/named-checkzone",
+        ],
+    )
+}
+fn checkconf_bin() -> String {
+    tool_path(
+        "CRUCIBLE_CHECKCONF_BIN",
+        "named-checkconf",
+        &[
+            "/usr/local/sbin/named-checkconf",
+            "/usr/sbin/named-checkconf",
+            "/usr/bin/named-checkconf",
+        ],
+    )
+}
+
+/// 在**替换运行中的 named.conf 之前**用 BIND 自己的解析器验一遍。
+///
+/// 为什么必须有：`reconcile` 在 named 已运行时**跳过** `validate`（探活会与在跑的
+/// 实例抢端口），直接 `rndc reconfig`。于是任何生成器语法错误（真实机踩过：
+/// slave 分区写出 `min-refresh-time 1h` → `expected number near '1h'`）都会让
+/// reconfig 返回错误、**整份新配置不生效**（所有 zone 一起停在旧配置），而毒行已经
+/// 落库 —— 之后每次 reconcile 都失败。这里在落盘前用 named-checkconf 拦下：
+/// 返回错误给面板，旧的 named.conf 保持不动，运行中的 DNS 不受影响。
+///
+/// 工具缺失时跳过（生产 OpenBSD base 与 bind9-utils 都带；测试机没装不应让所有
+/// 保存失败）。
+fn check_named_conf_text(conf: &str) -> Result<()> {
+    let bin = checkconf_bin();
+    if !Path::new(&bin).is_file() {
+        return Ok(());
+    }
+    let dir = state_root().join("tmp");
+    std::fs::create_dir_all(&dir)?;
+    let tmp = tmp_path_for(&dir.join("checkconf.named.conf"));
+    write_new_0600(&tmp, conf.as_bytes())?;
+    let out = std::process::Command::new(&bin).arg(&tmp).output();
+    let _ = std::fs::remove_file(&tmp);
+    match out {
+        Ok(o) if o.status.success() => Ok(()),
+        Ok(o) => {
+            let mut msg = String::from_utf8_lossy(&o.stderr).into_owned();
+            msg.push_str(&String::from_utf8_lossy(&o.stdout));
+            bail!(
+                "named-checkconf 拒绝生成的 named.conf（{bin}）：{}",
+                last_lines(msg.trim(), 8)
+            );
+        }
+        Err(_) => Ok(()),
+    }
+}
+
+/// named 的运行账户：`CRUCIBLE_NAMED_USER` 显式覆盖（空串 = 不传 `-u`，即当前用户）。
+///
+/// 默认值按平台：OpenBSD 必须是 `_bind`（root 直跑会被 lib 权限限制拒掉 logging/写盘，
+/// 这是原有行为）；其它平台不传 `-u`（非 root 测试实例传 `-u` 会直接 setuid 失败，
+/// named 连配置都读不到就退出）。显式环境变量让「以 root 跑但想 drop 到别的账户」
+/// 的部署也能配。
+fn named_user() -> Option<String> {
+    if let Some(v) = crate::server::apps::env_lock::read_static_env("CRUCIBLE_NAMED_USER") {
+        let v = v.trim();
+        return if v.is_empty() { None } else { Some(v.to_string()) };
+    }
+    if cfg!(target_os = "openbsd") {
+        Some("_bind".to_string())
+    } else {
+        None
+    }
+}
+
+/// 给 named 命令行加 `-u <user>`（未配置运行账户时什么都不加）。
+fn apply_named_user(cmd: &mut std::process::Command) {
+    if let Some(u) = named_user() {
+        cmd.arg("-u").arg(u);
+    }
+}
+
+/// `host` / `host:port` / `[v6]:port` / 裸 IPv6 → `(host, port)`。
+///
+/// `dig` 没有 `@host:port` 语法（那是 URI/HTTP 写法）：把 `127.0.0.1:15354` 原样塞进
+/// `@` 会被当成主机名解析失败。`valid_primary` 允许 `host:port` 形态，rootzone 的
+/// `axfr_servers` 也可能这么写 —— 必须拆出来用 `-p` 传给 dig，否则「本地测试/非 53
+/// 端口的 AXFR 源」永远拉不到（表现为 dig 退出非 0 或空应答）。
+fn split_host_port(server: &str) -> (String, Option<u16>) {
+    let s = server.trim();
+    if let Some(rest) = s.strip_prefix('[') {
+        if let Some((ip, port)) = rest.split_once("]:") {
+            return (ip.to_string(), port.parse::<u16>().ok());
+        }
+        return (rest.trim_end_matches(']').to_string(), None);
+    }
+    // 裸 IPv6 含多个冒号，不能按 host:port 切
+    if s.parse::<std::net::Ipv6Addr>().is_ok() {
+        return (s.to_string(), None);
+    }
+    if let Some((host, port)) = s.rsplit_once(':') {
+        if !host.is_empty() {
+            if let Ok(p) = port.parse::<u16>() {
+                return (host.to_string(), Some(p));
+            }
+        }
+    }
+    (s.to_string(), None)
+}
 
 fn run(bin: &str, args: &[&str]) -> Result<String> {
     let out = std::process::Command::new(bin)
@@ -2723,12 +3116,12 @@ fn named_zone_serial(cfg: &DnsConfig, zone: &str) -> u64 {
 
 fn rndc(cfg: &DnsConfig, args: &[&str]) -> Result<String> {
     let conf = state_root().join("etc/rndc.conf");
-    let out = std::process::Command::new(RNDC_BIN)
+    let out = std::process::Command::new(rndc_bin())
         .arg("-c")
         .arg(&conf)
         .args(args)
         .output()
-        .context("spawn rndc")?;
+        .with_context(|| format!("spawn rndc（{}）", rndc_bin()))?;
     if !out.status.success() {
         bail!("rndc {}: {}", args.join(" "), String::from_utf8_lossy(&out.stderr).trim());
     }
@@ -2775,11 +3168,7 @@ pub fn reconcile(cfg: &DnsConfig) -> Result<()> {
         // 一起交给 _bind。那等于让数据面账号拥有自己的控制面：一个能影响 named 处理
         // 不可信 DNS 数据的漏洞，就能顺手改掉控制面配置与分区数据库。
         for sub in ["zones", "log", "keys"] {
-            let _ = std::process::Command::new("chown")
-                .arg("-R")
-                .arg("_bind:_bind")
-                .arg(state_root().join(sub))
-                .status();
+            chown_bind(&state_root().join(sub));
         }
         // OpenBSD lo0 默认只有 127.0.0.1/32——fwd view 的 127.0.0.(2+i) 目标需显式 alias
         if cfg.geo.enabled {
@@ -2801,10 +3190,9 @@ pub fn reconcile(cfg: &DnsConfig) -> Result<()> {
             let _ = std::fs::create_dir_all(d);
         }
         let logf = std::fs::OpenOptions::new().create(true).append(true).open(&derr).ok();
-        let mut cmd = std::process::Command::new(NAMED_BIN);
-        cmd.arg("-u")
-            .arg("_bind")
-            .arg("-c")
+        let mut cmd = std::process::Command::new(named_bin());
+        apply_named_user(&mut cmd);
+        cmd.arg("-c")
             .arg(&conf)
             .arg("-g")
             .stdin(std::process::Stdio::null());
@@ -2828,8 +3216,25 @@ pub fn reconcile(cfg: &DnsConfig) -> Result<()> {
         }
         let st = cmd.spawn();
         match st {
-            Ok(_) => std::thread::sleep(std::time::Duration::from_millis(800)),
-            Err(e) => bail!("spawn named: {e}"),
+            Ok(_) => {
+                // named 刚 spawn 时 rndc 控制通道需要一点时间（加载配置/key/zone）。
+                // 固定 sleep 800ms 在慢机/大 zone 上不够，紧随其后的 reconfig 会
+                // connection refused —— 配置完全有效，面板却回一个误导性的错误。
+                // 轮询 named_alive（即 rndc status）直到就绪，最多 5s。
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+                let mut up = false;
+                while std::time::Instant::now() < deadline {
+                    if named_alive(cfg) {
+                        up = true;
+                        break;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                }
+                if !up {
+                    log::warn!("dns: named 已启动但 5s 内 rndc 控制通道不可达（后续 reconfig 可能失败）");
+                }
+            }
+            Err(e) => bail!("spawn named（{}）: {e}", named_bin()),
         }
     }
     // reconfig + reload 缺一不可（BIND 语义）：
@@ -2886,7 +3291,7 @@ pub fn keygen(zone: &str, role: &str, alg: &str) -> Result<String> {
     args.push("3600".into());
     args.push(zone.to_string());
     let names = run(
-        KEYGEN_BIN,
+        &keygen_bin(),
         &args.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
     )?;
     let name = names.trim().to_string();
@@ -2905,9 +3310,11 @@ pub fn upload_key(filename: &str, b64: &str) -> Result<PathBuf> {
     let dir = state_root().join("keys");
     std::fs::create_dir_all(&dir)?;
     let p = dir.join(filename);
-    // 0600 + _bind：named（_bind）要读它做签名，本机其它用户不该读私钥；
+    // 0600 + named 运行账户：named 要读它做签名，本机其它用户不该读私钥；
     // 原子落盘避免「半截密钥文件」——那会让 named 解析失败、该区 DNSSEC 起不来。
-    write_atomic(&p, &decoded, 0o600, Some("_bind"))?;
+    // 属主只在配置了运行账户时才改（Linux 测试实例以当前用户跑 named）。
+    let owner = named_user();
+    write_atomic(&p, &decoded, 0o600, owner.as_deref())?;
     Ok(p)
 }
 
@@ -2980,10 +3387,104 @@ fn rootzone_targets(cfg: &DnsConfig) -> Vec<PathBuf> {
 
 /// 把同一份 root zone 文本装到 [`rootzone_targets`] 的所有目标。
 fn install_rootzone(cfg: &DnsConfig, data: &[u8]) -> Result<()> {
+    // SOA 是 singleton：多于一条的 master file 会被 named 以
+    // `multiple RRs of singleton type` 拒载（AXFR 的结尾 SOA 是真实踩过的来源）。
+    // 调用方应先 strip_trailing_soa；这里再兜底一次，绝不让坏文件落盘。
+    if let Ok(s) = std::str::from_utf8(data) {
+        let n = s.lines().filter(|l| is_soa_record(l)).count();
+        if n != 1 {
+            bail!("root zone 内容含 {n} 条 SOA（SOA 是 singleton 类型，named 会拒载整区）");
+        }
+    }
+    // 单调性保护：绝不把 root.zone 换成**更低** serial 的版本。
+    // BIND 会忽略低 serial 的重载（继续服务旧区），但文件已经被覆盖 —— 下一次
+    // 走到别的分支时就会以旧数据为准；更糟的是 `rootzone_refresh` 的 ixfr→HTTPS
+    // 回退会把刚成功应用的 IXFR 结果用一个更旧的镜像覆盖掉（真实机复现：
+    // IXFR 已应用到 2026102502，验证时序误判触发回退，HTTP 源 2026102301 直接
+    // 覆盖了文件）。在替换前比较新旧 serial，低就报错、保留现有文件。
+    let new_serial = std::str::from_utf8(data)
+        .ok()
+        .and_then(serial_from_zone_text);
+    if let Some(ns) = new_serial {
+        for p in rootzone_targets(cfg) {
+            if let Some(old) = rootzone_current_serial(&p) {
+                if ns < old {
+                    bail!(
+                        "拒绝把 root zone 回退：新内容 serial {ns} 低于现有 {}（{}）",
+                        old,
+                        p.display()
+                    );
+                }
+            }
+        }
+    }
     for p in rootzone_targets(cfg) {
         install_zone_file(&p, data)?;
     }
     Ok(())
+}
+
+/// 落盘后确认 named **真的**换成了这份 root zone。
+///
+/// `rndc reload .` 在「新文件 serial 比当前服务的小」时返回成功但**不重载**（BIND 的
+/// 单调性保护）。旧代码只看 rndc 退出码，于是镜像回滚/测试用低 serial 源会让面板显示
+/// 「已刷新」、`root_last_ok` 也被推进，而 named 继续服务旧根区直到下一个周期 ——
+/// 典型的「保存成功但没生效」。这里对比 named 的 `zonestatus serial` 与文件 serial，
+/// 不一致就报错（named 未运行时 zonestatus 取不到，跳过）。
+fn verify_rootzone_serial(cfg: &DnsConfig, path: &Path) -> Result<()> {
+    let file = match rootzone_current_serial(path) {
+        Some(s) => s,
+        None => return Ok(()),
+    };
+    // `rndc reload` 是异步的：发出命令后 named 还要加载/校验 zone 才更新 zonestatus。
+    // 立刻比较会把「正常的异步重载」误判成失败（真实机复现：IXFR 已正确应用，
+    // 验证却看到旧 serial，调用方随即回退 HTTPS）。轮询到 5s。
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        let loaded = named_zone_serial(cfg, ".");
+        if loaded == 0 {
+            // 0 = 取不到。必须区分「named 没跑」与「named 在跑但这个区加载失败」：
+            // 后者会一直返回 0，旧逻辑直接当成功，于是 duplicate SOA 这种被拒载的
+            // root.zone 也能回 `{"ok":true}`（真实机踩过：两次 AXFR 的 SOA 让
+            // named 报 multiple RRs of singleton type，面板却显示刷新成功）。
+            if named_alive(cfg) {
+                bail!(
+                    "named 在运行但无法提供根区状态（root.zone 可能被拒载，见 named.stderr.log）"
+                );
+            }
+            return Ok(());
+        }
+        if loaded == file {
+            return Ok(());
+        }
+        if std::time::Instant::now() >= deadline {
+            bail!(
+                "root zone 已落盘 serial {file}，但 named 仍在服务 serial {loaded}（BIND 拒绝 serial 回退，旧根区继续生效）"
+            );
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+}
+
+/// 去掉 AXFR 应答里的**结尾 SOA**：RFC 5936 的 AXFR 把 SOA 发两次（开头 + 结尾），
+/// 而 master 文件里 SOA 是 singleton —— 原样落盘会被 named 以
+/// `multiple RRs of singleton type` **拒载整个根区**（真实机复现：全量 AXFR 装好的
+/// root.zone 有两条 SOA，随后 IXFR 只替换了第一条，reload 直接 `not loaded`）。
+/// 只保留第一处 SOA（以及它后面可能的多行括号内容，那些行不含 SOA token）。
+fn strip_trailing_soa(text: &str) -> String {
+    let mut seen = false;
+    let mut out = String::new();
+    for line in text.lines() {
+        if is_soa_record(line) {
+            if seen {
+                continue;
+            }
+            seen = true;
+        }
+        out.push_str(line);
+        out.push('\n');
+    }
+    out
 }
 
 /// 拉取 root.zone（curl）→ 安装 → reload（合法性由 named 加载日志 + dig 兜底）。
@@ -3022,9 +3523,12 @@ pub fn rootzone_refresh(cfg: &DnsConfig) -> Result<String> {
     if !text.lines().any(is_soa_record) {
         bail!("rootzone 下载内容里没有 SOA 记录；拒绝覆盖 root.zone");
     }
-    install_rootzone(cfg, &out.stdout)?;
+    // 下载源也可能是 AXFR 风格（开头+结尾各一条 SOA）；singleton 类型只保留一条。
+    let clean = strip_trailing_soa(&text);
+    install_rootzone(cfg, clean.as_bytes())?;
     meta_set("root_last_ok", &chrono_now().to_string())?;
     let _ = rndc(cfg, &["reload", "."]);
+    verify_rootzone_serial(cfg, &rootzone_targets(cfg)[0])?;
     Ok(rootzone_targets(cfg)[0].to_string_lossy().into())
 }
 
@@ -3391,13 +3895,14 @@ pub fn rootzone_ixfr(cfg: &DnsConfig) -> Result<String> {
         Ok(true) => {
             // IXFR 只就地改了 root.zone；配了 geo 多 view 时各 view 的 root.<view>.zone
             // 也要同步分发，否则分线路 view 一直服务占位根区。
+            // 分发/校验失败必须向上报：install_rootzone 现在还会拒绝「多条 SOA」的
+            // 文本，吞掉错误会让坏的 root.zone 留在盘上、面板仍回 ok。
             if let Ok(data) = std::fs::read(&dst) {
-                if let Err(e) = install_rootzone(cfg, &data) {
-                    log::warn!("dns: rootzone view 分发失败: {e:#}");
-                }
+                install_rootzone(cfg, &data)?;
             }
             meta_set("root_last_ok", &chrono_now().to_string())?;
             let _ = rndc(cfg, &["reload", "."]);
+            verify_rootzone_serial(cfg, &dst)?;
             return Ok(dst.to_string_lossy().into());
         }
         Ok(false) => log::info!("dns: rootzone IXFR unsupported/not applicable, full AXFR fallback"),
@@ -3405,10 +3910,19 @@ pub fn rootzone_ixfr(cfg: &DnsConfig) -> Result<String> {
     }
 
     // 全量 AXFR：dig 的 axfr 输出本身就是 master file 格式。
-    let out = std::process::Command::new("dig")
-        .args(["axfr".to_string(), format!("@{server}"), ".".to_string()])
+    // axfr_servers 允许 `host:port`（valid_primary 同款），但 dig 只认 `-p <port>`；
+    // 把 `@127.0.0.1:15354` 原样传给 dig 会被当成主机名，永远拉不到非 53 端口的源。
+    let (host, port) = split_host_port(server);
+    let mut dig = std::process::Command::new(dig_bin());
+    dig.arg("axfr");
+    if let Some(p) = port {
+        dig.arg("-p").arg(p.to_string());
+    }
+    let out = dig
+        .arg(format!("@{host}"))
+        .arg(".")
         .output()
-        .context("dig axfr")?;
+        .with_context(|| format!("dig axfr（{}）", dig_bin()))?;
     if !out.status.success() {
         bail!("dig axfr failed: {}", String::from_utf8_lossy(&out.stderr).trim());
     }
@@ -3417,9 +3931,13 @@ pub fn rootzone_ixfr(cfg: &DnsConfig) -> Result<String> {
     if !text.lines().any(is_soa_record) {
         bail!("dig axfr output has no SOA; refusing to overwrite zone");
     }
-    install_rootzone(cfg, &out.stdout)?;
+    // AXFR 流以 SOA 开头、**再以同一 SOA 结尾**（RFC 5936）；原样落盘会得到两条 SOA，
+    // named 判 `multiple RRs of singleton type` 拒载整个根区。只保留第一条。
+    let clean = strip_trailing_soa(&text);
+    install_rootzone(cfg, clean.as_bytes())?;
     meta_set("root_last_ok", &chrono_now().to_string())?;
     let _ = rndc(cfg, &["reload", "."]);
+    verify_rootzone_serial(cfg, &rootzone_targets(cfg)[0])?;
     Ok(rootzone_targets(cfg)[0].to_string_lossy().into())
 }
 
@@ -3516,17 +4034,19 @@ fn try_ixfr_apply(server: &str, dst: &Path, current_serial: u64) -> Result<bool>
     // "Warning, ixfr requires a serial number" 后忽略（不设置查询类型），
     // 紧随其后的数字变成查询名 —— 实际发出的是 A 查询，应答为空、永远回落全量。
     // +tcp：IXFR 的差异流只能走 TCP（UDP 只回单个 SOA）。
-    let out = std::process::Command::new("dig")
-        .args([
-            "+noall",
-            "+answer",
-            "+tcp",
-            &format!("ixfr={current_serial}"),
-            &format!("@{server}"),
-            ".",
-        ])
+    // axfr_servers 的 `host:port` 必须拆成 `-p`（dig 没有 `@host:port` 语法）。
+    let (host, port) = split_host_port(server);
+    let mut dig = std::process::Command::new(dig_bin());
+    dig.args(["+noall", "+answer", "+tcp"]);
+    if let Some(p) = port {
+        dig.arg("-p").arg(p.to_string());
+    }
+    let out = dig
+        .arg(format!("@{host}"))
+        .arg(format!("ixfr={current_serial}"))
+        .arg(".")
         .output()
-        .context("dig ixfr")?;
+        .with_context(|| format!("dig ixfr（{}）", dig_bin()))?;
     if !out.status.success() {
         return Ok(false);
     }
@@ -3544,6 +4064,16 @@ fn try_ixfr_apply(server: &str, dst: &Path, current_serial: u64) -> Result<bool>
     if soa_cnt == 1 {
         let new_serial = soa_serial_from_line(records[0]);
         if new_serial == Some(current_serial) {
+            // 「无变化」也要顺手修复本地文件：旧版本全量 AXFR 会留下开头+结尾两条
+            // SOA（RFC 5936 的正常流，但不是合法 master file）。只返回 Ok 不重写，
+            // named 会一直拒载该区，而本函数每轮都判定「已经是最新」→ 永远修不好。
+            if let Ok(original) = std::fs::read_to_string(dst) {
+                let clean = strip_trailing_soa(&original);
+                if clean != original {
+                    install_zone_file(dst, clean.as_bytes())?;
+                    log::info!("dns: rootzone 已修复重复 SOA（保留一条 singleton）");
+                }
+            }
             log::info!("dns: rootzone already at serial {current_serial}");
             return Ok(true);
         }
@@ -3560,6 +4090,21 @@ fn try_ixfr_apply(server: &str, dst: &Path, current_serial: u64) -> Result<bool>
 
     let original = std::fs::read_to_string(dst).context("read current zone")?;
     let mut lines: Vec<String> = original.lines().map(|l| l.to_string()).collect();
+    // 历史遗留：旧版本把 `dig axfr` 的开头+结尾 SOA 原样落盘，root.zone 里可能有
+    // 两条 SOA。这里先删掉第一处之后的所有 SOA，再替换 SOA 块 —— 否则 IXFR 应用后
+    // 文件仍是「两条 SOA」，named 直接 `multiple RRs of singleton type` 拒载。
+    {
+        let extra: Vec<usize> = lines
+            .iter()
+            .enumerate()
+            .filter(|(_, l)| is_soa_record(l))
+            .map(|(i, _)| i)
+            .skip(1)
+            .collect();
+        for i in extra.into_iter().rev() {
+            lines.remove(i);
+        }
+    }
     // 1) 用 records[0]（新 SOA，dig 单行形态）整体替换本地 SOA 块。
     //    本地 SOA 可能是多行括号形态，逐行匹配旧 serial 是永远删不掉的。
     let Some(soa_start) = lines.iter().position(|l| is_soa_record(l)) else {
@@ -3674,45 +4219,18 @@ fn serial_from_zone_text(text: &str) -> Option<u64> {
 }
 
 fn rootzone_current_serial(dst: &Path) -> Option<u64> {
-    if !dst.exists() { return None; }
-    let content = std::fs::read_to_string(dst).ok()?;
-    // SOA record serial: the first pure-digit token after the rname field.
-    // Handles both:
-    //   . 86400 IN SOA mname. rname. ( SERIAL ... )
-    //   . IN SOA mname rname SERIAL ...
-    let mut in_soa = false;
-    let mut past_rname = false;
-    for line in content.lines() {
-        let t = line.trim();
-        if t.is_empty() || t.starts_with(";") { continue; }
-        if t.starts_with("$") || t.starts_with("@") { continue; }
-        if t.contains(" IN SOA ") || t.contains("\tIN SOA ") {
-            in_soa = true;
-            // Check for serial on same line (no paren)
-            let parts: Vec<&str> = t.split_whitespace().collect();
-            for (i, p) in parts.iter().enumerate() {
-                if *p == "SOA" && i + 3 <= parts.len() {
-                    let candidate = parts.get(i + 3).map(|s| s.trim_matches(|c: char| !c.is_ascii_digit())).unwrap_or("");
-                    if let Ok(n) = candidate.parse::<u64>() {
-                        return Some(n);
-                    }
-                }
-            }
-            continue;
-        }
-        if in_soa && !past_rname {
-            let parts: Vec<&str> = t.split_whitespace().collect();
-            for p in &parts {
-                let s = p.trim_matches(|c: char| !c.is_ascii_digit() && c != ';');
-                if s.chars().all(|c| c.is_ascii_digit()) && s.len() >= 8 {
-                    if let Ok(n) = s.parse::<u64>() {
-                        return Some(n);
-                    }
-                }
-            }
-        }
+    if !dst.exists() {
+        return None;
     }
-    None
+    let content = std::fs::read_to_string(dst).ok()?;
+    // 必须按 **token** 判定 SOA，不能匹配 `" IN SOA "` / `"\tIN SOA "` 这类固定空白：
+    // `dig axfr` 的输出是制表符分隔的 `name\tTTL\tIN\tSOA\trdata`（IN 与 SOA 之间是
+    // `\t` 而不是空格）。旧实现因此在「从 dig axfr 装进来的 root.zone」上永远返回
+    // None → `try_ixfr_apply` 直接判 current_serial==0 → **永远回落全量 AXFR**
+    // （真实机复现：日志每条都是 `IXFR unsupported/not applicable, full AXFR`，
+    // 而手工 `dig ixfr=<serial>` 明明返回了合法差异流）。
+    // `serial_from_zone_text` 已经是整份文本的 token 扫描（且支持多行 SOA），直接复用。
+    serial_from_zone_text(&content)
 }
 
 /// 维护循环：config.toml mtime 变化 → 重新 reconcile；rootzone 到期 → 刷新（需求 2）。
@@ -4410,7 +4928,10 @@ mod dns_hardening_tests {
         let c = secondary_clauses(&z);
         assert!(c.contains("allow-notify { 10.0.0.0/8; 2001:db8::/32; };"), "{c}");
         assert!(c.contains("allow-transfer { 10.0.0.0/8; 2001:db8::/32; };"), "{c}");
-        assert!(c.contains("min-refresh-time 6h; max-refresh-time 6h;"), "{c}");
+        // BIND 的 zone 级 min/max-refresh-time 只接受**秒**（写成 6h 会让
+        // named-checkconf 报 `expected number near '1h'`，整份配置不生效）。
+        assert!(c.contains("min-refresh-time 21600; max-refresh-time 21600;"), "{c}");
+        assert!(!c.contains("6h"), "duration 单位会被 BIND 拒绝: {c}");
         assert!(!c.contains("bad"), "非法 ACL 项不得输出: {c}");
         let mut z2 = zone_row("slave2.test", "slave");
         z2.refresh_hours = 0;

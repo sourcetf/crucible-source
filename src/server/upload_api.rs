@@ -79,6 +79,16 @@ fn upload_gate(port: u16, threads: u16) -> std::sync::Arc<tokio::sync::Semaphore
     }
 }
 
+/// 一次 percent-decode 之后的路径，是否仍能被 percent-decode 改动（= 客户端做了**两层**编码）。
+///
+/// 为什么要求「解码后是不动点」：本项目的 static/upload 全链路只解码一次，若放行
+/// `%252e%252e%252f…`，它就会以字面名 `%2e%2e%2f…` 落盘（实测 201，非穿越但属防御纵深
+/// 缺口：落盘侧与下载侧对该名字的理解不同）。合法的 `100%.txt`（URL `100%25.txt`）解码后
+/// `%` 后面不是两位十六进制，再解不变 ⇒ 不受影响。
+fn is_double_encoded(decoded: &str) -> bool {
+    percent_encoding::percent_decode_str(decoded).decode_utf8_lossy().as_ref() != decoded
+}
+
 /// 扩展名闸门。
 ///
 /// **必须取「最后一个非空、且不是 `.` 的段」**：落盘路径会经过 `safe_join` 的 Path 归一化，
@@ -148,12 +158,12 @@ fn listener_for_conn(
     found.or_else(|| crate::server::live_config::listener_by_port(live, lc.port))
 }
 
-/// 该请求是否应交给上传处理（调用方在 ACL/限速/鉴权之后、静态分发之前问一次）。
-pub fn enabled_for(live: &Arc<LiveConfig>, lc: &ListenerConfig, path: &str) -> bool {
-    // 判据用**当前生效**的 listener 配置（连接期快照只作回退）：否则「面板里关掉上传」
-    // 之后，已建立的长连接仍会被当成「开了上传」的端口。
-    let cur = listener_for_conn(live, lc);
-    let lc = cur.as_ref().unwrap_or(lc);
+/// 该 listener 的配置是否把 `path` 划进上传面（纯配置判据，不看 live）。
+///
+/// 与 [`enabled_for`] 拆开是为了让静态层的 405 `Allow`（`static_files.rs`）能用
+/// **同一套路径边界判据**：`DELETE <upload-enabled path>` 的 405 必须列出该资源
+/// 真正接受的全部方法（PUT/POST/PATCH），不能只写 `GET, HEAD`。
+pub fn allows_path(lc: &ListenerConfig, path: &str) -> bool {
     let a = &lc.autoindex;
     if !a.enabled || !a.enable_upload {
         return false;
@@ -166,6 +176,14 @@ pub fn enabled_for(live: &Arc<LiveConfig>, lc: &ListenerConfig, path: &str) -> b
             let p = p.trim_end_matches('/');
             path == p || path.starts_with(&format!("{p}/"))
         })
+}
+
+/// 该请求是否应交给上传处理（调用方在 ACL/限速/鉴权之后、静态分发之前问一次）。
+pub fn enabled_for(live: &Arc<LiveConfig>, lc: &ListenerConfig, path: &str) -> bool {
+    // 判据用**当前生效**的 listener 配置（连接期快照只作回退）：否则「面板里关掉上传」
+    // 之后，已建立的长连接仍会被当成「开了上传」的端口。
+    let cur = listener_for_conn(live, lc);
+    allows_path(cur.as_ref().unwrap_or(lc), path)
 }
 
 fn resp(status: StatusCode, msg: &str, offset: Option<u64>) -> Response<BoxBody> {
@@ -302,11 +320,13 @@ where
     let path = req.uri().path().to_string();
     let method = req.method().clone();
     if !matches!(method, Method::PUT | Method::PATCH | Method::POST) {
-        // RFC 9110 §15.5.6：405 **必须**带 Allow（静态层已修，这里此前漏了）。
-        // 支持的写方法 = PUT/PATCH（POST 仍接受，但见下面的跨站闸门）。
+        // RFC 9110 §15.5.6：405 **必须**带 Allow，且必须列出该资源**当前支持**的全部方法。
+        // 本端点接受 PUT/PATCH/POST 三种写方法（POST 同样走上传落盘，见下面的 CSRF 闸门），
+        // 旧值只写 `PUT, PATCH` 漏了 POST —— 自动化客户端据此会认为 POST 不可用。
+        // GET/HEAD/DELETE 不由本端点处理（GET/HEAD 走静态层、其余同样 405）。
         return Response::builder()
             .status(StatusCode::METHOD_NOT_ALLOWED)
-            .header(header::ALLOW, "PUT, PATCH")
+            .header(header::ALLOW, "PUT, POST, PATCH")
             .header(header::CONTENT_TYPE, "text/plain; charset=utf-8")
             .body(full("method not allowed"))
             .unwrap_or_else(|_| Response::new(full("method not allowed".to_string())));
@@ -355,6 +375,24 @@ where
     // NUL 不能在路径里：fs 层会以难读的 OS 错误冒泡（Windows 上还可能有截断语义）。
     if decoded.contains('\0') {
         return resp(StatusCode::BAD_REQUEST, "路径含 NUL 字节，拒绝", None);
+    }
+    // **双重 percent 编码**（`%252e%252e%252fesc.bin`）必须拒：全链路（static/upload）
+    // 只解码一次，这条路径落盘时会把 `%2e%2e%2fesc.bin` 当成一个**普通文件名**写进
+    // docroot（实测 201）—— 它不是穿越（再解码该名字仍是一段、`safe_join` 不会越界），
+    // 但属于「解码次数不一致」的防御纵深缺口：同一个名字在下载侧（再解码一次）与落盘侧
+    // 含义不同，任何未来把某处改成「多解一次」的改动都会立刻变成可穿越。
+    //
+    // 判据：**一次解码的结果必须是 percent-decode 的不动点**（再解一次不变）。
+    // 合法的含 `%` 名字不受影响：`100%.txt` 的 URL 是 `100%25.txt`，一次解码得
+    // `100%.txt`，其中 `%` 后面是 `.` 而不是两位十六进制 → 再解仍是它自己 → 放行。
+    // 被拒的只有「名字里带合法 `%XX` 序列」的写法（如 `a%20b.txt`，URL `a%2520b.txt`）
+    // —— 这种名字天然与编码层混淆，按安全口径一律拒。
+    if is_double_encoded(&decoded) {
+        return resp(
+            StatusCode::BAD_REQUEST,
+            "路径含双重 percent 编码，拒绝（文件名请勿包含 %XX 形式的字面序列）",
+            None,
+        );
     }
     if decoded.split(['/', '\\']).any(|seg| seg == "..") {
         return resp(StatusCode::BAD_REQUEST, "路径含 .. 段，拒绝", None);
@@ -488,6 +526,11 @@ where
                 // `last < complete-length`（除非 complete-length 未知用 `*`）——
                 // `bytes 0-100/50` 这类声明本身自相矛盾，继续走会把「比声明的 total 多收的
                 // 字节」照单收下（文件比 total 大却 commit），故直接 400。
+                //
+                // `bytes 0-0/0`（空表示的「首个字节」）同理无意义：complete-length=0 时
+                // **不存在**任何可满足的字节区间（响应侧对应 `416 + Content-Range: bytes */0`），
+                // 但请求侧声明本身违反 §14.4 ⇒ 400（与 `bytes */0` 缺 first-last 的 400 同一口径）。
+                // 空文件上传走 `Content-Length: 0`（实测 201）；`bytes 0-0/1` 是合法的一字节区间（201）。
                 if let Some(t) = t {
                     if e >= t {
                         return resp(
@@ -880,6 +923,54 @@ mod tests {
         assert_eq!(r.headers().get("x-upload-offset").unwrap(), "1234");
     }
 
+    /// 双重编码判据：`%252e%252e%252f` 必须拒，正常含 `%` 的名字不得误伤。
+    ///
+    /// 修前实测：`PUT /%252e%252e%252fesc.bin` → **201**，磁盘落字面名
+    /// `%2e%2e%2fesc.bin`（非穿越，但与「只解码一次」的下载侧语义分叉）。现在一次解码
+    /// 后仍含合法 `%XX` ⇒ 400；`100%.txt`（`100%25.txt`）解码后是不动点 ⇒ 放行。
+    #[test]
+    fn double_percent_encoded_path_rejected() {
+        let d = |p: &str| {
+            percent_encoding::percent_decode_str(p)
+                .decode_utf8_lossy()
+                .to_string()
+        };
+        for raw in [
+            "/up/%252e%252e%252fesc.bin",
+            "/up/%252E%252E%252Fesc.bin",
+            "/up/%252e%252e%255cesc.bin",
+            "/up/%25%32%65%25%32%65%25%32%66esc.bin",
+        ] {
+            assert!(
+                is_double_encoded(&d(raw)),
+                "{raw} 一次解码得 {:?}，仍是可再解码形式，必须拒",
+                d(raw)
+            );
+        }
+        // 合法名字：解码后不含合法 %XX 序列 → 不动点 → 放行
+        for raw in ["/up/100%25.txt", "/up/50%25off.bin", "/up/a%20b.txt"] {
+            assert!(
+                !is_double_encoded(&d(raw)),
+                "{raw} 解码得 {:?}，是合法名字，不得误伤",
+                d(raw)
+            );
+        }
+        // 非 ASCII 名字（百分号编码一次）同样是合法不动点
+        assert!(!is_double_encoded(&d("/up/%E6%8A%A5%E5%91%8A.pdf")));
+    }
+
+    /// 上传面判据（`allows_path`）与静态层 405 的 `Allow` 必须用同一套路径边界。
+    #[test]
+    fn allows_path_uses_boundaries() {
+        let toml_text = "[[listeners]]\naddress = \"127.0.0.1\"\nport = 1\nroot = \"/tmp\"\nautoindex = { enabled = true, enable_upload = true, paths = [\"/up\"] }\n";
+        let cfg: crate::config::Config = ::toml::from_str(toml_text).expect("parse");
+        let lc = cfg.listeners[0].clone();
+        assert!(allows_path(&lc, "/up/x.txt"));
+        assert!(allows_path(&lc, "/up"));
+        assert!(!allows_path(&lc, "/uploads/x.txt"), "裸 starts_with 会误判 /uploads");
+        assert!(!allows_path(&lc, "/upfoo"), "/upfoo 不是 /up 的子路径");
+    }
+
     /// 扩展名闸门必须看**percent-decode 之后**的路径：落盘用的是解码后的名字，
     /// 只看 raw 时 `shell.ph%70` 会被当成「没有扩展名」放行，却以 `shell.php` 落盘。
     #[test]
@@ -953,6 +1044,7 @@ mod tests {
             qmux: false,
             connect_udp: false,
             access_log: None,
+            ..Default::default()
         };
         std::fs::write(base.join(".env"), "SECRET\n").unwrap();
         std::fs::write(base.join("up/shellX.php"), "<?php ?>\n").unwrap();
@@ -1065,6 +1157,7 @@ root = "/tmp/site-b"
             qmux: false,
             connect_udp: false,
             access_log: None,
+            ..Default::default()
         };
         let t = |rel: &str| canon_best_effort(&base.join(rel));
         // docroot 内（含 init.sh / deps/bin/index 这类非可执行扩展名的运行期文件）→ 命中

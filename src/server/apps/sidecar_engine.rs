@@ -398,22 +398,28 @@ pub(crate) async fn proxy_uds_simple(
 /// 挂死」时永不自愈（实测：h1 起、被 SIGSTOP 的 JSP sidecar，h2c 连续两次都是 30s+502）。
 #[cfg(unix)]
 pub(crate) fn kill_managed_sidecar_simple_by_sock(sock: &std::path::Path) -> bool {
+    let Some(mut dead) = take_managed_sidecar_simple_by_sock(sock) else {
+        return false;
+    };
+    log::warn!(
+        "sidecar(simple): {} 代理超时（客户端已 502）→ 终止受管进程，后续请求将重启",
+        sock.display()
+    );
+    crate::server::apps::child_registry::kill_child(&mut dead);
+    true
+}
+
+/// 从本注册表「摘除」某个 sock 的 sidecar（不杀、不记日志），返回 Child 供调用方按
+/// 自己的语义回收（超时 / `.env` 指纹变化）。
+#[cfg(unix)]
+pub(crate) fn take_managed_sidecar_simple_by_sock(
+    sock: &std::path::Path,
+) -> Option<std::process::Child> {
     let key = {
         let map = SIDECARS_SIMPLE.lock();
         map.iter().find(|(_, s)| s.sock == sock).map(|(k, _)| k.clone())
-    };
-    let Some(key) = key else {
-        return false;
-    };
-    if let Some(mut dead) = SIDECARS_SIMPLE.lock().remove(&key) {
-        log::warn!(
-            "sidecar(simple): {} 代理超时（客户端已 502）→ 终止受管进程，后续请求将重启",
-            dead.sock.display()
-        );
-        crate::server::apps::child_registry::kill_child(&mut dead.child);
-        return true;
-    }
-    false
+    }?;
+    SIDECARS_SIMPLE.lock().remove(&key).map(|s| s.child)
 }
 
 #[cfg(unix)]
@@ -463,19 +469,19 @@ async fn ensure_sidecar_simple(
     let fp = native_http::env_fingerprint(env_vars);
     let docroot_desired = abs_canon(&app.docroot.clone().unwrap_or_else(|| lc.root.clone()));
 
-    // 别的协议（h1）或本注册表之外的实例已经把这个 socket 起好了：直接复用，
-    // 绝不能 remove_file 抢走它。
-    //
-    // 注意：本函数只负责「sock 活着且指纹一致」的复用判断 —— 跨协议复用的 sidecar
-    // 若指纹不同（.env 变了），本协议这一侧无法确认对方进程的 env，直接从 socket
-    // 连过去也可能拿到旧环境；但杀别人管的进程更危险（对方表里仍记着它），因此这里
-    // 保持「sock_alive 即复用」的既有语义，只在**自己表里**做指纹重启。
+    // 别的协议（h1）或本注册表之外的实例已经把这个 socket 起好了：**核验 `.env` 指纹后**
+    // 复用。sock 旁有 spawner 写下的 `app.sock.envfp`：
+    //   * 指纹一致 → 复用（不重启，反复切协议无抖动）；
+    //   * 不一致/缺失 → 旧进程的进程 env 是陈旧的（`.env` 已变），必须重启；
+    //   * 不能直接 remove_file 抢走对方的监听 socket（会让对方进程成孤儿）。
     if sock_alive(&sock) {
         let owned_ok = {
             let map = SIDECARS_SIMPLE.lock();
-            map.get(&key)
-                .map(|s| s.env_fp == fp && s.docroot == docroot_desired)
-                .unwrap_or(true)
+            match map.get(&key) {
+                Some(s) => s.env_fp == fp && s.docroot == docroot_desired,
+                // 本表没有条目 = 由另一条协议拉起：只能靠指纹文件核验。
+                None => native_http::sidecar_env_fp_matches(&sock, fp),
+            }
         };
         if owned_ok {
             return Ok(sock);
@@ -507,8 +513,15 @@ async fn ensure_sidecar_simple(
     // 为真即代表「有人在服务」⇒ 复用。绝不 `remove_file` + 抢 spawn（那会偷走它的监听
     // socket、把它变成无人回收的孤儿）。
     if sock_alive(&sock) {
-        log::debug!("sidecar(simple): {key} 已由其它注册表拉起（sock 存活），复用");
-        return Ok(sock);
+        // 本表里仍有条目 ⇒ 它在上面两处检查里都没通过（指纹/docroot 过期），必须重建。
+        let own_entry_stale = SIDECARS_SIMPLE.lock().contains_key(&key);
+        if !own_entry_stale && native_http::sidecar_env_fp_matches(&sock, fp) {
+            log::debug!(
+                "sidecar(simple): {key} 已由其它注册表拉起（sock 存活且 .env 指纹一致），复用"
+            );
+            return Ok(sock);
+        }
+        native_http::evict_sidecar_for_env_change(&sock, fp);
     }
     // 死条目 / 指纹或 docroot 变化的旧条目：杀进程再摘除（只删表会留下孤儿）。
     if let Some(mut dead) = SIDECARS_SIMPLE.lock().remove(&key) {
@@ -549,6 +562,8 @@ async fn ensure_sidecar_simple(
     let start = Instant::now();
     while start.elapsed() < Duration::from_secs(5) {
         if sock_alive(&sock) {
+            // 先落 `.env` 指纹再进表：h1 侧拿同一把 per-sock 锁后会读它核验。
+            native_http::write_sidecar_env_fp(&sock, fp, child.id());
             SIDECARS_SIMPLE.lock().insert(
                 key,
                 SimpleSidecar {

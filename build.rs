@@ -87,13 +87,62 @@ fn add_openbsd_tls_paths(builder: &mut cc::Build) {
         builder.include("/usr/local/include/nspr/private");
         builder.include("/usr/local/include");
         println!("cargo:rustc-link-search=native=/usr/local/lib");
-    } else {
-        builder.include("/usr/include/nss");
-        builder.include("/usr/include/nss3");
-        builder.include("/usr/include/nspr");
-        builder.include("/usr/include/nspr4");
-        builder.include("/usr/include/nspr/private");
+        return;
     }
+    // Linux/BSD：系统头（libnss3-dev）优先；用户级安装（aptlocal.sh → ~/local/usr）
+    // 在无 root 的机器上是唯一来源。NSS_PREFIX / NSS_INCLUDE_DIR / NSPR_INCLUDE_DIR
+    // 可显式覆盖。
+    let mut prefixes: Vec<String> = Vec::new();
+    for var in ["NSS_PREFIX", "CRUCIBLE_LOCAL_PREFIX"] {
+        if let Ok(p) = env::var(var) {
+            if !p.is_empty() {
+                prefixes.push(p);
+            }
+        }
+    }
+    if let Ok(home) = env::var("HOME") {
+        prefixes.push(format!("{home}/local/usr"));
+        prefixes.push(format!("{home}/local"));
+    }
+    prefixes.push("/usr/local".to_string());
+    for p in &prefixes {
+        let nss = Path::new(p).join("include/nss");
+        let nspr = Path::new(p).join("include/nspr");
+        if nss.exists() {
+            builder.include(&nss);
+        }
+        if nspr.exists() {
+            builder.include(&nspr);
+            let private = nspr.join("private");
+            if private.exists() {
+                builder.include(&private);
+            }
+        }
+    }
+    if let Ok(d) = env::var("NSS_INCLUDE_DIR") {
+        builder.include(d);
+    }
+    if let Ok(d) = env::var("NSPR_INCLUDE_DIR") {
+        builder.include(d);
+    }
+    // 兜底：标准系统路径（头不在时 cc 会自动忽略不存在的 -I）。
+    builder.include("/usr/include/nss");
+    builder.include("/usr/include/nss3");
+    builder.include("/usr/include/nspr");
+    builder.include("/usr/include/nspr4");
+    builder.include("/usr/include/nspr/private");
+    // 运行库搜索：用户级安装的 libnss3.so 等不在系统 ldconfig 路径里。
+    for p in &prefixes {
+        for libdir in ["lib/x86_64-linux-gnu", "lib64", "lib"] {
+            let d = Path::new(p).join(libdir);
+            if d.join("libnss3.so").exists() || d.join("libnss3.a").exists() {
+                println!("cargo:rustc-link-search=native={}", d.display());
+            }
+        }
+    }
+    println!("cargo:rerun-if-env-changed=NSS_PREFIX");
+    println!("cargo:rerun-if-env-changed=NSS_INCLUDE_DIR");
+    println!("cargo:rerun-if-env-changed=NSPR_INCLUDE_DIR");
 }
 
 fn build_tls_common() {
@@ -129,8 +178,12 @@ fn build_tomcrypt_shim() {
     build.file("libs/tls-tomcrypt/tc_shim.c");
     build.include("libs/tls-common");
     build.define("CRUCIBLE_HAVE_TOMCRYPT", None);
-    // LTC_ARGCHK → return error codes (never abort). Must match vendored libtomcrypt.a.
-    build.define("ARGTYPE", Some("2"));
+    // LTC_ARGCHK → return CRYPT_INVALID_ARG (never abort / never continue).
+    // libtomcrypt 1.18.2 与 master 的编号：0=abort, 1=assert, 2=warn+continue,
+    // 3=no-op, 4=return CRYPT_INVALID_ARG。这里必须是 4，且必须与
+    // scripts/build_libtomcrypt.sh 构建出的 libtomcrypt.a 一致
+    //（用 2 时 ARGCHK 失败会继续执行 → NULL 解引用 SIGSEGV）。
+    build.define("ARGTYPE", Some("4"));
     add_openbsd_tls_paths(&mut build);
     let vendored_inc = Path::new("target/tls-libs/include");
     if vendored_inc.exists() {
@@ -147,8 +200,8 @@ fn build_tomcrypt_shim() {
     if !vendored.exists() {
         panic!(
             "tls_tomcrypt requires vendored target/tls-libs/libtomcrypt.a \
-             (run scripts/build_libtomcrypt.sh with ARGTYPE=2). \
-             System libtomcrypt often uses LTC_ARGCHK→abort() and will kill the process."
+             (run scripts/build_libtomcrypt.sh with ARGTYPE=4). \
+             System libtomcrypt uses LTC_ARGCHK→abort()/continue and will kill the process."
         );
     }
     println!("cargo:rustc-link-search=native=target/tls-libs");

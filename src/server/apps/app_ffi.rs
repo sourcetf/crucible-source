@@ -512,6 +512,7 @@ async fn exec_dispatch(
     // 都成功，见 EngineLib::env_free）。只有这种 .so 才允许跳过 env_lock：
     //   * 跳过 ⇒ 该引擎的子进程/子请求 env 完全由「启动期基底 + 本请求 .env」拼出，
     //     一个慢的**空**请求不会挡住随后带 `.env` 的请求（见 env_lock 模块注释）；
+    //     目前自报的有 cgi（子进程 envp）与 python（TLS 覆盖表 + 基底对齐视图）；
     //   * 不自报（含所有其它引擎、以及任何陈旧 .so）⇒ 留在锁内，跨应用 `.env` 隔离
     //     不依赖引擎实现。
     //
@@ -642,12 +643,15 @@ async fn exec_dispatch(
     // ---- 第二段：引擎执行（deadline **只**算执行）----
     // 超时的**取舍**（本方案的诚实边界）：
     //   * 卡死的 C 调用无法被安全中断（杀线程会在任意指令处损坏状态）⇒ 该 worker 线程
-    //     被放弃，每只隔离的引擎最多泄漏一个线程；隔离后不会再有新调用占线程；
+    //     被放弃；`replace_abandoned_worker` 会补一条替补，把池宽顶回去（上限
+    //     [`MAX_REPLACEMENT_WORKERS`]）——健康引擎不再因别人的卡死调用而饿死；
+    //   * 该 .so 永久隔离（fail-closed），不会再产生新的超时调用；线程数因此有界
+    //     （初始池宽 + 补位上限），不会「每超时一次就无界新增」；
     //   * 非自报 env-free 的引擎在超时时可能还持有宿主的进程 env 锁（Slot 永不 Drop），
     //     因此**毒化** env 锁：之后依赖 env 锁的引擎立即 502，绝不阻塞等待、也绝不
     //     在「可能装着别人 .env」的进程 env 上继续运行；
-    //   * 自报 env-free 的 .so（cgi/cgi_script 这类子进程 envp 引擎）不碰进程 env，
-    //     超时只隔离它自己，其它引擎（含其它 env-free 引擎）照常工作。
+    //   * 自报 env-free 的 .so（cgi/cgi_script/python 这类）不碰进程 env，超时只隔离
+    //     它自己，其它引擎（含其它 env-free 引擎）照常工作。
     // 正常长请求不受影响：只要在 deadline 内返回就与旧行为完全一致。
     match exec_timeout {
         None => result_rx
@@ -658,6 +662,8 @@ async fn exec_dispatch(
             Ok(Err(_recv)) => bail!("engine worker dropped"),
             Err(_elapsed) => {
                 quarantine(&lib_key, &engine_for_pool, t.as_secs());
+                // 卡死的调用永久占着一条 worker：补一条替补，别让它吃掉健康引擎的池产能。
+                pool.replace_abandoned_worker(&engine_for_pool);
                 if !lib_is_env_free(&lib_key) {
                     env_lock::poison(&format!(
                         "engine `{engine_for_pool}` exceeded {}s wall clock while holding the process-env lock",
@@ -791,8 +797,23 @@ fn project_root() -> PathBuf {
 
 type PoolJob = Box<dyn FnOnce() + Send + 'static>;
 
+/// 每个池最多补几条「替补 worker」。
+///
+/// 被看门狗判超时的 C 调用无法安全终止（杀线程会在任意指令处损坏堆/解释器状态），
+/// 只能把那条 worker 线程连同它烧的 CPU 一起放弃。旧实现没有任何补充：卡死调用
+/// 永远占着**通用池**的一个名额，连坏 8 只 .so 后所有 FFI 引擎一起排队。
+/// 现在超时即补一条 worker 顶替产能；上限保证线程数有界（卡死线程数 ≤ 补位上限，
+/// 且同一只 .so 一旦隔离就不会再产生新的超时调用）。
+const MAX_REPLACEMENT_WORKERS: usize = 32;
+
 struct EnginePool {
     tx: std::sync::mpsc::Sender<PoolJob>,
+    /// 池名（线程名/日志用）。
+    name: String,
+    /// 工作队列的接收端：替补 worker 与初始 worker 共用同一条队列。
+    rx: Arc<Mutex<std::sync::mpsc::Receiver<PoolJob>>>,
+    /// 已补的替补 worker 数（见 [`MAX_REPLACEMENT_WORKERS`]）。
+    replaced: std::sync::atomic::AtomicUsize,
 }
 
 static GENERIC_POOL: Lazy<Arc<EnginePool>> =
@@ -820,23 +841,65 @@ fn serial_engine(engine: &str) -> bool {
 impl EnginePool {
     fn start(threads: usize, name: &str) -> EnginePool {
         let (tx, rx) = std::sync::mpsc::channel::<PoolJob>();
-        let rx = Arc::new(Mutex::new(rx));
+        let pool = EnginePool {
+            tx,
+            name: name.to_string(),
+            rx: Arc::new(Mutex::new(rx)),
+            replaced: std::sync::atomic::AtomicUsize::new(0),
+        };
         for i in 0..threads.max(1) {
-            let rx = Arc::clone(&rx);
-            let _ = std::thread::Builder::new()
-                .name(format!("cruc-{name}-{i}"))
-                .spawn(move || loop {
-                    let job = {
-                        let guard = rx.lock();
-                        guard.recv()
-                    };
-                    match job {
-                        Ok(j) => j(),
-                        Err(_) => break,
-                    }
-                });
+            pool.spawn_worker(i);
         }
-        EnginePool { tx }
+        pool
+    }
+
+    /// 起一条 worker（初始 worker 与超时后的替补共用）。线程 detach：池本身常驻，
+    /// 队列的发送端关闭时 `recv` 返回 Err、线程自然退出。
+    fn spawn_worker(&self, idx: usize) {
+        let rx = Arc::clone(&self.rx);
+        let name = self.name.clone();
+        let _ = std::thread::Builder::new()
+            .name(format!("cruc-{name}-{idx}"))
+            .spawn(move || loop {
+                let job = {
+                    let guard = rx.lock();
+                    guard.recv()
+                };
+                match job {
+                    Ok(j) => j(),
+                    Err(_) => break,
+                }
+            });
+    }
+
+    /// 一次执行超时：放弃那条卡住的 worker，并补一条替补把池宽顶回去。
+    ///
+    /// 为什么必须补：卡死调用不返回，原 worker 永远不会再取队列；不补的话每次超时
+    /// 都永久吃掉一份池产能（通用池被 8 只卡死 .so 吃光后，健康引擎全部 503）。
+    /// 为什么必须限：替补线程数 = 被放弃的 worker 数，卡死调用数由「同一 .so 隔离一次」
+    /// 约束，但仍可能在多 .so/并发超时下叠加，硬上限保证线程数有界。
+    ///
+    /// 如果卡死的调用**最终**返回了，这条替补就变成一条空闲 worker：线程数比初始多
+    /// 一条，但不再有任何调用会超时（该 .so 已隔离），属于可接受的有界余量。
+    fn replace_abandoned_worker(&self, engine: &str) {
+        use std::sync::atomic::Ordering;
+        let n = self.replaced.fetch_add(1, Ordering::SeqCst);
+        if n >= MAX_REPLACEMENT_WORKERS {
+            log::warn!(
+                "app_ffi: engine `{engine}` 超时放弃的 worker 已达替补上限 {MAX_REPLACEMENT_WORKERS}（池 `{}`）；\
+                 不再新增线程（线程数有界）",
+                self.name
+            );
+            return;
+        }
+        self.spawn_worker(1000 + n);
+        log::warn!(
+            "app_ffi: engine `{engine}` 的调用超时且无法安全中止 → 放弃该 worker 线程，\
+             为池 `{}` 补充替补 worker（{}/{}）",
+            self.name,
+            n + 1,
+            MAX_REPLACEMENT_WORKERS
+        );
     }
 
     /// 提交一个引擎调用作业，返回「等结果」的接收端。
@@ -1574,5 +1637,47 @@ mod status_and_rel_tests {
         assert!(ENGINE_BUSY_BODY.starts_with("503 Service Unavailable"));
         // 两段 deadline 的默认关系：没设 QUEUE 变量时与执行上限同值（60s）。
         assert_eq!(engine_queue_timeout(), engine_call_timeout());
+    }
+
+    /// 看门狗超时后**补充 worker** 的机制：池宽 1 时，第一条作业卡住（模拟永不返回的
+    /// C 调用），`replace_abandoned_worker` 必须让池重新能服务后续作业 —— 这是
+    /// 「一个卡死引擎不再饿死健康引擎」的承重墙。上限由 replaced 计数保证（另见
+    /// [`MAX_REPLACEMENT_WORKERS`]）。
+    #[test]
+    fn abandoned_worker_is_replaced_so_pool_keeps_serving() {
+        use std::sync::mpsc::channel;
+        use std::time::Duration;
+        let pool = EnginePool::start(1, "utpool");
+        let (started_tx, started_rx) = channel::<()>();
+        let (release_tx, release_rx) = channel::<()>();
+        let _stuck = pool
+            .submit(move || -> Result<()> {
+                started_tx.send(()).unwrap();
+                let _ = release_rx.recv(); // 模拟卡死的 C 调用
+                Ok(())
+            })
+            .expect("submit stuck job");
+        started_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("stuck job must start on the only worker");
+
+        // 看门狗判超时 → 放弃该 worker 并补一条替补。
+        pool.replace_abandoned_worker("ut");
+        assert_eq!(pool.replaced.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        // 替补必须能取到并完成新作业（旧实现在这里会永远排队）。
+        let (done_tx, done_rx) = channel::<()>();
+        let _job2 = pool
+            .submit(move || -> Result<()> {
+                done_tx.send(()).unwrap();
+                Ok(())
+            })
+            .expect("submit second job");
+        done_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("replacement worker must serve new jobs");
+
+        // 释放卡住的作业，让测试线程干净退出（池 Drop 后 worker 因 recv Err 退出）。
+        release_tx.send(()).unwrap();
     }
 }

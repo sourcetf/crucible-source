@@ -1,15 +1,52 @@
 //! Bidirectional TCP ↔ relay bridge for legacy TLS handshakes (NSS / TomCrypt).
 
 use std::io::{Read, Write};
+use std::net::{TcpListener, TcpStream as StdTcpStream};
 use std::os::unix::io::{IntoRawFd, RawFd};
-use std::os::unix::net::UnixStream;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::TcpStream;
 
+/// 建一对**回环 TCP** 连接当 legacy 栈的 relay。
+///
+/// 为什么不能用 `UnixStream::pair()`：NSS 的 `PR_ImportTCPSocket` 接受任意 fd，
+/// 但握手途中会按 TCP socket 处理（`getsockname`/socket option 等）。AF_UNIX 在
+/// 这一步返回 `PR_ADDRESS_NOT_SUPPORTED_ERROR (-5985)`，于是 `SSL_ForceHandshake`
+/// 立刻失败 —— 实测：真实 webserver 里每条 NSS 连接都 `crucible_nss_accept returned
+/// null`，而单测/独立 harness 用真实 TCP fd 时一切正常（同一份 shim、同一张证书）。
+/// 回环 TCP 对 NSS 就是普通 TCP，对 TomCrypt 的裸 read/write 也毫无区别。
+fn loopback_tcp_pair() -> anyhow::Result<(StdTcpStream, StdTcpStream)> {
+    let listener = TcpListener::bind(("127.0.0.1", 0))
+        .map_err(|e| anyhow::anyhow!("relay listener bind: {e}"))?;
+    let addr = listener
+        .local_addr()
+        .map_err(|e| anyhow::anyhow!("relay listener local_addr: {e}"))?;
+    let tx = StdTcpStream::connect(addr).map_err(|e| anyhow::anyhow!("relay connect: {e}"))?;
+    let (rx, _peer) = listener
+        .accept()
+        .map_err(|e| anyhow::anyhow!("relay accept: {e}"))?;
+    // 阻塞模式：桥用 std::io::copy 跑在普通线程里；非阻塞 fd 上 copy 会在第一次
+    // WouldBlock 时直接返回错误并退出线程（曾经让 TCP→relay 方向完全不通）。
+    for s in [&tx, &rx] {
+        s.set_nonblocking(false)
+            .map_err(|e| anyhow::anyhow!("relay set_nonblocking: {e}"))?;
+    }
+    Ok((tx, rx))
+}
+
 /// Spawn background threads copying bytes both ways between `tcp` and `relay`.
-pub fn spawn_bidirectional_bridge(tcp: std::net::TcpStream, mut relay: UnixStream) -> anyhow::Result<()> {
+///
+/// `relay`/`tcp` 必须是**阻塞** socket（`std::io::copy` 在非阻塞 fd 上会因
+/// WouldBlock 直接报错退出）。
+pub fn spawn_bidirectional_bridge(tcp: std::net::TcpStream, relay: StdTcpStream) -> anyhow::Result<()> {
+    // tokio 的 `TcpStream::into_std()` 保留 O_NONBLOCK —— std 线程里的
+    // `std::io::copy` 读不到数据时立刻返回 WouldBlock 并退出，桥就只剩单向。
+    tcp.set_nonblocking(false)
+        .map_err(|e| anyhow::anyhow!("tcp set_nonblocking: {e}"))?;
+    relay
+        .set_nonblocking(false)
+        .map_err(|e| anyhow::anyhow!("relay set_nonblocking: {e}"))?;
     let mut tcp_to_relay = tcp
         .try_clone()
         .map_err(|e| anyhow::anyhow!("tcp try_clone: {e}"))?;
@@ -19,11 +56,14 @@ pub fn spawn_bidirectional_bridge(tcp: std::net::TcpStream, mut relay: UnixStrea
     let mut tcp_from_relay = tcp
         .try_clone()
         .map_err(|e| anyhow::anyhow!("tcp try_clone: {e}"))?;
+    let mut relay_into_tcp = relay;
     std::thread::spawn(move || {
         let _ = std::io::copy(&mut relay_to_tcp, &mut tcp_to_relay);
+        let _ = tcp_to_relay.shutdown(std::net::Shutdown::Write);
     });
     std::thread::spawn(move || {
-        let _ = std::io::copy(&mut tcp_from_relay, &mut relay);
+        let _ = std::io::copy(&mut tcp_from_relay, &mut relay_into_tcp);
+        let _ = relay_into_tcp.shutdown(std::net::Shutdown::Write);
     });
     Ok(())
 }
@@ -31,8 +71,7 @@ pub fn spawn_bidirectional_bridge(tcp: std::net::TcpStream, mut relay: UnixStrea
 /// Write peek to relay peer, bridge tcp ↔ relay, return relay fd for C shim.
 /// Use for NSS (reads only from the fd — needs ClientHello reinjected on the wire).
 pub async fn relay_with_peek(stream: TcpStream, peek: Vec<u8>) -> anyhow::Result<RawFd> {
-    let (mut relay_tx, relay_rx) =
-        UnixStream::pair().map_err(|e| anyhow::anyhow!("socketpair: {e}"))?;
+    let (mut relay_tx, relay_rx) = loopback_tcp_pair()?;
     relay_tx
         .write_all(&peek)
         .map_err(|e| anyhow::anyhow!("relay peek write: {e}"))?;
@@ -44,8 +83,7 @@ pub async fn relay_with_peek(stream: TcpStream, peek: Vec<u8>) -> anyhow::Result
 /// Bridge tcp ↔ relay **without** writing peek (TomCrypt owns peek via `peek_io`).
 /// Writing peek here AND into peek_io double-feeds ClientHello as a fake CMK and can abort.
 pub async fn relay_bridge_only(stream: TcpStream) -> anyhow::Result<RawFd> {
-    let (relay_tx, relay_rx) =
-        UnixStream::pair().map_err(|e| anyhow::anyhow!("socketpair: {e}"))?;
+    let (relay_tx, relay_rx) = loopback_tcp_pair()?;
     let std_stream = stream.into_std().map_err(|e| anyhow::anyhow!("into_std: {e}"))?;
     spawn_bidirectional_bridge(std_stream, relay_tx)?;
     Ok(relay_rx.into_raw_fd())

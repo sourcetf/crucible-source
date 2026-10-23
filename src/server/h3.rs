@@ -168,7 +168,13 @@ mod imp {
             log::info!("h3: early data (0-RTT) explicitly enabled by ssl.early_data");
         }
         // Bind UDP then attach Boring-aware EndpointConfig (HMAC/versions).
-        let socket = std::net::UdpSocket::bind(bind).context("h3 udp bind")?;
+        //
+        // 绑定走 [`bind_udp_with_retry`]（SO_REUSEADDR + 短重试）而不是裸
+        // `UdpSocket::bind`：热重载时旧端点的 socket 由 quinn 驱动任务异步释放，
+        // 紧接的 rebind 会偶发 EADDRINUSE，旧实现只会把整个 h3 端点推迟 5s 重启
+        //（真机：`h3 udp bind: Address already in use; retry in 5s` ⇒ 最坏 5s 空窗）。
+        let socket = bind_udp_with_retry(bind).await?;
+
         // TASK2：整个 QUIC 端点都跑在这一条 UDP socket 上，ECN 的 socket 级设置
         // 与启动校验打在这里。默认关闭（`ListenerConfig::quic_ecn`）——
         // 它不改变 ECN 是否生效（quinn 那边本来就开着），只把状态变成可观测，
@@ -285,6 +291,122 @@ mod imp {
         Ok(())
     }
 
+    /// 带 `SO_REUSEADDR` 的 UDP 绑定 + 短重试（热重载重启 h3 端点的承重墙）。
+    ///
+    /// 故障形态（verify6 §5 P3-6 真机）：无活跃连接的配置/证书重载 ⇒ 端点立即
+    /// `close()`，`serve` 返回，上层循环**立刻**重绑同一 UDP 地址；此刻旧端点
+    /// 的 socket 仍被 quinn 驱动任务持有（`Endpoint::close` 只是发起关闭，驱动在
+    /// 下一个 poll 周期才 drop socket），`UdpSocket::bind` 拿 `EADDRINUSE`，
+    /// 上层 `mod.rs` 只能 `retry in 5s` ⇒ 最坏 5s 的 h3 完全不可用。
+    ///
+    /// 修两层：
+    ///   1. bind 前设 `SO_REUSEADDR`。UDP 上它允许新旧 socket 短暂共存（Linux/OpenBSD
+    ///      都要求两侧都设 —— 本端点每一代都经本函数创建，故升级后的重启满足条件）；
+    ///   2. 仍是 `EADDRINUSE`（升级前创建的老 socket 没设、或端口暂时被占）时，在这里
+    ///      以 20ms 间隔重试最多 900ms。成功即恢复服务；超过 900ms 才返回错误，交给
+    ///      上层 5s 退避 —— 「最坏 5s 空窗」于是变成「最坏 <1s」。
+    #[cfg(unix)]
+    fn bind_udp_reuseaddr(bind: SocketAddr) -> std::io::Result<std::net::UdpSocket> {
+        use std::os::unix::io::FromRawFd;
+
+        let domain = if bind.is_ipv4() {
+            libc::AF_INET
+        } else {
+            libc::AF_INET6
+        };
+        let fd = unsafe { libc::socket(domain, libc::SOCK_DGRAM, 0) };
+        if fd < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        // FD_CLOEXEC 必须显式设：`std::net::UdpSocket::bind` 会用 SOCK_CLOEXEC，而这里
+        // 是裸 `socket()`。否则 CGI/sidecar 子进程会继承 h3 的 UDP fd —— 父进程重启
+        // 端点时旧 socket 被子进程续命，rebind 会持续 EADDRINUSE（本修复要消灭的 5s
+        // 空窗的另一种来源），且子进程可能分走 QUIC 报文。
+        if unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) } < 0 {
+            let e = std::io::Error::last_os_error();
+            unsafe { libc::close(fd) };
+            return Err(e);
+        }
+        let one: libc::c_int = 1;
+        let rc = unsafe {
+            libc::setsockopt(
+                fd,
+                libc::SOL_SOCKET,
+                libc::SO_REUSEADDR,
+                &one as *const _ as *const libc::c_void,
+                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+            )
+        };
+        if rc != 0 {
+            let e = std::io::Error::last_os_error();
+            unsafe { libc::close(fd) };
+            return Err(e);
+        }
+        let mut ss: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
+        let len = match bind {
+            SocketAddr::V4(a) => {
+                let sin = &mut ss as *mut libc::sockaddr_storage as *mut libc::sockaddr_in;
+                unsafe {
+                    (*sin).sin_family = libc::AF_INET as libc::sa_family_t;
+                    (*sin).sin_port = a.port().to_be();
+                    // s_addr 按网络字节序存储：octets 原样落内存（不能用 u32::from，
+                    // 那会把 127.0.0.1 写成 01 00 00 7f）。
+                    (*sin).sin_addr.s_addr = u32::from_ne_bytes(a.ip().octets());
+                }
+                std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t
+            }
+            SocketAddr::V6(a) => {
+                let sin6 = &mut ss as *mut libc::sockaddr_storage as *mut libc::sockaddr_in6;
+                unsafe {
+                    (*sin6).sin6_family = libc::AF_INET6 as libc::sa_family_t;
+                    (*sin6).sin6_port = a.port().to_be();
+                    (*sin6).sin6_addr.s6_addr = a.ip().octets();
+                }
+                std::mem::size_of::<libc::sockaddr_in6>() as libc::socklen_t
+            }
+        };
+        if unsafe { libc::bind(fd, &ss as *const _ as *const libc::sockaddr, len) } != 0 {
+            let e = std::io::Error::last_os_error();
+            unsafe { libc::close(fd) };
+            return Err(e);
+        }
+        Ok(unsafe { std::net::UdpSocket::from_raw_fd(fd) })
+    }
+
+    #[cfg(not(unix))]
+    fn bind_udp_reuseaddr(bind: SocketAddr) -> std::io::Result<std::net::UdpSocket> {
+        std::net::UdpSocket::bind(bind)
+    }
+
+    /// rebind 的总重试窗口（见 [`bind_udp_reuseaddr`]）：必须明显小于上层 5s 退避，
+    /// 又足够覆盖 quinn 驱动任务释放旧 socket 的一两个 poll 周期。
+    const H3_REBIND_RETRY: std::time::Duration = std::time::Duration::from_millis(900);
+    const H3_REBIND_INTERVAL: std::time::Duration = std::time::Duration::from_millis(20);
+
+    async fn bind_udp_with_retry(bind: SocketAddr) -> Result<std::net::UdpSocket> {
+        let start = std::time::Instant::now();
+        loop {
+            match bind_udp_reuseaddr(bind) {
+                Ok(s) => {
+                    if start.elapsed() >= H3_REBIND_INTERVAL {
+                        log::info!(
+                            "h3 udp rebind {bind} succeeded after {:?} (waited for the previous endpoint socket to go away)",
+                            start.elapsed()
+                        );
+                    }
+                    return Ok(s);
+                }
+                Err(e)
+                    if e.kind() == std::io::ErrorKind::AddrInUse
+                        && start.elapsed() < H3_REBIND_RETRY =>
+                {
+                    tokio::time::sleep(H3_REBIND_INTERVAL).await;
+                }
+                Err(e) => return Err(e).context("h3 udp bind"),
+            }
+        }
+    }
+
     /// 配置/证书变更或 listener 被移除时的**优雅**端点关闭：
     /// 1. 广播 shutdown（每条活跃连接的 accept 循环据此发 H3 GOAWAY）；
     /// 2. 有活跃连接时宽限 [`H3_SHUTDOWN_GRACE`]，让在飞请求把响应写完；
@@ -309,6 +431,11 @@ mod imp {
             tokio::time::sleep(H3_SHUTDOWN_GRACE).await;
         }
         ep.close(quinn::VarInt::from_u32(0), reason);
+        // 等驱动任务真正收尾并**释放 UDP socket**：`Endpoint::close` 只发起关闭，
+        // 紧接着的 rebind 会与仍在 drop 的旧 socket 撞 EADDRINUSE（见
+        // [`bind_udp_reuseaddr`] 的说明）。wait_idle 有界（750ms），超时也不阻塞
+        // 重启 —— 剩下的竞态由 SO_REUSEADDR + 900ms 重试兜住。
+        let _ = tokio::time::timeout(std::time::Duration::from_millis(750), ep.wait_idle()).await;
     }
 
     /// QUIC 传输层显式限额（**不依赖 quinn 的库默认值**）。
@@ -954,7 +1081,7 @@ mod imp {
         {
             let snap = live.snapshot();
             if crate::server::access::is_admin_path(&snap.admin.path, req.uri().path()) {
-                use crate::server::basic_auth::{admin_gate, retry_after_secs, AdminGate};
+                use crate::server::basic_auth::{admin_gate_path, retry_after_secs, AdminGate};
                 let t0 = std::time::Instant::now();
                 // (状态码, Retry-After, 文案)；None = 已过鉴权门，交给 admin::handle
                 // 判定顺序与 h1/h2 的「ACL → CSRF → 鉴权门」一致：ACL 是**无状态**的纯判定，
@@ -973,7 +1100,7 @@ mod imp {
                         let (st, msg) = crate::server::access::cross_site_response();
                         Some((st, None, msg))
                     } else {
-                        match admin_gate(req.headers(), &snap.admin, peer.ip()) {
+                        match admin_gate_path(req.headers(), &snap.admin, peer.ip(), req.uri().path()) {
                             AdminGate::Proceed => None,
                             AdminGate::Unauthorized => {
                                 Some((StatusCode::UNAUTHORIZED, None, "unauthorized"))
@@ -1622,7 +1749,7 @@ use chunked uploads (Content-Range) or HTTP/1.1 for larger bodies",
                 Ok(r) => r,
                 Err(resp) => return tag(resp, "admin"),
             };
-            let resp = crate::server::admin::handle(req.map(Full::new), live).await;
+            let resp = crate::server::admin::handle(req.map(Full::new), live, lc.ssl.is_some(), peer.ip()).await;
             // 兜底记账（与 h1/h2 同语义）：鉴权与失败退避已在 admin_gate 里完成，
             // 这里只在「过了门却仍回 401」（两次校验之间配置被热重载）时补记一次。
             crate::server::basic_auth::note_admin_result(peer.ip(), resp.status());
@@ -1634,7 +1761,7 @@ use chunked uploads (Content-Range) or HTTP/1.1 for larger bodies",
 
         // page_rules: block/redirect(apply_simple) + rewrite(路径改写) + cache/header(响应头)
         if let Some((status, location)) =
-            crate::server::page_rules::apply_simple(&lc, &path, &crate::server::page_rules::MatchCtx::from_request(&req))
+            crate::server::page_rules::apply_simple(&lc, &path, &crate::server::page_rules::MatchCtx::from_request_with_peer(&req, peer.ip(), &lc))
         {
             if status == StatusCode::FORBIDDEN {
                 return tag(
@@ -1658,7 +1785,7 @@ use chunked uploads (Content-Range) or HTTP/1.1 for larger bodies",
         // 见 `from_request_with_host` 的说明）。
         let pr_host = crate::server::page_rules::host_snapshot(&req);
         {
-            let pr_ctx = crate::server::page_rules::MatchCtx::from_request(&req);
+            let pr_ctx = crate::server::page_rules::MatchCtx::from_request_with_peer(&req, peer.ip(), &lc);
             if let Some(np) = crate::server::page_rules::rewrite_path(&lc, &path, &pr_ctx) {
                 let pq = match req.uri().query() {
                     Some(q) => format!("{np}?{q}"),
@@ -1674,7 +1801,12 @@ use chunked uploads (Content-Range) or HTTP/1.1 for larger bodies",
         // host 用改写前的快照：h3 的 host 只存在于 `:authority`（URI authority），
         // 客户端可以不发 Host 头；URI 被换成相对形态后 authority 消失，重建 ctx 会
         // 丢 host ⇒ 带 host 约束的 block/pass/header 静默不命中（仅 h2/h3 的漏洞面）。
-        let pr_ctx = crate::server::page_rules::MatchCtx::from_request_with_host(&req, pr_host.as_deref());
+        let pr_ctx = crate::server::page_rules::MatchCtx::from_request_with_host_and_peer(
+            &req,
+            pr_host.as_deref(),
+            peer.ip(),
+            &lc,
+        );
         // P1-5：h1 的 pass_upstream（page rule pass 动作）在 h3 同样生效。
         if let Some((murl, upstream)) = crate::server::page_rules::pass_upstream(&lc, &path, &pr_ctx) {
             // proxy_page_rule 需要 h1 体类型（Bytes）：先收齐（≤8MiB）。

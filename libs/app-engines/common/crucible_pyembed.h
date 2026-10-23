@@ -119,6 +119,9 @@ typedef struct {
 static crucible_py_api g_py;
 static void *g_py_lib;
 static int g_py_state;            /* 0=未尝试 1=就绪 -1=失败 */
+/* 1 = 正处在「初始化锁内的视图清理回调」上下文（此时 g_py_state 仍是 0，但解释器
+ * 已初始化、g_py 表已加载；只允许本线程的 env_view 走通，见该函数）。 */
+static int g_py_init_scrub_ctx;
 static char g_py_init_err[256];
 static char g_py_version[96];
 static void *g_py_tstate;         /* PyEval_SaveThread 保存的初始化线程状态 */
@@ -557,7 +560,7 @@ static void *crucible_py_env_view(void)
 {
     void *os_mod, *envmap, *real, *data;
 
-    if (g_py_state != 1)
+    if (g_py_state != 1 && !g_py_init_scrub_ctx)
         return NULL;
     os_mod = g_py.import_module("os");
     if (os_mod == NULL) {
@@ -585,7 +588,169 @@ static void *crucible_py_env_view(void)
     return data;
 }
 
-/* 把底层 dict 交给窗口持有（新引用）。返回 1 = 窗口接管（调用方不得 dec_ref）。 */
+/* ---------------- 初始化时刻的 os.environ 视图清理（跨引擎 .env 残值） ---
+ *
+ * 故障：CPython 的 os.environ 是 import 时从 posix.environ 拷出的快照（_data），
+ * 之后 C environ 的 setenv 它看不见。若 Py_Initialize 恰好发生在某个带 `.env`
+ * 的 wsgi/asgi/uwsgi 请求窗口里（env_lock 已把该请求的 .env 装进 C environ），
+ * 这些键会被永久烤进视图；后续「无 .env」的应用（尤其 python 引擎）读到别人的
+ * 秘密值。python 引擎旧实现只在**首次安装 shim** 时清理**本请求**的键 —— 别的
+ * 引擎先初始化时留下的键永远清不掉。
+ *
+ * 修法：**谁真正执行 Py_Initialize，谁在初始化锁内把视图对齐到启动期基底**
+ *（appengine_set_base_env 的快照，绝不含请求期 .env）。为什么必须锁内：等待
+ * 初始化的另一个引擎一旦拿到锁就会开始 `crucible_py_sync_environ_locked`，
+ * 清理若在锁外与之竞速，会把刚同步进去的键删掉（跨引擎 `<unset>`）。
+ *
+ * 清理后：视图 = 启动期基底；请求期 `.env` 由各引擎自己的每请求通道提供
+ *（pyembed 的同步窗口 / python 引擎的 TLS 覆盖表）。
+ */
+static const char *crucible_py_base_lookup(const char *key, size_t klen, size_t *vlen)
+{
+    const char *base = appengine_base_env_block();
+    const char *p;
+
+    if (base == NULL)
+        return NULL;
+    for (p = base; *p != '\0'; p += strlen(p) + 1) {
+        const char *eq = strchr(p, '=');
+
+        if (eq != NULL && (size_t)(eq - p) == klen && memcmp(p, key, klen) == 0) {
+            if (vlen != NULL)
+                *vlen = strlen(eq + 1);
+            return eq + 1;
+        }
+    }
+    return NULL;
+}
+
+/* 把视图对齐到启动期基底。须持 GIL；只在初始化锁内调用（见上）。 */
+static void crucible_py_env_scrub_to_base(void)
+{
+    void *view, *keys;
+    const char *base;
+    long n, i;
+
+    base = appengine_base_env_block();
+    if (base == NULL)
+        return; /* 旧宿主没给基底：保持旧行为，绝不清空视图 */
+    view = crucible_py_env_view(); /* 新引用 */
+    if (view == NULL)
+        return;
+    /* 先取键的**列表快照**（`list(view.keys())`）：dict 不是序列（不能用
+     * PySequence_GetItem 按下标取），而边遍历边删会抛 RuntimeError。 */
+    keys = g_py.object_call_method(view, "keys", NULL); /* 新引用（view） */
+    if (keys != NULL) {
+        void *bi = g_py.import_module("builtins");
+        void *list = NULL;
+
+        if (bi != NULL) {
+            list = g_py.object_call_method(bi, "list", "O", keys);
+            g_py.dec_ref(bi);
+        }
+        g_py.dec_ref(keys);
+        keys = list;
+    }
+    if (keys == NULL) {
+        crucible_py_clear_error();
+        g_py.dec_ref(view);
+        return;
+    }
+    n = g_py.sequence_size(keys);
+    for (i = 0; i < n; i++) {
+        void *key = g_py.sequence_get_item(keys, i); /* 新引用 */
+        char *kb = NULL;
+        long klen = 0;
+        size_t vlen = 0;
+        const char *bv;
+
+        if (key == NULL) {
+            crucible_py_clear_error();
+            continue;
+        }
+        if (g_py.bytes_as_string_and_size(key, &kb, &klen) != 0 || kb == NULL) {
+            crucible_py_clear_error();
+            g_py.dec_ref(key);
+            continue;
+        }
+        bv = crucible_py_base_lookup(kb, (size_t)klen, &vlen);
+        if (bv == NULL) {
+            if (g_py.dict_del_item(view, key) != 0)
+                crucible_py_clear_error();
+        } else {
+            void *cur = g_py.dict_get_item(view, key); /* 借用 */
+            char *cs = NULL;
+            long cn = 0;
+            int same = 0;
+
+            if (cur != NULL && g_py.bytes_as_string_and_size(cur, &cs, &cn) == 0 &&
+                (size_t)cn == vlen && memcmp(cs, bv, vlen) == 0)
+                same = 1;
+            crucible_py_clear_error();
+            if (!same) {
+                void *val = g_py.bytes_from_string_and_size(bv, (long)vlen);
+
+                if (val != NULL) {
+                    if (g_py.dict_set_item(view, key, val) != 0)
+                        crucible_py_clear_error();
+                    g_py.dec_ref(val);
+                } else {
+                    crucible_py_clear_error();
+                }
+            }
+        }
+        g_py.dec_ref(key);
+    }
+    g_py.dec_ref(keys);
+    /* 基底里有、视图里没有的键：补上（无 .env 的应用仍要看到运维环境）。 */
+    {
+        const char *p;
+
+        for (p = base; *p != '\0'; p += strlen(p) + 1) {
+            const char *eq = strchr(p, '=');
+            void *key, *val;
+
+            if (eq == NULL || eq == p)
+                continue;
+            key = g_py.bytes_from_string_and_size(p, (long)(eq - p));
+            if (key == NULL) {
+                crucible_py_clear_error();
+                continue;
+            }
+            if (g_py.dict_get_item(view, key) == NULL) {
+                val = g_py.bytes_from_string_and_size(eq + 1, (long)strlen(eq + 1));
+                if (val != NULL) {
+                    if (g_py.dict_set_item(view, key, val) != 0)
+                        crucible_py_clear_error();
+                    g_py.dec_ref(val);
+                } else {
+                    crucible_py_clear_error();
+                }
+            }
+            g_py.dec_ref(key);
+        }
+    }
+    g_py.dec_ref(view);
+    crucible_py_clear_error();
+}
+
+/* 初始化回调（crucible_pyinit_ensure_cb 的 v2 形状）：在共享初始化锁内、初始化
+ * 线程已 SaveThread 之后调用 —— 这里自己取/放 GIL。 */
+static void crucible_py_env_scrub_on_init(void)
+{
+    int gil;
+
+    if (g_py.gil_ensure == NULL || g_py.is_initialized == NULL ||
+        !g_py.is_initialized())
+        return;
+    g_py_init_scrub_ctx = 1;
+    gil = g_py.gil_ensure();
+    crucible_py_env_scrub_to_base();
+    g_py.gil_release(gil);
+    g_py_init_scrub_ctx = 0;
+}
+
+
 static int crucible_py_envwin_set_view(void *view)
 {
     int took = 0;
@@ -934,8 +1099,9 @@ static int crucible_py_init_locked(char *err, size_t errsz)
          * 协调器（scriptffi.c::crucible_py_ensure_init）用进程级静态互斥串行化
          * 「检查 + initialize + SaveThread」；libscriptffi.so 缺失时退回本 .so
          * 私有锁（只有一个嵌入点的场景仍然正确）。 */
-        if (crucible_pyinit_ensure(g_py.is_initialized, g_py.init,
-                                   (void *(*)(void))g_py.save_thread, err, errsz) != 0) {
+        if (crucible_pyinit_ensure_cb(g_py.is_initialized, g_py.init,
+                                      (void *(*)(void))g_py.save_thread,
+                                      crucible_py_env_scrub_on_init, err, errsz) != 0) {
             snprintf(g_py_init_err, sizeof(g_py_init_err), "%s",
                      (err != NULL && err[0] != '\0') ? err : "CPython 初始化失败");
             if (err != NULL && errsz > 0)
@@ -1005,6 +1171,18 @@ typedef struct {
 
 static crucible_py_app_cache g_py_app;
 
+/* ------------------------------- ASGI 应用缓存（C 侧静态句柄，每 .so 一份） --- *
+ * 旧实现把缓存挂在 `sys.modules['__crucible_asgi_cache__']`：那是**解释器全局且
+ * 应用可写**的命名空间——同进程里任何一个 Python 应用都能把它换掉/清空，直接影响
+ * 别的 ASGI 应用的 app 对象（代码替换/性能打击），而且 `sys.modules` 可枚举。
+ * 现在缓存是 C 侧持有的一个 dict（本 .so 私有 static），经每次请求的驱动命名空间
+ * 参数 `__cr_cache` 传入；应用拿不到它，`sys.modules` 里也不再有这个名字。
+ *
+ * 生命周期：解释器常驻（从不 Py_Finalize），dict 与其中的 app 对象随进程存活；
+ * shutdown 时清空内容（见 crucible_py_app_cache_clear）。键 = 脚本路径，
+ * 值 = (mtime, app)。所有访问都在 GIL 内。 */
+static void *g_py_asgi_cache;
+
 /* 清缓存（须持 GIL；调用方持 g_py_lock）。 */
 static void crucible_py_app_cache_clear(void)
 {
@@ -1015,7 +1193,147 @@ static void crucible_py_app_cache_clear(void)
     g_py_app.script[0] = '\0';
     g_py_app.mtime = 0;
     g_py_app.size = 0;
+    if (g_py_asgi_cache != NULL) {
+        void *r = g_py.object_call_method(g_py_asgi_cache, "clear", NULL);
+        if (r != NULL)
+            g_py.dec_ref(r);
+        else
+            crucible_py_clear_error();
+    }
 }
+
+/* 定义在本段之后；sys.path 守卫用到它。 */
+static const char *crucible_py_dirname(const char *path, char *out, size_t outsz);
+
+/* ------------------------------- sys.path 请求级守卫（每 .so 一份） ---
+ *
+ * 旧实现只在 WSGI 应用（重）加载时 `sys.path.insert(0, 脚本目录)`，从不移除：
+ * ① 每次重载再插一份（同一目录重复）；② 目录随配置有界，但**同 .so 的所有应用
+ * 共享**——A 应用可以 import 到 B 应用 docroot 里的同名模块；③ ASGI 走
+ * `runpy.run_path` 从不加目录（asgi 应用无法 import 同目录模块，功能缺口）。
+ *
+ * 现在每请求进入时确保脚本目录在最前（**去重**），离开时**只移除本次插入的那一项**
+ *（按值 `list.remove`）。不能「整表快照/覆盖」：wsgi/asgi/uwsgi 在**同一解释器**里
+ * 并发执行（各自 .so 私有 statics），整表恢复会把别的请求刚插入的目录一起抹掉，
+ * 正在执行的请求随后 import 同目录模块就会失败。按值移除只撤回自己加的那一条，
+ * 既不增长也不干扰并发请求。
+ */
+typedef struct {
+    char dir[1024];
+    int inserted; /* 1 = 本请求插入了目录，离开时必须移除 */
+} crucible_py_path_guard;
+
+/* `sys.path` 里是否已有 dir（只比较 str 项；返回 1/0）。须持 GIL。 */
+static int crucible_py_sys_path_contains(const char *dir)
+{
+    void *sys_mod, *sys_path;
+    long n, i;
+    int found = 0;
+
+    sys_mod = g_py.import_module("sys");
+    if (sys_mod == NULL) {
+        crucible_py_clear_error();
+        return 0;
+    }
+    sys_path = g_py.object_get_attr_string(sys_mod, "path");
+    g_py.dec_ref(sys_mod);
+    if (sys_path == NULL) {
+        crucible_py_clear_error();
+        return 0;
+    }
+    n = g_py.sequence_size(sys_path);
+    for (i = 0; i < n; i++) {
+        void *item = g_py.sequence_get_item(sys_path, i); /* 新引用 */
+        const char *s;
+        long slen = 0;
+
+        if (item == NULL) {
+            crucible_py_clear_error();
+            continue;
+        }
+        s = g_py.unicode_as_utf8_and_size(item, &slen);
+        if (s != NULL && slen == (long)strlen(dir) && memcmp(s, dir, (size_t)slen) == 0)
+            found = 1;
+        g_py.dec_ref(item);
+        if (found)
+            break;
+    }
+    g_py.dec_ref(sys_path);
+    crucible_py_clear_error();
+    return found;
+}
+
+/* 请求进入：把脚本目录放到 sys.path[0]（已存在则不重复插入）。须持 GIL。
+ * 返回的 guard 必须传给 [`crucible_py_path_leave`]（同一次请求内、释放 GIL 之前）。 */
+static void crucible_py_path_enter(const char *script, crucible_py_path_guard *guard)
+{
+    void *sys_mod, *sys_path;
+    const char *dir;
+
+    guard->inserted = 0;
+    guard->dir[0] = '\0';
+    if (script == NULL || script[0] == '\0')
+        return;
+    dir = crucible_py_dirname(script, guard->dir, sizeof(guard->dir));
+    if (dir == NULL)
+        return;
+    if (crucible_py_sys_path_contains(guard->dir)) {
+        guard->dir[0] = '\0'; /* 已在路径里：本请求不拥有任何插入 */
+        return;
+    }
+    sys_mod = g_py.import_module("sys");
+    if (sys_mod == NULL) {
+        crucible_py_clear_error();
+        guard->dir[0] = '\0';
+        return;
+    }
+    sys_path = g_py.object_get_attr_string(sys_mod, "path");
+    g_py.dec_ref(sys_mod);
+    if (sys_path == NULL) {
+        crucible_py_clear_error();
+        guard->dir[0] = '\0';
+        return;
+    }
+    {
+        void *r = g_py.object_call_method(sys_path, "insert", "is", 0, guard->dir);
+        if (r != NULL) {
+            g_py.dec_ref(r);
+            guard->inserted = 1;
+        } else {
+            crucible_py_clear_error();
+            guard->dir[0] = '\0';
+        }
+    }
+    g_py.dec_ref(sys_path);
+    crucible_py_clear_error();
+}
+
+/* 请求离开：只移除本请求插入的那一项（按值删第一个匹配）。须持 GIL。 */
+static void crucible_py_path_leave(crucible_py_path_guard *guard)
+{
+    void *sys_mod, *sys_path;
+
+    if (guard == NULL || !guard->inserted || guard->dir[0] == '\0')
+        return;
+    sys_mod = g_py.import_module("sys");
+    if (sys_mod == NULL) {
+        crucible_py_clear_error();
+        return;
+    }
+    sys_path = g_py.object_get_attr_string(sys_mod, "path");
+    g_py.dec_ref(sys_mod);
+    if (sys_path != NULL) {
+        void *r = g_py.object_call_method(sys_path, "remove", "s", guard->dir);
+        if (r != NULL)
+            g_py.dec_ref(r);
+        else
+            crucible_py_clear_error(); /* 应用已自行移除：忽略 */
+        g_py.dec_ref(sys_path);
+    }
+    guard->inserted = 0;
+    crucible_py_clear_error();
+}
+
 
 /* 脚本所在目录（写入 out，返回 out 或 NULL）。 */
 static const char *crucible_py_dirname(const char *path, char *out, size_t outsz)
@@ -1043,9 +1361,6 @@ static int crucible_py_wsgi_app_locked(const char *script, char *err, size_t err
 {
     struct stat st;
     void *runpy, *ns, *app;
-    void *sys_mod, *sys_path;
-    char dirbuf[1024];
-    const char *dir;
 
     if (script == NULL || script[0] == '\0') {
         snprintf(err, errsz, "未解析到脚本路径");
@@ -1080,18 +1395,8 @@ static int crucible_py_wsgi_app_locked(const char *script, char *err, size_t err
         return -1;
     }
     g_py.inc_ref(app);
-    /* sys.path 前置脚本目录：应用 import 同目录模块（模板/工具）时必需。 */
-    sys_mod = g_py.import_module("sys");
-    if (sys_mod != NULL) {
-        sys_path = g_py.object_get_attr_string(sys_mod, "path");
-        if (sys_path != NULL) {
-            dir = crucible_py_dirname(script, dirbuf, sizeof(dirbuf));
-            if (dir != NULL)
-                (void)g_py.object_call_method(sys_path, "insert", "is", 0, dir);
-            g_py.dec_ref(sys_path);
-        }
-        g_py.dec_ref(sys_mod);
-    }
+    /* sys.path 由**每请求**守卫负责（crucible_py_path_enter/leave）：这里插入会在
+     * 缓存命中时被跳过、在重载时无限重复，而且永不移除（旧实现）。 */
     crucible_py_clear_error();
 
     crucible_py_xdecref(g_py_app.app);
@@ -1188,6 +1493,7 @@ static int crucible_py_wsgi_request(const char *label, const char *script,
     char hostbuf[320];
     char *trace = NULL;
     int gil = 0, rc = -1, we_gil = 0, envwin = 0;
+    crucible_py_path_guard path_guard;
     void *app = NULL;
     void *environ = NULL, *args = NULL, *sr = NULL, *result = NULL, *it = NULL;
     void *state = NULL, *write_fn = NULL, *io = NULL, *pybody = NULL, *wsgi_in = NULL;
@@ -1199,6 +1505,7 @@ static int crucible_py_wsgi_request(const char *label, const char *script,
     (void)docroot; /* 脚本解析由引擎完成（script 已是可用路径） */
     memset(&hb, 0, sizeof(hb));
     memset(&bb, 0, sizeof(bb));
+    memset(&path_guard, 0, sizeof(path_guard));
 
     if (out == NULL)
         return -1;
@@ -1237,6 +1544,9 @@ static int crucible_py_wsgi_request(const char *label, const char *script,
         envwin = 1;
         crucible_py_sync_environ_locked();
     }
+    /* 应用（重）加载会执行模块顶层代码，可能 import 同目录模块 ⇒ 目录必须在
+     * runpy.run_path 之前进 sys.path。守卫在请求结束时只撤回自己插入的那一项。 */
+    crucible_py_path_enter(script, &path_guard);
     if (crucible_py_wsgi_app_locked(script, errbuf, sizeof(errbuf)) != 0) {
         pthread_mutex_unlock(&g_py_lock);
         rc = crucible_py_fail(out, "%s: %s", label, errbuf);
@@ -1443,6 +1753,7 @@ done:
      * （本修复就是后者：并发同组请求互相抹掉 .env）。 */
     if (envwin)
         crucible_py_envwin_leave();
+    crucible_py_path_leave(&path_guard);
     crucible_py_xdecref(app);
     crucible_py_xdecref(environ);
     crucible_py_xdecref(args);
@@ -1468,31 +1779,29 @@ done:
 /*
  * ASGI 需要事件循环，C 侧不便手写；这里把驱动逻辑作为 Python 源码 exec 进一个
  * 新建的命名空间（同进程内执行，不是 spawn），再读回结果字典。
- * 应用按 (script, mtime) 缓存：缓存在同解释器的 sys.modules 私有键下，语义与
- * WSGI 路径一致（import 一次的 ASGI 应用不会被每请求重新执行），脚本改动即重载。
+ * 应用按 (script, mtime) 缓存：缓存是 C 侧持有的私有 dict（`__cr_cache` 参数，
+ * 见 `g_py_asgi_cache`），语义与 WSGI 路径一致（import 一次的 ASGI 应用不会被
+ * 每请求重新执行），脚本改动即重载。**不再**用 `sys.modules` 里的可枚举键。
  * 输入：__cr_script / __cr_method / __cr_path / __cr_query / __cr_body /
- *       __cr_ct / __cr_host / __cr_port / __cr_remote / __cr_headers
+ *       __cr_ct / __cr_host / __cr_port / __cr_remote / __cr_headers / __cr_cache
  *       （__cr_headers 是 ABI 头块的 bytes，行间 \\r\\n）
  * 输出：__cr_result = {'status': str, 'headers': "K: V\r\n" 文本块, 'body': bytes}
  */
 static const char *g_py_asgi_driver =
-    "import asyncio, os, runpy, sys, types\n"
-    "_C = sys.modules.get('__crucible_asgi_cache__')\n"
-    "if _C is None:\n"
-    "    _C = types.SimpleNamespace(apps={})\n"
-    "    sys.modules['__crucible_asgi_cache__'] = _C\n"
+    "import asyncio, os, runpy, sys\n"
+    "_C = __cr_cache\n"
     "try:\n"
     "    _mt = os.stat(__cr_script).st_mtime\n"
     "except OSError:\n"
     "    _mt = None\n"
-    "_ent = _C.apps.get(__cr_script)\n"
+    "_ent = _C.get(__cr_script)\n"
     "if _ent is None or _ent[0] != _mt:\n"
     "    _ns = runpy.run_path(__cr_script)\n"
     "    _app = _ns.get('app') or _ns.get('application')\n"
     "    if _app is None:\n"
     "        raise RuntimeError('asgi: no app/application callable in ' + __cr_script)\n"
     "    _ent = (_mt, _app)\n"
-    "    _C.apps[__cr_script] = _ent\n"
+    "    _C[__cr_script] = _ent\n"
     "_app = _ent[1]\n"
     "_status = [200]\n"
     "_headers = []\n"
@@ -1585,6 +1894,7 @@ static int crucible_py_asgi_request(const char *label, const char *script,
     char *htmp = NULL;
     char *trace = NULL;
     int gil = 0, rc = -1, we_gil = 0, envwin = 0;
+    crucible_py_path_guard path_guard;
     void *g = NULL, *res = NULL, *pybody = NULL, *drv = NULL, *st = NULL, *hd = NULL;
     void *bdy = NULL, *portobj = NULL, *pyheaders = NULL;
     const char *srv = server_name != NULL && server_name[0] != '\0' ? server_name : "crucible";
@@ -1593,6 +1903,7 @@ static int crucible_py_asgi_request(const char *label, const char *script,
     (void)docroot;
     memset(&hb, 0, sizeof(hb));
     memset(&bb, 0, sizeof(bb));
+    memset(&path_guard, 0, sizeof(path_guard));
 
     if (out == NULL)
         return -1;
@@ -1620,6 +1931,18 @@ static int crucible_py_asgi_request(const char *label, const char *script,
         envwin = 1;
         crucible_py_sync_environ_locked();
     }
+    /* sys.path：进入前确保脚本目录在最前（ASGI 旧实现从不加目录 ⇒ 同目录模块
+     * import 不到；WSGI 侧则是只增不减）。离开时只撤回自己插入的那一项。 */
+    crucible_py_path_enter(script, &path_guard);
+    /* 应用缓存：C 侧私有 dict（应用改不到、sys.modules 里也没有这个名字）。 */
+    if (g_py_asgi_cache == NULL) {
+        g_py_asgi_cache = g_py.dict_new();
+        if (g_py_asgi_cache == NULL) {
+            crucible_py_err_text(errbuf, sizeof(errbuf), "构造 ASGI 应用缓存失败");
+            rc = crucible_py_fail(out, "%s: %s", label, errbuf);
+            goto done;
+        }
+    }
 
     if (port == 80)
         snprintf(hostbuf, sizeof(hostbuf), "%s", srv);
@@ -1646,6 +1969,7 @@ static int crucible_py_asgi_request(const char *label, const char *script,
     (void)g_py.dict_set_item_string(g, "__cr_body", pybody);
     (void)g_py.dict_set_item_string(g, "__cr_headers", pyheaders);
     (void)g_py.dict_set_item_string(g, "__cr_port", portobj);
+    (void)g_py.dict_set_item_string(g, "__cr_cache", g_py_asgi_cache);
 
     drv = crucible_py_exec_source(g_py_asgi_driver, "<crucible-asgi-driver>", g,
                                   errbuf, sizeof(errbuf));
@@ -1699,6 +2023,7 @@ done:
     /* 窗口引用计数退场（须在释放 GIL 之前；理由同 WSGI 路径：最后一个离开者恢复）。 */
     if (envwin)
         crucible_py_envwin_leave();
+    crucible_py_path_leave(&path_guard);
     crucible_py_xdecref(drv);
     crucible_py_xdecref(pybody);
     crucible_py_xdecref(portobj);

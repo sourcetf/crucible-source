@@ -84,17 +84,34 @@ note_missing_tool() {
 }
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+# 用户级运行时（php/ruby/java/maven/node/dotnet 由 scripts/install_app_runtimes.sh
+# 装到 ~/local）：自动进 PATH/LD_LIBRARY_PATH/JAVA_HOME，否则 build_script_ffi.sh
+# 找不到 ruby.h、build_jsp_sidecar.sh 找不到 mvn/javac。
+# shellcheck source=scripts/runtime_env.sh
+. "${ROOT}/scripts/runtime_env.sh"
 OUT="${CRUCIBLE_APP_ENGINES_OUT:-${ROOT}/target/app-engines}"
 INC="${ROOT}/libs/app-engines/include"
 COMMON="${ROOT}/libs/app-engines/common"
 SAMPLES="${ROOT}/libs/app-engines/samples"
 LUA_DIR="${ROOT}/libs/app-engines/lua"
 GO_SHM_DIR="${ROOT}/libs/app-engines/go-shm"
+HOST_OS="$(uname -s | tr "[:upper:]" "[:lower:]")"
+# GO_ENGINE_MODE 优先级：显式环境变量 > config.mk（**仅当它为目标机生成时**）> ffi。
+# config.mk 是 configure 在目标机（生产 OpenBSD）生成的跟踪文件；在 Linux 开发机
+# 上它写着 TARGET_OS=openbsd + GO_ENGINE_MODE=shm，照抄会**跳过 Linux 能用的
+# c-shared**（/go/ 只能走 sidecar，规格 §7.3 的 in-process FFI 无法验证）。
+# 只在「config.mk 的 TARGET_OS == 本机 uname」时才采纳它的模式。
+GO_ENGINE_MODE_EXPLICIT="${GO_ENGINE_MODE:-}"
 GO_ENGINE_MODE="${GO_ENGINE_MODE:-ffi}"
 if [[ -f "${ROOT}/config.mk" ]]; then
   _mode="$(grep '^GO_ENGINE_MODE' "${ROOT}/config.mk" | sed 's/.*:= *//' || true)"
-  if [[ -n "${_mode}" ]]; then
+  _target="$(grep '^TARGET_OS' "${ROOT}/config.mk" | sed 's/.*:= *//' || true)"
+  if [[ -n "${GO_ENGINE_MODE_EXPLICIT}" ]]; then
+    GO_ENGINE_MODE="${GO_ENGINE_MODE_EXPLICIT}"
+  elif [[ -n "${_mode}" && ( -z "${_target}" || "${_target}" == "${HOST_OS}" ) ]]; then
     GO_ENGINE_MODE="${_mode}"
+  elif [[ -n "${_mode}" ]]; then
+    echo "NOTE: config.mk TARGET_OS=${_target} ≠ 本机 ${HOST_OS}；忽略其中的 GO_ENGINE_MODE=${_mode}（按 ${GO_ENGINE_MODE} 构建）"
   fi
 fi
 
@@ -300,9 +317,13 @@ fi
 # grep -E 而非 BRE `\|`：BSD grep 把 `\|` 当字面量，`grep -q 'a\|b'` 永不匹配，
 # 这道门会恒为假失败。PUC-Lua 5.4 导出的是 lua_pcallk（lua_pcall 是宏），
 # 用子串匹配即可同时覆盖 5.3/5.4。
+# 注意：`nm | grep -q` 在 `set -o pipefail` 下会**假失败** —— grep 命中即退出，
+# nm 继续写符号表收到 SIGPIPE（141），管道整体非零。先把输出收进变量再匹配。
 if command -v nm >/dev/null 2>&1; then
-  if ! nm -D "${OUT}/libapp_lua.so" 2>/dev/null | grep -qE 'lua_pcall|luaL_newstate'; then
-    if ! nm "${OUT}/libapp_lua.so" 2>/dev/null | grep -qE 'lua_pcall|luaL_newstate'; then
+  lua_syms="$(nm -D "${OUT}/libapp_lua.so" 2>/dev/null || true)"
+  if ! grep -qE 'lua_pcall|luaL_newstate' <<<"${lua_syms}"; then
+    lua_syms="$(nm "${OUT}/libapp_lua.so" 2>/dev/null || true)"
+    if ! grep -qE 'lua_pcall|luaL_newstate' <<<"${lua_syms}"; then
       echo "FAIL: libapp_lua.so missing lua_pcall — stub build detected" >&2
       exit 1
     fi
@@ -328,66 +349,20 @@ for eng in wsgi asgi psgi rack cgi uwsgi tsx; do
   build_stub_engine "${eng}"
 done
 
-# ---- Rack：MRI Ruby 真嵌入（rack_engine.c 的 CRUCIBLE_HAVE_RUBY 分支）------
-# 为什么这里单独编一次：build_script_ffi.sh 的 build_extra_engine 也补编 rack，但它把
-# `-DCRUCIBLE_HAVE_RUBY` 直接拼在 RB_CFLAGS 末尾（缺空格），最后一个 -I（OpenBSD 的
-# arch 头文件目录）会被拼坏 → ruby.h 找不到 ruby/config.h，编译失败（实测见
-# /tmp/eng-rack.log）。按 Lua 的模式在这里探测并以显式分隔的参数构建；探测/编译失败
-# 就退回上面 build_stub_engine 的「诚实失败」构建（不 spawn、不假 hello）。
-# 若 build_script_ffi.sh 之后又补编失败，它会保留这里的产物（log: keeping previous artifact）。
+# ---- Rack：MRI Ruby 真嵌入由 build_script_ffi.sh 统一构建 -------------------
+# 这里原先还单独编一次 rack（为了绕开旧 build_extra_engine 拼接 RB_CFLAGS 的坑）。
+# 那个坑已在 build_script_ffi.sh 修好（-L/-rpath + 平台默认 + stub 重建），而且本
+# 脚本末尾必定调用 build_script_ffi.sh；再编一次只会产生一条「先失败后覆盖」的
+# 误导日志。保留一个空函数占位，明确产物来源。
 build_rack_engine() {
-  # 默认**关闭** MRI 嵌入：实测会周期性 SIGSEGV 整个进程（GET /rack/ 返回 200 后
-  # 数秒~数十秒内崩溃，core 456MB，gdb 栈顶在 libruby34.so 的 sigsegv 处理器，
-  # 所有监听口一起下线）。已在 build_script_ffi.sh 的 build_extra_engine rack 处
-  # 写明高置信度原因（MRI 定时器/信号 + 从任意原生线程调用 Ruby API 未注册线程）
-  # 与启用条件（所有 Ruby 调用经专用 Ruby 线程 / rb_thread_call_with_gvl + 5 分钟
-  # 不崩 + 1000 次请求压测）。设为 1 才会尝试嵌入。
-  if [[ "${CRUCIBLE_ENABLE_RACK_EMBED:-0}" != "1" ]]; then
-    echo "    rack: MRI 嵌入默认关闭（会崩进程；启用见 build_script_ffi.sh 注释）→ 构建诚实失败版"
-    build_stub_engine rack
-    return 0
-  fi
-  local src="${ROOT}/libs/app-engines/rack/rack_engine.c"
-  local rb="" cand="" hdr="" arch="" libs="" ver=""
-  if [[ ! -f "${src}" ]]; then
-    echo "WARN: missing ${src}" >&2
-    return 0
-  fi
-  for cand in ruby ruby34 ruby33 ruby32 ruby31; do
-    if command -v "${cand}" >/dev/null 2>&1; then
-      rb="${cand}"
-      break
-    fi
-  done
-  if [[ -n "${rb}" ]]; then
-    hdr="$(${rb} -rrbconfig -e 'print RbConfig::CONFIG["rubyhdrdir"]' 2>/dev/null || true)"
-    arch="$(${rb} -rrbconfig -e 'print RbConfig::CONFIG["rubyarchhdrdir"]' 2>/dev/null || true)"
-    libs="$(${rb} -rrbconfig -e 'print RbConfig::CONFIG["LIBRUBYARG_SHARED"]' 2>/dev/null || true)"
-  fi
-  if [[ -z "${hdr}" || ! -f "${hdr}/ruby.h" ]]; then
-    local d
-    for d in /usr/local/include/ruby-* /usr/include/ruby-*; do
-      if [[ -f "${d}/ruby.h" ]]; then
-        hdr="${d}"
-        break
-      fi
-    done
-  fi
-  if [[ -z "${hdr}" || ! -f "${hdr}/ruby.h" ]]; then
-    echo "    rack: 未找到 ruby.h → 保留诚实失败构建（不 spawn）"
-    return 0
-  fi
-  if [[ -z "${libs}" ]]; then
-    ver="$(basename "${hdr}" | sed -E 's/^ruby-([0-9]+)\.([0-9]+).*/\1\2/')"
-    libs="-lruby${ver}"
-  fi
-  echo "==> building libapp_rack.so (in-process Ruby: ${hdr})"
-  if ! ${CC} ${CFLAGS} -I"${hdr}" ${arch:+-I"${arch}"} -DCRUCIBLE_HAVE_RUBY ${LDFLAGS} \
-      -o "${OUT}/libapp_rack.so" "${src}" ${COMMON_SRC} ${libs}; then
-    echo "WARN: rack in-process 构建失败 → 回退诚实失败 stub" >&2
-    build_stub_engine rack
-  fi
+  # rack 的嵌入式 MRI 构建**只在 build_script_ffi.sh 里做一次**（平台默认：
+  # Linux 开 / OpenBSD 关），本脚本末尾必定调用它。此前这里也编一遍，用的是
+  # rbconfig 的原始 -lruby-3.3（没有 -L ~/local/...，用户级 ruby 下必然链接失败）
+  # 后「回退诚实失败 stub」，而随后 build_script_ffi 又成功覆盖为嵌入式 ——
+  # 构建日志里出现一条吓人的失败，最终产物却是好的。删除重复构建。
+  echo "    rack: 由 build_script_ffi.sh 统一构建（in-process Ruby / 诚实失败按平台默认）"
 }
+
 build_rack_engine
 
 echo "==> building libapp_asp.so (AxonASP engine)"
@@ -428,7 +403,6 @@ done
 # CRUCIBLE_HAVE_* in-process flags applied by auxiliary build_script_ffi.sh below.
 
 echo "==> building Go engine (${GO_ENGINE_MODE})"
-HOST_OS="$(uname -s | tr "[:upper:]" "[:lower:]")"
 # go 的位置：$GO 优先（buildenv 一类环境导出绝对路径），其次 PATH。
 GO_BIN="${GO:-}"
 if [[ -z "${GO_BIN}" ]] && command -v go >/dev/null 2>&1; then

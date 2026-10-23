@@ -12,6 +12,10 @@ COMMON="${ROOT}/libs/app-engines/common"
 CC="${CC:-cc}"
 mkdir -p "${OUT}"
 
+# 用户级运行时（Go/Ruby/... 的 PATH/LD_LIBRARY_PATH）。
+# shellcheck source=scripts/runtime_env.sh
+. "${ROOT}/scripts/runtime_env.sh"
+
 export PATH="/usr/local/bin:/usr/bin:/bin:${PATH:-}"
 if [[ -x /usr/local/bin/gcc ]]; then
   CC=/usr/local/bin/gcc

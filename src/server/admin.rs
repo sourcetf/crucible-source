@@ -23,6 +23,7 @@ use bytes::Bytes;
 use http::{header, HeaderMap, Method, Request, Response, StatusCode};
 use http_body_util::{BodyExt, Full};
 use serde_json::Value as Json;
+use std::net::IpAddr;
 use std::sync::Arc;
 
 pub const UI_HTML: &str = include_str!("admin_ui.html");
@@ -130,6 +131,78 @@ fn state_change_allowed<T>(req: &Request<T>) -> bool {
         })
 }
 
+/// §16.13 登录请求体：UI 只收集明文密码，后端 argon2id/yescrypt 校验。
+#[derive(serde::Deserialize)]
+struct LoginBody {
+    username: String,
+    password: String,
+}
+
+/// `POST <admin>/api/login`：校验明文口令 → 建立服务端会话 → 下发 secure cookie。
+///
+/// 只在 TLS listener 上签发 cookie（`__Host-` 前缀要求 Secure）；明文口仍可用
+/// Basic，但不会得到会话（返回 `cookie_set:false` 并说明原因）。
+/// 失败与 Basic 共用同一张按 IP 失败表（阈值/指数退避），不能用登录接口绕过爆破防护。
+async fn handle_login(
+    req: Request<Full<Bytes>>,
+    cfg: &Config,
+    tls: bool,
+    peer: IpAddr,
+) -> Response<BoxBody> {
+    if let Some(d) = crate::server::basic_auth::admin_login_blocked(peer) {
+        return Response::builder()
+            .status(StatusCode::TOO_MANY_REQUESTS)
+            .header(
+                header::RETRY_AFTER,
+                crate::server::basic_auth::retry_after_secs(d).to_string(),
+            )
+            .body(full("too many failed authentication attempts"))
+            .unwrap();
+    }
+    let bytes = match req.into_body().collect().await {
+        Ok(c) => c.to_bytes(),
+        Err(_) => return text_err(StatusCode::BAD_REQUEST, "cannot read request body"),
+    };
+    let body: LoginBody = match serde_json::from_slice(&bytes) {
+        Ok(b) => b,
+        Err(_) => {
+            return text_err(
+                StatusCode::BAD_REQUEST,
+                "invalid JSON body (want {\"username\":\"…\",\"password\":\"…\"})",
+            )
+        }
+    };
+    if !crate::server::basic_auth::check_admin_credentials(&cfg.admin, &body.username, &body.password) {
+        crate::server::basic_auth::note_admin_login(peer, false);
+        // 与 Basic 相同的泛化文案：不区分「用户不存在」与「口令错误」。
+        return Response::builder()
+            .status(StatusCode::UNAUTHORIZED)
+            .body(full("invalid credentials"))
+            .unwrap();
+    }
+    crate::server::basic_auth::note_admin_login(peer, true);
+    if !tls {
+        // 不在明文连接上发 Secure cookie（浏览器也不会存储，属于误导性成功）。
+        return json_ok(
+            "{\"ok\":true,\"cookie_set\":false,\"reason\":\"secure cookie requires TLS; Basic auth remains available\"}"
+                .to_string(),
+        );
+    }
+    let token = crate::server::basic_auth::create_admin_session();
+    let mut resp = json_ok("{\"ok\":true,\"cookie_set\":true}".to_string());
+    match http::HeaderValue::from_str(&crate::server::basic_auth::admin_session_set_cookie(&token)) {
+        Ok(v) => {
+            resp.headers_mut().append(header::SET_COOKIE, v);
+        }
+        Err(e) => {
+            // 理论上不可能（token 是 hex）；不 panic，但必须留痕。
+            log::warn!("admin login: cannot build Set-Cookie: {e}");
+            return text_err(StatusCode::INTERNAL_SERVER_ERROR, "cannot issue session cookie");
+        }
+    }
+    resp
+}
+
 /// P1-4：统一请求体类型为 Request<Full<Bytes>>——h1 在入口收齐（32MiB 上限），
 /// h2/h3 把已收集的 body 用 Full 重建后复用同一处理函数（admin API 不再只走 h1）。
 ///
@@ -137,36 +210,38 @@ fn state_change_allowed<T>(req: &Request<T>) -> bool {
 /// `Cache-Control: no-store`：口令哈希、MaxMind key 这类凭据材料不该被中间代理或
 /// 浏览器磁盘缓存留下副本（此前全树 grep 不到任何 Cache-Control）。TOML/JSON 读取
 /// 端点尤其如此。
-pub async fn handle(req: Request<Full<Bytes>>, live: Arc<LiveConfig>) -> Response<BoxBody> {
-    let mut resp = handle_inner(req, live).await;
+///
+/// `tls`：当前 listener 是否 TLS。§16.13 的 secure cookie 会话只在 TLS 上签发
+/// （`__Host-` 前缀本身要求 Secure）；明文口继续用 Basic。
+pub async fn handle(
+    req: Request<Full<Bytes>>,
+    live: Arc<LiveConfig>,
+    tls: bool,
+    peer: IpAddr,
+) -> Response<BoxBody> {
+    let mut resp = handle_inner(req, live, tls, peer).await;
     resp.headers_mut()
         .insert(header::CACHE_CONTROL, http::HeaderValue::from_static("no-store"));
     resp
 }
 
-async fn handle_inner(req: Request<Full<Bytes>>, live: Arc<LiveConfig>) -> Response<BoxBody> {
+async fn handle_inner(
+    req: Request<Full<Bytes>>,
+    live: Arc<LiveConfig>,
+    tls: bool,
+    peer: IpAddr,
+) -> Response<BoxBody> {
     let cfg = live.snapshot();
     let admin_path = cfg.admin.path.trim_end_matches('/').to_string();
     let path = req.uri().path().to_string();
     let method = req.method().clone();
 
-    // Basic gate: any configured user list requires Authorization (empty hashes never pass).
-    let needs_auth = crate::server::basic_auth::admin_requires_auth(&cfg.admin);
-    if needs_auth {
-        if !crate::server::basic_auth::check_admin(&req, &cfg.admin) {
-            return Response::builder()
-                .status(StatusCode::UNAUTHORIZED)
-                .header(
-                    header::WWW_AUTHENTICATE,
-                    format!("Basic realm=\"{}\"", cfg.admin.realm),
-                )
-                .body(full("unauthorized"))
-                .unwrap();
-        }
-    }
-
     // CSRF 防护（P0-2）：状态变更请求必须同源或具备非简单请求特征，缺 `Origin` 不再
     // 直接放行（判定细节见 `state_change_allowed`）。GET/HEAD 只读，不加这道门槛。
+    //
+    // 放在鉴权**之前**：登录端点本身没有可鉴权的凭据，必须同样受 CSRF 约束
+    //（登录 CSRF 可把受害者登入攻击者账号）。对未认证请求，结论只会更严格；
+    // 三协议入口的 `Sec-Fetch-Site` 检查仍在其之前。
     if matches!(method, Method::POST | Method::PUT | Method::DELETE | Method::PATCH)
         && !state_change_allowed(&req)
     {
@@ -174,6 +249,40 @@ async fn handle_inner(req: Request<Full<Bytes>>, live: Arc<LiveConfig>) -> Respo
             .status(StatusCode::FORBIDDEN)
             .body(full("cross-origin request blocked"))
             .unwrap();
+    }
+
+    // §16.13 登录端点：无凭据也可进入（口令校验 + 失败退避在本函数内）。
+    if method == Method::POST && path.ends_with("/api/login") {
+        return handle_login(req, &cfg, tls, peer).await;
+    }
+
+    // 两种凭据任一生效：HTTP Basic（向后兼容）或 secure cookie 会话。
+    let needs_auth = crate::server::basic_auth::admin_requires_auth(&cfg.admin);
+    let basic_ok = needs_auth && crate::server::basic_auth::check_admin(&req, &cfg.admin);
+    let session_ok = crate::server::basic_auth::validate_request_session(req.headers());
+    if needs_auth && !(basic_ok || session_ok) {
+        return Response::builder()
+            .status(StatusCode::UNAUTHORIZED)
+            .header(
+                header::WWW_AUTHENTICATE,
+                format!("Basic realm=\"{}\"", cfg.admin.realm),
+            )
+            .body(full("unauthorized"))
+            .unwrap();
+    }
+
+    // §16.13 登出：删除服务端令牌并清除 cookie（需要已通过上面的鉴权）。
+    if method == Method::POST && path.ends_with("/api/logout") {
+        if let Some(tok) = crate::server::basic_auth::session_token_from_headers(req.headers()) {
+            crate::server::basic_auth::destroy_admin_session(&tok);
+        }
+        let mut resp = json_ok("{\"ok\":true}".to_string());
+        if let Ok(v) =
+            http::HeaderValue::from_str(&crate::server::basic_auth::admin_session_clear_cookie())
+        {
+            resp.headers_mut().append(header::SET_COOKIE, v);
+        }
+        return resp;
     }
 
     if path == admin_path || path == format!("{admin_path}/") || path.ends_with("/index.html") {
@@ -1746,11 +1855,18 @@ fn save_autoindex(live: &Arc<LiveConfig>, v: &Json) -> Response<BoxBody> {
 
 const PAGE_RULE_ACTIONS: &[&str] = &["redirect", "block", "rewrite", "pass", "cache", "header"];
 
-/// body: {"port": 9081, "rules": [{"match_url": "/old/*", "action": "redirect", "target": "/new"}]}
+/// body: {"port": 9081, "rules": [...]} 或
+///       {"global": true, "rules": [...]}（§3.1 全局页面规则）
 fn save_page_rules(live: &Arc<LiveConfig>, v: &Json) -> Response<BoxBody> {
-    let port = match json_port(&v, "port") {
-        Ok(p) => p,
-        Err(resp) => return resp,
+    let global = v.get("global").and_then(|b| b.as_bool()).unwrap_or(false)
+        || v.get("scope").and_then(|s| s.as_str()) == Some("global");
+    let port = if global {
+        0
+    } else {
+        match json_port(&v, "port") {
+            Ok(p) => p,
+            Err(resp) => return resp,
+        }
     };
     let Some(rules) = v.get("rules").and_then(|a| a.as_array()) else {
         return text_err(StatusCode::BAD_REQUEST, "missing rules array");
@@ -1807,10 +1923,11 @@ fn save_page_rules(live: &Arc<LiveConfig>, v: &Json) -> Response<BoxBody> {
         if let Some(p) = r.get("priority").and_then(|x| x.as_i64()) {
             t.insert("priority".into(), toml::Value::Integer(p));
         }
-        // §16.11 匹配维度 host/method/header：选填；空串/纯空白视为「未配置」不落盘
-        // （避免写出空字段把「不约束」变成「约束空值」——运行期声明了空 host 的规则
-        // 永远不命中）。合法性由 check_page_rule 在写盘前统一校验。
-        for key in ["host", "method", "header"] {
+        // §16.11 匹配维度 host/method/header/country：选填；空串/纯空白视为
+        // 「未配置」不落盘（避免写出空字段把「不约束」变成「约束空值」——
+        // 运行期声明了空 host/country 的规则永远不命中）。合法性由
+        // check_page_rule 在写盘前统一校验。
+        for key in ["host", "method", "header", "country"] {
             if let Some(val) = r.get(key).and_then(|x| x.as_str()) {
                 let val = val.trim();
                 if !val.is_empty() {
@@ -1827,6 +1944,14 @@ fn save_page_rules(live: &Arc<LiveConfig>, v: &Json) -> Response<BoxBody> {
         Ok(x) => x,
         Err(e) => return text_err(StatusCode::BAD_REQUEST, format!("{e:#}")),
     };
+    if global {
+        // §3.1：顶层 `page_rules`。整表替换（空数组 = 显式清空全局规则）。
+        let Some(root) = tree.as_table_mut() else {
+            return text_err(StatusCode::BAD_REQUEST, "config root is not a table");
+        };
+        root.insert("page_rules".to_string(), toml::Value::Array(out));
+        return finish_write(live, &tree, "global page_rules saved");
+    }
     if let Err(e) = cfg_edit::set_listener_key(
         &mut tree,
         port,
@@ -2293,13 +2418,14 @@ fn check_page_rule(rule: &Json, idx: usize) -> Result<(), String> {
             return Err(format!("rule[{idx}].priority 必须是整数（当前 {p:?}）"));
         }
     }
-    // §16.11 匹配维度 host/method/header：运行期对非法值只会「不匹配」（不会 panic），
-    // 但那意味着面板存进去的规则**永不生效**且没有任何提示 —— 保存时按运行期同一口径
-    // 拒绝。null/缺省 = 不约束；显式写了就必须能生效。
+    // §16.11 匹配维度 host/method/header/country：运行期对非法值只会「不匹配」
+    // （不会 panic），但那意味着面板存进去的规则**永不生效**且没有任何提示 ——
+    // 保存时按运行期同一口径拒绝。null/缺省 = 不约束；显式写了就必须能生效。
     for (key, check) in [
         ("host", check_page_rule_host as fn(usize, &str) -> Result<(), String>),
         ("method", check_page_rule_method as fn(usize, &str) -> Result<(), String>),
         ("header", check_page_rule_header as fn(usize, &str) -> Result<(), String>),
+        ("country", check_page_rule_country as fn(usize, &str) -> Result<(), String>),
     ] {
         if let Some(v) = rule.get(key) {
             if !v.is_null() {
@@ -2464,6 +2590,50 @@ fn check_page_rule_header(idx: usize, spec: &str) -> Result<(), String> {
         return Err(format!("rule[{idx}].header 缺少头名: {spec:?}"));
     }
     check_header_pair(&format!("rule[{idx}].header"), name, value)
+}
+
+/// §16.11 country 维度校验：逗号分隔、`!` 前缀排除、ISO2/别名。
+///
+/// 与 `page_rules::country_matches` 同一口径：每个 token 去掉 `!` 后必须能被
+/// `resolve_country_alias` 归一化成 2..=8 位 ASCII 字母数字（`CN`/`China`→`CN`）；
+/// 空 token 忽略，但整串至少要有一个有效 token（否则规则永不命中）。
+fn check_page_rule_country(idx: usize, spec: &str) -> Result<(), String> {
+    let mut any = false;
+    let mut n = 0usize;
+    for tok in spec.split(',') {
+        let t = tok.trim();
+        if t.is_empty() {
+            continue;
+        }
+        n += 1;
+        if n > 64 {
+            return Err(format!("rule[{idx}].country 条目过多（> 64）"));
+        }
+        let raw = t.strip_prefix('!').unwrap_or(t).trim();
+        if raw.is_empty() {
+            return Err(format!(
+                "rule[{idx}].country 的排除项 `!` 后缺少国家码: {spec:?}"
+            ));
+        }
+        let code = crate::server::geoip_panel::aliases::resolve_country_alias(raw)
+            .trim()
+            .to_ascii_uppercase();
+        if code.is_empty()
+            || code.len() > 8
+            || !code.bytes().all(|b| b.is_ascii_alphanumeric())
+        {
+            return Err(format!(
+                "rule[{idx}].country 的国家码不合法: {raw:?}（用 ISO2 如 CN/US，或 China/中国 等别名）"
+            ));
+        }
+        any = true;
+    }
+    if !any {
+        return Err(format!(
+            "rule[{idx}].country 不能为空（留空请删掉该字段）"
+        ));
+    }
+    Ok(())
 }
 
 /// 上游地址校验（proxy.rs 的 `upstream_parts`：必须是 http/https 且带 host）。
@@ -2996,7 +3166,7 @@ fn engines_overview_json(cfg: &Config) -> String {
                 "{{\"port\":{},\"idx\":{},\"engine\":{},\"enabled\":{},\"via\":{},\"ready\":{}}}",
                 l.port,
                 idx,
-                json_str(&a.engine),
+                json_str(a.engine.as_str()),
                 a.enabled,
                 json_str(via),
                 match ready {
@@ -3082,6 +3252,43 @@ enum RulesKind {
 /// POST {port, remove: i}  → 删除第 i 条
 /// POST {port, ...fields}  → 追加一条(Page: match_url/action/target;Proxy: path/upstream/ssl_mode)
 /// POST 成功后写回 config.toml 并触发热重载(brand-free:文案经 scrub)。
+/// §16.11 页面规则 JSON 回显（全局与每站共用；字段与面板 `prRow` 一一对应）。
+fn page_rules_json(rules: &[crate::config::PageRuleConfig]) -> String {
+    let mut s = String::from("[");
+    for (i, r) in rules.iter().enumerate() {
+        if i > 0 {
+            s.push(',');
+        }
+        let target = r
+            .target
+            .as_deref()
+            .map(|t| json_str(&crate::server::page_rules::scrub_brand(t)))
+            .unwrap_or_else(|| "null".into());
+        // §16.11 维度回显：面板据此填 host/method/header/country 输入框（缺省 null）。
+        let opt_dims = |v: &Option<String>| {
+            v.as_deref()
+                .map(|x| json_str(&crate::server::page_rules::scrub_brand(x)))
+                .unwrap_or_else(|| "null".into())
+        };
+        // match_url 与 action/target 同一口径 scrub：旧配置/手写 toml 里的
+        // 品牌词不得经 GET 回显扩散到面板（保存入口早已 scrub）。
+        s.push_str(&format!(
+            "{{\"idx\":{},\"match_url\":{},\"action\":{},\"target\":{},\"priority\":{},\"host\":{},\"method\":{},\"header\":{},\"country\":{}}}",
+            i,
+            json_str(&crate::server::page_rules::scrub_brand(&r.match_url)),
+            json_str(&crate::server::page_rules::scrub_brand(&r.action)),
+            target,
+            r.priority,
+            opt_dims(&r.host),
+            opt_dims(&r.method),
+            opt_dims(&r.header),
+            opt_dims(&r.country)
+        ));
+    }
+    s.push(']');
+    s
+}
+
 async fn handle_rules_api(
     req: Request<Full<Bytes>>,
     live: &Arc<LiveConfig>,
@@ -3092,43 +3299,22 @@ async fn handle_rules_api(
     let cfg = live.snapshot();
 
     if method == Method::GET {
+        // §3.1 / §16.11：`?scope=global`（或 `?global=1`）读取顶层全局规则。
+        let global = query_str(&q, "scope").as_deref() == Some("global")
+            || query_str(&q, "global").as_deref() == Some("1");
+        if kind == RulesKind::Page && global {
+            return json_ok(page_rules_json(&cfg.page_rules));
+        }
         let port = query_u16(&q, "port").unwrap_or(0);
         let Some(lc) = cfg.listeners.iter().find(|l| l.port == port) else {
             return text_err(StatusCode::BAD_REQUEST, "unknown listener port");
         };
+        if kind == RulesKind::Page {
+            return json_ok(page_rules_json(&lc.page_rules));
+        }
         let mut s = String::from("[");
         match kind {
-            RulesKind::Page => {
-                for (i, r) in lc.page_rules.iter().enumerate() {
-                    if i > 0 {
-                        s.push(',');
-                    }
-                    let target = r
-                        .target
-                        .as_deref()
-                        .map(|t| json_str(&crate::server::page_rules::scrub_brand(t)))
-                        .unwrap_or_else(|| "null".into());
-                    // §16.11 维度回显：面板据此填 host/method/header 输入框（缺省 null）。
-                    let opt_dims = |v: &Option<String>| {
-                        v.as_deref()
-                            .map(|x| json_str(&crate::server::page_rules::scrub_brand(x)))
-                            .unwrap_or_else(|| "null".into())
-                    };
-                    // match_url 与 action/target 同一口径 scrub：旧配置/手写 toml 里的
-                    // 品牌词不得经 GET 回显扩散到面板（保存入口早已 scrub）。
-                    s.push_str(&format!(
-                        "{{\"idx\":{},\"match_url\":{},\"action\":{},\"target\":{},\"priority\":{},\"host\":{},\"method\":{},\"header\":{}}}",
-                        i,
-                        json_str(&crate::server::page_rules::scrub_brand(&r.match_url)),
-                        json_str(&crate::server::page_rules::scrub_brand(&r.action)),
-                        target,
-                        r.priority,
-                        opt_dims(&r.host),
-                        opt_dims(&r.method),
-                        opt_dims(&r.header)
-                    ));
-                }
-            }
+            RulesKind::Page => unreachable!("handled above"),
             RulesKind::Proxy => {
                 for (i, r) in lc.proxy_rules.iter().enumerate() {
                     if i > 0 {
@@ -3154,15 +3340,25 @@ async fn handle_rules_api(
     let Ok(v) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
         return text_err(StatusCode::BAD_REQUEST, "invalid JSON body");
     };
-    let Some(port) = v.get("port").and_then(|x| x.as_u64()) else {
-        return text_err(StatusCode::BAD_REQUEST, "port required");
-    };
-    // 端口按 u64 判范围再转换：`as u16` 会把 131165 截断成 9095 ——
-    // 于是「给 131165 加一条规则」实际改的是 9095 那个站点的规则表。
-    if port == 0 || port > u16::MAX as u64 {
-        return bad_request(format!("port 越界（{port}，必须是 1..=65535）"));
+    // §3.1 全局页面规则的快捷增删（整表保存走 /api/page_rules/save）。
+    let global = v.get("global").and_then(|x| x.as_bool()).unwrap_or(false)
+        || v.get("scope").and_then(|x| x.as_str()) == Some("global");
+    if global && kind != RulesKind::Page {
+        return text_err(StatusCode::BAD_REQUEST, "global scope only applies to page rules");
     }
-    let port = port as u16;
+    let port = if global {
+        0
+    } else {
+        let Some(port) = v.get("port").and_then(|x| x.as_u64()) else {
+            return text_err(StatusCode::BAD_REQUEST, "port required");
+        };
+        // 端口按 u64 判范围再转换：`as u16` 会把 131165 截断成 9095 ——
+        // 于是「给 131165 加一条规则」实际改的是 9095 那个站点的规则表。
+        if port == 0 || port > u16::MAX as u64 {
+            return bad_request(format!("port 越界（{port}，必须是 1..=65535）"));
+        }
+        port as u16
+    };
     let cfg_path = live.path().clone();
 
     let raw = match std::fs::read_to_string(&cfg_path) {
@@ -3175,31 +3371,66 @@ async fn handle_rules_api(
             return text_err(StatusCode::INTERNAL_SERVER_ERROR, format!("parse config: {e}"))
         }
     };
-    let Some(listeners) = doc.get_mut("listeners").and_then(|l| l.as_array_mut()) else {
-        return text_err(StatusCode::INTERNAL_SERVER_ERROR, "config has no [[listeners]]");
-    };
-    let Some(li) = listeners
-        .iter()
-        .position(|l| l.get("port").and_then(|p| p.as_integer()) == Some(port as i64))
-    else {
-        return text_err(StatusCode::BAD_REQUEST, "unknown listener port");
-    };
-    let Some(lentry) = listeners.get_mut(li) else {
-        return text_err(StatusCode::INTERNAL_SERVER_ERROR, "listener entry missing");
-    };
     let key = match kind {
         RulesKind::Page => "page_rules",
         RulesKind::Proxy => "proxy_rules",
     };
+    let target_arr: &mut Vec<toml::Value> = if global {
+        let Some(root) = doc.as_table_mut() else {
+            return text_err(StatusCode::INTERNAL_SERVER_ERROR, "config root is not a table");
+        };
+        match root
+            .entry(key.to_string())
+            .or_insert_with(|| toml::Value::Array(Vec::new()))
+            .as_array_mut()
+        {
+            Some(a) => a,
+            None => {
+                return text_err(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("{key} is not an array"),
+                )
+            }
+        }
+    } else {
+        let Some(listeners) = doc.get_mut("listeners").and_then(|l| l.as_array_mut()) else {
+            return text_err(StatusCode::INTERNAL_SERVER_ERROR, "config has no [[listeners]]");
+        };
+        let Some(li) = listeners
+            .iter()
+            .position(|l| l.get("port").and_then(|p| p.as_integer()) == Some(port as i64))
+        else {
+            return text_err(StatusCode::BAD_REQUEST, "unknown listener port");
+        };
+        let Some(lentry) = listeners.get_mut(li) else {
+            return text_err(StatusCode::INTERNAL_SERVER_ERROR, "listener entry missing");
+        };
+        let Some(tbl) = lentry.as_table_mut() else {
+            return text_err(StatusCode::INTERNAL_SERVER_ERROR, "listener entry is not a table");
+        };
+        match tbl
+            .entry(key.to_string())
+            .or_insert_with(|| toml::Value::Array(Vec::new()))
+            .as_array_mut()
+        {
+            Some(a) => a,
+            None => {
+                return text_err(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("listener {port}: {key} is not an array"),
+                )
+            }
+        }
+    };
 
     if let Some(rm) = v.get("remove").and_then(|x| x.as_u64()) {
-        let Some(arr) = lentry.get_mut(key).and_then(|a| a.as_array_mut()) else {
+        if target_arr.is_empty() {
             return text_err(StatusCode::BAD_REQUEST, "no rules to remove");
-        };
-        if (rm as usize) >= arr.len() {
+        }
+        if (rm as usize) >= target_arr.len() {
             return text_err(StatusCode::BAD_REQUEST, "remove index out of range");
         }
-        arr.remove(rm as usize);
+        target_arr.remove(rm as usize);
     } else {
         // 追加前的取值校验与结构化端点共用同一套（save_page_rules / save_proxy_rules）：
         // 否则「面板表格里的快捷添加」会成为绕过校验的后门。
@@ -3253,7 +3484,7 @@ async fn handle_rules_api(
                 }
                 // §16.11 维度：与 save_page_rules 一致（选填，空串不落盘；合法性已由
                 // 上面的 check_page_rule 统一校验）。
-                for key in ["host", "method", "header"] {
+                for key in ["host", "method", "header", "country"] {
                     if let Some(val) = v.get(key).and_then(|x| x.as_str()) {
                         let val = val.trim();
                         if !val.is_empty() {
@@ -3295,23 +3526,10 @@ async fn handle_rules_api(
             }
         };
         // 条数上限（config 级上限见 admin_config_edit::MAX_RULES_PER_LISTENER）。
-        let existing = lentry
-            .get(key)
-            .and_then(|a| a.as_array())
-            .map(|a| a.len())
-            .unwrap_or(0);
-        if let Err(e) = check_len(key, existing + 1, MAX_LIST_ITEMS) {
+        if let Err(e) = check_len(key, target_arr.len() + 1, MAX_LIST_ITEMS) {
             return bad_request(e);
         }
-        if lentry.get(key).is_none() {
-            if let Some(tbl) = lentry.as_table_mut() {
-                tbl.insert(key.into(), toml::Value::Array(Vec::new()));
-            }
-        }
-        match lentry.get_mut(key).and_then(|a| a.as_array_mut()) {
-            Some(arr) => arr.push(entry),
-            None => return text_err(StatusCode::INTERNAL_SERVER_ERROR, "rules array missing"),
-        }
+        target_arr.push(entry);
     }
 
     // Validate + atomic write via shared pipeline (rejects bad roots/ports).
@@ -3460,8 +3678,20 @@ mod tests {
         // 非字符串类型（数字/数组）也必须拒绝。
         assert!(ok(r#","host":123"#).is_err());
         assert!(ok(r#","method":["GET"]"#).is_err());
+        // §16.11 country：ISO2 / 多值 / 排除 / 别名都可；空/空排除项/奇怪 token 被拒。
+        assert!(ok(r#","country":"CN""#).is_ok());
+        assert!(ok(r#","country":"CN,US""#).is_ok());
+        assert!(ok(r#","country":"cn, us""#).is_ok());
+        assert!(ok(r#","country":"!CN""#).is_ok());
+        assert!(ok(r#","country":"!CN,!RU""#).is_ok());
+        assert!(ok(r#","country":"China""#).is_ok());
+        assert!(ok(r#","country":"中国""#).is_ok());
+        assert!(ok(r#","country":"""#).is_err());
+        assert!(ok(r#","country":" , ""#).is_err());
+        assert!(ok(r#","country":"!""#).is_err());
+        assert!(ok(r#","country":"C N""#).is_err());
         // null/缺省 = 不约束，合法。
-        assert!(ok(r#","host":null,"method":null,"header":null"#).is_ok());
+        assert!(ok(r#","host":null,"method":null,"header":null,"country":null"#).is_ok());
     }
 
     /// 非法 CIDR：`access::cidr_or_exact` 把解析不了的条目当「不匹配」——

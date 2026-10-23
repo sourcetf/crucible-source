@@ -740,6 +740,7 @@ mod script_rel_tests {
             qmux: false,
             connect_udp: false,
             access_log: None,
+            ..Default::default()
         }
     }
 

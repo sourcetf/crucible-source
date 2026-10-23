@@ -20,6 +20,17 @@
 //! 会挡住（并等待）任何非空组。这是修「空值窗口」的关键 —— 旧实现让无 .env 请求完全绕过
 //! 互斥，于是在 A（带 .env）在飞时并发的 B（无 .env）会读到 A 的私密值（跨应用秘密泄漏）。
 //! 空组跨引擎同身份，所以「无 .env」请求彼此仍并发（§13.8 的 sleep-CGI DoS 不回归）。
+//!
+//! # 「慢空请求挡住带 .env 的同族请求」的剩余面
+//!
+//! 进程 env 只有一个：**仍靠它承载 `.env`** 的引擎（wsgi/asgi/uwsgi/lua/php/…）
+//! 之间，「不同内容组」本来就必须串行 —— 这是正确性约束，不是锁实现问题。
+//! 真正可消除的是**读路径引擎**的排队：cgi/cgi_script 早已按子进程 envp 传 `.env`
+//!（`appengine_env_isolation` 自报，见 `app_ffi::EngineLib::env_free`），本波把
+//! **python 脚本引擎**也改成自报隔离（TLS 覆盖表 + 启动期基底对齐，见
+//! `libs/script-ffi/script_engine.c` 的 `appengine_env_isolation`）—— 慢的空请求
+//! 不再挡住 python 的带 `.env` 请求。其余引擎若要同样收益，需逐个改成按请求传 env
+//!（属引擎级大改，未在宿主锁里硬拆：拆了就等于允许它们读到别人的秘密）。
 
 use once_cell::sync::Lazy;
 use parking_lot::{Condvar, Mutex};

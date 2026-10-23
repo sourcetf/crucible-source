@@ -307,9 +307,32 @@ pub enum AdminGate {
 /// 因此合法管理请求的口令校验成本仍然是**一次** argon2id；代价为零而收益是
 /// 「带任意垃圾凭据的请求也拿不到 32MiB/请求 的缓冲」。
 /// 本函数的校验结果同时是失败计数/退避的唯一记账点。
-pub fn admin_gate(headers: &HeaderMap, admin: &AdminConfig, ip: IpAddr) -> AdminGate {
+/// 与 [`admin_gate`] 相同，但额外支持 **secure cookie 会话**，并放行登录端点。
+///
+/// §16.13「会话：secure cookie + CSRF（Admin POST）」：
+/// - 携带有效 `__Host-crucible_admin` 会话令牌 ⇒ 直接通过（无需 Basic）；
+/// - `POST <admin>/api/login` 本身必须能在**无凭据**时进入（否则无法建立会话），
+///   其口令校验/失败退避在 `admin::handle_login` 内完成；CSRF 仍在 admin 层统一检查；
+/// - 其余路径的判定与 [`admin_gate`] 完全一致（Basic 向后兼容 + 失败退避）。
+///
+/// 三协议入口（h1/h2/h3）都调用本函数，保证 cookie 会话在 h1/h2/h3 上一致。
+pub fn admin_gate_path(
+    headers: &HeaderMap,
+    admin: &AdminConfig,
+    ip: IpAddr,
+    path: &str,
+) -> AdminGate {
     if let Some(d) = ADMIN_FAILS.blocked(ip) {
         return AdminGate::Throttled(d);
+    }
+    // 会话令牌校验是常数时间哈希查表，不跑 argon2；成功即清零失败计数。
+    if validate_request_session(headers) {
+        ADMIN_FAILS.note_success(ip);
+        return AdminGate::Proceed;
+    }
+    // 登录端点：没有凭据也要让它进来（口令校验在 handler 内）。
+    if path.ends_with("/api/login") {
+        return AdminGate::Proceed;
     }
     if !has_basic_credentials(headers) {
         // 没凭据 → 立刻回 401，不跑哈希也不收 body。
@@ -321,6 +344,158 @@ pub fn admin_gate(headers: &HeaderMap, admin: &AdminConfig, ip: IpAddr) -> Admin
     } else {
         ADMIN_FAILS.note_failure(ip);
         AdminGate::Unauthorized
+    }
+}
+
+/// 兼容入口：不带路径（telemetry 等既有无会话调用点）。
+pub fn admin_gate(headers: &HeaderMap, admin: &AdminConfig, ip: IpAddr) -> AdminGate {
+    admin_gate_path(headers, admin, ip, "")
+}
+
+// ===== §16.13：Admin secure cookie 会话 =====
+//
+// 设计要点：
+// - 会话是**服务端内存表**（重启即失效，符合「secure cookie」而不是自包含 JWT）；
+// - 令牌 32 字节 CSPRNG（/dev/urandom 经 getrandom），hex 编码；
+// - Cookie 名固定 `__Host-crucible_admin`：`__Host-` 前缀浏览器强制要求
+//   Secure + Path=/ + 无 Domain，第三方站点无法覆盖/伪造同名 cookie；
+// - `HttpOnly`（JS 读不到）+ `SameSite=Strict`（跨站请求不携带）；
+// - 只在 **TLS listener** 上签发：`__Host-` 前缀本身要求 Secure，明文口签发
+//   会被浏览器丢弃/根本不该存在；明文口继续用 Basic（向后兼容）。
+// - 有过期（8h）与容量上限（4096）；登出/过期即从表中删除。
+
+pub const ADMIN_SESSION_COOKIE: &str = "__Host-crucible_admin";
+/// 会话有效期：8 小时（管理面板的一次工作日；过期后重新登录）。
+const ADMIN_SESSION_TTL: Duration = Duration::from_secs(8 * 60 * 60);
+/// 会话表容量上限（无界内存防护）。超出时优先淘汰最旧的条目。
+const ADMIN_SESSION_CAP: usize = 4096;
+
+static ADMIN_SESSIONS: Lazy<Mutex<HashMap<String, Instant>>> =
+    Lazy::new(|| Mutex::new(HashMap::new()));
+
+/// 创建会话令牌并写入服务端表。返回令牌原文（只出现在 Set-Cookie 里）。
+pub fn create_admin_session() -> String {
+    use rand_core::{OsRng, RngCore};
+    let mut bytes = [0u8; 32];
+    OsRng.fill_bytes(&mut bytes);
+    let mut token = String::with_capacity(64);
+    for b in bytes {
+        token.push_str(&format!("{b:02x}"));
+    }
+    let now = Instant::now();
+    let mut map = ADMIN_SESSIONS.lock();
+    // 惰性清理过期项；仍超上限时淘汰最旧一条（不整表清空 —— 否则全站会话被
+    // 一次批量登录挤掉，等于一个廉价的全局登出 DoS）。
+    map.retain(|_, at| now.duration_since(*at) <= ADMIN_SESSION_TTL);
+    if map.len() >= ADMIN_SESSION_CAP {
+        if let Some(k) = map.iter().min_by_key(|(_, at)| **at).map(|(k, _)| k.clone()) {
+            map.remove(&k);
+        }
+    }
+    map.insert(token.clone(), now);
+    token
+}
+
+/// 校验会话令牌（存在且未过期）。过期项顺手删除。
+pub fn validate_admin_session(token: &str) -> bool {
+    if token.is_empty() {
+        return false;
+    }
+    let now = Instant::now();
+    let mut map = ADMIN_SESSIONS.lock();
+    match map.get(token) {
+        Some(at) if now.duration_since(*at) <= ADMIN_SESSION_TTL => true,
+        Some(_) => {
+            map.remove(token);
+            false
+        }
+        None => false,
+    }
+}
+
+/// 登出：删除会话令牌（幂等）。
+pub fn destroy_admin_session(token: &str) {
+    ADMIN_SESSIONS.lock().remove(token);
+}
+
+/// 从 `Cookie` 头取管理会话令牌（名字精确匹配；不存在/畸形返回 None）。
+pub fn session_token_from_headers(headers: &HeaderMap) -> Option<String> {
+    let raw = headers.get(header::COOKIE)?.to_str().ok()?;
+    for part in raw.split(';') {
+        let part = part.trim();
+        let Some((name, value)) = part.split_once('=') else {
+            continue;
+        };
+        if name.trim() == ADMIN_SESSION_COOKIE {
+            let v = value.trim();
+            if !v.is_empty() {
+                return Some(v.to_string());
+            }
+        }
+    }
+    None
+}
+
+/// 请求是否携带**有效**会话 cookie。
+pub fn validate_request_session(headers: &HeaderMap) -> bool {
+    session_token_from_headers(headers)
+        .as_deref()
+        .is_some_and(validate_admin_session)
+}
+
+/// `Set-Cookie` 值：`__Host-` 前缀 + Secure/HttpOnly/SameSite=Strict。
+pub fn admin_session_set_cookie(token: &str) -> String {
+    format!(
+        "{ADMIN_SESSION_COOKIE}={token}; Path=/; Secure; HttpOnly; SameSite=Strict"
+    )
+}
+
+/// 清除会话的 `Set-Cookie`（登出/会话失效）。
+pub fn admin_session_clear_cookie() -> String {
+    format!(
+        "{ADMIN_SESSION_COOKIE}=; Path=/; Max-Age=0; Secure; HttpOnly; SameSite=Strict"
+    )
+}
+
+/// 登录表单的口令校验（§16.13：UI 只收明文、后端 argon2id/yescrypt 验证）。
+///
+/// 与 Basic 路径共用 `password::verify_password`（恒时）；用户名的比较用
+/// [`ct_eq_str`]。对**每个**配置用户都跑一次 verify（不按名字短路），避免通过
+/// 响应时间枚举用户名。
+pub fn check_admin_credentials(admin: &AdminConfig, username: &str, password: &str) -> bool {
+    if admin.users.is_empty() {
+        crate::server::log_throttle::warn_every(
+            "admin-no-users",
+            std::time::Duration::from_secs(300),
+            "admin: no [[admin.users]] configured; admin login is inaccessible",
+        );
+        return false;
+    }
+    let mut ok = false;
+    for u in &admin.users {
+        if u.password_hash.is_empty() {
+            continue;
+        }
+        let name_ok = ct_eq_str(username, &u.username);
+        let pass_ok = password::verify_password(password, &u.password_hash).unwrap_or(false);
+        if name_ok && pass_ok {
+            ok = true;
+        }
+    }
+    ok
+}
+
+/// 登录/登出接口的失败退避查询（与 Basic 共用同一张按 IP 失败表）。
+pub fn admin_login_blocked(ip: IpAddr) -> Option<Duration> {
+    ADMIN_FAILS.blocked(ip)
+}
+
+/// 登录结果记账：失败走与 Basic 相同的阈值/指数退避，成功清零。
+pub fn note_admin_login(ip: IpAddr, ok: bool) {
+    if ok {
+        ADMIN_FAILS.note_success(ip);
+    } else {
+        ADMIN_FAILS.note_failure(ip);
     }
 }
 
@@ -706,5 +881,114 @@ mod tests {
             t.blocked(victim).is_some(),
             "throttle state must survive eviction"
         );
+    }
+
+    // ===== §16.13 secure cookie 会话 =====
+
+    #[test]
+    fn session_lifecycle_create_validate_destroy() {
+        let tok = create_admin_session();
+        assert_eq!(tok.len(), 64, "32 字节 CSPRNG → 64 hex 字符");
+        assert!(tok.bytes().all(|b| b.is_ascii_hexdigit()));
+        assert!(validate_admin_session(&tok));
+        // 两个令牌不相同（CSPRNG）。
+        let tok2 = create_admin_session();
+        assert_ne!(tok, tok2);
+        destroy_admin_session(&tok);
+        assert!(!validate_admin_session(&tok));
+        assert!(validate_admin_session(&tok2));
+        destroy_admin_session(&tok2);
+    }
+
+    #[test]
+    fn session_cookie_header_parsing_and_attributes() {
+        let tok = "deadbeef";
+        let mut h = HeaderMap::new();
+        h.insert(
+            header::COOKIE,
+            http::HeaderValue::from_str(&format!("a=1; {}={tok}; b=2", ADMIN_SESSION_COOKIE)).unwrap(),
+        );
+        assert_eq!(session_token_from_headers(&h).as_deref(), Some(tok));
+        // 名字必须精确匹配（结尾/前缀相似的名字不算）。
+        let mut h2 = HeaderMap::new();
+        h2.insert(
+            header::COOKIE,
+            http::HeaderValue::from_static("__Host-crucible_admin_x=deadbeef"),
+        );
+        assert_eq!(session_token_from_headers(&h2), None);
+        assert_eq!(session_token_from_headers(&HeaderMap::new()), None);
+
+        let set = admin_session_set_cookie(tok);
+        assert!(set.starts_with(&format!("{ADMIN_SESSION_COOKIE}={tok};")));
+        assert!(set.contains("Path=/"));
+        assert!(set.contains("Secure"));
+        assert!(set.contains("HttpOnly"));
+        assert!(set.contains("SameSite=Strict"));
+        let clear = admin_session_clear_cookie();
+        assert!(clear.contains("Max-Age=0"));
+        assert!(clear.contains("Secure"));
+    }
+
+    /// 会话 cookie 可以单独通过 admin 门；登录端点无凭据也可进入；
+    /// 其余路径无凭据仍 401（cookie 不能绕过 CSRF —— 那是 admin 层单独判定的）。
+    #[test]
+    fn admin_gate_path_accepts_session_and_login_only() {
+        let cfg = admin_with_hash("");
+        let ip: IpAddr = "10.9.9.31".parse().unwrap();
+        let tok = create_admin_session();
+        let mut h = HeaderMap::new();
+        h.insert(
+            header::COOKIE,
+            http::HeaderValue::from_str(&format!("{ADMIN_SESSION_COOKIE}={tok}")).unwrap(),
+        );
+        assert!(matches!(
+            admin_gate_path(&h, &cfg, ip, "/__admin/api/overview"),
+            AdminGate::Proceed
+        ));
+        // 无效令牌 + 无 Basic ⇒ 401。
+        let mut bad = HeaderMap::new();
+        bad.insert(
+            header::COOKIE,
+            http::HeaderValue::from_static("__Host-crucible_admin=nope"),
+        );
+        assert!(matches!(
+            admin_gate_path(&bad, &cfg, ip, "/__admin/api/overview"),
+            AdminGate::Unauthorized
+        ));
+        // 登录端点无凭据放行（口令校验在 admin handler）；其它 POST 不放行。
+        assert!(matches!(
+            admin_gate_path(&HeaderMap::new(), &cfg, ip, "/__admin/api/login"),
+            AdminGate::Proceed
+        ));
+        assert!(matches!(
+            admin_gate_path(&HeaderMap::new(), &cfg, ip, "/__admin/api/logout"),
+            AdminGate::Unauthorized
+        ));
+        destroy_admin_session(&tok);
+    }
+
+    #[test]
+    fn session_expiry_is_enforced_and_entry_is_removed() {
+        let tok = create_admin_session();
+        // 把创建时间改成「刚过期」：validate 必须拒绝并顺手删除条目。
+        if let Some(old) = Instant::now().checked_sub(ADMIN_SESSION_TTL + Duration::from_secs(1)) {
+            ADMIN_SESSIONS.lock().insert(tok.clone(), old);
+            assert!(!validate_admin_session(&tok));
+            assert!(
+                !ADMIN_SESSIONS.lock().contains_key(&tok),
+                "过期会话必须从表中删除"
+            );
+        }
+    }
+
+    #[test]
+    fn login_credentials_verify_plaintext() {
+        let hash = password::hash_password("s3cret").unwrap();
+        let cfg = admin_with_hash(&hash);
+        assert!(check_admin_credentials(&cfg, "u", "s3cret"));
+        assert!(!check_admin_credentials(&cfg, "u", "wrong"));
+        assert!(!check_admin_credentials(&cfg, "other", "s3cret"));
+        let empty = admin_with_hash("");
+        assert!(!check_admin_credentials(&empty, "u", ""));
     }
 }

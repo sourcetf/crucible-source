@@ -257,9 +257,9 @@ img.preview{max-width:100%;max-height:420px}
   <section class="tab" id="tab-pagerules">
     <div class="card">
       <h2>页面规则</h2>
-      <p class="hint">CDN 风格页面规则：redirect(可 "301:"/"307:"/"308:" 前缀)/block/rewrite/pass/cache/header。匹配按 match_url 前缀/通配，另可按 host（*、a.example、*.example.com）/method（GET, HEAD）/header（X-Foo 或 X-Foo: bar）约束；priority 数值大者先评估。各维度留空 = 不约束。</p>
+      <p class="hint">CDN 风格页面规则：redirect(可 "301:"/"307:"/"308:" 前缀)/block/rewrite/pass/cache/header。匹配按 match_url 前缀/通配，另可按 host（*、a.example、*.example.com）/method（GET, HEAD）/header（X-Foo 或 X-Foo: bar）/country（CN、CN,US、!CN）约束；priority 数值大者先评估（全局与每站合并排序，等值全局在前）。各维度留空 = 不约束。选「全局（所有站点）」编辑顶层 page_rules。</p>
       <div class="row">
-        <div><label>站点（端口）</label><select id="prPort"></select></div>
+        <div><label>站点（端口）/ 范围</label><select id="prPort"></select></div>
         <div><button class="act" id="btnPrLoad">载入</button><button class="act ghost" id="btnPrAdd">加一行</button><button class="act" id="btnPrSave">保存规则</button></div>
       </div>
       <div id="prOut"></div>
@@ -664,6 +664,15 @@ img.preview{max-width:100%;max-height:420px}
         <button class="act" id="btnUserAdd">添加用户</button>
       </div>
       <pre id="usersMsg"></pre>
+      <h3 class="sub">管理会话（secure cookie + CSRF）</h3>
+      <p class="hint">§16.13：登录成功后服务端下发 <code>__Host-crucible_admin</code> 会话 cookie（Secure/HttpOnly/SameSite=Strict，仅 TLS 端口签发）；HTTP Basic 仍然可用（向后兼容）。会话保存在进程内存，重启即失效。</p>
+      <div class="row">
+        <div><label>用户名</label><input id="loginUser" autocomplete="username"/></div>
+        <div><label>密码（明文）</label><input id="loginPass" type="password" autocomplete="current-password"/></div>
+        <button class="act" id="btnLogin">登录（建立会话）</button>
+        <button class="act ghost" id="btnLogout">登出</button>
+      </div>
+      <pre id="sessionOut"></pre>
       <h3 class="sub">首个用户密码（兼容旧入口）</h3>
       <label>用户名</label><input id="adminUser" readonly/>
       <div class="row">
@@ -1410,7 +1419,16 @@ $('btnFileUpload').onclick=async()=>{
 
 /* ============ 页面规则 ============ */
 const PR_ACTIONS=['redirect','block','rewrite','pass','cache','header'];
-function initPrTab(){fillPortSelect($('prPort'),$('prPort').value);$('prPort').onchange=renderPr;renderPr();}
+const PR_GLOBAL='global';
+function initPrTab(){
+  fillPortSelect($('prPort'),$('prPort').value);
+  // §3.1 全局规则：同一个表格编辑器，选中「全局」时读写顶层 page_rules。
+  if(!Array.from($('prPort').options).some(o=>o.value===PR_GLOBAL)){
+    const o=document.createElement('option');o.value=PR_GLOBAL;o.textContent='全局（所有站点）';
+    $('prPort').appendChild(o);
+  }
+  $('prPort').onchange=renderPr;renderPr();
+}
 function prRow(r){
   r=r||{};
   const tr=document.createElement('tr');
@@ -1423,18 +1441,21 @@ function prRow(r){
     +'<td><input class="r-host" value="'+esc(r.host||'')+'" placeholder="* / a.example / *.example.com（空=不限）"/></td>'
     +'<td><input class="r-method" value="'+esc(r.method||'')+'" placeholder="GET, HEAD（空=不限）"/></td>'
     +'<td><input class="r-header" value="'+esc(r.header||'')+'" placeholder="X-Foo 或 X-Foo: bar（空=不限）"/></td>'
+    +'<td><input class="r-country" value="'+esc(r.country||'')+'" placeholder="CN / CN,US / !CN（空=不限）"/></td>'
     +'<td class="actions"><button class="act mini danger">删</button></td>';
   tr.querySelector('button.danger').onclick=()=>tr.remove();
   return tr;
 }
 function renderPr(){
-  const l=listenerByPort($('prPort').value);
+  const global=$('prPort').value===PR_GLOBAL;
+  const l=global?null:listenerByPort($('prPort').value);
   const wrap=$('prOut');
-  if(!l){wrap.innerHTML='<p class="hint">无站点。</p>';return;}
+  if(!global&&!l){wrap.innerHTML='<p class="hint">无站点。</p>';return;}
   const table=document.createElement('table');table.className='data';
-  table.innerHTML='<thead><tr><th>match_url</th><th>action</th><th>target</th><th>priority</th><th>host</th><th>method</th><th>header</th><th></th></tr></thead>';
+  table.innerHTML='<thead><tr><th>match_url</th><th>action</th><th>target</th><th>priority</th><th>host</th><th>method</th><th>header</th><th>country</th><th></th></tr></thead>';
   const tb=document.createElement('tbody');
-  (l.page_rules||[]).forEach(r=>tb.appendChild(prRow(r)));
+  const rules=global?((CFG&&CFG.page_rules)||[]):(l.page_rules||[]);
+  rules.forEach(r=>tb.appendChild(prRow(r)));
   table.appendChild(tb);
   wrap.innerHTML='';wrap.appendChild(table);bindGeoipActionButtons(wrap);
   $('btnPrAdd').onclick=()=>tb.appendChild(prRow({}));
@@ -1449,10 +1470,12 @@ function renderPr(){
         // §16.11 维度：空串 = 不约束（后端也把空串视为未配置，不落盘）。
         host:tr.querySelector('.r-host').value.trim()||null,
         method:tr.querySelector('.r-method').value.trim()||null,
-        header:tr.querySelector('.r-header').value.trim()||null
+        header:tr.querySelector('.r-header').value.trim()||null,
+        country:tr.querySelector('.r-country').value.trim()||null
       });
     });
-    const r=await api('/api/page_rules/save',jpost({port:parseInt($('prPort').value,10),rules:rules}));
+    const payload=global?{global:true,rules:rules}:{port:parseInt($('prPort').value,10),rules:rules};
+    const r=await api('/api/page_rules/save',jpost(payload));
     // 结果输出到本 tab 的 pre（#fileOut 在「文件管理」tab，这里看不到错误详情）。
     out('prSaveOut',r.text,r.ok);toast(r.text,!r.ok);
     if(r.ok)await loadCfg();
@@ -1846,6 +1869,21 @@ $('btnTomlSave').onclick=async()=>{
 };
 
 /* ============ 账号 ============ */
+/* §16.13 secure cookie 会话：登录/登出（Basic 仍然可用，cookie 只是另一条凭据）。 */
+$('btnLogin').onclick=async()=>{
+  const u=$('loginUser').value.trim();
+  const p=$('loginPass').value;
+  if(!u||!p){toast('填写用户名与明文密码',true);return;}
+  const r=await api('/api/login',jpost({username:u,password:p}));
+  out('sessionOut',r.text,r.ok);toast(r.text,!r.ok);
+  if(r.ok)$('loginPass').value='';
+};
+$('btnLogout').onclick=async()=>{
+  const r=await api('/api/logout',jpost({}));
+  out('sessionOut',r.text,r.ok);toast(r.text,!r.ok);
+  // 只清掉 cookie 后刷新：若浏览器仍缓存 Basic 凭据，面板会继续用 Basic 工作。
+  if(r.ok)setTimeout(()=>location.reload(),300);
+};
 $('btnPass').onclick=async()=>{
   const p1=$('adminPass').value,p2=$('adminPass2').value;
   if(!p1){toast('填写新密码',true);return;}

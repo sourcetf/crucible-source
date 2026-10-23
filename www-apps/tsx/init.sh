@@ -10,15 +10,27 @@ ROOT="$(cd "$(dirname "$0")" && pwd)"
 DEPS="${DEPS_DIR:-$ROOT/deps}"
 mkdir -p "$DEPS"
 
-# 已有可用的全局转译器就**不要**再联网装一份：init.sh 跑在请求路径的 deps 冷启动上
+# 已有可用的转译器就**不要**再联网装一份：init.sh 跑在请求路径的 deps 冷启动上
 # （首次 /tsx/ 会先 ensure deps 再编译），而 npm install 在慢网下要几分钟，
 # 让第一个请求干等到超时。deploy 机器上预装了 esbuild 时这里应当秒过。
+#
+# 探测顺序与引擎一致（src/server/apps/tsx.rs::detect_tool）：
+#   PATH → <docroot>/node_modules/.bin → <docroot>/deps/node_modules/.bin
+# docroot/node_modules 是**应用自带（bundled）**的转译器，放在 deps/ 之外：
+# deps/ 每次 ensure_app_deps 冷启动都会整体 wipe（§7.9），把包放里面会被删掉重装。
 if command -v esbuild >/dev/null 2>&1 || command -v tsc >/dev/null 2>&1; then
   echo "tsx: 已有全局转译器（$(command -v esbuild || command -v tsc)），跳过 npm install" >&2
+elif [ -x "$ROOT/node_modules/.bin/esbuild" ] || [ -x "$ROOT/node_modules/.bin/tsc" ]; then
+  echo "tsx: 应用自带转译器（$ROOT/node_modules/.bin），跳过 npm install" >&2
 elif command -v npm >/dev/null 2>&1; then
-  # --no-audit --no-fund：省掉两次多余的联网往返；失败不阻断（引擎会给出明确错误）。
-  if ! npm install --prefix "$DEPS" --no-audit --no-fund --silent esbuild >"$DEPS/npm-install.log" 2>&1; then
-    echo "tsx: npm install esbuild 失败（详见 $DEPS/npm-install.log）—— 需要联网或预置包" >&2
+  # --no-audit --no-fund：省掉两次多余的联网往返；--no-save：不改包清单。
+  # 优先装到 docroot（bundle 到应用，deps wipe 不影响）；失败再退回 deps/。
+  if ! npm install --prefix "$ROOT" --no-audit --no-fund --no-save --silent esbuild \
+        >"$ROOT/npm-install.log" 2>&1; then
+    echo "tsx: npm install esbuild 到 docroot 失败，重试 deps/（详见 npm-install.log）" >&2
+    if ! npm install --prefix "$DEPS" --no-audit --no-fund --silent esbuild >"$DEPS/npm-install.log" 2>&1; then
+      echo "tsx: npm install esbuild 失败（详见 $DEPS/npm-install.log）—— 需要联网或预置包" >&2
+    fi
   fi
 else
   echo "tsx: 未安装 node/npm —— 请 pkg_add -I node 后重试（引擎会明确报错，不会假装成功）" >&2

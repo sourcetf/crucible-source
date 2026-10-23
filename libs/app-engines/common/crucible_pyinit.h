@@ -36,6 +36,17 @@ typedef int (*crucible_py_ensure_init_fn)(int (*is_initialized)(void),
                                           void *(*save_thread)(void),
                                           char *err, size_t errsz);
 
+/* v2：在**初始化真正发生的那一次**、仍在共享初始化锁内、SaveThread 之后调用
+ * `on_initialized`（可为 NULL）。为什么必须锁内：调用方借这个回调把 CPython 的
+ * `os.environ` 视图对齐到启动期基底；若挪到锁外，等待初始化的另一个引擎可能先
+ * 完成「同步视图」再把键写回去，随后被这份清理删掉（跨引擎 `<unset>`）。
+ * 新调用方在 v2 符号不存在时自动退回 v1（回调不执行）。 */
+typedef int (*crucible_py_ensure_init2_fn)(int (*is_initialized)(void),
+                                           void (*initialize)(void),
+                                           void *(*save_thread)(void),
+                                           void (*on_initialized)(void),
+                                           char *err, size_t errsz);
+
 /* scriptffi.c 是提供方，只需借 typedef，不需要下列 static 辅助函数。 */
 #ifndef CRUCIBLE_PYINIT_DECLARATIONS_ONLY
 
@@ -97,13 +108,19 @@ static void *crucible_pyinit_open_shared(void)
     return NULL;
 }
 
-/* 确保解释器已初始化（可并发调用；内部跨 .so 只执行一次初始化）。 */
-static int crucible_pyinit_ensure(int (*is_initialized)(void),
-                                  void (*initialize)(void),
-                                  void *(*save_thread)(void), char *err, size_t errsz)
+/* 确保解释器已初始化（可并发调用；内部跨 .so 只执行一次初始化）。
+ *
+ * `on_initialized`：仅当**本次调用真的执行了 Py_Initialize** 时、在共享初始化锁内
+ * 调用（见 v2 typedef 的说明）。NULL = 旧行为。 */
+static int crucible_pyinit_ensure_cb(int (*is_initialized)(void),
+                                     void (*initialize)(void),
+                                     void *(*save_thread)(void),
+                                     void (*on_initialized)(void),
+                                     char *err, size_t errsz)
 {
     static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
     static crucible_py_ensure_init_fn shared_fn;
+    static crucible_py_ensure_init2_fn shared_fn2;
     static int shared_resolved;
     static int local_state; /* 0 未初始化 1 就绪 -1 失败 */
     static char local_err[256];
@@ -118,6 +135,7 @@ static int crucible_pyinit_ensure(int (*is_initialized)(void),
         shared_resolved = 1;
         if (h != NULL) {
             *(void **)(&shared_fn) = dlsym(h, "crucible_py_ensure_init");
+            *(void **)(&shared_fn2) = dlsym(h, "crucible_py_ensure_init2");
             if (shared_fn == NULL)
                 fprintf(stderr,
                         "crucible: libscriptffi.so 缺少 crucible_py_ensure_init"
@@ -127,6 +145,12 @@ static int crucible_pyinit_ensure(int (*is_initialized)(void),
                     "crucible: 未找到 libscriptffi.so —— CPython 初始化退回 .so 私有锁"
                     "（多 .so 并发冷启动存在竞争风险）\n");
         }
+    }
+    if (shared_fn2 != NULL) {
+        rc = shared_fn2(is_initialized, initialize, save_thread, on_initialized, err,
+                        errsz);
+        pthread_mutex_unlock(&lock);
+        return rc;
     }
     if (shared_fn != NULL) {
         rc = shared_fn(is_initialized, initialize, save_thread, err, errsz);
@@ -156,19 +180,34 @@ static int crucible_pyinit_ensure(int (*is_initialized)(void),
         initialize();
         if (save_thread != NULL)
             (void)save_thread(); /* 初始化线程持有 GIL，必须由它释放 */
+        /* 回调在**本 .so 私有锁**内执行：共享库缺失时只有一个嵌入点，不存在
+         * 「别的引擎先同步视图」的竞态。 */
+        if (on_initialized != NULL)
+            on_initialized();
     }
     local_state = 1;
     pthread_mutex_unlock(&lock);
     return 0;
 }
 
+/* 旧入口（无回调）：保持给旧调用点使用。 */
+static int crucible_pyinit_ensure(int (*is_initialized)(void),
+                                  void (*initialize)(void),
+                                  void *(*save_thread)(void), char *err, size_t errsz)
+{
+    return crucible_pyinit_ensure_cb(is_initialized, initialize, save_thread, NULL, err,
+                                     errsz);
+}
+
 #else /* _WIN32：引擎只在 Unix 上加载，这里保持可编译的最小实现。 */
 
 static void crucible_pyinit_set_hint(const char *lib_hint) { (void)lib_hint; }
 
-static int crucible_pyinit_ensure(int (*is_initialized)(void),
-                                  void (*initialize)(void),
-                                  void *(*save_thread)(void), char *err, size_t errsz)
+static int crucible_pyinit_ensure_cb(int (*is_initialized)(void),
+                                     void (*initialize)(void),
+                                     void *(*save_thread)(void),
+                                     void (*on_initialized)(void),
+                                     char *err, size_t errsz)
 {
     if (err != NULL && errsz > 0)
         err[0] = '\0';
@@ -178,8 +217,18 @@ static int crucible_pyinit_ensure(int (*is_initialized)(void),
         initialize();
         if (save_thread != NULL)
             (void)save_thread();
+        if (on_initialized != NULL)
+            on_initialized();
     }
     return 0;
+}
+
+static int crucible_pyinit_ensure(int (*is_initialized)(void),
+                                  void (*initialize)(void),
+                                  void *(*save_thread)(void), char *err, size_t errsz)
+{
+    return crucible_pyinit_ensure_cb(is_initialized, initialize, save_thread, NULL, err,
+                                     errsz);
 }
 
 #endif /* _WIN32 */

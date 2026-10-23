@@ -599,6 +599,22 @@ async fn start_fpm(
 
     // 全部绝对路径；禁止 prefix=/（部分 fpm 报 unknown entry）
     let listen = format!("{}", abs_path(&sock_path).display());
+    // user/group/listen.owner/listen.group 只在 **root** 下有意义：非 root 的 fpm
+    // 会明确忽略它们（NOTICE: 'user' directive is ignored when FPM is not running
+    // as root），但**仍会 getgrnam/getpwnam 解析**。Debian/Ubuntu 只有用户 nobody、
+    // 没有名为 nobody 的**组**（组是 nogroup）⇒
+    //   ERROR: [pool x] cannot get gid for group 'nobody'
+    //   ERROR: FPM initialization failed
+    // ⇒ php-fpm 起不来、/php/ 恒 502（本机 2026-10-23 真机复现）。
+    // 非 root 时直接省略这四行：FPM 行为等价（本来就不 chown），且不再解析不存在的组。
+    let (pool_owner, listen_owner) = if unsafe { libc::geteuid() } == 0 {
+        (
+            "user = nobody\ngroup = nobody\n",
+            "listen.owner = nobody\nlisten.group = nobody\n",
+        )
+    } else {
+        ("", "")
+    };
     let conf = format!(
         r#"[global]
 error_log = {err}
@@ -606,12 +622,8 @@ daemonize = no
 pid = {pid}
 
 [{pool}]
-user = nobody
-group = nobody
-listen = {listen}
-listen.owner = nobody
-listen.group = nobody
-listen.mode = 0660
+{pool_owner}listen = {listen}
+{listen_owner}listen.mode = 0660
 listen.backlog = 4096
 pm = static
 pm.max_children = {workers}
@@ -631,6 +643,8 @@ pm.max_requests = 10000
         pid = abs_path(&pid_path).display(),
         pool = key.replace(['/', '\\', ':'], "_"),
         listen = listen,
+        pool_owner = pool_owner,
+        listen_owner = listen_owner,
         workers = app.workers.max(1),
     );
     fs::write(&conf_path, conf).context("write php-fpm conf")?;

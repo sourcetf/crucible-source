@@ -80,6 +80,140 @@ pub(crate) fn env_fingerprint(vars: &[(String, String)]) -> u64 {
     h.finish()
 }
 
+// ---------------------------------------------------- sidecar `.env` 指纹文件 ---
+//
+// 为什么需要（P2）：h1 与 h2/h3 各有一张 sidecar 注册表，却服务**同一个** UDS 路径。
+// 「sock 活着就复用」让后到的协议无法核验先到协议那次 spawn 用的 `.env` —— `.env`
+// 改了但只有对方协议先请求时，会一直沿用旧进程的旧环境（长驻进程 env 只在 spawn 时
+// 定型）。现在 spawner 在 sock 旁写 `app.sock.envfp`（内容 = 指纹 + pid），复用前
+// **一律核验**；不一致就杀掉所有者并重建（见 [`evict_sidecar_for_env_change`]）。
+// 相同指纹 → 不重启（来回切协议不会抖动）。
+
+/// 与 UDS 相邻的指纹文件路径（`.../app.sock` → `.../app.sock.envfp`）。
+pub(crate) fn sidecar_env_fp_path(sock: &Path) -> PathBuf {
+    let mut os = sock.as_os_str().to_os_string();
+    os.push(".envfp");
+    PathBuf::from(os)
+}
+
+/// 指纹文件内容：第一行 `v1 <16 位十六进制指纹> <spawner pid>`。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct SidecarEnvFp {
+    pub fp: u64,
+    pub pid: Option<i32>,
+}
+
+pub(crate) fn read_sidecar_env_fp(sock: &Path) -> Option<SidecarEnvFp> {
+    let text = fs::read_to_string(sidecar_env_fp_path(sock)).ok()?;
+    let mut it = text.split_whitespace();
+    if it.next()? != "v1" {
+        return None;
+    }
+    let fp = u64::from_str_radix(it.next()?, 16).ok()?;
+    let pid = it.next().and_then(|s| s.parse::<i32>().ok());
+    Some(SidecarEnvFp { fp, pid })
+}
+
+/// 复用前核验：指纹文件存在且与本次请求的 `.env` 指纹一致。
+pub(crate) fn sidecar_env_fp_matches(sock: &Path, fp: u64) -> bool {
+    read_sidecar_env_fp(sock).map(|i| i.fp == fp).unwrap_or(false)
+}
+
+/// spawn 成功、sock 就绪后写指纹文件（原子写：临时文件 + rename）。
+///
+/// 写失败只记日志、不影响服务：最坏情况是下一次复用把它当作「无法核验」→ 重启一次。
+pub(crate) fn write_sidecar_env_fp(sock: &Path, fp: u64, pid: u32) {
+    let p = sidecar_env_fp_path(sock);
+    let tmp = p.with_extension("envfp.tmp");
+    let body = format!("v1 {fp:016x} {pid}\n");
+    let res = fs::write(&tmp, body.as_bytes()).and_then(|_| fs::rename(&tmp, &p));
+    if let Err(e) = res {
+        let _ = fs::remove_file(&tmp);
+        log::warn!(
+            "native_http: 写 sidecar .env 指纹失败 {}: {e}（下次复用会重启一次）",
+            p.display()
+        );
+    }
+}
+
+/// `pid` 是否仍是**本进程的直接子进程**（sidecar 由本 webserver 的某个注册表 spawn，
+/// 跨注册表也一样）。防 pid 复用误杀：只杀 ppid == 自己 的进程。
+#[cfg(unix)]
+fn pid_is_own_child(pid: i32) -> bool {
+    if pid <= 1 || pid == std::process::id() as i32 {
+        return false;
+    }
+    let out = std::process::Command::new("ps")
+        .arg("-o")
+        .arg("ppid=")
+        .arg("-p")
+        .arg(pid.to_string())
+        .output();
+    match out {
+        Ok(o) => String::from_utf8_lossy(&o.stdout)
+            .trim()
+            .parse::<i32>()
+            .ok()
+            == Some(std::process::id() as i32),
+        Err(_) => false,
+    }
+}
+
+/// 杀一个已核验 ppid 的 sidecar pid（SIGTERM → 短等 → SIGKILL）。
+///
+/// 正常路径优先走两个注册表的 `kill_managed_*_by_sock`（那边有 `Child` 句柄、能 wait
+/// 回收，避免僵尸）。只有「指纹文件里的 pid 不在任何注册表」时才走这里。
+#[cfg(unix)]
+fn kill_sidecar_pid(pid: i32) {
+    if !pid_is_own_child(pid) {
+        log::warn!("native_http: sidecar pid={pid} 不是本进程的子进程（或已退出），不动它");
+        return;
+    }
+    let _ = unsafe { libc::kill(pid, libc::SIGTERM) };
+    for _ in 0..40 {
+        if unsafe { libc::kill(pid, 0) } != 0 {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    let _ = unsafe { libc::kill(pid, libc::SIGKILL) };
+}
+
+/// 同一个 sock 上的 sidecar 存在、但 `.env` 指纹与本次请求不一致 → 杀掉重建。
+///
+/// 调用前提：已持有该 sock 的 [`sidecar_spawn_lock`]（跨注册表串行化）。
+/// 顺序：先让两个注册表各自 kill 自己表里的进程（能 wait 回收）→ 都不认领时按指纹
+/// 文件里的 pid 杀（已核验 ppid）→ 删除监听 socket，让调用方重新 spawn。
+pub(crate) fn evict_sidecar_for_env_change(sock: &Path, new_fp: u64) {
+    let info = read_sidecar_env_fp(sock);
+    let old_fp = info.map(|i| i.fp);
+    let mut reaped = false;
+    if let Some(mut child) = take_managed_sidecar_by_sock(sock) {
+        crate::server::apps::child_registry::kill_child(&mut child);
+        reaped = true;
+    }
+    if !reaped {
+        if let Some(mut child) =
+            crate::server::apps::sidecar_engine::take_managed_sidecar_simple_by_sock(sock)
+        {
+            crate::server::apps::child_registry::kill_child(&mut child);
+            reaped = true;
+        }
+    }
+    if !reaped {
+        if let Some(pid) = info.and_then(|i| i.pid) {
+            kill_sidecar_pid(pid);
+        }
+    }
+    let _ = fs::remove_file(sock);
+    log::warn!(
+        "native_http: sidecar {} 的 .env 指纹不一致（运行中 {:?} / 本次 {:016x}）→ 杀掉旧进程并重建",
+        sock.display(),
+        old_fp.map(|f| format!("{f:016x}")).unwrap_or_else(|| "无指纹文件".into()),
+        new_fp
+    );
+}
+
 /// Try FFI-less native sidecar for c/go/rust when `.so` is missing.
 ///
 /// `env_vars` = 本请求 app 的 `.env`（deps 解析结果）。长驻 sidecar 在 spawn 时把它装进
@@ -160,20 +294,17 @@ async fn ensure_sidecar(
 
     let docroot = docroot_current;
     // **别的协议/别的注册表**（h2/h3 的 `sidecar_engine::SIDECARS_SIMPLE`）已经在同一个
-    // sock 路径上服务：直接复用它，**绝不** `remove_file` + 重新 spawn —— 那会偷走对方的
-    // 监听 socket，把对方刚 spawn 的进程变成谁也不管的孤儿（实测：h2c 首请求起 sidecar 后
-    // 首个 h1 请求会再 spawn 一个，旧进程泄漏到 webserver 退出；反复交替可无界堆积）。
-    //
-    // 跨注册表的并发首请求由 [`sidecar_spawn_lock`]（同一把 per-sock 锁）挡住：对方在锁内
-    // spawn 并**等到 sock 就绪**才释放锁，所以拿锁后这里看到的一定是「已 bind」的 sock。
-    //
-    // 诚实边界（与 `sidecar_engine::ensure_sidecar_simple` 同一取舍）：复用别人管的进程时
-    // 无法核验它的 `.env` 指纹（env 在对方 spawn 时定型），因此「改了 `.env` 但只有对方
-    // 协议先请求」的窗口里可能短暂沿用旧环境；下一次**自己表里**的指纹检查或超时回收会
-    // 纠正。宁可短暂陈旧，也不制造无人回收的孤儿进程。
+    // sock 路径上服务：先核验它 spawn 时写下的 `.env` 指纹（sock 旁的 `app.sock.envfp`）。
+    //   * 一致 → 直接复用；
+    //   * 不一致/文件缺失 → `.env`（或 spawn 者版本）已变，旧进程的进程 env 是陈旧的：
+    //     杀掉并重建（`evict_sidecar_for_env_change` 会同时清理两个注册表里的条目）。
+    // 绝不直接 `remove_file` + spawn（那会偷走对方的监听 socket、留下孤儿进程）。
     if sock_alive(&sock) {
-        log::debug!("native_http: sidecar {key} 已由其它注册表拉起（sock 存活），复用");
-        return Ok(sock);
+        if sidecar_env_fp_matches(&sock, fp) {
+            log::debug!("native_http: sidecar {key} 已由其它注册表拉起（sock 存活且 .env 指纹一致），复用");
+            return Ok(sock);
+        }
+        evict_sidecar_for_env_change(&sock, fp);
     }
 
     let deps_bin = app
@@ -221,6 +352,9 @@ async fn ensure_sidecar(
     let start = std::time::Instant::now();
     while start.elapsed() < Duration::from_secs(5) {
         if sock_alive(&sock) {
+            // 先落指纹再进表/返回：并发的另一协议拿锁后会读它核验（见
+            // `sidecar_env_fp_matches`）。写失败只影响下次复用（会重启一次）。
+            write_sidecar_env_fp(&sock, fp, child.id());
             SIDECARS.lock().insert(
                 key.to_string(),
                 Sidecar {
@@ -263,23 +397,29 @@ fn sock_alive(sock: &Path) -> bool {
 /// 由 `child_registry::kill_child` 完成。
 #[cfg(unix)]
 pub(crate) fn kill_managed_sidecar_by_sock(sock: &Path) -> bool {
+    let Some(mut dead) = take_managed_sidecar_by_sock(sock) else {
+        return false;
+    };
+    log::warn!(
+        "native_http: sidecar {} 代理超时（客户端已 502）→ 终止受管进程，后续请求将重启",
+        sock.display()
+    );
+    crate::server::apps::child_registry::kill_child(&mut dead);
+    true
+}
+
+/// 从本注册表「摘除」某个 sock 的受管 sidecar（不杀、不记日志），返回 Child 供调用方
+/// 用适合自己的语义回收（超时 / `.env` 指纹变化）。
+///
+/// 为什么拆出来：指纹变化的重启路径也要杀旧进程，但它**不是**超时 —— 复用
+/// `kill_managed_sidecar_by_sock` 会打出「代理超时（客户端已 502）」的误导日志。
+#[cfg(unix)]
+pub(crate) fn take_managed_sidecar_by_sock(sock: &Path) -> Option<Child> {
     let key = {
         let map = SIDECARS.lock();
         map.iter().find(|(_, s)| s.sock == sock).map(|(k, _)| k.clone())
-    };
-    let Some(key) = key else {
-        return false;
-    };
-    let removed = SIDECARS.lock().remove(&key);
-    if let Some(mut dead) = removed {
-        log::warn!(
-            "native_http: sidecar {} 代理超时（客户端已 502）→ 终止受管进程，后续请求将重启",
-            dead.sock.display()
-        );
-        crate::server::apps::child_registry::kill_child(&mut dead.child);
-        return true;
-    }
-    false
+    }?;
+    SIDECARS.lock().remove(&key).map(|s| s.child)
 }
 
 #[cfg(unix)]
@@ -538,9 +678,7 @@ pub fn uds_socket_path(app: &AppRouteConfig) -> Option<PathBuf> {
     let p = raw.strip_prefix("unix:").unwrap_or(raw.as_str());
     let path = abs_path(Path::new(p));
     path.exists().then_some(path)
-}
-
-/// Proxy one request to a pre-started UDS HTTP sidecar (`apps[].socket`).
+}/// Proxy one request to a pre-started UDS HTTP sidecar (`apps[].socket`).
 ///
 /// 显式 socket 是**运维自己起的**进程（如 Jetty）：宿主无法再注入它的进程 env，因此
 /// 本 app 的 `.env` 以 `x-crucible-env-<key>` 请求头（percent-encoded 值）转发，
@@ -561,5 +699,59 @@ pub async fn try_handle_uds(
         let sock = uds_socket_path(app).context("apps[].socket missing")?;
         let target = uds_target_uri(app, req.uri());
         proxy_unix(req, &sock, peer, Some(target), extra_headers).await
+    }
+}
+
+#[cfg(test)]
+mod sidecar_env_fp_tests {
+    use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    /// 指纹文件：落盘/读取/比较/覆盖（跨注册表复用判据的存储面）。
+    #[test]
+    fn env_fp_file_roundtrip_and_mismatch() {
+        let dir = std::env::temp_dir().join(format!(
+            "crucible-fp-test-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let sock = dir.join("app.sock");
+        assert!(read_sidecar_env_fp(&sock).is_none(), "文件不存在 = 无法核验");
+        assert!(!sidecar_env_fp_matches(&sock, 7));
+        write_sidecar_env_fp(&sock, 7, 4242);
+        assert_eq!(
+            read_sidecar_env_fp(&sock),
+            Some(SidecarEnvFp {
+                fp: 7,
+                pid: Some(4242)
+            })
+        );
+        assert!(sidecar_env_fp_matches(&sock, 7));
+        assert!(!sidecar_env_fp_matches(&sock, 8), "指纹不同必须判不一致");
+        // 覆盖写（原子的临时文件 + rename）
+        write_sidecar_env_fp(&sock, 0xdead_beef, 4243);
+        assert_eq!(read_sidecar_env_fp(&sock).unwrap().fp, 0xdead_beef);
+        assert_eq!(read_sidecar_env_fp(&sock).unwrap().pid, Some(4243));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// 指纹与键序无关；内容不同则不同（不能有拼接碰撞）。
+    #[test]
+    fn env_fingerprint_is_order_independent_and_collision_resistant() {
+        let a = vec![
+            ("A".to_string(), "1".to_string()),
+            ("B".to_string(), "2".to_string()),
+        ];
+        let mut b = a.clone();
+        b.reverse();
+        assert_eq!(env_fingerprint(&a), env_fingerprint(&b));
+        let c = vec![
+            ("A".to_string(), "1B=2".to_string()),
+        ];
+        assert_ne!(env_fingerprint(&a), env_fingerprint(&c));
     }
 }

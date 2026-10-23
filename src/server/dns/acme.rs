@@ -34,6 +34,22 @@ pub struct AcmeCfg {
     /// 续期检查间隔（天，默认 60）
     #[serde(default = "default_renew_days")]
     pub renew_days: u64,
+    /// ACME directory URL（空/None = Let's Encrypt production）。
+    ///
+    /// 用途：LE staging（`https://acme-staging-v02.api.letsencrypt.org/directory`）
+    /// 预检、以及本地测试 CA（pebble：`https://localhost:14000/dir`）。此前该值写死
+    /// 成 acme.sh 的 `--server letsencrypt` 别名 —— 测试/预发环境**无法**把整条
+    /// 探测链指向自定义 CA，只能在生产 CA 上做真机验证。
+    #[serde(default)]
+    pub server: Option<String>,
+    /// 跳过 ACME 服务端 TLS 证书校验（仅测试 CA，如 pebble 的自签目录端点）。
+    /// 生产必须保持 false（默认）。
+    #[serde(default)]
+    pub insecure: bool,
+    /// HTTP-01 挑战监听端口；0 = 80。非 root 测试实例可改高端口（pebble 的
+    /// `httpPort` 必须与之对齐），否则 bind :80 失败、首次签发必然失败。
+    #[serde(default)]
+    pub http_port: u16,
 }
 
 fn default_renew_days() -> u64 {
@@ -112,11 +128,12 @@ pub async fn startup(cfg: &AcmeCfg) {
         .clone()
         .unwrap_or_else(|| acme_root().join("www").display().to_string());
     // (1) HTTP-01 challenge 监听：先起，等 bind 结果（有界等待，超时也继续 —— 不阻塞启动）。
+    let port = if cfg.http_port == 0 { 80 } else { cfg.http_port };
     let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
-    tokio::spawn(http01_listener(webroot.clone(), Some(ready_tx)));
+    tokio::spawn(http01_listener(webroot.clone(), port, Some(ready_tx)));
     match tokio::time::timeout(std::time::Duration::from_secs(3), ready_rx).await {
-        Ok(Ok(true)) => log::info!("dns-acme: http-01 challenge listener ready on :80"),
-        Ok(Ok(false)) => log::warn!("dns-acme: bind :80 failed —— HTTP-01 不可用，签发会失败"),
+        Ok(Ok(true)) => log::info!("dns-acme: http-01 challenge listener ready on :{port}"),
+        Ok(Ok(false)) => log::warn!("dns-acme: bind :{port} failed —— HTTP-01 不可用，签发会失败"),
         _ => log::warn!("dns-acme: http-01 listener bind 未在 3s 内确认，继续尝试签发"),
     }
     // (2) 签发/续期循环（后台）：失败按退避重试而不是死等 renew_days；成功按 renew_days
@@ -270,6 +287,17 @@ fn issue(cfg: &AcmeCfg) -> anyhow::Result<()> {
     // 「装了但失败」。旧实现两种情况都报 `no acme client available` —— 面板按钮
     // 明明有 acme.sh 却回「没有客户端」，真正原因（rateLimited 等）只在服务日志里。
     let mut attempted: Vec<String> = Vec::new();
+    // ACME directory：空 = LE production（acme.sh 的 `letsencrypt` 别名）。自定义值
+    // （staging / pebble / 私有 CA）原样传给客户端；certbot 只接受 URL，故仅在显式
+    // 配置时传 `--server`（否则用 certbot 自己的默认 CA，避免把 `letsencrypt` 这个
+    // acme.sh 别名喂给 certbot 导致「无法解析服务器」）。
+    let custom_server = cfg
+        .server
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+    let acme_server = custom_server.clone().unwrap_or_else(|| "letsencrypt".to_string());
     // 1) acme.sh（用户目录安装或 /usr/local）；HOME 缺失时无法定位 ~/.acme.sh，跳过。
     // 走 env_lock 缓存读 HOME：本函数跑在 spawn_blocking 线程里，与请求路径上应用引擎
     // 的 setenv（perl/python/ruby 的 ENV 注入）并发 —— libc setenv 可能 realloc environ，
@@ -283,10 +311,14 @@ fn issue(cfg: &AcmeCfg) -> anyhow::Result<()> {
                 cmd.arg("--issue")
                     .arg("-d").arg(&cfg.domain)
                     .arg("--webroot").arg(&www)
-                    .arg("--server").arg("letsencrypt")
+                    .arg("--server").arg(&acme_server)
                     .arg("-m").arg(&cfg.email)
                     .arg("--keylength").arg("ec-256")
                     .env("LE_WORKING_DIR", format!("{home}/.acme.sh"));
+                if cfg.insecure {
+                    // acme.sh `--insecure`：不校验 ACME 目录端点的证书（pebble 自签）。
+                    cmd.arg("--insecure");
+                }
                 if run_client(&mut cmd, "acme.sh --issue").is_some() {
                     return install_acme_sh(&bin, &cfg.domain, &out_dir);
                 }
@@ -327,6 +359,13 @@ fn issue(cfg: &AcmeCfg) -> anyhow::Result<()> {
             .arg("-m").arg(&cfg.email)
             .arg("--agree-tos")
             .arg("--non-interactive");
+        // certbot 的 `--server` 只接受 URL（acme.sh 的 `letsencrypt` 别名对它非法）。
+        if let Some(s) = &custom_server {
+            cmd.arg("--server").arg(s);
+        }
+        if cfg.insecure {
+            cmd.arg("--no-verify-ssl");
+        }
         if run_client(&mut cmd, "certbot").is_some() {
             let src = std::path::Path::new("/etc/letsencrypt/live").join(domain);
             let _ = std::fs::copy(src.join("fullchain.pem"), out_dir.join("fullchain.pem"));
@@ -494,37 +533,64 @@ const HTTP01_HEADER_TIMEOUT: std::time::Duration = std::time::Duration::from_sec
 /// 单连接总寿命上限（keep-alive 已关，正常请求毫秒级完成）。
 const HTTP01_CONN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
-/// :80 HTTP-01 challenge 静态服务（极简 h1，只 serve .well-known/acme-challenge/*）。
+/// :80（或配置的 `http_port`）HTTP-01 challenge 静态服务（极简 h1，只 serve
+/// .well-known/acme-challenge/*）。
 /// 独立于 web listener——80 端口本模块独占；绑定结果通过 `ready` 通知调用方
 /// （签发必须在 bind 成功之后开始，否则首次签发必然失败）。
 /// 连接有上限与超时：旧实现无条件 spawn、无任何超时，任何人可对 :80 slowloris 耗尽 fd。
-async fn http01_listener(webroot: String, ready: Option<tokio::sync::oneshot::Sender<bool>>) {
+async fn http01_listener(webroot: String, port: u16, ready: Option<tokio::sync::oneshot::Sender<bool>>) {
+    let mut ready = ready;
+    let root = std::sync::Arc::new(std::path::PathBuf::from(&webroot));
+    let conns = std::sync::Arc::new(tokio::sync::Semaphore::new(HTTP01_MAX_CONNS));
+    // 同时监听 IPv6 与 IPv4：CA 的 HTTP-01 校验按 A/AAAA 解析结果选地址。旧实现只绑
+    // 0.0.0.0；域名有 AAAA（challtestsrv 默认 ::1、真实双栈站点很常见）时 CA 连
+    // [::1]:port 直接 connection refused，校验必然失败（真实机 pebble 复现：
+    // 记录 A=127.0.0.1/AAAA=::1，pebble 选 ::1，HTTP-01 永远 INVALID）。
+    // 先试 [::]（Linux 默认 dual-stack，同时覆盖 IPv4），再试 0.0.0.0（OpenBSD
+    // v6only=1 时需要单独绑）；至少一个成功才通知 ready。
+    let mut listeners: Vec<tokio::net::TcpListener> = Vec::new();
+    let mut last_err: Option<std::io::Error> = None;
+    for addr in [format!("[::]:{port}"), format!("0.0.0.0:{port}")] {
+        match tokio::net::TcpListener::bind(&addr).await {
+            Ok(l) => {
+                log::info!("dns-acme: http-01 challenge listener on {addr} webroot={webroot}");
+                listeners.push(l);
+            }
+            Err(e) => last_err = Some(e),
+        }
+    }
+    if listeners.is_empty() {
+        log::error!(
+            "dns-acme: bind :{port} failed（HTTP-01 不可用，签发将失败；若主 listener 要占该端口需把它接入挑战路由）: {}",
+            last_err.map(|e| e.to_string()).unwrap_or_default()
+        );
+        if let Some(tx) = ready.take() {
+            let _ = tx.send(false);
+        }
+        return;
+    }
+    if let Some(tx) = ready.take() {
+        let _ = tx.send(true);
+    }
+    for l in listeners {
+        tokio::spawn(http01_accept_loop(
+            l,
+            std::sync::Arc::clone(&root),
+            std::sync::Arc::clone(&conns),
+        ));
+    }
+}
+
+/// 单地址的 HTTP-01 accept 循环（IPv4/IPv6 各一个任务）。
+async fn http01_accept_loop(
+    listener: tokio::net::TcpListener,
+    root: std::sync::Arc<std::path::PathBuf>,
+    conns: std::sync::Arc<tokio::sync::Semaphore>,
+) {
     use hyper::service::service_fn;
     use hyper_util::rt::TokioIo;
     use hyper::{Request, Response, StatusCode};
     use hyper::body::Incoming;
-
-    let mut ready = ready;
-    let listener = match tokio::net::TcpListener::bind("0.0.0.0:80").await {
-        Ok(l) => {
-            if let Some(tx) = ready.take() {
-                let _ = tx.send(true);
-            }
-            l
-        }
-        Err(e) => {
-            log::error!(
-                "dns-acme: bind :80 failed（HTTP-01 不可用，签发将失败；若主 listener 要占 80 需把它接入挑战路由）: {e}"
-            );
-            if let Some(tx) = ready.take() {
-                let _ = tx.send(false);
-            }
-            return;
-        }
-    };
-    log::info!("dns-acme: http-01 challenge listener on :80 webroot={webroot}");
-    let root = std::path::PathBuf::from(&webroot);
-    let conns = std::sync::Arc::new(tokio::sync::Semaphore::new(HTTP01_MAX_CONNS));
     loop {
         let (sock, peer) = match listener.accept().await {
             Ok(x) => x,
@@ -542,12 +608,12 @@ async fn http01_listener(webroot: String, ready: Option<tokio::sync::oneshot::Se
                 continue;
             }
         };
-        let root = root.clone();
+        let root = std::sync::Arc::clone(&root);
         tokio::spawn(async move {
             let _permit = permit;
             let io = TokioIo::new(sock);
             let svc = service_fn(move |req: Request<Incoming>| {
-                let root = root.clone();
+                let root = std::sync::Arc::clone(&root);
                 async move {
                     // 只允许 GET /.well-known/acme-challenge/*
                     let path = req.uri().path();
@@ -586,6 +652,11 @@ async fn http01_listener(webroot: String, ready: Option<tokio::sync::oneshot::Se
             let _ = tokio::time::timeout(
                 HTTP01_CONN_TIMEOUT,
                 hyper::server::conn::http1::Builder::new()
+                    // hyper 1.x 的 header_read_timeout **必须**搭配 Timer，否则每个连接
+                    // 在 common/time.rs 直接 panic（"timeout set, but no timer set"）——
+                    // 真实机复现：HTTP-01 监听器 accept 后每条请求都 panic 一个 tokio
+                    // worker、连接被 RST，LE/pebble 的校验永远失败（ACME 首次签发必挂）。
+                    .timer(hyper_util::rt::TokioTimer::new())
                     .header_read_timeout(HTTP01_HEADER_TIMEOUT)
                     .keep_alive(false)
                     .serve_connection(io, svc),

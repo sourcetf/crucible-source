@@ -152,6 +152,20 @@ fn dir_redirect_location(uri: &http::Uri) -> Option<http::HeaderValue> {
     http::HeaderValue::from_str(&target).ok()
 }
 
+/// 405 的 `Allow` 值：必须列出该路径**当前支持的全部方法**（RFC 9110 §15.5.6）。
+///
+/// 静态层与上传端点共用 URL 空间：上传面（`autoindex.enabled && enable_upload` 且路径命中）
+/// 上 `GET/HEAD` 由静态层服务、`PUT/POST/PATCH` 由上传端点服务。`DELETE` 走到 405 时若
+/// 只写 `GET, HEAD`，就与「该资源实际接受 PUT/POST/PATCH」矛盾（自动化客户端据此会认为
+/// 上传不可用）。判据复用 `upload_api::allows_path`，与分发层同一套路径边界，避免漂移。
+fn allow_header_value(lc: &ListenerConfig, path: &str) -> &'static str {
+    if crate::server::upload_api::allows_path(lc, path) {
+        "GET, HEAD, PUT, POST, PATCH"
+    } else {
+        "GET, HEAD"
+    }
+}
+
 pub async fn serve(req: &Request<Incoming>, lc: &ListenerConfig) -> Result<Response<BoxBody>> {
     if req.method() != Method::GET && req.method() != Method::HEAD {
         // RFC 9110 §15.5.6：405 **必须**带 Allow，告诉客户端该资源支持哪些方法
@@ -160,9 +174,11 @@ pub async fn serve(req: &Request<Incoming>, lc: &ListenerConfig) -> Result<Respo
         // `Content-Type`，于是同一个 `POST /index.html` 在 h1 上是「无 Content-Type」、
         // 在 h2/h3 上是 `text/plain; charset=utf-8` —— 跨协议头不一致（规格 §4/§16 要求
         // 同一资源在任何协议下行为一致，缓存/CDN/自动化客户端会据此分叉）。
+        // `Allow` 必须把上传方法也列上（上传面上 PUT/POST/PATCH 是接受的，见
+        // [`allow_header_value`]）；非上传路径仍是 `GET, HEAD`。
         return Ok(Response::builder()
             .status(StatusCode::METHOD_NOT_ALLOWED)
-            .header(header::ALLOW, "GET, HEAD")
+            .header(header::ALLOW, allow_header_value(lc, req.uri().path()))
             .header(header::CONTENT_TYPE, "text/plain; charset=utf-8")
             .body(full("method not allowed"))
             .unwrap());
@@ -362,7 +378,29 @@ fn file_ino(_meta: &fs::Metadata) -> u64 {
     0
 }
 
-/// 文件「身份指纹」：(长度, inode, mtime)。小文件缓存与 ETag 都用它。
+/// 文件 **ctime**（inode 状态变更时间，(秒, 纳秒)）；非 Unix 平台返回 (0, 0)。
+///
+/// 为什么 ETag/缓存需要它：`mtime` 是**用户可设置**的 —— `touch -r`/`utime()` 可以把
+/// 一个被原地改写过的文件「还原」成与缓存条目完全相同的 mtime（长度不变、inode 不变），
+/// 于是只看 `(len, ino, mtime)` 的缓存键会继续发送**旧字节**（fastsec-wave10 O1 实测：
+/// TTL 过期重填后仍是旧视图）。ctime 由内核在每次 inode 变更（写盘、utime、chmod…）时
+/// 更新，**用户态无法设置**，因此「改写 + 还原 mtime」必然改变 ctime → 缓存必然刷新。
+///
+/// 诚实边界：ctime 的**秒**粒度粗（部分文件系统），但纳秒字段同取；即便同一 tick 内完成
+/// 「改写 + utime」，两次 inode 变更仍各自推进 ctime 的时钟值（同一 tick 只可能同时发生
+/// 一次写入与一次 utime —— 实测该组合下 ctime 已变）。非 Unix 平台无 ctime，退回旧判据。
+#[cfg(unix)]
+fn file_ctime(meta: &fs::Metadata) -> (i64, i64) {
+    use std::os::unix::fs::MetadataExt;
+    (meta.ctime(), meta.ctime_nsec())
+}
+#[cfg(not(unix))]
+fn file_ctime(_meta: &fs::Metadata) -> (i64, i64) {
+    (0, 0)
+}
+
+/// 文件「身份指纹」：(长度, inode, mtime, ctime)。两处静态缓存（`SMALL_CACHE` /
+/// `FAST_CACHE`）的命中判据都用它。
 ///
 /// 为什么不能只看 mtime：本机（WSL ext4 与 OpenBSD）的文件时间戳走**粗粒度时钟**
 /// （jiffy），实测同一毫秒内的两次写盘得到**完全相同**的 `mtime_ns` —— 于是
@@ -370,13 +408,17 @@ fn file_ino(_meta: &fs::Metadata) -> u64 {
 /// 都会把**旧内容**当成当前表示。inode 能把**原子替换**（rename：部署脚本
 /// `sed -i`/`cp`、以及本项目的上传 commit 都是这个形态）区分开。
 ///
-/// 诚实边界：**同 inode 原地改写 + 同长度 + 同 tick** 仍然分辨不出（要彻底解决
-/// 只能读内容算哈希，代价与收益不成比例）。这条边界写在这里而不是假装不存在。
+/// **ctime** 把「同 inode 原地改写 + 恢复 mtime」这条也堵住（见 [`file_ctime`]）：
+/// 写入与 `utime()` 都会推进 ctime，而用户态无法把它改回去。
+///
+/// 诚实边界：要在**同一次** inode 变更里既改内容又不改 ctime 是不可能的（ctime 由内核
+/// 维护）；理论上的盲区只剩「非 Unix 平台」（无 ctime 概念）。
 #[derive(Clone, Copy, PartialEq, Eq)]
 struct FileId {
     len: u64,
     ino: u64,
     mtime: SystemTime,
+    ctime: (i64, i64),
 }
 
 fn file_id(meta: &fs::Metadata) -> FileId {
@@ -384,6 +426,7 @@ fn file_id(meta: &fs::Metadata) -> FileId {
         len: meta.len(),
         ino: file_ino(meta),
         mtime: meta.modified().unwrap_or(SystemTime::UNIX_EPOCH),
+        ctime: file_ctime(meta),
     }
 }
 
@@ -396,6 +439,11 @@ fn file_id(meta: &fs::Metadata) -> FileId {
 ///   `If-Range` 错误放行旧偏移的 Range —— 客户端拿到旧内容。上传的原子 rename、
 ///   部署脚本的 `sed -i` 都属于这类（可复现：同目录 `rename` 覆盖同长度文件）。
 ///   时间戳粒度不足时（粗粒度时钟），inode 仍然能兜住原子替换这条主流路径。
+/// * **注意**：ETag 的字段数与顺序是 `h1_fast::parse_etag_id` 的**跨模块契约**
+///   （正好四个十六进制字段）。服务端缓存指纹 [`FileId`] 另外带 ctime（见
+///   [`file_ctime`]），但 ETag 不能加字段，否则 h1 快车道解析失败、全部请求回退。
+///   因此「原地改写 + 还原 mtime」靠缓存指纹兜住；客户端条件请求（If-None-Match）
+///   在这条极端形态下仍可能看到 304 —— 需要 h1_fast 的 Id 同步扩展才能闭合（跨 scope）。
 /// * `Last-Modified` / `If-Modified-Since` / `If-Range`(日期形式) 仍用**秒级**截断：
 ///   HTTP 日期只有秒精度，不截断会把同一秒内的请求判成「已修改」，条件请求永远拿不到 304。
 ///
@@ -635,7 +683,7 @@ pub async fn serve_simple<T>(req: &Request<T>, lc: &ListenerConfig) -> Result<Re
     if method != Method::GET && method != Method::HEAD {
         return Ok(Response::builder()
             .status(StatusCode::METHOD_NOT_ALLOWED)
-            .header(header::ALLOW, "GET, HEAD")
+            .header(header::ALLOW, allow_header_value(lc, req.uri().path()))
             .header(header::CONTENT_TYPE, "text/plain; charset=utf-8")
             .body(Bytes::from_static(b"method not allowed"))
             .unwrap());
@@ -2370,6 +2418,63 @@ mod tests {
         );
         // 内容确实没变时，缓存仍应命中（避免每次都重读）
         assert_eq!(read_cached(&p, &m2).unwrap().as_ref(), b"BBBB");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// 小文件缓存 / ETag 必须识别「**原地改写 + 还原 mtime**」。
+    ///
+    /// fastsec-wave10 O1 实测：`swap.txt` 原地改写后用 `utime` 把 mtime 还原成缓存里的
+    /// 值（长度、inode 都不变）⇒ 缓存键 `(len, ino, mtime)` 完全相同，TTL 过期重填后
+    /// 仍拿旧字节。修法是给指纹加 **ctime**（内核维护、用户态不可设置；写入与 `utime`
+    /// 都会推进它）。语义红线：**不得**退回「只比 mtime」——原子替换（inode 变）与
+    /// 同 tick 等长改写（见上一条用例）都要继续能识别。
+    #[cfg(unix)]
+    #[test]
+    fn cache_detects_inplace_rewrite_with_restored_mtime() {
+        use std::os::unix::fs::MetadataExt;
+        let dir = std::env::temp_dir().join(format!("crucible-ctime-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("swap.txt");
+        fs::write(&p, b"OLD!").unwrap();
+        let m1 = fs::metadata(&p).unwrap();
+        assert_eq!(read_cached(&p, &m1).unwrap().as_ref(), b"OLD!");
+        let (etag1, _) = validators(&m1);
+        let old_mtime = m1.modified().unwrap();
+        // 让 ctime 至少推进一个时钟 tick（粗粒度时钟下同一 tick 的两次变更共享时间戳）
+        std::thread::sleep(std::time::Duration::from_millis(30));
+        // 原地改写：同 inode、同长度
+        fs::write(&p, b"NEW!").unwrap();
+        // 还原 mtime（等价 `touch -r` / `os.utime`）；ctime 由内核推进且用户态改不了
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&p)
+            .unwrap()
+            .set_times(fs::FileTimes::new().set_modified(old_mtime))
+            .unwrap();
+        let m2 = fs::metadata(&p).unwrap();
+        assert_eq!(m2.ino(), m1.ino(), "前提：原地改写不换 inode");
+        assert_eq!(m2.len(), m1.len(), "前提：同长度");
+        assert_eq!(m2.modified().unwrap(), old_mtime, "前提：mtime 已还原");
+        assert_ne!(
+            file_ctime(&m2),
+            file_ctime(&m1),
+            "写入/utime 必须推进 ctime（否则缓存判据失效）"
+        );
+        let (etag2, _) = validators(&m2);
+        // ETag 仍是 (len, ino, mtime) 四字段（h1_fast 的 parse_etag_id 是跨模块契约，
+        // 不能加字段）；这条极端形态由缓存指纹的 ctime 兜住，ETag 不做断言。
+        assert_eq!(
+            etag1, etag2,
+            "前提：ETag 只含 len/ino/mtime，本形态下不变（故必须靠 ctime 保证缓存刷新）"
+        );
+        assert_eq!(
+            read_cached(&p, &m2).unwrap().as_ref(),
+            b"NEW!",
+            "TTL 内原地改写 + 还原 mtime 后必须返回新内容（旧实现命中旧缓存发旧字节）"
+        );
+        // 未变时仍命中（同一 meta 再查必须是新内容，不能回退成旧条目）
+        assert_eq!(read_cached(&p, &m2).unwrap().as_ref(), b"NEW!");
         let _ = fs::remove_dir_all(&dir);
     }
 

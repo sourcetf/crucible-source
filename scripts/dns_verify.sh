@@ -1,5 +1,12 @@
 #!/bin/sh
 set -u
+# 真机全量模式：一条命令起 named/pebble、跑三模式/权威/DNSSEC/AXFR-IXFR/DoT-DoH/ECS/ACME、
+# 最后清理。默认（不带 --real）仍是原来的「对已运行实例做 HTTP 冒烟」，保持验收脚本兼容。
+if [ "${1:-}" = "--real" ]; then
+    shift
+    SELF_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+    exec sh "$SELF_DIR/dns_bind_verify.sh" "$@"
+fi
 BASE="${1:-http://127.0.0.1:19095/__admin}"
 AUTH="${2:-admin:admin}"
 PASS=0; FAIL=0

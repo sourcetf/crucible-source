@@ -11,26 +11,48 @@
 //! **评估顺序三协议统一**（唯一入口 [`plan`]）：rewrite → redirect/block → pass →
 //! 响应头（`response_headers` 按改写后的路径求值）。rewrite 命中后的路径必须重新
 //! 经过 block/redirect，否则改写可以绕过安全规则（h2/h3 旧实现即如此）。
+//!
+//! **全局 + 每站规则**（§3.1 / §16.11）：顶层 `page_rules` 是全局规则，每个 listener
+//! 还可以有自己的 `page_rules`。两份规则**合并后统一按 `priority` 降序评估**
+//! （数值大者先），优先级相同时**全局规则在前、每站规则在后**（稳定排序）。
+//! 全局为空时顺序 = 每站规则的书写顺序，旧配置行为逐字节不变。
 
 use crate::config::{ListenerConfig, PageRuleConfig};
 use crate::server::h1::{full, BoxBody};
 use http::{header, HeaderMap, Request, Response, StatusCode};
 use hyper::body::Incoming;
+use once_cell::sync::Lazy;
+use parking_lot::Mutex;
+use std::collections::HashMap;
+use std::net::IpAddr;
+use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
-/// 按 §16.11 的 `priority` 排序：**数值大者先评估**；等值保持**配置顺序**
-/// （`sort_by` 是稳定排序，且全默认 0 时直接沿用原切片顺序，零排序开销）。
+/// 页面规则是否非空（全局或每站）。性能短路用：空规则表下 5 个入口恒为
+/// None/空，h1 快车道也以此判定是否可用。
+pub fn has_rules(lc: &ListenerConfig) -> bool {
+    !lc.page_rules.is_empty() || !lc.global_page_rules.is_empty()
+}
+
+/// 合并全局 + 每站规则并按 `priority` 排序：**数值大者先评估**；等值保持
+/// 「全局在前、每站在后」的稳定顺序（全局为空时 = 每站配置顺序，零行为变化）。
 ///
 /// 所有评估入口（apply / scan_immediate / rewrite_path / pass_upstream /
 /// response_headers）都经此遍历，保证「首个命中者胜」在协议间与优先级间一致。
-fn ordered<'a>(rules: &'a [PageRuleConfig]) -> Vec<&'a PageRuleConfig> {
-    let mut v: Vec<&PageRuleConfig> = rules.iter().collect();
+fn ordered<'a>(lc: &'a ListenerConfig) -> Vec<&'a PageRuleConfig> {
+    let g = &lc.global_page_rules;
+    let l = &lc.page_rules;
+    let mut v: Vec<&PageRuleConfig> = Vec::with_capacity(g.len() + l.len());
+    // 全局先入列：稳定排序下等 priority 时全局规则先评估（§16.11「全局/每站」）。
+    v.extend(g.iter());
+    v.extend(l.iter());
     if v.iter().any(|r| r.priority != 0) {
         v.sort_by(|a, b| b.priority.cmp(&a.priority));
     }
     v
 }
 
-/// 页面规则匹配的**请求上下文**（§16.11 的 host / 方法 / header 维度）。
+/// 页面规则匹配的**请求上下文**（§16.11 的 host / 方法 / header / country 维度）。
 ///
 /// 为什么需要它：评估入口此前只收 `&str path`，host/方法/header 无从判定。更关键的是
 /// **跨协议一致** —— h1 的 [`apply`] 拿得到 `Request`，而 h2/h3 走
@@ -40,11 +62,17 @@ fn ordered<'a>(rules: &'a [PageRuleConfig]) -> Vec<&'a PageRuleConfig> {
 ///
 /// `None` 的维度 = 该维度**不可用**：若规则声明了该维度则判**不匹配**（而非静默忽略），
 /// 避免「取不到 host 就把带 host 约束的规则放宽成 path-only」这种误命中。
+///
+/// `peer` / `geoip_db` 只用于 country 维度：调用方传**真实 TCP/UDP peer 地址**
+/// （绝不使用 `X-Forwarded-For` 等可伪造头）。GeoIP 查询仅在规则声明了 country
+/// 且其它维度已命中时发生（见 [`country_of_ctx`]），未声明该维度的站点零开销。
 #[derive(Clone, Copy, Default)]
 pub struct MatchCtx<'a> {
     pub method: Option<&'a str>,
     pub host: Option<&'a str>,
     pub headers: Option<&'a HeaderMap>,
+    pub peer: Option<IpAddr>,
+    pub geoip_db: Option<&'a Path>,
 }
 
 impl<'a> MatchCtx<'a> {
@@ -56,6 +84,7 @@ impl<'a> MatchCtx<'a> {
             method: Some(req.method().as_str()),
             host: host_of(req),
             headers: Some(req.headers()),
+            ..Self::default()
         }
     }
 
@@ -66,6 +95,8 @@ impl<'a> MatchCtx<'a> {
             method: None,
             host: None,
             headers: None,
+            peer: None,
+            geoip_db: None,
         }
     }
 
@@ -82,6 +113,39 @@ impl<'a> MatchCtx<'a> {
             method: Some(req.method().as_str()),
             host: host.or_else(|| host_of(req)),
             headers: Some(req.headers()),
+            ..Self::default()
+        }
+    }
+
+    /// 带**真实 peer IP** 与 listener 的 GeoIP 库路径：country 维度需要它们。
+    /// 三协议都必须在请求入口传同一个 peer（见各协议调用点）。
+    pub fn from_request_with_peer<B>(
+        req: &'a Request<B>,
+        peer: IpAddr,
+        lc: &'a ListenerConfig,
+    ) -> Self {
+        Self {
+            method: Some(req.method().as_str()),
+            host: host_of(req),
+            headers: Some(req.headers()),
+            peer: Some(peer),
+            geoip_db: lc.geoip_db.as_deref(),
+        }
+    }
+
+    /// `from_request_with_peer` + 改写前的 host 快照（h2/h3 rewrite 之后用）。
+    pub fn from_request_with_host_and_peer<B>(
+        req: &'a Request<B>,
+        host: Option<&'a str>,
+        peer: IpAddr,
+        lc: &'a ListenerConfig,
+    ) -> Self {
+        Self {
+            method: Some(req.method().as_str()),
+            host: host.or_else(|| host_of(req)),
+            headers: Some(req.headers()),
+            peer: Some(peer),
+            geoip_db: lc.geoip_db.as_deref(),
         }
     }
 }
@@ -103,12 +167,14 @@ fn host_of<B>(req: &Request<B>) -> Option<&str> {
         .and_then(|v| v.to_str().ok())
 }
 
-/// 一条规则是否命中：**URL + host + 方法 + header 四个维度全部满足**才命中。
+/// 一条规则是否命中：**URL + host + 方法 + header + country 五个维度全部满足**才命中。
 ///
 /// - 规则**未声明**的维度不构成约束（`None`）；
 /// - 规则**声明了**但 ctx 里该维度不可用 ⇒ 判不匹配（见 [`MatchCtx`] 说明）；
 /// - 任何畸形输入（非法 header 名、超长 host、控制字符）都只导致「不匹配」，
 ///   绝不 panic（`HeaderName`/`HeaderValue` 构造失败即返回 false）。
+/// - `country` 放在最后判定：只有路径/方法/host/header 都命中后才查 GeoIP，
+///   把昂贵的查询限制在「确实可能命中」的规则上。
 pub fn rule_matches(rule: &PageRuleConfig, path: &str, ctx: &MatchCtx) -> bool {
     if !path_matches(&rule.match_url, path) {
         return false;
@@ -134,6 +200,15 @@ pub fn rule_matches(rule: &PageRuleConfig, path: &str, ctx: &MatchCtx) -> bool {
             return false;
         };
         if !header_matches(spec, map) {
+            return false;
+        }
+    }
+    if let Some(spec) = rule.country.as_deref() {
+        // 取不到真实 peer / 未配置 GeoIP 库 / 库无记录 ⇒ 一律不命中（fail-closed）。
+        let Some(actual) = country_of_ctx(ctx) else {
+            return false;
+        };
+        if !country_matches(spec, &actual) {
             return false;
         }
     }
@@ -227,11 +302,180 @@ fn header_matches(spec: &str, headers: &HeaderMap) -> bool {
     }
 }
 
+/// country 维度：逗号分隔的 ISO2/别名，大小写不敏感；`!` 前缀 = 排除。
+///
+/// 语义（规格 §16.11「国家…」维度）：
+/// - 至少一个**正向** token 时：实际国家必须命中其中之一；
+/// - `!XX`：实际国家等于 XX ⇒ 立即不命中；
+/// - 只有排除项（如 `!CN`）时：任何**已解析出国家**且未被排除的请求都命中；
+/// - token 里的国家名支持 `China`/`中国` 等别名（复用 `geoip_panel::aliases`）；
+/// - 所有 token 都非法/为空 ⇒ 不命中（绝不退化成「匹配所有」）。
+fn country_matches(pattern: &str, actual: &str) -> bool {
+    let actual = actual.trim().to_ascii_uppercase();
+    if actual.is_empty() {
+        return false;
+    }
+    let mut positive = false;
+    let mut hit = false;
+    let mut any_token = false;
+    for tok in pattern.split(',') {
+        let t = tok.trim();
+        if t.is_empty() {
+            continue;
+        }
+        let (neg, raw) = match t.strip_prefix('!') {
+            Some(rest) => (true, rest.trim()),
+            None => (false, t),
+        };
+        if raw.is_empty() {
+            continue;
+        }
+        let code = crate::server::geoip_panel::aliases::resolve_country_alias(raw)
+            .trim()
+            .to_ascii_uppercase();
+        if code.is_empty() {
+            continue;
+        }
+        any_token = true;
+        if neg {
+            if actual == code {
+                return false;
+            }
+        } else {
+            positive = true;
+            if actual == code {
+                hit = true;
+            }
+        }
+    }
+    any_token && (!positive || hit)
+}
+
+/// 从 `MatchCtx` 解析客户端国家：只使用**真实 peer IP**（绝不看
+/// `X-Forwarded-For`/`CF-Connecting-IP` 等可伪造头）+ listener 注入的 GeoIP 库路径。
+/// 任一不可用 ⇒ `None`（声明了 country 的规则由此 fail-closed）。
+fn country_of_ctx(ctx: &MatchCtx) -> Option<String> {
+    let peer = ctx.peer?;
+    let db = ctx.geoip_db?;
+    country_of_peer(db, peer)
+}
+
+const COUNTRY_CACHE_TTL: Duration = Duration::from_secs(60);
+const COUNTRY_CACHE_CAP: usize = 4096;
+const COUNTRY_OPEN_RETRY: Duration = Duration::from_secs(30);
+
+/// 进程级 GeoIP 查询缓存。
+///
+/// 为什么要缓存连接：`geoip_panel::db::open` 每次都会跑一遍迁移 DDL + 索引创建，
+/// 放在请求热路径上会把「一条带 country 的规则」变成每次请求一次建表检查。
+/// 这里按库文件缓存一个只读查询连接，并把 (库, IP) → 国家 的结果缓存 60s：
+/// - 只有在规则声明 country 时才会走到；
+/// - 同一客户端 IP 的连续请求不再查库；
+/// - 库换文件（同名路径）时靠 60s TTL 自然切换（配置重载也会触发新 listener 快照）。
+///
+/// 打开失败时退避 30s：库不存在不应让每个带 country 的请求都去撞一次文件系统。
+struct CountryCache {
+    db: Option<PathBuf>,
+    conn: Option<rusqlite::Connection>,
+    open_failed_until: Option<Instant>,
+    entries: HashMap<(PathBuf, IpAddr), (Instant, Option<String>)>,
+}
+
+static COUNTRY_CACHE: Lazy<Mutex<CountryCache>> = Lazy::new(|| {
+    Mutex::new(CountryCache {
+        db: None,
+        conn: None,
+        open_failed_until: None,
+        entries: HashMap::new(),
+    })
+});
+
+fn country_of_peer(db: &Path, peer: IpAddr) -> Option<String> {
+    // v4-mapped（`::ffff:a.b.c.d`）折回 v4：covering 按地址族分流，不归一化会让
+    // 双栈 listener 上的同一客户端查不到 v4 段（与面板 lookup/access/rate_limit 同口径）。
+    let ip = crate::server::geoip_panel::iputil::unmap_v4_mapped(peer);
+    let key = (db.to_path_buf(), ip);
+    let now = Instant::now();
+    let mut cache = COUNTRY_CACHE.lock();
+
+    if let Some((at, val)) = cache.entries.get(&key) {
+        if now.duration_since(*at) <= COUNTRY_CACHE_TTL {
+            return val.clone();
+        }
+    }
+    if cache
+        .open_failed_until
+        .is_some_and(|until| until > now)
+        && cache.db.as_deref() != Some(db)
+    {
+        return None;
+    }
+
+    // 库路径变了 / 还没有连接：重开。查询失败时清连接，下个请求重试。
+    if cache.db.as_deref() != Some(db) || cache.conn.is_none() {
+        match crate::server::geoip_panel::db::open(db) {
+            Ok(c) => {
+                cache.db = Some(db.to_path_buf());
+                cache.conn = Some(c);
+                cache.open_failed_until = None;
+            }
+            Err(e) => {
+                crate::server::log_throttle::warn_every(
+                    "page-rules-geoip-open",
+                    Duration::from_secs(300),
+                    &format!("page_rules country: 无法打开 GeoIP 库 {}: {e:#}", db.display()),
+                );
+                cache.open_failed_until = Some(now + COUNTRY_OPEN_RETRY);
+                cache.entries.insert(key, (now, None));
+                return None;
+            }
+        }
+    }
+
+    let Some(conn) = cache.conn.as_ref() else {
+        return None;
+    };
+    let merged = match crate::server::geoip_panel::covering::lookup_merged(conn, &ip.to_string()) {
+        Ok(m) => m,
+        Err(e) => {
+            crate::server::log_throttle::warn_every(
+                "page-rules-geoip-query",
+                Duration::from_secs(300),
+                &format!("page_rules country: GeoIP 查询失败（{}）: {e:#}", ip),
+            );
+            cache.conn = None;
+            cache.entries.insert(key, (now, None));
+            return None;
+        }
+    };
+    let country = merged.country.trim().to_ascii_uppercase();
+    let val = (!country.is_empty()).then_some(country);
+    // 容量上限：先清过期项，仍满则丢弃一个任意项（无界内存防护）。
+    if cache.entries.len() >= COUNTRY_CACHE_CAP {
+        cache
+            .entries
+            .retain(|_, (at, _)| now.duration_since(*at) <= COUNTRY_CACHE_TTL);
+        if cache.entries.len() >= COUNTRY_CACHE_CAP {
+            if let Some(k) = cache.entries.keys().next().cloned() {
+                cache.entries.remove(&k);
+            }
+        }
+    }
+    cache.entries.insert(key, (now, val.clone()));
+    val
+}
+
 /// 立即响应类动作(redirect/block)的同步判定;rewrite/pass/cache/header 见其余入口。
-pub fn apply(lc: &ListenerConfig, req: &Request<Incoming>) -> Option<Response<BoxBody>> {
+///
+/// `ctx` 由调用方构造（h1 用 [`MatchCtx::from_request_with_peer`]），
+/// 这样 country 维度也能拿到真实 peer IP。
+pub fn apply(
+    lc: &ListenerConfig,
+    req: &Request<Incoming>,
+    ctx: &MatchCtx,
+) -> Option<Response<BoxBody>> {
     let path = req.uri().path();
-    let ctx = MatchCtx::from_request(req);
-    for rule in ordered(&lc.page_rules) {
+    for rule in ordered(lc) {
         if rule_matches(rule, path, &ctx) {
             match rule.action.as_str() {
                 "redirect" => {
@@ -305,7 +549,7 @@ fn scan_immediate(
     path: &str,
     ctx: &MatchCtx,
 ) -> Option<(StatusCode, Option<String>)> {
-    for rule in ordered(&lc.page_rules) {
+    for rule in ordered(lc) {
         if rule_matches(rule, path, ctx) {
             match rule.action.as_str() {
                 "block" => return Some((StatusCode::FORBIDDEN, None)),
@@ -382,7 +626,7 @@ fn redirect_response(target: String) -> Response<BoxBody> {
 
 /// `rewrite` 动作:把 match_url 匹配的前缀替换为 target,返回新路径。
 pub fn rewrite_path(lc: &ListenerConfig, path: &str, ctx: &MatchCtx) -> Option<String> {
-    for rule in ordered(&lc.page_rules) {
+    for rule in ordered(lc) {
         if rule.action != "rewrite" {
             continue;
         }
@@ -413,7 +657,7 @@ pub fn rewrite_path(lc: &ListenerConfig, path: &str, ctx: &MatchCtx) -> Option<S
 /// `pass` 动作:返回 (match_url, upstream 基础 URL)。
 /// path 合并交由 `proxy::proxy_page_rule` 按反代规则处理。
 pub fn pass_upstream(lc: &ListenerConfig, path: &str, ctx: &MatchCtx) -> Option<(String, String)> {
-    for rule in ordered(&lc.page_rules) {
+    for rule in ordered(lc) {
         if rule.action != "pass" {
             continue;
         }
@@ -433,7 +677,7 @@ pub fn pass_upstream(lc: &ListenerConfig, path: &str, ctx: &MatchCtx) -> Option<
 /// `cache`/`header` 动作产生的响应头(注入到最终响应)。
 pub fn response_headers(lc: &ListenerConfig, path: &str, ctx: &MatchCtx) -> Vec<(String, String)> {
     let mut out = Vec::new();
-    for rule in ordered(&lc.page_rules) {
+    for rule in ordered(lc) {
         if !rule_matches(rule, path, ctx) {
             continue;
         }
@@ -535,6 +779,7 @@ mod tests {
             method: None,
             host: None,
             header: None,
+            country: None,
             match_url: m.into(),
             action: a.into(),
             target: t.map(|s| s.into()),
@@ -547,6 +792,7 @@ mod tests {
             method: None,
             host: None,
             header: None,
+            country: None,
             match_url: m.into(),
             action: a.into(),
             target: t.map(|s| s.into()),
@@ -738,6 +984,7 @@ mod tests {
             method: method.map(Into::into),
             host: host.map(Into::into),
             header: header.map(Into::into),
+            country: None,
             match_url: m.into(),
             action: action.into(),
             target: target.map(Into::into),
@@ -750,7 +997,7 @@ mod tests {
     fn method_dimension_case_insensitive_and_multi_value() {
         let lc = lc_with(vec![rule_dims("/x", "block", None, None, Some("get, HEAD"), None)]);
         let hm = HeaderMap::new();
-        let mk = |m: &'static str| MatchCtx { method: Some(m), host: None, headers: Some(&hm) };
+        let mk = |m: &'static str| MatchCtx { method: Some(m), host: None, headers: Some(&hm), ..Default::default() };
         assert_eq!(apply_simple(&lc, "/x", &mk("GET")), Some((StatusCode::FORBIDDEN, String::new())));
         assert_eq!(apply_simple(&lc, "/x", &mk("HEAD")), Some((StatusCode::FORBIDDEN, String::new())));
         assert_eq!(apply_simple(&lc, "/x", &mk("POST")), None, "未列出的方法不得命中");
@@ -810,14 +1057,14 @@ mod tests {
         assert_eq!(apply_simple(&lc, "/k", &MatchCtx::path_only()), None);
 
         let empty = HeaderMap::new();
-        let ctx = MatchCtx { method: Some("POST"), host: Some("a.example"), headers: Some(&empty) };
+        let ctx = MatchCtx { method: Some("POST"), host: Some("a.example"), headers: Some(&empty), ..Default::default() };
         assert_eq!(apply_simple(&lc, "/h", &ctx), Some((StatusCode::FORBIDDEN, String::new())));
         assert_eq!(apply_simple(&lc, "/m", &ctx), Some((StatusCode::FORBIDDEN, String::new())));
         assert_eq!(apply_simple(&lc, "/k", &ctx), None, "头不存在 ⇒ 不命中");
 
         let mut hm = HeaderMap::new();
         hm.insert("X-Foo", http::HeaderValue::from_static("bar"));
-        let ctx2 = MatchCtx { method: Some("GET"), host: None, headers: Some(&hm) };
+        let ctx2 = MatchCtx { method: Some("GET"), host: None, headers: Some(&hm), ..Default::default() };
         assert_eq!(apply_simple(&lc, "/k", &ctx2), Some((StatusCode::FORBIDDEN, String::new())));
     }
 
@@ -855,5 +1102,78 @@ mod tests {
         let ctx2 = MatchCtx::from_request_with_host(&req2, snap2.as_deref());
         assert_eq!(ctx2.host, None);
         assert_eq!(apply_simple(&lc, "/new/x", &ctx2), None);
+    }
+
+    /// §3.1 / §16.11 全局 + 每站规则：等 priority 时全局在前，priority 大者跨两份
+    /// 规则表胜出；全局为空时行为与旧配置完全一致。
+    #[test]
+    fn global_rules_evaluated_before_listener_and_priority_crosses() {
+        // 等 priority：全局的 redirect 先命中（每站同路径规则不生效）。
+        let mut lc = lc_with(vec![rule("/g", "redirect", Some("301:/local"))]);
+        lc.global_page_rules = vec![rule("/g", "redirect", Some("308:/global"))];
+        assert_eq!(
+            apply_simple(&lc, "/g", &MatchCtx::path_only()),
+            Some((StatusCode::PERMANENT_REDIRECT, "/global".to_string())),
+            "等 priority 全局先评估"
+        );
+        // 每站规则 priority 更高 ⇒ 跨全局/每站按数值排序。
+        lc.global_page_rules = vec![rule_p("/p", "redirect", Some("301:/global"), 2)];
+        let mut lc2 = lc_with(vec![rule_p("/p", "redirect", Some("308:/local"), 7)]);
+        lc2.global_page_rules = lc.global_page_rules.clone();
+        assert_eq!(
+            apply_simple(&lc2, "/p", &MatchCtx::path_only()),
+            Some((StatusCode::PERMANENT_REDIRECT, "/local".to_string())),
+            "priority 7 > 2，每站规则先评估"
+        );
+        // rewrite / pass / response_headers 入口同样看到全局规则。
+        let mut lc3 = lc_with(vec![]);
+        lc3.global_page_rules = vec![
+            rule("/old/*", "rewrite", Some("/new")),
+            rule("/new/*", "header", Some("X-Global: yes")),
+        ];
+        assert!(has_rules(&lc3));
+        let ctx = MatchCtx::path_only();
+        assert_eq!(rewrite_path(&lc3, "/old/a", &ctx).as_deref(), Some("/new/a"));
+        assert_eq!(
+            response_headers(&lc3, "/new/a", &ctx),
+            vec![("X-Global".to_string(), "yes".to_string())]
+        );
+    }
+
+    /// country 维度语法：正向/多值/排除/别名；无国家信息时 fail-closed（含 `!CN`）。
+    #[test]
+    fn country_dimension_semantics() {
+        assert!(country_matches("CN", "CN"));
+        assert!(country_matches("cn, us", "US"));
+        assert!(!country_matches("CN,US", "JP"));
+        assert!(country_matches("!CN", "US"));
+        assert!(!country_matches("!CN", "CN"));
+        assert!(country_matches("!CN,!RU", "JP"));
+        assert!(!country_matches("!CN,!RU", "RU"));
+        assert!(country_matches("China", "CN"), "别名→ISO2");
+        assert!(country_matches("中国", "CN"));
+        // 畸形/空 pattern 绝不放大成全匹配。
+        assert!(!country_matches("", "CN"));
+        assert!(!country_matches(" , ! ", "CN"), "空 token 不得匹配任何国家");
+        // ctx 里没有真实 peer / 没有 GeoIP 库 ⇒ 声明 country 的规则不命中，
+        // 即使 pattern 是纯排除项（不能把「未知」当成「非 CN」放行）。
+        let lc = lc_with(vec![crate::config::PageRuleConfig {
+            method: None,
+            host: None,
+            header: None,
+            country: Some("!CN".into()),
+            match_url: "/geo".into(),
+            action: "block".into(),
+            target: None,
+            priority: 0,
+        }]);
+        assert_eq!(apply_simple(&lc, "/geo", &MatchCtx::path_only()), None);
+        let req = Request::builder().uri("/geo").body(()).unwrap();
+        let mut ctx = MatchCtx::from_request(&req);
+        ctx.peer = Some("127.0.0.1".parse().unwrap());
+        assert_eq!(apply_simple(&lc, "/geo", &ctx), None, "无 GeoIP 库 ⇒ 不命中");
+        // 补上库路径但文件不存在 ⇒ 同样不命中（且不会 panic）。
+        ctx.geoip_db = Some(Path::new("/nonexistent/crucible-geoip-test.sqlite"));
+        assert_eq!(apply_simple(&lc, "/geo", &ctx), None);
     }
 }

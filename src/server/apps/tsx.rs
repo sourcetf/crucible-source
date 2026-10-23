@@ -87,6 +87,11 @@ enum Cached {
     Ok {
         sig: u64,
         paths: Paths,
+        /// 这次构建应产出的文件（绝对路径）。缓存命中前逐个 `is_file()`：
+        /// 运维/清理脚本删掉 out_dir（或某个产物）后，只靠 mtime 指纹会一直认为
+        /// 「已构建」，`serve_product` 读不到文件 → 静态层 404，直到服务器重启。
+        /// 真机复现：`rm -rf www-apps/tsx/dist` 后 `/tsx/` 404（源码未变）。
+        products: Vec<std::path::PathBuf>,
     },
     Err {
         sig: u64,
@@ -100,6 +105,16 @@ impl Cached {
     fn sig(&self) -> u64 {
         match self {
             Cached::Ok { sig, .. } | Cached::Err { sig, .. } => *sig,
+        }
+    }
+
+    /// `Cached::Ok` 的产物是否仍然齐全（Err 无产物，恒 true）。
+    fn products_present(&self) -> bool {
+        match self {
+            Cached::Ok { products, .. } => {
+                !products.is_empty() && products.iter().all(|p| p.is_file())
+            }
+            Cached::Err { .. } => true,
         }
     }
 
@@ -196,7 +211,13 @@ fn app_state(key: &str, port: u16, engine: &str) -> Arc<AppBuild> {
 fn fresh_cached(state: &AppBuild) -> Option<Cached> {
     let c = state.cache.lock();
     match c.checked {
-        Some(t) if t.elapsed() < MIN_CHECK_INTERVAL => c.entry.clone(),
+        Some(t) if t.elapsed() < MIN_CHECK_INTERVAL => {
+            // 产物被外部删除时不能把「已构建」当成事实（否则 404 到重启）。
+            match &c.entry {
+                Some(e) if !e.products_present() => None,
+                _ => c.entry.clone(),
+            }
+        }
         _ => None,
     }
 }
@@ -885,7 +906,7 @@ fn ensure_built(
     // （parking_lot 不可重入），在 if let 的临时 guard 里调用会直接死锁。
     let cached_now = state.cache.lock().entry.clone();
     if let Some(c) = cached_now {
-        if c.sig() == sig {
+        if c.sig() == sig && c.products_present() {
             state.set_cached(Some(c.clone())); // 只刷新 checked
             return c.result();
         }
@@ -934,9 +955,12 @@ fn ensure_built(
                 }
             }
             let took = started.elapsed();
+            let products: Vec<std::path::PathBuf> =
+                files.iter().map(|f| out.join(product_rel(&f.rel))).collect();
             state.set_cached(Some(Cached::Ok {
                 sig,
                 paths: paths.clone(),
+                products,
             }));
             state.set_status(|st| {
                 st.state = "ok".into();
@@ -1252,7 +1276,7 @@ pub async fn handle(
         app.engine.to_ascii_lowercase(),
         docroot.display()
     );
-    let state = app_state(&key, lc.port, &app.engine);
+    let state = app_state(&key, lc.port, app.engine.as_str());
     if app.watch {
         register_watch(&key, state.clone(), app, &docroot);
     }
@@ -1334,7 +1358,7 @@ pub async fn handle_bytes(
         app.engine.to_ascii_lowercase(),
         docroot.display()
     );
-    let state = app_state(&key, lc.port, &app.engine);
+    let state = app_state(&key, lc.port, app.engine.as_str());
     if app.watch {
         register_watch(&key, state.clone(), app, &docroot);
     }
@@ -1540,5 +1564,31 @@ mod tests {
         let s3 = signature(std::slice::from_ref(&f1), "tsc", &out);
         assert_ne!(s1, s2);
         assert_ne!(s1, s3);
+    }
+
+    /// 产物被外部删除（rm -rf out_dir / 清理脚本）后，缓存必须失效：
+    /// 旧实现只比源码 mtime 指纹，会一直返回「已构建」→ 静态层 404 到重启。
+    #[test]
+    fn cached_ok_invalidates_when_product_missing() {
+        let dir = std::env::temp_dir().join(format!(
+            "crucible-tsx-products-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let product = dir.join("a.js");
+        std::fs::write(&product, "x").unwrap();
+        let c = Cached::Ok {
+            sig: 1,
+            paths: Paths {
+                source: dir.clone(),
+                out: dir.clone(),
+            },
+            products: vec![product.clone()],
+        };
+        assert!(c.products_present());
+        std::fs::remove_file(&product).unwrap();
+        assert!(!c.products_present());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -13,6 +13,7 @@
 #include "../app-engines/common/appengine_common.h"
 
 #include <dlfcn.h>
+#include <glob.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -20,12 +21,188 @@
 #ifdef _WIN32
 #define strcasecmp _stricmp
 #else
+#include <pthread.h>
 #include <strings.h> /* strcasecmp（ServerVariables 的键名比较） */
 #endif
 
 static int g_ready;
 static void *g_hostfxr;
 static int g_hostfxr_ok;
+/* ---------------------------------------------------------------------------
+ * 真 hostfxr 路径：进程内加载托管程序集并调用 UnmanagedCallersOnly 入口
+ *
+ * 为什么需要：旧实现只 dlopen("libhostfxr.so") 然后把 g_hostfxr_ok 置 1，
+ * **从未调用 hostfxr 的任何 API** —— 即使机器装了 .NET，/aspnet/ 也永远是 mini
+ * 渲染器（body 是 C 代码拼的），规格 §16.6 的「hostfxr 进程内」无法验证。
+ *
+ * 约定（最小、可验证）：
+ *   <docroot>/bin/CrucibleAspNetSample.dll + .runtimeconfig.json
+ *   类型 Crucible.AspNet.Sample.Handler，方法 Render：
+ *     int Render(const char *method, const char *path, const char *query,
+ *                const char *body, const char *source,
+ *                char *out, int out_cap);   // 返回写入字节数，<0 失败
+ *   C 侧把 .aspx 源文本交给托管渲染器；成功时响应头带
+ *   X-Crucible-Engine: aspnet-hostfxr + X-Crucible-AspNet-Mode: hostfxr。
+ *   托管程序集缺失/加载失败 → 保持原来的 mini 渲染器（诚实降级，200 仍来自样例）。
+ * ------------------------------------------------------------------------- */
+typedef int (*hostfxr_initialize_for_runtime_config_fn)(const char *, const void *, void **);
+typedef int (*hostfxr_get_runtime_delegate_fn)(void *, int, void **);
+typedef int (*hostfxr_close_fn)(void *);
+typedef int (*load_assembly_and_get_function_pointer_fn)(
+    const char *, const char *, const char *, const char *, void *, void **);
+typedef int (*aspx_managed_render_fn)(
+    const char *, const char *, const char *, const char *, const char *, char *, int);
+
+#define ASPX_HDT_LOAD_ASSEMBLY_AND_GET_FUNCTION_POINTER 5
+
+/* 定义在文件后面（FIFO 安全的存在性判定）。 */
+static int is_regular_file(const char *p);
+
+struct aspx_managed {
+    int state; /* 0=未尝试 1=不可用 2=就绪 */
+    void *ctx; /* hostfxr host context */
+    load_assembly_and_get_function_pointer_fn load;
+    aspx_managed_render_fn render;
+    char assembly[1024];
+    char runtimeconfig[1024];
+};
+static struct aspx_managed g_managed;
+#ifndef _WIN32
+static pthread_mutex_t g_managed_mx = PTHREAD_MUTEX_INITIALIZER;
+#endif
+
+static void aspx_managed_lock(void)
+{
+#ifndef _WIN32
+    pthread_mutex_lock(&g_managed_mx);
+#endif
+}
+static void aspx_managed_unlock(void)
+{
+#ifndef _WIN32
+    pthread_mutex_unlock(&g_managed_mx);
+#endif
+}
+
+/* 在 DOTNET_ROOT / 常见安装位置找 libhostfxr.so，返回第一个能 dlopen 的。 */
+static void *aspx_load_hostfxr(void)
+{
+    const char *roots[5];
+    char envbuf[1024];
+    glob_t g;
+    size_t i;
+    void *h = NULL;
+    const char *dotnet_root = getenv("DOTNET_ROOT");
+
+    roots[0] = dotnet_root;
+    roots[1] = getenv("DOTNET_ROOT_X64");
+    roots[2] = "/usr/lib/dotnet";
+    roots[3] = "/usr/share/dotnet";
+    roots[4] = "/usr/local/share/dotnet";
+    for (i = 0; i < sizeof(roots) / sizeof(roots[0]); i++) {
+        size_t k;
+        if (roots[i] == NULL || roots[i][0] == '\0')
+            continue;
+        memset(&g, 0, sizeof(g));
+        snprintf(envbuf, sizeof(envbuf), "%s/host/fxr/*/libhostfxr.so", roots[i]);
+        if (glob(envbuf, 0, NULL, &g) != 0) {
+            globfree(&g);
+            continue;
+        }
+        for (k = 0; k < g.gl_pathc; k++) {
+            h = dlopen(g.gl_pathv[k], RTLD_NOW | RTLD_LOCAL);
+            if (h != NULL) {
+                fprintf(stderr, "aspnet-hostfxr: using %s\n", g.gl_pathv[k]);
+                break;
+            }
+        }
+        globfree(&g);
+        if (h != NULL)
+            return h;
+    }
+    /* 最后兜底：LD_LIBRARY_PATH 里的裸名（容器/自定义布局）。 */
+    h = dlopen("libhostfxr.so", RTLD_NOW | RTLD_LOCAL);
+    if (h == NULL)
+        h = dlopen("libhostfxr.so.8", RTLD_NOW | RTLD_LOCAL);
+    if (h == NULL)
+        h = dlopen("libhostfxr.so.6", RTLD_NOW | RTLD_LOCAL);
+    return h;
+}
+
+/* 尝试初始化托管渲染器（幂等；失败后不再重试，避免每请求都 dlopen/报错）。 */
+static int aspx_managed_ensure(const char *docroot)
+{
+    hostfxr_initialize_for_runtime_config_fn init_fn;
+    hostfxr_get_runtime_delegate_fn get_delegate;
+    hostfxr_close_fn close_fn;
+    int rc;
+
+    aspx_managed_lock();
+    if (g_managed.state != 0) {
+        rc = (g_managed.state == 2) ? 1 : 0;
+        aspx_managed_unlock();
+        return rc;
+    }
+    g_managed.state = 1; /* 先假定不可用；成功再改 2（锁内单写者） */
+    if (docroot == NULL || docroot[0] == '\0')
+        goto fail;
+    snprintf(g_managed.assembly, sizeof(g_managed.assembly),
+             "%s/bin/CrucibleAspNetSample.dll", docroot);
+    snprintf(g_managed.runtimeconfig, sizeof(g_managed.runtimeconfig),
+             "%s/bin/CrucibleAspNetSample.runtimeconfig.json", docroot);
+    if (!is_regular_file(g_managed.assembly) || !is_regular_file(g_managed.runtimeconfig)) {
+        /* 绝大多数部署没有托管样例：不算错误，保持 mini（不刷日志）。 */
+        goto fail;
+    }
+    if (g_hostfxr == NULL) {
+        g_hostfxr = aspx_load_hostfxr();
+    }
+    if (g_hostfxr == NULL)
+        goto fail;
+    init_fn = (hostfxr_initialize_for_runtime_config_fn)
+        dlsym(g_hostfxr, "hostfxr_initialize_for_runtime_config");
+    get_delegate = (hostfxr_get_runtime_delegate_fn)
+        dlsym(g_hostfxr, "hostfxr_get_runtime_delegate");
+    close_fn = (hostfxr_close_fn)dlsym(g_hostfxr, "hostfxr_close");
+    if (init_fn == NULL || get_delegate == NULL || close_fn == NULL)
+        goto fail;
+    rc = init_fn(g_managed.runtimeconfig, NULL, &g_managed.ctx);
+    /* 0=Success, 1=Success_HostAlreadyInitialized, 2=Success_DifferentRuntimeProperties */
+    if (rc < 0 || rc > 2) {
+        fprintf(stderr, "aspnet-hostfxr: initialize_for_runtime_config(%s) rc=%d\n",
+                g_managed.runtimeconfig, rc);
+        g_managed.ctx = NULL;
+        goto fail;
+    }
+    rc = get_delegate(g_managed.ctx,
+                      ASPX_HDT_LOAD_ASSEMBLY_AND_GET_FUNCTION_POINTER,
+                      (void **)&g_managed.load);
+    if (rc < 0 || g_managed.load == NULL) {
+        fprintf(stderr, "aspnet-hostfxr: get_runtime_delegate rc=%d\n", rc);
+        goto fail;
+    }
+    rc = g_managed.load(g_managed.assembly,
+                        "Crucible.AspNet.Sample.Handler, CrucibleAspNetSample",
+                        "Render",
+                        /* hostfxr 的 UNMANAGEDCALLERSONLY_METHOD 哨兵值是
+                         * ((const char_t*)-1)，**不是**字面量
+                         * "UNMANAGEDCALLERSONLY_METHOD"（后者只是文档里的宏名）。
+                         * 传字面量会得到 0x80131522 并静默退回 mini。 */
+                        (const char *)(intptr_t)-1, NULL,
+                        (void **)&g_managed.render);
+    if (rc != 0 || g_managed.render == NULL) {
+        fprintf(stderr, "aspnet-hostfxr: load_assembly_and_get_function_pointer rc=%d\n", rc);
+        goto fail;
+    }
+    g_managed.state = 2;
+    fprintf(stderr, "aspnet-hostfxr: managed handler ready (%s)\n", g_managed.assembly);
+    aspx_managed_unlock();
+    return 1;
+
+fail:
+    aspx_managed_unlock();
+    return 0;
+}
 
 /* 请求上下文：ServerVariables 的取值来源（ABI 形参 + headers 块 + 进程环境）。
  * 与 AxonASP 引擎同一套语义（`.env` 经宿主 env_lock 装进进程 env 后由 getenv 兜底读）。 */
@@ -334,11 +511,11 @@ int appengine_init(const char *engine, const char *lib_hint)
     (void)lib_hint;
     g_hostfxr = NULL;
     g_hostfxr_ok = 0;
-    g_hostfxr = dlopen("libhostfxr.so", RTLD_NOW | RTLD_LOCAL);
-    if (!g_hostfxr)
-        g_hostfxr = dlopen("libhostfxr.so.6", RTLD_NOW | RTLD_LOCAL);
-    if (!g_hostfxr)
-        g_hostfxr = dlopen("libhostfxr.so.8", RTLD_NOW | RTLD_LOCAL);
+    memset(&g_managed, 0, sizeof(g_managed));
+    /* 真正的 hostfxr 搜索（DOTNET_ROOT / /usr/lib/dotnet / /usr/share/dotnet …）。
+     * 旧实现只认裸名 libhostfxr.so[.6/.8]，用户级安装（~/local/usr/lib/dotnet）与
+     * 发行版布局都不在默认 loader 路径里 ⇒ 永远走 mini。 */
+    g_hostfxr = aspx_load_hostfxr();
     if (g_hostfxr)
         g_hostfxr_ok = 1;
     /* Mini ASPX renderer is always available when hostfxr is absent. */
@@ -391,6 +568,40 @@ int appengine_execute(
 
     if (resolve_aspx(script, docroot, path, filepath, sizeof(filepath)) == 0 &&
         read_file(filepath, &raw, &raw_len) == 0 && raw) {
+        /* 真 hostfxr 优先：docroot/bin/CrucibleAspNetSample.dll 存在且 CoreCLR 就绪时，
+         * 由托管代码渲染（真的经过 hostfxr_initialize_for_runtime_config +
+         * load_assembly_and_get_function_pointer），失败才退回 mini。 */
+        if (aspx_managed_ensure(docroot)) {
+            int cap = (int)raw_len + 8192;
+            char *mbuf;
+            int n;
+            if (cap < 16384)
+                cap = 16384;
+            if (cap > 4 * 1024 * 1024)
+                cap = 4 * 1024 * 1024;
+            mbuf = (char *)malloc((size_t)cap);
+            if (mbuf != NULL) {
+                n = g_managed.render(method != NULL ? method : "GET",
+                                     path != NULL ? path : "/",
+                                     query != NULL ? query : "",
+                                     body != NULL ? body : "",
+                                     raw, mbuf, cap);
+                if (n >= 0) {
+                    out->status = 200;
+                    appengine_result_set_headers(
+                        out, "Content-Type: text/html; charset=utf-8\r\n"
+                             "X-Crucible-Engine: aspnet-hostfxr\r\n"
+                             "X-Crucible-AspNet-Mode: hostfxr\r\n");
+                    appengine_result_set_body(out, mbuf, (size_t)n);
+                    free(mbuf);
+                    free(raw);
+                    return 0;
+                }
+                fprintf(stderr,
+                        "aspnet-hostfxr: managed render failed rc=%d, falling back to mini\n", n);
+                free(mbuf);
+            }
+        }
         rendered = render_aspx(&ctx, raw, raw_len);
         free(raw);
         if (rendered) {
@@ -427,10 +638,16 @@ int appengine_execute(
 
 void appengine_shutdown(void)
 {
-    if (g_hostfxr) {
+    if (g_hostfxr != NULL) {
+        if (g_managed.ctx != NULL) {
+            hostfxr_close_fn close_fn = (hostfxr_close_fn)dlsym(g_hostfxr, "hostfxr_close");
+            if (close_fn != NULL)
+                close_fn(g_managed.ctx);
+        }
         dlclose(g_hostfxr);
         g_hostfxr = NULL;
     }
+    memset(&g_managed, 0, sizeof(g_managed));
     g_hostfxr_ok = 0;
     g_ready = 0;
 }

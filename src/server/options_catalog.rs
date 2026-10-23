@@ -114,6 +114,14 @@ pub fn app_engines() -> &'static [EngineOption] {
             help: "AxonASP FFI sidecar.",
             default_extensions: &["asp"],
         },
+        // §3.3 的 21 类之一：`do` 是 Apache/Tomcat 风格的 JSP 别名，
+        // 运行期与 jsp 同一派发路径（apps/mod.rs 的 "jsp" | "do" 分支）。
+        EngineOption {
+            id: "do",
+            label: "DO (JSP alias)",
+            help: "Apache/Tomcat-style JSP alias; dispatched exactly like jsp.",
+            default_extensions: &["do", "jsp"],
+        },
         EngineOption {
             id: "aspnet",
             label: "ASP.NET Core",
@@ -125,6 +133,14 @@ pub fn app_engines() -> &'static [EngineOption] {
             label: "TypeScript / TSX",
             help: "One-click compile + watch deploy.",
             default_extensions: &["tsx", "ts"],
+        },
+        // §3.3 的 21 类之一：显式 Unknown。配置可加载（向后兼容），请求期由
+        // apps::dispatch 的兜底分支回 501 并点名引擎。
+        EngineOption {
+            id: "unknown",
+            label: "Unknown / custom",
+            help: "Unrecognized or custom engine id; config loads, requests return 501.",
+            default_extensions: &[],
         },
     ]
 }
@@ -172,4 +188,23 @@ fn json_escape(s: &str) -> String {
         "\"{}\"",
         s.replace('\\', "\\\\").replace('"', "\\\"").replace('\n', "\\n")
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// §3.3：目录必须覆盖全部 21 类引擎（含 do / unknown），面板下拉据此生成。
+    #[test]
+    fn catalog_covers_all_21_engine_kinds() {
+        let ids: Vec<&str> = app_engines().iter().map(|e| e.id).collect();
+        assert_eq!(ids.len(), 21, "catalog 必须有 21 项: {ids:?}");
+        for need in [
+            "php", "fastcgi", "jsp", "asp", "do", "tsx", "aspnet", "python", "ruby",
+            "perl", "lua", "wsgi", "asgi", "psgi", "cgi", "uwsgi", "rack", "c", "go",
+            "rust", "unknown",
+        ] {
+            assert!(ids.contains(&need), "catalog 缺少引擎 {need}: {ids:?}");
+        }
+    }
 }

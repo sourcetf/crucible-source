@@ -31,9 +31,11 @@ static int g_ready;
  * 自己的解释器实例。此处不引用任何链接期 Py_* 符号：本 .so 未链接 libpython 时
  * 也必须能提供该符号。 */
 #ifndef _WIN32
-int crucible_py_ensure_init(int (*is_initialized)(void),
-                            void (*initialize)(void), void *(*save_thread)(void),
-                            char *err, size_t errsz)
+static int crucible_py_ensure_init_impl(int (*is_initialized)(void),
+                                        void (*initialize)(void),
+                                        void *(*save_thread)(void),
+                                        void (*on_initialized)(void),
+                                        char *err, size_t errsz)
 {
     static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
     static int state; /* 0 = 未尝试 1 = 就绪 -1 = 失败 */
@@ -66,10 +68,32 @@ int crucible_py_ensure_init(int (*is_initialized)(void),
          * 本线程。解释器已由别的 .so 初始化时不碰 GIL（那个 .so 已按契约释放）。 */
         if (save_thread != NULL)
             (void)save_thread();
+        /* v2 回调：仍在初始化锁内执行（其它嵌入点此刻被挡在锁外，尚未开始
+         * 「同步 os.environ 视图」）—— 用于把**初始化那一刻**的请求期 `.env`
+         * 污染从解释器视图里清掉。回调自己取/放 GIL（本线程刚 SaveThread）。 */
+        if (on_initialized != NULL)
+            on_initialized();
     }
     state = 1;
     pthread_mutex_unlock(&lock);
     return 0;
+}
+
+int crucible_py_ensure_init(int (*is_initialized)(void),
+                            void (*initialize)(void), void *(*save_thread)(void),
+                            char *err, size_t errsz)
+{
+    return crucible_py_ensure_init_impl(is_initialized, initialize, save_thread, NULL, err,
+                                        errsz);
+}
+
+/* v2：带「本次真的执行了初始化」回调（见 crucible_pyinit.h 的 typedef 说明）。 */
+int crucible_py_ensure_init2(int (*is_initialized)(void),
+                             void (*initialize)(void), void *(*save_thread)(void),
+                             void (*on_initialized)(void), char *err, size_t errsz)
+{
+    return crucible_py_ensure_init_impl(is_initialized, initialize, save_thread,
+                                        on_initialized, err, errsz);
 }
 #endif /* _WIN32 */
 

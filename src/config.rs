@@ -8,7 +8,9 @@ use anyhow::{Context, Result};
 pub use crate::server::dns::{DnsConfig, DohCfg, DotCfg};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::collections::BTreeMap;
+use std::fmt;
 use std::fs;
+use std::ops::Deref;
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -23,6 +25,16 @@ pub struct Config {
     pub syncookie: SyncookieConfig,
     #[serde(default)]
     pub geoip: GeoIpConfig,
+    /// §3.1 / §16.11：**全局页面规则**（对所有 listener 生效）。
+    ///
+    /// 语义见 `server::page_rules` 的文件头：全局规则与每站规则合并后按 `priority`
+    /// **降序**评估（数值大者先）；优先级相同时全局规则在前、每站规则在后（稳定排序，
+    /// 因此旧配置——全局为空——的评估顺序与书写顺序逐字节不变）。
+    ///
+    /// 全局规则在 `Config::load` 时复制进每个 `ListenerConfig::global_page_rules`
+    /// （运行期只读快照，不参与 config.toml 序列化）。
+    #[serde(default)]
+    pub page_rules: Vec<PageRuleConfig>,
     #[serde(default)]
     pub tor_hs: TorHsConfig,
     #[serde(default)]
@@ -549,6 +561,18 @@ pub struct ListenerConfig {
     pub proxy_rules: Vec<ProxyRuleConfig>,
     #[serde(default)]
     pub page_rules: Vec<PageRuleConfig>,
+    /// §3.1 / §16.11：**全局**页面规则的运行期副本（`Config::load` 从顶层
+    /// `page_rules` 注入；不参与 config.toml / 面板 JSON 序列化 —— 面板编辑的是
+    /// 顶层 `page_rules`，避免每站回显一份全局规则的副本）。
+    ///
+    /// 评估顺序见 `server::page_rules::ordered`：全局 + 每站合并后按 priority 降序，
+    /// 等优先级时全局在前。
+    #[serde(skip)]
+    pub global_page_rules: Vec<PageRuleConfig>,
+    /// §16.11 country 维度的 GeoIP 库路径（`Config::load` 从 `[geoip].db_path` 注入）。
+    /// 只有规则声明了 country 时才会被读取。
+    #[serde(skip)]
+    pub geoip_db: Option<PathBuf>,
     #[serde(default)]
     pub server_name: Option<String>,
     #[serde(default)]
@@ -637,6 +661,8 @@ impl Default for ListenerConfig {
             basic_auth: None,
             proxy_rules: Vec::new(),
             page_rules: Vec::new(),
+            global_page_rules: Vec::new(),
+            geoip_db: None,
             server_name: None,
             status_path: None,
             address_v6: None,
@@ -889,13 +915,197 @@ impl SslConfig {
     }
 }
 
+/// §3.3 的应用引擎类型（21 类）。
+///
+/// 兼容性要求：**旧 config.toml 里 `engine = "php"` 等字符串必须原样解析**，
+/// 未知/自定义引擎名也必须能加载（运行期回 501，而不是配置加载失败）。
+/// 因此本枚举：
+/// - 已知名字大小写不敏感（`"PHP"`/`"Php"` → `Php`），序列化统一为小写规范名；
+/// - 未识别的名字落入 [`AppEngineKind::Other`] 并**保留原始文本**，序列化时原样写回；
+/// - 通过 `Deref<Target = str>` 让既有 `app.engine.to_ascii_lowercase()` /
+///   `format!("{}", app.engine)` 等字符串用法保持不变。
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum AppEngineKind {
+    Php,
+    Fastcgi,
+    Jsp,
+    Asp,
+    /// Apache/Tomcat 风格的 JSP 别名（`engine = "do"`）。
+    Do,
+    Tsx,
+    AspNet,
+    Python,
+    Ruby,
+    Perl,
+    Lua,
+    Wsgi,
+    Asgi,
+    Psgi,
+    Cgi,
+    Uwsgi,
+    Rack,
+    C,
+    Go,
+    Rust,
+    /// 显式声明为未知（`engine = "unknown"`）。
+    Unknown,
+    /// 向后兼容：目录外/自定义引擎名，保留原始字符串。
+    Other(String),
+}
+
+impl AppEngineKind {
+    /// 规范名（小写）。`Other` 返回原始文本。
+    pub fn as_str(&self) -> &str {
+        match self {
+            Self::Php => "php",
+            Self::Fastcgi => "fastcgi",
+            Self::Jsp => "jsp",
+            Self::Asp => "asp",
+            Self::Do => "do",
+            Self::Tsx => "tsx",
+            Self::AspNet => "aspnet",
+            Self::Python => "python",
+            Self::Ruby => "ruby",
+            Self::Perl => "perl",
+            Self::Lua => "lua",
+            Self::Wsgi => "wsgi",
+            Self::Asgi => "asgi",
+            Self::Psgi => "psgi",
+            Self::Cgi => "cgi",
+            Self::Uwsgi => "uwsgi",
+            Self::Rack => "rack",
+            Self::C => "c",
+            Self::Go => "go",
+            Self::Rust => "rust",
+            Self::Unknown => "unknown",
+            Self::Other(s) => s,
+        }
+    }
+
+    /// 从配置字符串解析：已知名字大小写不敏感；未知名字保留原文（trim 后不丢字符）。
+    pub fn from_name(name: &str) -> Self {
+        let t = name.trim();
+        let lower = t.to_ascii_lowercase();
+        match lower.as_str() {
+            "php" => Self::Php,
+            "fastcgi" => Self::Fastcgi,
+            "jsp" => Self::Jsp,
+            "asp" => Self::Asp,
+            "do" => Self::Do,
+            "tsx" => Self::Tsx,
+            "aspnet" | "aspx" => Self::AspNet,
+            "python" => Self::Python,
+            "ruby" => Self::Ruby,
+            "perl" => Self::Perl,
+            "lua" => Self::Lua,
+            "wsgi" => Self::Wsgi,
+            "asgi" => Self::Asgi,
+            "psgi" => Self::Psgi,
+            "cgi" => Self::Cgi,
+            "uwsgi" => Self::Uwsgi,
+            "rack" => Self::Rack,
+            "c" => Self::C,
+            "go" => Self::Go,
+            "rust" => Self::Rust,
+            "unknown" => Self::Unknown,
+            _ => Self::Other(t.to_string()),
+        }
+    }
+
+    /// 是否为规格列出的已知类型（`Other` = 目录外自定义名）。
+    pub fn is_known(&self) -> bool {
+        !matches!(self, Self::Other(_))
+    }
+}
+
+impl Default for AppEngineKind {
+    fn default() -> Self {
+        Self::Unknown
+    }
+}
+
+impl Deref for AppEngineKind {
+    type Target = str;
+    fn deref(&self) -> &str {
+        self.as_str()
+    }
+}
+
+impl fmt::Display for AppEngineKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl From<&str> for AppEngineKind {
+    fn from(s: &str) -> Self {
+        Self::from_name(s)
+    }
+}
+
+impl From<String> for AppEngineKind {
+    fn from(s: String) -> Self {
+        Self::from_name(&s)
+    }
+}
+
+impl From<AppEngineKind> for String {
+    fn from(k: AppEngineKind) -> Self {
+        k.as_str().to_string()
+    }
+}
+
+impl AsRef<str> for AppEngineKind {
+    fn as_ref(&self) -> &str {
+        self.as_str()
+    }
+}
+
+impl PartialEq<str> for AppEngineKind {
+    fn eq(&self, other: &str) -> bool {
+        self.as_str() == other
+    }
+}
+
+impl PartialEq<&str> for AppEngineKind {
+    fn eq(&self, other: &&str) -> bool {
+        self.as_str() == *other
+    }
+}
+
+impl PartialEq<String> for AppEngineKind {
+    fn eq(&self, other: &String) -> bool {
+        self.as_str() == other.as_str()
+    }
+}
+
+impl PartialEq<AppEngineKind> for str {
+    fn eq(&self, other: &AppEngineKind) -> bool {
+        self == other.as_str()
+    }
+}
+
+impl Serialize for AppEngineKind {
+    fn serialize<S: Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for AppEngineKind {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> std::result::Result<Self, D::Error> {
+        let s = String::deserialize(deserializer)?;
+        Ok(Self::from_name(&s))
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppRouteConfig {
     #[serde(default)]
     pub paths: Vec<String>,
     #[serde(default = "default_true")]
     pub enabled: bool,
-    pub engine: String,
+    /// §3.3：引擎类型（显式枚举；未知值落 [`AppEngineKind::Other`] 以兼容旧配置）。
+    pub engine: AppEngineKind,
     #[serde(default)]
     pub socket: Option<String>,
     #[serde(default)]
@@ -1085,6 +1295,23 @@ pub struct PageRuleConfig {
     /// （值精确匹配）。头名大小写不敏感。
     #[serde(default)]
     pub header: Option<String>,
+    /// §16.11 匹配维度 —— **国家/地区**（GeoIP，请求期判定）。
+    ///
+    /// 语法：逗号分隔的 ISO2 码或常见别名（`CN`、`China`、`中国`），大小写不敏感；
+    /// 前缀 `!` 表示排除。示例：
+    /// - `"CN"`：仅中国
+    /// - `"CN,US"`：中国或美国
+    /// - `"!CN"`：除中国外**任何已解析出国家**的请求
+    /// - `"!CN,!RU"`：既不是中国也不是俄罗斯
+    ///
+    /// **未解析出国家**（库未配置/无记录/查询失败）时，声明了该维度的规则一律
+    /// **不命中**（与其他维度「声明了但上下文不可用 ⇒ 不匹配」的 fail-closed 语义
+    /// 一致；否则 `!CN` 会把「未知」当成「非中国」放行）。
+    ///
+    /// 性能：仅当某条规则声明了 `country` 且其它维度都已命中时才查询 GeoIP，
+    /// 结果按 (库, 客户端 IP) 做短 TTL 缓存；未声明该维度的站点零额外开销。
+    #[serde(default)]
+    pub country: Option<String>,
 }
 
 /// 兼容旧版 `[admin] username/password_hash` 扁平字段。
@@ -1100,6 +1327,8 @@ struct ConfigRaw {
     syncookie: SyncookieConfig,
     #[serde(default)]
     geoip: GeoIpConfig,
+    #[serde(default)]
+    page_rules: Vec<PageRuleConfig>,
     #[serde(default)]
     tor_hs: TorHsConfig,
     #[serde(default)]
@@ -1174,6 +1403,7 @@ impl Config {
             ip_access: raw_cfg.ip_access,
             syncookie: raw_cfg.syncookie,
             geoip: raw_cfg.geoip,
+            page_rules: raw_cfg.page_rules,
             tor_hs: raw_cfg.tor_hs,
             telemetry: raw_cfg.telemetry,
             dns: raw_cfg.dns,
@@ -1191,7 +1421,26 @@ impl Config {
         check_tor_hs_data_dir(&cfg, &base)?;
         cfg.normalize_tls_version_ranges()?;
         cfg.validate()?;
+        // 全局页面规则 / GeoIP 库路径是**跨 listener 的共享配置**：注入到每个
+        // listener 的运行期字段（`#[serde(skip)]`，不参与序列化）。放在 validate
+        // 之后：校验只看磁盘上的真实配置，注入后的副本不再回写。
+        cfg.inject_shared_listener_config();
         Ok(cfg)
+    }
+
+    /// 把顶层 `page_rules` 与 `[geoip].db_path` 复制进每个 listener 的运行期字段。
+    ///
+    /// 为什么复制而不是让评估函数多收一个全局切片：页面规则的 5 个评估入口在
+    /// h1/h2/h3 共 10+ 个调用点上；复制后**所有既有调用点无需改签名**就能同时看到
+    /// 全局与每站规则（`page_rules::ordered` 合并两份切片）。规则条数很少（上限 512），
+    /// 配置热重载时才复制一次。
+    pub fn inject_shared_listener_config(&mut self) {
+        let global = self.page_rules.clone();
+        let db = self.geoip.db_path.clone();
+        for l in &mut self.listeners {
+            l.global_page_rules = global.clone();
+            l.geoip_db = db.clone();
+        }
     }
 
     /// §18：把 `min_version` / `max_version` 区间展开成 `versions` 列表。
@@ -1709,46 +1958,13 @@ cover 只用于「未使用 / 被拒 ECH」的连接，ECH 关闭时它会成为
                 }
             }
 
-            // ⑤b page_rules 的 redirect target 会进 Location 响应头。`HeaderValue` 拒绝
-            //     控制字符与非 ASCII，而 `http::Builder` 把错误**推迟到 `.body()`** ——
-            //     手写配置里一个带换行/非 ASCII 的 target，会让每个命中该规则的请求在 hyper
-            //     的 service future 里 panic（连接被直接丢弃）。代码侧已改成不 unwrap 的降级
-            //     路径，这里再加一道配置期拦截，让错误在加载时就报出来。
-            for (i, r) in l.page_rules.iter().enumerate() {
-                if r.action == "redirect" {
-                    let t = r.target.as_deref().unwrap_or("/");
-                    let loc = match t.split_once(':') {
-                        Some(("301" | "307" | "308", u)) => u,
-                        _ => t,
-                    };
-                    if !safe_header_value(loc) {
-                        anyhow::bail!(
-                            "listener {}:{}: page_rules[{i}]（redirect）的 target 不能作为 Location 响应头（含控制字符、非 ASCII、引号或反斜杠）: {loc:?}",
-                            l.address, l.port
-                        );
-                    }
-                }
-            }
-            // ⑤c page_rules 的 match_url：只有**结尾**的 `*` 是受支持的通配
-            //     （page_rules::path_matches 用 strip_suffix('*') + starts_with）。
-            //     中间的 `*` 会被当普通字符比较 ⇒ 规则**永不匹配**，而面板里看起来
-            //     完全正常（保存成功、规则列表也在），只有请求打不上去才发现。
-            for (i, r) in l.page_rules.iter().enumerate() {
-                if let Some(pos) = r.match_url.find('*') {
-                    if pos != r.match_url.len() - 1 {
-                        anyhow::bail!(
-                            "listener {}:{}: page_rules[{i}].match_url {:?} 里的 `*` 只在结尾受支持（中间的 `*` 按字面比较，规则永不匹配）",
-                            l.address, l.port, r.match_url
-                        );
-                    }
-                }
-                if !r.match_url.starts_with('/') && !r.match_url.starts_with("http") {
-                    anyhow::bail!(
-                        "listener {}:{}: page_rules[{i}].match_url {:?} 必须以 `/` 开头（路径规则）",
-                        l.address, l.port, r.match_url
-                    );
-                }
-            }
+            // ⑤b/c page_rules（每站）：redirect target 必须能进 Location 响应头；
+            //     match_url 只支持结尾 `*`；country 语法必须可解析。与全局规则共用
+            //     同一套校验（见 `validate_page_rule_list`）。
+            validate_page_rule_list(
+                &l.page_rules,
+                &format!("listener {}:{}: page_rules", l.address, l.port),
+            )?;
             // ⑤d l4_forward：必须能解析成 ip:port。否则每次连接才在 listener 里 parse 失败，
             //     连接被静默丢弃（配置加载却是成功的）。
             if let Some(dest) = &l.l4_forward {
@@ -1831,12 +2047,87 @@ cover 只用于「未使用 / 被拒 ECH」的连接，ECH 关闭时它会成为
             }
         }
 
+        // 全局页面规则与每站同一套语义/校验（§3.1「页面规则全局/每站」）。
+        if self.page_rules.len() > 512 {
+            anyhow::bail!(
+                "page_rules（全局）条数过多（{} > 512）—— 每个请求都要线性扫描该表",
+                self.page_rules.len()
+            );
+        }
+        validate_page_rule_list(&self.page_rules, "page_rules（全局）")?;
+
         Ok(())
     }
 
     pub fn to_toml_string(&self) -> Result<String> {
         Ok(toml::to_string_pretty(self)?)
     }
+}
+
+/// 页面规则列表校验（全局与每站共用）。
+///
+/// 运行期对畸形输入只返回「不匹配」（绝不 panic），但配置期必须把「永远不可能
+/// 命中」的规则拦下来 —— 否则面板/手写配置显示保存成功，实际整条规则是死的。
+fn validate_page_rule_list(rules: &[PageRuleConfig], where_: &str) -> Result<()> {
+    for (i, r) in rules.iter().enumerate() {
+        // redirect target 会进 Location 响应头；HeaderValue 拒绝控制字符与非 ASCII。
+        if r.action == "redirect" {
+            let t = r.target.as_deref().unwrap_or("/");
+            let loc = match t.split_once(':') {
+                Some(("301" | "307" | "308", u)) => u,
+                _ => t,
+            };
+            if !safe_header_value(loc) {
+                anyhow::bail!(
+                    "{where_}[{i}]（redirect）的 target 不能作为 Location 响应头（含控制字符、非 ASCII、引号或反斜杠）: {loc:?}"
+                );
+            }
+        }
+        // match_url：只有**结尾**的 `*` 是受支持的通配；中间的 `*` 按字面比较。
+        if let Some(pos) = r.match_url.find('*') {
+            if pos != r.match_url.len() - 1 {
+                anyhow::bail!(
+                    "{where_}[{i}].match_url {:?} 里的 `*` 只在结尾受支持（中间的 `*` 按字面比较，规则永不匹配）",
+                    r.match_url
+                );
+            }
+        }
+        if !r.match_url.starts_with('/') && !r.match_url.starts_with("http") {
+            anyhow::bail!(
+                "{where_}[{i}].match_url {:?} 必须以 `/` 开头（路径规则）",
+                r.match_url
+            );
+        }
+        // country：逗号分隔、可带 `!` 前缀；空 token / 空国家码会让语义不可预测。
+        if let Some(spec) = r.country.as_deref() {
+            if spec.len() > 256 {
+                anyhow::bail!("{where_}[{i}].country 过长（{} > 256）", spec.len());
+            }
+            let mut any = false;
+            for tok in spec.split(',') {
+                let t = tok.trim();
+                if t.is_empty() {
+                    continue;
+                }
+                let code = t.strip_prefix('!').unwrap_or(t).trim();
+                if code.is_empty() {
+                    anyhow::bail!(
+                        "{where_}[{i}].country 含空的排除项（`!` 后必须有国家码）: {spec:?}"
+                    );
+                }
+                if code.chars().any(char::is_control) || code.len() > 64 {
+                    anyhow::bail!(
+                        "{where_}[{i}].country 含控制字符或超长国家码（≤64 字节）: {code:?}"
+                    );
+                }
+                any = true;
+            }
+            if !any {
+                anyhow::bail!("{where_}[{i}].country 不能为空（留空请删掉该字段）");
+            }
+        }
+    }
+    Ok(())
 }
 
 /// 所有会进 `WWW-Authenticate: Basic realm="…"` 的 realm（管理面 + 每个 listener 的 basic_auth）。
@@ -2776,5 +3067,81 @@ root = "www"
             cfg2.listeners[0].root
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// §3.1：顶层 `page_rules` 在 load 时注入每个 listener（运行期字段），
+    /// 但**不参与序列化**（面板/TOML 里只有一份顶层 page_rules）。
+    #[test]
+    fn global_page_rules_injected_into_listeners_without_serializing_duplicates() {
+        let dir = std::env::temp_dir().join(format!("crucible-global-pr-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("config.toml");
+        std::fs::write(
+            &path,
+            r#"
+[[page_rules]]
+match_url = "/blocked*"
+action = "block"
+
+[[page_rules]]
+match_url = "/geo*"
+action = "block"
+country = "CN"
+
+[[listeners]]
+address = "127.0.0.1"
+port = 18082
+root = "www"
+
+[[listeners.page_rules]]
+match_url = "/local*"
+action = "redirect"
+target = "/moved"
+"#,
+        )
+        .unwrap();
+        let cfg = Config::load(&path).unwrap();
+        assert_eq!(cfg.page_rules.len(), 2, "顶层规则只解析一次");
+        assert_eq!(
+            cfg.listeners[0].global_page_rules.len(),
+            2,
+            "全局规则必须注入 listener 运行期字段"
+        );
+        assert_eq!(cfg.listeners[0].page_rules.len(), 1, "每站规则保持独立");
+        assert_eq!(cfg.listeners[0].global_page_rules[1].country.as_deref(), Some("CN"));
+        let text = cfg.to_toml_string().unwrap();
+        assert!(text.contains("[[page_rules]]"), "顶层规则必须写回");
+        assert!(
+            !text.contains("global_page_rules"),
+            "运行期副本不得出现在 config.toml: {text}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// §3.3：21 类引擎名全部可解析为已知枚举；旧/未知字符串仍能加载并原样写回。
+    #[test]
+    fn app_engine_kind_parses_all_spec_variants_and_unknown() {
+        let names = [
+            "php", "fastcgi", "jsp", "asp", "do", "tsx", "aspnet", "python", "ruby",
+            "perl", "lua", "wsgi", "asgi", "psgi", "cgi", "uwsgi", "rack", "c", "go",
+            "rust", "unknown",
+        ];
+        assert_eq!(names.len(), 21);
+        for n in names {
+            assert!(AppEngineKind::from_name(n).is_known(), "{n} 必须是已知类型");
+        }
+        // 大小写不敏感 + aspx 兼容别名。
+        assert_eq!(AppEngineKind::from_name("PHP"), AppEngineKind::Php);
+        assert_eq!(AppEngineKind::from_name("aspx"), AppEngineKind::AspNet);
+        // 未知引擎：保留原文、可加载、可原样写回（向后兼容）。
+        let route: AppRouteConfig =
+            toml::from_str("engine = \"my_custom_engine\"\n").expect("unknown engine must parse");
+        assert_eq!(route.engine, AppEngineKind::Other("my_custom_engine".into()));
+        assert_eq!(route.engine.as_str(), "my_custom_engine");
+        let back = toml::to_string(&route).unwrap();
+        assert!(back.contains("my_custom_engine"), "{back}");
+        // 已知引擎序列化为规范小写名。
+        let route: AppRouteConfig = toml::from_str("engine = \"JSP\"\n").unwrap();
+        assert!(toml::to_string(&route).unwrap().contains("engine = \"jsp\""));
     }
 }

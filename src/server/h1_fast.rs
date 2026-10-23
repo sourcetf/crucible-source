@@ -133,7 +133,7 @@ pub(crate) fn enabled() -> bool {
 /// 鉴权/限流/上传），那些语义由 hyper + 应用层处理，快车道**不试图理解**。
 pub(crate) fn conn_eligible(lc: &ListenerConfig) -> bool {
     lc.apps.is_empty()
-        && lc.page_rules.is_empty()
+        && !crate::server::page_rules::has_rules(&lc)
         && lc.proxy_rules.is_empty()
         && lc.file_open.is_empty()
         && lc.basic_auth.is_none()

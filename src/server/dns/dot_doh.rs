@@ -7,7 +7,7 @@
 
 use crate::config::Config;
 use crate::server::h1::{full, BoxBody};
-use anyhow::Result;
+use anyhow::{Context as _, Result};
 use http::{Request, Response, StatusCode};
 use hyper::body::Incoming;
 use http_body_util::BodyExt;
@@ -976,6 +976,15 @@ fn dot_cfg_fingerprint(dc: &crate::server::dns::DnsConfig) -> u64 {
     dc.test_mode.hash(&mut h);
     dc.port.hash(&mut h);
     dc.recursion_acl.hash(&mut h);
+    // ECS 开关与分线路（geo）也必须进指纹：DoT 的 udp_query 读的是本快照里的
+    // `cfg.ecs` / `cfg.geo`（resolve_fwd_dest）。旧指纹只覆盖 [dns.dot] 字段，于是
+    // 面板改「ECS 开关」或「分线路」对**已连接/后续 DoT 连接**都不生效（DoH 每请求
+    // 读 effective() 所以正常）—— 真实机复现：给 127.0.0.1 配 geo 线路把转发目标
+    // 指到 127.0.0.2，DoH 走了新目标，DoT 仍发给 127.0.0.1 并拿到 NXDOMAIN。
+    dc.ecs.hash(&mut h);
+    if let Ok(geo) = toml::to_string(&dc.geo) {
+        geo.hash(&mut h);
+    }
     dc.dot.enabled.hash(&mut h);
     dc.dot.port.hash(&mut h);
     dc.dot.allow.hash(&mut h);
@@ -1072,7 +1081,26 @@ fn build_tls_acceptor(dot: &crate::config::DotCfg) -> Result<boring::ssl::SslAcc
     }
     key_permission_warn(&key);
     let mut b = BoringAcceptor::mozilla_intermediate_v5(SslMethod::tls())?;
-    b.set_certificate_file(&cert, SslFiletype::PEM)?;
+    // **必须按 fullchain 装配**：ACME/certbot 的 fullchain.pem 是「叶 + 中间 CA」。
+    // 旧实现 `set_certificate_file` 只取第一张（叶），DoT 握手只发叶证书 —— 客户端
+    // 未预置中间 CA 时报 `unable to get local issuer certificate`。真实机复现：
+    // pebble 签发的 acme.crucible.test（leaf←Pebble Intermediate←Pebble Root），
+    // `dig +tls +tls-ca=root.pem` 与 Python ssl 都校验失败；Web TLS 侧早已用
+    // split_chain/attach_intermediates 修过同一问题，DoT 漏了。
+    let pem = std::fs::read(&cert)
+        .with_context(|| format!("read DoT cert {}", cert.display()))?;
+    let mut chain = boring::x509::X509::stack_from_pem(&pem)
+        .with_context(|| format!("parse DoT cert PEM {}", cert.display()))?;
+    if chain.is_empty() {
+        anyhow::bail!("DoT 证书 {} 里没有任何 CERTIFICATE 块", cert.display());
+    }
+    let leaf = chain.remove(0);
+    b.set_certificate(&leaf)?;
+    // add_extra_chain_cert 追加的是**非叶**证书（叶由 set_certificate 放链首）。
+    for c in chain {
+        b.add_extra_chain_cert(c)
+            .with_context(|| "添加 DoT 中间证书链失败")?;
+    }
     b.set_private_key_file(&key, SslFiletype::PEM)?;
     b.check_private_key()?;
     // RFC 8310 的 ALPN 标识 "dot"：客户端（unbound/stubby/kdig 等）在 ALPN 里给出
@@ -1292,6 +1320,27 @@ async fn dot_connection(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// DoT 的运行参数指纹必须覆盖 ECS 开关与分线路（geo）：udp_query 读的是本进程
+    /// 快照里的这两个字段，旧指纹漏掉它们 ⇒ 面板改 ECS/分线路对 DoT 不生效。
+    #[test]
+    fn dot_fingerprint_covers_ecs_and_geo() {
+        let mut a = crate::server::dns::DnsConfig::default();
+        a.enabled = true;
+        a.listen_addr = "127.0.0.1".into();
+        a.ecs = true;
+        let fp = dot_cfg_fingerprint(&a);
+        let mut b = a.clone();
+        b.ecs = false;
+        assert_ne!(fp, dot_cfg_fingerprint(&b), "ECS 开关必须进指纹");
+        let mut c = a.clone();
+        c.geo.enabled = true;
+        c.geo.lines.push(crate::server::dns::GeoLine {
+            name: "l0".into(),
+            cidrs: vec!["127.0.0.1/32".into()],
+        });
+        assert_ne!(fp, dot_cfg_fingerprint(&c), "geo 线路必须进指纹");
+    }
 
     #[test]
     fn doh_whitelist_strips_ports() {

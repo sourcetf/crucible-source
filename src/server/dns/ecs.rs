@@ -151,11 +151,16 @@ pub fn formerr_response(query: &[u8]) -> Option<Vec<u8>> {
     Some(out)
 }
 
-/// RFC 7871 §7.2.2：客户端查询**带** ECS 时，应答必须回带 ECS option。
+/// RFC 7871 §7.2.2：客户端查询**带** ECS 时，应答必须回带 ECS option；
+/// 查询**没带** ECS 时应答必须**不带** ECS option。
 ///
-/// - 查询没带 ECS → 应答原样返回。
+/// - 查询没带 ECS：若上游应答里意外带了 ECS（真实机：BIND 9.20 会把转发查询里的
+///   ECS option 原样复制进应答 —— 而本进程在 DoT/DoH 层**注入**了 /24 ECS），
+///   这里把它剥掉，其余 EDNS option 保留。旧实现直接原样返回，于是「客户端没带 ECS」
+///   的 DoT/DoH 应答反而带上了它自己的 /24（协议违反 + 下游缓存按子网串味）。
 /// - 应答已带 ECS（上游权威返回的 FAMILY/SOURCE/SCOPE）→ 原样返回，不覆盖上游 scope。
-/// - 应答未带（BIND 的常态）→ 按查询的 FAMILY/SOURCE/ADDRESS 回显，SCOPE=0。
+/// - 应答未带（BIND 的权威区在无 ECS 查询时的常态）→ 按查询的 FAMILY/SOURCE/ADDRESS
+///   回显，SCOPE=0。
 ///
 /// 调用方应传入**注入前**的原始查询 wire（客户端真实请求）。
 pub fn apply_response_ecs(query: &[u8], response: &[u8]) -> Vec<u8> {
@@ -166,13 +171,24 @@ pub fn apply_response_ecs(query: &[u8], response: &[u8]) -> Vec<u8> {
         Some(o) => parse_options(&o.rdata).ecs,
         None => None,
     };
-    let Some(q) = q_ecs else {
-        return response.to_vec();
-    };
     let Some(r_off) = question_end(response) else {
         return response.to_vec();
     };
     let opt = find_opt(response, r_off);
+    if q_ecs.is_none() {
+        // 客户端没带 ECS：应答必须不带。BIND 会回显我们注入的那条，这里剥掉。
+        if let Some(o) = &opt {
+            let parsed = parse_options(&o.rdata);
+            if parsed.ecs_count > 0 {
+                return splice_opt(response, Some(o), o.payload, o.ttl, &parsed.others);
+            }
+        }
+        return response.to_vec();
+    }
+    let q = match q_ecs {
+        Some(q) => q,
+        None => return response.to_vec(),
+    };
     if let Some(o) = &opt {
         let parsed = parse_options(&o.rdata);
         // 上游已经回了 ECS：保留上游的 scope（我们不知道真实 scope，无权改写）。
@@ -612,6 +628,28 @@ mod tests {
         let mut resp = q.clone();
         resp[2] |= 0x80;
         assert_eq!(apply_response_ecs(&q, &resp), resp);
+    }
+
+    /// 真实机回归：BIND 会把本进程**注入**的 ECS option 原样回显到应答里。客户端
+    /// 查询本身没带 ECS 时，应答必须把这条 ECS 剥掉（RFC 7871 §7.2.2：查询没带
+    /// ECS，应答不得带）。旧实现「查询没 ECS 就原样返回」，于是 DoH/DoT 客户端
+    /// 会收到自己的 /24（且下游缓存会按子网串味）。
+    #[test]
+    fn response_strips_ecs_when_query_had_none() {
+        let q = minimal_query();
+        let mut resp = query_with_opt(
+            minimal_query(),
+            &ecs_option_bytes(1, 24, 0, &[127, 0, 0]),
+        );
+        resp[2] |= 0x80;
+        let out = apply_response_ecs(&q, &resp);
+        assert!(
+            out_ecs(&out).is_none(),
+            "query 没带 ECS 时应答不得带 ECS: {:?}",
+            out_ecs(&out)
+        );
+        // 其它 EDNS option 必须保留（这里 RESP 只有 ECS，剥完只剩空 OPT，ARCOUNT 仍 1）。
+        assert_eq!(u16::from_be_bytes([out[10], out[11]]), 1);
     }
 
     /// RFC 7871 §7.2.2：查询带 ECS，应答必须回显（SCOPE=0）。

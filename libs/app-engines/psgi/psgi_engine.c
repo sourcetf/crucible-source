@@ -295,6 +295,10 @@ static int psgi_request(const char *script, const char *method, const char *path
         PSGI_UNLOCK();
         return crucible_err(out, "psgi: 嵌入式 Perl 不可用: %s", errbuf);
     }
+    /* ithreads Perl（Debian/Ubuntu）：PL_curinterp 是线程本地 TLS；池线程轮换时
+     * 未 set context 的线程访问 PL_* 会 SIGSEGV（同 script_engine.c 的修复）。
+     * set 之后同一线程内的所有 perl API 才是安全的。 */
+    PERL_SET_CONTEXT(my_perl);
     req = get_hv(PSGI_REQ_HV, GV_ADD);
     res = get_hv(PSGI_RES_HV, GV_ADD);
     if (req == NULL || res == NULL) {

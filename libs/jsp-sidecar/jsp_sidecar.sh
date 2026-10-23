@@ -14,7 +14,11 @@ JAVA_BIN=""
 if [ -n "${JAVA_HOME:-}" ] && [ -x "${JAVA_HOME}/bin/java" ]; then
   JAVA_BIN="${JAVA_HOME}/bin/java"
 else
-  for cand in /usr/local/jdk-17/bin/java /usr/local/jdk-21/bin/java /usr/local/jdk-11/bin/java; do
+  # 用户级 JDK（scripts/install_app_runtimes.sh → ~/local/usr/lib/jvm/*）优先，
+  # 其次 OpenBSD pkg_add 的 /usr/local/jdk-*，最后系统 JVM / PATH。
+  for cand in "${HOME}"/local/usr/lib/jvm/*/bin/java \
+              /usr/local/jdk-17/bin/java /usr/local/jdk-21/bin/java /usr/local/jdk-11/bin/java \
+              /usr/lib/jvm/*/bin/java; do
     if [ -x "$cand" ]; then JAVA_BIN="$cand"; break; fi
   done
   if [ -z "$JAVA_BIN" ] && command -v java >/dev/null 2>&1; then
