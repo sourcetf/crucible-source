@@ -173,7 +173,10 @@ async fn handle_login(
         }
     };
     if !crate::server::basic_auth::check_admin_credentials(&cfg.admin, &body.username, &body.password) {
-        crate::server::basic_auth::note_admin_login(peer, false);
+        // 失败计数**不在这里记**：h1/h2/h3 入口在 admin::handle 返回后都会调用
+        // `note_admin_result(peer, status)`，401 会记一次。此前这里再记一次 ⇒ 每次
+        // 失败尝试在共享失败表里 +2，源码声明的 FAIL_THRESHOLD=8 实际 4 次就退避
+        // （合法管理员打错 4 次即被 429）。成功仍在这里清零（200 不经过上面的补记）。
         // 与 Basic 相同的泛化文案：不区分「用户不存在」与「口令错误」。
         return Response::builder()
             .status(StatusCode::UNAUTHORIZED)

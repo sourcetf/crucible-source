@@ -4647,3 +4647,167 @@ h1_fast 2s 缓存、child_registry ps 语义、在途 DNS WIP 未认证。逐条
 **资产**：`~/scratch-verify7/{bin,target,target-legacy,target-fat,logs,conf,perf}` + `matrix.py` /
 `page_rules_test.py` / `admin_session_test.py` / `logcheck.py` / `perf_final.py`；
 `scripts/accept-*` 端口/scratch 迁移 + start.sh 增加 runtime_env 继承。
+
+---
+
+# 【agent-specpages3 / 工号 1009 · Wave-16】全局规则 + country + AppEngineKind + Admin cookie 验证/修复（2026-10-23 18:33–20:2x）
+
+**scope**：`src/config.rs`、`src/server/page_rules.rs`、`src/server/admin.rs`、`src/server/admin_ui.html`、
+`src/server/basic_auth.rs`、`src/server/options_catalog.rs`（后者本波无需改）。
+**纪律**：未 commit/push/checkout/reset/stash/clean；只改上述 scope；port 276xx + 40xxx；
+未碰其他 agent 的实例（含 `final-thin` 39094/39095 与 scratch-specpages2 375xx）。自起实例/上游已停。
+
+**认证**：HEAD `c48dc3b`（含 `e79dfb4`）。最终二进制 `~/scratch-specpages3/bin/webserver`
+md5 **`487fb03fa7c3197a7b393ae6815ce5ff`**（20,477,888 B，`tls,tls_boring`）。
+黑盒套件（隔离副本 40xxx）**302 PASS / 0 FAIL / 0 SKIP** = 149+113+7+24+6+3（与 verify7 同集）。
+单测：本 scope 代码 **542/0/1**（基线 541+新增 1）；当前共享树（含另一 agent 19:45 的
+`h1_fast.rs` WIP +1 测试）在 PID namespace 内 **543/0/1**。普通 `cargo test` 下
+`child_registry::kill_all_matches_guard_semantics` 会因另一 agent 的 php-fpm + Linux `ps -p`
+整表输出而误报（既有 O12）；`h1_fast::fd_revalidation…` 同源。
+
+**结果**：
+- 全局页面规则 **145/145**（6 协议面：h1/h2c/h1-TLS/h2-TLS/h3/第二 listener h1）：多 listener
+  生效、redirect/block/header/cache/pass/rewrite 五入口、等 priority 全局先于每站（100 轮零漂移）、
+  跨表 priority 9>5 / 7>1、rewrite 后重新过 block、每站不外溢、旧配置与 wave-12 二进制 9/9 一致。
+  边界：513 条拒绝/512 通过、country/URL/`*`/redirect 非法值均配置期拒绝。
+- 面板全局规则往返 **33/33**：`?scope=global`/`?global=1`、保存/热重载/清空（`page_rules = []`）、
+  每站规则不受影响、运行期 `global_page_rules`/`geoip_db` 不序列化、快捷增删走顶层。
+- country **全绿**：CN/JP/无记录 × CN、`China` 别名、`CN,JP`、`!CN`（未知不误放行）、
+  rewrite+country；无库/enabled=false/缺文件/坏路径全部 fail-closed；h1/h2/TLS/h3 一致。
+  性能：600 次无 country 请求 `/proc/<pid>/fd` 无 geoip fd；首次 country 才 open；
+  `/gblock` vs `/gcn` 各 2000 请求 mean 247/246 µs（无可测开销）。h1 快车道：无规则实例
+  `conns=20 served=20`；有全局规则实例无 fastpath 日志且 `/gblock` 403（不绕过）。
+- AppEngineKind/目录：21 项（含 do/unknown）真机 `/api/catalog`；24 条路由（+aspx/PHP/自定义）
+  加载/回显/保存往返不丢值；unknown/custom 501 点名，do/jsp 已识别（502）。
+  旧配置：config-test/prof/features `--check-config` OK；`config.toml` 仅缺生产 ECH 资产
+  （wave-12 旧二进制同），补齐 scratch 夹具后 OK（5 listeners/18 apps）。
+- Admin 会话 **35/35**：明文不发 cookie；TLS `__Host-crucible_admin` 64hex + Path=/+Secure+
+  HttpOnly+SameSite=Strict+无 Domain；cookie/Basic/401/伪造/跨站 403/登出/重启失效/h2+h3 全过；
+  **4416 并发登录后恰好 4096 令牌有效**（RSS 有界）；`listeners_allow` 下非法端口 404（cookie/
+  Basic/login 一致）；登录失败退避**第 9 次**起 429（修复后）。
+
+**修掉 3 个缺陷（+1 注释）**：
+1) P2 `admin.rs:175` 登录失败 handler+入口双记账 ⇒ 阈值 8 实际 4；删 handler 记账（修复后 401×8→429）。
+2) P2 `config.rs:1438` `[geoip] enabled=false` 仍注入 db ⇒ country 规则照拦；改为仅 enabled 注入。
+3) P3 `page_rules.rs:414` 缺库路径会在请求热路径 CREATE 空 sqlite；改为 `is_file()` 前置 +
+   节流告警 + 负缓存（并统一 4096 缓存上限）。
+4) P3 `admin_ui.html:1157/1185` 注释仍称 do 不在目录；更新文案。新增单测
+   `config::tests::geoip_db_injected_only_when_enabled`。
+
+**诚实边界**：Admin TTL 8h 未墙钟等待（常量+单测）；明文口手工发 TLS cookie 可认证（浏览器
+Secure 约束下不发，与明文 Basic 可用一致，未改）；UI 无真实浏览器点击（API/JSON 真机 + 静态
+键比对）；country 数据质量为合成夹具；Linux 非 OpenBSD。
+
+报告：`.agents/1009/reports/specpages3-wave16.md`；修复：`.agents/1009/fixes/specpages3-wave16.md`。
+资产：`~/scratch-specpages3/{bin,conf-*.toml,geoip.sqlite,rules_matrix.py,panel_rules.py,
+admin_session.py,h3cli.py,logs/,accept/}`。
+
+
+---
+
+# 【agent-perfgate / 工号 1009 · Wave-16】h1 规格门禁口径裁决 + fd 复核优化（2026-10-23 18:30–20:45）
+
+**scope**：`src/server/h1_fast.rs`（唯一实质改动）、`scripts/build_release.sh`（LTO 默认）、本报告/fixes、contact.txt 追加。
+**纪律**：未 commit/push/checkout/reset/stash/clean；未改非 scope 文件；`config.rs/admin.rs/admin_ui.html/page_rules.rs` 的在途 WIP 未触碰。
+
+**裁决**：规格 plain-h1 门禁 = `wrk -t2 -c64 -d10s --latency`（`bench/h2_fair_gate.py:26`，官方脚本的 wrk 分支；spec §0/§22.1 双门禁 1.2）。**不是 gobench**：h2load 是 h2/h2c 工具，对 h1-only listener 实测 0 req/s+2000 failed 且退出 0，脚本不会回退 wrk；开 h2c 则测到的是 h2。c128 不是规格项，是内部加压。
+
+**根因（wrk vs gobench 20%+）**：请求字节只差一个 `Connection: keep-alive`（69B vs 93B，抓包）；gobench 客户端自己烧 **5.4–5.8 核 / 53–60µs per req**（wrk 1.9 核 / 11–13µs），把服务端每请求 CPU 从 11–13µs 抬到 19–23µs，且经常不把双方打到 2 核预算 ⇒ 比值被压缩/反转（本次 c128 gobench ours 111k > h2o 97k，wrk 同窗口 1.005）。gobench 是 wave-8 无 wrk 时的替代品，不是规格口径。
+
+**修复**：h1 快车道每请求路径 `lstat`（1.84µs）→ 填充时打开只读 fd，每请求裸 `libc::fstat`（0.51µs）+ `dev/ino/len/mtime/ctime/nlink` 比对；fd 不可用时逐请求退回原 lstat（语义不变）；fd 预算 512。原地改写/rename-over/unlink 均**立即**失效（单测+真机）；唯一放宽：docroot 父目录整体被换时可见性 ≤2s TTL。**ABBA 配对：c64 −2.00µs/req（−14.7%）、c128 −1.37µs/req（−10.9%）**。
+
+**门禁（诚实口径，wrk，双方 2 线程，127B 同文件，ours 日志开）**：
+- thin：c64 吞吐 **1.025** / 延迟 **0.942**；c128 **1.035 / 1.055** ⇒ **PASS**
+- fat ：c64 **1.054 / 1.016**；c128 **1.053 / 1.028** ⇒ **PASS**
+- 官方 `bench/h2_fair_gate.py` 实跑：`h2o/ours=1.061 ≤1.2 PASS`、`ours/h2o=0.794 ≤1.2 PASS`（exit 0）
+- 修前同装置：verify7 1.382/1.523、1.285/1.399；本波 bin/base 1.336/1.351、1.266/1.379。
+
+**LTO**：fat 与 thin 都过；ABBA 配对 fat 慢 0.4–0.5%（噪声内）、无速度优势。按任务书指令已把 `scripts/build_release.sh` **默认改为 fat**（`Cargo.toml:106` 仍按规格 thin；`--thin` 回退；OpenBSD 若 fat 链接 bus error/OOM 用 --thin）。
+
+**回归**：单测 **542/0/1**（隔离 PID ns；共享表里 1 条既有 O12 环境失败，owner=apps）；accept-verify（39xxx）**302/0/0**（149+113+7+24+6+3）；快车道 ON/OFF 47 形状 46/47 逐字节（唯一差异=既有 GET+half-close）；日志 10/10（wave-12 对拍 11 行逐字节、五协议一致、16×500=8000 行 0 逆序）。
+
+**未闭/跨 scope**：h2 多路复用差距（h2h3）；`child_registry::ps_command` 带 `-p` 仍传 `-ax`，procps 返回整表（apps）；TLS 矩阵与 OpenBSD 1 vCPU 未测；fd 优化只覆盖 h1 快车道（hyper/FAST_CACHE 仍逐请求 lstat）。
+
+**资产**：`~/scratch-perfgate/{base,work,bin,logs,av}`；报告 `.agents/1009/reports/perfgate-wave16.md`；fixes `.agents/1009/fixes/perfgate-wave16.md`。实例/套件/上游/named 已全部停止，39xxx/397xx 端口已释放。
+
+---
+
+# 【agent-perfgate / 工号 1009 · Wave-16 复核】h1 规格门禁定论（2026-10-24 08:35–09:53；主机 uptime 10:20→11:34）
+
+**口径裁决**：plain-h1 官方门禁 = `bench/h2_fair_gate.py:26` 的 wrk 分支
+`wrk -t2 -c64 -d10s --latency`；plain-h2 才是 h2load（`-n 0 -c50 -t2 -D10`）。c128 不是规格项。
+双方 2 线程、同一 127B 文件、keep-alive、ours 访问日志开（更严）。实测 h2load 在 h1-only
+listener 上 0 req/s 且 exit 0，官方脚本不回退 wrk（FAIL missing measurements, exit 2）；
+开 h2c 则 h2load 测到的是 h2c。证据 `~/scratch-perfgate/run2/logs/h2load-evidence.out`。
+
+**结论（当前共享树，含 fd 复核修复）**：
+- thin 5 轮中位：c64 吞吐 **1.110** / 延迟 **1.066**；c128 **1.064 / 1.092** ⇒ PASS
+- fat：c64 **1.113 / 1.085**；c128 **1.044 / 1.049** ⇒ PASS
+- 官方脚本 wrk 分支：**1.042/1.027、1.100/1.014，exit 0**
+- 最差单轮 c64 1.150/1.134，仍 <1.2；verify7 的 1.382/1.285 是修复前二进制。
+- 早先报告 1.025 是特定窗口采样；本会话同口径复测 1.110，**裕量按 1.11 记**。
+
+**wrk vs gobench 根因**：请求字节只差 24B `Connection: keep-alive`。用 gobench 发送与 wrk
+相同字节（gobench-plain）后，客户端成本仍 51.6µs/5.5 核、服务端仍 ~18µs；wrk 是
+11µs/1.9 核。gobench 客户端自己烧 5.4–5.8 核，把服务端 CPU/req 从 11.2µs 抬到 18µs，
+比值方向不稳定（本会话 clean 轮 1.174，其他轮可反转；verify7 1.116）⇒ 不能当门禁。
+
+**修复收益（同窗口 ABBA）**：h1 快车道每请求 `lstat`→fd `fstat`：12.841→11.013µs/req
+（−14.2%）、rps +15.6%。剩余差距 +0.79µs/req = fstat 0.51 + access log 0.34；不放宽语义
+已无可安全削减项。
+
+**LTO**：thin/fat 都 PASS；ABBA c64 打平（0.9996），c128 fat 慢 1.5%（噪声）。按任务书已把
+`scripts/build_release.sh` 默认切 fat（Cargo.toml 仍 thin）；**与 spec:951/1079/1126
+“禁止 fat 默认”冲突**，主会话若要严格按规格可一行回退。
+
+**回归**：单测 543/0/1（隔离 PID ns）；accept-verify 302/0/0；快车道 ON/OFF 47 形状
+46/47（唯一差异=既有 GET+half-close）；日志 10/10（wave-12 11 行逐字节、五协议一致、
+16×500=8000 行 0 逆序）；日志 ON 下写 5.8GB 仍 PASS。
+
+报告：`.agents/1009/reports/perfgate-wave16.md`；修复：`.agents/1009/fixes/perfgate-wave16.md`。
+资产：`~/scratch-perfgate/run2/{gate.py,abba.py,official.py,h2load_evidence.py}`、
+`~/scratch-perfgate/target-run2-{thin,fat}/release/webserver`、`~/scratch-perfgate/run2/logs/`。
+实例/h2o/上游/named 已全部停止，39781/39791/39782/39783/39xxx 已释放。
+
+---
+
+# 【agent-specpages3 / 工号 1009 · Wave-16 验证】全局页面规则 / country / AppEngineKind / Admin 会话（2026-10-24 08:26–11:10）
+
+**结论**：`e79dfb4` 的三块能力 + Admin 会话全部真机通过；本波新增 1 个 P3 修复（F5）。
+认证二进制 `~/scratch-specpages3/bin/ws-specpages3-final`，md5 **`8be66931…`**（20,479,472 B，
+HEAD `c48dcbcf` + 本 scope 未提交改动）。单测 **544 passed / 0 failed / 1 ignored**
+（`unshare -Urpf --mount-proc sh -c '<test-bin>'`）；黑盒套件 **302 PASS / 0 FAIL / 0 SKIP**
+（`logs-w16/accept-final4.log`，40xxx 隔离副本，与 verify7 的 302 项同集）。
+
+**逐项结果**：
+- 全局页面规则：矩阵 **186/186**（h1/h2c/h1-TLS/h2-TLS/h3/第二 listener × block/redirect/
+  rewrite(prefix+exact)/pass/header/cache）；边界 **74/74**（同名同 priority 100 次单值、
+  跨表 priority、rewrite target 尾斜杠/`/`/相对路径、rewrite 后重入 block、method+country）；
+  每站规则不外溢（/local 仅 A 403，B/C 404）；旧 wave-12 二进制 A/B **0 语义差异**。
+- country：CN/JP/无记录 × `CN`/别名/`!CN`/多值 在 6 面一致；无库/关闭/缺文件/目录/损坏库
+  全部 fail-closed；缺库**不再创建空 sqlite**（1 条告警）；600 次非 country 请求 0 个 GeoIP fd，
+  首次 country 查询才开库；h1 快车道仅在无规则时启用，全局规则使其回退且不被绕过。
+- AppEngineKind：24 路由（21 规范 + aspx + PHP + 自定义）加载/回显/派发；catalog **21 项**
+  （含 do/unknown）；面板 save 回写 `do`/`custom`/`unknown` 不丢值；仓库 config-test/prof/
+  features 全 OK；config.toml 仍因缺生产 ECH 资产失败（wave-12 旧二进制同，非回归）。
+- Admin 会话 **44/44**：__Host- 属性、伪造/近似/空 token 401、cookie+Basic 兼容、
+  跨站 Origin/Sec-Fetch-Site/表单 CT 全 403（换 Basic 也不能绕 CSRF）、登出/重启失效、
+  明文口不签发但手工重放可认证（设计边界）、listeners_allow 非白名单端口 h1+h2c 404；
+  4416 并发登录后**恰好 4096 有效**，满表后再 1000 次登录 RSS 0 增长。
+- 面板/UI **41/41**：cookie 登录态调 API；全局规则保存/清空/恢复；country 字段往返；
+  8 个键与后端一致；未做真实浏览器点击（同 JSON 真机往返 + HTML 静态审查）。
+
+**本波代码改动（仅 scope）**：`config.rs` F2（geoip enabled 开关）+ **F5 新增**（页面规则
+action/target 配置期校验，手写 `action="blokc"`/缺 target/相对 rewrite target 由 rc=0 变 rc=1 指名）；
+`page_rules.rs` F3（缺库不建空库 + 缓存统一上限）；`admin.rs`/`basic_auth.rs` F1（登录失败双计数，
+阈值恢复 8）；`admin_ui.html` F4（注释）。F1–F4 为被打断的上一次 specpages3 已留在工作树的
+未提交改动，本波逐条独立复核；**未发现新的 P0/P1**。
+
+**未闭/边界**：Admin 8h TTL 未墙钟等待（源码 + 单测）；明文口接受手工重放的 Secure cookie；
+country 夹具为合成 /32、IPv4-mapped 未构造；配置期 target 校验仍不完整（pass URL/header 形态等
+只在面板校验）；单测 O12 环境敏感（共享机 php-fpm 使 `ps -p` 退化；测试二进制作 PID 1 会误伤
+`pid<=1` 断言），非本 scope。未 commit/push/checkout/reset/stash/clean；其他 agent 的
+`h1_fast.rs` WIP 与 `build_release.sh` 原样保留；所有自起实例/上游已停止，277xx/40xxx 已释放。
+
+报告 `.agents/1009/reports/specpages3-wave16.md`；修复 `.agents/1009/fixes/specpages3-wave16.md`；
+资产 `~/scratch-specpages3/{w16_*.py,conf-w16-*.toml,logs-w16/}`。

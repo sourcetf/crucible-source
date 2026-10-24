@@ -411,6 +411,23 @@ fn country_of_peer(db: &Path, peer: IpAddr) -> Option<String> {
         return None;
     }
 
+    // 库文件不存在时**不要**调用 `db::open`：它为面板场景带了 `CREATE TABLE`，
+    // 会在请求热路径上按配置里的笔误路径落下一个空 sqlite 文件。缺少库 = 无国家
+    // 信息 ⇒ 直接 fail-closed（与「库存在但无记录」同语义），并缓存负结果，
+    // 避免每个请求都 stat / 尝试建库。
+    if !db.is_file() {
+        crate::server::log_throttle::warn_every(
+            "page-rules-geoip-missing",
+            Duration::from_secs(300),
+            &format!(
+                "page_rules country: GeoIP 库不存在或不是文件 {}（country 规则按不命中处理）",
+                db.display()
+            ),
+        );
+        cache_insert(&mut cache, key, now, None);
+        return None;
+    }
+
     // 库路径变了 / 还没有连接：重开。查询失败时清连接，下个请求重试。
     if cache.db.as_deref() != Some(db) || cache.conn.is_none() {
         match crate::server::geoip_panel::db::open(db) {
@@ -426,7 +443,7 @@ fn country_of_peer(db: &Path, peer: IpAddr) -> Option<String> {
                     &format!("page_rules country: 无法打开 GeoIP 库 {}: {e:#}", db.display()),
                 );
                 cache.open_failed_until = Some(now + COUNTRY_OPEN_RETRY);
-                cache.entries.insert(key, (now, None));
+                cache_insert(&mut cache, key, now, None);
                 return None;
             }
         }
@@ -444,13 +461,23 @@ fn country_of_peer(db: &Path, peer: IpAddr) -> Option<String> {
                 &format!("page_rules country: GeoIP 查询失败（{}）: {e:#}", ip),
             );
             cache.conn = None;
-            cache.entries.insert(key, (now, None));
+            cache_insert(&mut cache, key, now, None);
             return None;
         }
     };
     let country = merged.country.trim().to_ascii_uppercase();
     let val = (!country.is_empty()).then_some(country);
-    // 容量上限：先清过期项，仍满则丢弃一个任意项（无界内存防护）。
+    cache_insert(&mut cache, key, now, val.clone());
+    val
+}
+
+/// 写入 (库, IP) → 国家 的缓存（含容量上限：先清过期项，仍满则丢弃一个任意项）。
+fn cache_insert(
+    cache: &mut CountryCache,
+    key: (PathBuf, IpAddr),
+    now: Instant,
+    val: Option<String>,
+) {
     if cache.entries.len() >= COUNTRY_CACHE_CAP {
         cache
             .entries
@@ -461,8 +488,7 @@ fn country_of_peer(db: &Path, peer: IpAddr) -> Option<String> {
             }
         }
     }
-    cache.entries.insert(key, (now, val.clone()));
-    val
+    cache.entries.insert(key, (now, val));
 }
 
 /// 立即响应类动作(redirect/block)的同步判定;rewrite/pass/cache/header 见其余入口。

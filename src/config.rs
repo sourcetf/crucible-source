@@ -1434,9 +1434,17 @@ impl Config {
     /// h1/h2/h3 共 10+ 个调用点上；复制后**所有既有调用点无需改签名**就能同时看到
     /// 全局与每站规则（`page_rules::ordered` 合并两份切片）。规则条数很少（上限 512），
     /// 配置热重载时才复制一次。
+    ///
+    /// GeoIP 库只在 `[geoip] enabled = true` 时注入：`enabled = false` 是运营方的
+    /// 显式关闭开关（与 `geoip_panel::enabled`、公开 `/api/geoip/*` 的判定同口径）。
+    /// 否则「关掉 GeoIP」后页面规则的 country 维度仍会查库并拦流量，开关等于失效。
     pub fn inject_shared_listener_config(&mut self) {
         let global = self.page_rules.clone();
-        let db = self.geoip.db_path.clone();
+        let db = if self.geoip.enabled {
+            self.geoip.db_path.clone()
+        } else {
+            None
+        };
         for l in &mut self.listeners {
             l.global_page_rules = global.clone();
             l.geoip_db = db.clone();
@@ -2070,8 +2078,41 @@ cover 只用于「未使用 / 被拒 ECH」的连接，ECH 关闭时它会成为
 /// 命中」的规则拦下来 —— 否则面板/手写配置显示保存成功，实际整条规则是死的。
 fn validate_page_rule_list(rules: &[PageRuleConfig], where_: &str) -> Result<()> {
     for (i, r) in rules.iter().enumerate() {
+        // action 必须是运行期认识的小写动作。面板保存已经拒绝未知动作，但手写
+        // config.toml 里写错一个字母时，加载会成功、每个请求却**静默跳过**这条
+        // 规则（`page_rules::apply` 对未知 action 直接 continue）——正是本函数
+        // 存在的意义（「永远不可能命中」的规则必须在配置期拦下）。
+        let action = r.action.trim().to_ascii_lowercase();
+        const ACTIONS: &[&str] = &["redirect", "block", "rewrite", "pass", "cache", "header"];
+        if !ACTIONS.contains(&action.as_str()) {
+            anyhow::bail!(
+                "{where_}[{i}].action {:?} 不合法（只能是 {} 的小写形式）——运行期对未知动作静默忽略，规则永不生效",
+                r.action,
+                ACTIONS.join("/")
+            );
+        }
+        let target_trimmed = r.target.as_deref().map(str::trim);
+        // rewrite/pass/header 缺 target 时运行期直接 continue（静默跳过整条规则）。
+        if matches!(action.as_str(), "rewrite" | "pass" | "header")
+            && target_trimmed.unwrap_or("").is_empty()
+        {
+            anyhow::bail!(
+                "{where_}[{i}]（{action}）缺少 target —— 运行期会静默跳过这条规则"
+            );
+        }
+        // rewrite 的 target 会与请求路径做前缀拼接；相对路径拼出来的东西不再是
+        // 合法请求路径（后续 404，日志里也看不出原因）。
+        if action == "rewrite" {
+            if let Some(t) = target_trimmed.filter(|t| !t.is_empty()) {
+                if !t.starts_with('/') {
+                    anyhow::bail!(
+                        "{where_}[{i}]（rewrite）的 target 必须以 `/` 开头（当前 {t:?}）"
+                    );
+                }
+            }
+        }
         // redirect target 会进 Location 响应头；HeaderValue 拒绝控制字符与非 ASCII。
-        if r.action == "redirect" {
+        if action == "redirect" {
             let t = r.target.as_deref().unwrap_or("/");
             let loc = match t.split_once(':') {
                 Some(("301" | "307" | "308", u)) => u,
@@ -3116,6 +3157,94 @@ target = "/moved"
             "运行期副本不得出现在 config.toml: {text}"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 页面规则 action/target 的配置期校验：运行期对未知动作/缺 target/相对
+    /// rewrite target 一律静默跳过，必须在加载期指名拒绝（全局与每站同一校验器）。
+    #[test]
+    fn page_rule_action_and_target_validated_at_load() {
+        let cases = [
+            ("blokc", Some("/x"), "action"),
+            ("rewrite", None, "缺少 target"),
+            ("pass", None, "缺少 target"),
+            ("header", None, "缺少 target"),
+            ("rewrite", Some("relative"), "必须以 `/` 开头"),
+        ];
+        for (n, (action, target, want)) in cases.iter().enumerate() {
+            let dir = std::env::temp_dir().join(format!(
+                "crucible-page-rule-validation-{}-{n}",
+                std::process::id()
+            ));
+            let _ = std::fs::create_dir_all(&dir);
+            let path = dir.join("config.toml");
+            let target_line = target
+                .map(|t| format!("target = {t:?}\n"))
+                .unwrap_or_default();
+            std::fs::write(
+                &path,
+                format!(
+                    r#"
+[[page_rules]]
+match_url = "/x*"
+action = {action:?}
+{target_line}
+[[listeners]]
+address = "127.0.0.1"
+port = 18084
+root = "www"
+
+[[listeners.page_rules]]
+match_url = "/y*"
+action = {action:?}
+{target_line}
+"#
+                ),
+            )
+            .unwrap();
+            let err = Config::load(&path).unwrap_err().to_string();
+            assert!(
+                err.contains(want),
+                "case {action:?}/{target:?} 的错误必须指名 {want:?}，实际: {err}"
+            );
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
+    /// `[geoip] enabled = false` 是显式关闭开关：页面规则的 country 维度不得再查库
+    /// （否则运营方关掉 GeoIP 后规则仍会拦流量）。只有 enabled=true 才注入库路径。
+    #[test]
+    fn geoip_db_injected_only_when_enabled() {
+        for (enabled, want) in [(false, false), (true, true)] {
+            let dir = std::env::temp_dir().join(format!(
+                "crucible-geoip-gate-{}-{enabled}",
+                std::process::id()
+            ));
+            let _ = std::fs::create_dir_all(&dir);
+            let path = dir.join("config.toml");
+            std::fs::write(
+                &path,
+                format!(
+                    r#"
+[geoip]
+db_path = "/tmp/nonexistent-crucible-test.sqlite"
+enabled = {enabled}
+
+[[listeners]]
+address = "127.0.0.1"
+port = 18083
+root = "www"
+"#
+                ),
+            )
+            .unwrap();
+            let cfg = Config::load(&path).unwrap();
+            assert_eq!(
+                cfg.listeners[0].geoip_db.is_some(),
+                want,
+                "enabled={enabled} 时 geoip_db 注入状态不符"
+            );
+            let _ = std::fs::remove_dir_all(&dir);
+        }
     }
 
     /// §3.3：21 类引擎名全部可解析为已知枚举；旧/未知字符串仍能加载并原样写回。

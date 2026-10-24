@@ -1154,7 +1154,7 @@ async function loadCatalog(){
 }
 function engineDefaults(id){
   const e=(CATALOG||[]).find(x=>x.id===id);
-  // 未知引擎（后端可派发但目录未列出，如 "do"/"cgi_script"）返回 null：
+  // 目录外引擎（如 "cgi_script"/自定义名）返回 null：
   // 调用方必须保留原 extensions，不能清空。
   return e?e.default_extensions:null;
 }
@@ -1182,7 +1182,8 @@ function appRow(a){
   (CATALOG||[]).forEach(e=>{
     const o=document.createElement('option');o.value=e.id;o.textContent=e.label;sel.appendChild(o);
   });
-  // 后端可派发的引擎（"do"=jsp 别名、"cgi_script"）不在 /api/catalog 里。
+  // 后端可派发但目录未列出的引擎（如 "cgi_script"、旧配置里的自定义名）不在
+  // /api/catalog 里（"do" 自 wave-16 起已列入目录）。
   // 若配置中的 engine 没有对应 option，浏览器会回落到第一项（php），
   // 保存时就会把 engine 改写成 php 而 extensions 仍是 jsp —— 静默损坏配置。
   // 这里为目录外的引擎补一个 option，让原值精确往返。

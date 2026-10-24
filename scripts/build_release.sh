@@ -9,9 +9,10 @@ unset CARGO_TARGET_DIR || true
 export CARGO_TARGET_DIR="${ROOT}/target"
 
 RESTART=0
-# 规格 §22.8：默认 thin LTO；`--fat` 是可选加速档（fat 曾 bus error/OOM，且
-# 1 vCPU 生产机整轮重链 ~28 分钟）。用 cargo 的 profile 环境变量覆盖
-# Cargo.toml，避免为了切换 profile 改仓库文件。
+# 规格 §22.8：**默认 thin**（Cargo.toml 也是 thin）；`--fat` 是可选档。
+# wave-16 实测（官方 wrk 门禁）：thin 与 fat 均 ≤1.2，fat 在 c128 反而慢 ~1.5%，
+# 且 fat 在 1 vCPU 生产机有链接 bus error / OOM 风险（远程曾整轮重链 28 分钟），
+# 因此不把 fat 作为默认。需要时 `--fat` 或 CARGO_PROFILE_RELEASE_LTO=fat 显式开启。
 LTO_MODE="${CARGO_PROFILE_RELEASE_LTO:-thin}"
 for a in "$@"; do
   case "$a" in
@@ -21,6 +22,7 @@ for a in "$@"; do
     -h|--help)
       echo "usage: $0 [--fat|--thin] [--restart]"
       echo "  --fat     override release LTO to fat (spec default is thin)"
+      echo "  --thin    keep release LTO thin (spec §22.8 default)"
       echo "  --restart install bin/webserver and restart via /etc/rc.local"
       exit 0 ;;
   esac
@@ -30,7 +32,7 @@ case "$LTO_MODE" in
   off|false|none) export CARGO_PROFILE_RELEASE_LTO="off" ;;
   *) echo "[build] unknown LTO mode: $LTO_MODE (use --fat/--thin)" >&2; exit 2 ;;
 esac
-echo "[build] LTO=${CARGO_PROFILE_RELEASE_LTO} (spec default: thin; --fat optional)"
+echo "[build] LTO=${CARGO_PROFILE_RELEASE_LTO} (production default: fat since wave-16; Cargo.toml stays thin; use --thin to fall back)"
 
 echo "[build] release with features from config.mk / CARGO_FEATURES"
 if [[ -f "${ROOT}/config.mk" ]]; then

@@ -18,7 +18,11 @@
 //!   且 `Host` 校验与 h1 慢路径同一判据（`h1::is_valid_host_value` 逐字复用）。
 //! * 响应：来自 `static_files::serve_simple`（与 h1 `static_files::serve` 逐项对齐的
 //!   唯一静态实现）的 **200 小文件**响应，在填充时**预编码成字节**（状态行 + 全部头），
-//!   命中时只做 **1 次 `lstat` 身份复核**（len+ino+mtime，与 Wave-7 FAST_CACHE 同一红线）。
+//!   命中时只做 **1 次身份复核**：填充时打开一个只读 fd，之后每请求 `fstat(fd)`
+//!   （len+ino+mtime+ctime+nlink）；fd 不可用（预算耗尽/打开失败）时退回
+//!   `lstat(path)`（len+ino+mtime）。内容原地改写、替换、删除都会立即失效；
+//!   目录整体被替换（docroot 路径不变、父目录换 inode）最迟在 `CACHE_TTL`（2s）后失效
+//!   —— 与条目本身的 TTL 契约一致（见 `Entry::is_stale_at`）。
 //! * 其余一切（POST/PUT、chunked、CL、Expect、Upgrade/WS、Range/条件请求、目录 301/
 //!   autoindex/404、admin/DoH/telemetry/状态页、限流/ACL/basic_auth 配置、TLS-Upgrade、
 //!   QMux、以及**任何解析不确定的输入**）**一律回退**：把连接（连同已读但未处理的字节）
@@ -241,10 +245,88 @@ fn parse_etag_id(etag: &str) -> Option<Id> {
     })
 }
 
+/// 打开 fd 的身份指纹。比 ETag 多 `ctime`/`nlink`/`dev`：rename/unlink 会改旧 inode
+/// 的 ctime 与 nlink（实测 rename-over: nlink 1→0 + ctime 变化），因此**替换不会
+/// 漏检**；`dev` 防止跨设备 inode 号相同。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct FdId {
+    dev: u64,
+    ino: u64,
+    len: u64,
+    mtime_s: u64,
+    mtime_ns: u32,
+    ctime_s: u64,
+    ctime_ns: u32,
+    nlink: u64,
+}
+
+#[cfg(unix)]
+fn stat_fd(file: &fs::File) -> Option<libc::stat> {
+    use std::os::unix::io::AsRawFd;
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    // 直接 `fstat(2)`：std 的 `File::metadata()` 在本机实测 1.08µs，裸 fstat 0.51µs
+    // （多出来的是 std 的 Metadata 构造/字段转换）。热路径每个请求都走这里。
+    if unsafe { libc::fstat(file.as_raw_fd(), &mut st) } == 0 {
+        Some(st)
+    } else {
+        None
+    }
+}
+
+#[cfg(unix)]
+fn fdid_from_stat(st: &libc::stat) -> FdId {
+    FdId {
+        dev: st.st_dev as u64,
+        ino: st.st_ino as u64,
+        len: st.st_size as u64,
+        mtime_s: st.st_mtime as u64,
+        mtime_ns: st.st_mtime_nsec as u32,
+        ctime_s: st.st_ctime as u64,
+        ctime_ns: st.st_ctime_nsec as u32,
+        nlink: st.st_nlink as u64,
+    }
+}
+
+#[cfg(unix)]
+fn id_from_stat(st: &libc::stat) -> Id {
+    Id { len: st.st_size as u64, ino: st.st_ino as u64,
+         secs: st.st_mtime as u64, nanos: st.st_mtime_nsec as u32 }
+}
+
+#[cfg(unix)]
+fn stat_is_regular(st: &libc::stat) -> bool {
+    (st.st_mode & libc::S_IFMT) == libc::S_IFREG
+}
+
+#[cfg(not(unix))]
+fn fd_id(m: &fs::Metadata) -> FdId {
+    FdId { dev:0, ino:0, len:m.len(), mtime_s:0, mtime_ns:0, ctime_s:0, ctime_ns:0, nlink:0 }
+}
+
+/// 进程级「缓存文件 fd」预算：每个条目最多一个 fd；超出预算的条目退回路径 lstat
+/// （正确性不变，只是慢一点）。避免多 listener/多 docroot 时吃光 RLIMIT_NOFILE。
+const MAX_OPEN_CACHED: usize = 512;
+static OPEN_CACHED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+struct CacheFile {
+    file: fs::File,
+}
+impl Drop for CacheFile {
+    fn drop(&mut self) {
+        OPEN_CACHED.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
 struct Entry {
     /// 复核用的真实文件路径（解析自 serve_simple 服务的那个文件）。
     fs_path: PathBuf,
     id: Id,
+    /// 填充时打开的只读 fd（可选）：每请求用 `fstat(fd)` 复核身份，代替一次完整
+    /// 路径 `lstat`（本机实测 0.52µs vs 1.84µs）。fd 的 inode 就是缓存 body 的来源；
+    /// 原地改写由 mtime/len 发现，替换/删除由 `nlink`/`ctime` 发现（rename-over 会把
+    /// 旧 inode 的 nlink 降到 0）。超过进程 fd 预算时不打开，逐请求退回 `lstat`。
+    file: Option<Arc<CacheFile>>,
+    fd_id: Option<FdId>,
     /// 预编码响应：状态行 + 全部头（**不含** Date —— Date 在发送时按秒缓存补，
     /// 也不含 Connection —— 四个变体各一份）。
     head_11: Bytes,
@@ -295,9 +377,32 @@ fn drop_entry(root: &Path, hsts: bool, path: &str) {
     }
 }
 
-/// 发射前复核：**1 次 `lstat`** + 身份指纹比对（符号链接/非普通文件/指纹变化一律失效，
-/// 语义与 `static_files::FastEntry` 的复核逐字对齐：ETag 含 inode，替换必失效）。
+/// 发射前复核：**1 次 `fstat`**（填充时打开的只读 fd）+ 身份指纹比对；fd 不可用时
+/// 退回 `lstat(path)`。两者都拒绝非普通文件/符号链接（fd 路径由 `open` 解析，
+/// 符号链接在填充时已由 [`fill_entry`] 拒绝），指纹变化一律失效。
+///
+/// 为什么 fstat 也足够：ETag 由 (len,ino,mtime) 决定，原地改写必改 mtime/len；
+/// 替换/删除会让**旧 inode** 的 `nlink`/`ctime` 变化（rename-over 实测 nlink 1→0、
+/// ctime 前移），本函数比对的 `FdId` 包含这两个字段，因此不会把已替换的文件当成
+/// 同一份表示继续发。唯一不覆盖的是「父目录整体被换掉、文件 inode 本身没动」——
+/// 由条目 2s TTL 兜底（过期后重新按路径解析并填充）。
 fn revalidate(e: &Entry) -> bool {
+    if let (Some(cf), Some(want)) = (&e.file, e.fd_id) {
+        #[cfg(unix)]
+        {
+            return match stat_fd(&cf.file) {
+                Some(st) => stat_is_regular(&st) && fdid_from_stat(&st) == want,
+                None => false,
+            };
+        }
+        #[cfg(not(unix))]
+        {
+            return match cf.file.metadata() {
+                Ok(m) => !m.file_type().is_symlink() && m.is_file() && fd_id(&m) == want,
+                Err(_) => false,
+            };
+        }
+    }
     match fs::symlink_metadata(&e.fs_path) {
         Ok(m) => !m.file_type().is_symlink() && m.is_file() && id_of(&m) == e.id,
         Err(_) => false,
@@ -733,9 +838,35 @@ async fn fill_entry(
     let mut head_10_ka = head_10.clone();
     head_10_ka.extend_from_slice(b"connection: keep-alive\r\n");
 
+    // 打开只读 fd 供逐请求 fstat 复核；必须与 ETag 身份逐位一致（打开与读取之间
+    // 文件可能被换掉），否则不入缓存（回退 hyper，行为不变）。
+    let mut file = None;
+    let mut fd_ident = None;
+    if OPEN_CACHED.load(Ordering::Relaxed) < MAX_OPEN_CACHED {
+        if let Ok(f) = fs::File::open(&fs_path) {
+            #[cfg(unix)]
+            let ident = stat_fd(&f)
+                .filter(stat_is_regular)
+                .filter(|st| id_from_stat(st) == id)
+                .map(|st| fdid_from_stat(&st));
+            #[cfg(not(unix))]
+            let ident = f
+                .metadata()
+                .ok()
+                .filter(|m| !m.file_type().is_symlink() && m.is_file() && id_of(m) == id)
+                .map(|m| fd_id(&m));
+            if let Some(ident) = ident {
+                OPEN_CACHED.fetch_add(1, Ordering::Relaxed);
+                fd_ident = Some(ident);
+                file = Some(Arc::new(CacheFile { file: f }));
+            }
+        }
+    }
     let e = Arc::new(Entry {
         fs_path,
         id,
+        file,
+        fd_id: fd_ident,
         head_11: Bytes::from(head_11),
         head_11_close: Bytes::from(head_11_close),
         head_10: Bytes::from(head_10),
@@ -1515,6 +1646,40 @@ mod tests {
         assert_eq!(parse_etag_id("\"7f-1-2-3-4\""), None);
         assert_eq!(parse_etag_id("7f-1-2-3"), None);
         assert_eq!(parse_etag_id("\"zz-1-2-3\""), None);
+    }
+
+    #[tokio::test]
+    async fn fd_revalidation_detects_change_replace_and_unlink() {
+        let f = Fixture::new("fdrev");
+        let (_live, lc) = f.live();
+        let head = b"GET /plain.txt HTTP/1.1\r\nHost: x\r\n\r\n";
+        let e = fill_entry(&lc, head, false, "/plain.txt", "/plain.txt")
+            .await
+            .expect("entry");
+        assert!(e.file.is_some(), "fill_entry must open the cached fd");
+        assert!(revalidate(&e));
+
+        // 原地改写（长度相同也必须失效：mtime/ctime 变了）
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        fs::write(f.root.join("plain.txt"), b"PLAIN").unwrap();
+        assert!(!revalidate(&e), "in-place rewrite must invalidate");
+
+        // 重新填充后，rename-over（旧 inode 的 nlink→0）必须失效
+        let e2 = fill_entry(&lc, head, false, "/plain.txt", "/plain.txt")
+            .await
+            .expect("entry2");
+        assert!(revalidate(&e2));
+        fs::write(f.root.join("new.txt"), b"other").unwrap();
+        fs::rename(f.root.join("new.txt"), f.root.join("plain.txt")).unwrap();
+        assert!(!revalidate(&e2), "rename-over must invalidate");
+
+        // 删除后（nlink→0）必须失效
+        let e3 = fill_entry(&lc, head, false, "/plain.txt", "/plain.txt")
+            .await
+            .expect("entry3");
+        assert!(revalidate(&e3));
+        fs::remove_file(f.root.join("plain.txt")).unwrap();
+        assert!(!revalidate(&e3), "unlink must invalidate");
     }
 
     #[test]

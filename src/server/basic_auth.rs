@@ -490,7 +490,11 @@ pub fn admin_login_blocked(ip: IpAddr) -> Option<Duration> {
     ADMIN_FAILS.blocked(ip)
 }
 
-/// 登录结果记账：失败走与 Basic 相同的阈值/指数退避，成功清零。
+/// 登录结果记账：成功清零共享失败表。
+///
+/// **失败不要在 `/api/login` handler 里用 `ok=false` 记**：三协议入口在
+/// `admin::handle` 返回 401 后已统一调用 [`note_admin_result`] 记一次；两处都记
+/// 会让 FAIL_THRESHOLD=8 实际变成 4 次（合法管理员打错 4 次就被 429）。
 pub fn note_admin_login(ip: IpAddr, ok: bool) {
     if ok {
         ADMIN_FAILS.note_success(ip);
