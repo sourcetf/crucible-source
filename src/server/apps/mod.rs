@@ -54,9 +54,82 @@ use bytes::Bytes;
 use http::{Request, Response, StatusCode};
 use http_body_util::BodyExt;
 use hyper::body::Incoming;
+use once_cell::sync::Lazy;
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::Arc;
+use std::time::Instant;
+
+/// deps 热缓存：`deps::try_cached` 的命中路径要 stat 三个路径（init.sh / .env /
+/// deps_dir），本机每次 stat ≈1.7µs ⇒ 每请求 ~5µs。这里把「已确认的 DepsEnv」
+/// 缓存 100ms（`CRUCIBLE_APP_DEPS_TTL_MS`，0=关闭/逐请求 mtime 精确检查）。
+///
+/// **诚实边界**：编辑 `.env` / `init.sh` 后最迟 100ms 才生效（旧行为是下一请求即生效）。
+/// 缓存的是 mtime 检查的结果，不是文件内容；deps 重建仍由 `deps::try_cached` 在
+/// 缓存未命中时执行。失败结果**不缓存**（坏 init.sh 仍走原有 30s 退避）。
+struct DepsFastEntry {
+    docroot: std::path::PathBuf,
+    env: deps::DepsEnv,
+    at: Instant,
+}
+
+static DEPS_FAST: Lazy<parking_lot::Mutex<HashMap<u64, DepsFastEntry>>> =
+    Lazy::new(|| parking_lot::Mutex::new(HashMap::new()));
+
+fn deps_ttl() -> std::time::Duration {
+    static TTL: Lazy<std::time::Duration> = Lazy::new(|| {
+        match env_lock::read_static_env("CRUCIBLE_APP_DEPS_TTL_MS") {
+            Some(v) => v
+                .trim()
+                .parse::<u64>()
+                .map(std::time::Duration::from_millis)
+                .unwrap_or(std::time::Duration::from_millis(100)),
+            None => std::time::Duration::from_millis(100),
+        }
+    });
+    *TTL
+}
+
+fn docroot_key(p: &Path) -> u64 {
+    let mut h = 0xcbf2_9ce4_8422_2325u64;
+    for &b in p.as_os_str().as_encoded_bytes() {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x1000_0000_01b3);
+    }
+    h
+}
+
+async fn deps_cached(lc: &ListenerConfig, app: &AppRouteConfig) -> anyhow::Result<deps::DepsEnv> {
+    let ttl = deps_ttl();
+    if ttl.is_zero() {
+        return deps::try_cached(lc, app).await;
+    }
+    let docroot: &Path = app.docroot.as_deref().unwrap_or(&lc.root);
+    let key = docroot_key(docroot);
+    {
+        let map = DEPS_FAST.lock();
+        if let Some(e) = map.get(&key) {
+            if e.at.elapsed() < ttl && e.docroot == docroot {
+                return Ok(e.env.clone());
+            }
+        }
+    }
+    let env = deps::try_cached(lc, app).await?;
+    let mut map = DEPS_FAST.lock();
+    if map.len() >= 1024 {
+        map.clear();
+    }
+    map.insert(
+        key,
+        DepsFastEntry {
+            docroot: docroot.to_path_buf(),
+            env: env.clone(),
+            at: Instant::now(),
+        },
+    );
+    Ok(env)
+}
 
 pub async fn try_handle(
     req: Request<Incoming>,
@@ -64,24 +137,27 @@ pub async fn try_handle(
     lc: &ListenerConfig,
     peer: SocketAddr,
 ) -> Option<Response<BoxBody>> {
-    let path = req.uri().path().to_string();
-    let ext = Path::new(&path)
+    let _p_try_all = app_ffi::prof::span(app_ffi::prof::S_TRY_ALL);
+    let p_prep = app_ffi::prof::span(app_ffi::prof::S_TRY_PREP);
+    // 热路径只借不克隆：旧实现把 path/ext 各 to_string()（2 次分配），再
+    // `app.clone()` 深拷贝整份 AppRouteConfig（≥8 次分配/请求）。
+    let path = req.uri().path();
+    let ext = Path::new(path)
         .extension()
         .and_then(|e| e.to_str())
-        .unwrap_or("")
-        .to_string();
+        .unwrap_or("");
 
     // file_open preview/download skips engines (§16.2 path-level).
-    match lc.file_open_mode(&path) {
+    match lc.file_open_mode(path) {
         FileOpenMode::Preview | FileOpenMode::Download => return None,
         FileOpenMode::Execute | FileOpenMode::Auto => {}
     }
 
-    let (app_idx, app) = match_app_indexed(lc, &path, &ext)?;
-    // Clone app config for async moves; keep indices for php/native keys.
-    let app = app.clone();
+    let (app_idx, app) = match_app_indexed(lc, path, ext)?;
+    drop(p_prep);
+    let p_deps = app_ffi::prof::span(app_ffi::prof::S_TRY_DEPS);
     // P1-1：deps 的 .env 变量随请求 extensions 下发（引擎侧按需读取），避免改所有引擎签名。
-    let deps_env = match deps::try_cached(lc, &app).await {
+    let deps_env = match deps_cached(lc, app).await {
         Ok(e) => e,
         Err(e) => {
             // 同 engine_error：deps 坏掉时这是**每个请求一条**（客户端可控）
@@ -93,9 +169,12 @@ pub async fn try_handle(
             deps::DepsEnv::default()
         }
     };
+    drop(p_deps);
+    let p_ins = app_ffi::prof::span(app_ffi::prof::S_TRY_INSERT);
     let mut req = req;
     req.extensions_mut().insert(deps_env);
-    Some(dispatch(req, live, lc, &app, app_idx, peer).await)
+    drop(p_ins);
+    Some(dispatch(req, live, lc, app, app_idx, peer).await)
 }
 
 /// Path/ext only — does not consume the request body.
@@ -132,7 +211,7 @@ pub async fn try_handle_simple(
         return None;
     }
     let (app_idx, app) = match_app_indexed(lc, path, ext)?;
-    let deps_env = match deps::try_cached(lc, app).await {
+    let deps_env = match deps_cached(lc, app).await {
         Ok(e) => e,
         Err(e) => {
             crate::server::log_throttle::warn_every(

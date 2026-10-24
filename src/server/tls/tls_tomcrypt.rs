@@ -7,7 +7,7 @@
 use crate::config::{ListenerConfig, SslConfig};
 use crate::server::live_config::LiveConfig;
 use crate::server::ssl_material;
-use crate::server::tls::legacy_io::{relay_bridge_only, sync_io_bridge};
+use crate::server::tls::legacy_io::{relay_bridge_only, run_legacy_handshake, sync_io_bridge};
 use crate::server::{h1};
 use anyhow::{Context, Result};
 use std::ffi::CString;
@@ -155,10 +155,14 @@ pub async fn accept_and_serve(
         Err(e) => {
             // Never escalate legacy failures into process-killing panics.
             // 只写短原因（同 accept.rs / tls_nss.rs）：`{e:#}` 可能带着客户端字节。
-            log::warn!(
-                target: "tls_tomcrypt",
-                "tomcrypt legacy TLS soft-fail peer={peer} peek_len={peek_len}: {}",
-                crate::server::tls::handshake_failure_reason(&e)
+            // 节流：匿名客户端发个 SSLv2 hello 就能触发，逐连接 warn 会刷盘。
+            crate::server::log_throttle::warn_every(
+                "tls-tomcrypt-softfail",
+                std::time::Duration::from_secs(60),
+                &format!(
+                    "tomcrypt legacy TLS soft-fail peer={peer} peek_len={peek_len}: {}",
+                    crate::server::tls::handshake_failure_reason(&e)
+                ),
             );
             log::debug!(target: "tls_tomcrypt", "tomcrypt soft-fail peer={peer} 完整错误: {e:#}");
             Ok(())
@@ -174,7 +178,7 @@ async fn accept_and_serve_inner(
     peer: SocketAddr,
     live: Arc<LiveConfig>,
 ) -> Result<()> {
-    log::info!(
+    log::debug!(
         target: "tls_tomcrypt",
         "tomcrypt accept_and_serve peer={peer} peek_len={}",
         peek.len()
@@ -194,11 +198,14 @@ async fn accept_and_serve_inner(
     let cert_c = CString::new(cert_pem).context("cert PEM contains NUL")?;
     let key_c = CString::new(key_pem).context("key PEM contains NUL")?;
 
-    let relay_fd = relay_bridge_only(stream).await?;
+    let relay = relay_bridge_only(stream).await?;
+    let relay_fd = relay.c_fd().context("tomcrypt relay dup")?;
     let peek_copy = peek;
     let peer_log = peer;
 
-    let shared = tokio::task::spawn_blocking(move || -> Result<Arc<TomcryptShared>> {
+    // O8：10s 绝对 deadline + 并发上限；超时 shutdown(relay) 打断 C 侧阻塞读。
+    let shared = run_legacy_handshake(&relay, move || -> Result<Arc<TomcryptShared>> {
+        let relay_fd = relay_fd.into_raw();
         unsafe {
             let ptr = ffi::crucible_tomcrypt_accept(
                 relay_fd,
@@ -212,12 +219,14 @@ async fn accept_and_serve_inner(
             if ptr.is_null() {
                 anyhow::bail!("crucible_tomcrypt_accept failed");
             }
-            log::info!(target: "tls_tomcrypt", "tomcrypt handshake accepted peer={peer_log}");
+            log::debug!(target: "tls_tomcrypt", "tomcrypt handshake accepted peer={peer_log}");
             Ok(Arc::new(TomcryptShared { conn: ptr }))
         }
     })
     .await
-    .context("tomcrypt join")??;
+    .context("tomcrypt handshake")??;
+    // C 侧持有 relay fd 的 dup；Rust 侧这份握手结束即可关。
+    drop(relay);
 
     // 任务 6：阻塞 IO 移出 executor——读写线程 + mpsc 桥（ halves 共享同一连接）。
     let io = sync_io_bridge(

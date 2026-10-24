@@ -4811,3 +4811,62 @@ country 夹具为合成 /32、IPv4-mapped 未构造；配置期 target 校验仍
 
 报告 `.agents/1009/reports/specpages3-wave16.md`；修复 `.agents/1009/fixes/specpages3-wave16.md`；
 资产 `~/scratch-specpages3/{w16_*.py,conf-w16-*.toml,logs-w16/}`。
+
+---
+
+# 【agent-matrix2 / 工号 1009 · Wave-17】规格矩阵刷新到 Wave-16 最终态 + 权威剩余缺口清单（2026-10-24）
+
+**scope**：只读核对 + 文档。改动仅 `.agents/1009/reports/spec-matrix.md`、
+`.agents/1009/reports/spec-matrix-notes.md`、`.agents/1009/reports/matrix2-wave17.md`、
+`.agents/1009/fixes/matrix2-wave17.md`、本 `contact.txt` 追加。**未改产品代码**；
+未 commit/push/checkout/reset/stash/clean。共享树里其他 agent 的在途改动
+（`src/server/apps/{app_ffi,mod,sidecar_engine}.rs`、未跟踪 `bench/h2_tls_gate.py`）原样保留。
+
+**快照**：HEAD `03e4ae0`（Wave-16 收口）。构建核验：
+`cargo check --release --bin webserver --offline --features tls,tls_boring` → **rc=0（8.56s）**。
+
+**矩阵刷新（§3–§23 共 341 行逐条重核）**：✅ **294** / ⚠️ **37** / ❌ **0** / 🔵 **10**。
+Wave-14/15/16 已闭项全部 ⚠️→✅ 并换成真机证据：
+- 遗留 TLS：NSS SSLv3/v2compat、TomCrypt SSLv2 真机完整握手 + HTTP 200；默认构建
+  `ldd`/`strings`/`legacy=none` 证明不加载（legacytls-wave14；verify7 PASS=7）。
+- 19 引擎 × h1+h2c **38/38 200**：真 Jetty 11.0.24、真 hostfxr/CoreCLR 10.0.13、Go c-shared、
+  php-fpm（runtimes-wave14；verify7 §3.1）。
+- 全局页面规则 + country：**186/186 + 74/74 + 41/41**；AppEngineKind/catalog 21 项；
+  Admin `__Host-` 会话 **44/44**（specpages3-wave16）。
+- DNS 真 BIND 全链路 **72 PASS / 0 FAIL**（dnsbind2-wave15）。
+- h1 官方 wrk 双门禁 **PASS、exit 0**（thin c64 1.110/1.066，perfgate-wave16）；
+  RPS 门槛 rust 22.6k / c 22.4k / go 21.6k PASS；**延迟门禁 enginelat 验证中**。
+- LTO 默认 thin 恢复；访问日志无锁有序（8000 行 0 逆序）；上传/静态 P3（双编码 400、
+  Allow 含 POST、FileId+ctime）全部收口。
+
+**权威剩余缺口（58 条，逐条 file:line 见 notes §A）**：
+- **代码/能力 25**（P1×1、P2×9、P3×15）。P1 仅
+  **G-01 ECS 过 BIND 失效**（BIND 9.20 丢弃 ECS；需换 Unbound/自研递归，3–5d）。
+  P2：Ruby MRI 嵌入默认关（sidecar）、FFI 池 clamp(4,8)、NSS 4 线程、
+  DNS also-notify、rotation_days=0、ACME dns-01、DoT 443 SNI、
+  ns1 glue、GeoIP Rust/Python 口径不一致。
+  P3：trust_self_signed==no_verify、prefer_tls13 空开关、port_reuse 非 SO_REUSEPORT、
+  RTLD_NODELETE、C pthread 样例、H3 datagram、GeoIP 增益/配置位置/死代码、页面规则校验、
+  `build_release.sh:35` 文案反了、仓库根 `-o` 杂散文件、DNS 旧记录名/UI SOA/ACME HTML 日志。
+- **未验证 20**：enginelat 延迟门禁（**验证中**，baseline 已见 rust/static 2.285）、
+  TLS/h2 门禁（**验证中**，`bench/h2_tls_gate.py` + `~/scratch-h2gate`）、OpenBSD 专有面、
+  OCSP/ECH/PSK/0-RTT、CONNECT-UDP 回程、GeoIP 数据质量、ASN/BGP、真实老客户端、第三方 h3、
+  真实浏览器、Admin 8h TTL、真实签名递归上游、**生产 OpenBSD 未部署（仍 `c8ca3ff`）**、
+  config.toml ECH 资产、country mapped/缓存、Lua 高并发；
+  另有 **U-19 TomCrypt 完整 SSLv2 线协议**、**U-20 child_registry pid 判据**为复核期间
+  出现的**在途修复**（未提交/未认证）。
+- **残余风险 13**：h2 多路复用 0.21×、h1 c128 裕量/1vCPU、env_lock 同族排队、
+  看门狗卡死线程、h1_fast 2s 缓存、sidecar 指纹只 `.env`、明文口重放 cookie、
+  level display-only、构建产物不随仓库、deps 共享 docroot、country 缓存、快车道范围、双编码 400。
+
+**本轮顺手核实**：`build_release.sh:35` echo 与默认相反；仓库根 `-o` 被提交
+（`git ls-files -- -o` 命中）；`child_registry` 的 `ps -axww … -p` 在复核期间被另一 agent
+在途改为 `/proc`+启动时间判据（未提交/未认证，见 U-20）。
+
+**诚实边界**：未跑 release 构建/服务/压测；enginelat 与 h2 TLS gate 在别的 agent 的 scratch
+里跑，只读观察并标「验证中」，未把在途数字当结论；OpenBSD/OCSP/ECH/PSK/CONNECT-UDP 回程/
+GeoIP 数据质量/生产部署均标未验证。
+
+报告：`.agents/1009/reports/matrix2-wave17.md`；修复记录：
+`.agents/1009/fixes/matrix2-wave17.md`；矩阵：`.agents/1009/reports/spec-matrix.md`；
+缺口：`.agents/1009/reports/spec-matrix-notes.md` §A。

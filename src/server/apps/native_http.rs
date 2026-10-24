@@ -633,9 +633,43 @@ fn abs_canon(p: &Path) -> PathBuf {
 /// 或从非仓库根目录启动时，判活与加载会得出**相反**结论（真机：cwd=scratch 的实例里
 /// `/rust/`、`/c/` 三协议一致 502；配了 `APPENGINE_RUST_LIB` 时判活仍说「没有」）。
 pub fn lib_available(app: &AppRouteConfig, engine: &str) -> bool {
-    crate::server::apps::app_ffi::resolve_lib(app, engine)
-        .map(|p| p.is_file())
-        .unwrap_or(false)
+    // `is_file()` 是一次 stat（本机 ~1.7µs）；分发判活每个引擎请求至少调一次。
+    // 用 1s TTL 缓存「该路径当前是否存在」：新建 .so 最迟 1s 内被发现；缓存窗口内
+    // 删除 .so 会走 FFI 装载失败（干净 502），不会误执行。
+    // `CRUCIBLE_APP_LIB_TTL_MS=0` 关闭缓存（回到逐请求 stat）。
+    static TTL: Lazy<std::time::Duration> = Lazy::new(|| {
+        match crate::server::apps::env_lock::read_static_env("CRUCIBLE_APP_LIB_TTL_MS") {
+            Some(v) => v
+                .trim()
+                .parse::<u64>()
+                .map(std::time::Duration::from_millis)
+                .unwrap_or(std::time::Duration::from_millis(1000)),
+            None => std::time::Duration::from_millis(1000),
+        }
+    });
+    static CACHE: Lazy<Mutex<HashMap<PathBuf, (bool, std::time::Instant)>>> =
+        Lazy::new(|| Mutex::new(HashMap::new()));
+    let Ok(path) = crate::server::apps::app_ffi::resolve_lib(app, engine) else {
+        return false;
+    };
+    if TTL.is_zero() {
+        return path.is_file();
+    }
+    {
+        let map = CACHE.lock();
+        if let Some((ok, at)) = map.get(&path) {
+            if at.elapsed() < *TTL {
+                return *ok;
+            }
+        }
+    }
+    let ok = path.is_file();
+    let mut map = CACHE.lock();
+    if map.len() >= 1024 {
+        map.clear();
+    }
+    map.insert(path, (ok, std::time::Instant::now()));
+    ok
 }
 
 /// Sidecar binary from init.sh (`deps/bin/index`) for c/go/rust when FFI .so is unavailable.

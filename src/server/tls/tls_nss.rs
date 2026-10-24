@@ -5,7 +5,7 @@
 use crate::config::{ListenerConfig, SslConfig};
 use crate::server::live_config::LiveConfig;
 use crate::server::ssl_material;
-use crate::server::tls::legacy_io::{relay_with_peek, sync_io_bridge};
+use crate::server::tls::legacy_io::{relay_with_peek, run_legacy_handshake, sync_io_bridge};
 use crate::server::{h1};
 use anyhow::{Context, Result};
 use std::io::{Read, Write};
@@ -141,10 +141,15 @@ pub async fn accept_and_serve(
             // or tear down the accept loop for other connections.
             // 只写短原因：完整错误链里可能带着客户端字节，`{e:#}` 会把它们全写进日志
             // （见 `tls::handshake_failure_reason` 的说明）。
-            log::warn!(
-                target: "tls_nss",
-                "nss legacy TLS soft-fail peer={peer} peek_len={peek_len}: {}",
-                crate::server::tls::handshake_failure_reason(&e)
+            // 按类别+时间节流：这条路径匿名可触发（发一个 IE6 风格 hello 即可），
+            // 逐连接 warn 等于给磁盘开一个按连接数计费的写入口。
+            crate::server::log_throttle::warn_every(
+                "tls-nss-softfail",
+                std::time::Duration::from_secs(60),
+                &format!(
+                    "nss legacy TLS soft-fail peer={peer} peek_len={peek_len}: {}",
+                    crate::server::tls::handshake_failure_reason(&e)
+                ),
             );
             log::debug!(target: "tls_nss", "nss soft-fail peer={peer} 完整错误: {e:#}");
             Ok(())
@@ -161,7 +166,7 @@ async fn accept_and_serve_inner(
     live: Arc<LiveConfig>,
 ) -> Result<()> {
     let peek_len = peek.len();
-    log::info!(
+    log::debug!(
         target: "tls_nss",
         "nss accept_and_serve peer={peer} peek_len={peek_len}"
     );
@@ -183,15 +188,19 @@ async fn accept_and_serve_inner(
         e
     })?;
 
-    let relay_fd = relay_with_peek(stream, peek).await.map_err(|e| {
+    let relay = relay_with_peek(stream, peek).await.map_err(|e| {
         log::error!(target: "tls_nss", "nss: relay_with_peek failed peer={peer}: {e:#}");
         e
     })?;
+    let relay_fd = relay.c_fd().context("nss relay dup")?;
     let cert = cert_pem.clone();
     let key = key_pem.clone();
     let peer_log = peer;
 
-    let shared = tokio::task::spawn_blocking(move || -> Result<Arc<NssShared>> {
+    // O8：10s 绝对 deadline + 并发上限；超时用 shutdown(relay) 打断阻塞的
+    // SSL_ForceHandshake（以前 spawn_blocking 无超时，慢握手可长期占线程/fd）。
+    let shared = run_legacy_handshake(&relay, move || -> Result<Arc<NssShared>> {
+        let relay_fd = relay_fd.into_raw();
         let ptr = unsafe {
             ffi::crucible_nss_accept(
                 relay_fd,
@@ -208,15 +217,16 @@ async fn accept_and_serve_inner(
             );
             anyhow::bail!("crucible_nss_accept failed");
         }
-        log::info!(target: "tls_nss", "nss handshake accepted peer={peer_log}");
+        log::debug!(target: "tls_nss", "nss handshake accepted peer={peer_log}");
         Ok(Arc::new(NssShared { conn: ptr }))
     })
     .await
     .map_err(|e| {
-        log::error!(target: "tls_nss", "nss join error peer={peer}: {e}");
+        log::debug!(target: "tls_nss", "nss handshake failed peer={peer}: {e:#}");
         e
-    })
-    .context("nss join")??;
+    })??;
+    // C 侧持有 relay fd 的 dup；Rust 侧这份只用于超时 shutdown，握手结束即可关。
+    drop(relay);
 
     // 任务 6：阻塞 IO 移出 executor——读写线程 + mpsc 桥；同一描述符的并发读写
     // 由 NSPR 内部锁保证（全双工），Drop 只在最后一个 half 释放时 free 一次。

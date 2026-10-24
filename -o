@@ -1,9 +1,0 @@
-HTTP/2 200 
-date: Fri, 23 Oct 2026 03:16:40 GMT
-x-crucible-engine: jsp-jetty
-content-type: text/html;charset=utf-8
-set-cookie: JSESSIONID=node012dh015d1bqmh1qsdqvqviz1bq5.node0; Path=/
-expires: Thu, 01 Jan 1970 00:00:00 GMT
-content-length: 168
-server: Jetty(11.0.24)
-

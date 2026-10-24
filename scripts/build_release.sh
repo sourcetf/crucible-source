@@ -32,7 +32,7 @@ case "$LTO_MODE" in
   off|false|none) export CARGO_PROFILE_RELEASE_LTO="off" ;;
   *) echo "[build] unknown LTO mode: $LTO_MODE (use --fat/--thin)" >&2; exit 2 ;;
 esac
-echo "[build] LTO=${CARGO_PROFILE_RELEASE_LTO} (production default: fat since wave-16; Cargo.toml stays thin; use --thin to fall back)"
+echo "[build] LTO=${CARGO_PROFILE_RELEASE_LTO} (spec default: thin; use --fat to opt in)"
 
 echo "[build] release with features from config.mk / CARGO_FEATURES"
 if [[ -f "${ROOT}/config.mk" ]]; then

@@ -117,6 +117,16 @@ pub async fn handle_with_fallback(
     // 本 app 的 `.env`（deps 解析结果，`try_handle` 注入到 extensions）：
     //   * 受管 sidecar 在 spawn 时装进它的进程 env（本 app 的键在 `System.getenv`/`ENV` 可见）；
     //   * 显式 socket 另发 `x-crucible-env-*` 请求头（进程 env 够不着的兜底通道）。
+    let p_fb = app_ffi::prof::span(app_ffi::prof::S_FALLBACK_PREP);
+    let p_avail = app_ffi::prof::span(app_ffi::prof::S_LIB_AVAIL);
+    let avail = native_http::lib_available(app, engine);
+    drop(p_avail);
+    // FFI 命中时**不需要** .env 克隆 / 转发头（app_ffi::execute 自己从 extensions 取）：
+    // 旧实现先深拷贝整份 .env 再判 lib，c/go/rust 每请求白付一次 Vec 分配+拷贝。
+    if avail {
+        drop(p_fb);
+        return app_ffi::execute(req, lc, app, peer).await;
+    }
     let env_vars: Vec<(String, String)> = req
         .extensions()
         .get::<DepsEnv>()
@@ -127,9 +137,7 @@ pub async fn handle_with_fallback(
     } else {
         Vec::new()
     };
-    if native_http::lib_available(app, engine) {
-        return app_ffi::execute(req, lc, app, peer).await;
-    }
+    drop(p_fb);
     // **顺序**：显式配置且**活着**的 `socket` 优先于自动探测的 `deps/bin/index`。
     //
     // 为什么：`sidecar_available` 只判「`deps/bin/index` **这个文件存在**」，并不验证它跑得起来；

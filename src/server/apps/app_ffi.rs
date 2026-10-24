@@ -26,7 +26,7 @@ use std::collections::{HashMap, HashSet};
 use std::ffi::{CStr, CString};
 use std::net::SocketAddr;
 use std::os::raw::{c_char, c_int, c_void};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -152,6 +152,137 @@ static LIBS: Lazy<Mutex<HashMap<String, Arc<EngineLib>>>> =
 /// 分路径加锁既消除重复装载，又不让不同引擎互相阻塞。
 static LOAD_LOCKS: Lazy<Mutex<HashMap<String, Arc<Mutex<()>>>>> =
     Lazy::new(|| Mutex::new(HashMap::new()));
+
+// ---------------------------------------------------------------- 临时性能剖析（CRUCIBLE_APP_PROF=1）
+//
+// 只在 `CRUCIBLE_APP_PROF=1` 时统计；默认零开销（一次 OnceLock 读取）。
+// 每 2s 把各阶段累计 ns/count 打到 stderr，用于定位引擎路径的 µs 分解。
+// 这是本 wave 的测量脚手架，定位完成后删除。
+#[doc(hidden)]
+pub mod prof {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::Instant;
+
+    pub const S_ALL: usize = 0;
+    pub const S_EXEC_PREP: usize = 1;
+    pub const S_DISPATCH_PRE: usize = 2;
+    pub const S_QUEUE_WAIT: usize = 3;
+    pub const S_EXEC_WAIT: usize = 4;
+    pub const S_RESP_BUILD: usize = 5;
+    pub const S_JOB_TOTAL: usize = 6;
+    pub const S_JOB_LOAD: usize = 7;
+    pub const S_JOB_ENVLOCK: usize = 8;
+    pub const S_CALL_TOTAL: usize = 9;
+    pub const S_CALL_PREP: usize = 10;
+    pub const S_ENGINE_CALL: usize = 11;
+    pub const S_CALL_RESULT: usize = 12;
+    pub const S_TRY_PREP: usize = 13;
+    pub const S_TRY_DEPS: usize = 14;
+    pub const S_FALLBACK_PREP: usize = 15;
+    pub const S_RESOLVE_LIB: usize = 16;
+    pub const S_REL_SCRIPT: usize = 17;
+    pub const S_STAT: usize = 18;
+    pub const S_QUAR: usize = 19;
+    pub const S_LIB_AVAIL: usize = 20;
+    pub const S_TRY_INSERT: usize = 21;
+    pub const S_TRY_ALL: usize = 22;
+    pub const S_N: usize = 23;
+
+    pub const NAMES: [&str; S_N] = [
+        "all",
+        "exec_prep",
+        "dispatch_pre",
+        "queue_wait",
+        "exec_wait",
+        "resp_build",
+        "job_total",
+        "job_load",
+        "job_envlock",
+        "call_total",
+        "call_prep",
+        "engine_call",
+        "call_result",
+        "try_prep",
+        "try_deps",
+        "fallback_prep",
+        "resolve_lib",
+        "rel_script",
+        "stat",
+        "quar",
+        "lib_avail",
+        "try_insert",
+        "try_all",
+    ];
+
+    static NS: [AtomicU64; S_N] = [const { AtomicU64::new(0) }; S_N];
+    static CNT: [AtomicU64; S_N] = [const { AtomicU64::new(0) }; S_N];
+    static ENABLED: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| match std::env::var("CRUCIBLE_APP_PROF") {
+            Ok(v) => v.trim() == "1",
+            Err(_) => false,
+        });
+    static REPORTER: std::sync::Once = std::sync::Once::new();
+
+    #[inline]
+    pub fn enabled() -> bool {
+        *ENABLED
+    }
+
+    pub struct Span {
+        idx: usize,
+        start: Instant,
+    }
+
+    impl Drop for Span {
+        fn drop(&mut self) {
+            if *ENABLED {
+                NS[self.idx].fetch_add(self.start.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                CNT[self.idx].fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+
+    #[inline]
+    pub fn span(idx: usize) -> Option<Span> {
+        if !*ENABLED {
+            return None;
+        }
+        REPORTER.call_once(|| {
+            std::thread::Builder::new()
+                .name("app-prof".into())
+                .spawn(|| {
+                    let mut prev = [0u64; S_N];
+                    loop {
+                        std::thread::sleep(std::time::Duration::from_secs(2));
+                        let mut line = String::from("app-prof:");
+                        for i in 0..S_N {
+                            let ns = NS[i].load(Ordering::Relaxed);
+                            let cnt = CNT[i].load(Ordering::Relaxed);
+                            let d = ns.saturating_sub(prev[i]);
+                            prev[i] = ns;
+                            let per = if cnt > 0 { d as f64 / 1000.0 / cnt as f64 } else { 0.0 };
+                            line.push_str(&format!(" {}={:.2}us/{}", NAMES[i], per, cnt));
+                        }
+                        eprintln!("{line}");
+                    }
+                })
+                .ok();
+        });
+        Some(Span {
+            idx,
+            start: Instant::now(),
+        })
+    }
+
+    /// 立即记录一次（起点已经取过）。
+    #[inline]
+    pub fn note(idx: usize, start: Instant) {
+        if *ENABLED {
+            NS[idx].fetch_add(start.elapsed().as_nanos() as u64, Ordering::Relaxed);
+            CNT[idx].fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
 
 // ------------------------------------------------------------------ 看门狗（墙钟）
 
@@ -293,13 +424,16 @@ pub async fn execute(
     app: &AppRouteConfig,
     peer: SocketAddr,
 ) -> Result<Response<BoxBody>> {
+    let _p_all = prof::span(prof::S_ALL);
+    let p_prep = prof::span(prof::S_EXEC_PREP);
     // P1-1：.env 变量由 apps::try_handle 注入 extensions。所有引擎（含 c/go/rust）都经
     // env_lock 把它们装进**进程环境**：C 侧的 appengine_apply_extra 就是 setenv，没有
     // 哪条引擎路径是「只下发、不碰进程 env」的。
-    let env_vars: Vec<(String, String)> = req
+    // Arc clone（O(1)）；旧实现 `(*d.vars).clone()` 每请求深拷贝整份 .env。
+    let env_vars: Arc<Vec<(String, String)>> = req
         .extensions()
         .get::<crate::server::apps::deps::DepsEnv>()
-        .map(|d| (*d.vars).clone())
+        .map(|d| d.vars.clone())
         .unwrap_or_default();
     let (parts, body) = req.into_parts();
     let method = parts.method.as_str().to_string();
@@ -331,19 +465,23 @@ pub async fn execute(
     } else {
         Bytes::new()
     };
-    let outcome = exec_dispatch(
-        &method,
-        &path,
-        &query,
-        &content_type,
-        &body_bytes,
-        lc,
-        app,
-        peer,
-        &env_vars,
-        &headers_block,
-    )
-    .await?;
+    let outcome = {
+        drop(p_prep);
+        exec_dispatch(
+            &method,
+            &path,
+            &query,
+            &content_type,
+            &body_bytes,
+            lc,
+            app,
+            peer,
+            env_vars.as_slice(),
+            &headers_block,
+        )
+        .await?
+    };
+    let _p_resp = prof::span(prof::S_RESP_BUILD);
     Ok(response_from_outcome(outcome))
 }
 
@@ -376,7 +514,7 @@ pub async fn execute_simple(
         lc,
         app,
         peer,
-        &deps.vars,
+        deps.vars.as_slice(),
         &headers_block,
     )
     .await
@@ -393,25 +531,25 @@ pub async fn execute_simple(
 fn request_headers_block(headers: &http::HeaderMap, authority: Option<&http::uri::Authority>) -> Vec<u8> {
     const VALUE_CAP: usize = 16 * 1024;
     const BLOCK_CAP: usize = 64 * 1024;
-    let mut out = Vec::new();
+    // 预分配，避免逐条 extend 的多次 realloc；`HeaderName::as_str()` 已是小写，
+    // 但这里用 eq_ignore_ascii_case 比较（不假设实现细节，也**不再逐头分配** lowercase）。
+    let mut out = Vec::with_capacity(headers.len().saturating_mul(24).saturating_add(16));
     let mut has_host = false;
     for (name, value) in headers.iter() {
         let n = name.as_str();
-        let lower = n.to_ascii_lowercase();
-        if lower == "host" {
+        if n.eq_ignore_ascii_case("host") {
             has_host = true;
         }
-        let hop_by_hop = matches!(
-            lower.as_str(),
-            "connection"
-                | "keep-alive"
-                | "te"
-                | "transfer-encoding"
-                | "upgrade"
-                | "trailer"
-                | "content-length"
-                | "content-type"
-        ) || lower.starts_with("proxy-");
+        let is_proxy = n.len() >= 6 && n.as_bytes()[..6].eq_ignore_ascii_case(b"proxy-");
+        let hop_by_hop = is_proxy
+            || n.eq_ignore_ascii_case("connection")
+            || n.eq_ignore_ascii_case("keep-alive")
+            || n.eq_ignore_ascii_case("te")
+            || n.eq_ignore_ascii_case("transfer-encoding")
+            || n.eq_ignore_ascii_case("upgrade")
+            || n.eq_ignore_ascii_case("trailer")
+            || n.eq_ignore_ascii_case("content-length")
+            || n.eq_ignore_ascii_case("content-type");
         if hop_by_hop {
             continue;
         }
@@ -465,17 +603,23 @@ async fn exec_dispatch(
     env_vars: &[(String, String)],
     headers: &[u8],
 ) -> Result<ExecOutcome> {
+    let p_dispatch = prof::span(prof::S_DISPATCH_PRE);
     let engine = app.engine.to_ascii_lowercase();
+    let p_lib = prof::span(prof::S_RESOLVE_LIB);
     let lib_path = resolve_lib(app, &engine)?;
-    let docroot = app.docroot.clone().unwrap_or_else(|| lc.root.clone());
+    drop(p_lib);
+    // docroot / server_name 在热路径上**只借不克隆**：内联路径不需要任何 owned 拷贝，
+    // 池路径再克隆（见下方 `docroot_owned`）。
+    let docroot: &Path = app.docroot.as_deref().unwrap_or(lc.root.as_path());
     // §3.3 语义：docroot 已是应用级根（www-apps/<engine>），script 必须用剥掉
     // app 前缀后的相对路径（/lua/index.lua → index.lua）；目录/根请求回落 app.index。
     // 旧实现整条 request path 直接 join，导致 docroot 双重前缀（lua/wsgi 等真读
     // 文件的引擎 500，而 rust/c/go 样例插件不读文件被掩盖）。
     // §7.1 防穿越：script 必须留在 docroot 下（裸 join 可 /engine/../../ 读任意文件）。
+    let p_rel = prof::span(prof::S_REL_SCRIPT);
     let rel = rel_script_path(app, path);
-    let script = crate::server::admin_files::script_rel(&docroot, rel.trim_start_matches('/'))
-        .map_err(|e| anyhow::anyhow!("script path rejected: {e:#}"))?;
+    let script = resolve_script_cached(docroot, rel.trim_start_matches('/'))?;
+    drop(p_rel);
     // **非普通文件一律不交给引擎**：docroot 里存在 FIFO/字符设备/目录时，引擎侧多是
     // `fopen`/`luaL_loadfile` 直接打开它 —— FIFO 无写端时 open() 会**永久阻塞**，
     // 而 FFI 引擎调用没有墙钟超时，且调用期间持有宿主的 env 锁 ⇒ 一次请求就把
@@ -486,17 +630,36 @@ async fn exec_dispatch(
     // `script` 会解析成 docroot 目录本身（c/go 样例就忽略 script），目录上 fopen 只会
     // 返回 EISDIR，不会阻塞。文件**不存在**时也不做判断：cgi 引擎还会按
     // docroot/index.cgi → cgi-bin/index.cgi 回落，语义不变。
-    if let Ok(md) = std::fs::metadata(&script) {
-        if !md.is_file() && !md.is_dir() {
-            bail!(
-                "script is not a regular file (refusing to exec): {}",
-                script.display()
-            );
-        }
-    }
     let port = lc.port;
-    let server_name = lc.server_name.clone().unwrap_or_else(|| "crucible".into());
+    let server_name: &str = lc.server_name.as_deref().unwrap_or("crucible");
 
+    let lib_key_cow = lib_path.to_string_lossy();
+    // 入池前先拒绝已被看门狗隔离的 .so：快速 502，不占 worker、不让请求排队。
+    let p_quar = prof::span(prof::S_QUAR);
+    let quarantined = is_quarantined(lib_key_cow.as_ref());
+    drop(p_quar);
+    if quarantined {
+        bail!(
+            "engine `{engine}` is quarantined (a previous call exceeded the wall clock); \
+             restart webserver to recover"
+        );
+    }
+    // ---- §22.4.2 native_inline：c/go/rust 在请求线程内联执行 ----
+    // 这两次跨线程唤醒（入池 + 回传）在 c8 门禁下实测占每请求 ~60µs 的等待；
+    // 内联后用同一份 env 锁语义（空组可并发/不同组互斥）直接调用。
+    if inline_engine(&engine) {
+        drop(p_dispatch);
+        return inline_exec(
+            &engine, &lib_path, lib_key_cow.as_ref(), &script, docroot, method, path, query,
+            content_type, body, peer, port, server_name, env_vars, headers,
+        );
+    }
+    // 池路径需要 owned 键（closure 是 'static；lib_path 也要 move 进去）。
+    let lib_key = lib_key_cow.into_owned();
+
+    // ---- 进程池路径（其它引擎；c/go/rust 可用 CRUCIBLE_APP_INLINE=0 强制走这里）----
+    let docroot_owned = docroot.to_path_buf();
+    let server_name_owned = server_name.to_string();
     let m = method.to_string();
     let p = path.to_string();
     let q = query.to_string();
@@ -508,23 +671,6 @@ async fn exec_dispatch(
     // P1-1：闭包必须持有 owned 环境变量（'static），在闭包内转 &[(&str,&str)]。
     let env_vars_owned: Vec<(String, String)> = env_vars.to_vec();
     let headers_owned: Vec<u8> = headers.to_vec();
-    // 该 .so **自报**「不依赖进程 env」（`appengine_env_isolation` + `appengine_set_base_env`
-    // 都成功，见 EngineLib::env_free）。只有这种 .so 才允许跳过 env_lock：
-    //   * 跳过 ⇒ 该引擎的子进程/子请求 env 完全由「启动期基底 + 本请求 .env」拼出，
-    //     一个慢的**空**请求不会挡住随后带 `.env` 的请求（见 env_lock 模块注释）；
-    //     目前自报的有 cgi（子进程 envp）与 python（TLS 覆盖表 + 基底对齐视图）；
-    //   * 不自报（含所有其它引擎、以及任何陈旧 .so）⇒ 留在锁内，跨应用 `.env` 隔离
-    //     不依赖引擎实现。
-    //
-    // 入池前先拒绝已被看门狗隔离的 .so：快速 502，不占 worker、不让请求排队。
-    let lib_key = lib_path.to_string_lossy().into_owned();
-    if is_quarantined(&lib_key) {
-        bail!(
-            "engine `{engine}` is quarantined (a previous call exceeded the wall clock); \
-             restart webserver to recover"
-        );
-    }
-    let quarantined_key = lib_key.clone();
     // **两段 deadline 的状态机**（见 `engine_queue_timeout`）：`Queued` → 由 worker 在真正
     // 开始执行时置 `Started`；请求方在排队超时时 CAS `Queued → Cancelled`。
     //   * CAS 成功 ⇒ 调用**从未开始执行**，给客户端可重试的 503，绝不隔离/毒化；
@@ -535,6 +681,7 @@ async fn exec_dispatch(
     let stage_job = Arc::clone(&stage);
     let (started_tx, started_rx) = tokio::sync::oneshot::channel::<()>();
     let stage_engine = engine.clone();
+    let quarantined_key = lib_key.clone();
     let job = move || {
         // 排队结束、承诺执行：CAS `Queued → Started`。失败只可能是 `Cancelled`
         // （请求方已就排队超时回了可重试的 503）⇒ 直接返回，不跑引擎、不碰 env 锁。
@@ -555,7 +702,9 @@ async fn exec_dispatch(
         // 通知「开始执行」：请求方据此把 deadline 从「排队」切到「执行」。
         // （接收方可能已因排队超时放弃 ⇒ send 失败无害。）
         let _ = started_tx.send(());
+        let _pj = prof::span(prof::S_JOB_TOTAL);
         // 先按需装载（快路径 = 一次表查找）再决策：`env_free` 是 .so 的属性。
+        let p_load = prof::span(prof::S_JOB_LOAD);
         let lib = load_engine(&engine, &lib_path)?;
         // 二次检查：入池到执行之间，另一个并发调用可能刚被判定超时并隔离本 .so。
         if is_quarantined(&quarantined_key) {
@@ -564,10 +713,11 @@ async fn exec_dispatch(
                  restart webserver to recover"
             );
         }
+        drop(p_load);
         if lib.env_free {
             return call_exec(
-                &lib, &engine, &script, &docroot, &m, &p, &q, &ct, &b, peer, port,
-                &server_name, &env_vars_owned, &headers_owned,
+                &lib, &engine, &script, &docroot_owned, &m, &p, &q, &ct, &b, peer, port,
+                &server_name_owned, &env_vars_owned, &headers_owned,
             );
         }
         let vars: Vec<(&str, &str)> = env_vars_owned
@@ -576,8 +726,8 @@ async fn exec_dispatch(
             .collect();
         match env_lock::with_temp_env_named(&engine, &vars, || {
             call_exec(
-                &lib, &engine, &script, &docroot, &m, &p, &q, &ct, &b, peer, port,
-                &server_name, &env_vars_owned, &headers_owned,
+                &lib, &engine, &script, &docroot_owned, &m, &p, &q, &ct, &b, peer, port,
+                &server_name_owned, &env_vars_owned, &headers_owned,
             )
         }) {
             Ok(r) => r,
@@ -597,6 +747,8 @@ async fn exec_dispatch(
     // **同步提交**（见 `EnginePool::submit`）：到这里作业已在队列里，第一段的「等 started」
     // 才是真的在等排队。
     let result_rx = pool.submit(job)?;
+    drop(p_dispatch);
+    let p_queue = prof::span(prof::S_QUEUE_WAIT);
     let exec_timeout = engine_call_timeout();
     let queue_timeout = engine_queue_timeout();
     if exec_timeout.is_none() && queue_timeout.is_none() {
@@ -640,6 +792,8 @@ async fn exec_dispatch(
         // 排队上限被显式关闭：无限等开始（执行上限仍然生效）。
         let _ = started_rx.await;
     }
+    drop(p_queue);
+    let _p_exec = prof::span(prof::S_EXEC_WAIT);
     // ---- 第二段：引擎执行（deadline **只**算执行）----
     // 超时的**取舍**（本方案的诚实边界）：
     //   * 卡死的 C 调用无法被安全中断（杀线程会在任意指令处损坏状态）⇒ 该 worker 线程
@@ -677,6 +831,66 @@ async fn exec_dispatch(
                 )
             }
         },
+    }
+}
+
+/// §22.4.2 native_inline：c/go/rust 在**请求线程**内联执行引擎调用。
+///
+/// 为什么这样做（测量依据）：走进程池时，c8 门禁下每请求在「入池 → worker 唤醒」上
+/// 实测等待 ~63µs（`app-prof` queue_wait），而引擎本身只跑 ~2µs；两次跨线程唤醒
+/// 是延迟比的绝对主项。内联后同一份工作由请求线程直接完成。
+///
+/// 正确性：与池路径**同一套** env 语义 —— 非 env-free 的 .so 仍进
+/// `with_temp_env_named`（空 `.env` 组可并发、不同内容组互斥），不是「跳过锁」。
+/// 代价（诚实边界）：同步 C 调用无法被看门狗中断；卡死的 c/go/rust 调用会占住
+/// 一条 tokio worker 线程（池路径则是隔离 + 补位）。可用 `CRUCIBLE_APP_INLINE=0`
+/// 退回池路径。c/go/rust 是 in-process 编译插件（§7.3 最终态），样例调用在 1µs 量级。
+#[allow(clippy::too_many_arguments)]
+fn inline_exec(
+    engine: &str,
+    lib_path: &Path,
+    lib_key: &str,
+    script: &Path,
+    docroot: &Path,
+    method: &str,
+    path: &str,
+    query: &str,
+    content_type: &str,
+    body: &Bytes,
+    peer: SocketAddr,
+    port: u16,
+    server_name: &str,
+    env_vars: &[(String, String)],
+    headers: &[u8],
+) -> Result<ExecOutcome> {
+    let _pj = prof::span(prof::S_JOB_TOTAL);
+    let p_load = prof::span(prof::S_JOB_LOAD);
+    let lib = load_engine(engine, lib_path)?;
+    if is_quarantined(lib_key) {
+        bail!(
+            "engine `{engine}` is quarantined (a previous call exceeded the wall clock); \
+             restart webserver to recover"
+        );
+    }
+    drop(p_load);
+    if lib.env_free {
+        return call_exec(
+            &lib, engine, script, docroot, method, path, query, content_type, body, peer, port,
+            server_name, env_vars, headers,
+        );
+    }
+    let vars: Vec<(&str, &str)> = env_vars
+        .iter()
+        .map(|(k, v)| (k.as_str(), v.as_str()))
+        .collect();
+    match env_lock::with_temp_env_named(engine, &vars, || {
+        call_exec(
+            &lib, engine, script, docroot, method, path, query, content_type, body, peer, port,
+            server_name, env_vars, headers,
+        )
+    }) {
+        Ok(r) => r,
+        Err(e) => bail!("engine `{engine}` unavailable: {e}"),
     }
 }
 
@@ -785,12 +999,126 @@ fn default_lib_path(engine: &str) -> PathBuf {
 }
 
 /// `target/app-engines/` 的锚点：仓库根（见 [`default_lib_path`]）。
+///
+/// 结果进程内不变（编译期 manifest 路径 + 目录存在性），缓存到 OnceLock ——
+/// 旧实现每次 `resolve_lib` 都做一次 `is_dir()`（stat ≈1.7µs），而 `lib_available`
+/// 与 `exec_dispatch` 各解析一次 ⇒ 未写 `lib` 的应用每请求白付两次 stat。
 fn project_root() -> PathBuf {
-    let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    if manifest.join("libs").join("app-engines").is_dir() {
-        return manifest;
+    static ROOT: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+    ROOT.get_or_init(|| {
+        let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        if manifest.join("libs").join("app-engines").is_dir() {
+            return manifest;
+        }
+        std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
+    })
+    .clone()
+}
+
+// ---------------------------------------------------------------- 脚本路径热缓存
+//
+// 为什么需要：`admin_files::script_rel` → `safe_join` 对 **root 和结果路径各做一次
+// `fs::canonicalize`**，再把结果 `exists()`。本机实测（`canon` 微基准）一次
+// canonicalize **6.1–7.5µs**、stat 1.7µs ⇒ 每个引擎请求光「解析脚本路径 + FIFO 闸门」
+// 就 ~14µs，是引擎路径相对 static 的最大单项开销（见 enginelat-wave17 报告）。
+//
+// 缓存的是「路径解析结果 + 非普通文件拒绝判定」，不是文件内容：引擎每次仍自己打开
+// 脚本读最新内容。TTL（默认 250ms，`CRUCIBLE_APP_PATH_TTL_MS=0` 关闭）内如果脚本
+// 被换成 FIFO/符号链接，闸门判定最多滞后一个 TTL —— 这是为延迟门禁做的**有界**取舍，
+// 报告里有诚实说明。缓存键 = (docroot, rel) 的 64 位哈希 + 逐字节复核（防碰撞）。
+struct ScriptCacheEntry {
+    docroot: PathBuf,
+    rel: String,
+    path: PathBuf,
+    rejected: Option<String>,
+    at: std::time::Instant,
+}
+
+static SCRIPT_CACHE: Lazy<Mutex<HashMap<u64, ScriptCacheEntry>>> =
+    Lazy::new(|| Mutex::new(HashMap::new()));
+
+fn path_cache_ttl() -> Duration {
+    static TTL: Lazy<Duration> = Lazy::new(|| {
+        match env_lock::read_static_env("CRUCIBLE_APP_PATH_TTL_MS") {
+            Some(v) => match v.trim().parse::<u64>() {
+                Ok(ms) => Duration::from_millis(ms),
+                Err(_) => Duration::from_millis(250),
+            },
+            None => Duration::from_millis(250),
+        }
+    });
+    *TTL
+}
+
+fn fnv1a(bytes: &[u8], mut h: u64) -> u64 {
+    for &b in bytes {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x1000_0000_01b3);
     }
-    std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
+    h
+}
+
+fn script_cache_key(docroot: &Path, rel: &str) -> u64 {
+    let mut h = fnv1a(docroot.as_os_str().as_encoded_bytes(), 0xcbf2_9ce4_8422_2325);
+    h = fnv1a(&[0xff], h);
+    fnv1a(rel.as_bytes(), h)
+}
+
+/// 解析脚本路径（含 §7.1 防穿越与 FIFO/设备闸门），带 TTL 热缓存。
+fn resolve_script_cached(docroot: &Path, rel: &str) -> Result<PathBuf> {
+    let ttl = path_cache_ttl();
+    if ttl.is_zero() {
+        return resolve_script_exact(docroot, rel);
+    }
+    let key = script_cache_key(docroot, rel);
+    {
+        let map = SCRIPT_CACHE.lock();
+        if let Some(e) = map.get(&key) {
+            if e.at.elapsed() < ttl && e.docroot == docroot && e.rel == rel {
+                return match &e.rejected {
+                    Some(msg) => Err(anyhow::anyhow!("{msg}")),
+                    None => Ok(e.path.clone()),
+                };
+            }
+        }
+    }
+    let resolved = resolve_script_exact(docroot, rel);
+    let mut map = SCRIPT_CACHE.lock();
+    // 有界：URL 路径由客户端决定，不能无界增长（超限整体清空，代价只是一次冷解析）。
+    if map.len() >= 4096 {
+        map.clear();
+    }
+    map.insert(
+        key,
+        ScriptCacheEntry {
+            docroot: docroot.to_path_buf(),
+            rel: rel.to_string(),
+            path: resolved.as_ref().map(|p| p.clone()).unwrap_or_default(),
+            rejected: resolved.as_ref().err().map(|e| format!("{e:#}")),
+            at: std::time::Instant::now(),
+        },
+    );
+    resolved
+}
+
+/// 未缓存的脚本解析：与旧实现逐字一致（safe_join + 非普通文件拒绝）。
+fn resolve_script_exact(docroot: &Path, rel: &str) -> Result<PathBuf> {
+    let p_rel = prof::span(prof::S_REL_SCRIPT);
+    let script = crate::server::admin_files::script_rel(docroot, rel)
+        .map_err(|e| anyhow::anyhow!("script path rejected: {e:#}"))?;
+    drop(p_rel);
+    let p_stat = prof::span(prof::S_STAT);
+    let md = std::fs::metadata(&script).ok();
+    drop(p_stat);
+    if let Some(md) = md {
+        if !md.is_file() && !md.is_dir() {
+            bail!(
+                "script is not a regular file (refusing to exec): {}",
+                script.display()
+            );
+        }
+    }
+    Ok(script)
 }
 
 // ---------------------------------------------------------------- 线程池 (§7.3)
@@ -823,6 +1151,14 @@ static SERIAL_POOLS: Lazy<Mutex<HashMap<String, Arc<EnginePool>>>> =
     Lazy::new(|| Mutex::new(HashMap::new()));
 
 fn generic_pool_threads() -> usize {
+    // 本 wave 测量用覆盖：`CRUCIBLE_APP_POOL_THREADS`（1..=64）。
+    if let Some(raw) = env_lock::read_static_env("CRUCIBLE_APP_POOL_THREADS") {
+        if let Ok(n) = raw.trim().parse::<usize>() {
+            if n > 0 {
+                return n.min(64);
+            }
+        }
+    }
     let cpu = std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(2);
@@ -836,6 +1172,20 @@ fn generic_pool_threads() -> usize {
 
 fn serial_engine(engine: &str) -> bool {
     matches!(engine, "rack" | "psgi")
+}
+
+/// c/go/rust 是否在请求线程内联执行（§22.4.2 native_inline）。
+///
+/// 默认**开**；`CRUCIBLE_APP_INLINE=0` 退回进程池（运维/回归开关）。
+/// 其它引擎保持原线程池语义（解释器不是线程安全的 / 需要临时 env 锁）。
+fn inline_engine(engine: &str) -> bool {
+    if !matches!(engine, "c" | "rust" | "go") {
+        return false;
+    }
+    !matches!(
+        env_lock::read_static_env("CRUCIBLE_APP_INLINE").as_deref(),
+        Some("0")
+    )
 }
 
 impl EnginePool {
@@ -951,25 +1301,26 @@ fn dedicated_pool_threads(engine: &str) -> Option<usize> {
 
 // ---------------------------------------------------------------- dlopen / exec
 
-fn load_engine(engine: &str, lib_path: &PathBuf) -> Result<Arc<EngineLib>> {
-    let key = lib_path.to_string_lossy().into_owned();
+fn load_engine(engine: &str, lib_path: &Path) -> Result<Arc<EngineLib>> {
+    // 热路径**不分配**：HashMap<String, _> 支持用 &str 查询。
+    let key = lib_path.to_string_lossy();
     // 快路径：已装载
     {
         let map = LIBS.lock();
-        if let Some(l) = map.get(&key) {
+        if let Some(l) = map.get(key.as_ref()) {
             return Ok(Arc::clone(l));
         }
     }
     // 慢路径：按路径串行化，避免并发重复 dlopen + 重复 appengine_init。
     let path_lock = {
         let mut locks = LOAD_LOCKS.lock();
-        Arc::clone(locks.entry(key.clone()).or_default())
+        Arc::clone(locks.entry(key.to_string()).or_default())
     };
     let _guard = path_lock.lock();
     // 等到锁之后必须复查：这段时间里另一个线程可能已经装载完成。
     {
         let map = LIBS.lock();
-        if let Some(l) = map.get(&key) {
+        if let Some(l) = map.get(key.as_ref()) {
             return Ok(Arc::clone(l));
         }
     }
@@ -1083,7 +1434,7 @@ fn load_engine(engine: &str, lib_path: &PathBuf) -> Result<Arc<EngineLib>> {
     }
     let lib = Arc::new(EngineLib {
         engine: engine.to_string(),
-        path: key.clone(),
+        path: key.to_string(),
         // libloading 库句柄 (NonNull<c_void> + Drop dlclose)
         _lib: lib,
         init,
@@ -1092,16 +1443,48 @@ fn load_engine(engine: &str, lib_path: &PathBuf) -> Result<Arc<EngineLib>> {
         shutdown,
         env_free,
     });
-    LIBS.lock().insert(key, Arc::clone(&lib));
+    LIBS.lock().insert(key.into_owned(), Arc::clone(&lib));
     Ok(lib)
+}
+
+/// 每线程复用的 ABI 字符串暂存（避免每请求 ~9 次 malloc/free）。
+///
+/// 安全性：一次调用内先 reserve 到总需求 ⇒ 追加过程中不会 realloc，指针在
+/// `(lib.exec)` 调用期间保持有效；ABI 约定引擎不得保留这些指针。
+thread_local! {
+    static ABI_SCRATCH: std::cell::RefCell<Vec<u8>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// 把 `parts` 拼成 NUL 结尾的 C 字符串序列，回调里给出指针表。
+fn with_abi_cstrings<R>(parts: [&[u8]; 10], f: impl FnOnce([*const c_char; 10]) -> R) -> Result<R> {
+    if parts.iter().any(|p| p.contains(&0u8)) {
+        bail!("engine argument contains NUL");
+    }
+    ABI_SCRATCH.with(|cell| {
+        let mut buf = cell.borrow_mut();
+        buf.clear();
+        let need: usize = parts.iter().map(|p| p.len() + 1).sum();
+        if buf.capacity() < need {
+            buf.reserve(need);
+        }
+        let mut ptrs = [std::ptr::null(); 10];
+        for (i, part) in parts.iter().enumerate() {
+            // capacity 已保证 ⇒ extend 不会搬家，指针有效。
+            ptrs[i] = unsafe { buf.as_ptr().add(buf.len()) } as *const c_char;
+            buf.extend_from_slice(part);
+            buf.push(0);
+        }
+        Ok(f(ptrs))
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
 fn call_exec(
     lib: &EngineLib,
     engine: &str,
-    script: &PathBuf,
-    docroot: &PathBuf,
+    script: &Path,
+    docroot: &Path,
     method: &str,
     path: &str,
     query: &str,
@@ -1113,115 +1496,140 @@ fn call_exec(
     env_vars: &[(String, String)],
     headers: &[u8],
 ) -> Result<ExecOutcome> {
-    let c_script = CString::new(script.to_string_lossy().as_bytes())?;
-    let c_doc = CString::new(docroot.to_string_lossy().as_bytes())?;
-    let c_method = CString::new(method)?;
-    let c_path = CString::new(path)?;
-    let c_query = CString::new(query)?;
-    let c_ct = CString::new(content_type)?;
-    let c_remote = CString::new(peer.ip().to_string())?;
-    let c_server = CString::new(server_name)?;
+    let _p_call = prof::span(prof::S_CALL_TOTAL);
+    let p_prep = prof::span(prof::S_CALL_PREP);
     // P1-1：extra 语义升级——带 .env 变量时传 JSON {"engine":...,"env":{...}}，
     // 由 libs/app-engines/common 解析注入执行环境；无变量时保持 legacy 纯引擎名
     //（现有 C 侧 common 不消费 extra，旧插件不受影响）。
-    let extra_s: String = if env_vars.is_empty() {
-        engine.to_string()
+    let extra_json: Option<String> = if env_vars.is_empty() {
+        None
     } else {
         let mut env_obj = serde_json::Map::new();
         for (k, v) in env_vars {
             env_obj.insert(k.clone(), serde_json::Value::String(v.clone()));
         }
-        serde_json::json!({"engine": engine, "env": serde_json::Value::Object(env_obj)})
-            .to_string()
+        Some(
+            serde_json::json!({"engine": engine, "env": serde_json::Value::Object(env_obj)})
+                .to_string(),
+        )
     };
-    let c_extra = CString::new(extra_s)?;
-    // 请求头块：空块传 NULL（ABI 允许），否则 NUL 结尾的 "Name: Value\r\n" 块。
-    // request_headers_block 已滤掉 NUL/CR/LF，CString::new 不会失败。
-    let c_headers = if headers.is_empty() {
-        None
-    } else {
-        Some(CString::new(headers)?)
+    let extra: &[u8] = match &extra_json {
+        Some(s) => s.as_bytes(),
+        None => engine.as_bytes(),
     };
-    let mut out = AppEngineResult {
-        status: 500,
-        headers: std::ptr::null_mut(),
-        headers_len: 0,
-        body: std::ptr::null_mut(),
-        body_len: 0,
-        error: std::ptr::null_mut(),
+    // Path 在 linux/openbsd 上通常就是 UTF-8：Cow::Borrowed，无分配。
+    let script_s = script.to_string_lossy();
+    let docroot_s = docroot.to_string_lossy();
+    let mut ipbuf = [0u8; 64];
+    let ip_len = {
+        use std::io::Write as _;
+        let mut cur = std::io::Cursor::new(&mut ipbuf[..]);
+        let _ = write!(cur, "{}", peer.ip());
+        cur.position() as usize
     };
+    let parts: [&[u8]; 10] = [
+        script_s.as_bytes(),
+        docroot_s.as_bytes(),
+        method.as_bytes(),
+        path.as_bytes(),
+        query.as_bytes(),
+        content_type.as_bytes(),
+        &ipbuf[..ip_len],
+        server_name.as_bytes(),
+        extra,
+        headers,
+    ];
     let (body_ptr, body_len) = if body.is_empty() {
         (std::ptr::null(), 0usize)
     } else {
         (body.as_ptr(), body.len())
     };
-    unsafe {
-        let rc = (lib.exec)(
-            c_script.as_ptr(),
-            c_doc.as_ptr(),
-            c_method.as_ptr(),
-            c_path.as_ptr(),
-            c_query.as_ptr(),
-            c_ct.as_ptr(),
-            body_ptr,
-            body_len,
-            c_remote.as_ptr(),
-            c_server.as_ptr(),
-            port as c_int,
-            c_extra.as_ptr(),
-            c_headers.as_ref().map_or(std::ptr::null(), |c| c.as_ptr()),
-            &mut out,
-        );
-        if rc != 0 {
-            let msg = if !out.error.is_null() {
-                CStr::from_ptr(out.error).to_string_lossy().into_owned()
+    drop(p_prep);
+    let p_engine = prof::span(prof::S_ENGINE_CALL);
+    let out = with_abi_cstrings(parts, |p| -> Result<ExecOutcome> {
+        let mut out = AppEngineResult {
+            status: 500,
+            headers: std::ptr::null_mut(),
+            headers_len: 0,
+            body: std::ptr::null_mut(),
+            body_len: 0,
+            error: std::ptr::null_mut(),
+        };
+        unsafe {
+            let rc = (lib.exec)(
+                p[0],
+                p[1],
+                p[2],
+                p[3],
+                p[4],
+                p[5],
+                body_ptr,
+                body_len,
+                p[6],
+                p[7],
+                port as c_int,
+                p[8],
+                if headers.is_empty() {
+                    std::ptr::null()
+                } else {
+                    p[9]
+                },
+                &mut out,
+            );
+            drop(p_engine);
+            let _p_result = prof::span(prof::S_CALL_RESULT);
+            if rc != 0 {
+                let msg = if !out.error.is_null() {
+                    CStr::from_ptr(out.error).to_string_lossy().into_owned()
+                } else {
+                    format!("exec rc={rc}")
+                };
+                (lib.free)(&mut out);
+                bail!("{msg}");
+            }
+            // rc == 0 表示「引擎服务过这个请求」，但引擎**仍可能**填了 error：典型是
+            // WSGI/ASGI/uWSGI 的「应用抛异常 → 500 + 固定文本」，traceback **只在 error 里**
+            // （不再回显给客户端 —— 那会泄露绝对路径与源码行）。这类细节必须进本地日志，
+            // 否则排障就断了；而它又是**每请求一条**、可被对端驱动（脚本总是抛异常即可）
+            // ⇒ 走同一套按引擎的时间节流。
+            let engine_reported = if out.error.is_null() {
+                None
             } else {
-                format!("exec rc={rc}")
+                Some(CStr::from_ptr(out.error).to_string_lossy().into_owned())
             };
+            let headers = parse_result_headers(out.headers, out.headers_len);
+            // ABI 没有 body 容量字段，宿主无法真正校验 `body_len`（引擎写错长度时
+            // `from_raw_parts` 会越界读堆内存并把内容发给客户端）。这里至少加一条
+            // 上界：超过上游响应上限的长度一定是 bug，宁可 502 也不能跳进越界读。
+            let body_out = if out.body.is_null() || out.body_len == 0 {
+                Bytes::new()
+            } else if out.body_len > crate::server::h1::UPSTREAM_BODY_CAP {
+                let n = out.body_len;
+                (lib.free)(&mut out);
+                bail!(
+                    "engine {engine} returned body_len {n} > {} (ABI violation)",
+                    crate::server::h1::UPSTREAM_BODY_CAP
+                );
+            } else {
+                Bytes::copy_from_slice(std::slice::from_raw_parts(out.body, out.body_len))
+            };
+            let status = out.status;
             (lib.free)(&mut out);
-            bail!("{msg}");
+            if let Some(msg) = engine_reported {
+                crate::server::log_throttle::warn_every(
+                    &format!("engine-app-err::{engine}"),
+                    std::time::Duration::from_secs(60),
+                    &format!("{engine}: 应用级错误（客户端只收到固定文本，细节仅本地）: {msg}"),
+                );
+            }
+            Ok(ExecOutcome {
+                status,
+                headers,
+                body: body_out,
+            })
         }
-        // rc == 0 表示「引擎服务过这个请求」，但引擎**仍可能**填了 error：典型是
-        // WSGI/ASGI/uWSGI 的「应用抛异常 → 500 + 固定文本」，traceback **只在 error 里**
-        // （不再回显给客户端 —— 那会泄露绝对路径与源码行）。这类细节必须进本地日志，
-        // 否则排障就断了；而它又是**每请求一条**、可被对端驱动（脚本总是抛异常即可）
-        // ⇒ 走同一套按引擎的时间节流。
-        let engine_reported = if out.error.is_null() {
-            None
-        } else {
-            Some(CStr::from_ptr(out.error).to_string_lossy().into_owned())
-        };
-        let headers = parse_result_headers(out.headers, out.headers_len);
-        // ABI 没有 body 容量字段，宿主无法真正校验 `body_len`（引擎写错长度时
-        // `from_raw_parts` 会越界读堆内存并把内容发给客户端）。这里至少加一条
-        // 上界：超过上游响应上限的长度一定是 bug，宁可 502 也不能跳进越界读。
-        let body_out = if out.body.is_null() || out.body_len == 0 {
-            Bytes::new()
-        } else if out.body_len > crate::server::h1::UPSTREAM_BODY_CAP {
-            let n = out.body_len;
-            (lib.free)(&mut out);
-            bail!(
-                "engine {engine} returned body_len {n} > {} (ABI violation)",
-                crate::server::h1::UPSTREAM_BODY_CAP
-            );
-        } else {
-            Bytes::copy_from_slice(std::slice::from_raw_parts(out.body, out.body_len))
-        };
-        let status = out.status;
-        (lib.free)(&mut out);
-        if let Some(msg) = engine_reported {
-            crate::server::log_throttle::warn_every(
-                &format!("engine-app-err::{engine}"),
-                std::time::Duration::from_secs(60),
-                &format!("{engine}: 应用级错误（客户端只收到固定文本，细节仅本地）: {msg}"),
-            );
-        }
-        Ok(ExecOutcome {
-            status,
-            headers,
-            body: body_out,
-        })
-    }
+    })?;
+    out
 }
 
 /// 解析 ABI headers 块（"Name: value\r\n" NUL 结尾），带注入净化。
