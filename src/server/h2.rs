@@ -17,6 +17,7 @@ use h2::{
 };
 use http::{Request, Response, StatusCode};
 use http_body_util::{BodyExt, Full};
+use hyper::body::Body as _;
 use std::io::{self, Write};
 use std::future::Future;
 use std::net::SocketAddr;
@@ -79,6 +80,226 @@ pub const H2_INITIAL_WINDOW_SIZE: u32 = 1024 * 1024;
 /// （一个连接反复发巨大头部即可），64KiB 对正常请求足够宽裕，超限 h2 会以
 /// ENHANCE_YOUR_CALM/压缩错误终止该流而不是吃掉内存。
 pub const H2_MAX_HEADER_LIST_SIZE: u32 = 64 * 1024;
+
+/// 热路径开关（`CRUCIBLE_H2_*`；默认全开，`=0` 可退回旧行为做同二进制对照）。
+fn h2_flag(name: &str, default_on: bool) -> bool {
+    match crate::server::apps::env_lock::read_static_env(name).as_deref() {
+        Some("0") => false,
+        Some("1") => true,
+        _ => default_on,
+    }
+}
+
+/// h2 静态响应快车道。
+///
+/// 背景：`static_files::FAST_CACHE`（h1 快车道）只被 `static_files::serve`（hyper/h1）
+/// 使用，**h2/h3 的 `serve_simple` 从不查它**。于是同一个静态文件在 h1 上每请求只做
+/// 一次 `lstat` 复核，在 h2 上却每请求重走 resolve_path（锁+查表）→ `stat` →
+/// `mime_guess` → `validators`（ETag/HTTP-date 格式化）→ `Response` 头组装 → 读缓存。
+///
+/// 本缓存的语义与 h1 的 `FAST_CACHE` 对齐：
+/// - 条目只由**完整路径成功产出 200 之后**填充（`h2_fast_store` 还会把文件字节与响应体
+///   逐字节比对一次，确保缓存的是同一个文件内容）；
+/// - 命中只做一次 `lstat` 复核 + `(len, dev, ino, mtime, ctime)` 指纹比较，符号链接/
+///   非普通文件/指纹变化一律回完整路径；
+/// - TTL（[`H2_FAST_TTL`]）与 `CANON_TTL` 同窗口，过期即重走完整路径；
+/// - 键 = (docroot, 改写后的 URL path)；只对无 Range/If-* 的 GET、apps/file_open 未配置、
+///   路径无 `%`/`..`/隐藏段的请求生效。
+const H2_FAST_TTL: Duration = Duration::from_secs(2);
+const H2_FAST_CAP: usize = 256;
+/// 全进程条目上限（每条目最多持有一个 fd；配置反复换 root 时旧条目会留下，
+/// 这里给 fd 用量一个硬上界，超限整体清空）。
+const H2_FAST_MAX_TOTAL: usize = 1024;
+const H2_FAST_MAX_FILE: u64 = 256 * 1024;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct H2FastId {
+    len: u64,
+    dev: u64,
+    ino: u64,
+    nlink: u64,
+    mtime: (i64, i64),
+    ctime: (i64, i64),
+}
+
+fn h2_fast_id(m: &std::fs::Metadata) -> H2FastId {
+    use std::os::unix::fs::MetadataExt;
+    H2FastId {
+        len: m.len(),
+        dev: m.dev(),
+        ino: m.ino(),
+        nlink: m.nlink(),
+        mtime: (m.mtime(), m.mtime_nsec()),
+        ctime: (m.ctime(), m.ctime_nsec()),
+    }
+}
+
+struct H2FastEntry {
+    fs_path: std::path::PathBuf,
+    /// 填充时打开的只读 fd：命中用 `fstat(fd)` 复核，比每次 `lstat(path)` 便宜
+    /// （h1 快车道同做法）。fd 钉住的是填充时的 inode；无法打开时此条目不入缓存。
+    file: Option<Arc<std::fs::File>>,
+    id: H2FastId,
+    data: Bytes,
+    parts: http::response::Parts,
+    at: std::time::Instant,
+}
+
+static H2_FAST: once_cell::sync::Lazy<
+    parking_lot::Mutex<
+        std::collections::HashMap<
+            std::path::PathBuf,
+            std::collections::HashMap<String, Arc<H2FastEntry>>,
+        >,
+    >,
+> = once_cell::sync::Lazy::new(|| parking_lot::Mutex::new(std::collections::HashMap::new()));
+
+#[inline]
+fn h2_fast_eligible<T>(req: &Request<T>, lc: &ListenerConfig) -> bool {
+    if req.method() != http::Method::GET || !lc.apps.is_empty() || !lc.file_open.is_empty() {
+        return false;
+    }
+    let p = req.uri().path();
+    // `%` 解码后可能出现 `..`/隐藏段/`.upload.part`；裸 `..`/隐藏段由完整路径判。
+    // 这里只是「宁可少走快车道」的前置过滤，不是安全判据（实际身份由内层 fd/lstat 保）。
+    if p.contains('%') || p.contains("..") || p.contains("/.") {
+        return false;
+    }
+    for seg in p.split('/') {
+        if seg.is_empty() || !seg.starts_with('.') {
+            continue;
+        }
+        if seg.eq_ignore_ascii_case(".well-known") {
+            continue;
+        }
+        return false;
+    }
+    let h = req.headers();
+    !(h.contains_key(http::header::RANGE)
+        || h.contains_key(http::header::IF_MATCH)
+        || h.contains_key(http::header::IF_NONE_MATCH)
+        || h.contains_key(http::header::IF_MODIFIED_SINCE)
+        || h.contains_key(http::header::IF_UNMODIFIED_SINCE)
+        || h.contains_key(http::header::IF_RANGE))
+}
+
+/// 该 URL 在 docroot 下对应的候选文件（目录 URL 取 `index.html`/`index.htm`）。
+/// 找不到普通文件（或尾段是符号链接）就返回 None —— 不缓存，不改变行为。
+fn h2_fast_candidate(root: &std::path::Path, url_path: &str) -> Option<std::path::PathBuf> {
+    let rel = url_path.trim_start_matches('/');
+    let base = root.join(rel);
+    let check = |p: &std::path::Path| -> bool {
+        match std::fs::symlink_metadata(p) {
+            Ok(m) => m.is_file() && !m.file_type().is_symlink(),
+            Err(_) => false,
+        }
+    };
+    if url_path.ends_with('/') {
+        for name in ["index.html", "index.htm"] {
+            let p = base.join(name);
+            if check(&p) {
+                return Some(p);
+            }
+        }
+        None
+    } else if check(&base) {
+        Some(base)
+    } else {
+        None
+    }
+}
+
+fn h2_fast_lookup(root: &std::path::Path, url_path: &str) -> Option<Response<Bytes>> {
+    let e = {
+        let cache = H2_FAST.lock();
+        cache.get(root)?.get(url_path)?.clone()
+    };
+    if e.at.elapsed() >= H2_FAST_TTL {
+        return None;
+    }
+    match &e.file {
+        // fd 复核：fstat 只认 inode，不受路径改名/替换影响；nlink 能看见
+        // rename-over（旧目标被 unlink）与 unlink。父目录被改名走 TTL 兜底。
+        Some(f) => {
+            let m = f.metadata().ok()?;
+            if !m.is_file() || h2_fast_id(&m) != e.id {
+                return None;
+            }
+        }
+        // 无 fd（打开失败/关闭开关）：回 lstat 路径（与 h1 `serve_fast` 同判据）。
+        None => {
+            let m = std::fs::symlink_metadata(&e.fs_path).ok()?;
+            if m.file_type().is_symlink() || !m.is_file() || h2_fast_id(&m) != e.id {
+                return None;
+            }
+        }
+    }
+    Some(Response::from_parts(e.parts.clone(), e.data.clone()))
+}
+
+/// 完整路径产出 200 后填充。只缓存小文件、非 FileSource、无扩展的普通响应。
+fn h2_fast_store(root: &std::path::Path, url_path: &str, resp: &Response<Bytes>) {
+    if resp.status() != StatusCode::OK
+        || resp
+            .extensions()
+            .get::<crate::server::static_files::FileSource>()
+            .is_some()
+    {
+        return;
+    }
+    let data = resp.body();
+    if data.is_empty() || data.len() as u64 > H2_FAST_MAX_FILE {
+        return;
+    }
+    let Some(fs_path) = h2_fast_candidate(root, url_path) else {
+        return;
+    };
+    let Ok(m) = std::fs::symlink_metadata(&fs_path) else {
+        return;
+    };
+    if !m.is_file() || m.len() != data.len() as u64 {
+        return;
+    }
+    // 缓存体必须与磁盘内容逐字节一致（fill 只在每 TTL 一次，代价可忽略）。
+    // 否则「状态相同的另一个文件」会被配上错误的响应体/验证器。
+    // 读的也是**同一个 fd**（fstat/读取都针对这个 inode），不会出现
+    // 「读文件 A、记录文件 B 的指纹」的竞态配对。
+    let file = match std::fs::File::open(&fs_path) {
+        Ok(f) => f,
+        Err(_) => return,
+    };
+    use std::io::Read;
+    let mut buf = Vec::with_capacity(data.len());
+    if (&file).read_to_end(&mut buf).is_err() || buf != data.as_ref() {
+        return;
+    }
+    let m2 = match file.metadata() {
+        Ok(m) => m,
+        Err(_) => return,
+    };
+    if h2_fast_id(&m) != h2_fast_id(&m2) {
+        return;
+    }
+    let (parts, _) = resp.clone().into_parts();
+    let e = H2FastEntry {
+        fs_path,
+        file: Some(Arc::new(file)),
+        id: h2_fast_id(&m2),
+        data: data.clone(),
+        parts,
+        at: std::time::Instant::now(),
+    };
+    let mut cache = H2_FAST.lock();
+    let total: usize = cache.values().map(|m| m.len()).sum();
+    if total >= H2_FAST_MAX_TOTAL {
+        cache.clear();
+    }
+    let inner = cache.entry(root.to_path_buf()).or_default();
+    if inner.len() >= H2_FAST_CAP {
+        inner.clear();
+    }
+    inner.insert(url_path.to_string(), Arc::new(e));
+}
 
 pub async fn serve(
     stream: TcpStream,
@@ -161,24 +382,66 @@ where
     let conn_inflight = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let mut idle = tokio::time::sleep(H2_IDLE_TIMEOUT);
     tokio::pin!(idle);
+    // 每连接的流任务集合（`CRUCIBLE_H2_LOCALTASKS=1`）：请求 future 直接在连接任务里
+    // 用 `FuturesUnordered` 驱动，不再 `tokio::spawn` 到全局调度器。
+    //
+    // 动机：spawn 模型下每个请求至少产生「连接任务 → 流任务」+「流任务 → 连接任务」
+    // 两次跨任务唤醒；`h2` crate 的 `conn.accept()`/`send_response` 共享同一连接状态，
+    // 在单连接内用本地 future 集合驱动可以省掉这两次唤醒与一次任务分配，同时**保留**
+    // 多路复用（Pending 的 future 不会阻塞同连接其它流）。
+    // `ConnInflight` 计数与全局配额语义不变（配额仍在 future 内获取）。
+    let local_mode = h2_flag("CRUCIBLE_H2_LOCALTASKS", true);
+    let mut local: futures_util::stream::FuturesUnordered<
+        std::pin::Pin<Box<dyn Future<Output = ()> + Send>>,
+    > = futures_util::stream::FuturesUnordered::new();
     loop {
-        let accepted = tokio::select! {
-            r = conn.accept() => r,
-            _ = &mut idle => {
-                // 只有**本连接没有在飞流**时才关：否则长请求（大文件代理/上传）会在
-                // 「很久没有新请求头」时被误杀。有流在跑就重置计时继续等。
-                if conn_inflight.load(std::sync::atomic::Ordering::Relaxed) == 0 {
-                    log::info!(
-                        "h2 peer={peer}: 空闲 {H2_IDLE_TIMEOUT:?} 未读到完整请求头，关闭连接"
-                    );
-                    break;
+        let accepted = if local_mode {
+            tokio::select! {
+                r = conn.accept() => r,
+                _ = futures_util::StreamExt::next(&mut local), if !local.is_empty() => {
+                    idle.as_mut().reset(tokio::time::Instant::now() + H2_IDLE_TIMEOUT);
+                    continue;
                 }
-                idle.as_mut().reset(tokio::time::Instant::now() + H2_IDLE_TIMEOUT);
-                continue;
+                _ = &mut idle => {
+                    if conn_inflight.load(std::sync::atomic::Ordering::Relaxed) == 0 {
+                        log::info!(
+                            "h2 peer={peer}: 空闲 {H2_IDLE_TIMEOUT:?} 未读到完整请求头，关闭连接"
+                        );
+                        break;
+                    }
+                    idle.as_mut().reset(tokio::time::Instant::now() + H2_IDLE_TIMEOUT);
+                    continue;
+                }
+            }
+        } else {
+            tokio::select! {
+                r = conn.accept() => r,
+                _ = &mut idle => {
+                    // 只有**本连接没有在飞流**时才关：否则长请求（大文件代理/上传）会在
+                    // 「很久没有新请求头」时被误杀。有流在跑就重置计时继续等。
+                    if conn_inflight.load(std::sync::atomic::Ordering::Relaxed) == 0 {
+                        log::info!(
+                            "h2 peer={peer}: 空闲 {H2_IDLE_TIMEOUT:?} 未读到完整请求头，关闭连接"
+                        );
+                        break;
+                    }
+                    idle.as_mut().reset(tokio::time::Instant::now() + H2_IDLE_TIMEOUT);
+                    continue;
+                }
             }
         };
         idle.as_mut().reset(tokio::time::Instant::now() + H2_IDLE_TIMEOUT);
-        let Some(result) = accepted else { break };
+        let Some(result) = accepted else {
+            if local_mode && !local.is_empty() {
+                // 连接收尾（GOAWAY 完成 / 对端关闭）：把已在跑的流跑完（语义与
+                // spawn 模型一致 —— 那边任务不会因为 accept 循环退出而被取消）。
+                let drain = async {
+                    while futures_util::StreamExt::next(&mut local).await.is_some() {}
+                };
+                let _ = tokio::time::timeout(Duration::from_secs(10), drain).await;
+            }
+            break;
+        };
         let (request, mut respond) = result?;
         // RFC 9113 §8.2.2：connection-specific 字段（`connection` / `transfer-encoding` /
         // `upgrade` / `keep-alive` / `proxy-connection`）与 `te != trailers` 必须判 malformed。
@@ -211,53 +474,58 @@ where
         let sem = H2_INFLIGHT.clone();
         conn_inflight.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let conn_inflight_c = Arc::clone(&conn_inflight);
-        tokio::spawn(async move {
+        let fut = async move {
             // 守卫覆盖任务内**所有**返回路径（含提前 return），保证计数归还。
             let _inflight = ConnInflight(conn_inflight_c);
+            // 本请求的配置快照：admin 前置门、handle_h2 的路由判定、完成侧访问日志
+            // 共用同一份（此前每请求取 3 次 `RwLock` 读 + `Arc` 克隆）。
+            let snap = live.snapshot();
             // P0（DoS）：配额**绝不能**在 accept 循环里 await —— await 期间 `conn` 不被
             // poll，连接驱动停摆（回应写不出、WINDOW_UPDATE 发不出、其他流全部卡住），
             // 一条恶意连接持满 256 个慢速流即可让**所有** h2 连接失去响应。
             // 改成任务内获取 + 限时等待：拿不到配额就快速回 503，连接继续被驱动，
             // 正常突发（短暂排队）仍按原语义处理。
-            let _permit = match tokio::time::timeout(
-                H2_INFLIGHT_WAIT,
-                sem.acquire_owned(),
-            )
-            .await
-            {
-                Ok(Ok(p)) => p,
-                _ => {
-                    let t0 = std::time::Instant::now();
-                    let mut b = Response::builder()
-                        .status(StatusCode::SERVICE_UNAVAILABLE)
-                        .header(http::header::RETRY_AFTER, "1");
-                    b = b.header(http::header::CONTENT_TYPE, "text/plain; charset=utf-8");
-                    crate::server::access_log::log_response(
-                        &live,
-                        peer,
-                        "h2",
-                        request.method().as_str(),
-                        request.uri().path(),
-                        StatusCode::SERVICE_UNAVAILABLE.as_u16(),
-                        None,
-                        t0.elapsed(),
-                        "busy",
-                        lc.access_log.as_ref(),
-                    );
-                    // 不读 body 直接回包：流关闭时 h2 会自动归还连接级窗口
-                    // （recv.rs release_closed_capacity），不会占住连接窗口。
-                    if let Ok(mut send) = respond.send_response(b.body(()).unwrap(), false) {
-                        let _ = send.send_data(Bytes::from_static(b"server busy"), true);
+            //
+            // 快车道：配额通常在（无竞争时 `try_acquire_owned` 同步成功），此时**不**
+            // 注册超时计时器 —— `tokio::time::timeout` 每请求都会建一个 `Sleep`（定时器
+            // 轮注册+注销），在 10 万级 rps 下是纯开销。只有真正排队时才走限时等待。
+            let _permit = match sem.clone().try_acquire_owned() {
+                Ok(p) => p,
+                Err(_) => match tokio::time::timeout(H2_INFLIGHT_WAIT, sem.acquire_owned()).await
+                {
+                    Ok(Ok(p)) => p,
+                    _ => {
+                        let t0 = std::time::Instant::now();
+                        let mut b = Response::builder()
+                            .status(StatusCode::SERVICE_UNAVAILABLE)
+                            .header(http::header::RETRY_AFTER, "1");
+                        b = b.header(http::header::CONTENT_TYPE, "text/plain; charset=utf-8");
+                        crate::server::access_log::log_response_with(
+                            &snap,
+                            peer,
+                            "h2",
+                            request.method().as_str(),
+                            request.uri().path(),
+                            StatusCode::SERVICE_UNAVAILABLE.as_u16(),
+                            None,
+                            t0.elapsed(),
+                            "busy",
+                            lc.access_log.as_ref(),
+                        );
+                        // 不读 body 直接回包：流关闭时 h2 会自动归还连接级窗口
+                        // （recv.rs release_closed_capacity），不会占住连接窗口。
+                        if let Ok(mut send) = respond.send_response(b.body(()).unwrap(), false) {
+                            let _ = send.send_data(Bytes::from_static(b"server busy"), true);
+                        }
+                        return;
                     }
-                    return;
-                }
+                },
             };
             let (parts, body) = request.into_parts();
             // 与 h1 同序的 admin 前置门（见 basic_auth::admin_gate）：**先判鉴权/CSRF、
             // 再收 body**。否则不带凭据的并发 POST 每个都能占住 REQUEST_BODY_CAP（8MiB）
             // 的缓冲，等于不用通过鉴权就能放大内存。
             {
-                let snap = live.snapshot();
                 if crate::server::access::is_admin_path(&snap.admin.path, parts.uri.path()) {
                     let t0 = std::time::Instant::now();
                     use crate::server::basic_auth::{admin_gate_path, retry_after_secs, AdminGate};
@@ -297,8 +565,8 @@ where
                         // 安全拒绝也要落访问日志（h1 的同类分支在 handle_request 完成侧统一记，
                         // 这里提前 return 会绕过下面那段日志 —— 否则爆破/扫描命中的这条路径
                         // 在 access log 里完全不可见）。
-                        crate::server::access_log::log_response(
-                            &live,
+                        crate::server::access_log::log_response_with(
+                            &snap,
                             peer,
                             "h2",
                             parts.method.as_str(),
@@ -358,6 +626,11 @@ where
                     parts,
                     http_body_util::combinators::BoxBody::new(H2RecvBody::new(body)),
                 )
+            } else if body.is_end_stream() {
+                // END_STREAM 已在 HEADERS 上（GET/HEAD 与空体 POST 的常态）：没有 body
+                // 可读。跳过 `H2RecvBody`（每请求一个 box + 一个 60s `Sleep` 定时器）和
+                // 一次必然返回 None 的 collect —— 语义完全一致（空 body）。
+                Request::from_parts(parts, bytes_body(Bytes::new()))
             } else {
                 let boxed = Request::from_parts(
                     parts,
@@ -387,7 +660,7 @@ where
             let is_https = lc.ssl.is_some();
             // §16.12：每站访问日志覆盖也要在 move 之前取出（完成侧日志在下面）。
             let access_override = lc.access_log.clone();
-            let mut response = handle_h2(req, live.clone(), lc, peer).await;
+            let mut response = handle_h2(req, live.clone(), lc, peer, snap.clone()).await;
             // 访问日志用的路径：与旧实现一致，记**改写前**的请求路径（改写发生在
             // handle_h2 内部的副本上，这里拿不到也不需要）。
             let path = pre_path;
@@ -413,8 +686,8 @@ where
                 .map(|t| t.0)
                 .unwrap_or("http");
             // P1-11：完成侧全字段访问日志；h2 侧拿得到精确响应字节数。
-            crate::server::access_log::log_response(
-                &live,
+            crate::server::access_log::log_response_with(
+                &snap,
                 peer,
                 "h2",
                 &method,
@@ -532,7 +805,12 @@ where
                     let _ = send.send_data(data, true);
                 }
             }
-        });
+        };
+        if local_mode {
+            local.push(Box::pin(fut));
+        } else {
+            tokio::spawn(fut);
+        }
     }
     Ok(())
 }
@@ -580,6 +858,45 @@ async fn collect_bytes(
     cap: usize,
 ) -> Result<Request<Bytes>, Response<Bytes>> {
     let (parts, mut body) = req.into_parts();
+    // 已知长度且已完整就绪的 body（`Full<Bytes>`：空体 GET / 外层已收齐的请求）不需要
+    // 空闲超时定时器 —— 每帧一次 `tokio::time::timeout` 会建/销一个 `Sleep`，在 10 万级
+    // rps 下是纯开销。`H2RecvBody`（流式上传）报告的 size_hint 不是 exact，仍走限时路径。
+    if let Some(n) = body.size_hint().exact() {
+        if n > cap as u64 {
+            return Err(plain(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "request body too large for this protocol (single-request limit 8MiB); \
+use chunked uploads (Content-Range) or HTTP/1.1 for larger bodies",
+            ));
+        }
+        if n == 0 {
+            return Ok(Request::from_parts(parts, Bytes::new()));
+        }
+        let mut buf: Vec<u8> = Vec::with_capacity(n as usize);
+        loop {
+            match body.frame().await {
+                Some(Ok(f)) => {
+                    if let Some(data) = f.data_ref() {
+                        if buf.len() + data.len() > cap {
+                            return Err(plain(
+                                StatusCode::PAYLOAD_TOO_LARGE,
+                                "request body too large for this protocol \
+(single-request limit 8MiB); use chunked uploads (Content-Range) or HTTP/1.1 \
+for larger bodies",
+                            ));
+                        }
+                        buf.extend_from_slice(data);
+                    }
+                }
+                Some(Err(e)) => {
+                    log::debug!("h2 body read: {e}");
+                    return Err(plain(StatusCode::BAD_REQUEST, "request body read failed"));
+                }
+                None => break,
+            }
+        }
+        return Ok(Request::from_parts(parts, Bytes::from(buf)));
+    }
     let mut buf: Vec<u8> = Vec::new();
     loop {
         let frame = match tokio::time::timeout(H2_BODY_IDLE_TIMEOUT, body.frame()).await {
@@ -952,6 +1269,7 @@ async fn handle_h2(
     live: Arc<LiveConfig>,
     lc: ListenerConfig,
     peer: SocketAddr,
+    snap: Arc<crate::config::Config>,
 ) -> Response<Bytes> {
     use crate::server::static_files;
 
@@ -970,7 +1288,8 @@ async fn handle_h2(
     let path = req.uri().path().to_string();
     crate::server::telemetry::record_request();
 
-    let snap = live.snapshot();
+    // `snap` 由调用方（serve_io 的每请求任务）提供，完成侧访问日志复用同一份；
+    // 此前这里再取一次 `live.snapshot()` 纯属重复。
     // DoH 分流已下移到 ACL/限速之后（见下方），此处不再提前返回。
     if !crate::server::listener::ip_allowed(&snap.ip_access, &lc, peer) {
         return tag(
@@ -1175,83 +1494,92 @@ async fn handle_h2(
     }
 
     // page_rules: block/redirect(apply_simple) + rewrite(路径改写) + cache/header(响应头)
-    if let Some((status, location)) =
-        crate::server::page_rules::apply_simple(&lc, &path, &crate::server::page_rules::MatchCtx::from_request_with_peer(&req, peer.ip(), &lc))
-    {
-        if status == StatusCode::FORBIDDEN {
+    //
+    // 无规则（每站 + 全局都为空）时整段跳过：这几次调用虽然对空表很便宜，但仍要构造
+    // 3 个 `MatchCtx`、克隆 host（`host_snapshot` 一次 `String` 分配）、跑一遍
+    // `rewrite_path`/`scan_immediate`/`response_headers` 的空迭代。语义等价（无规则时
+    // 所有函数必然返回 None/空）。
+    let has_rules = !lc.page_rules.is_empty() || !lc.global_page_rules.is_empty();
+    if has_rules {
+        if let Some((status, location)) =
+            crate::server::page_rules::apply_simple(&lc, &path, &crate::server::page_rules::MatchCtx::from_request_with_peer(&req, peer.ip(), &lc))
+        {
+            if status == StatusCode::FORBIDDEN {
+                return tag(
+                    Response::builder()
+                        .status(status)
+                        .body(Bytes::from_static(b"blocked by page rule"))
+                        .unwrap(),
+                    "rule",
+                );
+            }
             return tag(
                 Response::builder()
                     .status(status)
-                    .body(Bytes::from_static(b"blocked by page rule"))
+                    .header(http::header::LOCATION, location)
+                    .body(Bytes::new())
                     .unwrap(),
                 "rule",
             );
         }
-        return tag(
-            Response::builder()
-                .status(status)
-                .header(http::header::LOCATION, location)
-                .body(Bytes::new())
-                .unwrap(),
-            "rule",
-        );
-    }
-    // §16.11：host 维度的 owned 快照（必须在下面的 rewrite 改 `uri_mut()` 前取，
-    // 见 `from_request_with_host` 的说明）。
-    let pr_host = crate::server::page_rules::host_snapshot(&req);
-    {
-        let pr_ctx = crate::server::page_rules::MatchCtx::from_request_with_peer(&req, peer.ip(), &lc);
-        if let Some(np) = crate::server::page_rules::rewrite_path(&lc, &path, &pr_ctx) {
-            let pq = match req.uri().query() {
-                Some(q) => format!("{np}?{q}"),
-                None => np,
-            };
-            if let Ok(u) = pq.parse() {
-                *req.uri_mut() = u;
+        // §16.11：host 维度的 owned 快照（必须在下面的 rewrite 改 `uri_mut()` 前取，
+        // 见 `from_request_with_host` 的说明）。
+        let pr_host = crate::server::page_rules::host_snapshot(&req);
+        {
+            let pr_ctx = crate::server::page_rules::MatchCtx::from_request_with_peer(&req, peer.ip(), &lc);
+            if let Some(np) = crate::server::page_rules::rewrite_path(&lc, &path, &pr_ctx) {
+                let pq = match req.uri().query() {
+                    Some(q) => format!("{np}?{q}"),
+                    None => np,
+                };
+                if let Ok(u) = pq.parse() {
+                    *req.uri_mut() = u;
+                }
             }
         }
-    }
-    // 改写后必须以新路径做后续判定与分发（同 h1 的修正：此前 pre/post 路径混用，
-    // 会导致 would_handle/would_proxy 与真正 handler 看到的路径不一致）。
-    let path = req.uri().path().to_string();
-    // host 快照必须在 `uri_mut()` 被换成相对形态**之前**取：h2 的 host 只存在于
-    // `:authority`（URI authority）里，客户端可以不发 Host 头 —— 改写后重建的 ctx
-    // 会拿不到 host，带 host 约束的 block/pass/header 规则静默不命中（h1 无此问题，
-    // 它的 Host 头始终在）。用快照保持三协议一致。
-    let pr_ctx = crate::server::page_rules::MatchCtx::from_request_with_host_and_peer(
-        &req,
-        pr_host.as_deref(),
-        peer.ip(),
-        &lc,
-    );
-    // P1-5：h1 的 pass_upstream（page rule pass 动作）在 h2 同样生效。
-    if let Some((murl, upstream)) = crate::server::page_rules::pass_upstream(&lc, &path, &pr_ctx) {
-        // proxy_page_rule 需要 h1 体类型（Bytes）：先收齐（≤8MiB）。
-        let req = match collect_bytes(req, REQUEST_BODY_CAP).await {
-            Ok(r) => r,
-            Err(resp) => return tag(resp, "proxy"),
-        };
-        let resp = crate::server::proxy::proxy_page_rule(
-            req.map(Full::new),
-            &murl,
-            &upstream,
+        // 改写后必须以新路径做后续判定与分发（同 h1 的修正：此前 pre/post 路径混用，
+        // 会导致 would_handle/would_proxy 与真正 handler 看到的路径不一致）。
+        let path = req.uri().path().to_string();
+        // host 快照必须在 `uri_mut()` 被换成相对形态**之前**取：h2 的 host 只存在于
+        // `:authority`（URI authority）里，客户端可以不发 Host 头 —— 改写后重建的 ctx
+        // 会拿不到 host，带 host 约束的 block/pass/header 规则静默不命中（h1 无此问题，
+        // 它的 Host 头始终在）。用快照保持三协议一致。
+        let pr_ctx = crate::server::page_rules::MatchCtx::from_request_with_host_and_peer(
+            &req,
+            pr_host.as_deref(),
             peer.ip(),
-            lc.ssl.is_some(),
-        )
-        .await;
-        return tag(collect_to_bytes(resp).await, "proxy");
-    }
-    let resp_mods = crate::server::page_rules::response_headers(&lc, &path, &pr_ctx);
-    let mut resp = h2_tail(req, live, lc, peer, path).await;
-    for (name, value) in resp_mods {
-        if let (Ok(nn), Ok(vv)) = (
-            name.parse::<http::header::HeaderName>(),
-            http::header::HeaderValue::from_str(&value),
-        ) {
-            resp.headers_mut().insert(nn, vv);
+            &lc,
+        );
+        // P1-5：h1 的 pass_upstream（page rule pass 动作）在 h2 同样生效。
+        if let Some((murl, upstream)) = crate::server::page_rules::pass_upstream(&lc, &path, &pr_ctx) {
+            // proxy_page_rule 需要 h1 体类型（Bytes）：先收齐（≤8MiB）。
+            let req = match collect_bytes(req, REQUEST_BODY_CAP).await {
+                Ok(r) => r,
+                Err(resp) => return tag(resp, "proxy"),
+            };
+            let resp = crate::server::proxy::proxy_page_rule(
+                req.map(Full::new),
+                &murl,
+                &upstream,
+                peer.ip(),
+                lc.ssl.is_some(),
+            )
+            .await;
+            return tag(collect_to_bytes(resp).await, "proxy");
         }
+        let resp_mods = crate::server::page_rules::response_headers(&lc, &path, &pr_ctx);
+        let mut resp = h2_tail(req, live, lc, peer, path).await;
+        for (name, value) in resp_mods {
+            if let (Ok(nn), Ok(vv)) = (
+                name.parse::<http::header::HeaderName>(),
+                http::header::HeaderValue::from_str(&value),
+            ) {
+                resp.headers_mut().insert(nn, vv);
+            }
+        }
+        return resp;
     }
-    resp
+    h2_tail(req, live, lc, peer, path).await
 }
 
 async fn h2_tail(
@@ -1312,8 +1640,22 @@ async fn h2_tail(
             "upload",
         );
     }
+    // 静态快车道（h2 侧，见 [`H2_FAST`] 的说明）：命中 = 1 次 lstat 复核 + 查表 + 克隆，
+    // 跳过 resolve_path/mime/validators/Response 组装。未命中/不满足条件走完整路径，
+    // 成功后再填充（每 TTL 一次）。
+    let fast_ok = h2_flag("CRUCIBLE_H2_FASTSTATIC", true) && h2_fast_eligible(&req, &lc);
+    if fast_ok {
+        if let Some(r) = h2_fast_lookup(&lc.root, req.uri().path()) {
+            return tag(r, "static");
+        }
+    }
     match crate::server::static_files::serve_simple(&req, &lc).await {
-        Ok(r) => tag(r, "static"),
+        Ok(r) => {
+            if fast_ok {
+                h2_fast_store(&lc.root, req.uri().path(), &r);
+            }
+            tag(r, "static")
+        }
         Err(_) => tag(
             Response::builder()
                 .status(StatusCode::NOT_FOUND)
@@ -1525,16 +1867,21 @@ mod tests {
         let check = tail
             .find("prohibited_request_field(request.headers())")
             .expect("serve_io 必须在 accept 后检查被禁字段");
-        let spawn = tail.find("tokio::spawn").expect("tokio::spawn");
+        // 生产路径上下一个结构性节点是每请求 future 的创建点（本地 FuturesUnordered
+        // 与 tokio::spawn 两种调度都在它之后）。字符串要选生产代码里唯一的字面量，
+        // 否则会命中注释里的同名文字。
+        let fut = tail
+            .find("let fut = async move")
+            .expect("per-request future");
         let acq = tail.find("acquire_owned").expect("acquire_owned");
         assert!(
-            check < spawn && check < acq,
-            "被禁字段检查必须早于 spawn（{check} < {spawn}）与配额获取（{check} < {acq}）"
+            check < fut && check < acq,
+            "被禁字段检查必须早于每请求 future（{check} < {fut}）与配额获取（{check} < {acq}）"
         );
         let reset = tail
             .find("send_reset(h2::Reason::PROTOCOL_ERROR)")
             .expect("被禁字段必须用 RST_STREAM(PROTOCOL_ERROR) 处置");
-        assert!(reset < spawn, "send_reset 必须早于 spawn");
+        assert!(reset < fut, "send_reset 必须早于每请求 future");
     }
 
     /// P0 回归：请求体适配器必须显式归还 h2 接收窗口（release_capacity）。
@@ -1583,13 +1930,142 @@ mod tests {
         let src = include_str!("h2.rs");
         let loop_pos = src.find("async fn serve_io").expect("serve_io");
         let tail = &src[loop_pos..];
-        let spawn_pos = tail.find("tokio::spawn").expect("spawn in accept loop");
+        // 每请求 future 的创建点 → 配额获取 → 交给调度（本地 FuturesUnordered 或
+        // tokio::spawn）。配额获取必须在这三者中间，也就是**在 future 内**：
+        // 绝不能出现在 accept 循环里直接 await（否则 await 期间 conn 不被 poll）。
+        let fut_pos = tail.find("let fut = async move").expect("per-request future");
         let acq_pos = tail
             .find("acquire_owned")
-            .expect("acquire_owned in the per-request task");
+            .expect("acquire_owned in the per-request future");
+        let push_pos = tail
+            .find("local.push(Box::pin(fut))")
+            .expect("local push in accept loop");
         assert!(
-            acq_pos > spawn_pos,
-            "配额必须在 spawn 出来的任务里获取（acquire_owned 位置 {acq_pos} 应晚于 spawn {spawn_pos}）"
+            fut_pos < acq_pos && acq_pos < push_pos,
+            "配额必须在 future 内获取（future {fut_pos} < acquire {acq_pos} < push {push_pos}）"
         );
+    }
+
+    /// 静态快车道的前置判据：只对「无条件 GET + 无 apps/file_open + 路径无危险形态」
+    /// 生效。任何 Range/If-* 都必须回完整路径（304/206/412/416 语义由 static 层处理）。
+    #[test]
+    fn h2_fast_eligible_is_conservative() {
+        use http::header::{HeaderMap, HeaderValue, RANGE};
+        let lc = ListenerConfig::default();
+        let req = |method: http::Method, uri: &str, headers: HeaderMap| {
+            let mut b = Request::builder().method(method).uri(uri);
+            if let Some(h) = b.headers_mut() {
+                *h = headers;
+            }
+            b.body(()).unwrap()
+        };
+        let get = http::Method::GET;
+        assert!(h2_fast_eligible(&req(get.clone(), "/index.html", HeaderMap::new()), &lc));
+        assert!(h2_fast_eligible(&req(get.clone(), "/", HeaderMap::new()), &lc));
+        // 非 GET
+        assert!(!h2_fast_eligible(&req(http::Method::HEAD, "/", HeaderMap::new()), &lc));
+        assert!(!h2_fast_eligible(&req(http::Method::POST, "/", HeaderMap::new()), &lc));
+        // 危险路径形态
+        for bad in ["/../x", "/a/../b", "/.env", "/a/%2e%2e/b", "/.git/config"] {
+            assert!(!h2_fast_eligible(&req(get.clone(), bad, HeaderMap::new()), &lc), "{bad}");
+        }
+        // 条件请求/Range
+        for name in [RANGE, http::header::IF_NONE_MATCH, http::header::IF_MATCH,
+                     http::header::IF_MODIFIED_SINCE, http::header::IF_UNMODIFIED_SINCE,
+                     http::header::IF_RANGE] {
+            let mut h = HeaderMap::new();
+            h.insert(name.clone(), HeaderValue::from_static("x"));
+            assert!(!h2_fast_eligible(&req(get.clone(), "/", h), &lc), "{name}");
+        }
+        // apps 配置了就不走快车道（请求可能被引擎接管）
+        let mut lc2 = ListenerConfig::default();
+        lc2.apps.push(crate::config::AppRouteConfig {
+            paths: vec!["/app".into()],
+            enabled: true,
+            engine: crate::config::AppEngineKind::Unknown,
+            socket: None,
+            extensions: Vec::new(),
+            index: None,
+            php_bin: None,
+            workers: 1,
+            source_dir: None,
+            out_dir: None,
+            entry: Vec::new(),
+            watch: false,
+            docroot: None,
+            lib: None,
+            deps_dir: None,
+            init_timeout_secs: None,
+            libc: None,
+        });
+        assert!(!h2_fast_eligible(&req(get.clone(), "/", HeaderMap::new()), &lc2));
+    }
+
+    /// 快车道缓存：命中 → 文件原地等长改写/rename 替换/unlink 必须立刻失效
+    /// （与 h1 `FAST_CACHE` 的 FileId 判据同语义）。同时验证 `/` 解析到 index.html。
+    #[test]
+    fn h2_fast_cache_roundtrip_and_invalidation() {
+        use std::io::Write as _;
+        let root = std::env::temp_dir().join(format!(
+            "crucible-h2-fast-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let idx = root.join("index.html");
+        std::fs::write(&idx, b"0123456789").unwrap();
+        assert_eq!(h2_fast_candidate(&root, "/"), Some(idx.clone()));
+        assert_eq!(h2_fast_candidate(&root, "/missing.txt"), None);
+        assert_eq!(h2_fast_candidate(&root, "/dir/"), None);
+
+        let resp = Response::builder()
+            .status(StatusCode::OK)
+            .header(http::header::CONTENT_TYPE, "text/html")
+            .header(http::header::CONTENT_LENGTH, 10)
+            .body(Bytes::from_static(b"0123456789"))
+            .unwrap();
+        h2_fast_store(&root, "/", &resp);
+        let hit = h2_fast_lookup(&root, "/").expect("first lookup must hit");
+        assert_eq!(hit.body().as_ref(), b"0123456789");
+        assert_eq!(
+            hit.headers().get(http::header::CONTENT_TYPE).unwrap(),
+            "text/html"
+        );
+
+        // 本机文件时间戳是粗粒度时钟（同一 tick 内的两次写盘 mtime 完全相同），
+        // 与 static_files::FileId 的注释同一取舍：等长原地改写的失效判定依赖 ctime。
+        // 测试里显式跨过一个 tick，避免把「同一 tick 内改写」误当成缓存 bug。
+        std::thread::sleep(Duration::from_millis(10));
+        // 等长原地改写：mtime/ctime 变化 → 必须 miss（内容不同）
+        {
+            let mut f = std::fs::OpenOptions::new().write(true).open(&idx).unwrap();
+            f.write_all(b"abcdefghij").unwrap();
+            f.sync_all().unwrap();
+        }
+        assert!(h2_fast_lookup(&root, "/").is_none(), "in-place rewrite must miss");
+
+        // 重新填充（响应体必须与当前文件内容一致，store 会逐字节校验）后
+        // rename 替换 → inode 变化 → miss
+        let resp2 = Response::builder()
+            .status(StatusCode::OK)
+            .header(http::header::CONTENT_TYPE, "text/html")
+            .header(http::header::CONTENT_LENGTH, 10)
+            .body(Bytes::from_static(b"abcdefghij"))
+            .unwrap();
+        h2_fast_store(&root, "/", &resp2);
+        assert!(h2_fast_lookup(&root, "/").is_some());
+        let tmp = root.join(".tmp-new");
+        std::fs::write(&tmp, b"0123456789").unwrap();
+        std::fs::rename(&tmp, &idx).unwrap();
+        assert!(h2_fast_lookup(&root, "/").is_none(), "rename-over must miss");
+
+        // 重新填充后 unlink → nlink=0 → miss
+        h2_fast_store(&root, "/", &resp);
+        assert!(h2_fast_lookup(&root, "/").is_some());
+        std::fs::remove_file(&idx).unwrap();
+        assert!(h2_fast_lookup(&root, "/").is_none(), "unlink must miss");
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

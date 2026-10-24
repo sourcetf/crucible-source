@@ -99,9 +99,10 @@ typedef struct crucible_tomcrypt_conn {
     uint8_t session_id[16];
     size_t session_id_len;
     /* Decrypted app-data left over when the caller's buffer is smaller than
-     * one record. SSLv2 records can be up to 32 KiB; h1 reads in ~16 KiB
-     * chunks, so a single-record read could otherwise silently truncate. */
-    uint8_t pending[SSL2_APP_RECORD_MAX];
+     * one record. SSLv2 2-byte-header records can carry up to 32767 bytes and
+     * h1 reads in ~16 KiB chunks, so a single-record read could otherwise
+     * silently truncate (buffer is sized for the full 2-byte-header maximum). */
+    uint8_t pending[SSL2_MAX_RECORD];
     size_t pending_len;
     size_t pending_off;
 #endif
@@ -296,6 +297,7 @@ static int ssl2_recv_record(crucible_tomcrypt_conn *c, uint8_t **out, size_t *ou
     uint8_t hdr[2];
     size_t rec_len;
     size_t padding = 0;
+    size_t max_len = SSL2_MAX_RECORD_2BYTE;
     if (read_exact(&c->io, hdr, 2) != 0) {
         return -1;
     }
@@ -308,8 +310,14 @@ static int ssl2_recv_record(crucible_tomcrypt_conn *c, uint8_t **out, size_t *ou
         }
         rec_len = ((size_t)(hdr[0] & 0x3f) << 8) | (size_t)hdr[1];
         padding = pad_byte;
+        max_len = SSL2_MAX_RECORD_3BYTE;
     }
-    if (rec_len == 0 || rec_len > SSL2_MAX_RECORD_3BYTE) {
+    /* The limit depends on the header form: a 2-byte header carries 15 length
+     * bits (32767), a 3-byte header only 14 (16383). Using the 3-byte limit
+     * for both rejected valid >16 KiB records that OpenSSL clients do send
+     * (ssl2_write picks a 2-byte header up to SSL2_MAX_RECORD_LENGTH_2_BYTE_
+     * HEADER when the cipher is a stream cipher). */
+    if (rec_len == 0 || rec_len > max_len) {
         return -1;
     }
     uint8_t *buf = (uint8_t *)malloc(rec_len);

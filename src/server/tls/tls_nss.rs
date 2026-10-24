@@ -225,9 +225,8 @@ async fn accept_and_serve_inner(
         log::debug!(target: "tls_nss", "nss handshake failed peer={peer}: {e:#}");
         e
     })??;
-    // C 侧持有 relay fd 的 dup；Rust 侧这份只用于超时 shutdown，握手结束即可关。
-    drop(relay);
-
+    // C 侧持有 relay fd 的 dup。Rust 这份的所有权交给写线程：响应写完后由它
+    // 对 relay 做 SHUT_WR，客户端才能收到 FIN（遗留栈无 close_notify）。
     // 任务 6：阻塞 IO 移出 executor——读写线程 + mpsc 桥；同一描述符的并发读写
     // 由 NSPR 内部锁保证（全双工），Drop 只在最后一个 half 释放时 free 一次。
     let io = sync_io_bridge(
@@ -235,6 +234,7 @@ async fn accept_and_serve_inner(
             shared: Arc::clone(&shared),
         },
         NssHalf { shared },
+        Some(relay),
     );
     h1::serve_tls(io, live, lc, peer).await.map_err(|e| {
         log::error!(target: "tls_nss", "nss h1::serve_tls failed peer={peer}: {e:#}");

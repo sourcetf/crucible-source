@@ -153,137 +153,6 @@ static LIBS: Lazy<Mutex<HashMap<String, Arc<EngineLib>>>> =
 static LOAD_LOCKS: Lazy<Mutex<HashMap<String, Arc<Mutex<()>>>>> =
     Lazy::new(|| Mutex::new(HashMap::new()));
 
-// ---------------------------------------------------------------- 临时性能剖析（CRUCIBLE_APP_PROF=1）
-//
-// 只在 `CRUCIBLE_APP_PROF=1` 时统计；默认零开销（一次 OnceLock 读取）。
-// 每 2s 把各阶段累计 ns/count 打到 stderr，用于定位引擎路径的 µs 分解。
-// 这是本 wave 的测量脚手架，定位完成后删除。
-#[doc(hidden)]
-pub mod prof {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    use std::time::Instant;
-
-    pub const S_ALL: usize = 0;
-    pub const S_EXEC_PREP: usize = 1;
-    pub const S_DISPATCH_PRE: usize = 2;
-    pub const S_QUEUE_WAIT: usize = 3;
-    pub const S_EXEC_WAIT: usize = 4;
-    pub const S_RESP_BUILD: usize = 5;
-    pub const S_JOB_TOTAL: usize = 6;
-    pub const S_JOB_LOAD: usize = 7;
-    pub const S_JOB_ENVLOCK: usize = 8;
-    pub const S_CALL_TOTAL: usize = 9;
-    pub const S_CALL_PREP: usize = 10;
-    pub const S_ENGINE_CALL: usize = 11;
-    pub const S_CALL_RESULT: usize = 12;
-    pub const S_TRY_PREP: usize = 13;
-    pub const S_TRY_DEPS: usize = 14;
-    pub const S_FALLBACK_PREP: usize = 15;
-    pub const S_RESOLVE_LIB: usize = 16;
-    pub const S_REL_SCRIPT: usize = 17;
-    pub const S_STAT: usize = 18;
-    pub const S_QUAR: usize = 19;
-    pub const S_LIB_AVAIL: usize = 20;
-    pub const S_TRY_INSERT: usize = 21;
-    pub const S_TRY_ALL: usize = 22;
-    pub const S_N: usize = 23;
-
-    pub const NAMES: [&str; S_N] = [
-        "all",
-        "exec_prep",
-        "dispatch_pre",
-        "queue_wait",
-        "exec_wait",
-        "resp_build",
-        "job_total",
-        "job_load",
-        "job_envlock",
-        "call_total",
-        "call_prep",
-        "engine_call",
-        "call_result",
-        "try_prep",
-        "try_deps",
-        "fallback_prep",
-        "resolve_lib",
-        "rel_script",
-        "stat",
-        "quar",
-        "lib_avail",
-        "try_insert",
-        "try_all",
-    ];
-
-    static NS: [AtomicU64; S_N] = [const { AtomicU64::new(0) }; S_N];
-    static CNT: [AtomicU64; S_N] = [const { AtomicU64::new(0) }; S_N];
-    static ENABLED: std::sync::LazyLock<bool> =
-        std::sync::LazyLock::new(|| match std::env::var("CRUCIBLE_APP_PROF") {
-            Ok(v) => v.trim() == "1",
-            Err(_) => false,
-        });
-    static REPORTER: std::sync::Once = std::sync::Once::new();
-
-    #[inline]
-    pub fn enabled() -> bool {
-        *ENABLED
-    }
-
-    pub struct Span {
-        idx: usize,
-        start: Instant,
-    }
-
-    impl Drop for Span {
-        fn drop(&mut self) {
-            if *ENABLED {
-                NS[self.idx].fetch_add(self.start.elapsed().as_nanos() as u64, Ordering::Relaxed);
-                CNT[self.idx].fetch_add(1, Ordering::Relaxed);
-            }
-        }
-    }
-
-    #[inline]
-    pub fn span(idx: usize) -> Option<Span> {
-        if !*ENABLED {
-            return None;
-        }
-        REPORTER.call_once(|| {
-            std::thread::Builder::new()
-                .name("app-prof".into())
-                .spawn(|| {
-                    let mut prev = [0u64; S_N];
-                    loop {
-                        std::thread::sleep(std::time::Duration::from_secs(2));
-                        let mut line = String::from("app-prof:");
-                        for i in 0..S_N {
-                            let ns = NS[i].load(Ordering::Relaxed);
-                            let cnt = CNT[i].load(Ordering::Relaxed);
-                            let d = ns.saturating_sub(prev[i]);
-                            prev[i] = ns;
-                            let per = if cnt > 0 { d as f64 / 1000.0 / cnt as f64 } else { 0.0 };
-                            line.push_str(&format!(" {}={:.2}us/{}", NAMES[i], per, cnt));
-                        }
-                        eprintln!("{line}");
-                    }
-                })
-                .ok();
-        });
-        Some(Span {
-            idx,
-            start: Instant::now(),
-        })
-    }
-
-    /// 立即记录一次（起点已经取过）。
-    #[inline]
-    pub fn note(idx: usize, start: Instant) {
-        if *ENABLED {
-            NS[idx].fetch_add(start.elapsed().as_nanos() as u64, Ordering::Relaxed);
-            CNT[idx].fetch_add(1, Ordering::Relaxed);
-        }
-    }
-}
-
 // ------------------------------------------------------------------ 看门狗（墙钟）
 
 /// 单次 FFI 调用的墙钟上限。
@@ -424,8 +293,6 @@ pub async fn execute(
     app: &AppRouteConfig,
     peer: SocketAddr,
 ) -> Result<Response<BoxBody>> {
-    let _p_all = prof::span(prof::S_ALL);
-    let p_prep = prof::span(prof::S_EXEC_PREP);
     // P1-1：.env 变量由 apps::try_handle 注入 extensions。所有引擎（含 c/go/rust）都经
     // env_lock 把它们装进**进程环境**：C 侧的 appengine_apply_extra 就是 setenv，没有
     // 哪条引擎路径是「只下发、不碰进程 env」的。
@@ -436,15 +303,16 @@ pub async fn execute(
         .map(|d| d.vars.clone())
         .unwrap_or_default();
     let (parts, body) = req.into_parts();
-    let method = parts.method.as_str().to_string();
-    let path = parts.uri.path().to_string();
-    let query = parts.uri.query().unwrap_or("").to_string();
+    // method/path/query/content-type 全部**借用** parts：旧实现对每个都 `to_string()`
+    // （4 次分配/请求），而这些串只在本次调用期间使用。
+    let method = parts.method.as_str();
+    let path = parts.uri.path();
+    let query = parts.uri.query().unwrap_or("");
     let content_type = parts
         .headers
         .get(http::header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
-        .unwrap_or("")
-        .to_string();
+        .unwrap_or("");
     // ABI 请求头块（Cookie/Authorization/User-Agent/X-Request-Id…）：
     // 此前引擎侧**完全看不到任何请求头**，Flask session / Django 登录等真实应用
     // 因此不可用。h1 路径从已解析的 parts.headers 直接构造。
@@ -465,23 +333,19 @@ pub async fn execute(
     } else {
         Bytes::new()
     };
-    let outcome = {
-        drop(p_prep);
-        exec_dispatch(
-            &method,
-            &path,
-            &query,
-            &content_type,
-            &body_bytes,
-            lc,
-            app,
-            peer,
-            env_vars.as_slice(),
-            &headers_block,
-        )
-        .await?
-    };
-    let _p_resp = prof::span(prof::S_RESP_BUILD);
+    let outcome = exec_dispatch(
+        method,
+        path,
+        query,
+        content_type,
+        &body_bytes,
+        lc,
+        app,
+        peer,
+        env_vars.as_slice(),
+        &headers_block,
+    )
+    .await?;
     Ok(response_from_outcome(outcome))
 }
 
@@ -494,22 +358,22 @@ pub async fn execute_simple(
     peer: SocketAddr,
     deps: &crate::server::apps::deps::DepsEnv,
 ) -> Result<ExecOutcome> {
-    let method = req.method().as_str().to_string();
-    let path = req.uri().path().to_string();
-    let query = req.uri().query().unwrap_or("").to_string();
+    // 与 h1 的 `execute` 同样**借用**：这些串只在本次调用期间使用，无需 4 次分配。
+    let method = req.method().as_str();
+    let path = req.uri().path();
+    let query = req.uri().query().unwrap_or("");
     let content_type = req
         .headers()
         .get(http::header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
-        .unwrap_or("")
-        .to_string();
+        .unwrap_or("");
     // h2/h3 字节路径同样携带完整请求头（与 h1 同一数据流）。
     let headers_block = request_headers_block(req.headers(), req.uri().authority());
     exec_dispatch(
-        &method,
-        &path,
-        &query,
-        &content_type,
+        method,
+        path,
+        query,
+        content_type,
         req.body(),
         lc,
         app,
@@ -603,11 +467,8 @@ async fn exec_dispatch(
     env_vars: &[(String, String)],
     headers: &[u8],
 ) -> Result<ExecOutcome> {
-    let p_dispatch = prof::span(prof::S_DISPATCH_PRE);
     let engine = app.engine.to_ascii_lowercase();
-    let p_lib = prof::span(prof::S_RESOLVE_LIB);
     let lib_path = resolve_lib(app, &engine)?;
-    drop(p_lib);
     // docroot / server_name 在热路径上**只借不克隆**：内联路径不需要任何 owned 拷贝，
     // 池路径再克隆（见下方 `docroot_owned`）。
     let docroot: &Path = app.docroot.as_deref().unwrap_or(lc.root.as_path());
@@ -616,10 +477,8 @@ async fn exec_dispatch(
     // 旧实现整条 request path 直接 join，导致 docroot 双重前缀（lua/wsgi 等真读
     // 文件的引擎 500，而 rust/c/go 样例插件不读文件被掩盖）。
     // §7.1 防穿越：script 必须留在 docroot 下（裸 join 可 /engine/../../ 读任意文件）。
-    let p_rel = prof::span(prof::S_REL_SCRIPT);
     let rel = rel_script_path(app, path);
     let script = resolve_script_cached(docroot, rel.trim_start_matches('/'))?;
-    drop(p_rel);
     // **非普通文件一律不交给引擎**：docroot 里存在 FIFO/字符设备/目录时，引擎侧多是
     // `fopen`/`luaL_loadfile` 直接打开它 —— FIFO 无写端时 open() 会**永久阻塞**，
     // 而 FFI 引擎调用没有墙钟超时，且调用期间持有宿主的 env 锁 ⇒ 一次请求就把
@@ -635,10 +494,7 @@ async fn exec_dispatch(
 
     let lib_key_cow = lib_path.to_string_lossy();
     // 入池前先拒绝已被看门狗隔离的 .so：快速 502，不占 worker、不让请求排队。
-    let p_quar = prof::span(prof::S_QUAR);
-    let quarantined = is_quarantined(lib_key_cow.as_ref());
-    drop(p_quar);
-    if quarantined {
+    if is_quarantined(lib_key_cow.as_ref()) {
         bail!(
             "engine `{engine}` is quarantined (a previous call exceeded the wall clock); \
              restart webserver to recover"
@@ -647,8 +503,12 @@ async fn exec_dispatch(
     // ---- §22.4.2 native_inline：c/go/rust 在请求线程内联执行 ----
     // 这两次跨线程唤醒（入池 + 回传）在 c8 门禁下实测占每请求 ~60µs 的等待；
     // 内联后用同一份 env 锁语义（空组可并发/不同组互斥）直接调用。
-    if inline_engine(&engine) {
-        drop(p_dispatch);
+    //
+    // **首次装载仍走池**：dlopen + `appengine_init` 是同步阻塞（实测 Go c-shared
+    // 首次装载 ~0.64s），在内联路径会在 tokio worker 上直接阻塞 —— 2 个 worker 都
+    // 被占住时整个 listener（含静态/其它引擎）一起停摆。未装载时交给进程池的
+    // worker 装载，请求照旧异步等待；装载完成后所有后续请求走内联快路径。
+    if inline_engine(&engine) && lib_is_loaded(lib_key_cow.as_ref()) {
         return inline_exec(
             &engine, &lib_path, lib_key_cow.as_ref(), &script, docroot, method, path, query,
             content_type, body, peer, port, server_name, env_vars, headers,
@@ -702,9 +562,7 @@ async fn exec_dispatch(
         // 通知「开始执行」：请求方据此把 deadline 从「排队」切到「执行」。
         // （接收方可能已因排队超时放弃 ⇒ send 失败无害。）
         let _ = started_tx.send(());
-        let _pj = prof::span(prof::S_JOB_TOTAL);
         // 先按需装载（快路径 = 一次表查找）再决策：`env_free` 是 .so 的属性。
-        let p_load = prof::span(prof::S_JOB_LOAD);
         let lib = load_engine(&engine, &lib_path)?;
         // 二次检查：入池到执行之间，另一个并发调用可能刚被判定超时并隔离本 .so。
         if is_quarantined(&quarantined_key) {
@@ -713,7 +571,6 @@ async fn exec_dispatch(
                  restart webserver to recover"
             );
         }
-        drop(p_load);
         if lib.env_free {
             return call_exec(
                 &lib, &engine, &script, &docroot_owned, &m, &p, &q, &ct, &b, peer, port,
@@ -747,8 +604,6 @@ async fn exec_dispatch(
     // **同步提交**（见 `EnginePool::submit`）：到这里作业已在队列里，第一段的「等 started」
     // 才是真的在等排队。
     let result_rx = pool.submit(job)?;
-    drop(p_dispatch);
-    let p_queue = prof::span(prof::S_QUEUE_WAIT);
     let exec_timeout = engine_call_timeout();
     let queue_timeout = engine_queue_timeout();
     if exec_timeout.is_none() && queue_timeout.is_none() {
@@ -792,8 +647,6 @@ async fn exec_dispatch(
         // 排队上限被显式关闭：无限等开始（执行上限仍然生效）。
         let _ = started_rx.await;
     }
-    drop(p_queue);
-    let _p_exec = prof::span(prof::S_EXEC_WAIT);
     // ---- 第二段：引擎执行（deadline **只**算执行）----
     // 超时的**取舍**（本方案的诚实边界）：
     //   * 卡死的 C 调用无法被安全中断（杀线程会在任意指令处损坏状态）⇒ 该 worker 线程
@@ -837,8 +690,9 @@ async fn exec_dispatch(
 /// §22.4.2 native_inline：c/go/rust 在**请求线程**内联执行引擎调用。
 ///
 /// 为什么这样做（测量依据）：走进程池时，c8 门禁下每请求在「入池 → worker 唤醒」上
-/// 实测等待 ~63µs（`app-prof` queue_wait），而引擎本身只跑 ~2µs；两次跨线程唤醒
-/// 是延迟比的绝对主项。内联后同一份工作由请求线程直接完成。
+/// 实测等待 ~63µs（wave-17 临时剖析的 queue_wait），而引擎本身只跑 ~1µs；两次跨线程
+/// 唤醒是延迟比的绝对主项。内联后同一份工作由请求线程直接完成（2026-10-24 实测：
+/// rust/c/go 的 wrk 延迟/static 由 2.01/2.22/2.17 降到 0.91/0.86/0.99）。
 ///
 /// 正确性：与池路径**同一套** env 语义 —— 非 env-free 的 .so 仍进
 /// `with_temp_env_named`（空 `.env` 组可并发、不同内容组互斥），不是「跳过锁」。
@@ -863,8 +717,6 @@ fn inline_exec(
     env_vars: &[(String, String)],
     headers: &[u8],
 ) -> Result<ExecOutcome> {
-    let _pj = prof::span(prof::S_JOB_TOTAL);
-    let p_load = prof::span(prof::S_JOB_LOAD);
     let lib = load_engine(engine, lib_path)?;
     if is_quarantined(lib_key) {
         bail!(
@@ -872,7 +724,6 @@ fn inline_exec(
              restart webserver to recover"
         );
     }
-    drop(p_load);
     if lib.env_free {
         return call_exec(
             &lib, engine, script, docroot, method, path, query, content_type, body, peer, port,
@@ -1103,13 +954,9 @@ fn resolve_script_cached(docroot: &Path, rel: &str) -> Result<PathBuf> {
 
 /// 未缓存的脚本解析：与旧实现逐字一致（safe_join + 非普通文件拒绝）。
 fn resolve_script_exact(docroot: &Path, rel: &str) -> Result<PathBuf> {
-    let p_rel = prof::span(prof::S_REL_SCRIPT);
     let script = crate::server::admin_files::script_rel(docroot, rel)
         .map_err(|e| anyhow::anyhow!("script path rejected: {e:#}"))?;
-    drop(p_rel);
-    let p_stat = prof::span(prof::S_STAT);
     let md = std::fs::metadata(&script).ok();
-    drop(p_stat);
     if let Some(md) = md {
         if !md.is_file() && !md.is_dir() {
             bail!(
@@ -1179,13 +1026,15 @@ fn serial_engine(engine: &str) -> bool {
 /// 默认**开**；`CRUCIBLE_APP_INLINE=0` 退回进程池（运维/回归开关）。
 /// 其它引擎保持原线程池语义（解释器不是线程安全的 / 需要临时 env 锁）。
 fn inline_engine(engine: &str) -> bool {
-    if !matches!(engine, "c" | "rust" | "go") {
-        return false;
-    }
-    !matches!(
+    inline_engine_with(
+        engine,
         env_lock::read_static_env("CRUCIBLE_APP_INLINE").as_deref(),
-        Some("0")
     )
+}
+
+/// [`inline_engine`] 的纯函数部分（便于单测，不碰进程环境缓存）。
+fn inline_engine_with(engine: &str, switch: Option<&str>) -> bool {
+    matches!(engine, "c" | "rust" | "go") && !matches!(switch, Some("0"))
 }
 
 impl EnginePool {
@@ -1300,6 +1149,15 @@ fn dedicated_pool_threads(engine: &str) -> Option<usize> {
 }
 
 // ---------------------------------------------------------------- dlopen / exec
+
+/// 该 .so 是否已装载（只查缓存表，**不**触发 dlopen）。
+///
+/// 内联执行的前置判据：首次 dlopen + `appengine_init` 是同步阻塞（实测 Go c-shared
+/// 冷装载 ~0.64s），不能放在 tokio worker 上做；未装载时先走进程池，装载完成后的
+/// 请求全部走内联快路径（见 `exec_dispatch`）。
+fn lib_is_loaded(lib_key: &str) -> bool {
+    LIBS.lock().contains_key(lib_key)
+}
 
 fn load_engine(engine: &str, lib_path: &Path) -> Result<Arc<EngineLib>> {
     // 热路径**不分配**：HashMap<String, _> 支持用 &str 查询。
@@ -1496,8 +1354,6 @@ fn call_exec(
     env_vars: &[(String, String)],
     headers: &[u8],
 ) -> Result<ExecOutcome> {
-    let _p_call = prof::span(prof::S_CALL_TOTAL);
-    let p_prep = prof::span(prof::S_CALL_PREP);
     // P1-1：extra 语义升级——带 .env 变量时传 JSON {"engine":...,"env":{...}}，
     // 由 libs/app-engines/common 解析注入执行环境；无变量时保持 legacy 纯引擎名
     //（现有 C 侧 common 不消费 extra，旧插件不受影响）。
@@ -1544,8 +1400,6 @@ fn call_exec(
     } else {
         (body.as_ptr(), body.len())
     };
-    drop(p_prep);
-    let p_engine = prof::span(prof::S_ENGINE_CALL);
     let out = with_abi_cstrings(parts, |p| -> Result<ExecOutcome> {
         let mut out = AppEngineResult {
             status: 500,
@@ -1576,8 +1430,6 @@ fn call_exec(
                 },
                 &mut out,
             );
-            drop(p_engine);
-            let _p_result = prof::span(prof::S_CALL_RESULT);
             if rc != 0 {
                 let msg = if !out.error.is_null() {
                     CStr::from_ptr(out.error).to_string_lossy().into_owned()
@@ -2087,5 +1939,86 @@ mod status_and_rel_tests {
 
         // 释放卡住的作业，让测试线程干净退出（池 Drop 后 worker 因 recv Err 退出）。
         release_tx.send(()).unwrap();
+    }
+
+    /// 脚本路径热缓存：同一 (docroot, rel) 连续解析必须命中并返回同一路径；
+    /// 穿越（`..`）仍必须被 `script_rel` 拒绝，且拒绝结果也可缓存。
+    #[test]
+    fn script_path_cache_hits_and_keeps_traversal_rejected() {
+        let dir = std::env::temp_dir().join(format!(
+            "crucible-script-cache-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("ok.txt"), b"x").unwrap();
+
+        let a = resolve_script_cached(&dir, "ok.txt").expect("regular file accepted");
+        let b = resolve_script_cached(&dir, "ok.txt").expect("cache hit");
+        assert_eq!(a, b);
+        assert!(a.ends_with("ok.txt"), "{a:?}");
+        assert!(
+            a.is_absolute(),
+            "script_rel must return a canonical absolute path: {a:?}"
+        );
+
+        // §7.1：`..` 穿越必须拒绝（失败结果也走缓存，第二次同样 Err）。
+        assert!(resolve_script_cached(&dir, "../etc/passwd").is_err());
+        assert!(resolve_script_cached(&dir, "../etc/passwd").is_err());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// ABI 字符串暂存：每个参数必须 NUL 结尾且内容完整；调用间复用同一缓冲；
+    /// 含 NUL 的参数必须在调用引擎前被拒绝。
+    #[test]
+    fn abi_cstrings_are_nul_terminated_and_reusable() {
+        fn read(p: *const c_char) -> String {
+            assert!(!p.is_null());
+            unsafe { CStr::from_ptr(p) }.to_string_lossy().into_owned()
+        }
+        let parts: [&[u8]; 10] = [
+            b"script", b"docroot", b"GET", b"/rust/", b"q=1", b"text/plain", b"127.0.0.1",
+            b"crucible", b"rust", b"host: x\r\n",
+        ];
+        let out = with_abi_cstrings(parts, |p| {
+            (0..10).map(|i| read(p[i])).collect::<Vec<_>>()
+        })
+        .unwrap();
+        assert_eq!(
+            out,
+            vec![
+                "script", "docroot", "GET", "/rust/", "q=1", "text/plain", "127.0.0.1",
+                "crucible", "rust", "host: x\r\n"
+            ]
+        );
+        // 第二次调用（不同长度）仍正确 ⇒ 线程本地缓冲被清空并复用。
+        let parts2: [&[u8]; 10] = [
+            b"a", b"bb", b"ccc", b"dddd", b"", b"f", b"g", b"h", b"i", b"j",
+        ];
+        let out2 = with_abi_cstrings(parts2, |p| {
+            (0..10).map(|i| read(p[i])).collect::<Vec<_>>()
+        })
+        .unwrap();
+        assert_eq!(out2, vec!["a", "bb", "ccc", "dddd", "", "f", "g", "h", "i", "j"]);
+        // 内嵌 NUL 会截断 C 字符串 ⇒ 必须报错而不是静默改参数。
+        let bad: [&[u8]; 10] = [b"a\0b", b"", b"", b"", b"", b"", b"", b"", b"", b""];
+        assert!(with_abi_cstrings(bad, |_| ()).is_err());
+    }
+
+    /// native_inline 的引擎选择：只有 c/go/rust 内联；`CRUCIBLE_APP_INLINE=0` 全局退回池。
+    #[test]
+    fn inline_engine_selection() {
+        for e in ["c", "rust", "go"] {
+            assert!(inline_engine_with(e, None), "{e} should inline by default");
+            assert!(inline_engine_with(e, Some("1")));
+            assert!(!inline_engine_with(e, Some("0")), "{e} pool fallback switch");
+        }
+        for e in ["lua", "php", "wsgi", "python", "cgi", "rack"] {
+            assert!(!inline_engine_with(e, None), "{e} must stay on the pool");
+        }
+        // 未装载的 .so 不能走内联（首次 dlopen 在 tokio worker 上会阻塞整个 listener）。
+        assert!(!lib_is_loaded("/nonexistent/crucible/libapp_nope.so"));
     }
 }

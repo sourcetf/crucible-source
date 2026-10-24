@@ -137,8 +137,6 @@ pub async fn try_handle(
     lc: &ListenerConfig,
     peer: SocketAddr,
 ) -> Option<Response<BoxBody>> {
-    let _p_try_all = app_ffi::prof::span(app_ffi::prof::S_TRY_ALL);
-    let p_prep = app_ffi::prof::span(app_ffi::prof::S_TRY_PREP);
     // 热路径只借不克隆：旧实现把 path/ext 各 to_string()（2 次分配），再
     // `app.clone()` 深拷贝整份 AppRouteConfig（≥8 次分配/请求）。
     let path = req.uri().path();
@@ -154,8 +152,6 @@ pub async fn try_handle(
     }
 
     let (app_idx, app) = match_app_indexed(lc, path, ext)?;
-    drop(p_prep);
-    let p_deps = app_ffi::prof::span(app_ffi::prof::S_TRY_DEPS);
     // P1-1：deps 的 .env 变量随请求 extensions 下发（引擎侧按需读取），避免改所有引擎签名。
     let deps_env = match deps_cached(lc, app).await {
         Ok(e) => e,
@@ -169,11 +165,8 @@ pub async fn try_handle(
             deps::DepsEnv::default()
         }
     };
-    drop(p_deps);
-    let p_ins = app_ffi::prof::span(app_ffi::prof::S_TRY_INSERT);
     let mut req = req;
     req.extensions_mut().insert(deps_env);
-    drop(p_ins);
     Some(dispatch(req, live, lc, app, app_idx, peer).await)
 }
 
@@ -310,8 +303,17 @@ async fn dispatch_simple(
         "lua" | "jsp" | "do" | "asp" | "aspnet" | "aspx" | "python" | "ruby" | "perl" => {
             simple_sidecar_dispatch(req, lc, app, app_idx, peer, deps_env, &engine).await
         }
-        "cgi" | "wsgi" | "asgi" | "psgi" | "rack" | "uwsgi" => {
+        "cgi" | "wsgi" | "asgi" | "psgi" | "uwsgi" => {
             simple_ffi(req, lc, app, peer, deps_env, &engine).await
+        }
+        // Rack 的 h2/h3 分支与 h1 同口径：嵌入不可用（OpenBSD 默认）且 sidecar/UDS
+        // 存在时走常驻 sidecar；否则维持 FFI（诚实 502）。见 `rack_embed_usable`。
+        "rack" => {
+            if sidecar_engine::rack_sidecar_preferred(app, lc) {
+                simple_sidecar_dispatch(req, lc, app, app_idx, peer, deps_env, "rack").await
+            } else {
+                simple_ffi(req, lc, app, peer, deps_env, "rack").await
+            }
         }
         "cgi_script" => match cgi_script_simple(req, lc, app, peer, deps_env).await {
             Ok(resp) => resp,
@@ -694,10 +696,31 @@ async fn dispatch(
                 }
             }
         },
-        "cgi" | "wsgi" | "asgi" | "psgi" | "rack" | "uwsgi" => {
+        "cgi" | "wsgi" | "asgi" | "psgi" | "uwsgi" => {
             match app_ffi::execute(req, lc, app, peer).await {
                 Ok(resp) => resp,
                 Err(e) => engine_error("app engine", &e),
+            }
+        }
+        // Rack：Linux 默认嵌入 MRI（稳定），OpenBSD 默认关（历史崩溃证据）→ 构建
+        // 产物是「诚实失败」stub。此时若 init.sh 生成了 `deps/bin/index`（常驻
+        // sidecar）或配置了存活 UDS，就走与 `/ruby/` 相同的 sidecar 链；否则保持
+        // 原来的 app_ffi 执行（stub 给出明确的 502 日志）。
+        "rack" => {
+            if sidecar_engine::rack_sidecar_preferred(app, lc) {
+                match sidecar_engine::handle_with_fallback(
+                    req, lc, app, peer, app_idx, "rack", "rack",
+                )
+                .await
+                {
+                    Ok(r) => r,
+                    Err(e) => engine_error("native sidecar", &e),
+                }
+            } else {
+                match app_ffi::execute(req, lc, app, peer).await {
+                    Ok(resp) => resp,
+                    Err(e) => engine_error("app engine", &e),
+                }
             }
         }
         "cgi_script" => match cgi_script::handle(req, lc, app, peer).await {

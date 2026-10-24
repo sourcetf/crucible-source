@@ -84,6 +84,18 @@ impl LegacyRelay {
         }
     }
 
+    /// Half-close the relay (FIN towards the client bridge). The C legacy
+    /// stacks have no close_notify, and their fd stays open as long as the
+    /// reader thread is blocked in `read(2)`; without this explicit FIN a
+    /// completed HTTP/1.1 `Connection: close` response would never reach the
+    /// client as EOF and both sides would wait until the client gives up.
+    pub fn shutdown_send(self) {
+        // SAFETY: fd is a live socket owned by this struct.
+        unsafe {
+            libc::shutdown(self.fd, libc::SHUT_WR);
+        }
+    }
+
     /// Interrupt a handshake blocked in `read(2)`/`write(2)`: `shutdown(2)` on
     /// the relay makes the C side see EOF/EPIPE immediately (both directions).
     pub fn interrupt(&self) {
@@ -228,6 +240,7 @@ impl LegacySyncIo {
     fn new<R: Read + Send + 'static, W: Write + Send + 'static>(
         mut reader: R,
         mut writer: W,
+        shutdown: Option<LegacyRelay>,
     ) -> Self {
         let (r_tx, r_rx) = tokio::sync::mpsc::channel::<std::io::Result<Vec<u8>>>(8);
         let (w_tx, mut w_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
@@ -257,7 +270,13 @@ impl LegacySyncIo {
                 }
             });
 
-        // 写线程：通道 → 阻塞 write_all；通道关闭（async 侧 drop）后 flush 收尾。
+        // 写线程：通道 → 阻塞 write_all；通道关闭（async 侧 drop）后 flush 收尾，
+        // 然后对 relay 做 SHUT_WR，向客户端 bridge 发 FIN。
+        //
+        // 为什么必须显式 shutdown：遗留 C 栈没有 close_notify，而且读线程还阻塞在
+        // `read(2)` 里、C 连接对象也被它引用着 ⇒ 只 drop 写 half 不会关闭 socket。
+        // 没有这一步时，h1 处理完 `Connection: close` 的响应后客户端永远等不到 EOF
+        // （实测 OpenSSL 1.0.2 SSLv2/SSLv3 客户端会挂到自己的超时）。
         let _ = std::thread::Builder::new()
             .name("cruc-legacy-wr".into())
             .spawn(move || {
@@ -267,6 +286,10 @@ impl LegacySyncIo {
                     }
                 }
                 let _ = writer.flush();
+                if let Some(relay) = shutdown {
+                    relay.shutdown_send();
+                }
+                // writer 在通道关闭后 drop；读线程仍持有同一 C 连接（读方向）。
             });
 
         Self {
@@ -351,10 +374,17 @@ impl AsyncWrite for LegacySyncIo {
 
 /// 把同一阻塞连接拆成「读 half + 写 half」交给桥的两个线程；
 /// 底层描述符的并发读写线程安全由 C 栈保证（见各 Half 文档）。
-pub fn sync_io_bridge<R, W>(reader: R, writer: W) -> LegacySyncIo
+///
+/// `shutdown` 是 relay fd 的所有权（握手成功后由调用方传入）：写线程在写完
+/// 最后一个响应后对它 `SHUT_WR`，让客户端收到 FIN（遗留栈没有 close_notify）。
+pub fn sync_io_bridge<R, W>(
+    reader: R,
+    writer: W,
+    shutdown: Option<LegacyRelay>,
+) -> LegacySyncIo
 where
     R: Read + Send + 'static,
     W: Write + Send + 'static,
 {
-    LegacySyncIo::new(reader, writer)
+    LegacySyncIo::new(reader, writer, shutdown)
 }

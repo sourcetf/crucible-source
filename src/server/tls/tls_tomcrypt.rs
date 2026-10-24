@@ -141,8 +141,10 @@ pub async fn accept_and_serve(
 ) -> Result<()> {
     let peek_len = peek.len();
     // Soft-reject incomplete probes in Rust — never enter C/RSA for truncated hellos.
+    // debug, not info: anonymous clients can trigger this per connection (a few
+    // bytes are enough), and this file is compiled into the public TLS listener.
     if !sslv2_hello_complete(&peek) {
-        log::info!(
+        log::debug!(
             target: "tls_tomcrypt",
             "tomcrypt soft-reject incomplete/probe SSLv2 hello peer={peer} peek_len={peek_len}"
         );
@@ -225,15 +227,15 @@ async fn accept_and_serve_inner(
     })
     .await
     .context("tomcrypt handshake")??;
-    // C 侧持有 relay fd 的 dup；Rust 侧这份握手结束即可关。
-    drop(relay);
-
+    // C 侧持有 relay fd 的 dup。Rust 这份的所有权交给写线程：响应写完后由它
+    // 对 relay 做 SHUT_WR，客户端才能收到 FIN（遗留栈无 close_notify）。
     // 任务 6：阻塞 IO 移出 executor——读写线程 + mpsc 桥（ halves 共享同一连接）。
     let io = sync_io_bridge(
         TomcryptHalf {
             shared: Arc::clone(&shared),
         },
         TomcryptHalf { shared },
+        Some(relay),
     );
     h1::serve_tls(io, live, lc, peer).await
 }

@@ -563,23 +563,47 @@ mod tests {
         let _ = child.wait();
     }
 
-    /// 真机行为：kill_all 只杀自己直系子进程；一个**非直系的同名外部进程**
-    /// （pid 复用场景）即使登记在表里，只要启动时间/程序名对不上就不能被误杀。
+    /// Spawn a long-lived, already-reparented process whose command line contains a
+    /// token with basename `name`.
+    ///
+    /// A shell **script** is used on purpose: Ubuntu's coreutils may be built as a
+    /// multi-call binary, so `exec -a php-fpm sleep 30` dies immediately with
+    /// "unknown program 'php-fpm'" (making the "same program name" precondition
+    /// racy). The script's own `/proc/<pid>/cmdline` is
+    /// `/bin/sh /tmp/…/<name>`, which contains the token deterministically.
+    #[cfg(any(target_os = "linux", target_os = "openbsd"))]
+    fn spawn_reparented_named_sleeper(name: &str) -> (i32, std::path::PathBuf) {
+        use std::os::unix::fs::PermissionsExt;
+        static SEQ: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir = std::env::temp_dir()
+            .join(format!("crucible-childreg-{}-{seq}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let script = dir.join(name);
+        std::fs::write(&script, "#!/bin/sh\nwhile :; do sleep 1; done\n")
+            .expect("write helper script");
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod helper script");
+        let out = Command::new("/bin/sh")
+            .arg("-c")
+            .arg(format!("{} >/dev/null 2>&1 & echo $!", script.display()))
+            .output()
+            .expect("spawn external process");
+        let pid = String::from_utf8_lossy(&out.stdout)
+            .trim()
+            .parse()
+            .expect("external pid");
+        (pid, dir)
+    }
+
+    /// 真机行为：kill_all 只杀自己直系子进程；一个**非直系且同名**的外部进程
+    /// （pid 复用场景）即使登记在表里、程序名完全一致，只要启动时间对不上就不能被误杀。
+    /// 启动时间是 pid 复用判据的主防线；同名只是第二道防线。
     #[cfg(any(target_os = "linux", target_os = "openbsd"))]
     #[test]
     fn kill_all_spares_reused_external_pid() {
         let _g = TEST_LOCK.lock();
-        // `sh -c 'sleep 30 & echo $!'` 退出后，sleep 被 reparent 到 init ⇒ 不是我们的
-        // 直系子进程，模拟「pid 已被复用给无关进程」。
-        let out = Command::new("/bin/sh")
-            .arg("-c")
-            .arg("sleep 30 >/dev/null 2>&1 & echo $!")
-            .output()
-            .expect("spawn external sleep");
-        let ext_pid: i32 = String::from_utf8_lossy(&out.stdout)
-            .trim()
-            .parse()
-            .expect("external pid");
+        let (ext_pid, dir) = spawn_reparented_named_sleeper("php-fpm");
         let info = proc_info(ext_pid).expect("external proc info");
         // 等到它不再是本测试进程的直接子进程。
         for _ in 0..200 {
@@ -588,6 +612,17 @@ mod tests {
             }
             std::thread::sleep(Duration::from_millis(10));
         }
+        // 前提确认：命令行里确实有 "php-fpm"（否则这条测试没有覆盖同名场景）。
+        let cmdline = proc_cmdline(ext_pid).unwrap_or_default();
+        assert!(
+            command_contains_program(&cmdline, "php-fpm"),
+            "外部进程命令行应含登记名: {cmdline}"
+        );
+        // 正对照：启动时间一致 ⇒ 身份确实是当初 spawn 的那个进程（可以被 kill_all 杀）。
+        assert!(
+            alive_and_matches(ext_pid, "php-fpm", Some(info.start)),
+            "启动时间一致时同一进程应匹配"
+        );
         REGISTRY.lock().insert(
             ext_pid,
             ChildEntry {
@@ -599,9 +634,41 @@ mod tests {
         kill_all();
         assert!(
             process_alive(ext_pid),
-            "pid 复用/程序名不符的外部进程不能被 kill_all 误杀"
+            "启动时间对不上（pid 已被复用）时，同名外部进程也不能被 kill_all 误杀"
         );
         let _ = unsafe { libc::kill(ext_pid, libc::SIGKILL) };
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 程序名判据**独立于**启动时间：一个非直系外部进程即便启动时间对得上
+    /// （例如登记时读到的是它），只要命令行里的 token basename 与登记程序名不符，
+    /// 也不能发信号。`kill_all` 的两道防线（启动时间、程序名）必须各自可用，
+    /// 不能只靠其中一道。
+    #[cfg(any(target_os = "linux", target_os = "openbsd"))]
+    #[test]
+    fn external_process_with_other_program_name_is_spared() {
+        let (ext_pid, dir) = spawn_reparented_named_sleeper("other-daemon");
+        for _ in 0..200 {
+            if proc_info(ext_pid).map(|i| i.ppid) != Some(std::process::id() as i32) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let info = proc_info(ext_pid).expect("external proc info");
+        // 启动时间**完全一致**（模拟「这个 pid 确实是我们当年 spawn 的那个」），
+        // 但登记的程序名不同 ⇒ 名字判据必须拒绝，绝不能误杀。
+        assert!(
+            !alive_and_matches(ext_pid, "php-fpm", Some(info.start)),
+            "非直系进程且程序名不符时必须拒绝发信号"
+        );
+        // 正对照：同一条记录若程序名写成 cmdline 里真实存在的 token，判据为真
+        // （说明上面的 false 确实来自程序名，而不是启动时间/ppid 的副作用）。
+        assert!(
+            alive_and_matches(ext_pid, "other-daemon", Some(info.start)),
+            "启动时间一致且程序名匹配时（模拟登记过的 daemon）应认为仍是同一进程"
+        );
+        let _ = unsafe { libc::kill(ext_pid, libc::SIGKILL) };
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// 真机行为：登记过的**自己的直系子进程**必须被 kill_all 杀掉（SIGTERM→SIGKILL）。

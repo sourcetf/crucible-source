@@ -105,6 +105,198 @@ fn engine_forwards_env_headers(engine: &str) -> bool {
     matches!(engine, "jsp" | "do")
 }
 
+/// `libapp_rack.so` 是否是**可用的嵌入式 MRI 产物**。
+///
+/// 为什么不能只看 `native_http::lib_available`：Rack 的 MRI 嵌入按平台默认开关
+/// （`scripts/build_script_ffi.sh`：Linux 开 / OpenBSD 关）。关闭时构建脚本仍会产出
+/// 一个「诚实失败」stub `.so` —— 文件存在、可 dlopen，但每个请求都返回「未嵌入
+/// Ruby」。`lib_available` 只判文件是否存在，于是 stub 会把 `deps/bin/index` 常驻
+/// sidecar 挡在分发之外，`/rack/` 在 OpenBSD 上恒 502（`/ruby/` 的同类问题是通过
+/// 「关嵌入时删掉 .so」解决的；rack 的 stub 被保留下来提供更明确的报错，所以这里
+/// 需要一个运行时判据）。
+///
+/// 判据：可执行映像里是否存在 `libruby<版本>.so` 形态的动态库名。嵌入式构建必定
+/// DT_NEEDED 共享 libruby（本仓库的构建用 `LIBRUBYARG_SHARED`），并且编进 .so 的
+/// 兼容层还带有 `libruby34.so` / `libruby-3.3.so.3.3` 字符串；stub 的报错文本里只有
+/// `libruby（…）`，不匹配这个形态（因此不会把 stub 误判为可用嵌入）。
+/// 结果按 (文件长度, mtime) 缓存：重建 .so 后下一次请求即生效。
+pub(crate) fn rack_embed_usable(app: &AppRouteConfig) -> bool {
+    use std::collections::HashMap;
+    use std::path::PathBuf;
+    use std::sync::OnceLock;
+    use std::time::UNIX_EPOCH;
+
+    static CACHE: OnceLock<parking_lot::Mutex<HashMap<PathBuf, (u64, u64, bool)>>> =
+        OnceLock::new();
+
+    let Ok(path) = app_ffi::resolve_lib(app, "rack") else {
+        return false;
+    };
+    let meta = match std::fs::metadata(&path) {
+        Ok(m) => m,
+        Err(_) => return false,
+    };
+    let len = meta.len();
+    let mtime = meta
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0);
+
+    let cache = CACHE.get_or_init(|| parking_lot::Mutex::new(HashMap::new()));
+    {
+        let map = cache.lock();
+        if let Some((c_len, c_mtime, ok)) = map.get(&path) {
+            if *c_len == len && *c_mtime == mtime {
+                return *ok;
+            }
+        }
+    }
+    let ok = std::fs::read(&path)
+        .map(|bytes| image_has_libruby_soname(&bytes))
+        .unwrap_or(false);
+    let mut map = cache.lock();
+    if map.len() >= 64 {
+        map.clear();
+    }
+    map.insert(path, (len, mtime, ok));
+    ok
+}
+
+/// 字节级判据：`libruby` 后跟可选 `-`/`.`、至少一位版本数字、`[0-9.-]*`，再是 `.so`。
+/// 见 [`rack_embed_usable`] 的说明（stub 的 `libruby（…）` 不匹配）。
+fn image_has_libruby_soname(bytes: &[u8]) -> bool {
+    const NEEDLE: &[u8] = b"libruby";
+    let mut i = 0usize;
+    while i + NEEDLE.len() <= bytes.len() {
+        let Some(off) = bytes[i..]
+            .windows(NEEDLE.len())
+            .position(|w| w == NEEDLE)
+        else {
+            break;
+        };
+        let pos = i + off;
+        // 无版本号的 SONAME（`libruby.so`）直接命中。stub 里的 `/libruby`（字符串
+        // 到此结束）与 `libruby（…）`（全角括号）都不匹配。
+        if bytes[pos + NEEDLE.len()..].starts_with(b".so") {
+            return true;
+        }
+        let mut j = pos + NEEDLE.len();
+        if j < bytes.len() && (bytes[j] == b'-' || bytes[j] == b'.') {
+            j += 1;
+        }
+        let version_start = j;
+        while j < bytes.len() {
+            let c = bytes[j];
+            if c.is_ascii_digit() {
+                j += 1;
+            } else if c == b'.' && j + 1 < bytes.len() && bytes[j + 1] == b's' {
+                break; // 版本号结束，紧跟 ".so"
+            } else if c == b'.' || c == b'-' {
+                j += 1;
+            } else {
+                break;
+            }
+        }
+        if j > version_start && bytes[j..].starts_with(b".so") {
+            return true;
+        }
+        i = pos + NEEDLE.len();
+    }
+    false
+}
+
+/// Rack 是否该走非 FFI 的 sidecar/UDS 链（嵌入不可用、且确有后端）。
+///
+/// 调用方据此在「app_ffi 直接执行」与 `sidecar_engine::handle_with_fallback` 之间选；
+/// [`handle_with_fallback`] 内部也会用 [`rack_embed_usable`] 复核（防止直接调用方绕过）。
+pub(crate) fn rack_sidecar_preferred(app: &AppRouteConfig, lc: &ListenerConfig) -> bool {
+    !rack_embed_usable(app)
+        && (native_http::uds_socket_available(app) || native_http::sidecar_available(app, lc))
+}
+
+/// Rack 的内部路径头：`x-crucible-rack-path`（percent-encoded 应用相对路径）。
+///
+/// 为什么需要：宿主的 `app_ffi::rel_script_path` 会把**目录请求**改成配置的 index
+/// （`/rack/` → `/index.ru`、`/rack/sub/` → `/index.ru`）——对 PHP/CGI 这类「一个
+/// 路径必须落到一个脚本」的引擎正确，但 Rack 应用需要真实的 URL 路径（PATH_INFO
+/// 是路由输入）。sidecar 侧若只看代理目标，root/目录请求会拿到 `/index.ru`，
+/// 应用按 PATH_INFO 路由时必然走错。这个头把**剥掉 app 前缀后的原始路径**带给
+/// sidecar（与 `/ruby/` 的 spawn 约定同一层：都是宿主 → 受管 sidecar 的内部通道）。
+///
+/// 客户端同名头一律在宿主侧删除后重写（见 [`set_rack_path_header`]），不可伪造。
+pub(crate) fn rack_path_header_value(app: &AppRouteConfig, path: &str) -> String {
+    let mut p = path.to_string();
+    for prefix in &app.paths {
+        if prefix.is_empty() {
+            continue;
+        }
+        let prefix = prefix.trim_end_matches('/');
+        if prefix.is_empty() {
+            continue;
+        }
+        if p == prefix || p.starts_with(&format!("{prefix}/")) {
+            p = p[prefix.len()..].to_string();
+            if !p.starts_with('/') {
+                p.insert(0, '/');
+            }
+            break;
+        }
+    }
+    if p.is_empty() {
+        p.push('/');
+    } else if !p.starts_with('/') {
+        p.insert(0, '/');
+    }
+    // 头里放**已解码的 URL 路径**：sidecar 只需 decode 一次就能得到 Rack 的
+    // PATH_INFO。若直接编码原始（仍带 `%2e%2e`）路径，sidecar 解一次后还是
+    // percent-encoded，既不符合 Rack 语义，也让穿越判据看不到 `..`。
+    percent_encode_env_value(&percent_decode_path(&p))
+}
+
+/// `%XX` → 字节（不处理 `+`，路径里 `+` 是字面量）。非法转义原样保留。
+fn percent_decode_path(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            let hi = (bytes[i + 1] as char).to_digit(16);
+            let lo = (bytes[i + 2] as char).to_digit(16);
+            if let (Some(h), Some(l)) = (hi, lo) {
+                out.push((h * 16 + l) as u8);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// 在请求上写入内部路径头（先删客户端同名头，防伪造）。
+pub(crate) fn set_rack_path_header<B>(req: &mut Request<B>, app: &AppRouteConfig) {
+    let value = rack_path_header_value(app, req.uri().path());
+    req.headers_mut().remove("x-crucible-rack-path");
+    if let Ok(hv) = http::HeaderValue::from_str(&value) {
+        req.headers_mut().insert("x-crucible-rack-path", hv);
+    }
+}
+
+/// 内部路径头（名称、值）：非 Rack 引擎返回 `None`。
+fn rack_path_header(app: &AppRouteConfig, engine: &str, path: &str) -> Option<(String, String)> {
+    if engine != "rack" {
+        return None;
+    }
+    Some((
+        "x-crucible-rack-path".to_string(),
+        rack_path_header_value(app, path),
+    ))
+}
+
+
 pub async fn handle_with_fallback(
     req: Request<Incoming>,
     lc: &ListenerConfig,
@@ -117,14 +309,13 @@ pub async fn handle_with_fallback(
     // 本 app 的 `.env`（deps 解析结果，`try_handle` 注入到 extensions）：
     //   * 受管 sidecar 在 spawn 时装进它的进程 env（本 app 的键在 `System.getenv`/`ENV` 可见）；
     //   * 显式 socket 另发 `x-crucible-env-*` 请求头（进程 env 够不着的兜底通道）。
-    let p_fb = app_ffi::prof::span(app_ffi::prof::S_FALLBACK_PREP);
-    let p_avail = app_ffi::prof::span(app_ffi::prof::S_LIB_AVAIL);
-    let avail = native_http::lib_available(app, engine);
-    drop(p_avail);
+    // rack：文件存在 ≠ 可用（RACK_EMBED=0 时是「诚实失败」stub，见
+    // [`rack_embed_usable`]）——否则 sidecar/UDS 永远轮不到。
+    let avail = native_http::lib_available(app, engine)
+        && (engine != "rack" || rack_embed_usable(app));
     // FFI 命中时**不需要** .env 克隆 / 转发头（app_ffi::execute 自己从 extensions 取）：
     // 旧实现先深拷贝整份 .env 再判 lib，c/go/rust 每请求白付一次 Vec 分配+拷贝。
     if avail {
-        drop(p_fb);
         return app_ffi::execute(req, lc, app, peer).await;
     }
     let env_vars: Vec<(String, String)> = req
@@ -137,7 +328,13 @@ pub async fn handle_with_fallback(
     } else {
         Vec::new()
     };
-    drop(p_fb);
+    // Rack 走 sidecar 时把**原始应用相对路径**通过内部头带给 sidecar（宿主会把
+    // 目录请求的代理目标改写成 `/index.ru`，而 Rack 的 PATH_INFO 必须是真实 URL 路径）。
+    // 客户端同名头在这里被先删后写，不可伪造。
+    let mut req = req;
+    if engine == "rack" {
+        set_rack_path_header(&mut req, app);
+    }
     // **顺序**：显式配置且**活着**的 `socket` 优先于自动探测的 `deps/bin/index`。
     //
     // 为什么：`sidecar_available` 只判「`deps/bin/index` **这个文件存在**」，并不验证它跑得起来；
@@ -183,7 +380,9 @@ pub async fn handle_with_fallback_simple(
     engine: &str,
     deps: &DepsEnv,
 ) -> Result<Response<Bytes>> {
-    if native_http::lib_available(app, engine) {
+    if native_http::lib_available(app, engine)
+        && (engine != "rack" || rack_embed_usable(app))
+    {
         let outcome = app_ffi::execute_simple(req, lc, app, peer, deps).await?;
         return Ok(app_ffi::simple_response_from_outcome(outcome));
     }
@@ -195,6 +394,8 @@ pub async fn handle_with_fallback_simple(
     } else {
         Vec::new()
     };
+    // Rack：原始应用相对路径（见 h1 侧同段说明）——显式 socket 与受管 sidecar 都带。
+    let rack_hdr = rack_path_header(app, engine, req.uri().path());
     // 与 h1 同序：显式配置的 socket（活着才算）优先，其次自动探测的 sidecar。
     #[cfg(unix)]
     {
@@ -204,7 +405,11 @@ pub async fn handle_with_fallback_simple(
             // WebAppContext 是 `/`，原样发 `/jsp/index.jsp` 会让它去 docroot/jsp/ 找文件，
             // 恒 404（与 h1 侧 native_http::try_handle_uds 同一判据）。
             let target = crate::server::apps::app_ffi::rel_script_path(app, req.uri().path());
-            return proxy_uds_simple(req, &sock, peer, Some(target), &extra_headers).await;
+            let mut hdrs = extra_headers.clone();
+            if let Some(h) = &rack_hdr {
+                hdrs.push(h.clone());
+            }
+            return proxy_uds_simple(req, &sock, peer, Some(target), &hdrs).await;
         }
         if native_http::sidecar_available(app, lc) {
             let sock = ensure_sidecar_simple(lc, app, app_idx, &env_vars).await?;
@@ -219,12 +424,17 @@ pub async fn handle_with_fallback_simple(
             //      在 h1 为空）；
             //   ② 每请求最多 64 头/16KiB 的纯重复开销。
             // 显式 `apps[].socket`（上一分支）仍发头 —— 那条通道是运维进程 env 够不着的兜底。
-            return proxy_uds_simple(req, &sock, peer, Some(target), &[]).await;
+            // Rack 的内部路径头是另一回事：它承载 PATH_INFO，必须与协议无关地送达。
+            let hdrs: &[(String, String)] = match &rack_hdr {
+                Some(h) => std::slice::from_ref(h),
+                None => &[],
+            };
+            return proxy_uds_simple(req, &sock, peer, Some(target), hdrs).await;
         }
     }
     #[cfg(not(unix))]
     {
-        let _ = (req, lc, app, peer, app_idx, deps, env_vars, extra_headers);
+        let _ = (req, lc, app, peer, app_idx, deps, env_vars, extra_headers, rack_hdr);
     }
     // 「无后端可用」是**引擎不可用**（配置/构建问题），与 h1 `handle_with_fallback` 同口径：
     // 返回一个固定的 502 **响应**（而不是 Err）—— Err 会被 `simple_engine_error` 换成通用
@@ -729,5 +939,74 @@ mod tests {
         let out = env_forward_headers(&[v("Db_Password", "p1"), v("db_password", "p2")]);
         assert_eq!(out.len(), 1);
         assert_eq!(out[0], ("x-crucible-env-db_password".to_string(), "p1".to_string()));
+    }
+
+    /// 嵌入判据：DT_NEEDED / shim 常量里的 `libruby<版本>.so` 命中；诚实失败 stub
+    /// 的报错文本（`libruby（…）`、`/libruby`）不命中。
+    #[test]
+    fn libruby_soname_detection_separates_embed_from_stub() {
+        for s in [
+            &b"DT_NEEDED libruby-3.3.so.3.3"[..],
+            b"x libruby34.so y",
+            b"/usr/local/lib/libruby34.so.0.0",
+            b"libruby.so.3.4",
+            b"libruby.so",
+        ] {
+            assert!(image_has_libruby_soname(s), "应判为嵌入: {:?}", String::from_utf8_lossy(s));
+        }
+        for s in [
+            // rack_engine.c 的诚实失败文本（编译进 stub .so）
+            &b"need ruby.h and libruby (scripts/build_script_ffi.sh) libapp_rack.so"[..],
+            b"libruby\xef\xbc\x88scripts/build_script_ffi.sh\xef\xbc\x89",
+            b"/libruby\x00",
+            b"libruby",
+            b"libapp_rack.so",
+        ] {
+            assert!(!image_has_libruby_soname(s), "应判为 stub: {:?}", String::from_utf8_lossy(s));
+        }
+    }
+
+    fn rack_app_with_paths(paths: &[&str]) -> AppRouteConfig {
+        AppRouteConfig {
+            paths: paths.iter().map(|s| s.to_string()).collect(),
+            enabled: true,
+            engine: "rack".into(),
+            socket: None,
+            extensions: vec![],
+            index: Some("index.ru".into()),
+            php_bin: None,
+            workers: 4,
+            source_dir: None,
+            out_dir: None,
+            entry: vec![],
+            watch: false,
+            docroot: None,
+            lib: None,
+            deps_dir: None,
+            init_timeout_secs: None,
+            libc: None,
+        }
+    }
+
+    /// Rack 内部路径头：剥前缀、保留目录请求的真实路径（不替换成 index）、
+    /// percent-encode（头值里不能出现非 ASCII/空格/换行）。
+    #[test]
+    fn rack_path_header_keeps_real_path() {
+        let app = rack_app_with_paths(&["/rack"]);
+        assert_eq!(rack_path_header_value(&app, "/rack/"), "%2F");
+        assert_eq!(rack_path_header_value(&app, "/rack/foo"), "%2Ffoo");
+        assert_eq!(rack_path_header_value(&app, "/rack/a/b/"), "%2Fa%2Fb%2F");
+        assert_eq!(rack_path_header_value(&app, "/rack/a b"), "%2Fa%20b");
+        assert_eq!(rack_path_header_value(&app, "/other/x"), "%2Fother%2Fx");
+        // URL 编码在宿主侧解一次：`%2e%2e` → `..`（sidecar 的穿越判据必须看得到）
+        assert_eq!(rack_path_header_value(&app, "/rack/%2e%2e/x"), "%2F..%2Fx");
+        // 双重编码只解一层（`%252e` → `%2e`，不是 `.`）
+        assert_eq!(
+            rack_path_header_value(&app, "/rack/%252e%252e"),
+            "%2F%252e%252e"
+        );
+        // 尾斜杠写法同义
+        let app = rack_app_with_paths(&["/rack/"]);
+        assert_eq!(rack_path_header_value(&app, "/rack/foo"), "%2Ffoo");
     }
 }

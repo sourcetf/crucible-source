@@ -4870,3 +4870,189 @@ GeoIP 数据质量/生产部署均标未验证。
 报告：`.agents/1009/reports/matrix2-wave17.md`；修复记录：
 `.agents/1009/fixes/matrix2-wave17.md`；矩阵：`.agents/1009/reports/spec-matrix.md`；
 缺口：`.agents/1009/reports/spec-matrix-notes.md` §A。
+
+---
+
+# 【agent-deploy2b / 工号 1009 · Wave-18】远程生产部署到 d389c56 + 全量验证（2026-10-24 11:47–12:21）
+
+**结论**：远程 `03e4ae0 → d389c56` 已部署并验证。增量构建 **rc=0 / 710s**（123 warnings，LTO thin，
+features `tls,tls_boring,go_shm_ipc,tls_nss,tls_tomcrypt`），二进制 20,765,720B md5
+**`378a1144a12b2c3d16df21c00bbe794d`**，`--check-config` OK（5 listeners / 18 apps / 3 acceptors）。
+现役 pid **89052**（12:06:35 起，rc.local）。引擎 .so 同步重建（16 个 12:04，29s）；
+perl/psgi `DT_NEEDED=libperl.so.27.0`，无 `/usr/local/lib/libperl.so` workaround，`/perl/ /psgi/` 200。
+构建前清掉了 deploy2 超时遗留的陈旧 `/tmp/remote-build.lock`（无 cargo 进程，留证），收工已释放。
+
+**验证**：9081/9095 h1+h2c 200；9445 仅 TLS1.2、9446 仅 TLS1.3（Python 强制版本实测被拒
+`alert protocol version`）、8443 TLS1.2+1.3+h2+h3(200 ver=3)；853 DoT TLS1.3 + DNS 应答；
+named 53 递归(`ad`)+根区权威+AXFR(根 24,916 行 / crucible.local 25 条含 13 RRSIG)+DNSSEC。
+**遗留 TLS：`test_tls_stacks.sh` PASS=7 FAIL=0**（NSS SSLv3/v2compat、TomCrypt SSLv2 完整握手 +
+HTTP 200，mac_verified=1；生产 8443 直接探针也 200）。静态/Range/304/416/穿越 404；页面规则/
+代理/限流 5×200+20×429/ACL/Basic Auth/Admin 401+正向/上传 201+h2c+路径外 405+`..` 400/
+DoH 404/405 fail-closed 全通过。h1 快车道：`conns=22761 served=22761 fb_*=0`。
+稳定性 200 顺序 0 失败、32×30s **43,632 请求 0 失败**（RSS 38.8→43.6MB、fd 22→23、无僵尸）。
+1 vCPU wrk 4.2.0：h1 静态 c32/t1 **13,134 rps**、c64/t2 12,812 rps（不敢与 32 核 158k 直比）。
+
+**仍未闭（重要）**：
+1. **`/rack/` 502**：d389c56 的 `www-apps/rack/init.sh` 仍是 141B 占位脚本，不生成
+   `deps/bin/index`；OpenBSD 的 `libapp_rack.so` 是「未嵌入 MRI」诚实 stub ⇒ 无 sidecar ⇒ 502。
+   修复（init.sh 4KB + `www-apps/rack/sidecar.rb` + `mod.rs`/`sidecar_engine.rs`）只在**本地共享树
+   未提交 WIP**，未在部署 commit 里。证据：deps/bin 空、manifest 只有 `rack: libapp_rack.so`、
+   `libruby-soname-present: 0`、无 `state/native/*-rack`。
+2. **生产 config 只有 18 apps，没有 `/uwsgi`**：`/uwsgi/` 是 static autoindex、
+   `/uwsgi/app.py` 返回源码；隔离实例证明 uwsgi 引擎 h1+h2c 200（`hello from uwsgi path=…`）。
+   config.toml 是 skip-worktree，本轮未改，需主会话补 block。
+3. **重启孤儿 ruby sidecar**：pid 96218 ppid=1（12:03:46 起），新实例日志写
+   `skip …（已退出）` 却复用其 socket；`/ruby/` 仍 200。owner：apps/child_registry（P3）。
+4. `build_jsp_sidecar.sh` 因 `javac` 不在 PATH 失败（JDK 在 `/usr/local/jdk-17`）；`/jsp/ /do/`
+   目前是 Python UDS shim，非真 Jetty。`www-apps/tsx/dist/index.js` 被引擎构建改写为 `M`（P3）。
+
+**回滚**：`cp -p bin/webserver.bak-wave18-pre bin/webserver`（旧 20,686,008B md5 `1970c20c…`）+
+`kill; sh /etc/rc.local`；完整回退见报告 §6（git reset 03e4ae0 + 重建 .so）。系统级仅新增
+`wrk` 包，可 `pkg_delete wrk`；未改 config.toml / rc.local / libperl 链接。
+磁盘 1013MB→952MB（22MB 访问日志 + wrk）；未做 cargo clean。
+
+报告 `.agents/1009/reports/deploy2b-wave18.md`；修复/处置
+`.agents/1009/fixes/deploy2b-wave18.md`；资产 `/root/wave18-*`、`/root/wave18-scratch/`。
+
+---
+
+# 【agent-legacyhard2 / 工号 1009 · Wave-18】O7/O8/O12 验证 + 3 个遗留栈缺陷修复（2026-10-24）
+
+**scope**：`libs/tls-tomcrypt/**`、`libs/tls-nss/**`、`src/server/tls/{tls_tomcrypt.rs,
+tls_nss.rs,legacy_io.rs,accept.rs,client_hello.rs}`、`src/server/apps/child_registry.rs`、
+`scripts/{test_sslv2_probe.py,test_tls_stacks.sh,tls_probe.py}`。未 commit/push/checkout/
+reset/stash/clean；其他 agent 的在途改动（`bench/app_engine_overhead.py`、`src/server/apps/
+{app_ffi,mod,sidecar_engine}.rs`、`www-apps/rack/*`）原样保留。基线 `d389c56`。
+
+**O7（闭）**：TomCrypt SSLv2 是完整 6 消息线协议，双向 finished 校验。证据：
+- Python 完整状态机客户端（`test_sslv2_probe.py --handshake -v`）逐字节 dump：CLIENT-HELLO
+  28B / SERVER-HELLO 736B（cert 706+010080+conn_id 16）/ CMK 266B / SERVER-VERIFY 明文
+  `05‖challenge` seq1 / CLIENT-FINISHED `03‖conn_id` seq2 / SERVER-FINISHED `06‖session_id`
+  seq2 / HTTP 200，MAC 全部 `mac_verified`。
+- **真实 OpenSSL 1.0.2u（enable-ssl2）`s_client -ssl2 -cipher RC4-MD5`** 直连 shim →
+  `HTTP/1.0 200 OK`（0.060s）；tee 抓到 C2S 28/266/33/56、S2C 736/33/33/427 的完整记录序列。
+  `-ssl3` 对 NSS shim 同样 200。不是自家客户端自证。
+- 修复：合法 >16 KiB 的 2-byte-header SSLv2 记录被旧代码按 16383 上限拒绝（大 POST 必断）；
+  按头型改上限并把 pending 扩到 32767（旧二进制 20KB 记录 response=0，新二进制 200）。
+
+**O8（闭）**：线程模型收敛为**每已建立连接 2 条 OS 线程**（旧 4）：relay 改 tokio
+`copy_bidirectional`，握手 1 个 blocking 槽/连接、128 上限 + 10s deadline。10 条已建立连接
+实测 24 线程/52 fd；100 个慢握手（SSLv2 与 NSS 各一轮）峰值 103 线程/412 fd，10s 时
+`released=100/100`、fd 减半，20s 线程回 3、fd 回 12，RSS 增长 <1MB（SSLv2）/~7MB（NSS）。
+另测字面「只连不发」100 连接：线程始终 4、fd 1s 时 110 / 4s 回 10，100/100 被 peek 2.4s
+预算关闭（不进入遗留栈、不起 blocking 线程）。
+合法慢客户端 5s 延迟成功、12s 被 deadline 拒绝；正常握手 <0.1s。
+- 修复（验证中发现）：遗留连接**从不发 FIN** —— `LegacySyncIo` 的 poll_shutdown 是 no-op，
+  读线程持有 C 连接阻塞在 read(2)，`Connection: close` 客户端永远等不到 EOF（旧二进制
+  openssl s_client 必须 20s timeout；Python 探针 16.7s）。把 relay 所有权交给写线程，flush
+  后 `shutdown(SHUT_WR)` → 新二进制 0.060s/0.113s 正常退出，keep-alive 2 请求仍全 200。
+- 修复：不完整 SSLv2 探针的 info 日志降 debug（匿名可触发的逐连接写盘）。
+
+**O12（闭）**：Linux `/proc/<pid>/stat` 第 22 字段 starttime + ppid + zombie + cmdline 程序名；
+`kill(pid,0)` 判在，任何身份读取失败都**不发信号**（fail-safe）。单测 8/8（含同名外部进程、
+pid 复用时间差、exec 后直系子进程、正常对照），并行 3 次稳定。真机：go sidecar 随 SIGTERM
+被杀、外部进程存活；矩阵实例停机清掉 JSP java（680551），其他 agent 的 JSP 未受影响。
+OpenBSD：`sysctl(KERN_PROC_PID)`→`kinfo_proc{p_ppid,p_stat(SZOMB=5),p_ustart_sec/usec}` +
+`KERN_PROC_ARGS`；libc 0.2.189 字段/常量已核对；**未交叉编译**（本机无 openbsd std），
+sysctl 失败一律返回 None ⇒ 不杀（方向安全，代价是可能漏清理孤儿）。
+
+**回归**：`test_tls_stacks.sh` **PASS=7**；默认二进制 **PASS=4 FAIL=3**（预期隔离：
+`legacy=none`、ldd 0 NSS/NSPR、strings 0）；现代 TLS1.2/1.3 正常；四 feature 单测
+**557 项/556 passed/1 ignored/0 failed**（默认 553/552/1/0）；19 引擎 × h1+h2c **38/38 200**。
+
+**改动文件**：`libs/tls-tomcrypt/tc_shim.c`（记录上限/pending）、
+`src/server/tls/legacy_io.rs`（FIN）、`tls_nss.rs`/`tls_tomcrypt.rs`（传 relay、日志）、
+`scripts/test_sslv2_probe.py`（字节取证/慢握手/文档）、
+`src/server/apps/child_registry.rs`（仅测试加固）。报告
+`.agents/1009/reports/legacyhard2-wave18.md`；修复 `.agents/1009/fixes/legacyhard2-wave18.md`；
+资产 `~/scratch-legacyhard2/`。端口 27443–27450 已释放。
+
+**未闭/边界**：OpenBSD 未真机；ASAN 未重跑；真实 1990s 客户端未测（用 OpenSSL 1.0.2u 替代）；
+`go_shm_ipc` 路径未触发（Linux 构建无此 feature）；10s deadline 为常量（极慢链路可能需调大）。
+
+---
+
+# 【agent-enginelat2 / 工号 1009 · Wave-18】引擎延迟门禁 rust/c/go 达标（2026-10-24 11:45–12:50）
+
+**scope**：`src/server/apps/{app_ffi,mod,native_http,sidecar_engine}.rs`、`www-apps/{rust,c,go}/**`、
+`bench/app_engine_overhead.py`、本报告/fixes、contact 追加。**未** commit/push/checkout/reset/stash/clean；
+共享树里其它 agent 的在途改动（rack/tls/child_registry）原样保留、未纳入结论。
+
+**结论：§14/§19 引擎延迟门禁 PASS。** 最终二进制（HEAD `d389c56` + 本波改动，md5
+`426caa8d7748f634ea58d374889bb755`）在独立端口 25095、TLS off、ABBA 多轮实测（wrk -t2 -c8 -d3s）：
+- rust：RPS **51.8k–56.7k**（≥11k），p50 118–138µs，p99 526–658µs，**延迟/static 0.80–0.91**
+  （5 轮同轮配对中位 0.880；9 轮复测 0.808）。
+- c：RPS **51.2k–57.6k**（≥9k），p50 118–137µs，延迟/static **0.75–0.90**（配对中位；单轮最差
+  1.099 是同轮外部负载尖峰，static p99 也 2.5–2.9ms）。
+- go：RPS **46.5k–51.6k**（≥9k），p50 134–153µs，延迟/static **0.82–1.09**（配对中位 0.99–1.04；
+  同响应体尺寸基线配对 1.035）。
+- 静态基线：同 listener/keep-alive/127B 文件，另做 23/29/39B 同尺寸文件基线。
+- 服务端 c8 下约 1.9–2.0 核；每次 3s 单轮均有 loadavg 记录（7.2–21）。
+
+**前后对照（决定性证据）**：父提交 `03e4ae0` 独立构建同配置：rust/c/go 延迟/static =
+**2.010 / 2.222 / 2.165**（复现 verify7 的 2.30 量级），RPS 17.4–17.8k。同代码开关 A/B：
+`CRUCIBLE_APP_INLINE=0` → 1.846/1.861/2.046；inline 开但 `CRUCIBLE_APP_PATH_TTL_MS=0` →
+1.267/1.307/1.563；两者默认开 → 0.896/0.910/1.084。**根因**是池路径两次跨线程唤醒（c8 下
+每请求 queue_wait 约 63µs）+ 每请求 canonicalize+stat（约 7–11µs），不是 FFI 本身；
+剩余主机侧开销已到 1.5–2.5µs/请求，go 的 ~4.5µs 全在 cgo 过界（GoString/CString/free 再入 Go）。
+
+**本波改动（4 项）**：
+1. **删除** `d389c56` 的临时 `CRUCIBLE_APP_PROF` 脚手架（app_ffi/mod/sidecar 全部 span）；
+   剖析值已按「区间增量/区间次数」重算后写入报告 §4。
+2. **首次装载不内联**（`app_ffi.rs:1158 lib_is_loaded` + `:505` 门控）：fresh 实例首次
+   `GET /go/` 实测 0.639s（Go runtime 初始化），原先会把 2 个 tokio worker 都卡住、整 listener
+   p99 460–552ms；修复后同一窗口 `/index.html` 1.95ms、`/rust/` 15.5ms，非 go 路由不再受
+   队头阻塞，装载完成后仍走内联快路径。
+3. h1+h2 `execute/execute_simple` 的 method/path/query/content-type 改借用（去掉 4 次分配）。
+4. `bench/app_engine_overhead.py`：默认引擎含 rust/c/go；输出 p50/p99/non2xx/lat-static/rps-static；
+   新增 `--static-path`、`--warmup`（默认 1，避免把冷启动算进稳态）、`--json`；实跑全 non2xx=0。
+   另加 3 条单测（路径缓存+穿越、ABI 字符串 NUL/复用、内联选择）。
+
+**回归**：19 引擎 × h1+h2c = **38/38 200**（verify_app_engines.py）；`engine_check.py` 19/19 200；
+单测 **553 passed / 0 failed / 1 ignored**（基线 547；本波只新增 3 条，其余增量来自其它 agent 在途测试）。
+期间 `child_registry::kill_all_spares_reused_external_pid` 曾失败一次，owner 12:43 改后复跑通过，
+非本 scope。wrk 机器上早已由前序 wave 装在 `~/local/usr/bin`，本波直接用。
+
+**诚实边界**：共享 32 核 WSL 机 load 7.2–21，单次 3s 样本会被外部负载放大 p99，结论用 ABBA
+配对中位并保留逐轮 raw；Go 冷启动 0.64s 不是稳态（脚本默认预热）；脚本路径缓存 TTL 250ms 是
+有界安全取舍；内联不享受 60s 看门狗（`CRUCIBLE_APP_INLINE=0` 可退回池）；OpenBSD 1vCPU 未压测、
+生产未部署；未把在途数字当结论。
+
+报告：`.agents/1009/reports/enginelat2-wave18.md`；修复：`.agents/1009/fixes/enginelat2-wave18.md`。
+资产：`~/scratch-enginelat2/{target/release/webserver, target-before, conf, apps-root, abba.py,
+logs/*.json, logs/prof-*.log, logs/unit-final*.log}`；25095 实例与端口已停止/释放。
+
+---
+
+# 【agent-racksidecar / 工号 1009 · Wave-18】/rack/ 常驻 sidecar：远程 502 → 200（2026-10-24 12:5x）
+
+**结论**：给 `/rack/` 补上与 `/ruby/` 同款的常驻 sidecar（UNIXServer + HTTP/1.1 + 同进程
+Rack 加载，非 per-request spawn）。远程 OpenBSD（stub `libapp_rack.so`、RACK_EMBED=0）
+`/rack/` **200**，`/rack/foo`、h2、POST、`.env`、10 并发全通过，`/ruby/` 与其它
+16 条引擎路由保持 200。**远程已在 `/tmp/remote-build.lock` 内构建并重启**。
+
+**改动（4 文件）**：`www-apps/rack/sidecar.rb`（新增 912 行：Rack::Builder/内置兼容层、
+CGI env、keep-alive、穿越防护、500 id+脱敏、`.rb` CGI 兼容、`x-crucible-env-*`）；
+`www-apps/rack/init.sh`（探测 ruby34/~/local 生成自包含 `deps/bin/index`，无 ruby 时删除
+→ 诚实 502）；`src/server/apps/sidecar_engine.rs`（`rack_embed_usable` 按 `.so` 的
+`libruby*.so` 判 stub；`rack_sidecar_preferred`；内部头 `x-crucible-rack-path` 修正
+目录请求被 `rel_script_path` 改成 `/index.ru` 的 PATH_INFO）；`src/server/apps/mod.rs`
+（h1 `:709` 与 h2/h3 `:311` 的 rack 分支落到 sidecar 链）。未改
+`libs/app-engines/rack/**`、`scripts/build_app_engines.sh`。
+
+**验证**：本机 sidecar 模式 19 引擎 38/38（`/rack/` = rack-sidecar，path=/）、embed 模式
+38/38（MRI，无 sidecar 进程）、无 ruby 502；单测 **553 passed / 0 failed / 1 ignored**；
+黑盒套件隔离副本（23xxx）**301 PASS / 1 P2 flake / 0 SKIP**（“限流先于页面规则”在套件
+高负载窗口偶发，单独重跑 2/2 通过，与 rack 无关）。远程：POST+`.env`
+`body=remote-body key=remote-env-1009`、穿越 400、10 并发 10/10、17/17 引擎 200、
+`pgrep rack/sidecar.rb`=1；`config.toml` 仍 skip-worktree。远程二进制 md5 `9acd50e…`，
+源码 md5 与 staging 一致（`99d2767…`/`d221224…`/`7494588…`/`8f7db35…`），备份
+`/tmp/racksidecar-bak-1792816221/`。远程构建 10m49s，构建后磁盘 925M。
+
+**边界**：嵌入模式 PATH_INFO 仍是 `/rack/`（app_ffi 原样传），sidecar 是 Rack 语义 `/`；
+判据为 `.so` 字节启发式（静态链接 libruby 需调整）；远程无 rack gem 走内置兼容层
+（本机有/无 gem 都测）；h3 未实测（要求 h1/h2c）。未 commit/push/checkout/reset/stash/clean；
+自起实例/上游/套件进程已停止，219xx/23xxx 已释放。
+
+报告：`.agents/1009/reports/racksidecar-wave18.md`；修复：`.agents/1009/fixes/racksidecar-wave18.md`。
+资产：`~/scratch-racksidecar/{config-*.toml,app-engines-stub/,remote/,accept/,logs/}`。
