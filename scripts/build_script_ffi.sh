@@ -84,6 +84,30 @@ RB_CFLAGS=""; RB_LIBS=""
 # 记录「有头无库/链接失败」的降级项，结束时汇总（避免在几百行编译输出里被淹没）。
 DEGRADED=()
 
+# ---- 嵌入式 Ruby 引擎互斥（fail fast，先于任何编译） ----
+# MRI 的 VM/GVL 是**进程全局且线程亲和**的：一个进程只能有一次成功的 ruby_init。
+# libapp_ruby.so（script 引擎，专用 MRI 线程）与 libapp_rack.so（app_ffi 池线程）
+# 各自 boot 会二次 ruby_init → `ruby_init_loadpath` 内 SIGSEGV（wave19 core 已证）。
+#   * 默认（ruby embed 关）→ rack embed 按平台默认（Linux 开），/ruby/ 走 sidecar；
+#   * ruby embed=1 且未显式指定 rack → rack 自动转诚实失败版（运行时两 .so 另有
+#     flock 选举兜底：先 boot 者赢，后来者显式 502，不崩进程）；
+#   * 两个都显式=1 → 构建直接失败（这个组合必然把 webserver 打崩，不给机会）。
+RUBY_EMBED_AUTO_OFF_RACK=0
+if [[ "${CRUCIBLE_ENABLE_RUBY_EMBED:-0}" == "1" ]]; then
+  if [[ "${CRUCIBLE_ENABLE_RACK_EMBED:-}" == "1" ]]; then
+    echo "FATAL: CRUCIBLE_ENABLE_RUBY_EMBED=1 与 CRUCIBLE_ENABLE_RACK_EMBED=1 不能同时设置。" >&2
+    echo "       原因：MRI 的 VM/GVL 是进程全局且线程亲和的；libapp_ruby 与 libapp_rack" >&2
+    echo "       各自 ruby_init 会二次初始化 VM → SIGSEGV 整个 webserver（实测 core 496MB）。" >&2
+    echo "       二选一：ruby 嵌入（rack 诚实失败）或 rack 嵌入（ruby 走常驻 sidecar，默认）。" >&2
+    exit 1
+  fi
+  if [[ -z "${CRUCIBLE_ENABLE_RACK_EMBED:-}" ]]; then
+    RUBY_EMBED_AUTO_OFF_RACK=1
+    echo "    NOTE: CRUCIBLE_ENABLE_RUBY_EMBED=1 → rack embed 自动关闭（MRI VM 单一宿主；" \
+         "libapp_rack.so 构建为诚实失败版）"
+  fi
+fi
+
 detect_python() {
   if pkg-config --exists python3-embed 2>/dev/null; then
     PY_CFLAGS="$(pkg-config --cflags python3-embed) -DCRUCIBLE_HAVE_PYTHON"
@@ -389,6 +413,10 @@ RACK_EMBED_DEFAULT=0
 case "$(uname -s)" in
   Linux) RACK_EMBED_DEFAULT=1 ;;
 esac
+# ruby embed 打开时 rack 自动转诚实失败版（互斥检查已在文件前部 fail-fast）。
+if [[ "${RUBY_EMBED_AUTO_OFF_RACK:-0}" == "1" ]]; then
+  RACK_EMBED_DEFAULT=0
+fi
 RACK_EMBED="${CRUCIBLE_ENABLE_RACK_EMBED:-${RACK_EMBED_DEFAULT}}"
 if [[ "${RACK_EMBED}" == "1" && -n "${RB_CFLAGS}" ]]; then
   build_extra_engine rack "${ROOT}/libs/app-engines/rack/rack_engine.c" "${RB_CFLAGS}" "${RB_LIBS}" "Ruby"

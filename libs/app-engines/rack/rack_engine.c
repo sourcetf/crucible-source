@@ -56,7 +56,53 @@
 #include <ruby/version.h> /* ruby_version[]（Ruby 3.4 起 RUBY_VERSION 宏不再进 C 头） */
 #ifndef _WIN32
 #include <dlfcn.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <limits.h>
 #include <pthread.h>
+#include <sys/file.h>
+
+/* 进程级「谁拥有 MRI VM」选举：MRI 的 VM/GVL 是进程全局且线程亲和的，ruby_init()
+ * 只能在一个原生线程里成功一次。若 libapp_ruby.so（script 引擎）已经 boot 了 VM，
+ * 本引擎再 ruby_init_loadpath() 会在 rb_wb_protected_newobj_of 里 SIGSEGV 整个进程
+ * （wave19 core 已证）。两个 .so 之间用 flock + env 标记选举：先启动者宣告所有权，
+ * 后来者显式失败（502）而不是崩进程。默认构建 ruby embed 关，不存在竞争。 */
+#define RACK_BOOT_MARKER "CRUCIBLE_EMBED_RUBY_BOOTED"
+
+static int rack_boot_lock_acquire(void)
+{
+    const char *tmp = getenv("TMPDIR");
+    char path[PATH_MAX];
+    int fd;
+
+    if (tmp == NULL || tmp[0] == '\0')
+        tmp = "/tmp";
+    if (snprintf(path, sizeof(path), "%s/crucible-embed-ruby.lock", tmp) >=
+        (int)sizeof(path))
+        return -1;
+    fd = open(path, O_RDWR | O_CREAT | O_CLOEXEC, 0600);
+    if (fd < 0)
+        return -1;
+    while (flock(fd, LOCK_EX) != 0) {
+        if (errno != EINTR) {
+            close(fd);
+            return -1;
+        }
+    }
+    return fd;
+}
+
+static void rack_boot_lock_release(int fd)
+{
+    if (fd < 0)
+        return;
+    (void)flock(fd, LOCK_UN);
+    close(fd);
+}
+#else /* _WIN32：无 flock，退化为无锁（Windows 不是本项目的运行目标） */
+#define RACK_BOOT_MARKER "CRUCIBLE_EMBED_RUBY_BOOTED"
+#define rack_boot_lock_acquire() (-1)
+#define rack_boot_lock_release(fd) ((void)(fd))
 #endif
 /* 由 gen_rack_shim_header.py 从 rack_shim.rb 生成（编进 .so，不落盘、不写 /tmp）。 */
 #include "rack_shim_rb.h"
@@ -122,6 +168,7 @@ static const char *resolve_script(const char *script, const char *docroot, char 
 #ifdef CRUCIBLE_HAVE_RUBY
 
 static int g_ruby_ready;
+static int g_ruby_vm_booted; /* 本 .so 已在本线程 boot 过 VM（shim 重试时不再 ruby_init） */
 static void *g_libruby_pin; /* RTLD_NODELETE 句柄，故意不 dlclose */
 
 /* 把当前 Ruby 异常（rb_errinfo / $!）格式化成多行文本；格式化本身失败时写 fallback。 */
@@ -219,39 +266,57 @@ static int rack_ruby_ensure_locked(char *err, size_t errsz)
 
     if (g_ruby_ready)
         return 0;
-    /* RUBY_INIT_STACK：本线程是 app_ffi 的池线程（不是进程 main 线程），
-     * 不标记栈底会让 GC 的保守扫描/栈深检查拿到错误的边界。 */
-#ifdef RUBY_INIT_STACK
-    RUBY_INIT_STACK;
-#endif
-    ruby_init();
-    ruby_init_loadpath();
-    /*
-     * 完整启动解释器。**只调 ruby_init 是不够的**：Ruby 3.4（OpenBSD ruby34，Prism
-     * 解析器）下这种半启动 VM 的方法查找不完整，实测 1.class / 1.frozen? 这类
-     * 核心方法会抛 NoMethodError 且错误信息里的方法名是垃圾 Symbol；ruby_options
-     * （加载 prelude / RubyGems / 静态扩展）之后才恢复正常。三条纪律：
-     *   - 不调用 ruby_run：它会 ruby_cleanup，把常驻解释器整个拆掉（本引擎约定
-     *     随进程常驻，且另一个 .so 可能正在用这个 VM）；
-     *   - ruby_options 重复调用会 SIGSEGV，故用**进程级 env 标记**保证只走一次
-     *     （dlclose 后重新 dlopen 本 .so 时静态变量归零，而 VM 还在）；
-     *   - $VERBOSE=nil 抑制 ruby_init + ruby_options 二次加载 prelude 的
-     *     "already initialized constant" 告警；临时摘掉 RUBYOPT，不把宿主环境
-     *     里的 ruby 选项注进引擎启动（可能加载任意代码或直接 exit）。
-     */
-    rb_gv_set("$VERBOSE", Qnil);
-    if (getenv("CRUCIBLE_EMBED_RUBY_BOOTED") == NULL) {
-        static char *embedding[] = {"libapp_rack", "-e", "0"};
-        char *rubyopt = getenv("RUBYOPT");
-        char *saved = rubyopt != NULL ? appengine_strdup(rubyopt) : NULL;
+    if (!g_ruby_vm_booted) {
+        int lockfd = rack_boot_lock_acquire();
 
-        unsetenv("RUBYOPT");
-        (void)ruby_options(3, embedding);
-        setenv("CRUCIBLE_EMBED_RUBY_BOOTED", "1", 1);
-        if (saved != NULL) {
-            setenv("RUBYOPT", saved, 1);
-            free(saved);
+        /* 先看 MRI VM 是否已被另一个嵌入式 Ruby 引擎（libapp_ruby.so）启动。 */
+        if (getenv(RACK_BOOT_MARKER) != NULL) {
+            rack_boot_lock_release(lockfd);
+            snprintf(err, errsz,
+                     "本进程的 MRI VM 已被另一个嵌入式 Ruby 引擎（libapp_ruby）初始化；"
+                     "MRI 的 VM/GVL 是进程全局且线程亲和的，二次 ruby_init 会 SIGSEGV 整个 "
+                     "webserver。默认构建应只启用一个嵌入式 Ruby 引擎（Ruby 脚本走 sidecar、"
+                     "Rack 走嵌入），见 scripts/build_script_ffi.sh。");
+            return -1;
         }
+        /* RUBY_INIT_STACK：本线程是 app_ffi 的池线程（不是进程 main 线程），
+         * 不标记栈底会让 GC 的保守扫描/栈深检查拿到错误的边界。 */
+#ifdef RUBY_INIT_STACK
+        RUBY_INIT_STACK;
+#endif
+        ruby_init();
+        ruby_init_loadpath();
+        /*
+         * 完整启动解释器。**只调 ruby_init 是不够的**：Ruby 3.4（OpenBSD ruby34，Prism
+         * 解析器）下这种半启动 VM 的方法查找不完整，实测 1.class / 1.frozen? 这类
+         * 核心方法会抛 NoMethodError 且错误信息里的方法名是垃圾 Symbol；ruby_options
+         * （加载 prelude / RubyGems / 静态扩展）之后才恢复正常。三条纪律：
+         *   - 不调用 ruby_run：它会 ruby_cleanup，把常驻解释器整个拆掉（本引擎约定
+         *     随进程常驻，且另一个 .so 可能正在用这个 VM）；
+         *   - ruby_options 重复调用会 SIGSEGV，故用**进程级 env 标记**保证只走一次
+         *     （dlclose 后重新 dlopen 本 .so 时静态变量归零，而 VM 还在）；
+         *   - $VERBOSE=nil 抑制 ruby_init + ruby_options 二次加载 prelude 的
+         *     "already initialized constant" 告警；临时摘掉 RUBYOPT，不把宿主环境
+         *     里的 ruby 选项注进引擎启动（可能加载任意代码或直接 exit）。
+         */
+        rb_gv_set("$VERBOSE", Qnil);
+        {
+            static char *embedding[] = {"libapp_rack", "-e", "0"};
+            char *rubyopt = getenv("RUBYOPT");
+            char *saved = rubyopt != NULL ? appengine_strdup(rubyopt) : NULL;
+
+            unsetenv("RUBYOPT");
+            (void)ruby_options(3, embedding);
+            if (saved != NULL) {
+                setenv("RUBYOPT", saved, 1);
+                free(saved);
+            }
+        }
+        rack_pin_libruby();
+        /* VM 已 boot；宣告所有权（后来者据此显式失败）。 */
+        setenv(RACK_BOOT_MARKER, "1", 1);
+        rack_boot_lock_release(lockfd);
+        g_ruby_vm_booted = 1;
     }
 
     v = rb_eval_string_protect(rack_shim_rb, &state);

@@ -2,7 +2,7 @@
 """accept-verify-fakenamed.py — 独立的「假 named」UDP 应答器（验收用，非生产组件）。
 
 本机没有 bind9/named，DoT/DoH 的正常递归路径只会超时，套件里两条检查因此长期 SKIP。
-本守护进程绑在测试配置的 named 端口（默认 38553），对任何查询回一条最小 A 应答，并把
+本守护进程绑在测试配置的 named 端口（默认 30553），对任何查询回一条最小 A 应答，并把
 收到的查询 wire 记到 `$SCRATCH/tmp/fake-named.log`（节流/回显检查都读它）。
 与 accept-verify-dns.py 里的同源实现共用 FakeNamed 类，避免两处逻辑漂移。
 
@@ -22,7 +22,7 @@ def load_fake_named():
 
 
 def main():
-    port = int(sys.argv[1]) if len(sys.argv) > 1 else 38553
+    port = int(sys.argv[1]) if len(sys.argv) > 1 else 30553
     FakeNamed = load_fake_named()
     fn = FakeNamed(port=port)
     fn.start()

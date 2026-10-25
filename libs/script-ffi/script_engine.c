@@ -879,20 +879,136 @@ struct ruby_job {
  * 放进深度 1 的队列并阻塞等结果（g_ruby_call_mtx 串行化调用者，等价于原来的全局锁）。
  * rack 引擎里同样的坑（libs/app-engines/rack）也是靠这套纪律才稳。 */
 #include <pthread.h>
+#include <dlfcn.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <limits.h>
+#include <sys/file.h>
+
+/* 进程级「谁拥有 MRI VM」选举标记。MRI 的 VM/GVL 是**进程全局且线程亲和**的：
+ * ruby_init() 只能在同一个原生线程里调用一次；第二个嵌入式 Ruby 引擎（本引擎与
+ * libapp_rack）再调 ruby_init_loadpath() 会直接 SIGSEGV（core 栈
+ * rb_wb_protected_newobj_of ← ruby_init_loadpath ← ruby_thread_main）。
+ * 两个 .so 之间唯一的共享面是 libc/文件系统，故用 flock + env 标记做跨 .so 选举：
+ * 先启动者在持锁期间完成 boot 并 setenv 标记；后来者看到标记就**显式失败**（502），
+ * 而不是把整个 webserver 打崩。默认构建里 ruby embed 关、rack embed 开，不会走到这里。 */
+#define RUBY_BOOT_MARKER "CRUCIBLE_EMBED_RUBY_BOOTED"
+
+static int ruby_boot_lock_acquire(void)
+{
+    const char *tmp = getenv("TMPDIR");
+    char path[PATH_MAX];
+    int fd;
+
+    if (tmp == NULL || tmp[0] == '\0')
+        tmp = "/tmp";
+    if (snprintf(path, sizeof(path), "%s/crucible-embed-ruby.lock", tmp) >=
+        (int)sizeof(path))
+        return -1;
+    fd = open(path, O_RDWR | O_CREAT | O_CLOEXEC, 0600);
+    if (fd < 0)
+        return -1;
+    while (flock(fd, LOCK_EX) != 0) {
+        if (errno != EINTR) {
+            close(fd);
+            return -1;
+        }
+    }
+    return fd;
+}
+
+static void ruby_boot_lock_release(int fd)
+{
+    if (fd < 0)
+        return;
+    (void)flock(fd, LOCK_UN);
+    close(fd);
+}
+
+/* 钉住 libruby（RTLD_NODELETE）：app_ffi 热卸载会 dlclose(libapp_ruby.so)，libruby
+ * 是其 DT_NEEDED；若引用计数归零会被解除映射，而 MRI 的定时器线程仍在里面跑 →
+ * 之后必 SIGSEGV。rack 引擎有同样的保护（rack_pin_libruby）。 */
+static void ruby_pin_libruby(void)
+{
+#ifdef RTLD_NODELETE
+    char soname[128];
+    const char *cands[6];
+    int n = 0;
+    int state = 0;
+    int i;
+    VALUE v;
+
+    v = rb_eval_string_protect(
+        "(defined?(RbConfig) ? RbConfig::CONFIG['LIBRUBY_SO'] : nil).to_s", &state);
+    if (state == 0 && RB_TYPE_P(v, T_STRING)) {
+        long len = RSTRING_LEN(v);
+
+        if (len > 0 && (size_t)len < sizeof(soname)) {
+            memcpy(soname, RSTRING_PTR(v), (size_t)len);
+            soname[len] = '\0';
+            cands[n++] = soname;
+        }
+    } else if (state != 0) {
+        rb_set_errinfo(Qnil);
+    }
+    cands[n++] = "libruby-3.3.so.3.3";
+    cands[n++] = "libruby.so.3.3";
+    cands[n++] = "libruby34.so.0.0";
+    cands[n++] = "libruby.so";
+    for (i = 0; i < n; i++) {
+        void *h = dlopen(cands[i], RTLD_NOW | RTLD_GLOBAL | RTLD_NODELETE);
+
+        if (h != NULL)
+            return; /* 句柄故意不关：常驻映射，直到进程退出 */
+    }
+#endif
+}
 
 static pthread_mutex_t g_ruby_call_mtx = PTHREAD_MUTEX_INITIALIZER; /* 串行化调用者 */
 static pthread_mutex_t g_ruby_q_mtx = PTHREAD_MUTEX_INITIALIZER;    /* job 交接 */
 static pthread_cond_t g_ruby_q_cond = PTHREAD_COND_INITIALIZER;     /* 工作线程等 job */
 static pthread_cond_t g_ruby_done_cond = PTHREAD_COND_INITIALIZER;  /* 调用者等完成 */
+static pthread_cond_t g_ruby_boot_cond = PTHREAD_COND_INITIALIZER;  /* 调用者等 boot */
 static struct ruby_job *g_ruby_pending;
 static int g_ruby_job_done;
-static int g_ruby_thread_state; /* 0=未建 1=已建 -1=建线程失败 */
+static int g_ruby_boot_state;   /* 0=booting 1=ready -2=VM 已被别的 .so 拥有 */
+static int g_ruby_thread_state; /* 0=未建 1=已建 -1=建线程/boot 失败 */
 #define RUBY_LOCK()   pthread_mutex_lock(&g_ruby_call_mtx)
 #define RUBY_UNLOCK() pthread_mutex_unlock(&g_ruby_call_mtx)
 #else
 #define RUBY_LOCK()   ((void)0)
 #define RUBY_UNLOCK() ((void)0)
 #endif
+
+/* ENV 的写入**不能**用 rb_hash_aset()。
+ *
+ * MRI 的 ENV 不是 T_HASH：它是一个 T_DATA（`ruby -e 'p ENV.class'` → Object；
+ * rb_type(ENV)==T_DATA）。rb_hash_aset() 先 rb_hash_modify() 再把参数当
+ * `struct RHash *` 直接访问 st_table 指针，等于按 RHash 布局改写 RData 的内存 ⇒
+ * 堆损坏。损坏不会立刻报错（本请求仍返回 200），而是在**下一次 GC 标记**时爆炸：
+ *
+ *   [BUG] try to mark T_NONE object        （webserver，request 13）
+ *   [BUG] rb_gc_mark(): unknown data type 0x18 ... corrupted object
+ *                                          （C harness，request 11）
+ *   C 栈：rb_bug ← gc_mark ← rb_imemo_new/新对象分配 ← rb_parser_compile_string_path
+ *
+ * 复现（本机，Ruby 3.3.8，见 .agents/1009/reports/rubyembed-wave19.md）：
+ *   顺序 /ruby/ ×13 → SIGABRT（core 496MB）；
+ *   同一脚本把 rb_hash_aset 换成 ENV[key]=value（rb_funcall）→ 1000 请求 0 崩。
+ * rack 引擎一直稳定也印证：它只对**普通 Hash**（$crucible_req）调 rb_hash_aset，
+ * 从不碰 ENV。
+ *
+ * 用 rb_funcall 走 ENV 自己的 `[]=` 实现：既更新内部 env 表也做 libc setenv，
+ * 与 Ruby 侧 `ENV[k]=v` 完全同义。 */
+static void ruby_env_set(VALUE env, const char *key, VALUE val)
+{
+    rb_funcall(env, rb_intern("[]="), 2, rb_str_new_cstr(key), val);
+}
+
+static void ruby_env_set_cstr(VALUE env, const char *key, const char *val)
+{
+    ruby_env_set(env, key, rb_str_new_cstr(val != NULL ? val : ""));
+}
 
 /* ENV 是解释器级全局：清掉上一请求残留的 HTTP_*，避免请求 A 的 Cookie/Authorization
  * 在请求 B（未带该头）里仍然可见。 */
@@ -921,7 +1037,7 @@ static int ruby_env_put_http_cb(void *ctx, const char *name, size_t name_len,
         return 1;
     if (appengine_cgi_http_key(key, sizeof(key), name, name_len) == 0)
         return 0;
-    rb_hash_aset(c->env, rb_str_new_cstr(key), rb_str_new(value, (long)value_len));
+    ruby_env_set(c->env, key, rb_str_new(value, (long)value_len));
     return 0;
 }
 
@@ -946,20 +1062,15 @@ static int ruby_exec_job(struct ruby_job *job)
     /* ENV inject（含请求体长度/类型；P2 body 丢失修复）。 */
     {
         VALUE env = rb_const_get(rb_cObject, rb_intern("ENV"));
-        rb_hash_aset(env, rb_str_new_cstr("REQUEST_METHOD"),
-                     rb_str_new_cstr(method ? method : "GET"));
-        rb_hash_aset(env, rb_str_new_cstr("PATH_INFO"),
-                     rb_str_new_cstr(path ? path : "/"));
-        rb_hash_aset(env, rb_str_new_cstr("QUERY_STRING"),
-                     rb_str_new_cstr(query ? query : ""));
-        rb_hash_aset(env, rb_str_new_cstr("REMOTE_ADDR"),
-                     rb_str_new_cstr(remote ? remote : ""));
-        rb_hash_aset(env, rb_str_new_cstr("SCRIPT_FILENAME"), rb_str_new_cstr(script));
+        ruby_env_set_cstr(env, "REQUEST_METHOD", method ? method : "GET");
+        ruby_env_set_cstr(env, "PATH_INFO", path ? path : "/");
+        ruby_env_set_cstr(env, "QUERY_STRING", query ? query : "");
+        ruby_env_set_cstr(env, "REMOTE_ADDR", remote ? remote : "");
+        ruby_env_set_cstr(env, "SCRIPT_FILENAME", script);
         snprintf(lenbuf, sizeof(lenbuf), "%lu", (unsigned long)body_len);
-        rb_hash_aset(env, rb_str_new_cstr("CONTENT_LENGTH"), rb_str_new_cstr(lenbuf));
+        ruby_env_set_cstr(env, "CONTENT_LENGTH", lenbuf);
         if (content_type != NULL && content_type[0] != '\0')
-            rb_hash_aset(env, rb_str_new_cstr("CONTENT_TYPE"),
-                         rb_str_new_cstr(content_type));
+            ruby_env_set_cstr(env, "CONTENT_TYPE", content_type);
         /* 请求头 → HTTP_*（CGI 语义）。 */
         ruby_env_clear_http(env);
         {
@@ -985,6 +1096,8 @@ static int ruby_exec_job(struct ruby_job *job)
         "rescue LoadError; $__crucible_out = nil; end",
         &state);
     rb_load_protect(rb_str_new_cstr(script), 0, &state);
+    if (state != 0)
+        rb_set_errinfo(Qnil); /* 不把上一请求的异常对象挂到下一请求 */
     out = rb_eval_string_protect(
         "begin; r = $__crucible_out ? $__crucible_out.string : ''; "
         "ensure; $stdout = $__crucible_old_stdout if $__crucible_old_stdout; "
@@ -1010,10 +1123,37 @@ static int ruby_exec_job(struct ruby_job *job)
 }
 
 #ifndef _WIN32
+/* ruby_exec_job 的 rb_protect 包装：ENV[]=（rb_funcall）在值编码非法时可能抛异常，
+ * 脚本里的非本地跳转也只有 protect 能兜住。任何逃逸的 Ruby 异常都不允许把专用
+ * MRI 线程的 root tag 打穿（那会让后续请求全挂）。 */
+static VALUE ruby_exec_job_protected(VALUE arg)
+{
+    return (VALUE)ruby_exec_job((struct ruby_job *)arg);
+}
+
 /* MRI 专用线程：初始化 VM（只此线程碰 rb_*），然后循环取 job 执行。 */
 static void *ruby_thread_main(void *arg)
 {
+    int lockfd;
+
     (void)arg;
+    /* 跨 .so 选举：libapp_rack 可能已经初始化并独占了这个进程的 MRI VM。 */
+    lockfd = ruby_boot_lock_acquire();
+    if (getenv(RUBY_BOOT_MARKER) != NULL) {
+        fprintf(stderr,
+                "scriptffi: ruby 嵌入式 MRI 未启动：本进程已由另一个嵌入式 Ruby 引擎"
+                "（通常是 libapp_rack）初始化了 MRI VM（%s=1）。MRI 的 VM/GVL 是进程全局且"
+                "线程亲和的，二次 ruby_init 会 SIGSEGV 整个 webserver；本引擎改为显式失败"
+                "（502）。默认配置用常驻 sidecar 提供 /ruby/（CRUCIBLE_ENABLE_RUBY_EMBED=0）；"
+                "若要嵌入式 ruby，请在同一构建里关闭 rack embed。\n",
+                RUBY_BOOT_MARKER);
+        pthread_mutex_lock(&g_ruby_q_mtx);
+        g_ruby_boot_state = -2;
+        pthread_cond_broadcast(&g_ruby_boot_cond);
+        pthread_mutex_unlock(&g_ruby_q_mtx);
+        ruby_boot_lock_release(lockfd);
+        return NULL;
+    }
     /* RUBY_INIT_STACK 必须落在本线程的栈帧里：MRI 的保守 GC/栈深检查用它定栈底，
      * 缺了它（从池线程直接 ruby_init）GC 会拿到错误边界 → SIGSEGV。 */
 #ifdef RUBY_INIT_STACK
@@ -1024,13 +1164,13 @@ static void *ruby_thread_main(void *arg)
     /* Ruby 3.4（Prism）：只 ruby_init 的半启动 VM 方法查找不完整（rack 引擎同结论），
      * 走一次 ruby_options 载入 prelude；env 标记避免 .so 重开后再 boot（会 SIGSEGV）。 */
     rb_gv_set("$VERBOSE", Qnil);
-    if (getenv("CRUCIBLE_EMBED_RUBY_BOOTED") == NULL) {
-        /* 只 boot 到「能 rb_load_protect 跑脚本」为止：
-         * did_you_mean / syntax_suggest / error_highlight 这些 prelude 在嵌入场景
-         * 实测会让 MRI 在启动阶段自己 rb_bug → SIGSEGV（OpenBSD + Ruby 3.4，core 栈
-         * sigsegv → rb_bug_for_fatal_signal → ruby_default_signal）；它们对执行脚本
-         * 毫无必要（只是 REPL 的报错美化）。gems 一并关掉：本引擎按契约只跑脚本文件，
-         * 需要 gem 的场景应走 rack 引擎。 */
+    /* 只 boot 到「能 rb_load_protect 跑脚本」为止：
+     * did_you_mean / syntax_suggest / error_highlight 这些 prelude 在嵌入场景
+     * 实测会让 MRI 在启动阶段自己 rb_bug → SIGSEGV（OpenBSD + Ruby 3.4，core 栈
+     * sigsegv → rb_bug_for_fatal_signal → ruby_default_signal）；它们对执行脚本
+     * 毫无必要（只是 REPL 的报错美化）。gems 一并关掉：本引擎按契约只跑脚本文件，
+     * 需要 gem 的场景应走 rack 引擎。 */
+    {
         static char *embedding[] = {"libapp_ruby",
                                     "--disable=gems,did_you_mean,syntax_suggest,error_highlight",
                                     "-e", "0"};
@@ -1039,12 +1179,19 @@ static void *ruby_thread_main(void *arg)
 
         unsetenv("RUBYOPT");
         (void)ruby_options(4, embedding);
-        setenv("CRUCIBLE_EMBED_RUBY_BOOTED", "1", 1);
         if (saved != NULL) {
             setenv("RUBYOPT", saved, 1);
             free(saved);
         }
     }
+    /* .so 常驻（RTLD_NODELETE）后再宣告「本进程的 VM 归我」，后来者据此显式失败。 */
+    ruby_pin_libruby();
+    setenv(RUBY_BOOT_MARKER, "1", 1);
+    ruby_boot_lock_release(lockfd);
+    pthread_mutex_lock(&g_ruby_q_mtx);
+    g_ruby_boot_state = 1;
+    pthread_cond_broadcast(&g_ruby_boot_cond);
+    pthread_mutex_unlock(&g_ruby_q_mtx);
     for (;;) {
         struct ruby_job *job;
 
@@ -1055,7 +1202,16 @@ static void *ruby_thread_main(void *arg)
         g_ruby_pending = NULL;
         pthread_mutex_unlock(&g_ruby_q_mtx);
 
-        job->rc = ruby_exec_job(job);
+        {
+            int state = 0;
+            int rc = (int)rb_protect(ruby_exec_job_protected, (VALUE)job, &state);
+
+            if (state != 0) {
+                rb_set_errinfo(Qnil);
+                rc = -1;
+            }
+            job->rc = rc;
+        }
 
         pthread_mutex_lock(&g_ruby_q_mtx);
         g_ruby_job_done = 1;
@@ -1096,7 +1252,13 @@ static int run_ruby_inprocess(const char *script, const char *method, const char
         pthread_attr_setstacksize(&attr, 8UL * 1024 * 1024);
         if (pthread_create(&th, &attr, ruby_thread_main, NULL) == 0) {
             (void)pthread_detach(th);
-            g_ruby_thread_state = 1;
+            /* 等 boot 结果：失败（VM 已被别家 .so 拥有 / ruby_init 失败）时不要把
+             * job 挂进去——否则没有消费者，请求线程会永久等 g_ruby_job_done。 */
+            pthread_mutex_lock(&g_ruby_q_mtx);
+            while (g_ruby_boot_state == 0)
+                pthread_cond_wait(&g_ruby_boot_cond, &g_ruby_q_mtx);
+            g_ruby_thread_state = (g_ruby_boot_state == 1) ? 1 : -1;
+            pthread_mutex_unlock(&g_ruby_q_mtx);
         } else {
             g_ruby_thread_state = -1;
         }
@@ -1104,7 +1266,8 @@ static int run_ruby_inprocess(const char *script, const char *method, const char
     }
     if (g_ruby_thread_state != 1) {
         RUBY_UNLOCK();
-        fprintf(stderr, "scriptffi: ruby 专用线程创建失败\n");
+        fprintf(stderr, "scriptffi: ruby 嵌入式引擎不可用（专用 MRI 线程创建或 VM boot 失败）；"
+                        "见上一条日志。\n");
         return -1;
     }
     pthread_mutex_lock(&g_ruby_q_mtx);

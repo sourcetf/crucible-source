@@ -6,7 +6,7 @@
   1. 空闲连接收到 GOAWAY（且 GOAWAY 之前连接未被 CONNECTION_CLOSE 掐断）；
   2. **在飞请求**（/slow 经代理到 2s 慢上游）在触发后仍拿到完整 200 响应。
 
-触发方式：改本套件**自己 scratch 里**的 config-verify.toml（把 38098 listener 的 root
+触发方式：改本套件**自己 scratch 里**的 config-verify.toml（把 30098 listener 的 root
 从 www-h3dir 换成 www-h3dir2 —— 指纹变化）+ SIGHUP；测完恢复原文件。
 （证书文件用仓库共享 cert.pem，绝不 touch。）
 
@@ -18,8 +18,8 @@ aioquic 的 H3Connection 会静默忽略 control stream 上的 GOAWAY，因此�
 import asyncio, json, os, re, signal, ssl, subprocess, sys, time
 
 HOST = "127.0.0.1"
-PORT = 38098
-SCRATCH = "/home/dev123/scratch-verify7"
+PORT = 30098
+SCRATCH = "/home/dev123/scratch-verify8"
 AUTHORITY = f"{HOST}:{PORT}"
 OLD_ROOT = f"{SCRATCH}/www-h3dir"
 NEW_ROOT = f"{SCRATCH}/www-h3dir2"
@@ -173,7 +173,7 @@ def status_of(slot):
 
 
 def trigger_reload(old=OLD_ROOT, new=NEW_ROOT):
-    """把 38098 listener 的 root 换掉（指纹变化）+ SIGHUP。返回 (ok, msg)。"""
+    """把 30098 listener 的 root 换掉（指纹变化）+ SIGHUP。返回 (ok, msg)。"""
     try:
         s = open(CFG).read()
     except Exception as e:
@@ -248,7 +248,7 @@ async def scenario(inflight: bool, wait_s=20.0):
 
 
 def test_idle():
-    area = "扩展·h3 GOAWAY（空闲连接 :38098）"
+    area = "扩展·h3 GOAWAY（空闲连接 :30098）"
     try:
         r = asyncio.run(scenario(inflight=False))
     except Exception as e:
@@ -257,7 +257,7 @@ def test_idle():
     got = bool(r["goaway"])
     rec(area, "空闲连接收到 H3 GOAWAY（配置变更）", got, "GOAWAY frame",
         f"goaways={r['goaway']} t={r['t_goaway']} terminated={r['terminated']}",
-        "改 scratch config 的 38098 root + SIGHUP；aioquic 自解析 control stream",
+        "改 scratch config 的 30098 root + SIGHUP；aioquic 自解析 control stream",
         sev="P1", owner="h2h3")
     rec(area, "GOAWAY 之前连接未被 CONNECTION_CLOSE 掐断", got and r["terminated"] is None,
         "no CONNECTION_CLOSE before GOAWAY",
@@ -265,7 +265,7 @@ def test_idle():
 
 
 def test_inflight():
-    area = "扩展·h3 GOAWAY（在飞请求 :38098/slow）"
+    area = "扩展·h3 GOAWAY（在飞请求 :30098/slow）"
     try:
         r = asyncio.run(scenario(inflight=True, wait_s=25.0))
     except Exception as e:
@@ -332,7 +332,7 @@ async def scenario_grace_window(delay=2.2, wait_s=20.0):
 
 
 def test_grace_window():
-    area = "扩展·h3 GOAWAY（宽限窗口内新连接 :38098）"
+    area = "扩展·h3 GOAWAY（宽限窗口内新连接 :30098）"
     try:
         r = asyncio.run(scenario_grace_window())
     except Exception as e:
@@ -350,7 +350,7 @@ def test_grace_window():
 
 
 def probe_ok(timeout_each=6.0):
-    """探测 38098 的 h3 端点是否已（重新）就绪：GET / → 200。"""
+    """探测 30098 的 h3 端点是否已（重新）就绪：GET / → 200。"""
     async def _p():
         from aioquic.asyncio.client import connect
         from aioquic.quic.configuration import QuicConfiguration
@@ -395,7 +395,7 @@ def wait_h3_ready(total=40.0):
 
 def upstream_ok():
     """h1(https) 打同一个 listener 的 /slow：200 说明套件上游活着（否则 502）。
-    注意 38098 是 **TLS** listener，必须 https（明文打它是 TLS 握手错误 → 000）。"""
+    注意 30098 是 **TLS** listener，必须 https（明文打它是 TLS 握手错误 → 000）。"""
     try:
         import ssl, urllib.request
         ctx = ssl._create_unverified_context()
@@ -418,10 +418,10 @@ def main():
     ready = wait_h3_ready()
     print(f"[goaway] endpoint re-ready after restore: {ready}")
     if not upstream_ok():
-        rec("扩展·h3 GOAWAY（在飞请求 :38098/slow）", "在飞请求期间收到 H3 GOAWAY", False,
-            "GOAWAY frame", "上游 38099 /slow 不可达（外部误杀？）", owner="h2h3", skip=True)
-        rec("扩展·h3 GOAWAY（在飞请求 :38098/slow）", "在飞 /slow 请求仍拿到完整 200（响应不被截断）",
-            False, 200, "上游 38099 /slow 不可达", owner="h2h3", skip=True)
+        rec("扩展·h3 GOAWAY（在飞请求 :30098/slow）", "在飞请求期间收到 H3 GOAWAY", False,
+            "GOAWAY frame", "上游 30099 /slow 不可达（外部误杀？）", owner="h2h3", skip=True)
+        rec("扩展·h3 GOAWAY（在飞请求 :30098/slow）", "在飞 /slow 请求仍拿到完整 200（响应不被截断）",
+            False, 200, "上游 30099 /slow 不可达", owner="h2h3", skip=True)
     else:
         try:
             test_inflight()

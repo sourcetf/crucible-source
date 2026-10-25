@@ -5056,3 +5056,236 @@ CGI env、keep-alive、穿越防护、500 id+脱敏、`.rb` CGI 兼容、`x-cruc
 
 报告：`.agents/1009/reports/racksidecar-wave18.md`；修复：`.agents/1009/fixes/racksidecar-wave18.md`。
 资产：`~/scratch-racksidecar/{config-*.toml,app-engines-stub/,remote/,accept/,logs/}`。
+
+---
+
+# 【agent-deploy3 / 工号 1009 · Wave-19】远程三处专属收口 + 二进制四 feature 纠偏（2026-10-24 13:2x–14:0x）
+
+**结论**：三项全部关闭，并发现简报前提不成立——远程实际是 `d389c56` + rack 未提交 WIP，
+现役二进制 `9acd50e…` **没有 NSS/TomCrypt**（`ldd` 无 nss、`strings` 计数 0），
+不是「已部署 47be71b + 四 feature」。本轮 `git fetch && git reset --hard origin/main`
+到 **`47be71b`** 后按 `config.mk` 的 5 feature 重建，遗留 TLS 恢复。
+
+**① `/uwsgi`（18→19 apps）**：备份 `config.toml`（原文件 md5 `809f0fb2…`），在 9095
+listener apps 末尾追加 `docroot="www-apps/uwsgi" / engine="uwsgi" /
+lib="target/app-engines/libapp_uwsgi.so" / paths=["/uwsgi"]`。`--check-config` →
+`config OK (listeners=5, apps=19, tls acceptors built=3)`。h1+h2c `/uwsgi/` **200**
+`hello from uwsgi path=/uwsgi/`；`/uwsgi/app.py` **200 36B 引擎文案**，源码 224B，
+`cmp` 不同、access log `kind=app` ⇒ **源码外泄已消除**。config 仍 `S`（skip-worktree）。
+
+**② 真 Jetty**：起始探针发现 `pkg_info` 登记 jdk-17 但 `/usr/local/jdk-17` 整棵树不在
+（wave18 之后被删），mvn 因 `JAVA_HOME` 不存在可用。从 packages-stable
+`pkg_add -U jdk-17.0.19.10.1p0v0`（包 228,831,963B，安装 361,137,078B），删除
+`jmods/demo/src.zip/man/legal/include` 后目录 178M、磁盘 923M→577M→729M。
+`PATH=/usr/local/jdk-17/bin` 下 `bash scripts/build_jsp_sidecar.sh` **19s** 产出
+`libs/jsp-sidecar/target/jsp-sidecar.jar` **7,792,763B**（md5 `79d9416c…`）；
+`sh www-apps/jsp/init.sh` 生成 Jetty wrapper。`/jsp/` `/do/` 实测 **200**，
+`server: Jetty(11.0.24)`、`x-crucible-engine: jsp-jetty`、CL 168、body 来自 `index.jsp`；
+进程为 `java -jar …/jsp-sidecar.jar`（ppid=webserver）。**不再是 Python shim。**
+
+**③ 孤儿 ruby**：清掉 ppid=1 的 96218；重启后同代 jsp/do/ruby/rack 四个 sidecar 也成了
+孤儿（旧实例 shutdown 日志 05:36:37 把 6 个存活子进程全 `skip …（已退出）`），逐个
+SIGTERM 后按需请求触发新实例拉起：ruby 83279、rack 37780、jsp 81171、do 92073 的 ppid
+均为 36360，`orphans=0`；05:49 之后 `skip …（已退出）` 计数 **0**，`/ruby/` 200。
+**残留根因（未改代码）**：`child_registry.rs:402-408` 的启动清理 stale 判据不认
+`java -jar .../jsp-sidecar.jar` 与 `ruby34 .../www-apps/{ruby,rack}/sidecar.rb`，
+且 `kill_all` 在 OpenBSD shutdown 窗口把直系子进程判死；建议后续补上两种 cmdline 并
+复查 `proc_info`，否则下次重启仍会留孤儿。
+
+**重建/复核**：二进制 `e85b1403…` 20,791,056B；`ldd` 载入 libnss3/libssl3/libnspr4，
+legacy strings=5；`test_tls_stacks.sh` **PASS=7 FAIL=0**（SSLv2 full handshake
+`mac_verified=1`），生产 8443 sslv3/v2compat 200。19 引擎 × h1/h2c = **38/38 状态 200**
+（脚本 4 条 c/rust 文案期望过期：`c path=/c/`、`rust path=/rust/`）。TLS1.2/1.3 策略、
+ALPN h2、h3 `200 ver=3`、DoT TLS1.3/AES256/rcode0/an2、BIND 9.20.27 全链路正常；
+静态/Range/条件/穿越、规则/代理/限流（200=5 429=20）/ACL/Basic Auth/面板 401/上传/
+DoH fail-closed 全通过。稳定性：200 顺序 0 失败；32×30s = **39,192 请求 0 bad/0 err**
+（1305.6 rps）；RSS 44,140→50,572KB，fd 30→44 瞬时→**30** 稳定；1 webserver、0 僵尸、
+0 孤儿。磁盘收工 **706M** 可用；`/tmp/remote-build.lock` 已释放。
+
+**回滚**：`bin/webserver.bak-wave19-pre`（`9acd50ea…`，20,355,696B；注意它没有
+NSS/TomCrypt）；配置备份 `/tmp/config.toml.bak-1792819852`、`/root/config.toml.wave19`。
+**边界**：未跑 cargo test / h2o 双门禁；h3 只验 `/`；`tsx/dist/index.js` 仍是构建写回（P3）。
+
+报告：`.agents/1009/reports/deploy3-wave19.md`；修复：`.agents/1009/fixes/deploy3-wave19.md`。
+
+
+---
+
+# 【agent-verify8 / 工号 1009 · Wave-19】最终验收：302/0/0 + 引擎门禁达标 + 远程 47be71b 复核（2026-10-24 13:2x–14:1x）
+
+**结论**：功能验收 **302 PASS / 0 FAIL / 0 SKIP**（PASS1 149、EXT 113、GOAWAY 7、H3+DoT+DoH 24、
+DNS-ECS 6+3），端口归一化后与 verify7 的 302 条检查 **diffs=0**；单测 **555/0/1**；
+19 引擎 × h1/h2c = **38/38**，embed 与 rack-sidecar 两种模式均通过（JSP 真 Jetty 11.0.24、
+ASP.NET 真 hostfxr 10.0.13、Go 真 c-shared）；遗留 TLS **PASS=7**（SSLv2 完整状态机
+`verify=ok finished=ok mac_verified=1`），默认二进制 PASS=4 FAIL=3（隔离）。
+性能：**引擎门禁全部达标** —— rust 53.8k RPS / 延迟比 **0.681**（≥11k、<1.1）；c 49.5k / 0.706；
+go 43.2k / 0.807（≥9k）。**h1 官方 wrk 双门禁** 8 轮 6 轮 exit 0，吞吐/延迟中位
+**1.118 / 1.012**（5 连续轮 5/5 PASS）；2 轮失败均为共享机外部 h2load 满核窗口单门禁越线
+（1.371 / 1.354），非本波回归。h2 多路复用仍差：c64 m10 **0.15×**（记录、不要求达标）。
+
+**端口/装置**：verify8 用 **30000 段**（低于临时端口范围，避开任务书点名的
+24/26/28/29/31/32/33/36/38/40xxx），SCRATCH=`~/scratch-verify8`；`scripts/accept-*` 11 个文件
+只做端口/路径迁移，判据一条未改。首轮 44xxx 遇外部端口争用（44088/44092/44098 启动瞬时
+EADDRINUSE + 上游 TLS 44100 被占）产生 3 条环境 FAIL，换 30000 段同二进制 302/0/0。
+
+**认证快照**：HEAD `47be71b`；二进制 md5 `cdf7ce6b…`（20,574,672B，thin LTO，tls,tls_boring）；
+四 feature 遗留栈 `f21d3697…`。**注意**：13:43 后共享树出现另一 agent 的未提交 WIP
+（rack_engine.c / script_engine.c / build_script_ffi.sh），**不在**本认证二进制/引擎产物内。
+
+**远程一致性终审**（只读；13:30 与 14:01 两次快照）：13:30 远程还是 `d389c56`+rack WIP、
+binary `9acd50e` **无 NSS/TomCrypt**、18 apps、JSP 是 Python shim、1 个 ppid=1 的 ruby 孤儿；
+agent-deploy3 于 13:48 完成纠偏后，本轮复核：**HEAD 47be71b**、binary `e85b1403`（ldd 见
+NSS/NSPR、strings=5）、**19 apps**（`/uwsgi/` 200 引擎、`app.py` 不再泄源码）、
+**真 Jetty**（`server: Jetty(11.0.24)` / jsp-jetty / JSESSIONID）、**0 孤儿**（4 个 sidecar
+ppid=36360）、抽查 10/10 路由 200。**仍开**：磁盘仅 **706M/97%**；config.toml 为
+skip-worktree（19 apps 不在 git）；`tsx/dist/index.js` 构建写回；`rl.toml`/`go/prebuilt`/
+`tsx/node_modules` 未跟踪；孤儿根因（child_registry stale 判据不认 java/ruby cmdline）未改代码。
+
+**58 条缺口终审**：已闭 6 条（U-01 引擎延迟、U-19 SSLv2 状态机、U-20 child_registry pid、
+U-15 生产部署、G-21 LTO 日志、G-22 杂散 `-o`）；U-02 部分闭（OpenBSD NSS/TomCrypt 已验，
+syncookie/v6only/1vCPU 未验）；**仍开 52 条**（代码 23 + 未验证 16 + 风险 13）。P1 仅
+G-01（ECS 过 BIND，外部依赖）；无 P0。明细（owner/复现/可修性）见报告 §4。
+
+**边界**：共享机 load 4.7–14.0（另一 agent 持续 h2load）；1 vCPU/OpenBSD 专有开关未验；
+OCSP/ECH/真实递归/真实老客户端未验；远程只读。所有自起实例/上游/假 named 已停止，
+30000 段端口已释放。
+
+报告：`.agents/1009/reports/verify8-wave19.md`；修复：`.agents/1009/fixes/verify8-wave19.md`。
+资产：`~/scratch-verify8/{bin,target,target-legacy,conf,logs,perf,app-engines-stub}` +
+`matrix.py`/`gen_matrix_config.py`/`srv-matrix.sh`/`engine_gate.py`/`run_h1_gate.sh`/
+`run_h2load.sh`/`start_h2c.sh`/`remote-check*.sh`。
+
+---
+
+# 【agent-rubyembed / 工号 1009 · Wave-19】Ruby MRI 嵌入崩溃根因 = `rb_hash_aset(ENV)` 写坏堆（request 13 GC abort）；已修 1000 请求 0 崩（2026-10-24 13:30–14:10）
+
+**结论**：`/ruby/` 嵌入式 MRI 第 13 个请求崩溃**不是**线程/GC 栈边界/load/StringIO，
+而是 **`script_engine.c` 把 MRI 的 `ENV`（T_DATA）当 Hash 调 `rb_hash_aset`** ⇒ 每请求
+错位写堆；第 13 个请求触发 GC 标记时 `[BUG] try to mark T_NONE object` → SIGABRT
+（core 496MB）。改为 `rb_funcall(ENV,"[]=",…)` 后：**1000 顺序 0 失败、并发 8/16/32
+各 400 全 200、RSS 25.3→25.6MB**；镜像同一 API 的 C harness 也复现 hash 模式第 11 个
+崩、func 模式 1000 稳。**旁证**：rack 一直稳定正是因为它只对普通 Hash
+（`$crucible_req`）调 `rb_hash_aset`，从不碰 ENV。
+
+**第二个独立缺陷（架构级）**：`libapp_rack`（嵌入）与 `libapp_ruby`（嵌入）同进程各自
+`ruby_init` → 第二次 `ruby_init_loadpath` SIGSEGV（core 502MB）。MRI VM/GVL 进程全局
+且线程亲和，加锁解决不了。已加：①两 .so boot 前跨进程 flock + `CRUCIBLE_EMBED_RUBY_BOOTED`
+选举（先到者赢，后来者显式 502，绝不崩进程）；②`build_script_ffi.sh` 两开关 fail-fast
+互斥，ruby embed 开时 rack 自动转 stub（`/rack/` 由 wave18 常驻 sidecar 兜底 200）。
+混合 .so 的 A/B 方向都实测：一个 200 + 一个 502 + 进程存活。**h3 未覆盖**（h1+h2c）。
+
+**改动（3 文件，未 commit）**：
+`libs/script-ffi/script_engine.c`（安全 ENV setter `:1003`、job 级 rb_protect `:1129/:1207`、
+flock 选举 `:895-929`、`RTLD_NODELETE` 钉 libruby `:931`、boot 完成再投递 job `:1225`）、
+`libs/app-engines/rack/rack_engine.c`（flock 选举 `:70-110`、`g_ruby_vm_booted` `:171`、
+ensure 保护 `:262-320`）、
+`scripts/build_script_ffi.sh`（互斥 fail-fast `:95-110`、rack 自动关 `:412-419`）。
+
+**回归**：默认模式 19 引擎 × h1+h2c **38/38**；`/rack/` 嵌入 1000 顺序 + 8/16/32 各 400
+全 200；`/ruby/` sidecar 300/300（`ruby-sidecar`）；`.env` 矩阵 `t2_env --phases 123`
+**PASS=110/FAIL=0**、h2c phase1 **91/0**；`cargo test --features tls,tls_boring`
+**555/0/1**（Linux 无法开 tls_nss/tls_tomcrypt，故不到 558）。嵌入版 POST 二进制
+body/非法 UTF-8 头/`.env` A-B 并发均通过；混合 .so 与同时开两开关（rc=1）均验证。
+
+**部署建议**：默认保持 `CRUCIBLE_ENABLE_RUBY_EMBED=0`（sidecar 是正确默认）+ Linux rack
+embed；嵌入 ruby 仅作显式单 Ruby 引擎开关。版本/GC 评估：`ENV` 在 MRI 3.x 恒为 T_DATA，
+换 Ruby 3.2/3.3 或调 GC 只改崩的时机、不改会不会崩。
+
+**环境提示（给别人）**：本机原来没有 gdb；我用 `~/bin/aptlocal.sh install gdb` 装了
+用户级 gdb 17.1（另补 `libbabeltrace1/libipt2/libsource-highlight4t64/libdebuginfod1t64`）。
+注意该脚本的 `extract_all` 会解包 `$HOME/aptdl` 里**缓存的所有 deb**（本次一次解了 483 个），
+可能把别的 agent 缓存的 JDK 等一并铺进 `~/local`；JAVA_HOME 目前仍解析到 java-17
+（runtime_env 的探测），未观察到 JSP 回归。libruby 是 stripped，ddebs 的 dbgsym 与
+`3.3.8-2ubuntu3.1` build-id 不匹配，core 里读不到 `ruby_current_ec`；证据链见报告。
+
+报告：`.agents/1009/reports/rubyembed-wave19.md`；修复：`.agents/1009/fixes/rubyembed-wave19.md`。
+证据：`~/scratch-rubyembed/{core.791089,core.794923,probe_env.c,probe_engine.c,srv*.log,conf/}`；
+实例 27300（嵌入模式）与 27301（默认矩阵）收工保持运行，Jetty 在
+`~/scratch-rubyembed/state/jsp/test.sock`。
+
+
+---
+
+# 【agent-deploy3 / 工号 1009 · Wave-19 复查】三处远程专属项在 2026-10-25 仍全部关闭；本轮无生产变更（2026-10-25 15:57–16:02 UTC）
+
+**前提核对**：远程 `HEAD=origin/main=47be71b`（`git fetch` 无更新，未 reset）；实例 **36360**
+自 2026-10-24 05:48Z 连续运行 **1d10h**；`config.toml` md5
+`55e01085cde12d9404de17cc661c3b73`、`git ls-files -v`=`S`（19 apps）；二进制
+`e85b1403…`（20,791,056B，ldd 有 nss3/ssl3/nspr4）。本轮**未改 config/二进制、未重启、
+未抢锁**（复查时锁不存在），只做只读探针 + 两个隔离实例（scratch 29090-29096、legacy 19543，
+测完即停）。
+
+**① `/uwsgi`**：`--check-config` = `listeners=5, apps=19, tls acceptors built=3`；h1/h2c
+`/uwsgi/` 200 30B、`/uwsgi/app.py` 200 **36B**（源文件 224B，`cmp` 不同 ⇒ **不再泄露**）；
+access log 两条 h1 + 两条 h2 均 `kind=app`。
+
+**② 真 Jetty**：jar 7,792,763B md5 `79d9416c…`；两个 `java -jar .../jsp-sidecar.jar`
+（ppid 36360），**无 python shim**；`/jsp/` `/do/` h1+h2c 均 200/168B、`server:
+Jetty(11.0.24)`、`x-crucible-engine: jsp-jetty`、body `path=/index.jsp`。
+
+**③ 孤儿 ruby**：仅 1 个 ruby sidecar（83279）与 1 个 rack（37780），ppid 均 36360；
+`orphans=0`；日志 `已退出` 计数 **0**；`/ruby/` 200。
+
+**全量复核（真实输出）**：19 引擎 × h1/h2c = **38/38 状态 200**（脚本 4 条 FAIL 仅为
+`/c/`、`/rust/` 样例文案与脚本期望串不一致）；TLS 9445 仅 1.2 / 9446 仅 1.3 / 8443 双版本，
+ALPN h2，h3 `200 ver=3`；`test_tls_stacks.sh` **PASS=7 FAIL=0**（SSLv2 `mac_verified=1`），
+生产 8443 sslv3/v2compat 200；DoT TLS1.3/AES256 rcode0 an2；BIND UDP/TCP 递归、根 NS 13、
+DNSKEY 3、SOA、NODATA+NSEC3/RRSIG、AXFR 本区 25 条 / 根区 24,922 行。静态 200/Range 206/
+304/416/穿越 404；规则 rewrite/301/403、代理 + 改头、限流 `200=5 429=20`、ACL 403、
+Basic Auth 401/200、面板 401、上传 201/405、PUT `%2e%2e` 400、DoH 明文/密文均为 404/405
+（fail-closed）。稳定性：200 顺序 0 失败；32×30s = **41,146 请求 0 bad/0 err**（1370.9 rps）；
+RSS 55,804→58,908KB、fd 36→37、1 webserver、0 僵尸、0 孤儿、日志 panic/fatal/engine-error=0。
+磁盘 724M/97%。
+
+**仍开（未变）**：child_registry 根因未修（本轮没重启所以孤儿未复发，下次重启仍可能产生；
+`child_registry.rs:402-408` 需认 `jsp-sidecar.jar`/`www-apps/*/sidecar.rb` cmdline）；
+`config.toml` skip-worktree（19 apps 不在 git）；`tsx/dist/index.js` 构建写回（P3）；
+`/aspnet/` 仍 mini、`/go/` 仍 prebuilt sidecar（远程无 .NET/Go 工具链）；h3 只验 `/`；
+未跑 cargo test / h2o 双门禁。
+
+报告：`.agents/1009/reports/deploy3-wave19.md` §9；修复：`.agents/1009/fixes/deploy3-wave19.md` §5。
+
+
+# 【agent-verify8 / 工号 1009 · Wave-19 最终验收（重跑）】302/0/0 + 引擎/遗留 TLS/19 引擎全过；h1 中位 1.100/1.036（6/8 exit 0）；h2 m10 0.124×；远程 47be71b / 19 apps / 真 Jetty / 0 孤儿（2026-10-25 23:58–00:30 +0800）
+
+**对象**：HEAD `47be71b` + 工作树中未提交的 Wave-19 Ruby/Rack C 修复
+（`libs/script-ffi/script_engine.c`、`libs/app-engines/rack/rack_engine.c`、
+`scripts/build_script_ffi.sh`）。本 agent 未做任何 git 写操作；只改 accept-* 注释、报告、fixes、
+本文件与 `~/scratch-verify8/`。
+
+**构建指纹**：`cargo build --release --features tls,tls_boring` rc=0 / 171s；
+二进制 `cdf7cebf…` 20,574,672B（与 10-24 初稿同 md5，Rust 未变；C 引擎已按 Wave-19 源码重建）；
+单测 **555 passed / 0 failed / 1 ignored**（30.05s）；遗留四 feature 二进制 `f21d3697…`。
+
+**全量套件（30xxx，8.5 分钟）**：PASS1 149 + EXT 113 + GOAWAY 7 + H3 24 + ECS-on 6 +
+ECS-off 3 = **302 PASS / 0 FAIL / 0 SKIP**；把 38xxx/30xxx/19xxx 归一化为 PORT 后与 verify7
+**逐检查项 diff=0**（302=302）。
+
+**门禁**：h1 官方 `bench/h2_fair_gate.py`（wrk -t2 -c64 -d10s --latency）8 轮 **6 轮 exit 0**，
+吞吐中位 **1.100**、延迟中位 **1.036**（≤1.2）；两次越线为 load 13–21 的单轮抖动
+（1.222 / 1.209+1.243），与 perfgate-wave16 的 1.110/1.066 同量级。引擎 `wrk -t2 -c8 -d3s`：
+rust **67,543 RPS / 0.761**、c 67,277 / 0.830、go 59,311 / 0.889（RPS 门槛余量 5–7×，全部 PASS）。
+h2：c8m1 0.864×、c64m1 0.662×、c64m10 **0.124×**、c128m1 0.419×（只记录，规格可冲刺）。
+
+**19 引擎**：embed **38/38**、rack sidecar **38/38**（真 Jetty 11.0.24、hostfxr .NET 10.0.13、
+Go c-shared 10 符号、`go-shm-server`=0）；**Wave-19 Ruby 嵌入** 1000 顺序 + 1400 并发 + 300
+rack sidecar 全 200、进程存活（RSS +1.5MB）；Rack 嵌入 1000 + 800 并发全 200。遗留 TLS
+**PASS=7**（SSLv2 verify/finished/mac 全过）；默认二 feature PASS=4/3 且 ldd/strings=0。
+补充：页面规则/country **16/16**（原 3 条 FAIL 是测试夹具缺 `[geoip] enabled=true`，非产品）、
+Admin **20/20**、日志 **10/10**（8000 行 0 逆序）。
+
+**远程（16:09Z 只读）**：HEAD 47be71b、binary `e85b1403…`（5 feature/NSS）、**19 apps**、
+`/jsp/ /do/` 真 Jetty、ruby/rack/jsp/do/php-fpm/go 全部 ppid=36360、**孤儿=0**、磁盘 **723M/97%**；
+`/uwsgi/` 200 且 app.py 不再泄露源码；`config.toml` 仍 skip-worktree。**仍开**：N-05
+child_registry 孤儿清理盲区（下次重启可能复发；`child_registry.rs:300-308/402-408` 需认
+`jsp-sidecar.jar` 与 `www-apps/*/sidecar.rb`）、N-01 磁盘、N-02 config 不在 git、N-03 tsx 构建写回、
+N-06 远程 aspnet-mini/go prebuilt 且未带 Wave-19 未提交 C 修复（默认路径不触发）、
+T-01 `verify_app_engines.py` c/rust 期望串过期、T-02 双栈粗判据。
+
+**缺口终审**：基线 58 条 → **6 闭**（U-01/U-19/U-20/U-15/G-21/G-22）、**52 开**
+（P1×1 G-01；P2×13；P3×22；未验证×16 含 U-02 部分闭）；新增 N-01..N-06 + T-01..T-03；
+**无 P0**。报告：`.agents/1009/reports/verify8-wave19.md`；fixes：`.agents/1009/fixes/verify8-wave19.md`。
+
+**环境**：WSL2 32 核共享，本窗口 load 10.2–21.5（其他 agent 的 kani/miri/cbmc）；主机 23:43:29
+启动、期间无重启；Linux vs 生产 OpenBSD 1 vCPU 的差异未覆盖。所有自起实例/上游/假 named/h2o
+已停，30xxx 与 19543/19544 已释放。
