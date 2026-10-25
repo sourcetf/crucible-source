@@ -83,6 +83,138 @@ pub struct DnsConfig {
     /// 的那份，不是另生成一份）写进应答。面板里同名的 HTTPS 记录优先，本项只在缺失时补。
     #[serde(default)]
     pub https_rr: Vec<HttpsRrCfg>,
+    /// 权威区自动 NS 的名字：相对名（默认 `ns1`，展开为 `ns1.<zone>.`）或绝对名
+    /// （以 `.` 结尾，如 `ns1.example.net.`）。`None`/空 = 默认 `ns1`。
+    ///
+    /// 为什么可配：旧实现给**每个**权威区硬编码 `ns1.<zone>` + `A 127.0.0.1`，
+    /// 生产区里指向 loopback 的胶水是错误数据且无法覆盖（只能再加一条 A）。
+    #[serde(default)]
+    pub ns_name: Option<String>,
+    /// 自动生成的胶水记录地址（A/AAAA 由字面量族决定）。
+    ///
+    /// `None` = 默认 `127.0.0.1`（本机测试开箱可用）；`Some("")` = **不生成**胶水
+    /// （NS 指向外部/自定义主机时的正确选择）；其它 = 自定义 IP 字面量。
+    #[serde(default)]
+    pub ns_glue: Option<String>,
+    /// 递归后端：`"bind"`（默认，BIND named 自身递归/转发，现状零变化）或
+    /// `"unbound"`（Unbound 作为主端口的递归器，BIND 退为内部权威后端）。
+    ///
+    /// 只有 unbound 模式才能把 EDNS Client Subnet（ECS）端到端送到真实上游：
+    /// BIND 9.20 不实现 ECS，递归/转发时丢弃未知 EDNS option；Unbound 的
+    /// `send-client-subnet` 会把客户端查询里的 ECS 原样转发给 forward-zone 上游。
+    #[serde(default = "default_recursor")]
+    pub recursor: String,
+    /// `recursor = "unbound"` 的细节（端口/缓存/ECS）。默认值对 bind 模式完全无效。
+    #[serde(default)]
+    pub unbound: UnboundCfg,
+}
+
+fn default_recursor() -> String {
+    "bind".into()
+}
+
+/// `[dns.unbound]`：Unbound 递归后端的可调项。全部有默认值，旧配置不需要改。
+///
+/// 端口分配（unbound 模式）：
+/// - `[dns] port`（主端口）→ **Unbound**（公开递归 + 权威镜像，DoT/DoH 的转发目标）
+/// - `[dns.unbound] auth_port`（默认 `port + 1`）→ **BIND**（权威/DNSSEC/AXFR 后端）
+/// - `[dns.unbound] control_port`（默认 `auth_port + 1`）→ unbound-control 控制口
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UnboundCfg {
+    /// BIND 权威后端端口；0 = 主端口 + 1（仅回环）。
+    #[serde(default)]
+    pub auth_port: u16,
+    /// unbound-control 控制口；0 = auth_port + 1（仅回环）。
+    #[serde(default)]
+    pub control_port: u16,
+    /// `msg-cache-size`（Unbound 消息缓存）。
+    #[serde(default = "default_ub_cache")]
+    pub msg_cache_size: String,
+    /// `rrset-cache-size`（Unbound RRset 缓存）。
+    #[serde(default = "default_ub_cache")]
+    pub rrset_cache_size: String,
+    /// `cache-min-ttl`（秒；0 = 不抬高 TTL）。
+    #[serde(default)]
+    pub cache_min_ttl: u32,
+    /// `cache-max-ttl`（秒；默认 86400，与 BIND 默认一致）。
+    #[serde(default = "default_ub_cache_max_ttl")]
+    pub cache_max_ttl: u32,
+    /// 是否向上游发送 ECS（`send-client-subnet` + `subnetcache` 模块）。
+    ///
+    /// 仅在 `[dns] ecs = true` 且配置了 `forwarders` 时生效：没有已知的上游地址，
+    /// Unbound 无法对迭代查询做 `send-client-subnet`（这也意味着纯迭代递归不带 ECS）。
+    #[serde(default = "default_true")]
+    pub send_client_subnet: bool,
+    /// `verbosity`（1 = 常规；调大排障）。
+    #[serde(default = "default_ub_verbosity")]
+    pub verbosity: u32,
+    /// 开启 `prefetch`（热名提前刷新）。
+    #[serde(default)]
+    pub prefetch: bool,
+    /// `num-threads`；0 = Unbound 默认（按 CPU 自选）。
+    #[serde(default)]
+    pub num_threads: u32,
+}
+
+fn default_ub_cache() -> String {
+    "16m".into()
+}
+fn default_ub_cache_max_ttl() -> u32 {
+    86400
+}
+fn default_ub_verbosity() -> u32 {
+    1
+}
+
+/// Unbound 的内存尺寸写法：`<数字>[b|k|m|g]`（大小写不敏感；无单位 = 字节）。
+fn valid_mem_size(s: &str) -> bool {
+    let s = s.trim();
+    if s.is_empty() {
+        return false;
+    }
+    let (num, unit) = match s.chars().last() {
+        Some(c) if c.is_ascii_alphabetic() => (&s[..s.len() - 1], c.to_ascii_lowercase()),
+        _ => (s, 'b'),
+    };
+    !num.is_empty()
+        && num.bytes().all(|b| b.is_ascii_digit())
+        && matches!(unit, 'b' | 'k' | 'm' | 'g')
+}
+
+impl Default for UnboundCfg {
+    fn default() -> Self {
+        Self {
+            auth_port: 0,
+            control_port: 0,
+            msg_cache_size: default_ub_cache(),
+            rrset_cache_size: default_ub_cache(),
+            cache_min_ttl: 0,
+            cache_max_ttl: default_ub_cache_max_ttl(),
+            send_client_subnet: default_true(),
+            verbosity: default_ub_verbosity(),
+            prefetch: false,
+            num_threads: 0,
+        }
+    }
+}
+
+impl UnboundCfg {
+    /// BIND 权威后端端口（0 = 主端口 + 1，端口 65535 时饱和）。
+    pub fn auth_port_or_default(&self, cfg: &DnsConfig) -> u16 {
+        if self.auth_port != 0 {
+            self.auth_port
+        } else {
+            cfg.port_or_default().saturating_add(1)
+        }
+    }
+    /// unbound-control 控制口（0 = auth_port + 1）。
+    pub fn control_port_or_default(&self, cfg: &DnsConfig) -> u16 {
+        if self.control_port != 0 {
+            self.control_port
+        } else {
+            self.auth_port_or_default(cfg).saturating_add(1)
+        }
+    }
 }
 
 /// 一条自动发布的 HTTPS/SVCB 记录（`[[dns.https_rr]]`）。
@@ -519,6 +651,66 @@ impl DnsConfig {
             953
         }
     }
+
+    /// 自动 NS 的原始名字（`None`/空 = 默认 `ns1`）。
+    pub fn ns_name_raw(&self) -> &str {
+        match self.ns_name.as_deref().map(str::trim) {
+            Some(s) if !s.is_empty() => s,
+            _ => "ns1",
+        }
+    }
+
+    /// 自动胶水地址：`Some(ip)` = 生成 A/AAAA；`None` = 不生成。
+    ///
+    /// `ns_glue = None`（未配置）回落到 `127.0.0.1`；显式空串表示关闭。
+    pub fn ns_glue_value(&self) -> Option<&str> {
+        match self.ns_glue.as_deref().map(str::trim) {
+            None => Some("127.0.0.1"),
+            Some("") => None,
+            Some(s) => Some(s),
+        }
+    }
+
+    /// dns-01 挑战的 TXT owner（小写、无尾点）；未配置域名时 None。
+    ///
+    /// ACME（RFC 8555 §8.4）规定 challenge 名 = `_acme-challenge.` + identifier，
+    /// 所以只需精确授权这一个名字即可完成签发/续期。
+    pub fn acme_challenge_fqdn(&self) -> Option<String> {
+        let d = self
+            .acme
+            .domain
+            .trim()
+            .trim_end_matches('.')
+            .to_ascii_lowercase();
+        if d.is_empty() {
+            return None;
+        }
+        Some(format!("_acme-challenge.{d}"))
+    }
+
+    /// 生效的递归后端名（空值视同 `bind`，兼容 `[dns]` 节缺失时的 derive Default）。
+    pub fn recursor(&self) -> &str {
+        let r = self.recursor.trim();
+        if r.is_empty() {
+            "bind"
+        } else {
+            r
+        }
+    }
+
+    /// `recursor = "unbound"`：Unbound 占用主端口，BIND 退到内部权威端口。
+    pub fn is_unbound(&self) -> bool {
+        self.recursor().eq_ignore_ascii_case("unbound")
+    }
+
+    /// BIND named 的监听端口：bind 模式 = 主端口；unbound 模式 = 内部权威端口。
+    pub fn named_port_or_default(&self) -> u16 {
+        if self.is_unbound() {
+            self.unbound.auth_port_or_default(self)
+        } else {
+            self.port_or_default()
+        }
+    }
 }
 
 /// DNS 状态根目录（默认 `state/dns`）：named.conf / rndc.conf / panel.toml /
@@ -730,6 +922,7 @@ pub fn store() -> Result<Connection> {
             kind TEXT NOT NULL DEFAULT 'master',
             primaries TEXT DEFAULT '',
             axfr_acl TEXT DEFAULT '',
+            also_notify TEXT DEFAULT '',
             refresh_hours INTEGER DEFAULT 24,
             created TEXT DEFAULT CURRENT_TIMESTAMP
         );
@@ -744,6 +937,19 @@ pub fn store() -> Result<Connection> {
         );
         CREATE TABLE IF NOT EXISTS meta(k TEXT PRIMARY KEY, v TEXT);",
     )?;
+    // 老库迁移（G-05）：CREATE TABLE IF NOT EXISTS 不会给已存在的表加列。
+    // 用 pragma 探测后 ALTER，保证已有部署升级后 also_notify 可用。
+    let has_also_notify: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM pragma_table_info('zones') WHERE name='also_notify'",
+        [],
+        |r| r.get(0),
+    )?;
+    if has_also_notify == 0 {
+        conn.execute(
+            "ALTER TABLE zones ADD COLUMN also_notify TEXT DEFAULT ''",
+            [],
+        )?;
+    }
     Ok(conn)
 }
 
@@ -1036,7 +1242,14 @@ fn valid_key_role(s: &str) -> bool {
     matches!(s.to_ascii_lowercase().as_str(), "ksk" | "zsk" | "csk")
 }
 
-pub fn add_zone(kind: &str, name: &str, primaries: &[String], axfr_acl: &[String], refresh_hours: u64) -> Result<i64> {
+pub fn add_zone(
+    kind: &str,
+    name: &str,
+    primaries: &[String],
+    axfr_acl: &[String],
+    refresh_hours: u64,
+    also_notify: &[String],
+) -> Result<i64> {
     // **全部校验必须在写库之前**：分区名的保留名/重名问题若在 write_all 里才 bail，
     // 毒行已经落进 SQLite，此后每一次 reconcile（含启动时）都失败 —— named 永远不会
     // 被拉起，只能靠面板再删一次那个「没添加成功」的分区。
@@ -1051,6 +1264,11 @@ pub fn add_zone(kind: &str, name: &str, primaries: &[String], axfr_acl: &[String
     }
     if let Some(bad) = axfr_acl.iter().find(|a| !valid_acl_item(a)) {
         bail!("bad axfr_acl item {bad:?}");
+    }
+    // also-notify 只接受 IP[:port]（BIND 的 also-notify 列表不支持 CIDR/主机名）。
+    // 非法项若进了 named.conf，named-checkconf 会拒载**整份配置**，所有区一起失效。
+    if let Some(bad) = also_notify.iter().find(|a| !valid_forwarder(a)) {
+        bail!("bad also_notify target {bad:?}（IP 或 IP:端口）");
     }
     let kind = match kind {
         "master" | "primary" => "master",
@@ -1075,12 +1293,13 @@ pub fn add_zone(kind: &str, name: &str, primaries: &[String], axfr_acl: &[String
     }
     let conn = store()?;
     conn.execute(
-        "INSERT OR REPLACE INTO zones(name,kind,primaries,axfr_acl,refresh_hours) VALUES(?1,?2,?3,?4,?5)",
+        "INSERT OR REPLACE INTO zones(name,kind,primaries,axfr_acl,also_notify,refresh_hours) VALUES(?1,?2,?3,?4,?5,?6)",
         rusqlite::params![
             name,
             kind,
             primaries.join(";"),
             axfr_acl.join(";"),
+            also_notify.join(";"),
             refresh_hours as i64
         ],
     )?;
@@ -1107,12 +1326,17 @@ pub struct ZoneRow {
     pub kind: String,
     pub primaries: Vec<String>,
     pub axfr_acl: Vec<String>,
+    /// master 区变更后主动 NOTIFY 的目标（IP 或 IP:port，G-05）。
+    #[serde(default)]
+    pub also_notify: Vec<String>,
     pub refresh_hours: i64,
 }
 
 pub fn list_zones() -> Result<Vec<ZoneRow>> {
     let conn = store()?;
-    let mut st = conn.prepare("SELECT name,kind,primaries,axfr_acl,refresh_hours FROM zones ORDER BY id")?;
+    let mut st = conn.prepare(
+        "SELECT name,kind,primaries,axfr_acl,also_notify,refresh_hours FROM zones ORDER BY id",
+    )?;
     let rows = st
         .query_map([], |r| {
             Ok(ZoneRow {
@@ -1120,7 +1344,8 @@ pub fn list_zones() -> Result<Vec<ZoneRow>> {
                 kind: r.get(1)?,
                 primaries: split_semi(r.get::<_, String>(2)?),
                 axfr_acl: split_semi(r.get::<_, String>(3)?),
-                refresh_hours: r.get(4)?,
+                also_notify: split_semi(r.get::<_, String>(4)?),
+                refresh_hours: r.get(5)?,
             })
         })?
         .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -1148,7 +1373,7 @@ fn zone_row_of(zone: &str) -> Result<Option<ZoneRow>> {
     let conn = store()?;
     let z = conn
         .query_row(
-            "SELECT name,kind,primaries,axfr_acl,refresh_hours FROM zones WHERE name=?1",
+            "SELECT name,kind,primaries,axfr_acl,also_notify,refresh_hours FROM zones WHERE name=?1",
             [zone],
             |r| {
                 Ok(ZoneRow {
@@ -1156,12 +1381,22 @@ fn zone_row_of(zone: &str) -> Result<Option<ZoneRow>> {
                     kind: r.get(1)?,
                     primaries: split_semi(r.get::<_, String>(2)?),
                     axfr_acl: split_semi(r.get::<_, String>(3)?),
-                    refresh_hours: r.get(4)?,
+                    also_notify: split_semi(r.get::<_, String>(4)?),
+                    refresh_hours: r.get(5)?,
                 })
             },
         )
         .optional()?;
     Ok(z)
+}
+
+/// 现有分区的 also-notify（用于「未提交该字段」的面板调用保持原值）。
+pub fn zone_also_notify(zone: &str) -> Vec<String> {
+    zone_row_of(zone)
+        .ok()
+        .flatten()
+        .map(|z| z.also_notify)
+        .unwrap_or_default()
 }
 
 /// 从区（slave）的记录：named 把传输来的区写进**它自己**的 zone 文件，DB 里没有，
@@ -1438,6 +1673,77 @@ fn normalize_record_name(name: &str, zone: &str) -> String {
     n.to_string()
 }
 
+/// 一次性迁移：把历史库里「绝对记录名」改写成区内相对名（G-23）。
+///
+/// 旧版本 add_record 不做归一，面板/API 传 `hello.verify.test` 会被原样拼进
+/// `$ORIGIN verify.test.`，生成 `hello.verify.test.verify.test.` —— 原名字查不到。
+/// 写入路径已修（[`normalize_record_name`]），但旧行仍在库里；这里在 reconcile
+/// 前扫一遍并重写。幂等：归一后与原值相同的行不动。
+///
+/// 若目标名字已存在**完全相同**的记录（同 zone/line/rtype/rdata），删掉旧行而不是
+/// 制造重复（重复 A 会让面板出现两条一样的记录，且删除时只能一条条来）。
+pub fn migrate_legacy_record_names() -> Result<usize> {
+    let zones = list_zones()?;
+    if zones.is_empty() {
+        return Ok(0);
+    }
+    let conn = store()?;
+    let mut changed = 0usize;
+    for z in zones {
+        let mut st = conn.prepare(
+            "SELECT id,name,line,rtype,rdata FROM records WHERE zone=?1",
+        )?;
+        let rows: Vec<(i64, String, String, String, String)> = st
+            .query_map([&z.name], |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, String>(3)?,
+                    r.get::<_, String>(4)?,
+                ))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        drop(st);
+        for (id, name, line, rtype, rdata) in rows {
+            let fixed = normalize_record_name(&name, &z.name);
+            if fixed == name {
+                continue;
+            }
+            let dup: Option<i64> = conn
+                .query_row(
+                    "SELECT id FROM records WHERE zone=?1 AND line=?2 AND rtype=?3 \
+                     AND rdata=?4 AND lower(name)=lower(?5) AND id<>?6 LIMIT 1",
+                    rusqlite::params![z.name, line, rtype, rdata, fixed, id],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            if dup.is_some() {
+                conn.execute("DELETE FROM records WHERE id=?1", [id])?;
+                log::info!(
+                    "dns: 迁移旧绝对记录名：删除重复行 zone={} name={:?}（已存在 {:?}）",
+                    z.name,
+                    name,
+                    fixed
+                );
+            } else {
+                conn.execute(
+                    "UPDATE records SET name=?1 WHERE id=?2",
+                    rusqlite::params![fixed, id],
+                )?;
+                log::info!(
+                    "dns: 迁移旧绝对记录名：zone={} {:?} → {:?}",
+                    z.name,
+                    name,
+                    fixed
+                );
+            }
+            changed += 1;
+        }
+    }
+    Ok(changed)
+}
+
 fn add_record_impl(
     zone: &str,
     line: &str,
@@ -1630,6 +1936,45 @@ pub fn gen_zone_file_monotonic_ext(
     prev_serial: Option<u64>,
     extra: &[(String, String)],
 ) -> String {
+    gen_zone_file_monotonic_ns(zone, kind, recs, prev_serial, extra, "ns1", Some("127.0.0.1"))
+}
+
+/// 权威区自动 NS / 胶水的**可配置**版本（G-09）。
+///
+/// `ns_name`：相对名（`ns1`）或绝对名（`ns1.example.net.`）；空串按默认 `ns1`。
+/// `ns_glue`：`Some(ip)` 生成胶水 A/AAAA；`None` 不生成。胶水只在该名字属于本区
+/// （in-bailiwick）时才有意义 —— out-of-zone 的 NS 生成胶水是**垃圾数据**，named
+/// 会以 out-of-zone 警告忽略它，这里直接跳过。
+pub(crate) fn gen_zone_file_monotonic_ns(
+    zone: &str,
+    kind: &str,
+    recs: &[RecordRow],
+    prev_serial: Option<u64>,
+    extra: &[(String, String)],
+    ns_name: &str,
+    ns_glue: Option<&str>,
+) -> String {
+    gen_zone_file_monotonic_ns_margin(zone, kind, recs, prev_serial, extra, ns_name, ns_glue, 0)
+}
+
+/// 同 [`gen_zone_file_monotonic_ns`]，但 SOA serial 在 `max(now, prev+1)` 之上再加
+/// `serial_margin`。
+///
+/// 为什么需要（G-07 早期 nsupdate 实现留下的防线）：动态更新会把 zone serial 顶到
+/// **当前 unix 秒**，与模块「按 unix 秒生成文件 serial」撞车时，文件 serial 与
+/// named 内存 serial 相等，`rndc reload` 判定「serial 未变」而**跳过加载** —— 文件里
+/// 有新记录、服务里却查不到（真机实测）。当前 dns-01 已改走 zone API（无动态更新），
+/// 但保留这个余量：手工 nsupdate / 其它外部写入仍可能触发同类竞争。
+fn gen_zone_file_monotonic_ns_margin(
+    zone: &str,
+    kind: &str,
+    recs: &[RecordRow],
+    prev_serial: Option<u64>,
+    extra: &[(String, String)],
+    ns_name: &str,
+    ns_glue: Option<&str>,
+    serial_margin: u64,
+) -> String {
     // 统一去尾点再拼，修复 zone 名带尾点时的 "ns1.example.com.." 双点（named 拒载）
     let zone = zone.trim_end_matches('.');
     let mut s = String::new();
@@ -1638,8 +1983,16 @@ pub fn gen_zone_file_monotonic_ext(
     let serial = match prev_serial {
         Some(p) => now.max(p.saturating_add(1)),
         None => now,
+    }
+    .saturating_add(serial_margin);
+    // NS 目标：绝对名原样（补尾点）；相对名展开成 <name>.<zone>.
+    let ns_raw = ns_name.trim();
+    let ns_raw = if ns_raw.is_empty() { "ns1" } else { ns_raw };
+    let ns_fqdn = if ns_raw.ends_with('.') {
+        ns_raw.to_string()
+    } else {
+        format!("{}.{zone}.", ns_raw.trim_end_matches('.'))
     };
-    let ns1 = format!("ns1.{zone}.");
     if kind == "master" {
         // SOA 必须由本函数**始终**生成：serial 单调地板（文件/.signed/DB 高水位/named）
         // 只喂给这一处。若数据库里存在历史 SOA 行（旧版本导入 / 面板手选留下），
@@ -1647,9 +2000,27 @@ pub fn gen_zone_file_monotonic_ext(
         // 面板改动写进文件但 BIND 判定「serial 未变、不重载」，从区也永远不来拉新版本；
         // 而面板再加一条 SOA 更会让 zone 文件出现两条 SOA、named 拒载整个区。
         s.push_str(&format!(
-            "@ IN SOA {ns1} hostmaster.{zone}. (\n  {serial} ; serial\n  900 ; refresh\n  600 ; retry\n  1209600 ; expire\n  300 ; minimum\n)\n"
+            "@ IN SOA {ns_fqdn} hostmaster.{zone}. (\n  {serial} ; serial\n  900 ; refresh\n  600 ; retry\n  1209600 ; expire\n  300 ; minimum\n)\n"
         ));
-        s.push_str(&format!("@ IN NS {ns1}\n{ns1} IN A 127.0.0.1\n"));
+        s.push_str(&format!("@ IN NS {ns_fqdn}\n"));
+        // 胶水：只在 in-bailiwick（名字落在本区内）时生成，且按字面量族选 A/AAAA。
+        // 旧实现无条件写 `<ns1.zone> IN A 127.0.0.1`，生产区的 NS 指向 loopback；
+        // 现在默认行为不变（向后兼容），但可覆盖/关闭。
+        if let Some(glue) = ns_glue.map(str::trim).filter(|g| !g.is_empty()) {
+            let in_zone = relative_owner(&ns_fqdn, zone).is_some();
+            let rtype = if glue.parse::<std::net::Ipv4Addr>().is_ok() {
+                Some("A")
+            } else if glue.parse::<std::net::Ipv6Addr>().is_ok() {
+                Some("AAAA")
+            } else {
+                None
+            };
+            if in_zone {
+                if let Some(rt) = rtype {
+                    s.push_str(&format!("{ns_fqdn} IN {rt} {glue}\n"));
+                }
+            }
+        }
     }
     for r in recs {
         // 见上：SOA 由本函数统一生成，DB 里的历史 SOA 行不再作为普通记录输出。
@@ -1817,6 +2188,24 @@ fn ensure_fq(n: &str) -> String {
     if n.ends_with('.') { n.to_string() } else { format!("{}.", n.trim_end_matches('.')) }
 }
 
+/// 导出口径的自动 NS/胶水设置。`panel.toml` 是 `effective()` 的权威来源（存在时
+/// 整体覆盖 config.toml），导出 `GET /api/dns/zones/export` 没有 live Config 入口，
+/// 因此直接读它，保证「导出的 .zone」与「named 实际加载的」使用同一套 NS/胶水。
+pub(crate) fn ns_settings_from_panel() -> (String, Option<String>) {
+    let p = state_root().join("etc/panel.toml");
+    if let Ok(text) = std::fs::read_to_string(&p) {
+        if !text.trim().is_empty() {
+            if let Ok(cfg) = toml::from_str::<DnsConfig>(&text) {
+                return (
+                    cfg.ns_name_raw().to_string(),
+                    cfg.ns_glue_value().map(str::to_string),
+                );
+            }
+        }
+    }
+    ("ns1".to_string(), Some("127.0.0.1".to_string()))
+}
+
 /// 根区最小占位（rootzone 未同步时的兜底，named 可加载）。
 fn minimal_root_zone(cfg: &DnsConfig) -> String {
     // A 记录的 rdata 必须是**合法点分四段**——"any"/"0.0.0.0" 都不是
@@ -1864,6 +2253,14 @@ fn acl_or(list: &[String], default: &str) -> String {
 /// KASP 严格档：带 9.20 未确证语句（cdnskey/cds-digest-types、inline-signing）。
 /// validate 探活失败自动降级到 lite 档（语句移除），保证 named 永远能起。
 static KASP_STRICT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+/// KASP key lifetime 的合法下限（天）。
+///
+/// BIND 的 kaspconf 会拒绝「短于 rollover 所需时间」的 lifetime（整份配置拒载）：
+/// 本模块固定 14d validity - 3d refresh + 1d max-zone-ttl + 1h retire-safety +
+/// 传播延迟，约 12 天；再留安全余量取 30 天。`rotation_days = 0` 是「立即轮换一次」
+/// 的哨兵值，写 KASP 时必须钳到本下限（0d 会让 named 拒载）。
+pub(crate) const KASP_MIN_KEY_LIFETIME_DAYS: u64 = 30;
 
 pub fn kasp_strict() -> bool {
     KASP_STRICT.load(std::sync::atomic::Ordering::Relaxed)
@@ -1990,28 +2387,68 @@ fn secondary_clauses(z: &ZoneRow) -> String {
     s
 }
 
+/// master（primary）zone 语句的附加子句：
+/// - `allow-transfer`：谁能从这里 AXFR（面板上的「AXFR传入白名单」对 master 同时是传出）
+/// - `also-notify`：区内容变更后主动通知的从服务器（G-05）。BIND 只在 serial 变化后
+///   向 NS 记录 + also-notify 发 NOTIFY；没有它，从区只能等 SOA refresh（最低 1h）。
+fn master_clauses(_cfg: &DnsConfig, z: &ZoneRow) -> String {
+    let mut s = String::new();
+    let acl: Vec<String> = z
+        .axfr_acl
+        .iter()
+        .map(|x| x.trim())
+        .filter(|x| valid_acl_item(x))
+        .map(|x| format!("{x};"))
+        .collect();
+    if !acl.is_empty() {
+        s.push_str(&format!(" allow-transfer {{ {} }};", acl.join(" ")));
+    }
+    // 只输出 IP[:port]：非法项在 add_zone 已拒；这里再过滤一次防历史 DB 行。
+    let notify: Vec<String> = z
+        .also_notify
+        .iter()
+        .filter_map(|x| forwarder_for_named(x))
+        .map(|x| format!("{x};"))
+        .collect();
+    if !notify.is_empty() {
+        s.push_str(&format!(" also-notify {{ {} }};", notify.join(" ")));
+    }
+    s
+}
+
 /// 生成 named.conf。
 /// - geo views（match-clients）承接直连 53 的外部客户端分线路
 /// - fwd views（match-destinations 127.0.0.2+i）承接 DoT/DoH 转发查询的分线路
 ///   （DoT/DoH 终结在本进程，源 IP 变 127.0.0.1，只能按目标地址选 view）
 /// - 默认 view 兜底；geo.lines 为空 → 单层无 view（零开销，需求 10）
 pub fn gen_named_conf(cfg: &DnsConfig, zones: &[ZoneRow]) -> String {
-    let port = cfg.port_or_default();
+    // unbound 模式：BIND 退为**内部权威后端**，只绑回环内部端口；主端口归 Unbound。
+    // bind 模式：端口/监听/递归/转发全部与既有行为一致（零变化）。
+    let unbound = cfg.is_unbound();
+    let port = cfg.named_port_or_default();
     let rndc_port = cfg.rndc_port_or_default();
     let secret = load_or_make_secret();
-    let geo_on = cfg.geo.enabled
+    let geo_on = !unbound
+        && cfg.geo.enabled
         && (!cfg.geo.lines.is_empty() || cfg.geo.mmdb.is_active());
     let mut s = String::new();
 
 // listen-on（IPv4）/ listen-on-v6（IPv6）：基础地址 + 分线路转发 loopback（127.0.0.2..N+1）
-    let (listen, v6_acl) = listen_lists(&cfg.listen_addr, cfg.test_mode, cfg.geo.lines.len());
+    let (listen, v6_acl) = if unbound {
+        // 只回环：Unbound 在 [dns] listen_addr:port 上接客，BIND 不能在公网地址抢端口。
+        // 不启分线路（check_config_strings 在 unbound 模式拒绝 geo）。
+        ("127.0.0.1;".to_string(), "none;".to_string())
+    } else {
+        listen_lists(&cfg.listen_addr, cfg.test_mode, cfg.geo.lines.len())
+    };
+    let recursion_on = cfg.modes.recursive && !unbound;
     s.push_str(&format!(
         "// generated by Crucible dns module — do not hand-edit\noptions {{\n  directory \"{}\";\n  listen-on port {port} {{ {listen} }};\n  listen-on-v6 port {port} {{ {v6_acl} }};\n  recursion {};",
         state_root().join("zones").display(),
-        if cfg.modes.recursive { "yes" } else { "no" }
+        if recursion_on { "yes" } else { "no" }
     ));
 
-    if cfg.modes.recursive {
+    if recursion_on {
         // 127.0.0.1 必须始终在递归白名单里：本进程的 DoT/DoH 转发（dot_doh::udp_query）
         // 源地址就是 127.0.0.1，分线路转发目标更是 127.0.0.(2+i)。管理员一旦配了
         // 自定义递归白名单（如 "10.0.0.0/8"），面板上 DoT/DoH 开关看着正常，
@@ -2110,19 +2547,7 @@ pub fn gen_named_conf(cfg: &DnsConfig, zones: &[ZoneRow]) -> String {
                     "zone \"{}\" {{ type primary; file \"{f}\";{}{} }};\n",
                     z.name,
                     dnssec_zone_opts(&z.name),
-                    {
-                        let acl: Vec<&str> = z
-                            .axfr_acl
-                            .iter()
-                            .map(|s| s.as_str())
-                            .filter(|s| valid_acl_item(s))
-                            .collect();
-                        if acl.is_empty() {
-                            String::new()
-                        } else {
-                            format!(" allow-transfer {{ {}; }};", acl.join("; "))
-                        }
-                    }
+                    master_clauses(cfg, z)
                 ));
             } else {
                 let prim: Vec<String> = z
@@ -2169,6 +2594,394 @@ pub fn gen_named_conf(cfg: &DnsConfig, zones: &[ZoneRow]) -> String {
         s.push_str("};\n");
     } else {
         emit_zones("", "", false, &mut s);
+    }
+    s
+}
+
+// ---------------------------------------------------------------- unbound 递归后端
+
+/// `state/dns/etc/unbound.conf`。
+pub fn unbound_conf_path() -> PathBuf {
+    state_root().join("etc/unbound.conf")
+}
+
+/// Unbound pidfile（`do-daemonize: no` 时也会写）。
+pub fn unbound_pidfile() -> PathBuf {
+    state_root().join("run/unbound.pid")
+}
+
+/// unbound-control 的证书/私钥（`unbound-control-setup -d etc` 生成）。
+fn unbound_control_files() -> [PathBuf; 4] {
+    let etc = state_root().join("etc");
+    [
+        etc.join("unbound_server.key"),
+        etc.join("unbound_server.pem"),
+        etc.join("unbound_control.key"),
+        etc.join("unbound_control.pem"),
+    ]
+}
+
+fn unbound_control_ready() -> bool {
+    unbound_control_files().iter().all(|p| p.is_file())
+}
+
+/// 生成 unbound-control 的自签控制证书（幂等；工具缺失时返回 false，退化为
+/// pidfile + SIGHUP 的生命周期管理）。
+fn unbound_ensure_control_keys() -> bool {
+    if unbound_control_ready() {
+        return true;
+    }
+    let setup = unbound_control_setup_bin();
+    if !Path::new(&setup).is_file() {
+        return false;
+    }
+    let etc = state_root().join("etc");
+    if std::fs::create_dir_all(&etc).is_err() {
+        return false;
+    }
+    let out = std::process::Command::new(&setup)
+        .arg("-d")
+        .arg(&etc)
+        .output();
+    match out {
+        Ok(o) if o.status.success() && unbound_control_ready() => true,
+        Ok(o) => {
+            log::warn!(
+                "dns: unbound-control-setup 失败（{}）：{}",
+                setup,
+                String::from_utf8_lossy(&o.stderr).trim()
+            );
+            false
+        }
+        Err(e) => {
+            log::warn!("dns: 无法执行 unbound-control-setup（{setup}）: {e}");
+            false
+        }
+    }
+}
+
+/// `forward-zone` 的 `forward-addr` 写法：`ip` 或 `ip@port`（v6 直接写地址）。
+fn forwarder_unbound_addr(s: &str) -> Option<String> {
+    let s = s.trim();
+    if s.parse::<std::net::IpAddr>().is_ok() {
+        return Some(s.to_string());
+    }
+    if let Some(rest) = s.strip_prefix('[') {
+        if let Some((ip, port)) = rest.split_once("]:") {
+            if ip.parse::<std::net::Ipv6Addr>().is_ok() && port.parse::<u16>().is_ok() {
+                return Some(format!("{ip}@{port}"));
+            }
+        }
+        return None;
+    }
+    if let Some((ip, port)) = s.rsplit_once(':') {
+        if ip.parse::<std::net::Ipv4Addr>().is_ok() && port.parse::<u16>().is_ok() {
+            return Some(format!("{ip}@{port}"));
+        }
+    }
+    None
+}
+
+/// `send-client-subnet: <IP>` 只取转发器地址（不带端口）。
+fn forwarder_unbound_ip(s: &str) -> Option<String> {
+    let (host, _) = split_host_port(s);
+    if host.parse::<std::net::IpAddr>().is_ok() {
+        Some(host)
+    } else {
+        None
+    }
+}
+
+/// Unbound 的 `interface:` 列表（含端口）。
+///
+/// 与 BIND 的差别：`any` 在 Unbound 里写 `0.0.0.0` / `::0`；显式 IP 时额外绑
+/// 127.0.0.1 —— 本进程 DoT/DoH 的转发源地址固定是 127.0.0.1，少了它整条
+/// DoT/DoH 链路会被自己拒绝。
+fn unbound_interfaces(cfg: &DnsConfig) -> Vec<String> {
+    let port = cfg.port_or_default();
+    let mut v: Vec<String> = Vec::new();
+    let mut add = |a: &str| {
+        let s = format!("{a}@{port}");
+        if !v.iter().any(|x| x == &s) {
+            v.push(s);
+        }
+    };
+    let a = cfg.listen_addr.trim();
+    match a {
+        "any" | "0.0.0.0" => {
+            add("0.0.0.0");
+            add("::0");
+        }
+        "localhost" => {
+            add("127.0.0.1");
+            add("::1");
+        }
+        // check_config_strings 在 unbound 模式已拒绝 none/localnets；这里兜底为 loopback。
+        "none" | "localnets" => add("127.0.0.1"),
+        _ => match a.parse::<std::net::IpAddr>() {
+            Ok(std::net::IpAddr::V4(ip)) => {
+                add("127.0.0.1");
+                add(&ip.to_string());
+            }
+            Ok(std::net::IpAddr::V6(ip)) => {
+                add("127.0.0.1");
+                add(&ip.to_string());
+            }
+            Err(_) => add("127.0.0.1"),
+        },
+    }
+    v
+}
+
+fn unbound_interfaces_have_v6(cfg: &DnsConfig) -> bool {
+    unbound_interfaces(cfg).iter().any(|i| i.contains(':'))
+        || cfg
+            .forwarders
+            .iter()
+            .filter_map(|f| forwarder_unbound_ip(f))
+            .any(|ip| ip.contains(':'))
+}
+
+/// access-control 行。
+///
+/// 语义与 BIND 对齐：
+/// - `modes.recursive = true`：`recursion_acl` 内 allow（默认仅回环），其余客户端
+///   `refuse_non_local` —— 可以查询权威数据（auth-zone/local-zone），但拿不到递归。
+/// - `modes.recursive = false`：所有人（含回环）`refuse_non_local` —— 只答权威数据，
+///   递归明确 REFUSED（与 named 的 `allow-recursion { none; }` 一致）。
+fn unbound_access_lines(cfg: &DnsConfig) -> Vec<String> {
+    let allow_rec = cfg.modes.recursive;
+    let mut out: Vec<String> = Vec::new();
+    let mut push = |line: String| {
+        if !out.contains(&line) {
+            out.push(line);
+        }
+    };
+    // Unbound 对 127.0.0.0/8 有**内建隐式 allow**（文档：only localhost, the
+    // 127.0.0.0/8 IP netblock, is implicitly allowed）。只写 127.0.0.1/32 allow
+    // 并不能收紧它 —— `dig -b 127.0.0.2` 照样能递归（真机复现）。先显式把 127/8
+    // 设为 refuse_non_local，再用更具体的 /32 allow 放开本机（最长前缀优先）。
+    push("access-control: 127.0.0.0/8 refuse_non_local".into());
+    push("access-control: ::/0 refuse_non_local".into());
+    if allow_rec {
+        push("access-control: 127.0.0.1/32 allow".into());
+        push("access-control: ::1/128 allow".into());
+        for item in &cfg.recursion_acl {
+            let s = item.trim();
+            if !valid_acl_item(s) {
+                continue;
+            }
+            match s {
+                "any" => {
+                    push("access-control: 0.0.0.0/0 allow".into());
+                    push("access-control: ::/0 allow".into());
+                }
+                "localhost" => {
+                    // named 的 localhost = 所有回环地址；显式放开 127/8。
+                    push("access-control: 127.0.0.0/8 allow".into());
+                }
+                "localnets" | "none" => {}
+                // 已由上面的 /32（/128）allow 覆盖，避免生成重复行。
+                "127.0.0.1" | "127.0.0.1/32" | "::1" | "::1/128" => {}
+                _ => push(format!("access-control: {s} allow")),
+            }
+        }
+    }
+    // 其余客户端：可以查权威数据（auth-zone/local-zone），但拿不到递归。
+    // 非递归模式下所有人都落在这里 —— 权威公开、递归明确 REFUSED。
+    // 例外：recursion_acl 显式包含 any 时已经 push 了 0.0.0.0/0 allow，
+    // 这里再 push 同前缀的 refuse 会把它覆盖掉（Unbound 同前缀后者生效）。
+    let allow_any = allow_rec
+        && cfg
+            .recursion_acl
+            .iter()
+            .any(|s| s.trim().eq_ignore_ascii_case("any"));
+    if !allow_any {
+        push("access-control: 0.0.0.0/0 refuse_non_local".into());
+    }
+    out
+}
+
+/// ECS 是否真正出网：`[dns] ecs` + `[dns.unbound] send_client_subnet` + 已知上游。
+fn unbound_ecs_on(cfg: &DnsConfig) -> bool {
+    cfg.ecs && cfg.unbound.send_client_subnet && !cfg.forwarders.is_empty()
+}
+
+/// Unbound `module-config`。`respip` 承载 RPZ，`subnetcache` 承载 ECS。
+///
+/// 注意：**模块列表变化必须重启 unbound**（`unbound-control reload` 在
+/// `subnetcache iterator` → `iterator` 时会在 init modules 阶段
+/// `fatal error: failed to init modules`，真机复现），所以它同时进入
+/// [`unbound_iface_fp`] 的重启指纹。
+fn unbound_modules(cfg: &DnsConfig) -> &'static str {
+    match (!cfg.rpz.is_empty(), unbound_ecs_on(cfg)) {
+        (true, true) => "respip subnetcache iterator",
+        (true, false) => "respip iterator",
+        (false, true) => "subnetcache iterator",
+        (false, false) => "iterator",
+    }
+}
+
+/// 生成 `unbound.conf`（recursor = "unbound"）。
+///
+/// 结构：
+/// - `server:`：主端口（`[dns] listen_addr:port`）、ACL、缓存、ECS
+///   （`send-client-subnet` + `subnetcache` 模块）
+/// - `remote-control:`：unbound-control（热载/健康检查；证书由 setup 工具生成）
+/// - `auth-zone:`：用户权威区的**只读镜像**（zone 文件与 BIND 同一份），
+///   让主端口上的权威查询照常返回（DNSSEC 签名/AXFR/KASP 仍由内部 BIND 负责）
+/// - `rpz:`：override（与 BIND 共用 rpz.zone + answers.zone）
+/// - `forward-zone: "."`：递归上游（ECS 在这里真正出网）
+pub fn gen_unbound_conf(cfg: &DnsConfig, zones: &[ZoneRow]) -> String {
+    let zones_dir = state_root().join("zones");
+    let mut s = String::from(
+        "# generated by Crucible dns module — recursor=unbound (do not hand-edit)\nserver:\n",
+    );
+    for i in unbound_interfaces(cfg) {
+        s.push_str(&format!("  interface: {i}\n"));
+    }
+    for a in unbound_access_lines(cfg) {
+        s.push_str(&format!("  {a}\n"));
+    }
+    s.push_str("  do-daemonize: no\n");
+    // 上游可能是本机伪服务器/本机 BIND 后端；默认 yes 会静默拒绝 127.0.0.1。
+    s.push_str("  do-not-query-localhost: no\n");
+    s.push_str("  use-syslog: no\n");
+    s.push_str(&format!(
+        "  logfile: \"{}\"\n",
+        state_root().join("log/unbound.log").display()
+    ));
+    s.push_str(&format!("  verbosity: {}\n", cfg.unbound.verbosity));
+    s.push_str("  username: \"\"\n  chroot: \"\"\n");
+    s.push_str(&format!("  directory: \"{}\"\n", zones_dir.display()));
+    s.push_str(&format!(
+        "  pidfile: \"{}\"\n",
+        unbound_pidfile().display()
+    ));
+    s.push_str(&format!(
+        "  msg-cache-size: {}\n  rrset-cache-size: {}\n",
+        cfg.unbound.msg_cache_size, cfg.unbound.rrset_cache_size
+    ));
+    s.push_str(&format!(
+        "  cache-min-ttl: {}\n  cache-max-ttl: {}\n",
+        cfg.unbound.cache_min_ttl, cfg.unbound.cache_max_ttl
+    ));
+    if cfg.unbound.prefetch {
+        s.push_str("  prefetch: yes\n");
+    }
+    if cfg.unbound.num_threads > 0 {
+        s.push_str(&format!("  num-threads: {}\n", cfg.unbound.num_threads));
+    }
+    // RFC 6761 的 `test.` 特殊用途域在 Unbound 里默认本地 NXDOMAIN，会遮住
+    // 所有 `*.test` 权威区（本仓库的验证区全在 .test 下）。关掉该默认。
+    s.push_str("  local-zone: \"test.\" nodefault\n");
+
+    // ECS：只有 cfg.ecs + send_client_subnet + 已知上游三者齐备才会真正出网。
+    // ecs=false 时**不加载 subnetcache、不写 send-client-subnet**：否则 Unbound 会
+    // 用客户端源地址（127.0.0.1）自动生成 ECS 发给上游 —— 等于开关没关。
+    let ecs_on = unbound_ecs_on(cfg);
+    let rpz_on = !cfg.rpz.is_empty();
+    s.push_str(&format!("  module-config: \"{}\"\n", unbound_modules(cfg)));
+    if ecs_on {
+        let mut seen: Vec<String> = Vec::new();
+        for f in &cfg.forwarders {
+            if let Some(ip) = forwarder_unbound_ip(f) {
+                if !seen.contains(&ip) {
+                    s.push_str(&format!("  send-client-subnet: {ip}\n"));
+                    seen.push(ip);
+                }
+            }
+        }
+        s.push_str("  max-client-subnet-ipv4: 24\n  max-client-subnet-ipv6: 56\n");
+    }
+    s.push_str(&format!(
+        "  do-ip6: {}\n",
+        if unbound_interfaces_have_v6(cfg) { "yes" } else { "no" }
+    ));
+
+    if unbound_control_ready() {
+        let [sk, sc, ck, cc] = unbound_control_files();
+        s.push_str("remote-control:\n  control-enable: yes\n  control-interface: 127.0.0.1\n");
+        s.push_str(&format!(
+            "  control-port: {}\n",
+            cfg.unbound.control_port_or_default(cfg)
+        ));
+        s.push_str(&format!("  server-key-file: \"{}\"\n", sk.display()));
+        s.push_str(&format!("  server-cert-file: \"{}\"\n", sc.display()));
+        s.push_str(&format!("  control-key-file: \"{}\"\n", ck.display()));
+        s.push_str(&format!("  control-cert-file: \"{}\"\n", cc.display()));
+    }
+
+    // 权威镜像：与 BIND 完全相同的 zone 文件（BIND 仍是签名/AXFR/KASP 的权威）。
+    // 文件不存在（首次启动的 slave 尚未完成 AXFR）的区先跳过；下一次 reconcile
+    // 会重新生成 unbound.conf 并热载。
+    if cfg.modes.authoritative {
+        for z in zones {
+            if z.name.trim().is_empty() {
+                continue;
+            }
+            let f = zones_dir.join(zone_file_name(z, ""));
+            if !f.is_file() {
+                log::info!(
+                    "dns: unbound auth-zone 跳过 {:?}（zone 文件尚未落盘：{}；BIND 完成 AXFR 后下次 reconcile 接入）",
+                    z.name,
+                    f.display()
+                );
+                continue;
+            }
+            s.push_str(&format!(
+                "auth-zone:\n  name: \"{}\"\n  zonefile: \"{}\"\n  for-downstream: yes\n  for-upstream: no\n",
+                z.name.trim_end_matches('.'),
+                f.display()
+            ));
+        }
+    }
+    if cfg.modes.root {
+        let f = zones_dir.join("root.zone");
+        if f.is_file() {
+            s.push_str(&format!(
+                "auth-zone:\n  name: \".\"\n  zonefile: \"{}\"\n  for-downstream: yes\n  for-upstream: no\n",
+                f.display()
+            ));
+        }
+    }
+    if rpz_on {
+        // answers 区承载 A/AAAA/TXT 的自定义响应（RPZ 规则 CNAME 到它）。
+        let af = zones_dir.join("answers.zone");
+        if af.is_file() {
+            s.push_str(&format!(
+                "auth-zone:\n  name: \"crucible.answers\"\n  zonefile: \"{}\"\n  for-downstream: yes\n  for-upstream: yes\n",
+                af.display()
+            ));
+        }
+        let rf = zones_dir.join("rpz.zone");
+        if rf.is_file() {
+            s.push_str(&format!(
+                "rpz:\n  name: \"crucible.rpz\"\n  zonefile: \"{}\"\n",
+                rf.display()
+            ));
+        }
+    }
+
+    // 递归上游：root 模式对 "." 权威，不再转发；recursive=false 时不存在递归入口。
+    if cfg.modes.recursive && !cfg.modes.root && !cfg.forwarders.is_empty() {
+        s.push_str("forward-zone:\n  name: \".\"\n");
+        for f in &cfg.forwarders {
+            if let Some(a) = forwarder_unbound_addr(f) {
+                s.push_str(&format!("  forward-addr: {a}\n"));
+            }
+        }
+        let only = cfg
+            .forward_policy
+            .as_deref()
+            .map(|p| p.trim().eq_ignore_ascii_case("only"))
+            .unwrap_or(false);
+        // BIND 的 `forward first`（默认）≈ Unbound `forward-first: yes`；
+        // `forward only` ≈ no（转发器 SERVFAIL 不再回退迭代）。
+        s.push_str(&format!(
+            "  forward-first: {}\n",
+            if only { "no" } else { "yes" }
+        ));
     }
     s
 }
@@ -2301,7 +3114,13 @@ fn gen_kasp_policy(d: &DnssecCfg) -> String {
             .filter(|_| d.rotation_enabled)
             .map(|n| format!("{n}d"))
             .unwrap_or_else(|| "unlimited".into());
-        let zsk_life = if d.rotation_enabled { format!("{}d", d.rotation_days) } else { "unlimited".into() };
+        // rotation_days=0 是「立即轮换一次」哨兵：KASP lifetime 必须钳到合法下限，
+        // 否则写出 `zsk lifetime 0d;`，named 以 key lifetime 过短拒载**整份配置**。
+        let zsk_life = if d.rotation_enabled {
+            format!("{}d", d.rotation_days.max(KASP_MIN_KEY_LIFETIME_DAYS))
+        } else {
+            "unlimited".into()
+        };
         s.push_str(&format!("    ksk lifetime {ksk_life} algorithm {};\n", d.algorithm));
         s.push_str(&format!("    zsk lifetime {zsk_life} algorithm {};\n", d.algorithm));
     } else {
@@ -2549,6 +3368,97 @@ pub(crate) fn check_config_strings(cfg: &DnsConfig) -> Result<()> {
             cfg.listen_addr
         );
     }
+    // 递归后端：只接受 bind|unbound（空值 = bind，兼容 [dns] 节缺失时的 derive Default）。
+    let rec = cfg.recursor();
+    if !matches!(rec.to_ascii_lowercase().as_str(), "bind" | "unbound") {
+        bail!("bad recursor {:?}（只接受 \"bind\" 或 \"unbound\"）", cfg.recursor);
+    }
+    if cfg.is_unbound() {
+        // Unbound 没有 BIND 的 view/match-clients：geo 分线路无法等价映射。
+        // 与其静默忽略线路（客户端拿到错误数据），不如保存前明确拒绝。
+        let geo_is_on =
+            cfg.geo.enabled && (!cfg.geo.lines.is_empty() || cfg.geo.mmdb.is_active());
+        if geo_is_on {
+            bail!(
+                "recursor=\"unbound\" 不支持 [dns.geo] 分线路（Unbound 无 BIND view/match-clients）；\
+请改回 recursor=\"bind\"，或关闭 [dns.geo] enabled/lines"
+            );
+        }
+        // Unbound 是主端口的唯一前端；BIND 只绑回环内部端口。listen_addr 必须能映射到
+        // Unbound 的 interface 语法（none/localnets 在 Unbound 里没有等价语义）。
+        let a = cfg.listen_addr.trim();
+        if matches!(a, "none" | "localnets") {
+            bail!(
+                "recursor=\"unbound\" 不支持 listen_addr = {a:?}（Unbound 只接受 IP 字面量 / any / localhost）；\
+请显式写 IP 或 any"
+            );
+        }
+        let main = cfg.port_or_default();
+        let auth = cfg.unbound.auth_port_or_default(cfg);
+        let ctl = cfg.unbound.control_port_or_default(cfg);
+        let rndc = cfg.rndc_port_or_default();
+        if auth == main {
+            bail!(
+                "dns.unbound.auth_port={auth} 不能等于主端口（端口 65535 无法再 +1 时应显式配置 auth_port）"
+            );
+        }
+        if auth == rndc || ctl == main || ctl == auth || ctl == rndc {
+            bail!(
+                "unbound 模式端口分配冲突：main={main} auth={auth} control={ctl} rndc={rndc}\
+（用 [dns.unbound] auth_port/control_port 显式指定互不相同的端口）"
+            );
+        }
+        if cfg.dot.enabled && cfg.dot.port != 0 && (cfg.dot.port == main || cfg.dot.port == auth) {
+            bail!(
+                "dns.dot.port={} 与 unbound 模式的主端口/权威端口冲突（main={main} auth={auth}）",
+                cfg.dot.port
+            );
+        }
+        for (name, v) in [
+            ("msg_cache_size", &cfg.unbound.msg_cache_size),
+            ("rrset_cache_size", &cfg.unbound.rrset_cache_size),
+        ] {
+            if !valid_mem_size(v) {
+                bail!("bad dns.unbound.{name} {v:?}（形如 512k / 16m / 1g；无单位 = 字节）");
+            }
+        }
+    }
+    // 自动 NS / 胶水会直接进 zone 文件：非法名/非 IP 胶水会让 named 拒载整区。
+    // 空 ns_name = 默认 ns1（合法）；空 ns_glue = 显式关闭胶水（合法）。
+    let ns_raw = cfg.ns_name_raw();
+    let ns_base = ns_raw.trim_end_matches('.');
+    if !valid_name(ns_base) {
+        bail!("bad ns_name {:?}（相对名或带尾点的绝对名）", ns_raw);
+    }
+    if ns_raw.ends_with('.') && !valid_zone_name(ns_base) {
+        bail!("bad ns_name {:?}：绝对名必须是合法域名", ns_raw);
+    }
+    if let Some(glue) = cfg.ns_glue_value() {
+        if glue.parse::<std::net::IpAddr>().is_err() {
+            bail!("bad ns_glue {glue:?}（必须是 IPv4/IPv6 字面量，或留空关闭自动胶水）");
+        }
+    } else {
+        // 关闭胶水时，NS 必须是 **out-of-zone** 名字：in-bailiwick NS 没有胶水会让
+        // BIND 以 `NS 'x' has no address records (A or AAAA)` **拒载整个分区**，而
+        // rndc reload 仍返回成功、BIND 继续服务**旧版本**（真机实测：关闭胶水后
+        // dig 仍返回旧 A，面板显示 ok —— 正是本项目反复出现的静默失败）。
+        if !ns_raw.ends_with('.') {
+            bail!(
+                "ns_glue 为空（关闭胶水）时 ns_name 必须是 out-of-zone 绝对名（如 ns1.example.net.）：\
+                 相对名在每个区里都是 in-bailiwick，BIND 会以 \"NS has no address records\" 拒载整区并继续服务旧版本"
+            );
+        }
+        if let Ok(zones) = list_zones() {
+            for z in zones.iter().filter(|z| z.kind == "master") {
+                if relative_owner(ns_raw, &z.name).is_some() {
+                    bail!(
+                        "ns_glue 已关闭，但 ns_name {ns_raw} 属于分区 {}（in-bailiwick NS 必须有胶水，否则 BIND 拒载该区）",
+                        z.name
+                    );
+                }
+            }
+        }
+    }
     // dnssec 关掉时这两个字段不会被写进 named.conf（gen_kasp_policy 不调用），
     // 只在真正启用时校验，免得把「没开 DNSSEC 的部署里一个不用的字段」判死。
     if cfg.dnssec.enabled {
@@ -2568,25 +3478,30 @@ pub(crate) fn check_config_strings(cfg: &DnsConfig) -> Result<()> {
         // + 1h retire-safety + 传播延迟）约 12 天，< 30d 还会告警。下限取 30 天，
         // 并且必须在**写 panel.toml 之前**执行（persist_and_reconcile 会先调本函数）：
         // 否则非法值先落进面板文件，此后每次 reconcile（含启动）都失败。
-        const MIN_KEY_LIFETIME_DAYS: u64 = 30;
+        //
+        // `rotation_days = 0` 是**哨兵值**（G-06）：「立即轮换一次」，KASP lifetime
+        // 由 gen_kasp_policy 钳到 30d（不能写 0d，否则 named 拒载整份配置）。
+        // 1..30 仍是非法值（会真的写出 BIND 拒载的 lifetime）。
         if cfg.dnssec.rotation_enabled {
-            if cfg.dnssec.rotation_days < MIN_KEY_LIFETIME_DAYS {
+            if cfg.dnssec.rotation_days != 0
+                && cfg.dnssec.rotation_days < KASP_MIN_KEY_LIFETIME_DAYS
+            {
                 bail!(
-                    "dnssec rotation_days={} 太小（named 会以 key lifetime is shorter than the time it takes to do a rollover 拒载；下限 {} 天）",
+                    "dnssec rotation_days={} 太小（named 会以 key lifetime is shorter than the time it takes to do a rollover 拒载；下限 {} 天；0 = 立即轮换一次）",
                     cfg.dnssec.rotation_days,
-                    MIN_KEY_LIFETIME_DAYS
+                    KASP_MIN_KEY_LIFETIME_DAYS
                 );
             }
             if let Some(n) = cfg.dnssec.ksk_lifetime_days {
-                if n < MIN_KEY_LIFETIME_DAYS {
-                    bail!("dnssec ksk_lifetime_days={n} 太小（下限 {MIN_KEY_LIFETIME_DAYS} 天）");
+                if n < KASP_MIN_KEY_LIFETIME_DAYS {
+                    bail!("dnssec ksk_lifetime_days={n} 太小（下限 {KASP_MIN_KEY_LIFETIME_DAYS} 天）");
                 }
             }
             for k in &cfg.dnssec.keys {
                 if let Some(n) = k.lifetime_days {
-                    if n < MIN_KEY_LIFETIME_DAYS {
+                    if n < KASP_MIN_KEY_LIFETIME_DAYS {
                         bail!(
-                            "dnssec keys[].lifetime_days={n}（role={}）太小（下限 {MIN_KEY_LIFETIME_DAYS} 天）",
+                            "dnssec keys[].lifetime_days={n}（role={}）太小（下限 {KASP_MIN_KEY_LIFETIME_DAYS} 天）",
                             k.role
                         );
                     }
@@ -2604,6 +3519,14 @@ pub(crate) fn check_config_strings(cfg: &DnsConfig) -> Result<()> {
     }
     if let Some(bad) = cfg.forwarders.iter().find(|f| !valid_forwarder(f)) {
         bail!("bad forwarder {bad:?}（只接受 ip、ip:port、[v6]:port）");
+    }
+    // ACME challenge 决定签发路径（dns-01 需要 worker 写 zone API），未知值
+    // 会让「配置看着保存成功、签发时才发现」——在写 panel.toml 之前拒。
+    if cfg.acme.challenge_kind().is_none() {
+        bail!(
+            "bad [dns.acme] challenge {:?}（只支持 http-01 | dns-01）",
+            cfg.acme.challenge
+        );
     }
     // root zone 的 AXFR 源会被拼进 `dig @host`（并用 split_host_port 拆端口）。
     // 未校验时一个带空格/引号的字符串会让 dig 收到意外 argv（配置来自面板/手改
@@ -2893,8 +3816,19 @@ pub fn write_all(cfg: &DnsConfig) -> Result<Vec<(String, PathBuf)>> {
                 .max();
             write_atomic(
                 &path,
-                gen_zone_file_monotonic_ext(&z.name, &z.kind, &recs, prev_serial, &extra_https)
-                    .as_bytes(),
+                gen_zone_file_monotonic_ns_margin(
+                    &z.name,
+                    &z.kind,
+                    &recs,
+                    prev_serial,
+                    &extra_https,
+                    cfg.ns_name_raw(),
+                    cfg.ns_glue_value(),
+                    // dns-01 的动态更新与文件生成共用 unix 秒 serial：留余量避免
+                    // 「文件 serial == 内存 serial → rndc reload 跳过」。
+                    if cfg.acme.challenge_is_dns01() { 5 } else { 0 },
+                )
+                .as_bytes(),
                 0o644,
                 None,
             )?;
@@ -2952,6 +3886,22 @@ pub fn write_all(cfg: &DnsConfig) -> Result<Vec<(String, PathBuf)>> {
             let _ = std::fs::remove_file(&j2);
             written.push(("crucible.answers".into(), apath));
         }
+    }
+    // unbound 模式：在**所有** zone/RPZ 文件落盘之后再生成 unbound.conf ——
+    // auth-zone 只接入已存在的 zone 文件（首次启动的 slave 要等 BIND 完成 AXFR
+    // 后的下一次 reconcile；调用方可通过 /api/dns/reload 主动触发）。
+    if cfg.is_unbound() {
+        // remote-control 段依赖控制证书；先生成（工具缺失时退化为 pid/SIGHUP）。
+        let _ = unbound_ensure_control_keys();
+        // unbound-checkconf 会检查 pidfile 的父目录必须存在
+        // （fatal: pidfile directory does not exist），必须在生成/校验前建好 run/。
+        std::fs::create_dir_all(state_root().join("run"))?;
+        let uconf = gen_unbound_conf(cfg, &zones);
+        check_unbound_conf_text(&uconf)?;
+        let p = unbound_conf_path();
+        // 配置里没有秘密（证书路径单独 0600），0640 便于运维读取。
+        write_atomic(&p, uconf.as_bytes(), 0o640, None)?;
+        written.push(("unbound.conf".into(), p));
     }
     Ok(written)
 }
@@ -3052,6 +4002,50 @@ fn rndc_bin() -> String {
         &["/usr/local/sbin/rndc", "/usr/sbin/rndc", "/usr/bin/rndc"],
     )
 }
+fn unbound_bin() -> String {
+    tool_path(
+        "CRUCIBLE_UNBOUND_BIN",
+        "unbound",
+        &[
+            "/usr/local/sbin/unbound",
+            "/usr/sbin/unbound",
+            "/usr/bin/unbound",
+        ],
+    )
+}
+fn unbound_control_bin() -> String {
+    tool_path(
+        "CRUCIBLE_UNBOUND_CONTROL_BIN",
+        "unbound-control",
+        &[
+            "/usr/local/sbin/unbound-control",
+            "/usr/sbin/unbound-control",
+            "/usr/bin/unbound-control",
+        ],
+    )
+}
+fn unbound_control_setup_bin() -> String {
+    tool_path(
+        "CRUCIBLE_UNBOUND_CONTROL_SETUP_BIN",
+        "unbound-control-setup",
+        &[
+            "/usr/local/sbin/unbound-control-setup",
+            "/usr/sbin/unbound-control-setup",
+            "/usr/bin/unbound-control-setup",
+        ],
+    )
+}
+fn unbound_checkconf_bin() -> String {
+    tool_path(
+        "CRUCIBLE_UNBOUND_CHECKCONF_BIN",
+        "unbound-checkconf",
+        &[
+            "/usr/local/sbin/unbound-checkconf",
+            "/usr/sbin/unbound-checkconf",
+            "/usr/bin/unbound-checkconf",
+        ],
+    )
+}
 fn keygen_bin() -> String {
     tool_path(
         "CRUCIBLE_KEYGEN_BIN",
@@ -3122,6 +4116,36 @@ fn check_named_conf_text(conf: &str) -> Result<()> {
             msg.push_str(&String::from_utf8_lossy(&o.stdout));
             bail!(
                 "named-checkconf 拒绝生成的 named.conf（{bin}）：{}",
+                last_lines(msg.trim(), 8)
+            );
+        }
+        Err(_) => Ok(()),
+    }
+}
+
+/// 落盘前用 Unbound 自己的解析器验一遍生成的 `unbound.conf`。
+///
+/// 与 [`check_named_conf_text`] 同一目的：任何生成器语法错误都必须在**替换运行中的
+/// 配置之前**变成面板可见的错误，而不是让 `unbound` 起不来（此时主端口上没有递归器，
+/// 所有 DoT/DoH 查询超时）。工具缺失时跳过（测试机没装不应让所有保存失败）。
+fn check_unbound_conf_text(conf: &str) -> Result<()> {
+    let bin = unbound_checkconf_bin();
+    if !Path::new(&bin).is_file() {
+        return Ok(());
+    }
+    let dir = state_root().join("tmp");
+    std::fs::create_dir_all(&dir)?;
+    let tmp = tmp_path_for(&dir.join("checkconf.unbound.conf"));
+    write_new_0600(&tmp, conf.as_bytes())?;
+    let out = std::process::Command::new(&bin).arg(&tmp).output();
+    let _ = std::fs::remove_file(&tmp);
+    match out {
+        Ok(o) if o.status.success() => Ok(()),
+        Ok(o) => {
+            let mut msg = String::from_utf8_lossy(&o.stderr).into_owned();
+            msg.push_str(&String::from_utf8_lossy(&o.stdout));
+            bail!(
+                "unbound-checkconf 拒绝生成的 unbound.conf（{bin}）：{}",
                 last_lines(msg.trim(), 8)
             );
         }
@@ -3200,6 +4224,388 @@ fn named_alive(cfg: &DnsConfig) -> bool {
     rndc(cfg, &["status"]).is_ok()
 }
 
+// ---------------------------------------------------------------- unbound 进程管理
+
+/// 执行 `unbound-control -c <state>/etc/unbound.conf <args>`。
+fn unbound_control(cfg: &DnsConfig, args: &[&str]) -> Result<String> {
+    let conf = unbound_conf_path();
+    let bin = unbound_control_bin();
+    let out = std::process::Command::new(&bin)
+        .arg("-c")
+        .arg(&conf)
+        .args(args)
+        .output()
+        .with_context(|| format!("spawn unbound-control（{bin}）"))?;
+    if !out.status.success() {
+        bail!(
+            "{bin} {}: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).into())
+}
+
+fn unbound_status(cfg: &DnsConfig) -> bool {
+    if !unbound_control_ready() {
+        return false;
+    }
+    unbound_control(cfg, &["status"]).is_ok()
+}
+
+fn unbound_pid() -> Option<u32> {
+    std::fs::read_to_string(unbound_pidfile())
+        .ok()
+        .and_then(|s| s.trim().parse::<u32>().ok())
+}
+
+fn pid_alive(pid: u32) -> bool {
+    if pid == 0 {
+        return false;
+    }
+    // kill(pid, 0)：0 = 存在且有权发信号；EPERM = 存在但属于别的用户。
+    let rc = unsafe { libc::kill(pid as libc::pid_t, 0) };
+    rc == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
+/// pid 的命令行是否包含我们的 unbound.conf（防 pidfile 陈旧/pid 复用误杀）。
+fn pid_cmdline_contains(pid: u32, needle: &str) -> bool {
+    if let Ok(raw) = std::fs::read(format!("/proc/{pid}/cmdline")) {
+        let s = String::from_utf8_lossy(&raw).replace('\0', " ");
+        return s.contains(needle);
+    }
+    // OpenBSD 等无 /proc：ps 兜底。BSD 的 `args=` 与 `command=` 都是合法关键字。
+    for key in ["args=", "command="] {
+        if let Ok(o) = std::process::Command::new("ps")
+            .args(["-p", &pid.to_string(), "-o", key])
+            .output()
+        {
+            let text = String::from_utf8_lossy(&o.stdout);
+            if !text.trim().is_empty() {
+                return text.contains(needle);
+            }
+        }
+    }
+    // ps 不可用/无输出：宁可判「不是我们」（可能重复 spawn，但绝不会误杀别的进程）。
+    false
+}
+
+fn unbound_alive(cfg: &DnsConfig) -> bool {
+    if unbound_status(cfg) {
+        return true;
+    }
+    let Some(pid) = unbound_pid() else {
+        return false;
+    };
+    if !pid_alive(pid) {
+        return false;
+    }
+    let conf = unbound_conf_path().display().to_string();
+    if !pid_cmdline_contains(pid, &conf) {
+        return false;
+    }
+    // 控制口不可用（证书未生成/被占）时，DNS 端口可连也算活着。
+    let addr = std::net::SocketAddr::from(([127u8, 0, 0, 1], cfg.port_or_default()));
+    std::net::TcpStream::connect_timeout(&addr, std::time::Duration::from_millis(300)).is_ok()
+}
+
+fn wait_unbound_healthy(cfg: &DnsConfig, timeout: std::time::Duration) -> bool {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        if unbound_alive(cfg) {
+            return true;
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+}
+
+/// 停止本单位启动的 unbound（control stop → SIGTERM → SIGKILL）。
+///
+/// 必须“明确停止”：recursor 从 unbound 切回 bind 时，若旧 unbound 还占着主端口，
+/// named 重启会 bind 失败、整个 DNS 起不来。
+fn stop_unbound(cfg: &DnsConfig) -> Result<()> {
+    if !unbound_alive(cfg) {
+        return Ok(());
+    }
+    if unbound_control_ready() && unbound_status(cfg) {
+        let _ = unbound_control(cfg, &["stop"]);
+    }
+    if wait_unbound_gone(cfg, std::time::Duration::from_secs(5)) {
+        return Ok(());
+    }
+    let conf = unbound_conf_path().display().to_string();
+    if let Some(pid) = unbound_pid() {
+        if pid_alive(pid) && pid_cmdline_contains(pid, &conf) {
+            unsafe {
+                libc::kill(pid as libc::pid_t, libc::SIGTERM);
+            }
+            if wait_unbound_gone(cfg, std::time::Duration::from_secs(5)) {
+                return Ok(());
+            }
+            log::warn!("dns: unbound pid={pid} 未在 SIGTERM 后退出 → SIGKILL");
+            unsafe {
+                libc::kill(pid as libc::pid_t, libc::SIGKILL);
+            }
+            let _ = wait_unbound_gone(cfg, std::time::Duration::from_secs(2));
+        }
+    }
+    if unbound_alive(cfg) {
+        bail!("无法停止旧的 unbound（主端口 {} 仍被占用）", cfg.port_or_default());
+    }
+    Ok(())
+}
+
+fn wait_unbound_gone(cfg: &DnsConfig, timeout: std::time::Duration) -> bool {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        if !unbound_alive(cfg) {
+            return true;
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+}
+
+/// 当前 unbound.conf 里以 `auth-zone:`/`rpz:` 加载的区名（用于精确热载）。
+fn unbound_auth_zone_names(cfg: &DnsConfig) -> Vec<String> {
+    let zones_dir = state_root().join("zones");
+    let mut v: Vec<String> = Vec::new();
+    if cfg.modes.authoritative {
+        if let Ok(zones) = list_zones() {
+            for z in zones {
+                if z.name.trim().is_empty() {
+                    continue;
+                }
+                if zones_dir.join(zone_file_name(&z, "")).is_file() {
+                    v.push(z.name.trim_end_matches('.').to_string());
+                }
+            }
+        }
+    }
+    if cfg.modes.root && zones_dir.join("root.zone").is_file() {
+        v.push(".".to_string());
+    }
+    if !cfg.rpz.is_empty() {
+        if zones_dir.join("answers.zone").is_file() {
+            v.push("crucible.answers".to_string());
+        }
+        if zones_dir.join("rpz.zone").is_file() {
+            v.push("crucible.rpz".to_string());
+        }
+    }
+    v
+}
+
+/// `unbound-control reload` **只重读配置**，不会重新读取已加载 auth-zone 的
+/// zone 文件内容（真机复现：面板加完记录后 unbound.conf 已热载，但主端口仍返回
+/// 旧数据/ NODATA，必须 `auth_zone_reload <zone>` 才生效）。这里逐个精确重载。
+fn reload_unbound_auth_zones(cfg: &DnsConfig) {
+    if !unbound_control_ready() {
+        return;
+    }
+    for z in unbound_auth_zone_names(cfg) {
+        if let Err(e) = unbound_control(cfg, &["auth_zone_reload", &z]) {
+            log::debug!("dns: auth_zone_reload {z} 失败（可能尚未加载）: {e:#}");
+        }
+    }
+}
+
+/// 热载：unbound-control reload（= SIGHUP；重读配置、清缓存）+ 逐个
+/// `auth_zone_reload`（zone 文件内容不会随 reload 自动重读）。
+fn unbound_reload(cfg: &DnsConfig) -> Result<()> {
+    let mut reloaded = false;
+    if unbound_control_ready() {
+        match unbound_control(cfg, &["reload"]) {
+            Ok(_) => reloaded = true,
+            Err(e) => log::debug!("dns: unbound-control reload 失败，退化 SIGHUP: {e:#}"),
+        }
+    }
+    if !reloaded {
+        let conf = unbound_conf_path().display().to_string();
+        let pid = unbound_pid()
+            .ok_or_else(|| anyhow!("unbound pidfile 不存在（{}）", unbound_pidfile().display()))?;
+        if !pid_alive(pid) || !pid_cmdline_contains(pid, &conf) {
+            bail!("unbound pid={pid} 不是本实例（pidfile 陈旧）");
+        }
+        unsafe {
+            libc::kill(pid as libc::pid_t, libc::SIGHUP);
+        }
+    }
+    reload_unbound_auth_zones(cfg);
+    Ok(())
+}
+
+/// root zone 落盘/重载后同步热载 unbound 的 `auth-zone "."`（失败只告警：
+/// rootzone_refresh 的主结果已成功，unbound 的下一轮 reconcile 会再对一次）。
+fn reload_unbound_for_rootzone(cfg: &DnsConfig) {
+    if !cfg.is_unbound() {
+        return;
+    }
+    if let Err(e) = unbound_reload(cfg) {
+        log::warn!("dns: root zone 更新后热载 unbound 失败: {e:#}");
+    }
+}
+
+/// 影响「监听 socket / 控制口 / 模块列表 / 缓存尺寸」的指纹：变化必须重启
+/// unbound（reload 不重开 socket；模块列表变化会让 reload 直接 fatal）。
+fn unbound_iface_fp(cfg: &DnsConfig) -> String {
+    format!(
+        "{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}",
+        cfg.port_or_default(),
+        unbound_interfaces(cfg).join(","),
+        unbound_interfaces_have_v6(cfg),
+        cfg.unbound.control_port_or_default(cfg),
+        unbound_control_ready(),
+        unbound_modules(cfg),
+        cfg.unbound.msg_cache_size,
+        cfg.unbound.rrset_cache_size,
+        cfg.unbound.cache_min_ttl,
+        cfg.unbound.cache_max_ttl,
+        cfg.unbound.num_threads
+    )
+}
+
+fn tail_file(path: &Path, n: usize) -> String {
+    std::fs::read_to_string(path)
+        .map(|t| last_lines(t.trim_end(), n))
+        .unwrap_or_default()
+}
+
+/// 拉起 unbound（前台 + detached stdio；webserver 退出后继续服务）。
+fn spawn_unbound(cfg: &DnsConfig) -> Result<()> {
+    let bin = unbound_bin();
+    if !Path::new(&bin).is_file() {
+        bail!(
+            "recursor=\"unbound\" 但找不到 unbound 可执行文件（{bin}）；\
+安装：/home/dev123/bin/aptlocal.sh install-deps unbound（生产：pkg_add unbound / apt install unbound）"
+        );
+    }
+    let conf = unbound_conf_path();
+    let log_dir = state_root().join("log");
+    std::fs::create_dir_all(&log_dir)?;
+    std::fs::create_dir_all(state_root().join("run"))?;
+    let err_path = log_dir.join("unbound.stderr.log");
+    let logf = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&err_path)
+        .ok();
+    let mut cmd = std::process::Command::new(&bin);
+    cmd.arg("-c").arg(&conf).arg("-d").stdin(std::process::Stdio::null());
+    match logf {
+        Some(f) => {
+            let f2 = f.try_clone().ok();
+            cmd.stdout(std::process::Stdio::from(f));
+            match f2 {
+                Some(g) => {
+                    cmd.stderr(std::process::Stdio::from(g));
+                }
+                None => {
+                    cmd.stderr(std::process::Stdio::null());
+                }
+            }
+        }
+        None => {
+            cmd.stdout(std::process::Stdio::null());
+            cmd.stderr(std::process::Stdio::null());
+        }
+    }
+    let mut child = cmd
+        .spawn()
+        .with_context(|| format!("spawn unbound（{bin} -c {}）", conf.display()))?;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        if let Ok(Some(st)) = child.try_wait() {
+            bail!(
+                "unbound 启动失败（{bin} -c {}）: {st}；stderr: {}",
+                conf.display(),
+                tail_file(&err_path, 12)
+            );
+        }
+        if unbound_alive(cfg) {
+            return Ok(());
+        }
+        if std::time::Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            bail!(
+                "unbound 已启动但 5s 内健康检查失败（unbound-control status / TCP {} 均不可用）；\
+配置 {}，stderr: {}",
+                cfg.port_or_default(),
+                conf.display(),
+                tail_file(&err_path, 12)
+            );
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+}
+
+/// 确保 unbound 处于「配置最新 + 进程健康」状态。
+///
+/// - 接口/端口/控制口变化 → 重启；
+/// - 仅内容变化 → `reload` 热载（配置 + auth-zone + RPZ + ACL 全部重读）；
+/// - 未运行 → 拉起；起不来/健康检查失败 → **明确报错**（不静默退回 BIND 递归）。
+fn ensure_unbound(cfg: &DnsConfig) -> Result<()> {
+    let conf_path = unbound_conf_path();
+    let text = std::fs::read_to_string(&conf_path)
+        .with_context(|| format!("读取 {}（write_all 未生成 unbound.conf）", conf_path.display()))?;
+    check_unbound_conf_text(&text)?;
+    let text_fp = format!("{:08x}", fnv1a32(&text));
+    let iface_fp = unbound_iface_fp(cfg);
+    let mut alive = unbound_alive(cfg);
+    if alive {
+        let prev_iface = meta_get("unbound_iface_fp").ok().flatten();
+        if prev_iface.as_deref() != Some(iface_fp.as_str()) {
+            log::info!(
+                "dns: unbound 监听/控制口变化（{} → {}）→ 重启 unbound",
+                prev_iface.as_deref().unwrap_or("?"),
+                iface_fp
+            );
+            stop_unbound(cfg)?;
+            alive = unbound_alive(cfg);
+            if alive {
+                bail!("旧 unbound 无法停止（主端口 {} 仍被占用）", cfg.port_or_default());
+            }
+        } else {
+            let prev_fp = meta_get("unbound_fp").ok().flatten();
+            if prev_fp.as_deref() != Some(text_fp.as_str()) {
+                log::info!("dns: unbound 配置内容变化 → 热载");
+                if let Err(e) = unbound_reload(cfg) {
+                    // reload 失败（模块列表变化等）→ 明确重启一次，而不是把
+                    // 主端口的解析器留在一个已经退出的状态。
+                    log::warn!("dns: unbound 热载失败，改为重启: {e:#}");
+                    let _ = stop_unbound(cfg);
+                    spawn_unbound(cfg)?;
+                    let _ = meta_set("unbound_iface_fp", &iface_fp);
+                    let _ = meta_set("unbound_fp", &text_fp);
+                    return Ok(());
+                }
+            } else {
+                // 配置没变但 zone 文件内容可能变了（面板加/删记录、rootzone 刷新）：
+                // unbound-control reload 不会重读 auth-zone 的 zonefile，必须逐个刷。
+                reload_unbound_auth_zones(cfg);
+            }
+            if !wait_unbound_healthy(cfg, std::time::Duration::from_secs(5)) {
+                log::warn!("dns: unbound 热载后健康检查失败 → 重启");
+                let _ = stop_unbound(cfg);
+                spawn_unbound(cfg)?;
+            }
+            let _ = meta_set("unbound_iface_fp", &iface_fp);
+            let _ = meta_set("unbound_fp", &text_fp);
+            return Ok(());
+        }
+    }
+    spawn_unbound(cfg)?;
+    let _ = meta_set("unbound_iface_fp", &iface_fp);
+    let _ = meta_set("unbound_fp", &text_fp);
+    Ok(())
+}
+
 /// 问 named 该 zone 当前的 SOA serial（权威来源；取 `serial` 与 `signed serial` 的较大者）。
 ///
 /// 用途见 [`write_all`] 里 prev_serial 处的注释：只按文件推算 serial 会低于 BIND 已知值
@@ -3262,9 +4668,13 @@ static RECONCILE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 /// （hostname/zone/ACL/RPZ 等仍走 reconfig，不重启。）
 fn listen_fingerprint(cfg: &DnsConfig) -> String {
     format!(
-        "{}|{}|{}|{}|{}",
+        "{}|{}|{}|{}|{}|{}|{}",
+        cfg.recursor(),
         cfg.listen_addr.trim(),
+        // bind 模式 = 主端口；unbound 模式 = BIND 内部权威端口。切换 recursor 时
+        // 端口会变，named 必须重启（reconfig 不会重开监听 socket）。
         cfg.port_or_default(),
+        cfg.named_port_or_default(),
         cfg.rndc_port_or_default(),
         cfg.test_mode,
         cfg.geo.lines.len().min(MAX_GEO_LINES)
@@ -3278,12 +4688,24 @@ pub fn reconcile(cfg: &DnsConfig) -> Result<()> {
     }
     // 锁被毒化（上一次 reconcile panic）时照样继续，避免之后每次保存都直接失败。
     let _guard = RECONCILE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    // G-23：旧库里的绝对记录名（`hello.zone` 在 zone 内 → 双后缀）在生成 zone 文件
+    // **之前**改写，否则每次 reload 都继续发布一个查不到的双后缀名。幂等、无变化时零写。
+    match migrate_legacy_record_names() {
+        Ok(0) => {}
+        Ok(n) => log::info!("dns: migrated {n} legacy absolute record name(s) into zone-relative form"),
+        Err(e) => log::warn!("dns: legacy record-name migration failed: {e:#}"),
+    }
     write_all(cfg)?;
     // 需求 9：MaxMind GeoLite2 数据库自同步 (cron 每日 + 启动时增量检查)
     if cfg.geo.enabled && cfg.geo.mmdb.is_active() && !cfg.geo.mmdb.license_key.is_empty() {
         if let Err(e) = crate::server::dns::geoip::ensure_synced(&cfg.geo.mmdb, false) {
             log::warn!("dns: geoip auto-sync failed: {e:#}");
         }
+    }
+    // 从 unbound 切回 bind：先停 unbound 释放主端口，否则 named 重启 bind 失败。
+    // （unbound 模式不主动停 named —— named 会因 listen 指纹变化先重启到内部端口。）
+    if !cfg.is_unbound() {
+        stop_unbound(cfg)?;
     }
     let fp = listen_fingerprint(cfg);
     let prev_fp = meta_get("listen_fp").ok().flatten();
@@ -3403,6 +4825,23 @@ pub fn reconcile(cfg: &DnsConfig) -> Result<()> {
     let rc = rndc(cfg, &["reconfig"]);
     let rl = rndc(cfg, &["reload"]);
     rc.and(rl)?;
+    // G-06：rotation_days=0 的哨兵在配置保存后**立即**执行（maintenance_loop 30s
+    // 内也会兜底）。只在 armed=0 时真正生成，重复 reconcile 是 no-op。
+    // 改回 >0 / 关闭轮换时**立即重新武装**，否则要等 maintenance_loop 下一轮（30s）
+    // 才允许下一次「设 0」触发 —— 运维会看到「设了 0 没反应」。
+    if cfg.dnssec.enabled && cfg.dnssec.rotation_enabled && cfg.dnssec.rotation_days == 0 {
+        if let Err(e) = dnssec_check_and_rotate(cfg, cfg) {
+            log::warn!("dns: rotation_days=0 immediate rotation failed: {e:#}");
+        }
+    } else {
+        disarm_rotation_once();
+    }
+    // unbound 模式：BIND 就绪后拉起/热载 Unbound（主端口的递归器）。
+    // 起不来时**明确返回错误**（面板可见），绝不静默退回 BIND 递归（那样 ECS 会
+    // 重新被丢弃，正是 G-01 要修的静默降级）。
+    if cfg.is_unbound() {
+        ensure_unbound(cfg)?;
+    }
     // 只有真正成功后才记住指纹：重启/拉起失败时下次还应该按「需要重启」处理。
     if listen_restart_pending {
         log::warn!("dns: 监听配置已变更但 named 未重启成功，保留旧指纹以便下一轮重试");
@@ -3695,6 +5134,7 @@ pub fn rootzone_refresh(cfg: &DnsConfig) -> Result<String> {
     meta_set("root_last_ok", &chrono_now().to_string())?;
     let _ = rndc(cfg, &["reload", "."]);
     verify_rootzone_serial(cfg, &rootzone_targets(cfg)[0])?;
+    reload_unbound_for_rootzone(cfg);
     Ok(rootzone_targets(cfg)[0].to_string_lossy().into())
 }
 
@@ -3925,15 +5365,22 @@ pub async fn startup(live: &Arc<crate::server::live_config::LiveConfig>, cfg_pat
         log::info!("dns: module disabled");
         return;
     }
-    // Let's Encrypt 先行（dot cert = "acme:<domain>" 时 DoT 依赖其产出）
-    acme::startup(&cfg.acme).await;
+    // **先 reconcile 再 ACME**：dns-01 挑战的 TXT 要写进本机权威区（named 必须先
+    // 起来（dns-01 的 TXT 走 zone API + reconcile），http-01 与顺序无关。DoT 在两者之后 spawn，
+    // 所以 `dot.cert = "acme:<domain>"` 仍能看到签发产物。
     let dc = cfg.clone();
     let r = tokio::task::spawn_blocking(move || reconcile(&dc)).await;
     match r {
-        Ok(Ok(())) => log::info!("dns: named reconciled (port {})", cfg.port_or_default()),
+        Ok(Ok(())) => log::info!(
+            "dns: reconciled (recursor={}, main port {}, named port {})",
+            cfg.recursor(),
+            cfg.port_or_default(),
+            cfg.named_port_or_default()
+        ),
         Ok(Err(e)) => log::error!("dns: reconcile failed: {e:#}"),
         Err(e) => log::error!("dns: reconcile join: {e}"),
     }
+    acme::startup(&cfg.acme, Arc::clone(&cfg)).await;
     // DoT 监听用 **live** 入口：每次判定取 `effective(live.snapshot())`，因此
     // panel.toml 与 config.toml 热载的 [dns]/[dns.dot] 改动（ACL/限速/并发上限/端口/
     // 启停）都会生效。旧实现用启动快照入口 `dot_listener(cfg.clone())`：它只重读
@@ -3951,13 +5398,111 @@ pub struct DsPublishInfo {
     pub algorithm: String,
 }
 
+/// `rotation_days=0` 一次性轮换是否已执行（"1" = 已执行，等待配置改回 >0 后重新武装）。
+const ROTATE_ONCE_META: &str = "dnssec_rotate_once_armed";
+
+/// 串行化一次性轮换：reconcile 与 maintenance_loop 可能并发调用本函数，没有锁时
+/// 两边都看到 armed=0 会各生成一把（真机上就是「一次设置出现两把新 ZSK」）。
+static ROTATE_ONCE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn disarm_rotation_once() {
+    match meta_get(ROTATE_ONCE_META) {
+        Ok(Some(v)) if v == "1" => {
+            if let Err(e) = meta_set(ROTATE_ONCE_META, "0") {
+                log::warn!("dnssec: 重置 rotation_days=0 哨兵失败: {e:#}");
+            }
+        }
+        _ => {}
+    }
+}
+
+/// 执行一次「立即轮换」：给每个已有 ZSK/CSK 的 master 分区生成一把替代 key 并
+/// `rndc loadkeys`。KSK-only 的分区跳过（KSK rollover 需要父区 DS 配合，不能由
+/// 单边「立即」完成）。
+fn rotate_once_now(cfg: &DnsConfig, dc: &DnsConfig) -> Result<Vec<DsPublishInfo>> {
+    let _g = ROTATE_ONCE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    // 已执行过：静默 no-op（maintenance_loop 每 30s 调一次）。
+    if meta_get(ROTATE_ONCE_META).ok().flatten().as_deref() == Some("1") {
+        return Ok(Vec::new());
+    }
+    // zone → (has_zsk, has_csk)
+    let mut zones: std::collections::BTreeMap<String, (bool, bool)> =
+        std::collections::BTreeMap::new();
+    for k in dnssec_key_list() {
+        let e = zones.entry(k.zone.clone()).or_insert((false, false));
+        if k.role.eq_ignore_ascii_case("ZSK") {
+            e.0 = true;
+        } else if k.role.eq_ignore_ascii_case("CSK") {
+            e.1 = true;
+        }
+    }
+    if zones.is_empty() {
+        log::info!(
+            "dnssec: rotation_days=0 请求立即轮换，但还没有任何 key（等待 KASP 首次出 key；\
+             初始出 key 本身即为一次轮换）"
+        );
+    }
+    let mut generated = 0usize;
+    for (zone, (has_zsk, has_csk)) in zones {
+        // 只轮换真实存在的 master 分区（已删除分区残留的 key 文件不生成新 key）。
+        if zone_kind_of(&zone).unwrap_or_default() != "master" {
+            continue;
+        }
+        let role = if has_zsk {
+            "zsk"
+        } else if has_csk {
+            "csk"
+        } else {
+            log::info!("dnssec: rotation_days=0：跳过 KSK-only 分区 {zone}（需父区 DS 协调）");
+            continue;
+        };
+        match keygen(&zone, role, &dc.dnssec.algorithm) {
+            Ok(name) => {
+                generated += 1;
+                log::info!(
+                    "dnssec: rotation_days=0 → immediate one-shot {} rotation for {}: {}",
+                    role.to_ascii_uppercase(),
+                    zone,
+                    name
+                );
+                if let Err(e) = rndc(cfg, &["loadkeys", &zone]) {
+                    log::debug!(
+                        "dnssec: rndc loadkeys {zone} 失败（按 best-effort 忽略）: {e:#}"
+                    );
+                }
+            }
+            Err(e) => log::warn!("dnssec: rotation_days=0：为 {zone} 生成 {role} 失败: {e:#}"),
+        }
+    }
+    // 无论成功与否都置位：失败每 30s 重试会不断派生 dnssec-keygen（工具缺失的部署
+    // 上空转），且配置改回 >0 后会自动重新武装。
+    if let Err(e) = meta_set(ROTATE_ONCE_META, "1") {
+        log::warn!("dnssec: 记录 rotation_days=0 哨兵失败: {e:#}");
+    }
+    log::info!(
+        "dnssec: rotation_days=0 one-shot 完成（生成 {generated} 把替代 key；\
+         再次触发请先把 rotation_days 改回 >0 再设为 0）"
+    );
+    Ok(Vec::new())
+}
+
 /// DNSSEC 密钥轮换（需求 3）：检查 key 年龄，快到期时生成新 key 让 BIND KASP 接管切换。
 /// ZSK：rotation_days 到期前 7 天；KSK：ksk_lifetime_days 到期前 14 天。
 /// 返回需要发布 DS 的 KSK（KSK rollover → 面板提示向父区/注册商提交 DS）。
+///
+/// `rotation_days = 0` 是**一次性哨兵**（G-06）：「立即轮换一次」。它不参与按年龄的
+/// 常规判定（lifetime=0 会让每个 key 每轮都命中），而是给每个已有 ZSK/CSK 的分区
+/// 生成一把替代 key 后置位 `dnssec_rotate_once_armed`，直到 rotation_days 改回 >0
+/// 才重新武装 —— 避免 maintenance_loop（30s）反复生成。
 pub fn dnssec_check_and_rotate(cfg: &DnsConfig, dc: &DnsConfig) -> Result<Vec<DsPublishInfo>> {
     if !dc.dnssec.enabled || !dc.dnssec.rotation_enabled {
+        disarm_rotation_once();
         return Ok(Vec::new());
     }
+    if dc.dnssec.rotation_days == 0 {
+        return rotate_once_now(cfg, dc);
+    }
+    disarm_rotation_once();
     let keys = dnssec_key_list();
     let now = chrono_now();
     let mut need_ds: Vec<DsPublishInfo> = Vec::new();
@@ -4131,6 +5676,7 @@ pub fn rootzone_ixfr(cfg: &DnsConfig) -> Result<String> {
             meta_set("root_last_ok", &chrono_now().to_string())?;
             let _ = rndc(cfg, &["reload", "."]);
             verify_rootzone_serial(cfg, &dst)?;
+            reload_unbound_for_rootzone(cfg);
             return Ok(dst.to_string_lossy().into());
         }
         Ok(false) => log::info!("dns: rootzone IXFR unsupported/not applicable, full AXFR fallback"),
@@ -4166,6 +5712,7 @@ pub fn rootzone_ixfr(cfg: &DnsConfig) -> Result<String> {
     meta_set("root_last_ok", &chrono_now().to_string())?;
     let _ = rndc(cfg, &["reload", "."]);
     verify_rootzone_serial(cfg, &rootzone_targets(cfg)[0])?;
+    reload_unbound_for_rootzone(cfg);
     Ok(rootzone_targets(cfg)[0].to_string_lossy().into())
 }
 
@@ -4523,18 +6070,30 @@ pub async fn maintenance_loop(live: Arc<crate::server::live_config::LiveConfig>,
             let wd_cfg = effective(&live.snapshot());
             if wd_cfg.enabled {
                 let probe = wd_cfg.clone();
-                let alive = tokio::task::spawn_blocking(move || named_alive(&probe))
+                let named_ok = tokio::task::spawn_blocking(move || named_alive(&probe))
                     .await
                     .unwrap_or(false);
-                if !alive {
+                // unbound 模式：主端口由 Unbound 服务，它挂了同样等于 DNS 全挂。
+                let unbound_ok = if wd_cfg.is_unbound() {
+                    let probe = wd_cfg.clone();
+                    tokio::task::spawn_blocking(move || unbound_alive(&probe))
+                        .await
+                        .unwrap_or(false)
+                } else {
+                    true
+                };
+                if !named_ok || !unbound_ok {
                     warn_once(
-                        "dns-named-down",
-                        "dns: named 未响应 rndc status ⇒ 看门狗触发 reconcile 拉起",
+                        "dns-daemon-down",
+                        &format!(
+                            "dns: {} 未响应 ⇒ 看门狗触发 reconcile 拉起",
+                            if !named_ok { "named" } else { "unbound" }
+                        ),
                     );
                     let d2 = wd_cfg.clone();
                     let r = tokio::task::spawn_blocking(move || reconcile(&d2)).await;
                     log::info!(
-                        "dns: named 看门狗 reconcile {:?}",
+                        "dns: 看门狗 reconcile {:?}",
                         r.as_ref().map(|_| "ok")
                     );
                 }
@@ -4844,6 +6403,7 @@ mod listen_lists_tests {
             kind: k.to_string(),
             primaries: vec![],
             axfr_acl: vec![],
+            also_notify: vec![],
             refresh_hours: 24,
         };
         let zones = vec![z("crucible.local", "master"), z("example.com", "master"), z("slave.test", "slave")];
@@ -4878,6 +6438,136 @@ mod config_guard_tests {
         let mut c = DnsConfig::default();
         c.listen_addr = listen.to_string();
         c
+    }
+
+    /// G-01：unbound 模式的配置必须真正把 ECS 送到上游 —— `send-client-subnet`
+    /// 与 `subnetcache` 模块缺一不可（少了任何一个，Unbound 都不会带 ECS 出网）。
+    #[test]
+    fn unbound_conf_wires_ecs_end_to_end() {
+        let mut c = cfg_with("127.0.0.1");
+        c.enabled = true;
+        c.test_mode = true;
+        c.recursor = "unbound".into();
+        c.modes.recursive = true;
+        c.forwarders = vec!["127.0.0.1:5300".into()];
+        c.forward_policy = Some("only".into());
+        c.ecs = true;
+        assert!(check_config_strings(&c).is_ok(), "合法的 unbound 配置必须通过校验");
+        let conf = gen_unbound_conf(&c, &[]);
+        assert!(conf.contains("send-client-subnet: 127.0.0.1"), "{conf}");
+        assert!(
+            conf.contains("module-config: \"subnetcache iterator\""),
+            "缺少 subnetcache 时 ECS 不会随递归出网: {conf}"
+        );
+        assert!(conf.contains("forward-addr: 127.0.0.1@5300"), "{conf}");
+        assert!(conf.contains("forward-first: no"), "forward only 应映射为 no: {conf}");
+        assert!(conf.contains("cache-max-ttl: 86400"), "{conf}");
+        // RFC6761 的 test. 默认 NXDOMAIN 会遮住所有 *.test 权威区
+        assert!(conf.contains("local-zone: \"test.\" nodefault"), "{conf}");
+        assert!(
+            conf.contains(&format!("interface: 127.0.0.1@{}", c.port_or_default())),
+            "{conf}"
+        );
+        // 127/8 必须显式 refuse_non_local（Unbound 内建隐式 allow 127/8），
+        // 再用 /32 allow 只放开本机；dig -b 127.0.0.2 不能拿到递归。
+        assert!(conf.contains("access-control: 127.0.0.0/8 refuse_non_local"), "{conf}");
+        assert!(conf.contains("access-control: 127.0.0.1/32 allow"), "{conf}");
+        assert!(
+            conf.contains("access-control: 0.0.0.0/0 refuse_non_local"),
+            "非 ACL 客户端仍应能查权威数据、但拿不到递归: {conf}"
+        );
+        // 端口分层：BIND 退到 port+1 的内部权威端口
+        assert_eq!(c.named_port_or_default(), c.port_or_default() + 1);
+        // named.conf 也必须退到内部端口且关闭递归（递归由 Unbound 承担）
+        let named = gen_named_conf(&c, &[]);
+        assert!(
+            named.contains(&format!("listen-on port {}", c.port_or_default() + 1)),
+            "{named}"
+        );
+        assert!(named.contains("recursion no;"), "unbound 模式下 BIND 不能再做递归: {named}");
+    }
+
+    /// `ecs = false` 时 Unbound 必须完全不发 ECS：不装 subnetcache、不写
+    /// send-client-subnet。否则它会用客户端源地址（127.0.0.1）自动生成一条 ECS，
+    /// 「关」开关形同虚设。
+    #[test]
+    fn unbound_conf_ecs_off_sends_nothing() {
+        let mut c = cfg_with("127.0.0.1");
+        c.enabled = true;
+        c.test_mode = true;
+        c.recursor = "unbound".into();
+        c.modes.recursive = true;
+        c.forwarders = vec!["127.0.0.1:5300".into()];
+        c.ecs = false;
+        let conf = gen_unbound_conf(&c, &[]);
+        assert!(!conf.contains("send-client-subnet"), "{conf}");
+        assert!(!conf.contains("subnetcache"), "{conf}");
+        assert!(conf.contains("module-config: \"iterator\""), "{conf}");
+        assert!(conf.contains("forward-addr: 127.0.0.1@5300"), "{conf}");
+    }
+
+    /// 递归关闭时不存在递归入口（不生成 `forward-zone "."`），且回环也只允许权威查询。
+    #[test]
+    fn unbound_conf_recursion_off_has_no_forward_zone() {
+        let mut c = cfg_with("127.0.0.1");
+        c.enabled = true;
+        c.test_mode = true;
+        c.recursor = "unbound".into();
+        c.modes.recursive = false;
+        c.forwarders = vec!["127.0.0.1:5300".into()];
+        let conf = gen_unbound_conf(&c, &[]);
+        assert!(!conf.contains("forward-zone"), "{conf}");
+        assert!(conf.contains("access-control: 127.0.0.0/8 refuse_non_local"), "{conf}");
+        assert!(conf.contains("access-control: 0.0.0.0/0 refuse_non_local"), "{conf}");
+    }
+
+    /// unbound 模式与 geo 分线路互斥（Unbound 没有 view/match-clients），必须在
+    /// 保存前明确拒绝，而不是静默忽略线路。
+    #[test]
+    fn unbound_mode_rejects_geo_and_conflicting_ports() {
+        let mut c = cfg_with("127.0.0.1");
+        c.enabled = true;
+        c.test_mode = true;
+        c.recursor = "unbound".into();
+        c.geo.enabled = true;
+        c.geo.lines.push(GeoLine {
+            name: "lab".into(),
+            cidrs: vec!["192.0.2.0/24".into()],
+        });
+        assert!(check_config_strings(&c).is_err(), "geo + unbound 必须被拒");
+
+        let mut bad = cfg_with("127.0.0.1");
+        bad.enabled = true;
+        bad.test_mode = true;
+        bad.recursor = "unbound".into();
+        bad.unbound.auth_port = bad.port_or_default();
+        assert!(check_config_strings(&bad).is_err(), "auth_port 不能等于主端口");
+
+        let mut ok = cfg_with("127.0.0.1");
+        ok.enabled = true;
+        ok.test_mode = true;
+        ok.recursor = "unbound".into();
+        ok.unbound.auth_port = 15400;
+        ok.unbound.control_port = 15401;
+        assert!(check_config_strings(&ok).is_ok());
+        assert_eq!(ok.named_port_or_default(), 15400);
+    }
+
+    #[test]
+    fn unbound_forwarder_translation() {
+        assert_eq!(forwarder_unbound_addr("127.0.0.1"), Some("127.0.0.1".into()));
+        assert_eq!(
+            forwarder_unbound_addr("127.0.0.1:5300"),
+            Some("127.0.0.1@5300".into())
+        );
+        assert_eq!(
+            forwarder_unbound_addr("[2001:db8::1]:5300"),
+            Some("2001:db8::1@5300".into())
+        );
+        assert_eq!(forwarder_unbound_addr("2001:db8::1"), Some("2001:db8::1".into()));
+        assert_eq!(forwarder_unbound_ip("127.0.0.1:5300"), Some("127.0.0.1".into()));
+        assert_eq!(forwarder_unbound_ip("[2001:db8::1]:5300"), Some("2001:db8::1".into()));
+        assert_eq!(forwarder_unbound_addr("not-an-ip"), None);
     }
 
     /// 根区占位里的 A 记录必须是**合法点分四段**：`listen_addr` 是 named 关键字或 v6
@@ -5029,6 +6719,7 @@ mod dns_hardening_tests {
             kind: kind.to_string(),
             primaries: vec![],
             axfr_acl: vec![],
+            also_notify: vec![],
             refresh_hours: 24,
         }
     }
@@ -5090,12 +6781,12 @@ mod dns_hardening_tests {
     #[test]
     fn add_zone_guards_bail_before_db_write() {
         // 空 primaries 的 slave：named.conf 不会声明该区（面板显示成功、服务里没有）
-        assert!(add_zone("slave", "s.test", &[], &[], 24).is_err());
-        assert!(add_zone("slave", "s.test", &["192.0.2.1".into()], &[], 0).is_err());
-        assert!(add_zone("slave", "s.test", &["192.0.2.1".into()], &[], 8761).is_err());
+        assert!(add_zone("slave", "s.test", &[], &[], 24, &[]).is_err());
+        assert!(add_zone("slave", "s.test", &["192.0.2.1".into()], &[], 0, &[]).is_err());
+        assert!(add_zone("slave", "s.test", &["192.0.2.1".into()], &[], 8761, &[]).is_err());
         // 保留名 / 非法名同样在写库前被拒
-        assert!(add_zone("master", "crucible.rpz", &[], &[], 24).is_err());
-        assert!(add_zone("master", ".example.com", &[], &[], 24).is_err());
+        assert!(add_zone("master", "crucible.rpz", &[], &[], 24, &[]).is_err());
+        assert!(add_zone("master", ".example.com", &[], &[], 24, &[]).is_err());
     }
 
     /// P1-3：算法白名单收窄 + lifetime 下限（都必须在写 panel.toml 之前拒掉）。
@@ -5470,5 +7161,111 @@ mod dns_hardening_tests {
         assert!(c.rootzone.enabled, "root zone 默认 daily 自动刷新（需求 2）");
         assert_eq!(c.acme.renew_days, 60);
         assert_eq!(c.geo.mmdb.sync_days, 7);
+        // G-09：自动 NS/胶水的默认行为必须与旧版一致（ns1 + 127.0.0.1）。
+        assert_eq!(c.ns_name_raw(), "ns1");
+        assert_eq!(c.ns_glue_value(), Some("127.0.0.1"));
+        // G-07：默认仍是 http-01（旧配置零行为变化）。
+        assert_eq!(c.acme.challenge, "http-01");
+        assert!(!c.acme.challenge_is_dns01());
+    }
+
+    /// G-09：ns_name/ns_glue 可覆盖/关闭；胶水只在该名字属于本区时生成。
+    #[test]
+    fn zone_ns_and_glue_are_configurable() {
+        let recs = vec![RecordRow {
+            id: 1,
+            zone: "example.com".into(),
+            line: String::new(),
+            name: "www".into(),
+            rtype: "A".into(),
+            ttl: 300,
+            rdata: "192.0.2.1".into(),
+        }];
+        // 默认：ns1 + 127.0.0.1（与旧版逐字节一致）
+        let d = gen_zone_file_monotonic_ns(
+            "example.com", "master", &recs, Some(1), &[], "ns1", Some("127.0.0.1"),
+        );
+        assert!(d.contains("@ IN SOA ns1.example.com. hostmaster.example.com."), "{d}");
+        assert!(d.contains("@ IN NS ns1.example.com."), "{d}");
+        assert!(d.contains("ns1.example.com. IN A 127.0.0.1"), "{d}");
+        // 自定义相对名 + IPv6 胶水
+        let c = gen_zone_file_monotonic_ns(
+            "example.com", "master", &recs, Some(1), &[], "ns2", Some("2001:db8::53"),
+        );
+        assert!(c.contains("@ IN NS ns2.example.com."), "{c}");
+        assert!(c.contains("ns2.example.com. IN AAAA 2001:db8::53"), "{c}");
+        // 关闭胶水：只有 NS，没有 A/AAAA
+        let off = gen_zone_file_monotonic_ns(
+            "example.com", "master", &recs, Some(1), &[], "ns1", None,
+        );
+        assert!(off.contains("@ IN NS ns1.example.com."), "{off}");
+        // 只能断言「没有自动胶水」，不能断言全文没有 " IN A " —— 测试数据本身
+        // 就有 `www 300 IN A 192.0.2.1`（旧断言恒失败）。
+        assert!(
+            !off.contains("ns1.example.com. IN A "),
+            "关闭后不得生成胶水: {off}"
+        );
+        // out-of-zone 绝对名：不生成胶水（in-bailiwick 才需要）
+        let ext = gen_zone_file_monotonic_ns(
+            "example.com", "master", &recs, Some(1), &[], "ns1.example.net.", Some("192.0.2.53"),
+        );
+        assert!(ext.contains("@ IN NS ns1.example.net."), "{ext}");
+        assert!(!ext.contains("192.0.2.53"), "out-of-zone NS 的胶水是无意义数据: {ext}");
+        // 校验：非法胶水/名字在保存前被拒
+        let mut cfg = test_cfg();
+        cfg.ns_name = Some("bad name".into());
+        assert!(check_config_strings(&cfg).is_err());
+        cfg.ns_name = Some("ns1".into());
+        cfg.ns_glue = Some("not-an-ip".into());
+        assert!(check_config_strings(&cfg).is_err());
+        // 关闭胶水 + 相对 NS = in-bailiwick ⇒ BIND 会拒载该区（必须保存前拒绝）。
+        cfg.ns_glue = Some(String::new());
+        assert!(check_config_strings(&cfg).is_err(), "相对 NS 关胶水必须被拒");
+        cfg.ns_name = Some("ns1.example.net.".into());
+        assert!(
+            check_config_strings(&cfg).is_ok(),
+            "out-of-zone 绝对 NS + 关闭胶水是合法组合"
+        );
+    }
+
+    /// G-05：master zone 的 also-notify 必须渲染成 BIND 语法（ip 或 ip port N），
+    /// 非法项 fail-closed（历史 DB 行也不得污染 named.conf）。
+    #[test]
+    fn master_zone_renders_also_notify() {
+        let mut z = zone_row("example.com", "master");
+        z.also_notify = vec![
+            "192.0.2.53".into(),
+            "127.0.0.1:5353".into(),
+            "2001:db8::53".into(),
+            "bad;};".into(),
+        ];
+        let c = master_clauses(&test_cfg(), &z);
+        assert!(
+            c.contains("also-notify { 192.0.2.53; 127.0.0.1 port 5353; 2001:db8::53; };"),
+            "{c}"
+        );
+        assert!(!c.contains("bad"), "{c}");
+        // 未配置时零输出（行为不变）
+        assert_eq!(master_clauses(&test_cfg(), &zone_row("example.com", "master")), "");
+    }
+
+    /// G-06：rotation_days=0 是合法哨兵；1..29 仍拒绝；KASP lifetime 钳到 30d
+    /// （写 0d 会让 named 拒载整份配置）。
+    #[test]
+    fn rotation_days_zero_is_sentinel_and_lifetime_clamped() {
+        let mut c = test_cfg();
+        c.dnssec.enabled = true;
+        c.dnssec.rotation_enabled = true;
+        c.dnssec.rotation_days = 0;
+        assert!(check_config_strings(&c).is_ok(), "0 = 立即轮换一次，必须放行");
+        let p = gen_kasp_policy(&c.dnssec);
+        assert!(p.contains("zsk lifetime 30d"), "0d 必须钳到 30d: {p}");
+        assert!(!p.contains("lifetime 0d"), "{p}");
+        c.dnssec.rotation_days = 29;
+        assert!(check_config_strings(&c).is_err(), "29 天仍会被 BIND 拒载");
+        c.dnssec.rotation_days = 30;
+        assert!(check_config_strings(&c).is_ok());
+        let p30 = gen_kasp_policy(&c.dnssec);
+        assert!(p30.contains("zsk lifetime 30d"), "{p30}");
     }
 }

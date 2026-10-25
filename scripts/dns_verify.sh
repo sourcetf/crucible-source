@@ -1,16 +1,38 @@
 #!/bin/sh
 set -u
-# 真机全量模式：一条命令起 named/pebble、跑三模式/权威/DNSSEC/AXFR-IXFR/DoT-DoH/ECS/ACME、
-# 最后清理。默认（不带 --real）仍是原来的「对已运行实例做 HTTP 冒烟」，保持验收脚本兼容。
+# 真机全量模式：一条命令跑 bind 与 unbound 两档。
+#   scripts/dns_verify.sh --real            # 两档都跑（bind 先、unbound 后）
+#   scripts/dns_verify.sh --real bind       # 只跑 BIND 全套（原 dns_bind_verify.sh）
+#   scripts/dns_verify.sh --real unbound    # 只跑 Unbound/ECS 端到端（dns_unbound_verify.sh）
+# 默认（不带 --real）仍是原来的「对已运行实例做 HTTP 冒烟」，保持验收脚本兼容。
 if [ "${1:-}" = "--real" ]; then
     shift
     SELF_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
-    # dns_bind_verify.sh 用了 bash 数组/ local / 进程替换：不能 `sh` 跑（dash 直接报
-    # `Syntax error: "(" unexpected`）。有 bash 用 bash，否则交给 shebang。
-    if command -v bash >/dev/null 2>&1; then
-        exec bash "$SELF_DIR/dns_bind_verify.sh" "$@"
+    MODE="${1:-both}"
+    RUN_BIND=0
+    RUN_UNBOUND=0
+    case "$MODE" in
+        bind|--bind) RUN_BIND=1; shift ;;
+        unbound|--unbound) RUN_UNBOUND=1; shift ;;
+        ""|both|all) RUN_BIND=1; RUN_UNBOUND=1 ;;
+        *) echo "usage: $0 --real [bind|unbound|both]" >&2; exit 2 ;;
+    esac
+    # dns_bind_verify.sh / dns_unbound_verify.sh 用了 bash 数组/local：不能 `sh` 跑
+    # （dash 直接报 `Syntax error: "(" unexpected`）。有 bash 用 bash，否则交给 shebang。
+    if ! command -v bash >/dev/null 2>&1; then
+        echo "FATAL: bash not found（两个验证脚本都需要 bash）" >&2
+        exit 2
     fi
-    exec "$SELF_DIR/dns_bind_verify.sh" "$@"
+    RC=0
+    if [ "$RUN_BIND" = 1 ]; then
+        echo "########## D档 1/2: BIND（recursor=bind） ##########"
+        bash "$SELF_DIR/dns_bind_verify.sh" "$@" || RC=$?
+    fi
+    if [ "$RUN_UNBOUND" = 1 ]; then
+        echo "########## D档 2/2: Unbound（recursor=unbound，ECS 端到端） ##########"
+        bash "$SELF_DIR/dns_unbound_verify.sh" "$@" || RC=$?
+    fi
+    exit "$RC"
 fi
 BASE="${1:-http://127.0.0.1:19095/__admin}"
 AUTH="${2:-admin:admin}"

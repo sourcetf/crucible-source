@@ -1,6 +1,8 @@
 //! DoT（RFC7858）与 DoH（RFC8484）服务器端。
 //!
-//! - DoT：独立 TCP 监听（TLS 后按 2 字节长度前缀收发 DNS wire 报文），转发到本机 named（UDP）
+//! - DoT：独立 TCP 监听（TLS 后按 2 字节长度前缀收发 DNS wire 报文），转发到主端口的
+//!   解析器：bind 模式 → 本机 named；unbound 模式 → 本机 Unbound（`send-client-subnet`
+//!   把 ECS 真正送到递归上游，G-01）
 //! - DoH：`h1_try_handle` + h2/h3 `doh_prepared`（路径/Host 白名单分离，需求 9）
 //!   443 SNI 复用的纯 DNS-wire 探测仍属可选增强，不阻塞 HTTP DoH。
 //! - 443 端口复用不冲突：DoH 走 /dns-query 路径 + Host 白名单；正常 HTTPS 站点不受影响
@@ -934,7 +936,8 @@ where
             match tokio::net::TcpListener::bind((bind_ip, port)).await {
                 Ok(l) => {
                     log::info!(
-                        "dns: DoT listening on {bind_ip}:{port} → named@{}:{} (allow={}, rate={}/s burst={}, max_conns={})",
+                        "dns: DoT listening on {bind_ip}:{port} → {}@{}:{} (allow={}, rate={}/s burst={}, max_conns={})",
+                        if dc.is_unbound() { "unbound" } else { "named" },
                         dc.listen_addr,
                         dc.port_or_default(),
                         dot_allow_desc(&dc),

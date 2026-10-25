@@ -119,6 +119,53 @@ pub(crate) fn sidecar_env_fp_matches(sock: &Path, fp: u64) -> bool {
     read_sidecar_env_fp(sock).map(|i| i.fp == fp).unwrap_or(false)
 }
 
+/// 「这个 sock 上的 sidecar 属于本进程」的缓存：sock → `.envfp` 里的 pid。
+///
+/// `is_direct_child` 要跑一次 `ps`；h1 与 h2/h3 各有注册表，**跨协议复用**时对方协议
+/// 的 `SIDECARS` 里没有条目，每次请求都会走到核验点。没有缓存就会变成「每请求一个
+/// `ps` 进程」（真机可测的性能回归）。pid 变了（sidecar 被杀后重建）或条目失效时
+/// 重新核验；sock 数量由配置决定，有界。
+static OWNED_SOCKS: Lazy<Mutex<HashMap<PathBuf, i32>>> =
+    Lazy::new(|| Mutex::new(HashMap::new()));
+
+/// `.envfp` 里记录的 spawner pid 是否仍是**本进程的直系子进程**。
+///
+/// 受管 sidecar 只可能由本进程 spawn；不是直系子进程 = 上一代 webserver 留下的孤儿
+///（SIGKILL 后 reparent / 关机漏杀）。这种进程不能复用：它的进程 env / docroot /
+/// 生命周期都属于上一代，而且新实例的 `kill_all` 也管不到它（会永久泄漏）。
+/// 无 pid 记录（旧版指纹文件）时保持旧行为（只看指纹）。
+fn sidecar_owned_by_this_process(sock: &Path) -> bool {
+    let Some(pid) = read_sidecar_env_fp(sock).and_then(|i| i.pid) else {
+        return true;
+    };
+    {
+        let cache = OWNED_SOCKS.lock();
+        if cache.get(sock) == Some(&pid) {
+            return true;
+        }
+    }
+    if crate::server::apps::child_registry::is_direct_child(pid) {
+        let mut cache = OWNED_SOCKS.lock();
+        if cache.len() >= 1024 {
+            cache.clear();
+        }
+        cache.insert(sock.to_path_buf(), pid);
+        true
+    } else {
+        false
+    }
+}
+
+/// sidecar 被替换/回收后清掉归属缓存（下一次按新 `.envfp` 重新核验）。
+fn forget_owned_sock(sock: &Path) {
+    OWNED_SOCKS.lock().remove(sock);
+}
+
+/// 受管 sidecar 可复用 = `.env` 指纹一致 **且** 进程属于本进程这一代。
+pub(crate) fn sidecar_reusable(sock: &Path, fp: u64) -> bool {
+    sidecar_env_fp_matches(sock, fp) && sidecar_owned_by_this_process(sock)
+}
+
 /// spawn 成功、sock 就绪后写指纹文件（原子写：临时文件 + rename）。
 ///
 /// 写失败只记日志、不影响服务：最坏情况是下一次复用把它当作「无法核验」→ 重启一次。
@@ -159,12 +206,23 @@ fn pid_is_own_child(pid: i32) -> bool {
     }
 }
 
-/// 杀一个已核验 ppid 的 sidecar pid（SIGTERM → 短等 → SIGKILL）。
+/// 杀一个已核验身份/命令行的 sidecar pid（SIGTERM → 短等 → SIGKILL）。
 ///
 /// 正常路径优先走两个注册表的 `kill_managed_*_by_sock`（那边有 `Child` 句柄、能 wait
 /// 回收，避免僵尸）。只有「指纹文件里的 pid 不在任何注册表」时才走这里。
+///
+/// 两类 pid：
+///   * 本进程直系子进程（注册表丢了，例如 spawn 后崩溃前的竞态）——按 ppid 核验；
+///   * **上一代遗留**的受管 sidecar（reparent 后 ppid=1/子收割者）——`is_direct_child`
+///     为假，但 `.envfp` 就写在我们的 state 目录里；交给 `kill_stale_managed_sidecar`
+///     用「命令行锚定本仓库 + 引擎形态」复核后清理。旧实现对这类进程只打一句
+///     「不是本进程的子进程，不动它」就 `remove_file(sock)` 重建 ⇒ 旧进程继续活着、
+///     持有旧监听 inode，成为**永远不会被回收**的孤儿（deploy3 §4.3 的形态）。
 #[cfg(unix)]
-fn kill_sidecar_pid(pid: i32) {
+fn kill_sidecar_pid(sock: &Path, pid: i32) {
+    if crate::server::apps::child_registry::kill_stale_managed_sidecar(pid, sock) {
+        return;
+    }
     if !pid_is_own_child(pid) {
         log::warn!("native_http: sidecar pid={pid} 不是本进程的子进程（或已退出），不动它");
         return;
@@ -202,12 +260,13 @@ pub(crate) fn evict_sidecar_for_env_change(sock: &Path, new_fp: u64) {
     }
     if !reaped {
         if let Some(pid) = info.and_then(|i| i.pid) {
-            kill_sidecar_pid(pid);
+            kill_sidecar_pid(sock, pid);
         }
     }
+    forget_owned_sock(sock);
     let _ = fs::remove_file(sock);
     log::warn!(
-        "native_http: sidecar {} 的 .env 指纹不一致（运行中 {:?} / 本次 {:016x}）→ 杀掉旧进程并重建",
+        "native_http: sidecar {} 不可复用（运行中 .env 指纹 {:?} / 本次 {:016x}，或进程不属于本进程）→ 杀掉旧进程并重建",
         sock.display(),
         old_fp.map(|f| format!("{f:016x}")).unwrap_or_else(|| "无指纹文件".into()),
         new_fp
@@ -300,8 +359,11 @@ async fn ensure_sidecar(
     //     杀掉并重建（`evict_sidecar_for_env_change` 会同时清理两个注册表里的条目）。
     // 绝不直接 `remove_file` + spawn（那会偷走对方的监听 socket、留下孤儿进程）。
     if sock_alive(&sock) {
-        if sidecar_env_fp_matches(&sock, fp) {
-            log::debug!("native_http: sidecar {key} 已由其它注册表拉起（sock 存活且 .env 指纹一致），复用");
+        // 「指纹一致」还不够：进程必须属于**本进程这一代**（`.envfp` 里的 pid 是直系
+        // 子进程）。上一代遗留的 sidecar 复用后会永久脱离 kill_all 的管理（孤儿），
+        // 必须杀掉重建。
+        if sidecar_reusable(&sock, fp) {
+            log::debug!("native_http: sidecar {key} 已由其它注册表拉起（sock 存活、.env 指纹一致且进程属于本进程），复用");
             return Ok(sock);
         }
         evict_sidecar_for_env_change(&sock, fp);

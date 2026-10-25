@@ -13,7 +13,8 @@
 use anyhow::Result;
 use once_cell::sync::Lazy;
 use parking_lot::Mutex;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
 
 /// 一条已登记的子进程。
@@ -92,9 +93,16 @@ fn alive_and_matches(pid: i32, program: &str, start: Option<u64>) -> bool {
     }
     let info = match proc_info(pid) {
         Some(info) => info,
-        // kill(2) 说存在但读不到身份（正好退出 / 平台不支持 / 权限）：
-        // 拿不到证据就**不发信号**，这是防误杀的安全方向。
-        None => return false,
+        // kill(2) 说存在但读不到内核身份（平台差异 / 权限 / 正好退出）。
+        //
+        // **不能直接放弃**：真实生产事故（OpenBSD 7.9，deploy3-wave19 §4.3）里
+        // `KERN_PROC_PID` 的 MIB 形态不对 ⇒ `proc_info` 对**所有** pid 返回 None ⇒
+        // spawn 时登记的启动时间是 None、关机时把自己刚 spawn 的存活 sidecar 全判成
+        // 「已退出」跳过 ⇒ php-fpm/jsp/ruby/rack 全部 reparent 成孤儿（日志
+        // `skip …（已退出）`）。这里退回到最小判据：**只认自己的直系子进程**
+        //（`ps -o ppid= -p PID`，Linux/OpenBSD 语义一致，且不带 `-a/-x`，没有
+        // 「选择项并集返回整表」的陷阱）。非直系仍然不发信号 —— 防误杀方向不变。
+        None => return pid_is_direct_child(pid),
     };
     if info.zombie {
         return false; // 已退出、只等 reap
@@ -114,6 +122,57 @@ fn alive_and_matches(pid: i32, program: &str, start: Option<u64>) -> bool {
     match proc_cmdline(pid) {
         Some(cmd) => command_contains_program(&cmd, program),
         None => false,
+    }
+}
+
+/// pid 是否仍是本进程的**直接子进程**（不依赖 `/proc` / `kinfo_proc`）。
+///
+/// `ps -o ppid= -p PID` 在 Linux procps 与 OpenBSD ps 上语义一致；这里**不带**
+/// `-a/-x`，所以没有本模块文件头警告的「选择项并集 = 返回整表」问题（那只是
+/// `-a/-x` 与 `-p` 混用的陷阱）。
+fn pid_is_direct_child(pid: i32) -> bool {
+    if pid <= 1 || pid == std::process::id() as i32 {
+        return false;
+    }
+    let out = match Command::new("ps")
+        .arg("-o")
+        .arg("ppid=")
+        .arg("-p")
+        .arg(pid.to_string())
+        .output()
+    {
+        Ok(o) => o,
+        Err(_) => return false,
+    };
+    String::from_utf8_lossy(&out.stdout)
+        .split_whitespace()
+        .next()
+        .and_then(|s| s.parse::<i32>().ok())
+        == Some(std::process::id() as i32)
+}
+
+/// 公开的最小身份判据：`pid` 是否为本进程的直系子进程。
+///
+/// 受管 sidecar 只可能由本进程 spawn；`.envfp` 里记录的 pid 若不是直系子进程，
+/// 就是上一代 webserver 的遗留（SIGKILL / 关机漏杀），不能把它当「自己的」复用。
+pub(crate) fn is_direct_child(pid: i32) -> bool {
+    pid_is_direct_child(pid)
+}
+
+/// pid 的完整命令行（Linux `/proc`；OpenBSD `KERN_PROC_ARGS`）。供引擎 spawn 前
+/// 复核上一代遗留进程（防 pid 复用误杀）。
+pub(crate) fn cmdline(pid: i32) -> Option<String> {
+    proc_cmdline(pid)
+}
+
+/// 存活且不是僵尸。
+fn process_running(pid: i32) -> bool {
+    if !process_alive(pid) {
+        return false;
+    }
+    match proc_info(pid) {
+        Some(info) => !info.zombie,
+        None => true, // 读不到身份时按「可能还在跑」处理（宁可多等一次 SIGKILL）
     }
 }
 
@@ -156,14 +215,36 @@ fn proc_info(pid: i32) -> Option<ProcInfo> {
     })
 }
 
-/// OpenBSD：`sysctl({CTL_KERN, KERN_PROC, KERN_PROC_PID, pid})` 返回 `kinfo_proc`。
-/// 不存在时 sysctl 返回 -1/ESRCH；`p_pid` 再核对一次，防止内核返回空结构。
+/// OpenBSD：`sysctl({CTL_KERN, KERN_PROC, KERN_PROC_PID, pid, elem_size, elem_count})`。
+///
+/// **MIB 形态是 OpenBSD 特有**：KERN_PROC 子树要求
+/// `{CTL_KERN, KERN_PROC, op, arg, sizeof(kinfo_proc), count}` **六级**（man 2 sysctl
+/// 的 KERN_PROC 段；与 FreeBSD 的四级 `{CTL_KERN, KERN_PROC, op, arg}` 不同）。
+/// 旧实现只给四级，内核一律返回 `EINVAL` —— 本波在远程 OpenBSD 7.9 用 C 探针实测：
+/// 四级 `rc=-1 errno=22`，同一进程六级 `rc=0` 且 `p_pid/p_ppid/p_stat/p_ustart` 正确。
+///
+/// 生产后果（deploy3-wave19 §4.3 的根因）：`proc_start()` 恒 None、`proc_info()` 恒
+/// None ⇒ 关机时 `alive_and_matches` 把**存活的直系子进程**判成「已退出」跳过 ⇒
+/// php-fpm / jsp / ruby / rack 全部 reparent 成 ppid=1 孤儿，新实例再复用旧 socket。
+///
+/// 注意：**不存在的 pid** 在此 MIB 下返回 `rc=0, len=0`（不是 ESRCH），所以必须核对
+/// `len` 与 `p_pid`。
 #[cfg(target_os = "openbsd")]
 fn proc_info(pid: i32) -> Option<ProcInfo> {
-    let mut mib: [libc::c_int; 4] = [libc::CTL_KERN, libc::KERN_PROC, libc::KERN_PROC_PID, pid];
+    if pid <= 0 {
+        return None;
+    }
+    let mut mib: [libc::c_int; 6] = [
+        libc::CTL_KERN,
+        libc::KERN_PROC,
+        libc::KERN_PROC_PID,
+        pid,
+        std::mem::size_of::<libc::kinfo_proc>() as libc::c_int,
+        1,
+    ];
     let mut kp: libc::kinfo_proc = unsafe { std::mem::zeroed() };
     let mut len = std::mem::size_of::<libc::kinfo_proc>();
-    // SAFETY: `kp`/`len` are valid for the duration of the call; MIB is 4 ints.
+    // SAFETY: `kp`/`len` are valid for the duration of the call; MIB is 6 ints.
     let rc = unsafe {
         libc::sysctl(
             mib.as_mut_ptr(),
@@ -234,9 +315,27 @@ fn proc_cmdline(pid: i32) -> Option<String> {
     Some(parts.join(" "))
 }
 
+/// OpenBSD 命令行：`sysctl({CTL_KERN, KERN_PROC_ARGS, pid, KERN_PROC_ARGV})`。
+///
+/// 旧实现只给 `{CTL_KERN, KERN_PROC_ARGS, pid}` **三级**，缺少操作码
+/// （`KERN_PROC_ARGV`/`KERN_PROC_ENV`）⇒ 内核返回 `EINVAL`（本波 C 探针实测：
+/// 三级 `errno=22`；补上第四级后 `rc=0` 且 argv 正确）。后果是 OpenBSD 上
+/// `proc_cmdline()` 恒 None —— pid 复用防线（程序名判据）与启动清理的命令行判据
+/// 全部失效。
+///
+/// 输出布局：`char *argv[]` 指针数组（NULL 结尾）紧跟字符串本体；指针指向**同一块**
+/// 输出缓冲区（内核会把指针重定位到用户缓冲区）。
 #[cfg(target_os = "openbsd")]
 fn proc_cmdline(pid: i32) -> Option<String> {
-    let mut mib: [libc::c_int; 3] = [libc::CTL_KERN, libc::KERN_PROC_ARGS, pid];
+    if pid <= 0 {
+        return None;
+    }
+    let mut mib: [libc::c_int; 4] = [
+        libc::CTL_KERN,
+        libc::KERN_PROC_ARGS,
+        pid,
+        libc::KERN_PROC_ARGV,
+    ];
     for cap in [4096usize, 65536usize] {
         let mut buf = vec![0u8; cap];
         let mut len = cap;
@@ -253,21 +352,48 @@ fn proc_cmdline(pid: i32) -> Option<String> {
         };
         if rc == 0 {
             buf.truncate(len);
-            let parts: Vec<String> = buf
-                .split(|b| *b == 0)
-                .filter(|p| !p.is_empty())
-                .map(|p| String::from_utf8_lossy(p).into_owned())
-                .collect();
-            if !parts.is_empty() {
-                return Some(parts.join(" "));
-            }
-            return None;
+            return argv_from_openbsd_block(&buf);
         }
         if std::io::Error::last_os_error().raw_os_error() != Some(libc::ENOMEM) {
             return None;
         }
     }
     None
+}
+
+/// 解析 OpenBSD `KERN_PROC_ARGV` 输出块（指针数组 + 字符串）。
+#[cfg(target_os = "openbsd")]
+fn argv_from_openbsd_block(buf: &[u8]) -> Option<String> {
+    let psize = std::mem::size_of::<usize>();
+    let base = buf.as_ptr() as usize;
+    let mut parts: Vec<String> = Vec::new();
+    let mut off = 0usize;
+    while off + psize <= buf.len() {
+        let mut raw = [0u8; std::mem::size_of::<usize>()];
+        raw.copy_from_slice(&buf[off..off + psize]);
+        let ptr = usize::from_ne_bytes(raw);
+        if ptr == 0 {
+            break;
+        }
+        let Some(start) = ptr.checked_sub(base) else {
+            break;
+        };
+        if start >= buf.len() {
+            break;
+        }
+        let end = buf[start..]
+            .iter()
+            .position(|b| *b == 0)
+            .map(|i| start + i)
+            .unwrap_or(buf.len());
+        parts.push(String::from_utf8_lossy(&buf[start..end]).into_owned());
+        off += psize;
+    }
+    if parts.is_empty() {
+        None
+    } else {
+        Some(parts.join(" "))
+    }
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "openbsd")))]
@@ -376,45 +502,41 @@ pub fn kill_if_matches(pid: i32, expect: &str) {
     }
 }
 
-/// 启动时清理无主孤儿：当没有任何其它存活 webserver 实例时，
-/// 终止引用本仓库 state/ 目录或 app-engines 二进制的遗留进程。
-/// （若存在存活实例，这些进程归它所有，不动。）
+/// 启动时清理无主孤儿：当没有任何其它存活 webserver 实例时，终止**本仓库**遗留的
+/// 引擎子进程（php-fpm / php-cgi / JSP jar / python shim / ruby/rack sidecar /
+/// deps/bin/index / go-shm-server / tsx 转译器）。
+///
+/// 判据 = **路径锚点**（cwd、cwd 下 `www-apps`/`libs`/`target` 的 canonical 路径，
+/// 后者让「cwd 是符号链接布局的隔离实例」也能认出命令行里的仓库真实路径）
+/// **+ 引擎形态**（可执行文件/脚本是已知引擎产物，或解释器 + 我们的脚本），
+/// 不再只看 `php-fpm`/`jsp_sidecar` 这类名字。这样：
+///   * `java -jar …/jsp-sidecar.jar --socket …/state/native/…/app.sock`（连字符）命中；
+///   * `ruby34: …/www-apps/ruby/sidecar.rb`（setproctitle）命中；
+///   * `vim /crucible/www-apps/ruby/sidecar.rb`、别的目录里的同名 `sidecar.rb`
+///     不命中（可执行文件不是引擎）。
+///
+/// 若存在存活 webserver 实例，这些进程归它所有 → 一个都不动（部署环境多实例）。
+/// 无存活实例时清理完还会删除 state 下无人监听的 stale socket（进程已死、
+/// socket 文件还在），避免下一次 spawn 前复用/误判。
 pub fn cleanup_orphans_at_startup() {
-    let root = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
-    let root_str = root
-        .canonicalize()
-        .unwrap_or(root)
-        .display()
-        .to_string();
+    let root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let root = root.canonicalize().unwrap_or(root);
     let self_pid = std::process::id() as i32;
 
     let Some(text) = ps_all() else {
         return;
     };
 
-    let mut live_webserver = false;
-    let mut orphans: Vec<(i32, String)> = Vec::new();
-    for line in text.lines() {
-        let line = line.trim();
-        let Some((pid_s, cmd)) = line.split_once(' ') else {
-            continue;
-        };
-        let Ok(pid) = pid_s.trim().parse::<i32>() else {
-            continue;
-        };
-        if pid == self_pid {
-            continue;
-        }
-        // 其它存活 webserver 实例（含测试实例）拥有这些 sidecar → 跳过清理。
-        if cmdline_is_webserver_instance(cmd) {
-            live_webserver = true;
-        }
-        let stale = (cmd.contains("php-fpm") && cmd.contains(&format!("{root_str}/state/")))
-            || cmd.contains(&format!("{root_str}/target/app-engines/"))
-            || (cmd.contains("jsp_sidecar") && cmd.contains(&format!("{root_str}/state/")))
-            || (cmd.contains("deps/bin") && cmd.contains(&format!("{root_str}/www-apps/")));
-        if stale {
-            orphans.push((pid, cmd.to_string()));
+    let anchors = owned_anchors(&root);
+    let pools = php_pool_names(&root);
+    let (live_webserver, mut orphans) = scan_orphan_candidates(&text, &anchors, &pools, self_pid);
+
+    // sock/pidfile 路径判据：受管 sidecar 的 `.envfp` 与 php-fpm 的 `.pid` 都记录了
+    // 所有者 pid。命令行被截断/改名时，ps 判据可能认不出，但**我们自己的 state 目录**
+    // 里写着 pid —— 活着且命令行仍锚定本仓库就清理。
+    for (pid, why) in pidfile_orphan_candidates(&root) {
+        if pid != self_pid && !orphans.iter().any(|(p, _)| *p == pid) {
+            orphans.push((pid, why));
         }
     }
 
@@ -430,14 +552,417 @@ pub fn cleanup_orphans_at_startup() {
         let _ = unsafe { libc::kill(*pid, libc::SIGTERM) };
     }
     if !orphans.is_empty() {
-        std::thread::sleep(std::time::Duration::from_millis(300));
+        std::thread::sleep(std::time::Duration::from_millis(500));
         for (pid, cmd) in &orphans {
-            if unsafe { libc::kill(*pid, 0) } == 0 {
+            if process_running(*pid) {
                 log::warn!("child_registry: SIGKILL orphan pid={pid} cmd={cmd}");
                 let _ = unsafe { libc::kill(*pid, libc::SIGKILL) };
             }
         }
     }
+    if !live_webserver {
+        remove_stale_state_sockets(&root);
+    }
+}
+
+/// 本进程「拥有」的路径锚点（用于启动清理与遗留 sidecar 回收）。
+fn owned_anchors(root: &Path) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut push = |p: PathBuf| {
+        let s = p.canonicalize().unwrap_or(p).display().to_string();
+        if !s.is_empty() && !out.contains(&s) {
+            out.push(s);
+        }
+    };
+    push(root.to_path_buf());
+    // 仓库布局的已知子目录：cwd 是隔离目录（符号链接到仓库）时，受管 sidecar 命令行
+    // 里出现的是 canonical 后的仓库路径 —— 只锚 cwd 会认不出自己的 ruby/jsp 子进程。
+    // 生产 cwd=/crucible 时这些与 root 同前缀，无副作用。
+    for sub in ["www-apps", "libs", "target", "state"] {
+        let p = root.join(sub);
+        if p.exists() {
+            push(p);
+        }
+    }
+    out
+}
+
+/// `state/php/<port>-<idx>.conf` 里的 pool 段名（= php-fpm worker 命令行里的
+/// `pool <name>`）。这是唯一能识别「master 已死、worker 仍活着」的路径判据：
+/// worker 的 cmdline 不含任何 state 路径。
+fn php_pool_names(root: &Path) -> Vec<String> {
+    let mut out = Vec::new();
+    let Ok(rd) = std::fs::read_dir(root.join("state/php")) else {
+        return out;
+    };
+    for ent in rd.flatten() {
+        let p = ent.path();
+        if p.extension().and_then(|e| e.to_str()) != Some("conf") {
+            continue;
+        }
+        let Ok(text) = std::fs::read_to_string(&p) else {
+            continue;
+        };
+        for line in text.lines() {
+            let line = line.trim();
+            let Some(name) = line.strip_prefix('[').and_then(|s| s.strip_suffix(']')) else {
+                continue;
+            };
+            let name = name.trim();
+            if !name.is_empty() && !name.eq_ignore_ascii_case("global") {
+                out.push(name.to_string());
+            }
+        }
+    }
+    out.sort();
+    out.dedup();
+    out
+}
+
+/// `ps -axww -o pid=,ppid=,command=` 的一行。
+struct ProcRow {
+    pid: i32,
+    ppid: i32,
+    cmd: String,
+}
+
+fn parse_ps_rows(text: &str) -> Vec<ProcRow> {
+    let mut rows = Vec::new();
+    for line in text.lines() {
+        let line = line.trim();
+        // 列之间是**多个空格**（ps 按宽度补齐）：不能用 `splitn(3, char::is_whitespace)`
+        // —— 那会在第二列拿到空串，整张表都被丢掉（本波真机复现：启动清理只剩
+        // pidfile 判据在工作，live-instance 检测恒 false，多实例下误杀）。
+        let Some((pid_s, rest)) = split_first_token(line) else {
+            continue;
+        };
+        let Some((ppid_s, cmd)) = split_first_token(rest) else {
+            continue;
+        };
+        let (Ok(pid), Ok(ppid)) = (pid_s.parse::<i32>(), ppid_s.parse::<i32>()) else {
+            continue;
+        };
+        rows.push(ProcRow {
+            pid,
+            ppid,
+            cmd: cmd.to_string(),
+        });
+    }
+    rows
+}
+
+/// 切出第一个空白分隔的 token，返回 (token, 去掉其后的空白)。
+fn split_first_token(s: &str) -> Option<(&str, &str)> {
+    let s = s.trim_start();
+    if s.is_empty() {
+        return None;
+    }
+    match s.find(char::is_whitespace) {
+        Some(pos) => Some((&s[..pos], s[pos..].trim_start())),
+        None => Some((s, "")),
+    }
+}
+
+/// 扫描进程表：返回（是否存在其它存活 webserver 实例，孤儿候选）。
+fn scan_orphan_candidates(
+    text: &str,
+    anchors: &[String],
+    pools: &[String],
+    self_pid: i32,
+) -> (bool, Vec<(i32, String)>) {
+    let rows = parse_ps_rows(text);
+    let mut live_webserver = false;
+    for row in &rows {
+        if row.pid != self_pid && cmdline_is_webserver_instance(&row.cmd) {
+            live_webserver = true;
+        }
+    }
+    let mut orphans: Vec<(i32, String)> = Vec::new();
+    let mut orphan_pids: HashSet<i32> = HashSet::new();
+    for row in &rows {
+        if row.pid == self_pid {
+            continue;
+        }
+        if is_our_engine_process(&row.cmd, anchors, pools) {
+            if orphan_pids.insert(row.pid) {
+                orphans.push((row.pid, row.cmd.clone()));
+            }
+        }
+    }
+    // php-fpm worker 没有路径锚点（cmdline 只有 `php-fpm: pool <name>`），靠 conf 里的
+    // pool 名识别；只在「父 master 也是本仓库的孤儿」或「已被 reparent 到 init」时动手，
+    // 避免碰到活着的另一实例的 worker（那种情况上面的 live_webserver 已整体跳过）。
+    for row in &rows {
+        if row.pid == self_pid || orphan_pids.contains(&row.pid) {
+            continue;
+        }
+        if php_pool_matches(&row.cmd, pools) && (row.ppid == 1 || orphan_pids.contains(&row.ppid)) {
+            if orphan_pids.insert(row.pid) {
+                orphans.push((row.pid, row.cmd.clone()));
+            }
+        }
+    }
+    (live_webserver, orphans)
+}
+
+/// 这条命令行是不是**本仓库**的引擎进程（用于启动清理 / 遗留 sidecar 回收）。
+fn is_our_engine_process(cmd: &str, anchors: &[String], pools: &[String]) -> bool {
+    if php_pool_matches(cmd, pools) {
+        return true;
+    }
+    if anchors.is_empty() || !anchors.iter().any(|a| cmd.contains(a.as_str())) {
+        return false;
+    }
+    let argv0 = cmd.split_whitespace().next().unwrap_or("");
+    // OpenBSD 的 setproctitle 形如 `php-fpm-8.4: …` / `ruby34: …`：去掉末尾冒号。
+    let prog = argv0
+        .trim_end_matches(':')
+        .rsplit('/')
+        .next()
+        .unwrap_or(argv0);
+
+    // 1) 可执行文件/脚本本身就是我们的产物。
+    if cmd.contains("/deps/bin/index") || prog == "go-shm-server" {
+        return true;
+    }
+    if prog == "sidecar.rb" || prog == "jsp_sidecar.py" || prog == "jsp_sidecar.sh" {
+        return true;
+    }
+    if cmd.contains("/libs/jsp-sidecar/jsp_sidecar.sh") {
+        return true;
+    }
+    // shebang 执行的脚本（`#!/bin/sh` 包装、`deps/bin/index` 还在 sh 阶段）：
+    // argv0 是解释器，脚本路径在后。
+    if prog == "sh" || prog == "bash" || prog == "dash" {
+        return cmd.contains("/sidecar.rb")
+            || cmd.contains("jsp_sidecar.sh")
+            || cmd.contains("/deps/bin/index");
+    }
+
+    // 2) 解释器 + 我们的脚本/产物（exec 之后进程名变成解释器的情况）。
+    if prog.starts_with("php-fpm") || prog.starts_with("php-cgi") {
+        // master 的命令行带 `-y /…/state/php/<key>.conf`；worker 由 pool 规则处理。
+        return cmd.contains("/state/php/") || cmd.contains("/state/");
+    }
+    if prog == "java" {
+        return cmd.contains("jsp-sidecar.jar");
+    }
+    if prog.starts_with("ruby") {
+        return cmd.contains("/sidecar.rb");
+    }
+    if prog == "python3" || prog == "python" {
+        return cmd.contains("jsp_sidecar.py");
+    }
+    // node/esbuild/tsc/swc/npx：只认跑我们源码/产物的那些（防误杀编辑器或别的项目）。
+    if matches!(prog, "node" | "esbuild" | "tsc" | "swc" | "npx") {
+        return cmd.contains("/www-apps/")
+            || cmd.contains("/state/tsx")
+            || cmd.contains("/target/app-engines/");
+    }
+    false
+}
+
+/// `php-fpm: pool <name>` / `php-fpm-8.4: pool <name>`（name 来自本仓库的 conf）。
+fn php_pool_matches(cmd: &str, pools: &[String]) -> bool {
+    if pools.is_empty() {
+        return false;
+    }
+    let argv0 = cmd.split_whitespace().next().unwrap_or("").trim_end_matches(':');
+    let prog = argv0.rsplit('/').next().unwrap_or("");
+    if !(prog.starts_with("php-fpm") || prog.starts_with("php-cgi")) {
+        return false;
+    }
+    pools
+        .iter()
+        .any(|p| !p.is_empty() && cmd.contains(&format!("pool {p}")))
+}
+
+/// 由 state 目录里的 pidfile/指纹文件给出的孤儿候选（补 ps 判据的盲区）。
+fn pidfile_orphan_candidates(root: &Path) -> Vec<(i32, String)> {
+    let mut out: Vec<(i32, String)> = Vec::new();
+    let anchors = owned_anchors(root);
+    let pools = php_pool_names(root);
+    let self_pid = std::process::id() as i32;
+
+    let mut push = |pid: i32, cmd: String, from: &Path, out: &mut Vec<(i32, String)>| {
+        if pid <= 1 || pid == self_pid || !process_running(pid) {
+            return;
+        }
+        if is_our_engine_process(&cmd, &anchors, &pools) {
+            out.push((pid, format!("{cmd} [from {}]", from.display())));
+        }
+    };
+
+    // 受管 native sidecar：state/native/<key>/app.sock.envfp = "v1 <fp> <pid>"
+    if let Ok(rd) = std::fs::read_dir(root.join("state/native")) {
+        for ent in rd.flatten() {
+            let envfp = ent.path().join("app.sock.envfp");
+            let Ok(text) = std::fs::read_to_string(&envfp) else {
+                continue;
+            };
+            let mut it = text.split_whitespace();
+            if it.next() != Some("v1") {
+                continue;
+            }
+            let _fp = it.next();
+            let Some(pid) = it.next().and_then(|s| s.parse::<i32>().ok()) else {
+                continue;
+            };
+            if let Some(cmd) = proc_cmdline(pid) {
+                push(pid, cmd, &envfp, &mut out);
+            }
+        }
+    }
+    // php-fpm master：state/php/<key>.pid（conf 里的 `pid = …` 指向它）。
+    if let Ok(rd) = std::fs::read_dir(root.join("state/php")) {
+        for ent in rd.flatten() {
+            let p = ent.path();
+            if p.extension().and_then(|e| e.to_str()) != Some("pid") {
+                continue;
+            }
+            let Ok(text) = std::fs::read_to_string(&p) else {
+                continue;
+            };
+            let Ok(pid) = text.trim().parse::<i32>() else {
+                continue;
+            };
+            if let Some(cmd) = proc_cmdline(pid) {
+                push(pid, cmd, &p, &mut out);
+            }
+        }
+    }
+    out
+}
+
+/// 启动清理（无存活实例时）删除 state 下**无人监听**的 stale socket：
+/// `state/native/*/app.sock`、`state/php/*.sock`、`state/go-ipc/*/notify.sock`。
+/// 仍然活着的 socket 一律保留（可能是别的实例/运维进程）。
+fn remove_stale_state_sockets(root: &Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::net::UnixStream;
+        let alive = |p: &Path| UnixStream::connect(p).is_ok();
+        for dir in ["state/native", "state/php", "state/go-ipc"] {
+            let Ok(rd) = std::fs::read_dir(root.join(dir)) else {
+                continue;
+            };
+            for ent in rd.flatten() {
+                let p = ent.path();
+                let files: Vec<PathBuf> = if p.is_dir() {
+                    match std::fs::read_dir(&p) {
+                        Ok(rd2) => rd2
+                            .flatten()
+                            .map(|e| e.path())
+                            .filter(|f| {
+                                f.file_name()
+                                    .and_then(|s| s.to_str())
+                                    .is_some_and(|n| n.ends_with(".sock"))
+                            })
+                            .collect(),
+                        Err(_) => continue,
+                    }
+                } else if p
+                    .file_name()
+                    .and_then(|s| s.to_str())
+                    .is_some_and(|n| n.ends_with(".sock"))
+                {
+                    vec![p]
+                } else {
+                    continue;
+                };
+                for sock in files {
+                    if alive(&sock) {
+                        continue;
+                    }
+                    if std::fs::remove_file(&sock).is_ok() {
+                        log::info!("child_registry: removed stale socket {}", sock.display());
+                    }
+                    let mut envfp = sock.as_os_str().to_os_string();
+                    envfp.push(".envfp");
+                    let _ = std::fs::remove_file(PathBuf::from(envfp));
+                }
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = root;
+    }
+}
+
+/// 杀掉一个**不属于本进程**、但确实是我们这个受管 socket 上一代遗留的 sidecar。
+///
+/// 触发点：`sock_alive()` 为真且 `.envfp` 指纹一致 —— 旧实现直接复用，于是上一代
+/// webserver 留下的进程（SIGKILL 后 reparent / 关机漏杀）被新实例永久沿用，
+/// 「skip …（已退出）却复用 socket」正是这条路径（deploy2b §5.3 / deploy3 §4.3）。
+///
+/// 防误杀：必须同时满足 ①pid 存活且**不是**本进程直系子进程；②命令行含本 sock 的
+/// 绝对路径，或锚定在 sock 所属 state 根上；③命令行是已知引擎形态。
+pub(crate) fn kill_stale_managed_sidecar(pid: i32, sock: &Path) -> bool {
+    if pid <= 1 || pid == std::process::id() as i32 {
+        return false;
+    }
+    if pid_is_direct_child(pid) {
+        return false; // 是本进程的：交给注册表的 kill_child（能 wait 回收）
+    }
+    if !process_running(pid) {
+        return false;
+    }
+    let Some(cmd) = proc_cmdline(pid) else {
+        return false;
+    };
+    let Some(root) = sock_state_root(sock) else {
+        return false;
+    };
+    let anchors = owned_anchors(&root);
+    let pools = php_pool_names(&root);
+    let anchored_here = cmd.contains(&sock.display().to_string())
+        || anchors.iter().any(|a| cmd.contains(a.as_str()));
+    if !anchored_here || !is_our_engine_process(&cmd, &anchors, &pools) {
+        log::warn!(
+            "child_registry: stale sidecar pid={pid} 命令行与 {} 不符，不动它: {cmd}",
+            sock.display()
+        );
+        return false;
+    }
+    log::warn!(
+        "child_registry: killing stale sidecar pid={pid}（上一代遗留，拒绝复用 socket {}）",
+        sock.display()
+    );
+    let _ = unsafe { libc::kill(pid, libc::SIGTERM) };
+    for _ in 0..40 {
+        if !process_running(pid) {
+            return true;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+    let _ = unsafe { libc::kill(pid, libc::SIGKILL) };
+    true
+}
+
+/// 全表搜索：命令行包含 `needle` 的 pid（仅引擎 spawn 前的上一代遗留回收用）。
+///
+/// 调用方必须再用 `cmdline(pid)` 复核程序形态并确认不是本进程直系子进程；
+/// 本函数只做「按命令行里的绝对路径缩小候选」。
+pub(crate) fn pids_with_cmdline(needle: &str) -> Vec<i32> {
+    if needle.is_empty() {
+        return Vec::new();
+    }
+    let Some(text) = ps_all() else {
+        return Vec::new();
+    };
+    parse_ps_rows(&text)
+        .into_iter()
+        .filter(|r| r.pid > 1 && r.cmd.contains(needle))
+        .map(|r| r.pid)
+        .collect()
+}
+
+/// 受管 UDS 路径 → 所属 state 根（`…/state/native/<key>/app.sock` → `…`）。
+fn sock_state_root(sock: &Path) -> Option<PathBuf> {
+    let s = sock.to_string_lossy();
+    let idx = s.find("/state/")?;
+    Some(PathBuf::from(&s[..idx]))
 }
 
 /// 「这条命令行是另一个存活 webserver 实例」——启动期孤儿清理据此决定动不动手。
@@ -451,27 +976,40 @@ pub fn cleanup_orphans_at_startup() {
 /// 按 token 判定（而不是整串 contains）避免把参数里恰好含 `-c`/`--config` 的无关命令
 /// 也算成 webserver 实例（会让清理该做时不做，属保守方向）。
 fn cmdline_is_webserver_instance(cmd: &str) -> bool {
-    let tokens: Vec<&str> = cmd.split_whitespace().collect();
-    let is_webserver = tokens
-        .iter()
-        .any(|t| *t == "webserver" || t.ends_with("/webserver"));
-    let has_config_flag = tokens
-        .iter()
-        .any(|t| *t == "-c" || *t == "--config" || t.starts_with("--config="));
-    is_webserver && has_config_flag
+    let mut tokens = cmd.split_whitespace();
+    let Some(argv0) = tokens.next() else {
+        return false;
+    };
+    // **argv0 必须是 webserver 自身**。旧实现是「任意 token 以 /webserver 结尾 +
+    // 任意 token 是 -c/--config」——于是任何外壳命令行都会误命中，例如
+    //   `bash -c '… /crucible/target/release/webserver …'`（`-c` 是 shell 自己的旗标）
+    // 或 `timeout 900 python3 test.py /path/webserver`。
+    // 误判 = 「另一个实例活着」= 启动清理整体跳过 = 真孤儿没人收（本波在共享测试机
+    // 上实测复现：harness 的 bash 壳让每次 SIGKILL 重启都跳过清理）。真正的
+    // webserver 进程 argv0 就是它自己，wrapper/shell 不可能是「存活实例」。
+    let base = argv0
+        .trim_end_matches(':')
+        .rsplit('/')
+        .next()
+        .unwrap_or(argv0);
+    if base != "webserver" {
+        return false;
+    }
+    tokens.any(|t| t == "-c" || t == "--config" || t.starts_with("--config="))
 }
 
-/// `ps -axww -o pid=,command=` 全量列表（**仅启动期孤儿枚举**用）。
+/// `ps -axww -o pid=,ppid=,command=` 全量列表（**仅启动期孤儿枚举**用）。
 ///
-/// 这里刻意保留 ps：`-axww -o pid=,command=` 在 Linux procps 与 OpenBSD ps 上
-/// 语义一致（枚举全表），O12 的问题出在 `-p` 选择项与 `-a/-x` 的并集语义。
+/// 这里刻意保留 ps：`-axww -o …=` 在 Linux procps 与 OpenBSD ps 上语义一致
+///（枚举全表），O12 的问题出在 `-p` 选择项与 `-a/-x` 的并集语义。
 /// 判活/身份核对已全部改为 `kill(2)` + `/proc` / `kinfo_proc`，不再调用
-/// `ps -p`。
+/// `ps -p`。`ppid` 用于识别 php-fpm pool worker（命令行不含路径，只能靠
+/// 「父 master 也是本仓库孤儿」或「已被 reparent」判定）。
 fn ps_all() -> Option<String> {
     let out = Command::new("ps")
         .arg("-axww")
         .arg("-o")
-        .arg("pid=,command=")
+        .arg("pid=,ppid=,command=")
         .output()
         .ok()?;
     Some(String::from_utf8_lossy(&out.stdout).into_owned())
@@ -713,8 +1251,227 @@ mod tests {
             "php-fpm -c /etc/php.ini",
             "python3 server.py --config /x",
             "/home/u/crucible/target/release/webserver --check-config",
+            // 外壳/测试命令行里出现 webserver 路径 + 自己的 `-c`：**不是**活实例。
+            // 误判会让启动清理整体跳过（真孤儿没人收）。
+            "/bin/bash -c . '/x/snapshot.sh' 2>/dev/null || timeout 900 python3 orphan_test.py /home/u/crucible/target-base/release/webserver sigkill 3",
+            "timeout 900 python3 orphan_test.py /home/u/crucible/target/release/webserver",
+            "sh -c /crucible/bin/webserver --config /crucible/config.toml",
+            "/usr/bin/tail -f /crucible/target/release/webserver -c 10",
         ] {
             assert!(!cmdline_is_webserver_instance(cmd), "不应判为存活实例: {cmd}");
         }
+    }
+
+    /// 启动清理必须认识生产上的全部 sidecar 形态（deploy3-wave19 §4.3 的漏网清单：
+    /// `java -jar …/jsp-sidecar.jar`、`ruby34: …/www-apps/*/sidecar.rb`）。
+    #[test]
+    fn startup_matcher_recognizes_all_remote_sidecar_forms() {
+        let anchors = vec!["/crucible".to_string()];
+        let pools = vec!["9095-0".to_string()];
+        for cmd in [
+            "/usr/local/jdk-17/bin/java -jar /crucible/libs/jsp-sidecar/target/jsp-sidecar.jar --socket /crucible/state/native/9095-7-jsp/app.sock --docroot /crucible/www-apps/jsp",
+            "ruby34: /crucible/www-apps/ruby/sidecar.rb (ruby34)",
+            "/usr/local/bin/ruby34 /crucible/www-apps/rack/sidecar.rb",
+            "php-fpm-8.4: master process (/crucible/state/php/9095-0.conf) (php-fpm-8.4)",
+            "php-fpm-8.4: pool 9095-0 (php-fpm-8.4)",
+            "/crucible/target/app-engines/go-shm-server",
+            "/crucible/www-apps/go/deps/bin/index",
+            "/crucible/www-apps/ruby/deps/bin/index",
+            "python3 /crucible/libs/jsp-sidecar/jsp_sidecar.py --socket /crucible/state/native/x/app.sock --docroot /crucible/www-apps/jsp",
+            "/bin/sh /crucible/libs/jsp-sidecar/jsp_sidecar.sh /crucible/state/native/x/app.sock /crucible/www-apps/jsp",
+            "/usr/bin/esbuild /crucible/www-apps/tsx/index.tsx --outdir=/crucible/state/tsx",
+        ] {
+            assert!(
+                is_our_engine_process(cmd, &anchors, &pools),
+                "必须识别为本仓库引擎进程: {cmd}"
+            );
+        }
+    }
+
+    /// 反向：同名但**不在本仓库路径下**的进程、以及只是「命令行里提到了文件」的
+    /// 编辑器/分页器，一律不能动（部署环境多实例；手工起的同名 sidecar）。
+    #[test]
+    fn startup_matcher_spares_foreign_same_name_processes() {
+        let anchors = vec!["/crucible".to_string()];
+        let pools = vec!["9095-0".to_string()];
+        for cmd in [
+            "ruby34: /opt/otherapp/sidecar.rb (ruby34)",
+            "/usr/local/bin/ruby34 /home/other/www-apps/rack/sidecar.rb",
+            "php-fpm-8.4: master process (/etc/php-fpm.d/www.conf)",
+            "php-fpm-8.4: pool www",
+            "/usr/local/jdk-17/bin/java -jar /opt/other/jsp-sidecar.jar --socket /tmp/x.sock",
+            "python3 /opt/other/jsp_sidecar.py --socket /tmp/y.sock",
+            "vim /crucible/www-apps/ruby/sidecar.rb",
+            "grep -r sidecar.rb /crucible/www-apps",
+            "tail -f /crucible/state/native/9095-7-jsp/sidecar.log",
+            "/usr/bin/esbuild /home/other/app.ts --outdir=/tmp/out",
+        ] {
+            assert!(
+                !is_our_engine_process(cmd, &anchors, &pools),
+                "绝不能误杀: {cmd}"
+            );
+        }
+    }
+
+    /// pool 名来自本仓库 `state/php/*.conf` 的段名；这是唯一能认出「master 已死、
+    /// worker 仍活着」的判据（worker 命令行不含任何路径）。
+    #[test]
+    fn php_pool_names_reads_conf_sections() {
+        let dir = std::env::temp_dir().join(format!("crucible-pools-{}", std::process::id()));
+        let state = dir.join("state/php");
+        std::fs::create_dir_all(&state).unwrap();
+        std::fs::write(
+            state.join("9095-0.conf"),
+            "[global]\npid = /x/9095-0.pid\n\n[9095-0]\npm = static\n",
+        )
+        .unwrap();
+        std::fs::write(
+            state.join("9095-1.conf"),
+            "[global]\n\n[9095-1]\npm = static\n",
+        )
+        .unwrap();
+        std::fs::write(state.join("notes.txt"), "[not-a-conf]\n").unwrap();
+        assert_eq!(php_pool_names(&dir), vec!["9095-0", "9095-1"]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `owned_anchors` 必须跟随符号链接到真实仓库路径：隔离实例的 cwd 是 scratch
+    /// 目录（`www-apps` 等是符号链接），受管 sidecar 命令行里出现的是 canonical
+    /// 之后的仓库路径 —— 只锚 cwd 会认不出自己的子进程。
+    #[cfg(unix)]
+    #[test]
+    fn owned_anchors_follow_symlinked_layout() {
+        let base = std::env::temp_dir().join(format!("crucible-anchors-{}", std::process::id()));
+        let root = base.join("run");
+        let real = base.join("repo");
+        std::fs::create_dir_all(root.join("state")).unwrap();
+        std::fs::create_dir_all(real.join("www-apps")).unwrap();
+        std::os::unix::fs::symlink(real.join("www-apps"), root.join("www-apps")).unwrap();
+        let anchors = owned_anchors(&root);
+        let want = real.join("www-apps").canonicalize().unwrap().display().to_string();
+        assert!(anchors.contains(&want), "anchors={anchors:?} want {want}");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// `is_direct_child` 的最小判据（ps -o ppid= -p）与 spawn 语义一致。
+    #[cfg(unix)]
+    #[test]
+    fn is_direct_child_sees_spawned_child_only() {
+        let mut child = Command::new("sleep").arg("5").spawn().expect("spawn sleep");
+        let pid = child.id() as i32;
+        assert!(is_direct_child(pid), "自己 spawn 的子进程必须认出");
+        assert!(!is_direct_child(1), "pid 1 不是我们的子进程");
+        assert!(
+            !is_direct_child(std::process::id() as i32),
+            "自己不是自己的子进程"
+        );
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
+    /// 启动扫描：孤儿候选按「路径 + 引擎形态」命中；另一个存活 webserver 实例
+    /// 会被识别（调用方据此整体跳过清理）。
+    #[test]
+    fn startup_scan_detects_orphans_and_live_instance() {
+        let anchors = vec!["/crucible".to_string()];
+        let pools = vec!["9095-0".to_string()];
+        // 注意列之间的**多个空格**（ps 按宽度补齐）：这正是曾经让整张表被丢弃的形态。
+        let text = "\
+            10     1 /usr/local/jdk-17/bin/java -jar /crucible/libs/jsp-sidecar/target/jsp-sidecar.jar --socket /crucible/state/native/9095-7-jsp/app.sock\n\
+            11     1 ruby34: /crucible/www-apps/ruby/sidecar.rb (ruby34)\n\
+            12    10 php-fpm-8.4: pool 9095-0 (php-fpm-8.4)\n\
+            13     1 /usr/bin/vim /crucible/config.toml\n";
+        let (live, orphans) = scan_orphan_candidates(text, &anchors, &pools, 999);
+        assert!(!live, "没有 webserver 实例");
+        let pids: Vec<i32> = orphans.iter().map(|(p, _)| *p).collect();
+        assert_eq!(pids, vec![10, 11, 12], "孤儿={orphans:?}");
+
+        let text2 = "\
+            20     1 /crucible/bin/webserver --config /crucible/config.toml\n\
+            10     1 ruby34: /crucible/www-apps/ruby/sidecar.rb (ruby34)\n";
+        let (live, orphans) = scan_orphan_candidates(text2, &anchors, &pools, 999);
+        assert!(live, "必须识别出另一个存活实例");
+        assert_eq!(orphans.len(), 1);
+        assert_eq!(orphans[0].0, 10);
+    }
+
+    /// stale socket：无人监听（connect 失败）才删；仍然活着的 socket 保留。
+    #[cfg(unix)]
+    #[test]
+    fn stale_socket_removal_only_removes_dead_sockets() {
+        let root = std::env::temp_dir().join(format!("crucible-socks-{}", std::process::id()));
+        let native = root.join("state/native/k");
+        std::fs::create_dir_all(&native).unwrap();
+        let dead = native.join("app.sock");
+        std::fs::write(&dead, b"").unwrap();
+        let live = root.join("state/php/live.sock");
+        std::fs::create_dir_all(live.parent().unwrap()).unwrap();
+        let _listener = std::os::unix::net::UnixListener::bind(&live).unwrap();
+        remove_stale_state_sockets(&root);
+        assert!(!dead.exists(), "死 socket 必须删除");
+        assert!(live.exists(), "活 socket 不能删");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// 上一代遗留的受管 sidecar：不是本进程子进程，但命令行锚定在本 sock 的 state
+    /// 根上 ⇒ 杀掉；别的目录里的同名脚本 ⇒ 一根毫毛都不动。
+    #[cfg(unix)]
+    #[test]
+    fn stale_sidecar_kill_is_path_anchored() {
+        use std::os::unix::fs::PermissionsExt;
+        let base = std::env::temp_dir().join(format!("crucible-stale-{}", std::process::id()));
+        let root = base.join("repo");
+        let state = root.join("state/native/k");
+        std::fs::create_dir_all(&state).unwrap();
+        let sock = state.join("app.sock");
+
+        let ours = root.join("www-apps/ruby/sidecar.rb");
+        std::fs::create_dir_all(ours.parent().unwrap()).unwrap();
+        std::fs::write(&ours, "#!/bin/sh\nwhile :; do sleep 1; done\n").unwrap();
+        std::fs::set_permissions(&ours, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let foreign = base.join("other/sidecar.rb");
+        std::fs::create_dir_all(foreign.parent().unwrap()).unwrap();
+        std::fs::write(&foreign, "#!/bin/sh\nwhile :; do sleep 1; done\n").unwrap();
+        std::fs::set_permissions(&foreign, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let spawn_reparented = |p: &std::path::Path| -> i32 {
+            let out = Command::new("/bin/sh")
+                .arg("-c")
+                .arg(format!("{} >/dev/null 2>&1 & echo $!", p.display()))
+                .output()
+                .expect("spawn detached");
+            let pid: i32 = String::from_utf8_lossy(&out.stdout).trim().parse().unwrap();
+            for _ in 0..200 {
+                if !pid_is_direct_child(pid) {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            pid
+        };
+
+        let foreign_pid = spawn_reparented(&foreign);
+        let ours_pid = spawn_reparented(&ours);
+        assert!(
+            !kill_stale_managed_sidecar(foreign_pid, &sock),
+            "别的目录里的同名 sidecar 不能杀"
+        );
+        assert!(process_alive(foreign_pid), "外部同名进程必须存活");
+        assert!(
+            kill_stale_managed_sidecar(ours_pid, &sock),
+            "本仓库 state 根下的遗留 sidecar 必须回收"
+        );
+        let mut gone = false;
+        for _ in 0..100 {
+            if !process_running(ours_pid) {
+                gone = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(gone, "遗留 sidecar 必须被终止");
+        let _ = unsafe { libc::kill(foreign_pid, libc::SIGKILL) };
+        let _ = std::fs::remove_dir_all(&base);
     }
 }

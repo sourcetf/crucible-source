@@ -15,12 +15,15 @@
 //! 回显、SCOPE=0（BIND 不会回 ECS，权威 scope 本层无法知道；见下）。
 //!
 //! 传输限制（诚实降级，勿把本模块当"递归已传 ECS"）：
-//! 注入点在本进程 DoH/DoT 层，收件人是**本机 BIND 9**（127.0.0.1 / 分线路
-//! 127.0.0.(2+i)）。BIND 9.20 不实现 ECS，也不会把未知 EDNS option 带进它自己的
-//! 递归/转发查询 —— 因此注入的 ECS 只到了本机 named 就被丢弃，**到不了真正的上游**；
-//! 应答回显也只能由本层合成（SCOPE 只能给 0）。要让 ECS 真正生效，需把上游换成支持
-//! ECS 的递归器（如 Unbound send-client-subnet），或在 Rust 侧实现上游递归。
-//! 本模块只保证 wire 格式与出站策略正确，不假装传输层已经支持。
+//! 注入点在本进程 DoH/DoT 层。默认（`[dns] recursor = "bind"`）收件人是**本机
+//! BIND 9**（127.0.0.1 / 分线路 127.0.0.(2+i)）。BIND 9.20 不实现 ECS，也不会把
+//! 未知 EDNS option 带进它自己的递归/转发查询 —— 因此注入的 ECS 只到了本机 named
+//! 就被丢弃，**到不了真正的上游**；应答回显也只能由本层合成（SCOPE 只能给 0）。
+//!
+//! 要让 ECS 真正端到端生效，配置 `[dns] recursor = "unbound"`：Unbound 占用主端口，
+//! 生成的 `unbound.conf` 带 `send-client-subnet: <上游>` + `subnetcache` 模块，会把
+//! 这里的查询 ECS option 原样转发给 forward-zone 上游（BIND 退为内部权威后端）。
+//! bind 模式仍是负控：上游只能看到 COOKIE，看不到 ECS。
 
 use std::net::IpAddr;
 

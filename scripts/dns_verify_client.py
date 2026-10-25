@@ -188,6 +188,33 @@ def fake_server(bind, port, log):
         s.sendto(bytes(resp), addr)
 
 
+def build_malformed(name, kind):
+    """构造畸形 ECS 查询（RFC 7871 §6/§7.2.1 应回 FORMERR）。
+
+    kind:
+      family — FAMILY=3（未知族）
+      dupe   — 同一 OPT 里两个 ECS
+      olen   — ECS option 声明长度 9 但只给 7 字节
+    """
+    w = struct.pack("!HHHHHH", 0x1234, 0x0100, 1, 0, 0, 1)
+    w += name_wire(name) + struct.pack("!HH", 1, 1)
+    if kind == "family":
+        body = struct.pack("!HBB", 3, 24, 0) + bytes([203, 0, 113, 0])
+        opts = struct.pack("!HH", 8, len(body)) + body
+    elif kind == "dupe":
+        body = struct.pack("!HBB", 1, 24, 0) + bytes([203, 0, 113, 0])
+        one = struct.pack("!HH", 8, len(body)) + body
+        opts = one + one
+    elif kind == "olen":
+        # 声明 olen=9，实际只有 7 字节（option 越过 OPT rdata 末尾）
+        opts = struct.pack("!HH", 8, 9) + struct.pack("!HBB", 1, 24, 0) + bytes([203, 0, 113])
+    else:
+        raise SystemExit("unknown malformed kind: %s" % kind)
+    w += b"\x00" + struct.pack("!HH", 41, 4096) + b"\x00\x00\x00\x00"
+    w += struct.pack("!H", len(opts)) + opts
+    return w
+
+
 def main():
     cmd = sys.argv[1]
     if cmd == "build":
@@ -195,15 +222,29 @@ def main():
         ecs = parse_ecs_arg(sys.argv[4]) if len(sys.argv) > 4 else None
         open(out, "wb").write(build_query(name, 1, ecs))
         return
+    if cmd == "build-malformed":
+        name, out, kind = sys.argv[2], sys.argv[3], sys.argv[4]
+        open(out, "wb").write(build_malformed(name, kind))
+        return
     if cmd == "doh":
         host, port, ca, method, name = sys.argv[2], int(sys.argv[3]), sys.argv[4], sys.argv[5], sys.argv[6]
         ecs = parse_ecs_arg(sys.argv[7]) if len(sys.argv) > 7 else None
         print(json.dumps(doh(host, port, build_query(name, 1, ecs), ca, method)))
         return
+    if cmd == "doh-wire":
+        host, port, ca, method, path = sys.argv[2], int(sys.argv[3]), sys.argv[4], sys.argv[5], sys.argv[6]
+        wire = open(path, "rb").read()
+        print(json.dumps(doh(host, port, wire, ca, method)))
+        return
     if cmd == "dot":
         port, ca, sni, name = int(sys.argv[2]), sys.argv[3], sys.argv[4], sys.argv[5]
         ecs = parse_ecs_arg(sys.argv[6]) if len(sys.argv) > 6 else None
         print(json.dumps(dot(port, build_query(name, 1, ecs), ca, sni)))
+        return
+    if cmd == "dot-wire":
+        port, ca, sni, path = int(sys.argv[2]), sys.argv[3], sys.argv[4], sys.argv[5]
+        wire = open(path, "rb").read()
+        print(json.dumps(dot(port, wire, ca, sni)))
         return
     if cmd == "fake":
         fake_server(sys.argv[2], int(sys.argv[3]), sys.argv[4])
@@ -216,7 +257,8 @@ def main():
             r = parse(bytes.fromhex(line))
             print(json.dumps({"qname": r["qname"], "ecs": r["ecs"]}))
         return
-    raise SystemExit("usage: build|doh|dot|fake|decode")
+    raise SystemExit("usage: build|build-malformed|doh|doh-wire|dot|dot-wire|fake|decode")
+
 
 
 if __name__ == "__main__":

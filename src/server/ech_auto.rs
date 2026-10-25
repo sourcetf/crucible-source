@@ -147,7 +147,15 @@ fn write_config_list_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
 /// 返回 true 表示实际发生了重写。
 pub fn ensure_config_list_file(config: &[u8]) -> bool {
     let list = encode_config_list(config);
-    let path = state_dir().join("ech_config_list.bin");
+    let dir = state_dir();
+    // 目录可能还不存在：显式 `ssl.ech_keys`（不走自动生成 `persist()`）的部署在
+    // **首次启动**时 `state/ech/` 往往不存在，旧实现直接写文件失败 ⇒ DNS/面板永远
+    // 读不到 ECHConfigList（ECH 静默不发布），只在日志留一条 warn。
+    if let Err(e) = std::fs::create_dir_all(&dir) {
+        log::warn!("ech: 创建 {} 失败: {e}", dir.display());
+        return false;
+    }
+    let path = dir.join("ech_config_list.bin");
     if std::fs::read(&path).ok().as_deref() == Some(list.as_slice()) {
         return false;
     }

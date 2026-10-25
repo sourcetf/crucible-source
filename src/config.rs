@@ -1143,6 +1143,10 @@ fn default_workers() -> usize {
 fn default_proxy_ssl_mode() -> String {
     "verify".into()
 }
+/// 可选字符串字段是否有实际内容（空白视同未配置）。
+fn non_empty(v: &Option<String>) -> bool {
+    v.as_deref().is_some_and(|s| !s.trim().is_empty())
+}
 fn default_init_timeout_opt() -> Option<u64> {
     Some(120)
 }
@@ -1215,6 +1219,10 @@ impl Default for ProxyRuleConfig {
             connection_pool: false,
             upstream_http_version: None,
             upstream_tls_version: None,
+            upstream_ca: None,
+            upstream_ca_sha256: None,
+            client_cert: None,
+            client_key: None,
         }
     }
 }
@@ -1240,6 +1248,29 @@ pub struct ProxyRuleConfig {
     /// 规格 11：回源 HTTP 版本（h1/h2；不配=h1 自动）。
     #[serde(default)]
     pub upstream_http_version: Option<String>,
+    /// `ssl_mode = "trust_self_signed"` 的**唯一信任锚**（PEM 文件路径或粘贴正文）。
+    ///
+    /// 语义（G-11）：该档位**只**信任这里给出的 CA / 自签证书，不叠加系统根证书；
+    /// 与 `no_verify`（完全不校验，接受任意证书）有本质区别。未配置本项时必须配
+    /// [`Self::upstream_ca_sha256`]（纯指纹固定模式），否则连接**拒绝**（fail-closed），
+    /// 不再静默退化成 `no_verify`。
+    #[serde(default)]
+    pub upstream_ca: Option<String>,
+    /// 信任锚 / 自签证书的 SHA-256 指纹（hex，可带 `:` 分隔或 `sha256:` 前缀）。
+    ///
+    /// 两种用法：
+    /// * 配了 [`Self::upstream_ca`]：指纹必须命中 CA 文件里的**某一张**证书，否则
+    ///   连接拒绝 —— 防止「CA 文件被静默换掉」导致信任面被悄悄放宽；
+    /// * 未配 `upstream_ca`：进入**纯证书固定**模式，只接受**叶子证书 SHA-256**
+    ///   等于该指纹的对端（适合没有 CA 文件、只有一个自签证书的上游）。
+    #[serde(default)]
+    pub upstream_ca_sha256: Option<String>,
+    /// 回源 mTLS 客户端证书（PEM 文件路径或粘贴正文）。
+    #[serde(default)]
+    pub client_cert: Option<String>,
+    /// 回源 mTLS 客户端私钥（与 [`Self::client_cert`] 必须成对）。
+    #[serde(default)]
+    pub client_key: Option<String>,
     /// 早期规格 3：连接池/多路复用默认禁用，显式 true 才启用。
     #[serde(default)]
     pub connection_pool: bool,
@@ -2027,6 +2058,41 @@ cover 只用于「未使用 / 被拒 ECH」的连接，ECH 关闭时它会成为
                         "listener {}:{}: proxy 规则 path={pth} 的 upstream 为空",
                         l.address, l.port
                     );
+                }
+                // G-11：`trust_self_signed` 只信任**指定** CA/自签证书。两者都没配时
+                // 没有可信任的锚点，必须 fail-closed（旧行为是静默等价 no_verify）。
+                let mode = crate::server::onion_ca::OnionSslMode::parse(&r.ssl_mode);
+                if mode == crate::server::onion_ca::OnionSslMode::TrustSelfSigned
+                    && !non_empty(&r.upstream_ca)
+                    && !non_empty(&r.upstream_ca_sha256)
+                {
+                    anyhow::bail!(
+                        "listener {}:{}: proxy 规则 path={pth} 的 ssl_mode=trust_self_signed \
+必须配置 upstream_ca（PEM 路径/正文）或 upstream_ca_sha256（SHA-256 指纹）—— \
+该档位只信任指定 CA/自签证书，不再等价于 no_verify；确实要接受任意证书请显式写 no_verify",
+                        l.address, l.port
+                    );
+                }
+                // mTLS 客户端证书与私钥必须成对：只给一半会让回源握手必然失败。
+                if non_empty(&r.client_cert) != non_empty(&r.client_key) {
+                    anyhow::bail!(
+                        "listener {}:{}: proxy 规则 path={pth} 的 client_cert 与 client_key 必须成对配置",
+                        l.address, l.port
+                    );
+                }
+                if let Some(pin) = r
+                    .upstream_ca_sha256
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                {
+                    if crate::server::proxy::normalize_sha256_hex(pin).is_none() {
+                        anyhow::bail!(
+                            "listener {}:{}: proxy 规则 path={pth} 的 upstream_ca_sha256={pin:?} \
+不是合法 SHA-256 指纹（需 64 个 hex 字符，可带 ':' 分隔或 'sha256:' 前缀）",
+                            l.address, l.port
+                        );
+                    }
                 }
             }
 

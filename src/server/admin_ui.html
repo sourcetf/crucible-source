@@ -468,6 +468,8 @@ img.preview{max-width:100%;max-height:420px}
       <label><input type="checkbox" id="dnsModeAuth"> 权威</label>
       <label>递归白名单 CIDR(逗号分隔) <input id="dnsRecAcl" placeholder="10.0.0.0/8,192.168.0.0/16"></label>
       <label><input type="checkbox" id="dnsEcs" checked> EDNS Client Subnet (ECS，RFC7871)</label>
+      <label>自动 NS 名(相对/绝对) <input id="dnsNsName" value="ns1" size="18" placeholder="ns1 或 ns1.example.net."></label>
+      <label>自动胶水 IP(留空=不生成) <input id="dnsNsGlue" value="127.0.0.1" size="18" placeholder="127.0.0.1"></label>
       <button id="btnDnsModes">保存模式并应用</button>
       <pre id="dnsModesOut"></pre>
     </div>
@@ -477,6 +479,7 @@ img.preview{max-width:100%;max-height:420px}
       <label>类型 <select id="dnsZoneKind"><option value="master">master</option><option value="slave">slave</option></select></label>
       <label>primaries(逗号分隔,slave) <input id="dnsZonePrimaries" placeholder="1.2.3.4"></label>
       <label>AXFR传入白名单CIDR(逗号分隔) <input id="dnsZoneAxfr" placeholder="5.6.7.0/24"></label>
+      <label>also-notify(逗号分隔,IP[:端口]) <input id="dnsZoneNotify" placeholder="10.0.0.2,10.0.0.3:5353"></label>
       <label>刷新频率(小时) <input id="dnsZoneRefresh" value="24" size="4"></label>
       <button id="btnDnsZoneAdd">添加/更新</button>
       <button id="btnDnsZoneDel">删除</button>
@@ -508,7 +511,9 @@ img.preview{max-width:100%;max-height:420px}
       <h3>记录（RFC 完整类型）</h3>
       <label>zone <input id="dnsRecZone" placeholder="example.com"></label>
       <label>名称 <input id="dnsRecName" value="@"></label>
-      <label>类型 <select id="dnsRecType"><option>A</option><option>AAAA</option><option>CNAME</option><option>NS</option><option>MX</option><option>TXT</option><option>SRV</option><option>CAA</option><option>SOA</option><option>DS</option><option>DNSKEY</option><option>RRSIG</option><option>CDS</option><option>CDNSKEY</option><option>NSEC3</option><option>NSEC3PARAM</option><option>PTR</option><option>TLSA</option></select></label>
+      <!-- SOA 不在此列：serial/timers 由模块统一生成（G-24）。后端 add_record 也会
+           明确拒绝 SOA —— 前端提供必然失败的选项只会制造「保存失败」的困惑。 -->
+      <label>类型 <select id="dnsRecType"><option>A</option><option>AAAA</option><option>CNAME</option><option>NS</option><option>MX</option><option>TXT</option><option>SRV</option><option>CAA</option><option>DS</option><option>DNSKEY</option><option>RRSIG</option><option>CDS</option><option>CDNSKEY</option><option>NSEC3</option><option>NSEC3PARAM</option><option>PTR</option><option>TLSA</option></select></label>
       <label>TTL <input id="dnsRecTtl" value="3600" size="6"></label>
       <label>线路(空=默认) <input id="dnsRecLine" size="8"></label>
       <label>值 <input id="dnsRecData" placeholder="1.2.3.4"></label>
@@ -586,6 +591,7 @@ img.preview{max-width:100%;max-height:420px}
       <h3>ACME / Let's Encrypt（DoT·DoH 证书自动签发）</h3>
       <label><input type="checkbox" id="acmeEnabled"> 启用自动签发</label>
       <label>域名 <input id="acmeDomain" placeholder="dns.example.com" size="20"></label>
+      <label>挑战 <select id="acmeChallenge"><option value="http-01">http-01</option><option value="dns-01">dns-01（写本机权威区 TXT）</option></select></label>
       <label>邮箱 <input id="acmeEmail" placeholder="admin@example.com" size="18"></label>
       <label>续期检查(天) <input id="acmeRenew" value="60" size="4"></label>
       <button id="btnAcmeSave">保存</button>
@@ -1968,6 +1974,9 @@ async function dnsStatus(){
     $('dnsModeRec').checked=!!(r.json.modes&&r.json.modes.recursive);
     $('dnsModeAuth').checked=!!(r.json.modes&&r.json.modes.authoritative);
     $('dnsEcs').checked=!!r.json.ecs;
+    // 自动 NS / 胶水（G-09）
+    if(r.json.ns_name!==undefined)$('dnsNsName').value=r.json.ns_name||'';
+    if(r.json.ns_glue!==undefined)$('dnsNsGlue').value=r.json.ns_glue==null?'':r.json.ns_glue;
     // AXFR 全局白名单
     if(r.json.axfr_out_acl){$('dnsAxfrOut').value=r.json.axfr_out_acl.join(',');}
     // 递归 ACL
@@ -2005,13 +2014,15 @@ $('btnDnsStatus').onclick=async()=>{ await dnsStatus(); await dnsRefreshZones();
 $('btnDnsModes').onclick=async()=>{
   const r=await apiJson('/api/dns/modes',jpost({
     enabled:$('dnsEnabled').checked,root:$('dnsModeRoot').checked,
-    recursive:$('dnsModeRec').checked,authoritative:$('dnsModeAuth').checked,ecs:$('dnsEcs').checked}));
+    recursive:$('dnsModeRec').checked,authoritative:$('dnsModeAuth').checked,ecs:$('dnsEcs').checked,
+    ns_name:$('dnsNsName').value, ns_glue:$('dnsNsGlue').value}));
   out('dnsModesOut',r.text,r.ok); if(r.ok)dnsStatus();
 };
 $('btnDnsZoneAdd').onclick=async()=>{
   const r=await apiJson('/api/dns/zones',jpost({action:'add',name:$('dnsZoneName').value,
     kind:$('dnsZoneKind').value,primaries:csv($('dnsZonePrimaries').value),
-    axfr_acl:csv($('dnsZoneAxfr').value),refresh_hours:+$('dnsZoneRefresh').value||24}));
+    axfr_acl:csv($('dnsZoneAxfr').value),also_notify:csv($('dnsZoneNotify').value),
+    refresh_hours:+$('dnsZoneRefresh').value||24}));
   out('dnsZonesOut',r.text,r.ok); if(r.ok)dnsStatus();
 };
 $('btnDnsZoneDel').onclick=async()=>{
@@ -2063,6 +2074,12 @@ async function dnsLoadRecords(){
   // 从区（slave）的记录由 named 的 AXFR/IXFR 维护，后端从磁盘上的 zone 文件读给我们看，
   // 并回 readonly=true —— 这里据此把编辑入口关掉（写了也会被下一次传输覆盖）。
   DNS_READONLY=!!r.json.readonly;
+  // 把该分区的 also-notify 回填到「添加/更新」表单，改完直接点保存即可（G-05）。
+  const zsel=DNS_ZONES.find(function(z){return z.name===zone;});
+  if(zsel&&$('dnsZoneNotify')){
+    $('dnsZoneNotify').value=(zsel.also_notify||[]).join(',');
+    if($('dnsZoneName')&&!$('dnsZoneName').value)$('dnsZoneName').value=zsel.name;
+  }
   renderDnsRecords(zone, r.json.records||[], DNS_READONLY, r.json.note);
 }
 
@@ -2248,10 +2265,14 @@ $('btnRzNow').onclick=async()=>{
   out('rzOut',r.text,r.ok);
 };
 $('btnAcmeSave').onclick=async()=>{
-  // config POST 是整体替换：先 GET 全量再合并 acme 字段，避免清掉 dnssec/rpz/geo
+  // config POST 是整体替换：先 GET 全量再合并 acme 字段，避免清掉 dnssec/rpz/geo。
+  // acme 内部也必须**按字段合并**（Object.assign）：整体替换会把 config.toml 里的
+  // server/insecure/webroot/http_port 抹回默认（pebble/私有 CA 配置一次保存就丢）。
   const cur=await apiJson('/api/dns/config');
   if(!cur.json)return out('acmeOut',cur.text,false);
-  cur.json.acme={enabled:$('acmeEnabled').checked,domain:$('acmeDomain').value,email:$('acmeEmail').value,renew_days:+$('acmeRenew').value||60};
+  cur.json.acme=Object.assign({},cur.json.acme||{},{enabled:$('acmeEnabled').checked,
+    domain:$('acmeDomain').value,email:$('acmeEmail').value,renew_days:+$('acmeRenew').value||60,
+    challenge:$('acmeChallenge').value});
   const r=await apiJson('/api/dns/config',jpost(cur.json));
   out('acmeOut',r.text,r.ok); if(r.ok)dnsStatus();
 };
@@ -2293,6 +2314,7 @@ async function initDnsTab(){
     $('acmeDomain').value=c.json.acme.domain||'';
     $('acmeEmail').value=c.json.acme.email||'';
     $('acmeRenew').value=c.json.acme.renew_days||60;
+    if($('acmeChallenge'))$('acmeChallenge').value=c.json.acme.challenge||'http-01';
   }
 }
 /* ===== 全局 tab（syncookie / telemetry / admin 暴露面） ===== */

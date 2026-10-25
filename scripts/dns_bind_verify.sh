@@ -484,7 +484,9 @@ cds = true'
   sleep 2
   expect "CDS published" "$(digq signed.test CDS +noall +answer)" 'CDS'
   expect "CDNSKEY published" "$(digq signed.test CDNSKEY +noall +answer)" 'CDNSKEY'
-  expect "DS from KSK" "$(dnssec-dsfromkey -2 "${ksk%.state}.key")" 'IN DS'
+  # dnssec-dsfromkey 会在**当前目录**写 dsset-<zone>. 文件：在 $WORK 下跑，
+  # 否则每轮验证都会往仓库根丢一个未跟踪文件（本波真机跑出现过 dsset-signed.test.）。
+  expect "DS from KSK" "$(cd "$WORK" && dnssec-dsfromkey -2 "${ksk%.state}.key")" 'IN DS'
 
   # keygen API：zsk（ECDSAP256SHA256）→ loadkeys → DNSKEY 增加
   local before after kg

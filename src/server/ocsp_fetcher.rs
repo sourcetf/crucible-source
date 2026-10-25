@@ -832,6 +832,9 @@ pub fn obtain(host: &str, leaf: &X509, chain_pem: &[u8]) -> Option<Vec<u8>> {
                         Some("application/ocsp-request"), Some(&req))
         .ok()?;
     if !ocsp_response_ok(&resp) {
+        log::warn!(
+            "ocsp: {host} responder 返回的响应未通过基本校验（不是合法 OCSPResponse）—— 丢弃，不装订"
+        );
         return None;
     }
     // 响应必须覆盖**这张**证书（CertID 序列号）。缓存键已按证书指纹隔离，这里是
@@ -922,9 +925,21 @@ fn load_disk_cache(host: &str, leaf: &X509) -> Option<Vec<u8>> {
     if !ocsp_response_ok(&der) {
         return None;
     }
+    let next_update = parse_next_update(&der);
+    // 磁盘上可能留着**已过期**的响应（旧版本写入、时钟跳变、responder 的 nextUpdate
+    // 本来就很短）。过期响应绝不能装订：must-staple 客户端会直接握手失败，普通客户端
+    // 也拿到一份无效 staple。旧实现只校验「响应结构是否像 OCSP」，会在启动时把过期
+    // 缓存读进槽并一直装订。这里拒绝入槽，交给后台续期线程重拉（拉不到就没 staple）。
+    if hard_expired(next_update, now_unix()) {
+        log::warn!(
+            "ocsp: {host} 磁盘缓存 {} 已过期（nextUpdate 已过），忽略并等待重新获取",
+            path.display()
+        );
+        return None;
+    }
     let entry = Cached {
         fetched_unix: file_mtime_unix(&path).unwrap_or_else(now_unix),
-        next_update_unix: parse_next_update(&der),
+        next_update_unix: next_update,
         der: der.clone(),
     };
     CACHE.lock().insert(cache_key_of(host, leaf), entry);
@@ -941,30 +956,64 @@ fn file_mtime_unix(path: &std::path::Path) -> Option<i64> {
     }
 }
 
-/// 握手回调持有的装订槽：`der` 为当前可装订的 OCSPResponse。
+/// 槽内一条可装订响应 + 它的 `nextUpdate`（UNIX 秒）。
+struct StapleEntry {
+    der: Vec<u8>,
+    next_update_unix: Option<i64>,
+}
+
+/// 握手回调持有的装订槽：当前可装订的 OCSPResponse。
 /// 由 select-certificate 回调的闭包以 `Arc` 持有，随 acceptor 生命周期存在。
 ///
 /// 写入方只有后台续期线程；读方是握手回调——单锁即可，无阻塞语义。
+///
+/// **过期即不装订**：响应在槽里放久了会自然过期（续期失败/网络断/responder 停摆）。
+/// 旧实现 `current()` 无条件返回最后一份 DER，于是一份 `nextUpdate` 已过的 staple
+/// 会被无限装订下去（must-staple 客户端握手失败）。现在读取时判 `nextUpdate`：
+/// 已过期返回 None（客户端自行查询 OCSP，比装一份无效 staple 正确），续期成功后自动恢复。
 pub struct StapleSlot {
-    der: Mutex<Option<Vec<u8>>>,
+    entry: Mutex<Option<StapleEntry>>,
 }
 
 impl StapleSlot {
-    /// 从磁盘缓存初始化（**不触网**）；无缓存则 der 为空，稍后由续期线程补。
+    /// 从磁盘缓存初始化（**不触网**）；无缓存则槽为空，稍后由续期线程补。
     fn from_disk(host: &str, leaf: &X509) -> Arc<Self> {
-        let der = load_disk_cache(host, leaf);
+        let entry = load_disk_cache(host, leaf).map(|der| StapleEntry {
+            next_update_unix: parse_next_update(&der),
+            der,
+        });
         Arc::new(StapleSlot {
-            der: Mutex::new(der),
+            entry: Mutex::new(entry),
         })
     }
 
-    /// 当前可装订的响应（无则 None）。握手路径只调这个——纯内存读，不触网。
+    /// 当前可装订的响应（无 / 已过期则 None）。握手路径只调这个——纯内存读，不触网。
     pub fn current(&self) -> Option<Vec<u8>> {
-        self.der.lock().clone()
+        let mut guard = self.entry.lock();
+        let expired = match guard.as_ref() {
+            Some(e) => hard_expired(e.next_update_unix, now_unix()),
+            None => false,
+        };
+        if expired {
+            log::warn!("ocsp: 槽内 staple 已过期（nextUpdate 已过），暂停装订并等待续期");
+            *guard = None;
+            return None;
+        }
+        guard.as_ref().map(|e| e.der.clone())
     }
 
     fn set(&self, der: Vec<u8>) {
-        *self.der.lock() = Some(der);
+        let next_update_unix = parse_next_update(&der);
+        // 纵深防御：`obtain()` 已经拒收过期响应，但续期线程/未来的调用方都不该能把
+        // 一份过期 DER 塞进槽里（那会被装订到下一次续期成功为止）。
+        if hard_expired(next_update_unix, now_unix()) {
+            log::warn!("ocsp: 拒绝把已过期响应写入装订槽（保留旧槽/等待下次续期）");
+            return;
+        }
+        *self.entry.lock() = Some(StapleEntry {
+            der,
+            next_update_unix,
+        });
     }
 }
 
@@ -1131,6 +1180,31 @@ mod tests {
         assert!(hard_expired(Some(now), now), "恰好到点即过期");
         assert!(!hard_expired(Some(now + 1), now), "未到期不得误判");
         assert!(!hard_expired(None, now), "无 nextUpdate 不能凭此判过期");
+    }
+
+    /// 槽内响应过了 nextUpdate 之后必须**停止装订**（返回 None 并清槽）：
+    /// 旧实现 `current()` 无条件返回最后一份 DER，续期失败时会把过期 staple 无限发下去
+    /// （must-staple 客户端直接握手失败）。
+    #[test]
+    fn slot_stops_serving_expired_staple() {
+        let now = now_unix();
+        let slot = StapleSlot {
+            entry: Mutex::new(Some(StapleEntry {
+                der: vec![0x30, 0x00],
+                next_update_unix: Some(now - 1),
+            })),
+        };
+        assert!(slot.current().is_none(), "过期 staple 不得返回给握手回调");
+        assert!(slot.entry.lock().is_none(), "读取到过期后应清槽，等待续期");
+
+        // 未过期的仍然正常返回。
+        let slot = StapleSlot {
+            entry: Mutex::new(Some(StapleEntry {
+                der: vec![0x30, 0x01, 0x00],
+                next_update_unix: Some(now + 3600),
+            })),
+        };
+        assert_eq!(slot.current(), Some(vec![0x30, 0x01, 0x00]));
     }
 
     /// GeneralizedTime：`Z` 形式与带小数秒的形式都要能用（旧实现遇到小数秒就

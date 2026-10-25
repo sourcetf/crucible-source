@@ -595,6 +595,12 @@ async fn start_fpm(
     let conf_path = state_dir.join(format!("{key}.conf"));
     let pid_path = state_dir.join(format!("{key}.pid"));
     let err_path = state_dir.join(format!("{key}-error.log"));
+    // 上一代遗留的 fpm master（正常关机漏杀 / webserver 被 SIGKILL）：它仍持有本
+    // sock 路径上的旧监听 inode。直接 `remove_file + spawn` 会让它继续活着 ——
+    // 同形态进程 = 2，且旧 master/worker 永远不会被 kill_all 回收（deploy3 §4.3）。
+    // 判据：pidfile 里的 pid 或命令行含本 conf 绝对路径 + 程序名 php-fpm/php-cgi；
+    // 只动**不是本进程直系子进程**的（自己的子进程由 PHP_RUNTIME 管理/回收）。
+    kill_stale_php(&[conf_path.as_path()], Some(pid_path.as_path()), &sock_path);
     let _ = fs::remove_file(&sock_path);
 
     // 全部绝对路径；禁止 prefix=/（部分 fpm 报 unknown entry）
@@ -700,6 +706,8 @@ async fn start_cgi(key: &str, app: &AppRouteConfig, state_dir: &Path) -> Result<
     #[cfg(unix)]
     {
         let sock_path = state_dir.join(format!("{key}-cgi.sock"));
+        // 同 start_fpm：先回收上一代仍监听本 sock 的 php-cgi（命令行带 `-b <sock>`）。
+        kill_stale_php(&[sock_path.as_path()], None, &sock_path);
         let _ = fs::remove_file(&sock_path);
         let abs_sock = abs_path(&sock_path);
         let mut cmd = Command::new(&cgi_bin);
@@ -782,6 +790,69 @@ async fn wait_ready(addr: &FcgiAddr, timeout: Duration) -> Result<()> {
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     bail!("php FastCGI not ready: {:?}", addr)
+}
+
+/// 回收上一代 webserver 遗留的 fpm/cgi master（见 [`start_fpm`] 调用点）。
+///
+/// `needles` = 会出现在目标进程命令行里的绝对路径（fpm 的 `-y <conf>`、cgi 的
+/// `-b <sock>`）；`pid_path` = 本 runtime 的 pidfile（fpm 自己写的）。只杀同时满足：
+///   * 存活、pid>1、**不是本进程的直系子进程**（自己的子进程归 PHP_RUNTIME 管）；
+///   * 命令行可读，程序名是 php-fpm/php-cgi，且含上述绝对路径之一。
+/// 这样 deploy 环境里别人起的同名 php-fpm（conf 在别的目录）不会被误杀。
+#[cfg(unix)]
+fn kill_stale_php(needles: &[&Path], pid_path: Option<&Path>, sock_path: &Path) {
+    use crate::server::apps::child_registry;
+    use std::os::unix::net::UnixStream;
+
+    let mut pids: Vec<i32> = Vec::new();
+    if let Some(pp) = pid_path {
+        if let Ok(text) = fs::read_to_string(pp) {
+            if let Ok(pid) = text.trim().parse::<i32>() {
+                pids.push(pid);
+            }
+        }
+    }
+    // socket 还活着 ⇒ 一定有个 master 在监听；按命令行里的绝对路径找它
+    // （pidfile 可能缺失/陈旧，不能只依赖它）。
+    if UnixStream::connect(sock_path).is_ok() {
+        for needle in needles {
+            let s = abs_path(needle).display().to_string();
+            for pid in child_registry::pids_with_cmdline(&s) {
+                if !pids.contains(&pid) {
+                    pids.push(pid);
+                }
+            }
+        }
+    }
+    let needles_s: Vec<String> = needles
+        .iter()
+        .map(|p| abs_path(p).display().to_string())
+        .collect();
+    for pid in pids {
+        if pid <= 1 || child_registry::is_direct_child(pid) {
+            continue;
+        }
+        let Some(cmd) = child_registry::cmdline(pid) else {
+            continue;
+        };
+        let prog = cmd.split_whitespace().next().unwrap_or("").trim_end_matches(':');
+        let base = prog.rsplit('/').next().unwrap_or("");
+        let is_php = base.starts_with("php-fpm") || base.starts_with("php-cgi");
+        if !is_php || !needles_s.iter().any(|n| cmd.contains(n.as_str())) {
+            continue;
+        }
+        log::warn!("php: 回收上一代遗留的 fpm/cgi pid={pid}（{cmd}）");
+        let _ = unsafe { libc::kill(pid, libc::SIGTERM) };
+        for _ in 0..40 {
+            if unsafe { libc::kill(pid, 0) } != 0 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        if unsafe { libc::kill(pid, 0) } == 0 {
+            let _ = unsafe { libc::kill(pid, libc::SIGKILL) };
+        }
+    }
 }
 
 fn resolve_php_bin(app: &AppRouteConfig, want_fpm: bool) -> Result<String> {

@@ -129,7 +129,10 @@ fn classify_tls_record(buf: &[u8]) -> HelloRoute {
 }
 
 /// Scan ClientHello extensions for supported_versions containing TLS 1.3 (0x0304).
-fn has_tls13_supported_versions(buf: &[u8]) -> bool {
+///
+/// `pub(crate)`：`boring_path` 的 `prefer_tls13` 分流复用它（两套 SSL_CTX 按
+/// ClientHello 选择，与 legacy 分流同一套 wire 探测，见 G-12）。
+pub(crate) fn has_tls13_supported_versions(buf: &[u8]) -> bool {
   // Handshake: type(1) len(3) version(2) random(32) session_id_len(1) ...
     if buf.len() < 43 {
         return false;

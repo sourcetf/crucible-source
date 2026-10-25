@@ -697,8 +697,10 @@ async fn ensure_sidecar_simple(
             let map = SIDECARS_SIMPLE.lock();
             match map.get(&key) {
                 Some(s) => s.env_fp == fp && s.docroot == docroot_desired,
-                // 本表没有条目 = 由另一条协议拉起：只能靠指纹文件核验。
-                None => native_http::sidecar_env_fp_matches(&sock, fp),
+                // 本表没有条目 = 由另一条协议拉起：靠指纹文件核验，**并且**要求
+                // `.envfp` 里的 pid 仍是本进程的直系子进程（指纹一致但 pid 已被
+                // reparent = 上一代遗留，复用会把它变成永久孤儿）。
+                None => native_http::sidecar_reusable(&sock, fp),
             }
         };
         if owned_ok {
@@ -733,9 +735,9 @@ async fn ensure_sidecar_simple(
     if sock_alive(&sock) {
         // 本表里仍有条目 ⇒ 它在上面两处检查里都没通过（指纹/docroot 过期），必须重建。
         let own_entry_stale = SIDECARS_SIMPLE.lock().contains_key(&key);
-        if !own_entry_stale && native_http::sidecar_env_fp_matches(&sock, fp) {
+        if !own_entry_stale && native_http::sidecar_reusable(&sock, fp) {
             log::debug!(
-                "sidecar(simple): {key} 已由其它注册表拉起（sock 存活且 .env 指纹一致），复用"
+                "sidecar(simple): {key} 已由其它注册表拉起（sock 存活、.env 指纹一致且进程属于本进程），复用"
             );
             return Ok(sock);
         }

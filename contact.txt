@@ -5289,3 +5289,195 @@ T-01 `verify_app_engines.py` c/rust 期望串过期、T-02 双栈粗判据。
 **环境**：WSL2 32 核共享，本窗口 load 10.2–21.5（其他 agent 的 kani/miri/cbmc）；主机 23:43:29
 启动、期间无重启；Linux vs 生产 OpenBSD 1 vCPU 的差异未覆盖。所有自起实例/上游/假 named/h2o
 已停，30xxx 与 19543/19544 已释放。
+
+---
+
+# 【agent-tlsgap / 工号 1009 · Wave-20】G-11/G-12/U-03/U-04/U-05 全部真机跑通；单测 581/584 全绿、遗留 TLS PASS=7、黑盒 302/0（2026-10-25 17:00–18:10）
+
+**改动（6 文件，未 commit；只动自己 scope）**
+- `src/config.rs`：`ProxyRuleConfig` 新增 `upstream_ca` / `upstream_ca_sha256` / `client_cert` /
+  `client_key`（PEM 路径或正文）；`trust_self_signed` 两者都无 → 加载期拒绝；mTLS 必须成对；
+  指纹格式校验（64 hex，可带 `:`/`sha256:`）。
+- `src/server/proxy.rs`：G-11 语义落地 —— `trust_self_signed` **只信任指定 CA**（替换整个
+  trust store，不叠加系统根）或纯叶子 SHA-256 固定；指纹可固定 CA 文件（防静默替换）；
+  回源 mTLS；连接池键纳入上述材料；rustls 回退显式拒绝而非静默 AcceptAll。
+- `src/server/tls/client_hello.rs` + `boring_path.rs`：G-12 `prefer_tls13` 做成**两套 SSL_CTX
+  按 ClientHello 选择**（含 0x0304 → 1.3-only；否则 max=1.2；peek 截断 → 库默认），
+  acceptor 指纹含档位；0-RTT 启动日志写明无重放防护。
+- `src/server/ocsp_fetcher.rs`：过期磁盘缓存拒绝入槽；`StapleSlot` 过期即停止装订；
+  非法 OCSPResponse 留 warn。
+- `src/server/ech_auto.rs`：显式 `ech_keys` 首次启动先建 `state/ech/`（旧实现写盘失败 →
+  ECH 静默不发布）。
+
+**真机证据（摘要；详报告）**
+- G-11（25480 + openssl s_server 25443/25444）：`verify 502 / trust 200 / trustpin 200 /
+  trustwrong 502 / trustpinbad 502 / pinonly 200 / pinonlybad 502 / noverify 200 /
+  mtls 200 / mtls-none 502 / 内联 PEM 两条 200`；无 CA 的 trust_self_signed `--check-config` rc=1。
+- G-12（25501 prefer=true / 25502 false）：`-tls1_3 / -tls1_2 / default` → 1.3/1.2/1.3；
+  服务端日志 `profile=Tls13Only / Tls12Max / Tls13Only`（1.2 客户端不被拒）。
+- U-03（25491–25495 + 本地 `openssl ocsp` responder）：首握手 `no response sent` → 抓取落盘
+  1305B → 第二握手 `Cert Status: good`；`ocsp_der_path` 首握手即 good；过期/坏响应无 staple、
+  不落盘；预置过期磁盘缓存被忽略；responder 停机后旧有效 staple 继续服务。
+- U-04（25496，bssl client）：ECH `Encrypted ClientHello: yes` + 服务端看到内层名
+  `inner.ech.test` + 返回内层证书；非 ECH（含用内层名探测）一律 cover 证书；
+  本地 BIND 9.20 HTTPS 记录 `ech=` 解码后与服务端 `state/ech/ech_config_list.bin` 71B 逐字节一致。
+- U-05（25498/25499）：TLS1.2 ECDHE-PSK 握手 + HTTP 200；错误 identity → unknown_psk_identity(115)，
+  错误 key → bad record mac(20)；0-RTT 默认关（`Early data: no`），开启后 `yes` 且 early-data 请求
+  得到 200；同一 ticket+early data 重放两次仍 `yes`+200 ⇒ **无应用层反重放**（已在启动 warn）。
+
+**回归**：单测 2 feature **581/0/1**、4 feature **584/0/1**（基线 555/558；本轮 +7 条）；
+`test_tls_stacks.sh` **PASS=7**；现代 TLS 矩阵 1.2-only/1.3-only/dual × h1/h2 全部正确；
+黑盒 `accept-verify.sh` **302 PASS / 0 FAIL**。
+
+**跨 scope 待办**：`src/server/admin.rs::save_proxy_rules` 的字段白名单会静默丢弃新增的
+`upstream_ca`/`upstream_ca_sha256`/`client_cert`/`client_key`，`admin_ui.html` 也无输入框
+⇒ **面板可配需 admin scope 补 4 字段**（手写 config.toml 完全可用）。rustls 回退不支持 G-11；
+0-RTT 反重放属新功能；OCSP 后注册目标首抓最多等 60s tick（非正确性）。
+
+报告：`.agents/1009/reports/tlsgap-wave20.md`；修复：`.agents/1009/fixes/tlsgap-wave20.md`。
+资产：`~/scratch-tlsgap/{target,target-4f,g11,u03,u04,u05,g12,matrix,logs}`；所有自起
+webserver/s_server/OCSP responder/named 已停止，端口 25480–25513/25543/25580–25582/5355 已释放。
+
+---
+
+# 【agent-orphan / 工号 1009 · Wave-20】N-05 孤儿 sidecar 根因修复 + 本机/远程真机验证（2026-10-25 夜–26 凌晨）
+
+**Scope**：`src/server/apps/child_registry.rs`、`native_http.rs`、`sidecar_engine.rs`、`php.rs`
+（仅注册/清理相关行；`jsp.rs` 无改动）。未做任何 git 写操作；共享工作树 HEAD `4dc379f`。
+
+**根因（两个独立缺陷）**：
+1. **OpenBSD sysctl MIB 形态错（主根因）**：`proc_info` 的 `KERN_PROC_PID` 需要**六级**
+   `{CTL_KERN,KERN_PROC,op,pid,elem_size,count}`，旧代码四级；`proc_cmdline` 的
+   `KERN_PROC_ARGS` 需要四级（补 `KERN_PROC_ARGV`），旧代码三级。OpenBSD 7.9 上两者都
+   `EINVAL` → `proc_info` 恒 None → 关机 `kill_all` 把存活直系子进程全判「已退出」跳过
+   → 4 种 sidecar + php-fpm 全部 ppid=1。C 探针 + 生产旧二进制 SIGTERM 双重复现
+   （17:40:18 六条 `skip …（已退出）`，随后 6 进程 + 16 workers ppid=1）。
+2. **启动清理判据不全 + 复用不校验归属**：不认 `java -jar …/jsp-sidecar.jar`、
+   `ruby34 …/www-apps/*/sidecar.rb`；SIGKILL 后新实例按「socket 活 + `.envfp` 指纹一致」
+   直接复用上一代孤儿。另修：`ps` 多空格列导致整表解析为空；「另一实例存活」判据被
+   `bash -c '… /path/webserver …'` 外壳行误命中（会让清理整体跳过）。
+
+**修复**：OpenBSD 六级/四级 MIB；`alive_and_matches` 在内核身份读不到时退到
+`ps -o ppid= -p` 只认直系子进程；启动清理改为「canonical 路径锚点 + 引擎形态」识别全部
+形态（jsp jar / ruby / rack / php-fpm / php-cgi / go-shm / deps/bin/index / python shim /
+esbuild），php-fpm pool worker 用本仓库 conf 段名识别；`.envfp`/`.pid` 路径判据兜底；
+无存活实例时删 stale socket；复用前要求 `.envfp` pid 是本进程直系子进程（否则回收重建，
+带 per-sock 归属缓存避免每请求 ps）；php 启动前按 pidfile/conf/sock 回收上一代 master。
+
+**本机验证（修复版二进制 `7f2a715e…`；配置 `~/scratch-orphan/config-orphan.toml` 端口 23810）**：
+- SIGTERM 重启 **5/5 PASS**；SIGKILL 重启（单实例拓扑）**3/3 PASS**（每轮崩溃后 6 孤儿 →
+  启动清理 0 → 触发后 4 形态各 1、`/jsp/ /ruby/ /rack/ /php/` 全 200）；
+- 多实例（B 活在 23811）：日志 `6 orphan candidate(s) skipped`，A 的 spawn 前归属复核只回收
+  自己的旧 sidecar，B 不受影响；外部同名进程（另一目录真实 `ruby sidecar.rb` / JSP jar /
+  `php-fpm -y` 外部 conf）跨 SIGTERM+SIGKILL 两轮全部存活；sidecar 死亡但 socket 残留 →
+  下一次请求 200 并重建。
+- 回归：单测 **563 passed / 0 failed / 1 ignored**（基线 555 + 8 新测试）；19 引擎矩阵
+  h1+h2c **38/38**；黑盒 `accept-verify.sh --no-build` **302 PASS / 0 FAIL / 0 SKIP**。
+
+**远程 OpenBSD 7.9 生产（`/tmp/remote-build.lock` 内构建，已释放）**：备份 4 文件到
+`/root/orphan-wave20-backup/`；上传 md5 与本地一致；`CARGO_BUILD_JOBS=1 cargo build`
+rc=0 / 11m33s → 新二进制 `/crucible/bin/webserver` md5 **`53906a44…`**（20,400,064B）。
+- 新实例启动清理掉旧二进制的 **22 个**遗留进程（jsp/do/ruby/rack/php-master + 16 workers +
+  go），删 7 个 stale socket；重启后 orphans=0、5 端点 200。
+- 新二进制 SIGTERM：日志 `SIGTERM …`（不再是 skip），关机后 0 遗留；重启后 5 端点 200、
+  sidecar 全部新 pid 子进程。SIGKILL：崩溃后 5+16 孤儿 → 启动清理 0 → 触发后全 200、orphans=0；
+  18:00 之后 `skip .*已退出` **0 条**。
+- 外部同名进程（`/root/orphan-ext/` 的 ruby sidecar.rb / JSP jar / php-fpm 外部 conf）跨两轮
+  重启全部存活，清理日志无一提及；19 引擎矩阵 38 checks / 4 failed，4 条均为已知 T-01
+  夹具串过期（c/rust 状态 200，仅期望串旧）。
+- 收尾：生产实例 **pid 61695**（新二进制）唯一运行，jsp/do/ruby/rack/php/go 全部 ppid=61695，
+  orphans=0，磁盘 1.0G；`config.toml` 未动（skip-worktree）；锁已释放。
+
+**仍开**：`go_shm.rs`（不在 scope）在「另一实例存活 → 启动清理跳过」时仍可能重复 spawn
+go-shm-server（生产 `/go/` 走 prebuilt sidecar，未触发）；php pool 名跨仓库同名碰撞（活实例
+存在时整体跳过，实际风险极低）；「存活实例」判据要求 argv0 为 `webserver`（改名部署退化时由
+spawn 前归属复核兜底）。
+
+报告：`.agents/1009/reports/orphan-wave20.md`；修复：`.agents/1009/fixes/orphan-wave20.md`。
+证据：`~/scratch-orphan/logs/*`；远程 `/var/log/crucible-restart.log`（18:01–18:05Z 段）。
+
+---
+
+# 【agent-ecs / 工号 1009 · Wave-20】G-01 关闭：Unbound 递归后端把 ECS 真正端到端送到上游（bind 默认零变化）
+
+**结果**：唯一 P1 G-01 **关闭**。新增 `[dns] recursor = "bind" | "unbound"`（默认 bind，
+旧配置零变化）。unbound 模式：Unbound 占主端口（`send-client-subnet` + `subnetcache`
+把客户端 ECS 原样送到 forward-zone 上游）；BIND 退到 `127.0.0.1:<port+1>` 的内部权威
+端口，继续负责 zone/KASP 签名/NSEC3/AXFR/RPZ。DoT/DoH 转发目标不变，ACL/限速/ECS 注入
+与应答回显代码不改。
+
+**ECS 端到端真机证据**（伪上游 UDP 抓包）：
+- unbound + DoT/DoH/dig 带 `ECS(203.0.113.0/24)` → 上游 wire 含
+  `0008 0007 0001 18 00 cb0071`（code=8, family=1, source=24, scope=0, addr=203.0.113）；
+- bind 负控同一链路 → 上游只含 `opts [10]`（COOKIE），**无 ECS**；
+- `ecs=false` → 应答无 ECS、上游无 ECS；畸形 ECS（family=3/重复/olen 不符）→
+  DoH/DoT 均 FORMERR 且不转发上游。
+
+**其它 unbound 模式真机通过**：权威 A/AAAA/MX/TXT/SRV/CAA/NS/SOA（Unbound
+`auth-zone` 镜像 BIND zone 文件）；缓存命中（第二次不再打上游）；递归 ACL
+（`127.0.0.2` REFUSED、`127.0.0.1` allow、权威公开）；`modes.recursive=false`
+（无 forward-zone、权威可查、递归 REFUSED）；RPZ nxdomain + A override；
+DNSSEC 由 BIND 内部端口验证（DNSKEY≥2、RRSIG A 13、NSEC3 proof）；
+面板加记录后 `auth_zone_reload` 热载（unbound pid 不变）。unbound 起不来时
+reconcile 明确报错（checkconf/spawn/health），不静默退回 BIND 递归。
+
+**回归**：
+- 单测 **581 passed / 0 failed / 1 ignored**；
+- bind 模式 72 项 **PASS=72 FAIL=0 SKIP=0**（未回归）；
+- 新增 `scripts/dns_unbound_verify.sh` **PASS=59 FAIL=0**；
+- `scripts/dns_verify.sh --real both` 一条命令两档：bind 72/0 + unbound 59/0；
+- DNS 黑盒 `accept-verify-dns.py` 端口平移档：ecs=on **6/0**、ecs=off **3/0**。
+
+**环境**：`/home/dev123/bin/aptlocal.sh install-deps unbound` →
+`~/local/usr/sbin/unbound` 1.24.2（`--enable-subnet`）；`unbound-control-setup`
+生成控制证书（缺失时退化为 pidfile+SIGHUP）。测试端口默认 42000 段，独立
+`CRUCIBLE_DNS_STATE_ROOT`，脚本退出清理。
+
+**边界（已写入报告）**：Unbound 主端口不支持 AXFR/IXFR（transfer 仍走 BIND 内部端口）；
+DNSSEC 签名/KASP 仍由 BIND 负责，Unbound 是未签名镜像；geo 分线路与 unbound 互斥
+（保存前明确拒绝）；纯迭代递归（无 forwarders）无法带 ECS；未跑完整 302 项
+accept-verify（30xxx 被其它 agent 实例占用），DNS 黑盒已按独立端口平移验证。
+
+报告：`.agents/1009/reports/ecs-wave20.md`；修复：`.agents/1009/fixes/ecs-wave20.md`。
+证据：`/home/dev123/scratch-ecs/verify-both-final.log`、
+`/home/dev123/scratch-tls/tmp/dns-unbound-verify-404036/`（unbound.conf/fake.log）、
+`/home/dev123/scratch-tls/tmp/dnsbind-verify-395979/`、`/home/dev123/scratch-ecs/blackbox/`。
+
+---
+
+# 【agent-dnsgap / 工号 1009 · Wave-20】A.1 DNS 剩余 7 条全部收口；75/0 gap 真机 + 72/0 bind + 581 单测（2026-10-26 01:00–02:25 +0800）
+
+**范围**：`src/server/dns/**`、`src/server/admin_ui.html`（仅 DNS 面板）、`scripts/dns_*.sh`。
+未 commit/push/checkout/reset/stash/clean；未触碰别人的端口/进程。最终二进制
+`be448147839e22d216897efd334b6556`（`$CARGO_TARGET_DIR/release/webserver`）。
+
+**7 条缺口**（每条 file:line + 真机证据见 `.agents/1009/reports/dnsgap-wave20.md`）：
+- **G-05** `also_notify`：`zones` 表新列 + 老库 ALTER 迁移；`IP[:port]` 校验；
+  named.conf `also-notify { 127.0.0.1 port 35554; };`；面板输入/回填；字段缺省保持原值。
+  真机双 named：主区加 `www2` → 从区日志 `received notify` → 3s 内 AXFR（serial 一致）。
+- **G-06** `rotation_days=0`：一次性「立即轮换」哨兵（meta armed，改回>0 重新武装；
+  reconcile 内立即执行），KASP `zsk lifetime` 钳 30d（不写 0d）。真机 keys 2→3、
+  DNSKEY 2→3、serial +2、NXDOMAIN 4 条 RRSIG、38s 查询 0 SERVFAIL。
+- **G-09** `ns_name`/`ns_glue` 可配置；**重要**：in-bailiwick NS 关闭胶水会让 BIND
+  拒载整区并继续服务旧版本（真机 dig 仍返回旧 A）→ 保存前 fail-closed；关闭胶水仅允许
+  out-of-zone 绝对 NS。三种形态 zone 文件 + 区加载 serial 已留证据。
+- **G-23** reconcile 前一次性迁移旧绝对记录名（归一/去重/幂等）；造旧行后 reload →
+  `hello.legacy.test` 变 `hello`、原名字可解析、双后缀消失、重复行删除。
+- **G-24** 记录类型下拉移除 SOA；面板/API 写 SOA 仍 HTTP 400；内联 JS esprima 解析 OK。
+- **G-25** ACME stderr 摘要：剥 HTML、优先 `error code:`/`detail`；假 acme.sh 输出
+  HTML 502 页 → 日志与面板都只显示 `Error code: 7 | Detail: ... Connection refused`。
+- **G-07** ACME `dns-01`：`[dns.acme] challenge`；TXT 经 **spool worker + 模块 zone API**
+  （records + reconcile）写入/清理，acme.sh/certbot hook；pebble 首签+续期全过，
+  签发窗口内 dig 真的抓到 43 字符 TXT、之后清理干净、20s 可用性循环 bad=0。
+  放弃 nsupdate 的原因：动态更新与按 unix 秒生成文件 serial 同秒撞车 → `rndc reload`
+  跳载（真机 NXDOMAIN），且删 journal 后动态 zone 仍不重载；DB 路径是唯一自洽方案。
+  另修：并发签发拿锁后复查证书（避免假失败+重复打 CA）；面板保存 ACME 改为按字段合并
+  （不再抹掉 server/insecure/webroot/http_port）；startup 先 reconcile 再 ACME。
+
+**回归**：新增 `scripts/dns_gap_verify.sh` → **PASS=75 FAIL=0**；
+`scripts/dns_verify.sh --real` → **bind 72 PASS / 0 FAIL**（另 unbound Stage 59/0）；
+`cargo test --release --bin webserver --features tls,tls_boring` → **581 passed / 0 failed / 1 ignored**。
+
+**未做/边界**：dns-01 仍单域名（通配符被 `safe_domain_segment` 拒绝）；302 项全量黑盒
+未并发跑 —— 30xxx 被另一 agent 实例占用（30099/30100/30153/30553），已在报告中如实标注，
+请主会话在空闲窗口补跑。证据：`~/scratch-dnsgap/{gap-final3.log,dnsv3-run.log,evidence/}`。

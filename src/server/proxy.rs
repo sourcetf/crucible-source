@@ -21,6 +21,12 @@
 //! in TLS (BoringSSL when `tls_boring`, else rustls). In `verify` mode the leaf
 //! DER is checked with [`onion_ca::onion_cert_matches_host`]; if no peer cert
 //! path is available the connection is rejected.
+//!
+//! `trust_self_signed` (G-11) is **not** `no_verify`: it trusts only the CA /
+//! self-signed certificate given by `upstream_ca` (replacing the system trust
+//! store), optionally pinned by `upstream_ca_sha256`; without a CA file the
+//! SHA-256 pin is checked against the peer leaf after the handshake. Configuring
+//! neither is a hard error. `client_cert`/`client_key` enable upstream mTLS.
 
 use crate::config::{ListenerConfig, ProxyRuleConfig};
 use crate::server::apps::env_lock;
@@ -72,9 +78,38 @@ static WS_TUNNELS: Lazy<tokio::sync::Semaphore> =
 const PROXY_BUFFER_BUDGET: usize = 1024 * 1024 * 1024; // 1 GiB
 static PROXY_BUFFER_RESERVED: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
-/// `trust_self_signed` 当前没有自定义根证书可配、实际等价 `no_verify`，只警告一次。
-static TRUST_SELF_SIGNED_WARNED: std::sync::atomic::AtomicBool =
+/// `trust_self_signed` 配了 CA 但没配指纹时的提示只打一次（不是错误：CA 文件本身
+/// 就是信任锚；指纹只是额外的「防静默换文件」固定）。
+static TRUST_SELF_SIGNED_UNPINNED_WARNED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
+
+/// 归一化 SHA-256 指纹：接受 `sha256:` / `SHA256:` 前缀、大小写 hex，以及 `:`/空白/
+/// `-` 分隔（`openssl x509 -fingerprint -sha256` 的输出可直接粘贴）。
+/// 合法时返回 64 个小写 hex 字符；非法返回 `None`。
+pub(crate) fn normalize_sha256_hex(s: &str) -> Option<String> {
+    let mut t = s.trim();
+    // 按字节比较，避免 `t[..7]` 在非 ASCII 输入上切到 UTF-8 字符中间 panic
+    //（配置校验/热重载会把任意用户字符串传进来）。
+    if t.len() >= 7 && t.as_bytes()[..7].eq_ignore_ascii_case(b"sha256:") {
+        t = &t[7..];
+    }
+    let hex: String = t
+        .chars()
+        .filter(|c| !c.is_ascii_whitespace() && *c != ':' && *c != '-')
+        .collect();
+    if hex.len() != 64 || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    Some(hex.to_ascii_lowercase())
+}
+
+/// 证书 DER 的 SHA-256（64 位小写 hex）。
+#[cfg(feature = "tls_boring")]
+fn sha256_hex(der: &[u8]) -> Option<String> {
+    use boring::hash::{hash, MessageDigest};
+    let d = hash(MessageDigest::sha256(), der).ok()?;
+    Some(d.iter().map(|b| format!("{b:02x}")).collect())
+}
 
 /// 响应缓冲预算的 RAII 预留（drop 即归还；随 [`Response`] extensions 一起活到响应被
 /// hyper 消费完，覆盖「已缓冲但还没写给客户端」的那段内存）。
@@ -164,9 +199,10 @@ fn upstream_error_response(e: &anyhow::Error) -> Response<BoxBody> {
 ///
 /// 此前是 `PoolKey(u64)`（DefaultHasher 各维度压成一个 u64）：池键决定复用到哪条
 /// 上游连接，哈希一旦碰撞，取出的就是发往**另一个上游**（或另一套 TLS 策略）的连接
-/// —— 与「复用」的语义完全不符，属安全问题而不只是命中率问题。字段集合没有变化，
-/// 所以相等性语义与原来一致（同规则 → 同键 → 可复用，不会退化成每条请求都新建连接）。
-#[derive(Clone, PartialEq, Eq, Hash)]
+/// —— 与「复用」的语义完全不符，属安全问题而不只是命中率问题。字段相等性等价于
+/// 「同规则 → 同键 → 可复用」，不会退化成每条请求都新建连接；G-11 新增的
+/// trust store / 指纹 / mTLS 身份也全部入键。
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 struct PoolKey {
     /// 目的地：TCP 上游是 host（+ 下面的 port），**UDS 上游是 socket 路径**。
     ///
@@ -196,6 +232,13 @@ struct PoolKey {
     /// 回源 TLS 版本（None = 自动协商）：同 host:port 上 tls1.2 与 tls1.3
     /// 是两次不同的握手结果。
     tls_version: Option<String>,
+    /// 回源信任锚 / 证书固定 / mTLS 身份：两条规则可以都用 `trust_self_signed` 却指定
+    /// 不同 CA（或不同客户端证书）。复用连接会让「只信任 CA-A」的会话被「只信任 CA-B」
+    /// 的规则使用 —— TLS 连接没有重协商，对后者就是**错误的信任状态**。
+    /// 存原始字符串（含内联 PEM）：同义写法只会少复用，不会错复用。
+    upstream_ca: Option<String>,
+    upstream_ca_sha256: Option<String>,
+    client_cert: Option<String>,
     /// Tor SOCKS 端点：不同端点 = 不同电路/出口节点，出口 IP 不同，同样不能互相复用。
     tor_socks: Option<String>,
 }
@@ -211,6 +254,9 @@ impl PoolKey {
         use_tor: bool,
         ssl_mode: &str,
         tls_version: Option<&str>,
+        upstream_ca: Option<&str>,
+        upstream_ca_sha256: Option<&str>,
+        client_cert: Option<&str>,
         tor_socks: Option<&str>,
     ) -> Self {
         Self {
@@ -221,6 +267,9 @@ impl PoolKey {
             use_tor,
             ssl_mode: ssl_mode.to_string(),
             tls_version: tls_version.map(str::to_string),
+            upstream_ca: upstream_ca.map(str::to_string),
+            upstream_ca_sha256: upstream_ca_sha256.map(str::to_string),
+            client_cert: client_cert.map(str::to_string),
             tor_socks: tor_socks.map(str::to_string),
         }
     }
@@ -688,6 +737,9 @@ async fn proxy_once(
             needs_tor(&host, rule),
             &rule.ssl_mode,
             rule.upstream_tls_version.as_deref(),
+            rule.upstream_ca.as_deref(),
+            rule.upstream_ca_sha256.as_deref(),
+            rule.client_cert.as_deref(),
             rule.tor_socks.as_deref(),
         )
     };
@@ -1319,14 +1371,7 @@ async fn connect_upstream_inner(
             None => UpstreamAlpn::Auto,
         }
     };
-    wrap_upstream_tls(
-        tcp,
-        host,
-        mode,
-        rule.upstream_tls_version.as_deref(),
-        alpn,
-    )
-    .await
+    wrap_upstream_tls(tcp, host, mode, rule, alpn).await
 }
 
 /// TLS wrap for HTTPS / onion upstreams. Onion `verify` checks leaf DER via
@@ -1346,27 +1391,16 @@ async fn wrap_upstream_tls(
     tcp: TcpStream,
     host: &str,
     mode: OnionSslMode,
-    tls_version: Option<&str>,
+    rule: &ProxyRuleConfig,
     alpn: UpstreamAlpn,
 ) -> Result<UpstreamIo> {
-    // P2：`trust_self_signed` 目前没有自定义根证书可配，实现上与 `no_verify` 一样落到
-    // 「接受任意证书」—— 与面板/规格给人的印象（只多信任自签）不符，警告一次。
-    // 语义修正需要 `upstream_ca_file`（已写 config-requests/proxy-subsys.md）。
-    if mode == OnionSslMode::TrustSelfSigned
-        && !TRUST_SELF_SIGNED_WARNED.swap(true, std::sync::atomic::Ordering::Relaxed)
-    {
-        log::warn!(
-            "proxy: ssl_mode=trust_self_signed 当前等价于 no_verify（接受任意证书，无证书绑定）——\
-             自定义根证书（upstream_ca_file）尚未实现；需要真正校验的上游请用 verify"
-        );
-    }
     #[cfg(feature = "tls_boring")]
     {
-        return wrap_upstream_tls_boring(tcp, host, mode, tls_version, alpn).await;
+        return wrap_upstream_tls_boring(tcp, host, mode, rule, alpn).await;
     }
     #[cfg(all(feature = "tls_rustls", not(feature = "tls_boring")))]
     {
-        return wrap_upstream_tls_rustls(tcp, host, mode, tls_version, alpn).await;
+        return wrap_upstream_tls_rustls(tcp, host, mode, rule, alpn).await;
     }
     #[cfg(not(any(feature = "tls_boring", feature = "tls_rustls")))]
     {
@@ -1388,14 +1422,20 @@ async fn wrap_upstream_tls_boring(
     tcp: TcpStream,
     host: &str,
     mode: OnionSslMode,
-    tls_version: Option<&str>,
+    rule: &ProxyRuleConfig,
     alpn: UpstreamAlpn,
 ) -> Result<UpstreamIo> {
     use boring::ssl::{SslConnector, SslMethod, SslVerifyMode, SslVersion};
+    use boring::x509::store::X509StoreBuilder;
+    use boring::x509::X509;
 
     let mut builder = SslConnector::builder(SslMethod::tls()).context("SslConnector builder")?;
     // 规格 11：回源 TLS 版本可配（tls1.2/tls1.3；不配=自动协商）。
-    match tls_version.map(|v| v.to_ascii_lowercase().replace(['.', '_'], "")) {
+    match rule
+        .upstream_tls_version
+        .as_deref()
+        .map(|v| v.to_ascii_lowercase().replace(['.', '_'], ""))
+    {
         Some(ref v) if v == "tls12" || v == "tlsv12" => {
             builder.set_min_proto_version(Some(SslVersion::TLS1_2))?;
             builder.set_max_proto_version(Some(SslVersion::TLS1_2))?;
@@ -1406,17 +1446,135 @@ async fn wrap_upstream_tls_boring(
         }
         _ => {}
     }
-    // Non-onion Verify: system CA verification. Onion + NoVerify/TrustSelfSigned: NONE
-    // (onion still checks cert-as-pubkey after handshake).
+
+    let normalized_pin = match rule
+        .upstream_ca_sha256
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        Some(p) => Some(normalize_sha256_hex(p).ok_or_else(|| {
+            anyhow::anyhow!(
+                "proxy: upstream_ca_sha256={p:?} 不是合法 SHA-256 指纹（需 64 个 hex 字符，\
+                 可带 ':' 分隔或 'sha256:' 前缀）"
+            )
+        })?),
+        None => None,
+    };
+
+    // `trust_self_signed` 且只有指纹（没有 CA 文件）时：普通链校验必然对自签证书
+    // 失败，所以这里关闭库内校验、握手后手工比对**叶子证书**的 SHA-256。
+    let mut pin_leaf_after_handshake: Option<String> = None;
+
+    // 回源证书校验档位（G-11）：
+    //   * `verify`（非 onion）→ 系统根证书（库默认）；
+    //   * `verify`（onion）   → NONE + 证书即公钥（握手后 `onion_cert_matches_host`）；
+    //   * `no_verify`         → NONE，接受任意证书；
+    //   * `trust_self_signed` → **只信任 `upstream_ca`**（替换整份 trust store，不叠加
+    //     系统根）；或用 `upstream_ca_sha256` 做纯叶子证书固定。两者都没有 ⇒ 拒绝连接。
     match mode {
         OnionSslMode::Verify if !is_onion_host(host) => {
             builder.set_verify(SslVerifyMode::PEER);
         }
-        OnionSslMode::Verify | OnionSslMode::NoVerify | OnionSslMode::TrustSelfSigned => {
+        OnionSslMode::Verify | OnionSslMode::NoVerify => {
             builder.set_verify(SslVerifyMode::NONE);
+        }
+        OnionSslMode::TrustSelfSigned => {
+            let ca_spec = rule
+                .upstream_ca
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty());
+            match (ca_spec, normalized_pin.as_deref()) {
+                (Some(spec), pin) => {
+                    let pem = crate::server::ssl_material::load_bytes(spec)
+                        .with_context(|| format!("读取 upstream_ca {spec}"))?;
+                    let certs = X509::stack_from_pem(&pem)
+                        .with_context(|| format!("解析 upstream_ca {spec}（需要 PEM 证书）"))?;
+                    if certs.is_empty() {
+                        bail!("proxy: upstream_ca {spec} 里没有任何 CERTIFICATE 块");
+                    }
+                    // 指纹固定：必须命中 CA 文件里的某一张（防「文件被静默换掉」）。
+                    if let Some(pin) = pin {
+                        let mut matched = false;
+                        for c in &certs {
+                            if sha256_hex(&c.to_der()?).as_deref() == Some(pin) {
+                                matched = true;
+                                break;
+                            }
+                        }
+                        if !matched {
+                            bail!(
+                                "proxy: upstream_ca_sha256 与 upstream_ca 中的任何证书都不匹配 —— \
+                                 CA 文件可能被替换/配错（拒绝连接）"
+                            );
+                        }
+                        log::debug!("proxy: trust_self_signed CA 指纹固定校验通过（{host}）");
+                    } else if !TRUST_SELF_SIGNED_UNPINNED_WARNED
+                        .swap(true, std::sync::atomic::Ordering::Relaxed)
+                    {
+                        log::info!(
+                            "proxy: trust_self_signed 使用 upstream_ca 作为**唯一**信任锚\
+（未配 upstream_ca_sha256；如需防止 CA 文件被静默替换请补 64 位 SHA-256 指纹）"
+                        );
+                    }
+                    // 关键：**替换**整个 store（SslConnector::builder 默认已装系统根）。
+                    // 只 add_cert 不替换 = 系统根 + 自定义 CA 的并集，那就不是「只信任
+                    // 指定 CA」了，自签上游能过、公共 CA 签的任意域名也能过。
+                    let mut store = X509StoreBuilder::new().context("X509StoreBuilder::new")?;
+                    for c in &certs {
+                        store.add_cert(c).context("upstream_ca 加入信任库")?;
+                    }
+                    builder.set_cert_store_builder(store);
+                    builder.set_verify(SslVerifyMode::PEER);
+                }
+                (None, Some(pin)) => {
+                    // 纯证书固定：没有 CA 文件，只认这个叶子指纹。
+                    builder.set_verify(SslVerifyMode::NONE);
+                    pin_leaf_after_handshake = Some(pin.to_string());
+                }
+                (None, None) => {
+                    bail!(
+                        "proxy: ssl_mode=trust_self_signed 必须配置 upstream_ca（PEM 路径/正文）\
+                         或 upstream_ca_sha256（SHA-256 指纹）—— 该档位只信任指定 CA/自签证书，\
+                         不再等价于 no_verify；确实要接受任意证书请显式写 no_verify"
+                    );
+                }
+            }
         }
         OnionSslMode::Off => {}
     }
+
+    // 回源 mTLS 客户端证书（与校验档位正交；verify / no_verify / trust_self_signed 都可用）。
+    match (
+        rule.client_cert.as_deref().map(str::trim).filter(|s| !s.is_empty()),
+        rule.client_key.as_deref().map(str::trim).filter(|s| !s.is_empty()),
+    ) {
+        (Some(cert_spec), Some(key_spec)) => {
+            let cert_pem = crate::server::ssl_material::load_bytes(cert_spec)
+                .with_context(|| format!("读取 client_cert {cert_spec}"))?;
+            let key_pem = crate::server::ssl_material::load_bytes(key_spec)
+                .with_context(|| format!("读取 client_key {key_spec}"))?;
+            let mut certs = X509::stack_from_pem(&cert_pem)
+                .with_context(|| format!("解析 client_cert {cert_spec}"))?;
+            if certs.is_empty() {
+                bail!("proxy: client_cert {cert_spec} 里没有任何 CERTIFICATE 块");
+            }
+            let leaf = certs.remove(0);
+            let key = boring::pkey::PKey::private_key_from_pem(&key_pem)
+                .with_context(|| format!("解析 client_key {key_spec}"))?;
+            builder.set_certificate(&leaf).context("设置 client_cert")?;
+            builder.set_private_key(&key).context("设置 client_key")?;
+            builder.check_private_key().context("client_cert/client_key 不匹配")?;
+            // 客户端证书链（leaf 之后的中间 CA）一并发送。
+            for c in certs {
+                builder.add_extra_chain_cert(c).context("追加 client_cert 中间链")?;
+            }
+        }
+        (None, None) => {}
+        _ => bail!("proxy: client_cert 与 client_key 必须成对配置"),
+    }
+
     let connector = builder.build();
     let mut config = connector.configure().context("ssl configure")?;
     // 规格 11「不配置时自动处理」：未显式指定回源 HTTP 版本时，用 ALPN 让上游
@@ -1436,7 +1594,7 @@ async fn wrap_upstream_tls_boring(
         UpstreamAlpn::Off => {}
     }
     // SNI: use host; for .onion Boring still accepts the name string.
-    let mut tls = tokio_boring::connect(config, host, tcp)
+    let tls = tokio_boring::connect(config, host, tcp)
         .await
         .with_context(|| format!("boring TLS connect to {host}"))?;
 
@@ -1456,6 +1614,31 @@ async fn wrap_upstream_tls_boring(
             bail!("onion ssl_mode=verify: peer certificate does not match .onion pubkey");
         }
         log::debug!("onion cert-as-pubkey verified for {host}");
+    }
+
+    // 纯指纹固定（trust_self_signed + 只有 upstream_ca_sha256）：握手后比对叶子证书。
+    // 库内校验已关闭，这里是该档位**唯一**的认证手段 ⇒ 拿不到证书/指纹不符都必须
+    // 拒绝（不能让请求走到上游）。
+    if let Some(pin) = pin_leaf_after_handshake.as_deref() {
+        let leaf_der = tls
+            .ssl()
+            .peer_certificate()
+            .map(|c| c.to_der())
+            .transpose()
+            .context("peer cert to_der")?
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "proxy: trust_self_signed + upstream_ca_sha256: 握手后拿不到对端证书（拒绝连接）"
+                )
+            })?;
+        let got = sha256_hex(&leaf_der).ok_or_else(|| anyhow::anyhow!("peer cert SHA-256 计算失败"))?;
+        if got != pin {
+            bail!(
+                "proxy: trust_self_signed 证书固定失败：对端叶子证书 SHA-256={got}，\
+                 期望 {pin}（拒绝连接）"
+            );
+        }
+        log::debug!("proxy: trust_self_signed 叶子证书指纹固定校验通过（{host}）");
     }
 
     let negotiated_alpn = tls
@@ -1481,7 +1664,7 @@ async fn wrap_upstream_tls_rustls(
     tcp: TcpStream,
     host: &str,
     mode: OnionSslMode,
-    tls_version: Option<&str>,
+    rule: &ProxyRuleConfig,
     alpn: UpstreamAlpn,
 ) -> Result<UpstreamIo> {
     use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
@@ -1609,6 +1792,19 @@ async fn wrap_upstream_tls_rustls(
         }
     }
 
+    // G-11：rustls 回退路径没有自定义 trust store / 证书固定 / mTLS 的实现。
+    // `trust_self_signed` 在该构建下**拒绝**（旧行为是静默落到 AcceptAll = no_verify，
+    // 正是这条档位要修的缺陷）；需要该档位请用 tls_boring 构建。
+    if mode == OnionSslMode::TrustSelfSigned {
+        bail!(
+            "ssl_mode=trust_self_signed via rustls fallback: 该构建不支持自定义 CA/证书固定\
+（tls_rustls 回退路径）；请使用 tls_boring 构建"
+        );
+    }
+    if rule.client_cert.is_some() || rule.client_key.is_some() {
+        bail!("proxy: client_cert/client_key 需要 tls_boring 构建（rustls 回退路径未实现回源 mTLS）");
+    }
+
     let verifier: Arc<dyn ServerCertVerifier> =
         if mode == OnionSslMode::Verify && is_onion_host(host) {
             Arc::new(OnionVerifier {
@@ -1626,7 +1822,11 @@ async fn wrap_upstream_tls_rustls(
     // 回源 TLS 版本：此前参数被整个忽略（`_tls_version`）⇒ 配置静默无效。
     // 归一化与 boring 分支一致（tls1.2 / tls12 / tlsv1.3 …）。
     let versions: &[&'static rustls::SupportedProtocolVersion] =
-        match tls_version.map(|v| v.to_ascii_lowercase().replace(['.', '_'], "")) {
+        match rule
+            .upstream_tls_version
+            .as_deref()
+            .map(|v| v.to_ascii_lowercase().replace(['.', '_'], ""))
+        {
             Some(ref v) if v == "tls12" || v == "tlsv12" => &[&rustls::version::TLS12],
             Some(ref v) if v == "tls13" || v == "tlsv13" => &[&rustls::version::TLS13],
             _ => rustls::DEFAULT_VERSIONS,
@@ -2199,6 +2399,10 @@ pub async fn proxy_page_rule(
         connection_pool: false,
         via_tor: false,
         tor_socks: None,
+        upstream_ca: None,
+        upstream_ca_sha256: None,
+        client_cert: None,
+        client_key: None,
     };
     match proxy_once(req, &rule, peer_ip, client_https).await {
         Ok(r) => r,
@@ -2685,5 +2889,95 @@ mod tor_socks_tests {
         );
         let o = anyhow::anyhow!("upstream send: connection reset by peer");
         assert_eq!(upstream_error_response(&o).status(), StatusCode::BAD_GATEWAY);
+    }
+}
+
+#[cfg(test)]
+mod tls_material_tests {
+    use super::*;
+
+    /// G-11：SHA-256 指纹输入格式必须宽容（openssl 的 `XX:YY:…` 输出可直接粘贴），
+    /// 但只有恰好 64 个 hex 字符才算合法；非法输入必须返回 None（配置校验据此拒绝）。
+    #[test]
+    fn normalize_sha256_accepts_openssl_forms() {
+        let plain = "a".repeat(64);
+        assert_eq!(normalize_sha256_hex(&plain).as_deref(), Some(plain.as_str()));
+        assert_eq!(
+            normalize_sha256_hex(&plain.to_ascii_uppercase()).as_deref(),
+            Some(plain.as_str())
+        );
+        assert_eq!(
+            normalize_sha256_hex(&format!("sha256:{}", plain.to_ascii_uppercase())).as_deref(),
+            Some(plain.as_str())
+        );
+        let colon = (0..64)
+            .map(|i| if i % 2 == 0 { 'A' } else { 'b' })
+            .collect::<Vec<_>>()
+            .chunks(2)
+            .map(|c| c.iter().collect::<String>())
+            .collect::<Vec<_>>()
+            .join(":");
+        assert_eq!(
+            normalize_sha256_hex(&colon).as_deref(),
+            Some("ab".repeat(32).as_str())
+        );
+
+        assert!(normalize_sha256_hex("").is_none());
+        assert!(normalize_sha256_hex("abc").is_none());
+        assert!(normalize_sha256_hex(&"g".repeat(64)).is_none());
+        assert!(normalize_sha256_hex(&"a".repeat(63)).is_none());
+        assert!(normalize_sha256_hex(&"a".repeat(65)).is_none());
+        // 非 ASCII 输入不能因按字节切片而 panic。
+        assert!(normalize_sha256_hex("指纹：abcdef").is_none());
+    }
+
+    /// G-11：连接池键必须区分不同信任锚 / 指纹 / mTLS 身份（否则 trust_self_signed
+    /// 的「只信任指定 CA」会被复用连接的另一种信任状态绕过）。
+    #[test]
+    fn pool_key_covers_tls_trust_material() {
+        let base = || {
+            PoolKey::new(
+                "backend.test",
+                443,
+                "https",
+                false,
+                false,
+                "trust_self_signed",
+                None,
+                Some("ca-a.pem"),
+                None,
+                None,
+                None,
+            )
+        };
+        let k = base();
+        assert_ne!(
+            k,
+            PoolKey::new(
+                "backend.test", 443, "https", false, false, "trust_self_signed", None,
+                Some("ca-b.pem"), None, None, None
+            )
+        );
+        assert_ne!(
+            k,
+            PoolKey::new(
+                "backend.test", 443, "https", false, false, "trust_self_signed", None,
+                Some("ca-a.pem"), Some("00"), None, None
+            )
+        );
+        assert_ne!(
+            k,
+            PoolKey::new(
+                "backend.test", 443, "https", false, false, "trust_self_signed", None,
+                Some("ca-a.pem"), None, Some("client.pem"), None
+            )
+        );
+        assert_eq!(
+            k,
+            PoolKey::new(
+                "backend.test", 443, "https", false, false, "trust_self_signed", None,
+                Some("ca-a.pem"), None, None, None
+            )
+        );
     }
 }

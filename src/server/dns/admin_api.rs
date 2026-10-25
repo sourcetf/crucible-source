@@ -104,6 +104,20 @@ async fn handle_inner(
                 // 若没带 enabled，会把一个配置为关闭的部署就地打开并 spawn named。
                 dc.enabled = keep_or(&v, "enabled", dc.enabled);
                 dc.ecs = keep_or(&v, "ecs", dc.ecs);
+                // 自动 NS / 胶水（G-09）：null 或缺省 = 保持；空串 glue = 关闭胶水。
+                if let Some(x) = v.get("ns_name").and_then(|x| x.as_str()) {
+                    dc.ns_name = if x.trim().is_empty() {
+                        None
+                    } else {
+                        Some(x.trim().to_string())
+                    };
+                }
+                if let Some(x) = v.get("ns_glue") {
+                    dc.ns_glue = match x.as_str() {
+                        Some(s) => Some(s.trim().to_string()),
+                        None => None,
+                    };
+                }
                 persist_and_reconcile(&dc).await?;
                 Ok(json!({"ok": true, "modes": dc.modes}))
             }
@@ -216,7 +230,13 @@ async fn handle_inner(
                         let primaries: Vec<String> = json_strs(&v["primaries"]);
                         let axfr: Vec<String> = json_strs(&v["axfr_acl"]);
                         let refresh = v["refresh_hours"].as_u64().unwrap_or(24);
-                        add_zone(kind, name, &primaries, &axfr, refresh)
+                        // also-notify（G-05）：字段缺省时**保持原值**（面板老表单/旧客户端
+                        // 只改 primaries 时不能把已配置的通知目标静默清空）。
+                        let also = match v.get("also_notify") {
+                            Some(_) => json_strs(&v["also_notify"]),
+                            None => zone_also_notify(name),
+                        };
+                        add_zone(kind, name, &primaries, &axfr, refresh, &also)
                             .map_err(|e| e.to_string())?;
                     }
                 }
@@ -299,7 +319,8 @@ async fn handle_inner(
                         let primaries: Vec<String> = json_strs(&v["primaries"]);
                         let axfr: Vec<String> = json_strs(&v["axfr_acl"]);
                         let refresh = v["refresh_hours"].as_u64().unwrap_or(24);
-                        add_zone("slave", name, &primaries, &axfr, refresh)
+                        let also = zone_also_notify(name);
+                        add_zone("slave", name, &primaries, &axfr, refresh, &also)
                             .map_err(|e| e.to_string())?;
                         reconcile_current(&live).await?;
                         Ok(json!({"ok": true}))
@@ -388,7 +409,8 @@ async fn handle_inner(
                 // 真正的签发是阻塞外部工具调用，走 blocking；与续期循环共用 issue_now
                 // （同一 CA/参数/互斥锁，证书未到期时 no-op）。
                 let c2 = dc.acme.clone();
-                let issued = tokio::task::spawn_blocking(move || acme_issue(&c2))
+                let d2 = dc.clone();
+                let issued = tokio::task::spawn_blocking(move || acme_issue(&c2, &d2))
                     .await
                     .map_err(|e| e.to_string())?;
                 issued.map(|_| json!({"ok": true}))
@@ -640,9 +662,14 @@ fn status_json(dc: &DnsConfig) -> Result<Value, String> {
         "enabled": dc.enabled,
         "test_mode": dc.test_mode,
         "modes": dc.modes,
+        "recursor": dc.recursor(),
         "port": dc.port_or_default(),
+        "named_port": dc.named_port_or_default(),
         "rndc_port": dc.rndc_port_or_default(),
         "named_running": named,
+        "unbound": dc.unbound,
+        "unbound_running": dc.is_unbound() && unbound_alive(dc),
+        "unbound_conf": unbound_conf_path().display().to_string(),
         "zones": zones,
         "records": records,
         "dnssec": dc.dnssec,
@@ -660,6 +687,8 @@ fn status_json(dc: &DnsConfig) -> Result<Value, String> {
         "forwarders": dc.forwarders,
         "forward_policy": dc.forward_policy,
         "ecs": dc.ecs,
+        "ns_name": dc.ns_name_raw(),
+        "ns_glue": dc.ns_glue_value(),
         "acme": dc.acme,
         "rootzone_last_ok": meta_get("root_last_ok").ok().flatten(),
     }))
@@ -677,8 +706,11 @@ fn status_json(dc: &DnsConfig) -> Result<Value, String> {
 /// ECC 不一致），还固定带 `--force`（面板可被反复点击刷 CA 限额）——面板签出的证书
 /// 与续期循环签出的可能**不是同一 CA/同一密钥类型**，换个环境还会「面板回 ok、其实没
 /// 有可用客户端」。统一入口后两边逐字节一致。
-fn acme_issue(c: &crate::server::dns::acme::AcmeCfg) -> Result<(), String> {
-    crate::server::dns::acme::issue_now(c).map_err(|e| format!("{e:#}"))
+fn acme_issue(
+    c: &crate::server::dns::acme::AcmeCfg,
+    dns: &crate::server::dns::DnsConfig,
+) -> Result<(), String> {
+    crate::server::dns::acme::issue_now(c, dns).map_err(|e| format!("{e:#}"))
 }
 
 /// `GET /api/dns/zones/export?name=<zone>` —— 按 RFC1035 导出单个分区（.zone 下载）。
@@ -727,7 +759,18 @@ pub async fn handle_zone_export(
         Ok(r) => r,
         Err(e) => return bad(StatusCode::INTERNAL_SERVER_ERROR, format!("records: {e}")),
     };
-    let text = gen_zone_file(&zone, &z.kind, &recs);
+    // 导出与写入使用同一套自动 NS/胶水设置（G-09）：panel.toml 是 effective 的
+    // 权威来源；否则回落默认 ns1/127.0.0.1。
+    let (ns_name, ns_glue) = super::ns_settings_from_panel();
+    let text = super::gen_zone_file_monotonic_ns(
+        &zone,
+        &z.kind,
+        &recs,
+        None,
+        &[],
+        &ns_name,
+        ns_glue.as_deref(),
+    );
     let fname = zone
         .chars()
         .map(|c| if c.is_ascii_alphanumeric() || c == '.' || c == '-' { c } else { '_' })

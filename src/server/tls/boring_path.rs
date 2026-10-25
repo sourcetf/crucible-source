@@ -22,12 +22,84 @@ use std::sync::Arc;
 use tokio::net::TcpStream;
 use tokio_boring::SslStream;
 
+/// G-12：`ssl.prefer_tls13 = true` 时按 **ClientHello** 选择的两套 SSL_CTX 版本档位。
+///
+/// BoringSSL 没有「协议版本偏好」开关（版本偏好库内固定），所以「prefer」做成可观测的
+/// 两套上下文：
+/// * 客户端在 `supported_versions` 里声明了 TLS1.3 (0x0304) ⇒ 用 **1.3-only** 上下文
+///   （客户端即使同时给 1.2 也只会协商到 1.3）；
+/// * 不支持 1.3 的客户端 ⇒ 用 **max=TLS1.2** 上下文，正常回落到 1.2（**不拒绝** 1.2 客户端）。
+///
+/// 只有 `ssl.versions` 为空（即没有显式版本钉死）时才启用；显式 `versions` /
+/// `min_version` / `max_version` 的优先级更高，此时按库默认范围（`Default`）。
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+pub(crate) enum VersionProfile {
+    /// 库默认范围（不因 prefer_tls13 做任何覆盖）。
+    Default,
+    /// 客户端支持 TLS1.3：只协商 TLS1.3。
+    Tls13Only,
+    /// 客户端不支持 TLS1.3：上限钉在 TLS1.2（min 仍为 1.2）。
+    Tls12Max,
+}
+
+/// 按 ClientHello 的 wire 探测选择版本档位（与 legacy 分流同一套探测：
+/// [`crate::server::tls::client_hello::has_tls13_supported_versions`]）。
+pub(crate) fn pick_version_profile(ssl: &SslConfig, peek: &[u8]) -> VersionProfile {
+    if !ssl.prefer_tls13 || !ssl.versions.is_empty() {
+        return VersionProfile::Default;
+    }
+    // peek 没读全（超长 ClientHello 被 PEEK_CAP 截断 / 对端只发了一半）时**不要**
+    // 猜成「不支持 1.3」：那会把一个支持 1.3 的客户端硬压到 1.2。无法判定就回库默认
+    // （它会按客户端能力正常协商），只有确定不含 0x0304 时才用 max=1.2 上下文。
+    if let Some(need) = crate::server::tls::accept::record_need(peek) {
+        if peek.len() < need {
+            return VersionProfile::Default;
+        }
+    }
+    if crate::server::tls::client_hello::has_tls13_supported_versions(peek) {
+        VersionProfile::Tls13Only
+    } else {
+        VersionProfile::Tls12Max
+    }
+}
+
+/// 把版本档位落到 builder 上（在 [`apply_versions`] 之后调用；显式 versions 时
+/// 调用方传 `Default`，不会被覆盖）。
+fn apply_version_profile(
+    builder: &mut SslAcceptorBuilder,
+    profile: VersionProfile,
+) -> Result<()> {
+    match profile {
+        VersionProfile::Default => {}
+        VersionProfile::Tls13Only => {
+            builder.set_min_proto_version(Some(SslVersion::TLS1_3))?;
+            builder.set_max_proto_version(Some(SslVersion::TLS1_3))?;
+        }
+        VersionProfile::Tls12Max => {
+            builder.set_min_proto_version(Some(SslVersion::TLS1_2))?;
+            builder.set_max_proto_version(Some(SslVersion::TLS1_2))?;
+        }
+    }
+    Ok(())
+}
+
 pub fn build_acceptor(ssl: &SslConfig, lc: &ListenerConfig) -> Result<SslAcceptor> {
+    build_acceptor_profile(ssl, lc, VersionProfile::Default)
+}
+
+/// [`build_acceptor`] 的带版本档位版本（accept 热路径按 ClientHello 选档位）。
+pub(crate) fn build_acceptor_profile(
+    ssl: &SslConfig,
+    lc: &ListenerConfig,
+    profile: VersionProfile,
+) -> Result<SslAcceptor> {
     let mut builder = SslAcceptor::mozilla_modern(SslMethod::tls())?;
     // boring 的 mozilla_modern 预设带 SSL_OP_NO_TLSV1_3,不清掉 TLS1.3 永远握手失败(
     // set_min/max_proto_version 不会复位该 option 位)。§6 主路径要求 1.2/1.3 全开。
     builder.clear_options(boring::ssl::SslOptions::NO_TLSV1_3);
     apply_versions(&mut builder, ssl)?;
+    // G-12：prefer_tls13 的两套上下文（显式 versions 时 profile=Default）。
+    apply_version_profile(&mut builder, profile)?;
     // OCSP 是**逐证书**一份：先规划（真实/cover 各一份），再让 load_identity 在
     // 「ECH 接受与否」的决策点装对应那份（见 OcspPlan 的说明）。
     let ocsp = plan_ocsp(ssl);
@@ -38,7 +110,15 @@ pub fn build_acceptor(ssl: &SslConfig, lc: &ListenerConfig) -> Result<SslAccepto
         unsafe {
             boring_sys::SSL_CTX_set_early_data_enabled(builder.as_ptr(), 1);
         }
-        log::info!("tls: early data (0-RTT) enabled");
+        // 重放防护语义（U-05）：BoringSSL **不做** 0-RTT 反重放 —— `SSL_CTX_set_early_data_enabled`
+        // 只是允许客户端在恢复会话里发 early data（服务端用 `SSL_in_early_data` /
+        // `SSL_early_data_accepted` 区分）。RFC 8446 §8 要求应用层自行反重放（单次票据、
+        // 时间窗、幂等判定等），本项目未实现任何反重放 ⇒ 开启后**同一份 early data 可以被
+        // 重放**。因此只应在幂等请求（GET/HEAD）上启用，或由前置层做单次票据校验。
+        log::warn!(
+            "tls: early data (0-RTT) enabled —— 注意 BoringSSL 不提供反重放，\
+同一份 early data 可被重放；仅建议用于幂等请求（GET/HEAD），state-changing 请求务必等 1-RTT"
+        );
     }
     apply_ciphers(&mut builder, ssl)?;
     apply_groups(&mut builder, ssl)?;
@@ -51,14 +131,9 @@ pub fn build_acceptor(ssl: &SslConfig, lc: &ListenerConfig) -> Result<SslAccepto
 
 fn apply_versions(builder: &mut SslAcceptorBuilder, ssl: &SslConfig) -> Result<()> {
     if ssl.versions.is_empty() {
-        if ssl.prefer_tls13 {
-            // 与不设这两行的效果**完全相同**（mozilla_modern 已被清掉 NO_TLSV1_3，库内
-            // 范围就是 1.2–1.3）：BoringSSL 没有「偏好 1.3」的开关，协议版本偏好库内固定。
-            // 这个字段是兼容性的空开关；面板/配置写 true 不会产生可观测差异，写 false
-            // 也无法关闭 1.3（要限制 1.3 只能靠 ssl.versions 把 max 钉到 tls1.2）。
-            builder.set_min_proto_version(Some(SslVersion::TLS1_2))?;
-            builder.set_max_proto_version(Some(SslVersion::TLS1_3))?;
-        }
+        // `prefer_tls13` **不在这里**生效：它需要按 ClientHello 在两套 SSL_CTX 之间
+        // 选择（1.3-only / max=1.2），见 [`VersionProfile`] 与 [`apply_version_profile`]。
+        // 这里保持库默认范围（mozilla_modern + 清除 NO_TLSV1_3 ⇒ 1.2–1.3）。
         return Ok(());
     }
     let (min, max, legacy) = plan_versions(&ssl.versions)?;
@@ -708,6 +783,107 @@ mod versions_tests {
     }
 }
 
+/// G-12：`prefer_tls13` 按 ClientHello 选两套上下文的判定。
+#[cfg(test)]
+mod prefer_profile_tests {
+    use super::*;
+
+    /// 真实布局的最小 ClientHello；`versions` 为空表示不带 supported_versions 扩展。
+    fn client_hello(versions: &[u16]) -> Vec<u8> {
+        let mut hs = Vec::new();
+        hs.extend_from_slice(&[0x03, 0x03]); // legacy_version
+        hs.extend_from_slice(&[0u8; 32]); // random
+        hs.push(0x00); // session_id_len
+        hs.extend_from_slice(&[0x00, 0x02, 0x13, 0x01]); // cipher_suites
+        hs.push(0x01); // compression_methods_len
+        hs.push(0x00);
+        let mut ext = Vec::new();
+        if !versions.is_empty() {
+            let mut ed = vec![(versions.len() * 2) as u8];
+            for v in versions {
+                ed.extend_from_slice(&v.to_be_bytes());
+            }
+            ext.extend_from_slice(&0x002bu16.to_be_bytes());
+            ext.extend_from_slice(&(ed.len() as u16).to_be_bytes());
+            ext.extend_from_slice(&ed);
+        }
+        hs.extend_from_slice(&(ext.len() as u16).to_be_bytes());
+        hs.extend_from_slice(&ext);
+
+        let mut rec = vec![0x16, 0x03, 0x01];
+        rec.extend_from_slice(&((4 + hs.len()) as u16).to_be_bytes());
+        rec.push(0x01);
+        let hl = hs.len();
+        rec.extend_from_slice(&[(hl >> 16) as u8, (hl >> 8) as u8, hl as u8]);
+        rec.extend_from_slice(&hs);
+        rec
+    }
+
+    #[test]
+    fn prefer_true_splits_by_clienthello() {
+        let ssl = SslConfig {
+            prefer_tls13: true,
+            ..Default::default()
+        };
+        // 声明 1.3 ⇒ 1.3-only；只声明 1.2 ⇒ 上限 1.2（不是拒绝）。
+        assert_eq!(
+            pick_version_profile(&ssl, &client_hello(&[0x0304, 0x0303])),
+            VersionProfile::Tls13Only
+        );
+        assert_eq!(
+            pick_version_profile(&ssl, &client_hello(&[0x0303])),
+            VersionProfile::Tls12Max
+        );
+        // 完全没有 supported_versions（老客户端）⇒ 回落 1.2。
+        assert_eq!(
+            pick_version_profile(&ssl, &client_hello(&[])),
+            VersionProfile::Tls12Max
+        );
+    }
+
+    /// peek 被截断（超长 ClientHello / 只读到一半）时不能猜成「不支持 1.3」：
+    /// 回库默认，由客户端能力正常协商（避免把 1.3 客户端硬压到 1.2）。
+    #[test]
+    fn truncated_peek_falls_back_to_library_default() {
+        let ssl = SslConfig {
+            prefer_tls13: true,
+            ..Default::default()
+        };
+        let full = client_hello(&[0x0304, 0x0303]);
+        assert_eq!(
+            pick_version_profile(&ssl, &full[..full.len() - 3]),
+            VersionProfile::Default
+        );
+    }
+
+    #[test]
+    fn prefer_false_is_library_default() {
+        let ssl = SslConfig::default();
+        assert_eq!(
+            pick_version_profile(&ssl, &client_hello(&[0x0304, 0x0303])),
+            VersionProfile::Default
+        );
+        assert_eq!(
+            pick_version_profile(&ssl, &client_hello(&[0x0303])),
+            VersionProfile::Default
+        );
+    }
+
+    #[test]
+    fn explicit_versions_win_over_prefer() {
+        let ssl = SslConfig {
+            prefer_tls13: true,
+            versions: vec!["tls1.2".into(), "tls1.3".into()],
+            ..Default::default()
+        };
+        assert_eq!(
+            pick_version_profile(&ssl, &client_hello(&[0x0304, 0x0303])),
+            VersionProfile::Default,
+            "显式 versions 优先，prefer_tls13 不得再覆盖范围"
+        );
+    }
+}
+
 /// Post-quantum hybrid + explicit group list (BoringSSL `SSL_CTX_set1_groups_list`).
 fn apply_groups(builder: &mut SslAcceptorBuilder, ssl: &SslConfig) -> Result<()> {
     let list = if !ssl.groups.is_empty() {
@@ -1284,8 +1460,15 @@ pub fn clear_acceptor_cache() {
     }
 }
 
-fn acceptor_fingerprint(ssl: &SslConfig, lc: &ListenerConfig) -> u64 {
+fn acceptor_fingerprint(
+    ssl: &SslConfig,
+    lc: &ListenerConfig,
+    profile: VersionProfile,
+) -> u64 {
     let mut h = DefaultHasher::new();
+    // G-12：同一个 listener 会同时存在 1.3-only 与 max=1.2 两套 acceptor，档位必须
+    // 进指纹，否则其中一套会命中另一套（把「prefer」语义抹掉）。
+    profile.hash(&mut h);
     ssl.cert.hash(&mut h);
     ssl.key.hash(&mut h);
     ssl.cert_ec.hash(&mut h);
@@ -1355,12 +1538,16 @@ fn acceptor_fingerprint(ssl: &SslConfig, lc: &ListenerConfig) -> u64 {
 }
 
 /// 缓存版 acceptor 构建（accept 热路径用；build_acceptor 供首建/测试直连）。
-pub fn build_acceptor_cached(ssl: &SslConfig, lc: &ListenerConfig) -> Result<Arc<SslAcceptor>> {
-    let fp = acceptor_fingerprint(ssl, lc);
+pub(crate) fn build_acceptor_cached(
+    ssl: &SslConfig,
+    lc: &ListenerConfig,
+    profile: VersionProfile,
+) -> Result<Arc<SslAcceptor>> {
+    let fp = acceptor_fingerprint(ssl, lc, profile);
     if let Some(a) = ACCEPTOR_CACHE.lock().get(&fp) {
         return Ok(Arc::clone(a));
     }
-    let a = Arc::new(build_acceptor(ssl, lc)?);
+    let a = Arc::new(build_acceptor_profile(ssl, lc, profile)?);
     let mut map = ACCEPTOR_CACHE.lock();
     if map.len() >= ACCEPTOR_CACHE_CAP {
         map.clear();
@@ -1388,7 +1575,16 @@ pub async fn accept_and_serve(
         drop(stream);
         return Ok(());
     }
-    let acceptor = build_acceptor_cached(ssl, &lc)?;
+    // G-12：prefer_tls13 的两套上下文按**这条连接的 ClientHello** 选择（与 legacy
+    // 分流同一套 wire 探测）。prefer_tls13=false / 显式 versions 时恒为 Default，
+    // 行为与修改前逐字节一致。
+    let profile = pick_version_profile(ssl, &peek);
+    if ssl.prefer_tls13 {
+        // debug 而非 info：匿名客户端可按连接速率触发；这里只用于验证/排障
+        // 「prefer_tls13 到底选了哪套 SSL_CTX」。
+        log::debug!("tls prefer_tls13: peer={peer} profile={profile:?} peek={}", peek.len());
+    }
+    let acceptor = build_acceptor_cached(ssl, &lc, profile)?;
     let io = PrefixedStream::new(stream, peek);
     // 握手必须有**截止时间**。`tokio_boring::accept` 自己没有任何超时：一个匿名客户端
     // 只要发一个**完整合法**的 ClientHello、然后在握手中途停下（不回 Finished），
@@ -1464,29 +1660,29 @@ mod fingerprint_tests {
         };
         let lc = crate::config::ListenerConfig::default();
 
-        let fp1 = acceptor_fingerprint(&ssl, &lc);
+        let fp1 = acceptor_fingerprint(&ssl, &lc, VersionProfile::Default);
         assert_eq!(
             fp1,
-            acceptor_fingerprint(&ssl, &lc),
+            acceptor_fingerprint(&ssl, &lc, VersionProfile::Default),
             "同样的材料必须得到同样的指纹（否则缓存永不命中）"
         );
 
         // ① 长度不同的替换
         std::thread::sleep(std::time::Duration::from_millis(20));
         std::fs::write(&cert, b"second-cert-content").expect("rewrite");
-        let fp2 = acceptor_fingerprint(&ssl, &lc);
+        let fp2 = acceptor_fingerprint(&ssl, &lc, VersionProfile::Default);
         assert_ne!(fp1, fp2, "证书被替换后指纹必须变化（否则继续用旧证书）");
 
         // ② **同样长度**、不同内容（只把 size 编进指纹的实现会在这条上漏掉）
         std::thread::sleep(std::time::Duration::from_millis(20));
         std::fs::write(&cert, b"THIRD-cert-content!").expect("rewrite2");
-        let fp3 = acceptor_fingerprint(&ssl, &lc);
+        let fp3 = acceptor_fingerprint(&ssl, &lc, VersionProfile::Default);
         assert_ne!(fp2, fp3, "等长替换也必须改变指纹（要靠 mtime）");
 
         // ③ 与内容无关的字段变化同样要影响指纹
         let mut ssl2 = ssl.clone();
         ssl2.prefer_tls13 = true;
-        assert_ne!(fp3, acceptor_fingerprint(&ssl2, &lc), "配置字段变化必须影响指纹");
+        assert_ne!(fp3, acceptor_fingerprint(&ssl2, &lc, VersionProfile::Default), "配置字段变化必须影响指纹");
 
         let _ = std::fs::remove_dir_all(&dir);
     }

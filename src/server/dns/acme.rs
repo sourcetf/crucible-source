@@ -50,6 +50,32 @@ pub struct AcmeCfg {
     /// `httpPort` 必须与之对齐），否则 bind :80 失败、首次签发必然失败。
     #[serde(default)]
     pub http_port: u16,
+    /// 挑战类型："http-01"（默认）或 "dns-01"（G-07）。
+    ///
+    /// dns-01 的 TXT 写进**本机权威区**：acme.sh 的自定义 dnsapi hook 把
+    /// `_acme-challenge.<domain>` TXT 写进本进程的 spool 目录，由 worker 通过模块
+    /// zone API（records 表 + reconcile）写入/清理 —— 不依赖 nsupdate/动态更新。
+    #[serde(default = "default_challenge")]
+    pub challenge: String,
+}
+
+pub fn default_challenge() -> String {
+    "http-01".to_string()
+}
+
+impl AcmeCfg {
+    /// 是否 dns-01 挑战（大小写/前后空白不敏感）。
+    pub fn challenge_is_dns01(&self) -> bool {
+        self.challenge.trim().eq_ignore_ascii_case("dns-01")
+    }
+    /// 校验后的规范化挑战名；未知值返回 None。
+    pub fn challenge_kind(&self) -> Option<&'static str> {
+        match self.challenge.trim().to_ascii_lowercase().as_str() {
+            "" | "http-01" => Some("http-01"),
+            "dns-01" => Some("dns-01"),
+            _ => None,
+        }
+    }
 }
 
 fn default_renew_days() -> u64 {
@@ -70,6 +96,7 @@ impl Default for AcmeCfg {
             server: None,
             insecure: false,
             http_port: 0,
+            challenge: default_challenge(),
         }
     }
 }
@@ -132,7 +159,7 @@ pub fn resolve_key_path(spec: &str) -> PathBuf {
 /// bind :80 —— 而首次签发时 :80 上根本没有服务（web listener 还没起，也不服务 ACME
 /// webroot），LE 的 HTTP-01 校验必然拉取失败 ⇒ 全新部署永远拿不到证书，还要等
 /// `renew_days`（默认 60 天）后的下一轮。签发放后台同时保证不阻塞启动。
-pub async fn startup(cfg: &AcmeCfg) {
+pub async fn startup(cfg: &AcmeCfg, dns: std::sync::Arc<super::DnsConfig>) {
     if !cfg.enabled || cfg.domain.is_empty() {
         return;
     }
@@ -140,30 +167,43 @@ pub async fn startup(cfg: &AcmeCfg) {
         log::warn!("dns-acme: refusing unsafe domain {:?}", cfg.domain);
         return;
     }
+    if cfg.challenge_kind().is_none() {
+        log::warn!(
+            "dns-acme: 未知 challenge {:?}（只支持 http-01 / dns-01），跳过签发",
+            cfg.challenge
+        );
+        return;
+    }
     let domain = cfg.domain.clone();
     let webroot = cfg
         .webroot
         .clone()
         .unwrap_or_else(|| acme_root().join("www").display().to_string());
-    // (1) HTTP-01 challenge 监听：先起，等 bind 结果（有界等待，超时也继续 —— 不阻塞启动）。
-    let port = if cfg.http_port == 0 { 80 } else { cfg.http_port };
-    let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
-    tokio::spawn(http01_listener(webroot.clone(), port, Some(ready_tx)));
-    match tokio::time::timeout(std::time::Duration::from_secs(3), ready_rx).await {
-        Ok(Ok(true)) => log::info!("dns-acme: http-01 challenge listener ready on :{port}"),
-        Ok(Ok(false)) => log::warn!("dns-acme: bind :{port} failed —— HTTP-01 不可用，签发会失败"),
-        _ => log::warn!("dns-acme: http-01 listener bind 未在 3s 内确认，继续尝试签发"),
+    // (1) HTTP-01 challenge 监听：仅 http-01 需要；dns-01 不占 :80。
+    if !cfg.challenge_is_dns01() {
+        let port = if cfg.http_port == 0 { 80 } else { cfg.http_port };
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(http01_listener(webroot.clone(), port, Some(ready_tx)));
+        match tokio::time::timeout(std::time::Duration::from_secs(3), ready_rx).await {
+            Ok(Ok(true)) => log::info!("dns-acme: http-01 challenge listener ready on :{port}"),
+            Ok(Ok(false)) => log::warn!("dns-acme: bind :{port} failed —— HTTP-01 不可用，签发会失败"),
+            _ => log::warn!("dns-acme: http-01 listener bind 未在 3s 内确认，继续尝试签发"),
+        }
+    } else {
+        log::info!("dns-acme: challenge=dns-01（TXT 写入本机权威区，不监听 :80）");
     }
     // (2) 签发/续期循环（后台）：失败按退避重试而不是死等 renew_days；成功按 renew_days
     //     ±抖动再查。renew_days 下限钳到 30 天（LE 证书 90 天，面板把它设成 1 会持续
-    //    撞 CA 的失败限额 5 次/小时）。
+    //     撞 CA 的失败限额 5 次/小时）。
     let days = cfg.renew_days.max(30);
     let c = cfg.clone();
+    let dns_cfg = std::sync::Arc::clone(&dns);
     tokio::spawn(async move {
         let mut fails: u32 = 0;
         loop {
             let c2 = c.clone();
-            let r = tokio::task::spawn_blocking(move || issue_if_missing(&c2)).await;
+            let d2 = std::sync::Arc::clone(&dns_cfg);
+            let r = tokio::task::spawn_blocking(move || issue_if_missing(&c2, &d2)).await;
             match r {
                 Ok(Ok(())) => {
                     if fails == 0 {
@@ -221,7 +261,7 @@ static ISSUE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 ///
 /// 私钥也必须在：只有 `fullchain.pem`、私钥丢失/损坏时旧实现永远不会重新签发，
 /// DoT 拿着配不上对的材料握手失败。
-fn issue_if_missing(cfg: &AcmeCfg) -> anyhow::Result<()> {
+fn issue_if_missing(cfg: &AcmeCfg, dns: &super::DnsConfig) -> anyhow::Result<()> {
     // 面板「立即签发」与自动续期共用本函数：域名没填时给出可定位的错误
     // （旧面板路径对空域名报 "unsafe domain \"\"" 之类，看不出是配置缺失）。
     if cfg.domain.trim().is_empty() {
@@ -230,12 +270,18 @@ fn issue_if_missing(cfg: &AcmeCfg) -> anyhow::Result<()> {
     if safe_domain_segment(&cfg.domain).is_none() {
         anyhow::bail!("unsafe ACME domain {:?}", cfg.domain);
     }
+    if cfg.challenge_kind().is_none() {
+        anyhow::bail!(
+            "[dns.acme] challenge 只支持 http-01 | dns-01（收到 {:?}）",
+            cfg.challenge
+        );
+    }
     let cp = cert_path(&cfg.domain);
     let kp = key_path(&cfg.domain);
     if cp.is_file() && kp.is_file() && cert_valid(&cp) {
         return Ok(());
     }
-    issue(cfg)
+    issue(cfg, dns)
 }
 
 /// openssl x509 -checkend 30 天探测有效期。
@@ -250,16 +296,22 @@ pub fn cert_valid(p: &std::path::Path) -> bool {
 }
 
 /// 运行外部签发工具并捕获输出：成功返回 Some(output)；失败按类别记日志（含
-/// `rateLimited` 单独标记）并返回 None。
-fn run_client(cmd: &mut std::process::Command, who: &str) -> Option<std::process::Output> {
+/// `rateLimited` 单独标记）、把可读摘要收进 `failures`（最终回给面板）并返回 None。
+fn run_client(
+    cmd: &mut std::process::Command,
+    who: &str,
+    failures: &mut Vec<String>,
+) -> Option<std::process::Output> {
     match cmd.output() {
         Ok(o) if o.status.success() => Some(o),
         Ok(o) => {
-            log_client_failure(who, &o);
+            let summary = log_client_failure(who, &o);
+            failures.push(format!("{who}: {summary}"));
             None
         }
         Err(e) => {
             log::warn!("dns-acme: {who} 无法启动: {e}");
+            failures.push(format!("{who}: 无法启动: {e}"));
             None
         }
     }
@@ -267,32 +319,154 @@ fn run_client(cmd: &mut std::process::Command, who: &str) -> Option<std::process
 
 /// 失败输出只留尾部（有界，避免把工具刷屏日志整段写进我们的日志），
 /// 命中速率限制时单独标记 —— 否则一周内无法签发而面板毫无提示。
-fn log_client_failure(who: &str, o: &std::process::Output) {
+fn log_client_failure(who: &str, o: &std::process::Output) -> String {
     let err = String::from_utf8_lossy(&o.stderr);
     let low = err.to_ascii_lowercase();
-    let tail: String = err.chars().rev().take(800).collect::<Vec<_>>().into_iter().rev().collect();
+    let summary = summarize_client_failure(&err);
     let rate_limited = low.contains("ratelimited")
         || low.contains("rate limit")
         || low.contains("too many certificates")
         || low.contains("too many failed");
     if rate_limited {
-        log::warn!("dns-acme: {who} 命中 CA 速率限制（rateLimited，可能一周内无法签发）: {tail}");
+        log::warn!("dns-acme: {who} 命中 CA 速率限制（rateLimited，可能一周内无法签发）: {summary}");
     } else {
-        log::warn!("dns-acme: {who} 退出失败: {tail}");
+        log::warn!("dns-acme: {who} 退出失败: {summary}");
+    }
+    summary
+}
+
+/// 把外部客户端 stderr 压缩成可读摘要（G-25）。
+///
+/// 现状问题：acme.sh/curl 在 HTTP 错误时会把 CA 返回的 **HTML 错误页**整段打到
+/// stderr，旧实现取末 800 字符 —— 日志里是一堆 `<html><body><h1>…`，真正的
+/// `error code: 7` / `detail: …` 被挤到 800 字符之外（或淹没在标签里），排障只能
+/// 反推 exit code。
+///
+/// 规则（确定性、纯函数，便于单测）：
+/// 1. 逐行去掉 HTML 标签；丢弃纯标签/空白行；
+/// 2. 优先保留含关键字的行：`error code:` / `detail` / `error` / `failed` /
+///    `invalid` / `refused` / `timeout` / `too many` / `rate.?limit`；
+/// 3. 一个关键字行都没有时，退化为「去标签后的全文尾部 800 字符」；
+/// 4. 结果仍是单行化（换行压成 ` | `）且有界（≤800 字符），日志不会被刷屏。
+fn summarize_client_failure(stderr: &str) -> String {
+    fn strip_tags(line: &str) -> String {
+        let mut out = String::with_capacity(line.len());
+        let mut in_tag = false;
+        for ch in line.chars() {
+            match ch {
+                '<' => in_tag = true,
+                '>' if in_tag => in_tag = false,
+                c if !in_tag => out.push(c),
+                _ => {}
+            }
+        }
+        out.replace("&nbsp;", " ")
+            .replace("&amp;", "&")
+            .replace("&lt;", "<")
+            .replace("&gt;", ">")
+            .trim()
+            .to_string()
+    }
+    let key = |s: &str| {
+        let l = s.to_ascii_lowercase();
+        l.contains("error code:")
+            || l.contains("detail")
+            || l.contains("error")
+            || l.contains("failed")
+            || l.contains("invalid")
+            || l.contains("refused")
+            || l.contains("timeout")
+            || l.contains("too many")
+            || l.contains("rate limit")
+            || l.contains("ratelimited")
+    };
+    let mut picked: Vec<String> = Vec::new();
+    let mut plain: Vec<String> = Vec::new();
+    for raw in stderr.lines() {
+        let s = strip_tags(raw);
+        if s.is_empty() {
+            continue;
+        }
+        if key(&s) {
+            picked.push(s.clone());
+        }
+        plain.push(s);
+    }
+    let joined = if picked.is_empty() {
+        // 没有关键字行：用去标签后的纯文本（去掉连续空白），保留尾部。
+        let text = plain.join(" ");
+        let compact = text.split_whitespace().collect::<Vec<_>>().join(" ");
+        let tail: String = compact
+            .chars()
+            .rev()
+            .take(800)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect();
+        tail
+    } else {
+        // 关键字行可能很多（HTML 每行都含 "error"），取尾部并去重。
+        let mut out: Vec<String> = Vec::new();
+        for s in picked {
+            if out.last().map(|p| p == &s).unwrap_or(false) {
+                continue;
+            }
+            out.push(s);
+        }
+        // 从末尾取，保证最近的错误在前因后果上完整；总长 ≤800。
+        let mut acc: Vec<String> = Vec::new();
+        let mut len = 0usize;
+        for s in out.into_iter().rev() {
+            if len + s.len() + 3 > 800 && !acc.is_empty() {
+                break;
+            }
+            len += s.len() + 3;
+            acc.push(s);
+        }
+        acc.into_iter().rev().collect::<Vec<_>>().join(" | ")
+    };
+    if joined.is_empty() {
+        "<empty stderr>".to_string()
+    } else {
+        joined
     }
 }
 
-/// 依次探测 acme.sh / acme-client / certbot，用 HTTP-01 签发。
+/// 依次探测 acme.sh / acme-client / certbot 签发（http-01 或 dns-01）。
 ///
 /// 要点：三条工具路径的 CA/参数保持一致（acme.sh 显式 `--server letsencrypt` +
 /// `ec-256`；certbot 不传 `--cert-path/--key-path`——那两个参数只在 `certonly --csr`
 /// 语义下有效，普通 certonly 会静默忽略，制造「退出 0 但 out_dir 没文件」的假成功）。
-fn issue(cfg: &AcmeCfg) -> anyhow::Result<()> {
+///
+/// dns-01（G-07）：acme.sh 走自定义 dnsapi hook（`--dns dns_crucible --dnssleep 2`），
+/// hook 把 `_acme-challenge.<domain>` TXT 交给本进程 worker（spool 协议），worker
+/// 通过模块 zone API 写入/清理；certbot 走 `--manual --preferred-challenges dns`
+/// + auth/cleanup hook。
+/// acme-client 没有 hook 机制（只做 webroot http-01），dns-01 下跳过。
+fn issue(cfg: &AcmeCfg, dns: &super::DnsConfig) -> anyhow::Result<()> {
     // 面板「立即签发」与续期循环共用本函数：同一时刻只允许一个签发进程，
     // 避免并发 --issue 触发 CA 的 duplicate-certificate 限额。
     let _guard = ISSUE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    // **拿锁后必须重新检查证书**：`issue_if_missing` 在锁外检查「证书不存在」，
+    // 而启动期自动签发与面板「立即签发」会并发 —— 真机实测：启动那次先拿锁、签发
+    // 成功并安装证书；面板那次在锁外看到旧状态，拿锁后又跑一遍 acme.sh。acme.sh
+    // 发现目录里已有未过期证书会直接退出非 0（stderr 为空），面板因此报「签发失败」
+    // —— 证书其实已经签好了（假失败），还白打了一次 CA。
+    if let Some(d) = safe_domain_segment(&cfg.domain) {
+        let cp = acme_root().join(d).join("fullchain.pem");
+        let kp = acme_root().join(d).join("privkey.pem");
+        if cp.is_file() && kp.is_file() && cert_valid(&cp) {
+            log::info!("dns-acme: 证书已有效，跳过重复签发（{}）", cfg.domain);
+            return Ok(());
+        }
+    }
     let domain = safe_domain_segment(&cfg.domain)
         .ok_or_else(|| anyhow::anyhow!("unsafe ACME domain {:?}", cfg.domain))?;
+    let kind = cfg
+        .challenge_kind()
+        .ok_or_else(|| anyhow::anyhow!("unknown ACME challenge {:?}", cfg.challenge))?;
+    let dns01 = kind == "dns-01";
     let out_dir = acme_root().join(domain);
     let www = cfg
         .webroot
@@ -301,10 +475,37 @@ fn issue(cfg: &AcmeCfg) -> anyhow::Result<()> {
     std::fs::create_dir_all(&out_dir)?;
     std::fs::create_dir_all(std::path::Path::new(&www).join(".well-known/acme-challenge"))?;
 
+    // dns-01 的写路径：hook 把请求写进 spool 目录，本进程的 worker 线程通过模块
+    // 自己的 zone API（records 表 + reconcile）写入 `_acme-challenge.<domain>` TXT。
+    //
+    // 为什么不用 nsupdate/动态更新：BIND 的动态更新会把 zone serial 顶到当前 unix 秒，
+    // 与模块「按 unix 秒生成文件 serial」冲突 —— 文件 serial 与内存 serial 相同，
+    // `rndc reload` 判定无变化而跳过；真机实测出现「签发期间加的记录一直 NXDOMAIN」。
+    // 本模块的 zone 文件由 DB 全量生成，动态更新本来就会被下一次 reconcile 覆盖，
+    // 因此走 DB 是唯一自洽的路径（也符合任务允许的「通过现有 zone API」）。
+    let _dns01_spool = if dns01 {
+        Some(Dns01Spool::start(dns).map_err(|e| anyhow::anyhow!("dns-01 spool: {e:#}"))?)
+    } else {
+        None
+    };
+    let spool_env = _dns01_spool
+        .as_ref()
+        .map(|s| s.dir.display().to_string())
+        .unwrap_or_default();
+    if dns01 {
+        log::info!(
+            "dns-acme: dns-01 挑战经模块 zone API 写入（spool {}，domain {}）",
+            spool_env,
+            dns.port_or_default()
+        );
+    }
+
     // 「客户端找到但执行失败」的清单：最终错误里必须区分「一个都没装」与
     // 「装了但失败」。旧实现两种情况都报 `no acme client available` —— 面板按钮
     // 明明有 acme.sh 却回「没有客户端」，真正原因（rateLimited 等）只在服务日志里。
     let mut attempted: Vec<String> = Vec::new();
+    // 失败摘要：最终错误回给面板，避免面板只能看到「见服务日志」（G-25）。
+    let mut failures: Vec<String> = Vec::new();
     // ACME directory：空 = LE production（acme.sh 的 `letsencrypt` 别名）。自定义值
     // （staging / pebble / 私有 CA）原样传给客户端；certbot 只接受 URL，故仅在显式
     // 配置时传 `--server`（否则用 certbot 自己的默认 CA，避免把 `letsencrypt` 这个
@@ -322,23 +523,57 @@ fn issue(cfg: &AcmeCfg) -> anyhow::Result<()> {
     // 此刻任何其它线程的 getenv 都会踩到已释放内存（仓库里已实测出同类 SIGSEGV）。
     let home = crate::server::apps::env_lock::read_static_env("HOME").unwrap_or_default();
     if !home.trim().is_empty() {
+        // dns-01：把自定义 dnsapi hook 放进 acme.sh 的工作目录（`_findHook` 会找
+        // `$LE_WORKING_DIR/dnsapi/dns_crucible.sh`）。
+        let hook_ready = if dns01 {
+            match write_acme_dnsapi_hook(&home) {
+                Ok(p) => {
+                    log::info!("dns-acme: dnsapi hook {}", p.display());
+                    true
+                }
+                Err(e) => {
+                    log::warn!("dns-acme: 写入 dnsapi hook 失败: {e:#}");
+                    false
+                }
+            }
+        } else {
+            true
+        };
         for bin in ["/usr/local/bin/acme.sh", "$HOME/.acme.sh/acme.sh"] {
             let bin = bin.replace("$HOME", &home);
             if std::path::Path::new(&bin).is_file() {
+                if dns01 && !hook_ready {
+                    attempted.push(format!("acme.sh（{bin}，dnsapi hook 写入失败）"));
+                    continue;
+                }
                 let mut cmd = std::process::Command::new(&bin);
                 cmd.arg("--issue")
                     .arg("-d").arg(&cfg.domain)
-                    .arg("--webroot").arg(&www)
                     .arg("--server").arg(&acme_server)
                     .arg("-m").arg(&cfg.email)
                     .arg("--keylength").arg("ec-256")
                     .env("LE_WORKING_DIR", format!("{home}/.acme.sh"));
+                if dns01 {
+                    // --dnssleep 让 acme.sh **跳过**它自己的公共 DNS 查询（本机权威区
+                    // 不在公网 DNS 里，查了必然失败），只等 worker 写库 + reconcile 生效。
+                    cmd.arg("--dns").arg("dns_crucible").arg("--dnssleep").arg("2");
+                    // --log：把 acme.sh 的挑战流程写进 .acme.sh/acme.sh.log，排障/验收
+                    // 可以确认 hook 的 add/del 是否真的被执行。
+                    cmd.arg("--log");
+                    cmd.env("CRUCIBLE_ACME_HOOK_DIR", &spool_env);
+                } else {
+                    cmd.arg("--webroot").arg(&www);
+                }
                 if cfg.insecure {
                     // acme.sh `--insecure`：不校验 ACME 目录端点的证书（pebble 自签）。
                     cmd.arg("--insecure");
                 }
-                if run_client(&mut cmd, "acme.sh --issue").is_some() {
-                    return install_acme_sh(&bin, &cfg.domain, &out_dir);
+                if run_client(&mut cmd, "acme.sh --issue", &mut failures).is_some() {
+                    let r = install_acme_sh(&bin, &cfg.domain, &out_dir);
+                    if dns01 {
+                        post_issue_reconcile(dns, "issue");
+                    }
+                    return r;
                 }
                 attempted.push(format!("acme.sh（{bin}）"));
             }
@@ -346,8 +581,10 @@ fn issue(cfg: &AcmeCfg) -> anyhow::Result<()> {
     } else {
         log::warn!("dns-acme: HOME 未设置，跳过 acme.sh（无法定位其工作目录）");
     }
-    // 2) OpenBSD acme-client（base 或 pkg）
-    if std::path::Path::new("/usr/local/sbin/acme-client").is_file()
+    // 2) OpenBSD acme-client（base 或 pkg）。它没有 dns-01 hook 机制，dns-01 下跳过。
+    if dns01 {
+        log::info!("dns-acme: acme-client 不支持 dns-01 hook，跳过（用 acme.sh 或 certbot）");
+    } else if std::path::Path::new("/usr/local/sbin/acme-client").is_file()
         || std::path::Path::new("/usr/sbin/acme-client").is_file()
     {
         let bin = if std::path::Path::new("/usr/sbin/acme-client").is_file() {
@@ -358,7 +595,7 @@ fn issue(cfg: &AcmeCfg) -> anyhow::Result<()> {
         // acme-client 需要 /etc/acme 配置与账户；挑战目录 webroot
         let mut cmd = std::process::Command::new(bin);
         cmd.arg("-v").arg("-C").arg(&www).arg("-D").arg(&cfg.domain).arg(&cfg.domain);
-        if run_client(&mut cmd, "acme-client").is_some() {
+        if run_client(&mut cmd, "acme-client", &mut failures).is_some() {
             // acme-client 默认产出 /etc/acme/<domain>/{fullchain,privkey}.pem
             let src = std::path::Path::new("/etc/acme").join(&cfg.domain);
             let _ = std::fs::copy(src.join("fullchain.pem"), out_dir.join("fullchain.pem"));
@@ -370,45 +607,344 @@ fn issue(cfg: &AcmeCfg) -> anyhow::Result<()> {
     }
     // 3) certbot：证书固定落在 /etc/letsencrypt/live/<domain>/，必须显式拷进 out_dir 并确认。
     if let Ok(found) = which("certbot") {
+        let mut hook_ok = true;
         let mut cmd = std::process::Command::new(&found);
-        cmd.arg("certonly")
-            .arg("--webroot").arg("-w").arg(&www)
-            .arg("-d").arg(&cfg.domain)
-            .arg("-m").arg(&cfg.email)
-            .arg("--agree-tos")
-            .arg("--non-interactive");
-        // certbot 的 `--server` 只接受 URL（acme.sh 的 `letsencrypt` 别名对它非法）。
-        if let Some(s) = &custom_server {
-            cmd.arg("--server").arg(s);
+        cmd.arg("certonly");
+        if dns01 {
+            // certbot 的 manual dns 模式：auth/cleanup hook 从环境变量拿
+            // CERTBOT_DOMAIN / CERTBOT_VALIDATION。
+            match write_certbot_dns_hook(&home) {
+                Ok(hook) => {
+                    cmd.arg("--manual")
+                        .arg("--preferred-challenges").arg("dns")
+                        .arg("--manual-auth-hook").arg(format!("{} auth", hook.display()))
+                        .arg("--manual-cleanup-hook")
+                        .arg(format!("{} cleanup", hook.display()));
+                }
+                Err(e) => {
+                    log::warn!("dns-acme: 写入 certbot dns hook 失败: {e:#}");
+                    hook_ok = false;
+                }
+            }
+        } else {
+            cmd.arg("--webroot").arg("-w").arg(&www);
         }
-        if cfg.insecure {
-            cmd.arg("--no-verify-ssl");
+        if !hook_ok {
+            attempted.push("certbot（dns hook 写入失败）".to_string());
+        } else {
+            cmd.arg("-d").arg(&cfg.domain)
+                .arg("-m").arg(&cfg.email)
+                .arg("--agree-tos")
+                .arg("--non-interactive");
+            // certbot 的 `--server` 只接受 URL（acme.sh 的 `letsencrypt` 别名对它非法）。
+            if let Some(s) = &custom_server {
+                cmd.arg("--server").arg(s);
+            }
+            if cfg.insecure {
+                cmd.arg("--no-verify-ssl");
+            }
+            if dns01 {
+                cmd.env("CRUCIBLE_ACME_HOOK_DIR", &spool_env);
+            }
+            if run_client(&mut cmd, "certbot", &mut failures).is_some() {
+                let src = std::path::Path::new("/etc/letsencrypt/live").join(domain);
+                let _ = std::fs::copy(src.join("fullchain.pem"), out_dir.join("fullchain.pem"));
+                let _ = std::fs::copy(src.join("privkey.pem"), out_dir.join("privkey.pem"));
+                ensure_installed(&out_dir, "certbot")?;
+                if dns01 {
+                    post_issue_reconcile(dns, "issue");
+                }
+                return Ok(());
+            }
+            attempted.push(format!("certbot（{found}）"));
         }
-        if run_client(&mut cmd, "certbot").is_some() {
-            let src = std::path::Path::new("/etc/letsencrypt/live").join(domain);
-            let _ = std::fs::copy(src.join("fullchain.pem"), out_dir.join("fullchain.pem"));
-            let _ = std::fs::copy(src.join("privkey.pem"), out_dir.join("privkey.pem"));
-            ensure_installed(&out_dir, "certbot")?;
-            return Ok(());
-        }
-        attempted.push(format!("certbot（{found}）"));
     }
     let manual = format!(
         "手动模式：把证书放到 {} 与 {}，或在 dns.dot.cert/key 直接写路径",
         out_dir.join("fullchain.pem").display(),
         out_dir.join("privkey.pem").display()
     );
+    if dns01 {
+        // 失败路径也要收尾：hook 可能已写入 TXT（或上次泄漏），reconcile 会按 DB
+        // 重写 zone 并删掉 journal（挑战记录随之中止）。
+        post_issue_reconcile(dns, "issue-failure");
+    }
     if attempted.is_empty() {
         anyhow::bail!(
             "no acme client available (tried acme.sh / acme-client / certbot) — {manual}"
         );
     }
     // 找到但失败：失败原因（含 rateLimited 标记）已由 log_client_failure 写进服务日志，
-    // 这里把「是哪个客户端失败」带回面板，附上日志检索关键字。
+    // 这里把「是哪个客户端失败」+ 最后一段**可读摘要**（HTML 已剥掉）带回面板。
+    let last = failures
+        .last()
+        .map(|s| format!("；最近失败：{s}"))
+        .unwrap_or_default();
     anyhow::bail!(
-        "ACME 客户端已找到但执行失败：{}（stderr 尾部见服务日志 `dns-acme:` 行）—— {manual}",
-        attempted.join("、")
+        "ACME 客户端已找到但执行失败：{}{}（完整日志见服务日志 `dns-acme:` 行）—— {manual}",
+        attempted.join("、"),
+        last
     )
+}
+
+/// dns-01 收尾：签发结束后用模块的 DB/zone 生成器 reconcile 一次。
+///
+/// 为什么必须做：hook 写入的挑战 TXT 直接进 records 表，签发结束（含失败）后要
+/// 保证 DB/zone 文件/内存三者一致：删掉可能残留的 `_acme-challenge` TXT（hook 崩溃、
+/// acme.sh 被 kill 时 rm 不会执行），再按 DB 重写 zone 并 reload。
+fn post_issue_reconcile(dns: &super::DnsConfig, who: &str) {
+    cleanup_challenge_records(&dns.acme.domain);
+    match super::reconcile(dns) {
+        Ok(()) => log::info!(
+            "dns-acme: post-{who} reconcile ok（清理挑战记录 / 同步 zone 文件与 serial）"
+        ),
+        Err(e) => log::warn!("dns-acme: post-{who} reconcile failed: {e:#}"),
+    }
+}
+
+/// dns-01 请求 spool 目录：hook 写 `.req`，worker 处理后写 `.ack`。
+fn dns01_spool_dir() -> std::path::PathBuf {
+    acme_root().join("dns01-spool")
+}
+
+/// dns-01 spool worker 的生命周期守卫：随 [`issue`] 返回一起停线程并清目录。
+struct Dns01Spool {
+    dir: std::path::PathBuf,
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Dns01Spool {
+    fn start(dns: &super::DnsConfig) -> anyhow::Result<Self> {
+        let dir = dns01_spool_dir();
+        std::fs::create_dir_all(&dir)?;
+        // 上次崩溃残留的 req/ack 一律清掉（否则 worker 会把陈旧挑战写进 zone）。
+        if let Ok(rd) = std::fs::read_dir(&dir) {
+            for e in rd.flatten() {
+                let _ = std::fs::remove_file(e.path());
+            }
+        }
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stop2 = std::sync::Arc::clone(&stop);
+        let d2 = dns.clone();
+        let dir2 = dir.clone();
+        let handle = std::thread::Builder::new()
+            .name("acme-dns01".into())
+            .spawn(move || dns01_worker(dir2, d2, stop2))
+            .map_err(|e| anyhow::anyhow!("spawn dns-01 worker: {e}"))?;
+        Ok(Self { dir, stop, handle: Some(handle) })
+    }
+}
+
+impl Drop for Dns01Spool {
+    fn drop(&mut self) {
+        self.stop
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        if let Some(h) = self.handle.take() {
+            let _ = h.join();
+        }
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
+/// worker 主循环：每 50ms 扫一次 `.req`，处理后原子写 `.ack` 并删除请求。
+fn dns01_worker(
+    dir: std::path::PathBuf,
+    dns: super::DnsConfig,
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+) {
+    while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+        let mut did = false;
+        if let Ok(rd) = std::fs::read_dir(&dir) {
+            for e in rd.flatten() {
+                let p = e.path();
+                // 请求文件名：`req-<随机>.req`；ack 是 `req-<随机>.ack`（扩展名不同）。
+                if p.extension().and_then(|x| x.to_str()) != Some("req") {
+                    continue;
+                }
+                did = true;
+                let id = p
+                    .file_stem()
+                    .and_then(|x| x.to_str())
+                    .unwrap_or("req")
+                    .to_string();
+                let text = std::fs::read_to_string(&p).unwrap_or_default();
+                let mut lines = text.lines();
+                let op = lines.next().unwrap_or("").trim().to_string();
+                let name = lines.next().unwrap_or("").trim().to_string();
+                let value = lines.next().unwrap_or("").trim().to_string();
+                let res = dns01_apply(&dns, &op, &name, &value);
+                let body = match res {
+                    Ok(()) => "ok\n".to_string(),
+                    Err(e) => format!("err {e}\n"),
+                };
+                let ack = dir.join(format!("{id}.ack"));
+                let tmp = dir.join(format!("{id}.ack.tmp"));
+                if std::fs::write(&tmp, body.as_bytes()).is_ok() {
+                    let _ = std::fs::rename(&tmp, &ack);
+                }
+                let _ = std::fs::remove_file(&p);
+            }
+        }
+        if !did {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+    }
+}
+
+/// 执行一条 dns-01 请求：校验名字/值，定位最长匹配的 master 分区，写/删 TXT 记录
+/// 并 reconcile。返回给 hook 的错误必须是可读的（acme.sh 会把 stderr 打出来）。
+fn dns01_apply(
+    dns: &super::DnsConfig,
+    op: &str,
+    name: &str,
+    value: &str,
+) -> Result<(), String> {
+    let name = name.trim().trim_end_matches('.').to_ascii_lowercase();
+    if !name.starts_with("_acme-challenge.") {
+        return Err(format!("refusing non-challenge name: {name}"));
+    }
+    if value.is_empty()
+        || !value
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+    {
+        return Err("bad TXT value（只接受 base64url 字符）".to_string());
+    }
+    let zones = super::list_zones().map_err(|e| format!("list zones: {e:#}"))?;
+    let mut best: Option<(String, String)> = None;
+    for z in zones.iter().filter(|z| z.kind == "master") {
+        if let Some(rel) = super::relative_owner(&name, &z.name) {
+            let better = best
+                .as_ref()
+                .map(|(zn, _)| z.name.len() > zn.len())
+                .unwrap_or(true);
+            if better {
+                best = Some((z.name.clone(), rel));
+            }
+        }
+    }
+    let (zone, rel) = best.ok_or_else(|| format!("no master zone contains {name}"))?;
+    match op {
+        "add" => {
+            super::add_record(&zone, "", &rel, "TXT", 60, value)
+                .map_err(|e| format!("add_record: {e:#}"))?;
+        }
+        "del" | "rm" | "cleanup" => {
+            let found = super::list_records(&zone)
+                .map_err(|e| format!("list records: {e:#}"))?
+                .into_iter()
+                .find(|r| {
+                    r.rtype.eq_ignore_ascii_case("TXT")
+                        && r.name.eq_ignore_ascii_case(&rel)
+                        && r.rdata.trim_matches('"') == value
+                });
+            if let Some(r) = found {
+                super::del_record(r.id).map_err(|e| format!("del_record: {e:#}"))?;
+            }
+        }
+        other => return Err(format!("bad op {other:?}")),
+    }
+    super::reconcile(dns).map_err(|e| format!("reconcile: {e:#}"))?;
+    Ok(())
+}
+
+/// 签发结束后清掉配置域名对应的**全部** `_acme-challenge` TXT（hook 泄漏/崩溃兜底）。
+fn cleanup_challenge_records(domain: &str) {
+    let Some(ch) = super::DnsConfig {
+        acme: AcmeCfg { domain: domain.to_string(), ..Default::default() },
+        ..Default::default()
+    }
+    .acme_challenge_fqdn()
+    else {
+        return;
+    };
+    if let Ok(zones) = super::list_zones() {
+        for z in zones.iter().filter(|z| z.kind == "master") {
+            if let Some(rel) = super::relative_owner(&ch, &z.name) {
+                if let Ok(recs) = super::list_records(&z.name) {
+                    for r in recs {
+                        if r.rtype.eq_ignore_ascii_case("TXT")
+                            && r.name.eq_ignore_ascii_case(&rel)
+                        {
+                            let _ = super::del_record(r.id);
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// 写 hook 脚本共用的 spool 协议函数（shell）。
+const SPOOL_FUNCS: &str = r#"_crucible_spool() {
+  _op="$1"; _name="$2"; _val="$3"
+  case "$_name" in
+    _acme-challenge.*) ;;
+    *) echo "crucible-dns01: refusing non-challenge name: $_name" >&2; return 1 ;;
+  esac
+  case "$_val" in
+    ''|*[!A-Za-z0-9_-]*) echo "crucible-dns01: bad TXT value" >&2; return 1 ;;
+  esac
+  _tmp=$(mktemp "$CRUCIBLE_ACME_HOOK_DIR/.tmp.XXXXXX") || {
+    echo "crucible-dns01: mktemp failed in $CRUCIBLE_ACME_HOOK_DIR" >&2
+    return 1
+  }
+  _base=${_tmp##*/}
+  _id=${_base#.tmp.}
+  _req="$CRUCIBLE_ACME_HOOK_DIR/req-$_id.req"
+  _ack="$CRUCIBLE_ACME_HOOK_DIR/req-$_id.ack"
+  printf '%s\n%s\n%s\n' "$_op" "$_name" "$_val" > "$_tmp" && mv "$_tmp" "$_req"
+  _i=0
+  while [ ! -f "$_ack" ] && [ "$_i" -lt 300 ]; do sleep 0.1; _i=$((_i+1)); done
+  if [ ! -f "$_ack" ]; then
+    echo "crucible-dns01: timeout waiting for webserver to apply $_op $_name" >&2
+    rm -f "$_req"
+    return 1
+  fi
+  if grep -q '^ok' "$_ack"; then rm -f "$_ack" "$_req"; return 0; fi
+  cat "$_ack" >&2; rm -f "$_ack" "$_req"; return 1
+}
+"#;
+
+/// 写出 acme.sh 的自定义 dnsapi hook（dns-01）。
+///
+/// 约定：acme.sh `--dns dns_crucible` 会 source `$LE_WORKING_DIR/dnsapi/dns_crucible.sh`
+/// 并调用 `dns_crucible_add <fulldomain> <txtvalue>` / `dns_crucible_rm ...`。
+/// hook 只把请求写进 `$CRUCIBLE_ACME_HOOK_DIR`，由本进程 worker 通过 zone API 落库。
+fn write_acme_dnsapi_hook(home: &str) -> anyhow::Result<std::path::PathBuf> {
+    let dir = std::path::Path::new(home).join(".acme.sh/dnsapi");
+    std::fs::create_dir_all(&dir)?;
+    let path = dir.join("dns_crucible.sh");
+    let script = format!(
+        "#!/bin/sh\n# Generated by Crucible (dns-01 hook). Do not hand-edit.\n{}dns_crucible_add() {{ _crucible_spool add \"$1\" \"$2\"; }}\ndns_crucible_rm() {{ _crucible_spool del \"$1\" \"$2\"; }}\n",
+        SPOOL_FUNCS
+    );
+    std::fs::write(&path, script)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700));
+    }
+    Ok(path)
+}
+
+/// 写出 certbot 的 manual dns auth/cleanup hook（dns-01）。
+fn write_certbot_dns_hook(home: &str) -> anyhow::Result<std::path::PathBuf> {
+    let dir = std::path::Path::new(home).join(".crucible-acme");
+    std::fs::create_dir_all(&dir)?;
+    let path = dir.join("certbot-dns-hook.sh");
+    let script = format!(
+        "#!/bin/sh\n# Generated by Crucible (certbot dns-01 manual hook). Do not hand-edit.\n# $1 = auth|cleanup; certbot passes CERTBOT_DOMAIN / CERTBOT_VALIDATION.\n{}_name=\"_acme-challenge.${{CERTBOT_DOMAIN}}\"\nif [ \"$1\" = \"cleanup\" ]; then\n  _crucible_spool del \"$_name\" \"$CERTBOT_VALIDATION\"\nelse\n  _crucible_spool add \"$_name\" \"$CERTBOT_VALIDATION\"\nfi\n",
+        SPOOL_FUNCS
+    );
+    std::fs::write(&path, script)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700));
+    }
+    Ok(path)
 }
 
 /// 确认证书与私钥**真的落到了** `out_dir`，且两者配对、私钥权限不过宽。
@@ -527,8 +1063,8 @@ pub(crate) fn install_acme_sh(
 /// 面板「立即签发」的统一入口（admin API 改调它，替代自己拼 acme.sh 命令）：
 /// 与自动续期同一套 CA/参数（`--server letsencrypt`、`ec-256`，不带 `--force`），
 /// 并走同一个进程级互斥。证书仍有效时直接返回 Ok（不重复打 CA 限额）。
-pub fn issue_now(cfg: &AcmeCfg) -> anyhow::Result<()> {
-    issue_if_missing(cfg)
+pub fn issue_now(cfg: &AcmeCfg, dns: &super::DnsConfig) -> anyhow::Result<()> {
+    issue_if_missing(cfg, dns)
 }
 
 fn which(name: &str) -> anyhow::Result<String> {
@@ -698,6 +1234,7 @@ pub fn status(cfg: &AcmeCfg) -> serde_json::Value {
         "cert": cp.display().to_string(),
         "valid": if cp.is_file() { cert_valid(&cp) } else { false },
         "renew_days": cfg.renew_days,
+        "challenge": cfg.challenge_kind().unwrap_or("invalid"),
     })
 }
 
@@ -707,7 +1244,49 @@ fn _unused(_c: &Config) {}
 
 #[cfg(test)]
 mod tests {
-    use super::{ensure_installed, fail_backoff_secs, safe_domain_segment, with_jitter};
+    use super::{
+        ensure_installed, fail_backoff_secs, safe_domain_segment, summarize_client_failure,
+        with_jitter, AcmeCfg,
+    };
+
+    /// G-25：HTML 错误页必须被压成可读摘要，`error code:` / `detail` 行优先保留。
+    #[test]
+    fn html_error_page_is_summarized() {
+        let stderr = "<!DOCTYPE html>\n<html><head><title>502 Bad Gateway</title></head>\n\
+<body>\n<h1>502 Bad Gateway</h1>\n<hr><center>nginx</center>\n</body>\n</html>\n\
+[Mon Oct 20] Please add '--debug' or '--log'.\n\
+[Mon Oct 20] Error code: 7\n\
+[Mon Oct 20] Detail: Fetching https://acme-v02.api.letsencrypt.org/directory: Connection refused\n";
+        let s = summarize_client_failure(stderr);
+        assert!(!s.contains('<'), "HTML 标签必须被剥掉: {s}");
+        assert!(!s.contains("DOCTYPE"), "{s}");
+        assert!(s.contains("Error code: 7"), "关键行必须保留: {s}");
+        assert!(s.contains("Connection refused"), "{s}");
+        assert!(s.len() <= 800, "摘要必须有界: {}", s.len());
+    }
+
+    /// 完全没有关键字行时退化为去标签后的尾部文本，且仍然有界/非空。
+    #[test]
+    fn plain_stderr_falls_back_to_clean_tail() {
+        let s = summarize_client_failure("<b>boom</b>   something   odd\n\n");
+        assert_eq!(s, "boom something odd");
+        assert_eq!(summarize_client_failure(""), "<empty stderr>");
+        let long = "x".repeat(2000);
+        assert!(summarize_client_failure(&long).len() <= 800);
+    }
+
+    /// G-07：challenge 解析 —— 默认 http-01、dns-01 大小写/空白不敏感、未知值可检出。
+    #[test]
+    fn challenge_kind_parsing() {
+        let mut c = AcmeCfg::default();
+        assert_eq!(c.challenge_kind(), Some("http-01"));
+        assert!(!c.challenge_is_dns01());
+        c.challenge = " DNS-01 ".into();
+        assert!(c.challenge_is_dns01());
+        assert_eq!(c.challenge_kind(), Some("dns-01"));
+        c.challenge = "tls-alpn-01".into();
+        assert_eq!(c.challenge_kind(), None);
+    }
 
     #[test]
     fn domain_ok() {
