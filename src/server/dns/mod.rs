@@ -558,6 +558,24 @@ pub struct DotCfg {
     /// 并发连接上限（0 = 用默认 128）
     #[serde(default)]
     pub max_conns: usize,
+    /// G-08：在**站点 TLS listener** 上复用端口提供 DoT（默认关闭，零变化）。
+    ///
+    /// 打开后，任何 `[listeners]` 的 TLS 口在 ClientHello 里声明 ALPN `dot`
+    /// （RFC 7858 / RFC 8310）时，TLS 握手完成后不再进入 HTTP，而是按
+    /// 2 字节长度前缀的 DNS wire 处理（与独立 `[dns.dot].port` 共用同一份
+    /// handler/ACL/限速/上游转发）。没声明 `dot` 的客户端（h1/h2/浏览器）
+    /// 完全不受影响。
+    ///
+    /// 证书：`[dns.dot] cert/key` 配置了就只对分流到 DoT 的连接出示该证书
+    /// （SNI 名字与站点证书不同也能验证通过）；没配置则沿用站点证书。
+    #[serde(default)]
+    pub reuse_tls_port: bool,
+    /// 允许走「端口复用 DoT」的 SNI 白名单（大小写不敏感，忽略末尾点）。
+    ///
+    /// 空 = 只按 ALPN `dot` 判定（不限制 SNI）；非空 = **必须**匹配其中一项，
+    /// 否则该连接按普通站点 TLS 处理（不会拿到 DNS handler）。
+    #[serde(default)]
+    pub sni: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

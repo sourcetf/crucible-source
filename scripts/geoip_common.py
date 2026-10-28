@@ -13,6 +13,100 @@ from typing import Any
 DEFAULT_DB = "data/geoip/current/geoip.sqlite"
 SOURCES_JSON = "data/geoip/current/SOURCES.json"
 PANEL_DB = "data/geoip/panel.sqlite"
+PANEL_TOML = "data/geoip/panel.toml"
+
+# G-10/G-17：Rust `covering::DEFAULT_PATH_PRIORITY_GAIN` 必须与此一致。
+DEFAULT_PATH_PRIORITY_GAIN = 10
+
+# Rust 侧用 i64 saturating 运算；Python 整数无界，必须显式模拟，否则极端权重下
+# 两侧的 (weight + bits*gain, epoch, bits) 评分会分叉（golden 向量把这条钉死）。
+_I64_MAX = (1 << 63) - 1
+_I64_MIN = -(1 << 63)
+
+
+def _sat_i64(v: int) -> int:
+    if v > _I64_MAX:
+        return _I64_MAX
+    if v < _I64_MIN:
+        return _I64_MIN
+    return v
+
+
+def _sat_add(a: int, b: int) -> int:
+    return _sat_i64(a + b)
+
+
+def _sat_mul(a: int, b: int) -> int:
+    return _sat_i64(a * b)
+
+
+def load_panel_settings(panel_path: str | Path | None = None) -> dict[str, Any]:
+    """读 `data/geoip/panel.toml`（面板设置，优先级高于 config.toml `[geoip]`）。
+
+    与 Rust `geoip_panel::toml_store` 同一文件；离线脚本只需要路径增益等少数键。
+    文件缺失/不可读/非法时回落默认值（离线脚本不应因为一份坏面板配置而整体失败）。
+    """
+    import os
+
+    if panel_path is None:
+        panel_path = (
+            os.environ.get("CRUCIBLE_GEOIP_PANEL")
+            or os.environ.get("CRUCIBLE_GEOIP_PANEL_TOML")
+            or PANEL_TOML
+        )
+    path = Path(panel_path)
+    if not path.is_file():
+        return {}
+    try:
+        import tomllib
+
+        with path.open("rb") as f:
+            data = tomllib.load(f)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def load_server_geoip_gain(config_path: str | Path | None = None) -> int:
+    """读 `config.toml [geoip] path_priority_gain`（优先级低于 panel.toml）。
+
+    运行期 Rust 的优先级是 `panel.toml > config.toml [geoip] > 默认 10`。离线
+    Python 若只看 panel.toml，就会出现「config.toml 写了 50、运行期用 50、离线
+    校验仍按 10」的口径分叉（G-10）。配置文件路径与 `webserver --config` 一致：
+    `CRUCIBLE_CONFIG` 环境变量，缺省为当前目录的 `config.toml`。
+    """
+    import os
+
+    if config_path is None:
+        config_path = os.environ.get("CRUCIBLE_CONFIG") or "config.toml"
+    path = Path(config_path)
+    if not path.is_file():
+        return DEFAULT_PATH_PRIORITY_GAIN
+    try:
+        import tomllib
+
+        with path.open("rb") as f:
+            data = tomllib.load(f)
+        geoip = data.get("geoip") if isinstance(data, dict) else None
+        raw = geoip.get("path_priority_gain") if isinstance(geoip, dict) else None
+        return int(raw) if raw is not None else DEFAULT_PATH_PRIORITY_GAIN
+    except Exception:
+        return DEFAULT_PATH_PRIORITY_GAIN
+
+
+def load_path_priority_gain(panel_path: str | Path | None = None) -> int:
+    """当前生效的路径优先级增益：`panel.toml > config.toml [geoip] > 默认 10`。
+
+    与 Rust `Config::load → apply_geoip_panel_settings` 同一优先级；`merge_covering`
+    不传 `path_priority_gain` 时用本函数，保证离线合并与运行期选同一行。
+    """
+    raw = load_panel_settings(panel_path).get("path_priority_gain")
+    if raw is not None:
+        try:
+            return int(raw)
+        except (TypeError, ValueError):
+            pass
+    return load_server_geoip_gain()
 
 EPOCH_FIELDS = (
     "country",
@@ -482,32 +576,84 @@ def load_covering(conn: sqlite3.Connection, ip: str) -> list[sqlite3.Row]:
     #   1.2.4.8 落在 1.2.4.0/24 内，但 '1.2.4.255' >= '1.2.4.8' 为假（'2' < '8'）；
     #   9.0.0.1 与 10.0.0.0 之间同理（'9' > '1'）。
     # 同一修复 Rust 侧早已做（covering.rs: load_from_geoip 用 start_i <= ?1 AND end_i >= ?1）。
+    #
+    # G-10/U-17：v4-mapped（`::ffff:a.b.c.d`）必须先折回 v4 再取数值键。Rust
+    # `covering::load_covering_prefixes` 在入口 unmap，Python 此前没做 ⇒ 双栈
+    # listener 上的同一客户端在离线校验里查不到 v4 段。
     try:
-        n = int(ipaddress.ip_address(ip))
+        addr = ipaddress.ip_address(ip)
     except ValueError:
         return []
+    if isinstance(addr, ipaddress.IPv6Address) and addr.ipv4_mapped is not None:
+        addr = addr.ipv4_mapped
+    n = int(addr)
     cur = conn.execute(
         """SELECT * FROM geoip
            WHERE start_i <= ? AND end_i >= ?
-           ORDER BY COALESCE(commit_unix, 0) ASC, COALESCE(weight, 0) ASC, COALESCE(bits, 0) ASC""",
+           -- 与 Rust `covering::load_from_geoip` 逐键一致（含 rowid 唯一键收尾）：
+           -- 同分行在合并侧「后行胜」，少了 rowid 会让结果依赖查询计划/索引存在性。
+           ORDER BY COALESCE(commit_unix, 0) ASC, COALESCE(weight, 0) ASC,
+                    COALESCE(bits, 0) ASC, rowid ASC""",
         (n, n),
     )
     return list(cur.fetchall())
 
 
-def merge_covering(rows: list[sqlite3.Row]) -> MergedFields:
+# §3.3 查询期过滤（与 Rust `covering::country_vote_ok` / `cn_city_polluted` 同一
+# 判定；离线合并也必须是同一口径，否则 ZZ 行会被 Python 选成国家）。
+_SPECIAL_COUNTRY_CODES = frozenset({"ZZ", "XX", "A1", "A2"})
+_FOREIGN_CITY_WORDS = (
+    "美国", "日本", "英国", "德国", "法国", "韩国", "俄罗斯", "加拿大",
+    "澳大利亚", "新加坡", "印度", "荷兰",
+)
+
+
+def country_vote_ok(cc: str) -> bool:
+    """特殊国家码（ZZ/XX/A1/A2）不参与地理结论。"""
+    return cc.strip().upper() not in _SPECIAL_COUNTRY_CODES
+
+
+def cn_city_polluted(row_country: str, city: str) -> bool:
+    """country=CN 但城市写外国名 → QQWry 污染票。"""
+    if row_country.upper() != "CN":
+        return False
+    return any(word in city for word in _FOREIGN_CITY_WORDS)
+
+
+def merge_covering(
+    rows: list[sqlite3.Row], path_priority_gain: int | None = None
+) -> MergedFields:
+    """按字段合并覆盖行（§23.5 covering merge）。
+
+    G-10：评分与 Rust `covering::merge_covering_fields_with_gain` **逐位一致**：
+    `(weight + bits * gain, epoch, bits)`；同分后行胜；空值不覆盖非空。
+    `gain` 缺省取 `data/geoip/panel.toml` 的 `path_priority_gain`（默认 10）。
+    """
     out = MergedFields()
     if not rows:
         return out
     out.prefixes_merged = len(rows)
+    gain = (
+        int(path_priority_gain)
+        if path_priority_gain is not None
+        else load_path_priority_gain()
+    )
 
     def pick(field: str) -> str:
         best = ""
-        best_score = (-1, -1)
+        best_score: tuple[int, int, int] | None = None
         e_col = f"e_{field}"
         for r in rows:
             keys = r.keys()
-            val = (r[field] or "").strip() if field in keys else ""
+            # 与 Rust 一致：**不 trim**（值原样参与输出；Rust 只判空，不裁剪）。
+            val = (r[field] or "") if field in keys else ""
+            row_country = (r["country"] or "") if "country" in keys else ""
+            # 与 Rust `sanitize` 一致：特殊国家码不参与地理结论；CN 行里的外国
+            # 城市名是 QQWry 污染票，同样丢弃（空值随后被跳过）。
+            if field == "country" and not country_vote_ok(val):
+                val = ""
+            if field == "city" and cn_city_polluted(row_country, val):
+                val = ""
             if not val:
                 continue
             epoch = 0
@@ -517,11 +663,11 @@ def merge_covering(rows: list[sqlite3.Row]) -> MergedFields:
             if epoch <= 0:
                 epoch = cu
             w = int(r["weight"] or 0) if "weight" in keys else 0
-            # 标准合并语义：信任权重优先，其次才是上游 commit_unix（score =
-            # weight * 10^10 + commit_unix 的元组等价形式）；空值不覆盖非空
-            # 由上方 val 判空保证。
-            score = (w, epoch)
-            if score >= best_score:
+            bits = int(r["bits"] or 0) if "bits" in keys else 0
+            # 与 Rust `field_score` 相同：saturating i64 加法/乘法。
+            effective_weight = _sat_add(w, _sat_mul(bits, gain))
+            score = (effective_weight, epoch, bits)
+            if best_score is None or score >= best_score:
                 best = val
                 best_score = score
         return best
@@ -541,12 +687,22 @@ def merge_covering(rows: list[sqlite3.Row]) -> MergedFields:
     out.cloud_service = pick("cloud_service")
     out.hosting = pick("hosting")
     out.division_code = pick("division_code")
-    last = rows[-1]
-    keys = last.keys()
-    out.prefix = (last["prefix"] or f"{last['ip_start']}-{last['ip_end']}") if "prefix" in keys else ""
-    out.bits = int(last["bits"] or 0) if "bits" in keys else 0
-    out.weight = int(last["weight"] or 0) if "weight" in keys else 0
-    out.commit_unix = int(last["commit_unix"] or 0) if "commit_unix" in keys else 0
+    # 命中前缀 / bits：与 Rust `merge_covering_fields` 一致 —— 取最大 bits
+    # （同 bits 后行胜）；weight/commit 取所有行的最大值。旧实现取 SQL 末行，
+    # Rust 取最长前缀，同一个 IP 两侧会报出不同的 prefix/bits。
+    for r in rows:
+        keys = r.keys()
+        rb = int(r["bits"] or 0) if "bits" in keys else 0
+        if not out.prefix or rb >= out.bits:
+            if "prefix" in keys:
+                out.prefix = r["prefix"] or f"{r['ip_start']}-{r['ip_end']}"
+            else:
+                out.prefix = f"{r['ip_start']}-{r['ip_end']}"
+            out.bits = rb
+        out.weight = max(out.weight, int(r["weight"] or 0) if "weight" in keys else 0)
+        out.commit_unix = max(
+            out.commit_unix, int(r["commit_unix"] or 0) if "commit_unix" in keys else 0
+        )
     return out
 
 

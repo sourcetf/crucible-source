@@ -1,0 +1,65 @@
+[package]
+name = "crucible-fuzz"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+httparse = "1"
+anyhow = "1"
+http = "1"
+
+[[bin]]
+name = "h1fast"
+path = "fuzz_targets/h1fast.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "hostval"
+path = "fuzz_targets/hostval.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "dns_wire"
+path = "fuzz_targets/dns_wire.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "rdata"
+path = "fuzz_targets/rdata.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "iputil"
+path = "fuzz_targets/iputil.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "page_rules"
+path = "fuzz_targets/page_rules.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "tlsprobe"
+path = "fuzz_targets/tlsprobe.rs"
+test = false
+doc = false
+bench = false
+
+[workspace]

@@ -5481,3 +5481,55 @@ accept-verify（30xxx 被其它 agent 实例占用），DNS 黑盒已按独立�
 **未做/边界**：dns-01 仍单域名（通配符被 `safe_domain_segment` 拒绝）；302 项全量黑盒
 未并发跑 —— 30xxx 被另一 agent 实例占用（30099/30100/30153/30553），已在报告中如实标注，
 请主会话在空闲窗口补跑。证据：`~/scratch-dnsgap/{gap-final3.log,dnsv3-run.log,evidence/}`。
+
+---
+
+# 【agent-samples / 工号 1009 · Wave-21】G-15 / G-16 两个规格字面缺口关闭（2026-10-26 23:20–次日 00:55 +0800）
+
+**范围**：`www-apps/c/**`、`src/server/apps/{native_http.rs,mod.rs}`（仅 c 分支）、
+`src/server/h3.rs`（仅 DATAGRAM/CONNECT-UDP）、`src/server/connect_udp.rs`、
+`config-test.toml`（仅 c 段）。未 commit/push/checkout/reset/stash/clean；只改上述文件。
+最终二进制 md5 `dae21d73…`（`$CARGO_TARGET_DIR/release/webserver`）；
+C sidecar md5 `b9fc0588…`（`www-apps/c/deps/bin/index`）；HEAD `cacc8b4…`（dirty）。
+
+**G-15 关闭**：`www-apps/c/main.c` 从 6 行 CGI 重写为 1068 行常驻 UDS HTTP/1.1
+sidecar（accept→pthread_create 每连接一线程、keep-alive、GET/HEAD/POST/PUT、
+CGI 环境/`HTTP_*`/`.env`、8KiB 行/64KiB 头/32MiB body/30s 空闲/60s 请求上限、
+400/408/411/413/431/405 错误路径）。`init.sh` 用 `cc -O2 -pthread` 编到
+`deps/bin/index`。`mod.rs` 的 c 分支加 `x-crucible-engine: c-ffi|c-sidecar`（与
+`lib_available` 同判据），FFI 优先、无 `.so` 自动走 sidecar。**验证中发现并修掉**
+阻塞 read 让 deadline 失效：改用 poll 截止时间 + `SO_RCVTIMEO/SNDTIMEO`；A/B 修前
+>36s 仍挂住、修后空闲 30.1s 关闭 / 半截请求 60.1s 回 408。
+真机（34995，h1+h2c）：FFI 与 sidecar 各 38/38（19 引擎 ×2）；100 并发 **100/100、
+100 个不同 pthread、0.58s**；keep-alive 同连接 2 请求；5MiB echo 逐字节一致；
+400/431/413/405 全对。**OpenBSD 7.9 真机**：base clang 19 编译成功并启动 sidecar，
+`nc -U` 打 `/c/?dump=1` → 200、`APP_HELLO`/`HTTP_HOST`/pthread 模式头全部正确
+（`sun_len` 已按 BSD 初始化）。
+
+**G-16 关闭**：CONNECT-UDP 新增 QUIC DATAGRAM 模式。`enable_http_datagram()` 调
+`h3::server::Builder::enable_datagram(true)`（仅 `connect_udp` listener，SETTINGS
+`H3_DATAGRAM=1`）；QUIC transport 声明 `max_datagram_frame_size=65535`。每请求三层
+协商：对端 H3 SETTINGS + `max_datagram_size()` + 请求流 → `Framing::Datagram`；
+否则 `Capsule-Protocol:?1` → Capsules；否则 LengthPrefixed。新增
+`frame/parse_h3_datagram`（qsid=`stream.id().index()`、ContextID 0）、每连接
+`DatagramRouter`（单读任务按 qsid 分发，128 队列满即丢，多隧道不互抢）、下行
+`send_datagram`（TooLarge 丢帧不拆隧道）、DATAGRAM 模式下流上仍接受控制 capsule。
+真机 aioquic 1.3.0（私有 netns，`8.8.8.8:19099` 在 lo）：客户端断言服务端
+`SETTINGS H3_DATAGRAM=1`；QUIC DATAGRAM 双向 echo、同连接双隧道按 qsid 分流、
+2000B 超 MTU 丢弃后隧道存活；transport-only（无 H3 SETTINGS）与普通客户端分别
+回落 Capsules，另测 LengthPrefixed —— 三种 framing 全 PASS。
+
+**回归**：单测 **602 passed / 0 failed / 1 ignored**（Wave-20 基线 581；共享树其他
+agent 新增测试后 602，本波 +2 条 DATAGRAM 单测）；19 引擎 h1+h2c **38/38（FFI）+
+38/38（sidecar）**；黑盒 `accept-verify.sh --no-build` **302 PASS / 0 FAIL / 0 SKIP**
+（149+113+7+24+6+3，含 h3 GOAWAY 7/0）；h3 流控 32MiB sha256/Range/PUT 读回
+`H3 FLOW PASS`。
+
+**边界**：远程 OpenBSD 仅验证 C sample 编译+运行，未在 OpenBSD 上 cargo build / 跑
+G-16（aioquic 未装、生产 1vCPU/磁盘）；G-16 UDP 目标在私有无特权 netns 的 lo 上，
+不访问公网；未使用远程构建锁、未触碰生产配置/二进制。
+
+报告 `.agents/1009/reports/samples-wave21.md`；修复 `.agents/1009/fixes/samples-wave21.md`。
+证据 `~/scratch-samples/logs/{matrix-*-final2,g15-final3,g15-timeout-final2,g16-run-final2,
+h3-g16-final,h3-flow-final,accept-full-final,openbsd-g15}.log`；
+脚本 `~/scratch-samples/{matrix19.py,g15_check.py,g15_timeout.py,g16_check.py,g16_run.sh,h3_flow.py}`。

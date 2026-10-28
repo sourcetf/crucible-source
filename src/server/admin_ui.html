@@ -357,7 +357,8 @@ img.preview{max-width:100%;max-height:420px}
       <div class="row">
         <div><label>启用</label><select id="geoEnabled"><option value="true">true</option><option value="false">false</option></select></div>
         <div style="flex:1"><label>db_path</label><input id="geoDbPath" style="width:100%"/></div>
-        <div><button class="act" id="btnGeoSave">保存开关/路径</button></div>
+        <div><label title="每多一位前缀长度，等效权重增加的数值（0..=1000）">路径增益</label><input id="geoPathGain" size="6" value="10"/></div>
+        <div><button class="act" id="btnGeoSave">保存开关/路径/增益</button></div>
       </div>
       <pre id="geoStatusOut">加载中…</pre>
       <div style="margin-top:10px">
@@ -1666,14 +1667,29 @@ function initGeoTab(){
   const g=CFG.geoip||{};
   $('geoEnabled').value=String(!!g.enabled);
   $('geoDbPath').value=g.db_path||'';
+  $('geoPathGain').value=(g.path_priority_gain!==undefined?g.path_priority_gain:10);
   refreshGeoStatus();
+  // 面板设置真正生效值（panel.toml > config.toml [geoip] > 默认），
+  // 与 CFG 可能不同（手改 panel.toml 后 config 里看不到）。
+  apiJson('/api/geoip/settings').then(r=>{
+    if(!r.ok)return;
+    try{
+      const s=JSON.parse(r.text);
+      if(s.enabled!==undefined)$('geoEnabled').value=String(!!s.enabled);
+      if(s.db_path!==undefined)$('geoDbPath').value=s.db_path||'';
+      if(s.path_priority_gain!==undefined)$('geoPathGain').value=s.path_priority_gain;
+    }catch(e){}
+  });
 }
 async function refreshGeoStatus(){
   const r=await apiJson('/api/geoip/status');
   out('geoStatusOut',r.text,r.ok);
 }
 $('btnGeoSave').onclick=async()=>{
-  const r=await api('/api/geoip/save',jpost({enabled:$('geoEnabled').value==='true',db_path:$('geoDbPath').value.trim()||null}));
+  // G-18：面板设置持久化到 data/geoip/panel.toml（不再改写 config.toml [geoip]）。
+  const gain=parseInt($('geoPathGain').value,10);
+  if(isNaN(gain)){toast('路径增益必须是整数',true);return;}
+  const r=await api('/api/geoip/settings',jpost({enabled:$('geoEnabled').value==='true',db_path:$('geoDbPath').value.trim()||null,path_priority_gain:gain}));
   toast(r.text,!r.ok);
   if(r.ok){await loadCfg();refreshGeoStatus();}
 };

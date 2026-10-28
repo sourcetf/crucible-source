@@ -267,8 +267,14 @@ async fn dispatch_simple(
             }
         }
         // 与 h1 的 c/rust 分支对应：有 .so → FFI；无 .so → deps/bin/index 持久 sidecar
-        //（§16.9 降级路径，旧实现只在 h1 生效）。
-        "c" | "rust" => {
+        //（§16.9 降级路径，旧实现只在 h1 生效）。c 额外打 `c-ffi`/`c-sidecar`
+        // 形态标签（G-15），与 h1 同一判据。
+        "c" => {
+            let resp = simple_sidecar_dispatch(req, lc, app, app_idx, peer, deps_env, &engine)
+                .await;
+            tag_c_engine_simple(resp, app)
+        }
+        "rust" => {
             simple_sidecar_dispatch(req, lc, app, app_idx, peer, deps_env, &engine).await
         }
         // 与 h1 的 go 分支对应（h1 侧同步补上 sidecar 降级，见 dispatch）。
@@ -471,6 +477,38 @@ fn simple_unavailable(engine: &str, msg: String) -> Response<Bytes> {
         .unwrap()
 }
 
+/// G-15：`/c` 的两种形态标签。
+///
+/// `lib_available` 与 `sidecar_engine` fallback 链用的是**同一个判据**
+/// （`app_ffi::resolve_lib` → `is_file`），所以标签与真实路径一致：
+///   * `.so` 在 → in-process FFI（`c-ffi`）；
+///   * `.so` 不在 → `deps/bin/index` 的 pthread-per-connection sidecar（`c-sidecar`）。
+/// 只加一个响应头，不改状态码/正文；h1 与 h2/h3 用同一口径。
+fn c_engine_mode(app: &AppRouteConfig) -> &'static str {
+    if native_http::lib_available(app, "c") {
+        "c-ffi"
+    } else {
+        "c-sidecar"
+    }
+}
+
+fn tag_c_engine_h1(
+    mut resp: Response<BoxBody>,
+    app: &AppRouteConfig,
+) -> Response<BoxBody> {
+    if let Ok(v) = http::HeaderValue::from_str(c_engine_mode(app)) {
+        resp.headers_mut().insert("x-crucible-engine", v);
+    }
+    resp
+}
+
+fn tag_c_engine_simple(mut resp: Response<Bytes>, app: &AppRouteConfig) -> Response<Bytes> {
+    if let Ok(v) = http::HeaderValue::from_str(c_engine_mode(app)) {
+        resp.headers_mut().insert("x-crucible-engine", v);
+    }
+    resp
+}
+
 pub fn match_app<'a>(
     lc: &'a ListenerConfig,
     path: &str,
@@ -615,7 +653,21 @@ async fn dispatch(
         // 的 `handle_with_fallback_simple` 有两处偏差 —— 不检查显式 socket，且「无后端」
         // 时的 502 文本不同（h1 `no libapp_c.so; run make engines` vs h2 `unavailable
         // (no libapp_c.so, sidecar, or socket)`）。统一到一个实现即消除全部偏差。
-        "c" | "rust" => {
+        "c" => {
+            let res = match sidecar_engine::handle_with_fallback(
+                req, lc, app, peer, app_idx, &engine, &engine,
+            )
+            .await
+            {
+                Ok(r) => r,
+                Err(e) => engine_error("native sidecar", &e),
+            };
+            // G-15：`/c` 有 `.so` 走 FFI、没有则走 pthread-per-conn sidecar。
+            // 用同一判据（`lib_available`，与 fallback 链内部同源）打标签，
+            // 让运维/验收能直接从响应区分两种形态（不改变状态码/body）。
+            tag_c_engine_h1(res, app)
+        }
+        "rust" => {
             match sidecar_engine::handle_with_fallback(
                 req, lc, app, peer, app_idx, &engine, &engine,
             )

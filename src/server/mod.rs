@@ -215,11 +215,15 @@ pub async fn run(live: Arc<LiveConfig>) -> Result<()> {
                     let need = match listener_addrs(lc) {
                         Ok(addrs) => {
                             let a = active_r.lock().await;
-                            // 地址没绑上 ⇒ 重建；**或 h3 端点不在跑**（例如 http_versions
-                            // 去掉 h3 后端点停了，之后又重新加回）⇒ 也要重建，否则 QUIC 面
-                            // 永远不恢复（端点任务已退出，仅靠地址记账看不出来）。
-                            addrs.iter().any(|ad| !a.contains(&addr_key(&key, ad)))
-                                || (lc.allows_h3() && !a.contains(&format!("h3|{key}")))
+                            // 任一 accept socket（reuse_port 下同一地址有 N 个）没绑上 ⇒
+                            // 重建；**或 h3 端点不在跑**（例如 http_versions 去掉 h3 后端点
+                            // 停了，之后又重新加回）⇒ 也要重建，否则 QUIC 面永远不恢复
+                            // （端点任务已退出，仅靠地址记账看不出来）。
+                            addrs.iter().any(|ad| {
+                                addr_keys(lc, &key, ad)
+                                    .iter()
+                                    .any(|k| !a.contains(k))
+                            }) || (lc.allows_h3() && !a.contains(&format!("h3|{key}")))
                         }
                         Err(_) => true,
                     };
@@ -277,12 +281,39 @@ pub async fn run(live: Arc<LiveConfig>) -> Result<()> {
 /// 报成功、socket 却**不重建**，仍全网卡监听（以为收紧了暴露面，实际没有）；
 /// 同端口不同地址的两个 listener 也只会绑第一个，第二个**永不监听且无告警**。
 pub fn bind_key(lc: &crate::config::ListenerConfig) -> String {
-    format!(
+    let base = format!(
         "{}|{}|{}",
         lc.address,
         lc.address_v6.as_deref().unwrap_or(""),
         lc.port
-    )
+    );
+    // G-13：SO_REUSEPORT 的开关与 loop 数必须参与绑定键 —— 否则把
+    // `reuse_port` 从 false 改成 true（地址/端口不变）时 reconciler 认为「已经绑好」
+    // 而不会重建 socket，开关形同虚设。false 时**不加后缀**，保持历史键逐字不变
+    // （`reuse_port=false` 完全回到现状）。
+    if lc.reuse_port {
+        format!("{base}|rp{}", reuse_port_workers(lc))
+    } else {
+        base
+    }
+}
+
+/// G-13：`reuse_port = true` 时每个地址要绑几个 SO_REUSEPORT socket（= accept loop 数）。
+///
+/// 默认按 CPU 数（规格「每 CPU 可配」），钳到 1..=32；显式配置优先。`reuse_port = false`
+/// 时恒为 1（不设 SO_REUSEPORT，完全沿用旧路径）。
+fn reuse_port_workers(lc: &crate::config::ListenerConfig) -> usize {
+    if !lc.reuse_port {
+        return 1;
+    }
+    lc.reuse_port_workers
+        .filter(|n| *n > 0)
+        .unwrap_or_else(|| {
+            std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(1)
+        })
+        .clamp(1, 32)
 }
 
 /// 单个**地址**的存活键 = `bind_key` + 该地址。
@@ -294,8 +325,26 @@ pub fn bind_key(lc: &crate::config::ListenerConfig) -> String {
 /// EADDRINUSE，`spawn_listener_port` 返回 Err 并把**刚绑上的 v4 一起丢掉** —— 每 2s
 /// 重试、永远失败，该监听口的 v4 半边**永久**不可用，只能重启进程恢复。
 /// 按地址记账后，失败的地址单独重试，已经服务中的地址不受牵连。
+///
+/// G-13：`reuse_port` 下同一地址有 N 个 socket，每个 socket 再带 `#rp<i>` 后缀
+/// （否则重建时只认「有一个 socket 活着」，挂掉的那几个永远不会补）。非 reuse_port
+/// 时后缀为空，键与历史实现逐字一致。
 fn addr_key(key: &str, addr: &std::net::SocketAddr) -> String {
     format!("{key}@{addr}")
+}
+
+fn addr_keys(
+    lc: &crate::config::ListenerConfig,
+    key: &str,
+    addr: &std::net::SocketAddr,
+) -> Vec<String> {
+    let base = addr_key(key, addr);
+    let n = reuse_port_workers(lc);
+    if n <= 1 {
+        vec![base]
+    } else {
+        (0..n).map(|i| format!("{base}#rp{i}")).collect()
+    }
 }
 
 /// 这个 listener 需要绑定的全部地址（与 `spawn_listener_port` 的绑定逻辑共用同一份构造，
@@ -338,126 +387,38 @@ fn listener_addrs(
 /// `v6only` 只在「同一 listener 同时绑 v4 与 v6」时为真（此时必须切开两个 socket）；
 /// 只配单个 v6 地址时不改默认，保留「Linux 上 `[::]` 单栈即可覆盖双栈」的既有行为
 /// （避免把 `address = "::"` 这种单地址配置意外收窄成 v6-only）。
-fn bind_tcp(addr: SocketAddr, v6only: bool) -> std::io::Result<std::net::TcpListener> {
-    use std::os::fd::{FromRawFd, RawFd};
+fn bind_tcp(
+    addr: SocketAddr,
+    v6only: bool,
+    reuse_port: bool,
+) -> std::io::Result<std::net::TcpListener> {
+    use socket2::{Domain, Protocol, Socket, Type};
 
-    let family = if addr.is_ipv6() {
-        libc::AF_INET6
+    let domain = if addr.is_ipv6() {
+        Domain::IPV6
     } else {
-        libc::AF_INET
+        Domain::IPV4
     };
-    let fd: RawFd = unsafe { libc::socket(family, libc::SOCK_STREAM, 0) };
-    if fd < 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    // 从这里起任何失败都要先 close(fd)，否则 fd 泄漏。
-    let close = |fd: RawFd| unsafe {
-        libc::close(fd);
-    };
-    let set_int =
-        |fd: RawFd, level: libc::c_int, name: libc::c_int, val: libc::c_int| -> std::io::Result<()> {
-            let rc = unsafe {
-                libc::setsockopt(
-                    fd,
-                    level,
-                    name,
-                    &val as *const libc::c_int as *const libc::c_void,
-                    std::mem::size_of::<libc::c_int>() as libc::socklen_t,
-                )
-            };
-            if rc != 0 {
-                Err(std::io::Error::last_os_error())
-            } else {
-                Ok(())
-            }
-        };
-
+    let socket = Socket::new(domain, Type::STREAM, Some(Protocol::TCP))?;
     // SO_REUSEADDR：与 tokio 在 unix 上的 bind 行为保持一致（TIME_WAIT 友好）。
-    if let Err(e) = set_int(fd, libc::SOL_SOCKET, libc::SO_REUSEADDR, 1) {
-        close(fd);
-        return Err(e);
+    socket.set_reuse_address(true)?;
+    // G-13：可选 SO_REUSEPORT（Linux/OpenBSD 同名选项）。默认关 ⇒ 不设，
+    // socket 选项面与历史实现完全一致（零行为变化）。
+    //
+    // 同一 listener 的 N 个 socket 都必须带这个选项才能绑定同一 address:port；
+    // 内核在它们之间按四元组哈希分发新连接（不保证均分）。
+    if reuse_port {
+        socket.set_reuse_port(true)?;
     }
     if v6only {
         // 只有 v6 socket 谈得上 IPV6_V6ONLY；对 v4 socket 设它会得到 ENOPROTOOPT。
-        if let Err(e) = set_int(fd, libc::IPPROTO_IPV6, libc::IPV6_V6ONLY, 1) {
-            close(fd);
-            return Err(e);
-        }
+        socket.set_only_v6(true)?;
     }
-
-    // 组装 sockaddr。BSD 的 sockaddr_in/sockaddr_in6 有 len 字段、Linux 没有 → 用 cfg 处理。
-    let mut storage: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
-    let len = match addr {
-        SocketAddr::V4(v4) => {
-            let sin = unsafe {
-                &mut *(&mut storage as *mut libc::sockaddr_storage as *mut libc::sockaddr_in)
-            };
-            sin.sin_family = libc::AF_INET as libc::sa_family_t;
-            sin.sin_port = v4.port().to_be();
-            sin.sin_addr.s_addr = u32::from(*v4.ip()).to_be();
-            #[cfg(any(
-                target_os = "openbsd",
-                target_os = "netbsd",
-                target_os = "freebsd",
-                target_os = "dragonfly",
-                target_os = "macos",
-                target_os = "ios"
-            ))]
-            {
-                sin.sin_len = std::mem::size_of::<libc::sockaddr_in>() as u8;
-            }
-            std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t
-        }
-        SocketAddr::V6(v6) => {
-            let sin6 = unsafe {
-                &mut *(&mut storage as *mut libc::sockaddr_storage as *mut libc::sockaddr_in6)
-            };
-            sin6.sin6_family = libc::AF_INET6 as libc::sa_family_t;
-            sin6.sin6_port = v6.port().to_be();
-            sin6.sin6_addr = libc::in6_addr {
-                s6_addr: v6.ip().octets(),
-            };
-            sin6.sin6_scope_id = v6.scope_id();
-            #[cfg(any(
-                target_os = "openbsd",
-                target_os = "netbsd",
-                target_os = "freebsd",
-                target_os = "dragonfly",
-                target_os = "macos",
-                target_os = "ios"
-            ))]
-            {
-                sin6.sin6_len = std::mem::size_of::<libc::sockaddr_in6>() as u8;
-            }
-            std::mem::size_of::<libc::sockaddr_in6>() as libc::socklen_t
-        }
-    };
-    let rc = unsafe {
-        libc::bind(
-            fd,
-            &storage as *const libc::sockaddr_storage as *const libc::sockaddr,
-            len,
-        )
-    };
-    if rc != 0 {
-        let e = std::io::Error::last_os_error();
-        close(fd);
-        return Err(e);
-    }
-    if unsafe { libc::listen(fd, 1024) } != 0 {
-        let e = std::io::Error::last_os_error();
-        close(fd);
-        return Err(e);
-    }
-    // 非阻塞（tokio 要求）+ CLOEXEC（避免被引擎子进程继承监听 fd）。
-    unsafe {
-        let fl = libc::fcntl(fd, libc::F_GETFL);
-        if fl >= 0 {
-            libc::fcntl(fd, libc::F_SETFL, fl | libc::O_NONBLOCK);
-        }
-        libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC);
-    }
-    Ok(unsafe { std::net::TcpListener::from_raw_fd(fd) })
+    // tokio 要求非阻塞；CLOEXEC 避免被引擎子进程继承监听 fd。
+    socket.set_nonblocking(true)?;
+    socket.bind(&addr.into())?;
+    socket.listen(1024)?;
+    Ok(socket.into())
 }
 
 async fn spawn_listener_port(
@@ -473,33 +434,46 @@ async fn spawn_listener_port(
     // 双栈（同时有 v4 与 v6 地址）时，v6 socket 必须显式 V6ONLY，否则 Linux 上两个 bind
     // 会冲突（见 `bind_tcp`）。单地址/单栈配置不改默认。
     let dual_stack = addrs.iter().any(|a| a.is_ipv4()) && addrs.iter().any(|a| a.is_ipv6());
-    // 逐地址登记 + 逐地址绑定：**部分失败不牵连已经绑上的地址**（见 `addr_key` 的说明）。
-    let mut listeners: Vec<(SocketAddr, tokio::net::TcpListener)> = Vec::new();
+    // 逐地址 / 逐 accept socket 登记 + 绑定：**部分失败不牵连已经绑上的 socket**
+    // （见 `addr_key` 的说明）。G-13：`reuse_port = true` 时同一地址有 N 个
+    // SO_REUSEPORT socket（N = `reuse_port_workers`，默认 nproc）；false 时 N = 1，
+    // 路径与历史实现一致。
+    let workers = reuse_port_workers(&lc);
+    // 第三项 = SO_REUSEPORT accept loop 序号（非 reuse_port 恒 0），只用于诊断计数
+    //（见 `accept_loop` 的 `target: "accept_loop"` 日志）。
+    let mut listeners: Vec<(SocketAddr, String, usize, tokio::net::TcpListener)> = Vec::new();
     let mut first_err: Option<anyhow::Error> = None;
-    // 有多少地址**已经**在跑（本次被跳过）。用于区分「本次没绑任何新地址」的两种含义：
+    // 有多少 socket **已经**在跑（本次被跳过）。用于区分「本次没绑任何新 socket」的两种含义：
     //   ① 全都已经在跑（正常，无需重建 TCP）  ② 全都绑失败（真失败）。
     let mut already_active = 0usize;
     for addr in addrs.iter().copied() {
-        let akey = addr_key(&key, &addr);
-        {
-            let mut a = active.lock().await;
-            if a.contains(&akey) {
-                already_active += 1;
-                continue; // 这个地址已有活着的 accept 任务
+        for (i, akey) in addr_keys(&lc, &key, &addr).into_iter().enumerate() {
+            {
+                let mut a = active.lock().await;
+                if a.contains(&akey) {
+                    already_active += 1;
+                    continue; // 这个 socket 已有活着的 accept 任务
+                }
+                a.insert(akey.clone());
             }
-            a.insert(akey.clone());
-        }
-        // 用 `bind_tcp` 而不是 `TcpListener::bind`：只有前者能在 bind 前设 IPV6_V6ONLY。
-        let bound = bind_tcp(addr, addr.is_ipv6() && dual_stack)
-            .and_then(tokio::net::TcpListener::from_std);
-        match bound {
-            Ok(l) => listeners.push((addr, l)),
-            Err(e) => {
-                // 只注销**这个地址**的账，让 reconciler 2s 后单独重试它；
-                // 兄弟地址（例如已经绑上的 v4）不受影响。
-                active.lock().await.remove(&akey);
-                if first_err.is_none() {
-                    first_err = Some(anyhow::Error::new(e).context(format!("bind {addr}")));
+            // 用 `bind_tcp` 而不是 `TcpListener::bind`：只有前者能在 bind 前设
+            // IPV6_V6ONLY，以及（G-13）可选的 SO_REUSEPORT。
+            let bound = bind_tcp(addr, addr.is_ipv6() && dual_stack, lc.reuse_port)
+                .and_then(tokio::net::TcpListener::from_std);
+            match bound {
+                Ok(l) => listeners.push((addr, akey, i, l)),
+                Err(e) => {
+                    // 只注销**这个 socket** 的账，让 reconciler 2s 后单独重试它；
+                    // 兄弟 socket（其它 rp 序号、v4/v6 对侧）不受影响。
+                    active.lock().await.remove(&akey);
+                    if first_err.is_none() {
+                        let what = if workers > 1 {
+                            format!("bind {addr} (SO_REUSEPORT loop {i}/{workers})")
+                        } else {
+                            format!("bind {addr}")
+                        };
+                        first_err = Some(anyhow::Error::new(e).context(what));
+                    }
                 }
             }
         }
@@ -508,30 +482,37 @@ async fn spawn_listener_port(
     // 用配置里的第一个地址 —— 它必然已经在 active 里（否则不会被跳过），UDP 与 TCP 不冲突。
     let h3_addr = listeners
         .first()
-        .map(|(a, _)| *a)
+        .map(|(a, _, _, _)| *a)
         .or_else(|| addrs.first().copied());
     // 这个 listener 是否有任何一个地址在服务（本次新绑 或 早已在跑）。用于区分
     // 「没绑新地址是因为全在跑」与「全绑失败」（后者 first_err 为 Some，另有返回）。
     let bound_or_active = !listeners.is_empty() || already_active > 0;
 
     if !listeners.is_empty() {
-        maybe_set_busy_poll(&listeners[0].1);
-        for (a, _) in &listeners {
-            log::info!("listener[{idx}] ready on {a} root={}", lc.root.display());
+        maybe_set_busy_poll(&listeners[0].3);
+        for (a, _, _, _) in &listeners {
+            log::info!(
+                "listener[{idx}] ready on {a} root={}{}",
+                lc.root.display(),
+                if workers > 1 {
+                    format!(" (SO_REUSEPORT × {workers} accept loops)")
+                } else {
+                    String::new()
+                }
+            );
         }
     }
 
-    for (a, listener) in listeners {
+    for (a, akey_c, slot, listener) in listeners {
         let live_c = Arc::clone(&live);
         let active_c = Arc::clone(&active);
         let key_c = key.clone();
-        let akey_c = addr_key(&key, &a);
         tokio::spawn(async move {
             // 把**实际绑定的地址**（而不是配置里的字符串）交给连接分发：
             // 同端口不同地址的两个 listener 各自服务自己的站点（C-2）。
-            let res = accept_loop(listener, live_c, key_c.clone(), a).await;
-            // 只注销**自己这个地址**的账 —— 抹掉整个 `key` 会让兄弟地址失去记账，
-            // 下次重建时兄弟地址被重复 bind（EADDRINUSE）并把已绑上的一起丢掉。
+            let res = accept_loop(listener, live_c, key_c.clone(), a, slot).await;
+            // 只注销**自己这个 socket** 的账 —— 抹掉整个 `key` 会让兄弟 socket 失去记账，
+            // 下次重建时兄弟被重复 bind（EADDRINUSE）并把已绑上的一起丢掉。
             active_c.lock().await.remove(&akey_c);
             log::warn!("accept_loop {a} ended: {res:?}");
         });
@@ -620,6 +601,7 @@ async fn accept_loop(
     live: Arc<LiveConfig>,
     key: String,
     local: std::net::SocketAddr,
+    slot: usize,
 ) -> Result<()> {
     // 配置重查定时器：**整个循环只建一次**。
     //
@@ -639,6 +621,12 @@ async fn accept_loop(
     let mut recheck = tokio::time::interval(std::time::Duration::from_secs(2));
     recheck.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     recheck.tick().await; // interval 的首个 tick 立即就绪，先消费掉
+    // G-13 诊断计数：每个 accept loop（= 每个 SO_REUSEPORT 监听 socket）各记一份，
+    // 每 2s 的 recheck 拍里若计数有变化就以 `target: "accept_loop"` 打一条 debug。
+    // 这是「多 accept 真的都在收连接」的直接证据（`RUST_LOG=accept_loop=debug` 可见），
+    // 默认日志级别下零输出、零热路径开销（一次自增）。
+    let mut accepts: u64 = 0;
+    let mut accepts_logged: u64 = 0;
     'accept: loop {
         let accept = listener.accept();
         tokio::pin!(accept);
@@ -667,6 +655,15 @@ async fn accept_loop(
                     }
                 },
                 _ = recheck.tick() => {
+                    if accepts != accepts_logged {
+                        log::debug!(
+                            target: "accept_loop",
+                            "accept_loop {local} slot#{slot} accepted {} (+{}) connections",
+                            accepts,
+                            accepts - accepts_logged
+                        );
+                        accepts_logged = accepts;
+                    }
                     let snap = live.snapshot();
                     if !snap.listeners.iter().any(|l| crate::server::bind_key(l) == key) {
                         log::info!(
@@ -677,6 +674,7 @@ async fn accept_loop(
                 }
             }
         };
+        accepts += 1;
         maybe_set_busy_poll_stream(&stream);
         // TCP_NODELAY：**必须**开。默认（Nagle）下小响应会被攒着等 ACK，与对端
         // 延迟 ACK 叠加后每个 keep-alive 请求白等 1–40ms —— 实测在本机把 p50 从
@@ -1081,6 +1079,25 @@ mod bind_key_tests {
             crate::server::bind_key(&same),
             "端口必须参与键"
         );
+
+        // G-13：reuse_port 开关与 loop 数必须参与键（否则改了开关不会重建 socket）；
+        // false 时键必须与历史实现逐字一致（零变化）。
+        let mut rp = a.clone();
+        rp.reuse_port = true;
+        rp.reuse_port_workers = Some(4);
+        assert_ne!(
+            crate::server::bind_key(&a),
+            crate::server::bind_key(&rp),
+            "reuse_port 必须参与键（改开关要重建 socket）"
+        );
+        assert!(crate::server::bind_key(&rp).ends_with("|rp4"));
+        let mut rp2 = rp.clone();
+        rp2.reuse_port_workers = Some(8);
+        assert_ne!(
+            crate::server::bind_key(&rp),
+            crate::server::bind_key(&rp2),
+            "reuse_port_workers 变化要重建 accept loop"
+        );
     }
 }
 
@@ -1112,9 +1129,9 @@ mod bind_tcp_tests {
     /// `IPV6_V6ONLY=1`。没有这条测试，有人把 `v6only` 参数去掉也不会有测试变红。
     #[test]
     fn dual_stack_same_port_binds_both() {
-        let v4 = bind_tcp("0.0.0.0:0".parse().unwrap(), false).expect("v4 wildcard bind");
+        let v4 = bind_tcp("0.0.0.0:0".parse().unwrap(), false, false).expect("v4 wildcard bind");
         let port = v4.local_addr().unwrap().port();
-        let v6 = bind_tcp(format!("[::]:{port}").parse().unwrap(), true);
+        let v6 = bind_tcp(format!("[::]:{port}").parse().unwrap(), true, false);
         assert!(
             v6.is_ok(),
             "dual-stack：同端口 v6 必须能绑（V6ONLY=1），实际 {:?}",
@@ -1126,15 +1143,47 @@ mod bind_tcp_tests {
     /// 只配单个 v6 地址时不设 V6ONLY —— 保留 Linux 上「`[::]` 单栈即覆盖双栈」的行为。
     #[test]
     fn single_v6_keeps_default_v6only() {
-        let l = bind_tcp("[::]:0".parse().unwrap(), false).expect("v6 bind");
+        let l = bind_tcp("[::]:0".parse().unwrap(), false, false).expect("v6 bind");
         // Linux 默认 v6only=0（双栈）；这里只断言「没有被我们改成 1」。
         assert_eq!(v6only_of(&l), 0, "单 v6 地址不应被强制 V6ONLY=1");
     }
 
     #[test]
     fn v4_socket_binds_and_is_v4() {
-        let l = bind_tcp("127.0.0.1:0".parse().unwrap(), false).expect("v4 bind");
+        let l = bind_tcp("127.0.0.1:0".parse().unwrap(), false, false).expect("v4 bind");
         assert!(l.local_addr().unwrap().is_ipv4());
+    }
+
+    /// G-13：`SO_REUSEPORT` 下同一 `address:port` 必须能绑 N 个 socket；关掉时
+    /// 第二个 bind 必须失败（证明 `reuse_port=false` 真的没有改变 socket 语义）。
+    ///
+    /// 这条同时钉住 `bind_tcp` 的 `reuse_port` 参数确实落到了 socket 选项上 ——
+    /// 只把配置字段解析出来而不设选项，第二个 bind 会 EADDRINUSE，测试立刻变红。
+    #[test]
+    fn reuse_port_allows_multiple_sockets_and_off_keeps_old_semantics() {
+        // 先拿一个空闲端口（用 v4 临时 socket），再关掉它，用同一端口做实验。
+        let probe = bind_tcp("127.0.0.1:0".parse().unwrap(), false, false).expect("probe bind");
+        let port = probe.local_addr().unwrap().port();
+        drop(probe);
+
+        let a = bind_tcp(format!("127.0.0.1:{port}").parse().unwrap(), false, true)
+            .expect("reuse_port socket #0");
+        let b = bind_tcp(format!("127.0.0.1:{port}").parse().unwrap(), false, true)
+            .expect("reuse_port socket #1");
+        assert_eq!(a.local_addr().unwrap().port(), port);
+        assert_eq!(b.local_addr().unwrap().port(), port);
+        drop(a);
+        drop(b);
+
+        // reuse_port=false：第二个 bind 必须被内核拒绝（旧语义）。
+        let a = bind_tcp(format!("127.0.0.1:{port}").parse().unwrap(), false, false)
+            .expect("plain socket #0");
+        let b = bind_tcp(format!("127.0.0.1:{port}").parse().unwrap(), false, false);
+        assert!(
+            b.is_err(),
+            "reuse_port=false 时同端口第二个 bind 必须失败（否则说明 SO_REUSEPORT 被误设）"
+        );
+        drop(a);
     }
 }
 

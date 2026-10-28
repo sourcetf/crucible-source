@@ -65,6 +65,9 @@ pub fn list_sources(conn: &Connection) -> Result<Vec<SourceRow>> {
     Ok(out)
 }
 
+// G-19 标注：离线管线（Python `geoip_update.sh`）直接写 panel_sources；
+// Rust 侧暂无调用点，保留为「源刷新回写」API。
+#[allow(dead_code)]
 pub fn record_source_refresh(
     conn: &Connection,
     name: &str,

@@ -29,12 +29,6 @@ pub fn ipv4_to_u32(s: &str) -> Option<u32> {
     s.trim().parse::<Ipv4Addr>().ok().map(u32::from)
 }
 
-/// Format u32 as dotted IPv4.
-pub fn u32_to_ipv4(n: u32) -> String {
-    Ipv4Addr::from(n).to_string()
-}
-
-
 /// IPv6 → u128 host order for numeric range compares.
 pub fn ipv6_to_u128(s: &str) -> Option<u128> {
     s.trim().parse::<Ipv6Addr>().ok().map(u128::from)
@@ -169,53 +163,8 @@ pub fn normalize_cidr_prefix(s: &str) -> Option<String> {
     }
 }
 
-/// Normalize IPv6 to canonical compressed form; IPv4 unchanged.
-pub fn normalize_ip(addr: IpAddr) -> String {
-    match addr {
-        IpAddr::V4(v4) => v4.to_string(),
-        IpAddr::V6(v6) => canonical_ipv6(v6).to_string(),
-    }
-}
-
-fn canonical_ipv6(v6: Ipv6Addr) -> Ipv6Addr {
-    let segments = v6.segments();
-    let mut best_start = 0usize;
-    let mut best_len = 0usize;
-    let mut cur_start = 0usize;
-    let mut cur_len = 0usize;
-    for (i, &seg) in segments.iter().enumerate() {
-        if seg == 0 {
-            if cur_len == 0 {
-                cur_start = i;
-            }
-            cur_len += 1;
-            if cur_len > best_len {
-                best_len = cur_len;
-                best_start = cur_start;
-            }
-        } else {
-            cur_len = 0;
-        }
-    }
-    if best_len < 2 {
-        return v6;
-    }
-    let mut out = String::new();
-    for (i, &seg) in segments.iter().enumerate() {
-        if i == best_start {
-            out.push_str("::");
-            continue;
-        }
-        if i > best_start && i < best_start + best_len {
-            continue;
-        }
-        if !out.is_empty() && !out.ends_with("::") {
-            out.push(':');
-        }
-        out.push_str(&format!("{seg:x}"));
-    }
-    out.parse().unwrap_or(v6)
-}
+// G-19：`normalize_ip` / `canonical_ipv6` 全树无调用者（RFC 5952 压缩逻辑没有任何
+// 入口使用；查询侧统一用 `unmap_v4_mapped(...).to_string()`），已删除。
 
 #[cfg(test)]
 mod tests {

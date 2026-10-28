@@ -1,0 +1,165 @@
+{
+  "comment": "G-10 golden vectors: Rust src/server/geoip_panel/covering.rs and Python scripts/geoip_common.py must produce identical merged fields for these inputs. Score = (weight + bits * path_priority_gain, epoch, bits); equal scores -> later row wins; empty never overwrites non-empty.",
+  "path_priority_gain": 10,
+  "cases": [
+    {
+      "name": "weight_dominates_bits",
+      "rows": [
+        {"country": "US", "weight": 300, "bits": 8, "commit_unix": 100},
+        {"country": "CN", "weight": 50, "bits": 24, "commit_unix": 100}
+      ],
+      "expected": {"country": "US"}
+    },
+    {
+      "name": "prefix_length_wins_at_equal_weight",
+      "rows": [
+        {"country": "AA", "weight": 100, "bits": 8, "commit_unix": 1},
+        {"country": "BB", "weight": 100, "bits": 24, "commit_unix": 1}
+      ],
+      "expected": {"country": "BB"}
+    },
+    {
+      "name": "newer_commit_wins_when_score_equal",
+      "rows": [
+        {"country": "AA", "weight": 100, "bits": 8, "commit_unix": 10},
+        {"country": "BB", "weight": 100, "bits": 8, "commit_unix": 20}
+      ],
+      "expected": {"country": "BB"}
+    },
+    {
+      "name": "field_epoch_beats_commit_unix",
+      "rows": [
+        {"country": "AA", "weight": 100, "bits": 8, "commit_unix": 500, "e_country": 0},
+        {"country": "BB", "weight": 100, "bits": 8, "commit_unix": 10, "e_country": 600}
+      ],
+      "expected": {"country": "BB"}
+    },
+    {
+      "name": "equal_score_last_row_wins",
+      "rows": [
+        {"country": "AA", "weight": 100, "bits": 8, "commit_unix": 5},
+        {"country": "BB", "weight": 100, "bits": 8, "commit_unix": 5}
+      ],
+      "expected": {"country": "BB"}
+    },
+    {
+      "name": "empty_never_overwrites_non_empty",
+      "rows": [
+        {"country": "CN", "city": "Hangzhou", "weight": 10, "bits": 8, "commit_unix": 1},
+        {"country": "", "city": "", "weight": 9999, "bits": 32, "commit_unix": 9}
+      ],
+      "expected": {"country": "CN", "city": "Hangzhou"}
+    },
+    {
+      "name": "bits_breaks_score_tie",
+      "rows": [
+        {"country": "AA", "weight": 120, "bits": 8, "commit_unix": 7},
+        {"country": "BB", "weight": 40, "bits": 16, "commit_unix": 7}
+      ],
+      "expected": {"country": "BB"}
+    },
+    {
+      "name": "per_field_independent_winners",
+      "rows": [
+        {"country": "US", "province": "CA", "city": "San Jose", "asn": "111", "weight": 900, "bits": 16, "commit_unix": 100},
+        {"country": "", "province": "", "city": "Shanghai", "asn": "222", "weight": 850, "bits": 24, "commit_unix": 200, "e_city": 2000, "e_asn": 2000}
+      ],
+      "expected": {"country": "US", "province": "CA", "city": "Shanghai", "asn": "222"}
+    },
+    {
+      "name": "gain_zero_uses_raw_weight",
+      "gain": 0,
+      "rows": [
+        {"country": "AA", "weight": 250, "bits": 8, "commit_unix": 5},
+        {"country": "BB", "weight": 100, "bits": 24, "commit_unix": 5}
+      ],
+      "expected": {"country": "AA"}
+    },
+    {
+      "name": "gain_default_flips_to_longer_prefix",
+      "gain": 10,
+      "rows": [
+        {"country": "AA", "weight": 250, "bits": 8, "commit_unix": 5},
+        {"country": "BB", "weight": 100, "bits": 24, "commit_unix": 5}
+      ],
+      "expected": {"country": "BB"}
+    },
+    {
+      "name": "gain_high_keeps_longer_prefix",
+      "gain": 50,
+      "rows": [
+        {"country": "AA", "weight": 700, "bits": 8, "commit_unix": 5},
+        {"country": "BB", "weight": 0, "bits": 24, "commit_unix": 5}
+      ],
+      "expected": {"country": "BB"}
+    },
+    {
+      "name": "gain_default_prefers_heavier_wider_row",
+      "gain": 10,
+      "rows": [
+        {"country": "AA", "weight": 700, "bits": 8, "commit_unix": 5},
+        {"country": "BB", "weight": 0, "bits": 24, "commit_unix": 5}
+      ],
+      "expected": {"country": "AA"}
+    },
+    {
+      "name": "saturating_i64_weight_ties_then_epoch_wins",
+      "rows": [
+        {"country": "AA", "weight": 9223372036854775807, "bits": 0, "commit_unix": 99},
+        {"country": "BB", "weight": 9223372036854775807, "bits": 8, "commit_unix": 1}
+      ],
+      "expected": {"country": "AA"}
+    },
+    {
+      "name": "cloud_fields_prefer_official_source",
+      "rows": [
+        {"cloud_provider": "Tencent Cloud", "cloud_region": "us-sanjose-1", "cloud_service": "cvm", "weight": 900, "bits": 16, "commit_unix": 100},
+        {"cloud_provider": "AWS", "cloud_region": "us-west-1", "cloud_service": "ec2", "weight": 300, "bits": 24, "commit_unix": 200}
+      ],
+      "expected": {"cloud_provider": "Tencent Cloud", "cloud_region": "us-sanjose-1", "cloud_service": "cvm"}
+    },
+    {
+      "name": "special_country_codes_ignored",
+      "rows": [
+        {"country": "US", "weight": 10, "bits": 8, "commit_unix": 1},
+        {"country": "ZZ", "weight": 9999, "bits": 32, "commit_unix": 9}
+      ],
+      "expected": {"country": "US"}
+    },
+    {
+      "name": "cn_foreign_city_pollution_ignored",
+      "rows": [
+        {"country": "CN", "city": "美国洛杉矶", "weight": 9999, "bits": 32, "commit_unix": 9},
+        {"country": "CN", "city": "杭州", "weight": 10, "bits": 8, "commit_unix": 1}
+      ],
+      "expected": {"country": "CN", "city": "杭州"}
+    },
+    {
+      "name": "all_fields_single_row",
+      "rows": [
+        {
+          "country": "CN", "province": "浙江省", "region": "ZJ", "city": "杭州市",
+          "district": "西湖区", "isp": "中国电信", "dc": "HGH1", "asn": "4134",
+          "as_org": "CHINANET", "net_org": "CHINANET-ZJ", "cloud_provider": "Aliyun",
+          "cloud_region": "cn-hangzhou", "cloud_service": "ecs", "hosting": "IDC",
+          "division_code": "330106", "weight": 80, "bits": 24, "commit_unix": 42
+        }
+      ],
+      "expected": {
+        "country": "CN", "province": "浙江省", "region": "ZJ", "city": "杭州市",
+        "district": "西湖区", "isp": "中国电信", "dc": "HGH1", "asn": "4134",
+        "as_org": "CHINANET", "net_org": "CHINANET-ZJ", "cloud_provider": "Aliyun",
+        "cloud_region": "cn-hangzhou", "cloud_service": "ecs", "hosting": "IDC",
+        "division_code": "330106"
+      }
+    },
+    {
+      "name": "all_empty_rows_yield_empty_fields",
+      "rows": [
+        {"weight": 10, "bits": 8, "commit_unix": 1},
+        {"weight": 20, "bits": 16, "commit_unix": 2}
+      ],
+      "expected": {}
+    }
+  ]
+}

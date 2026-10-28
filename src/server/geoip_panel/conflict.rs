@@ -3,13 +3,6 @@
 use super::covering::CoveringPrefix;
 use std::collections::HashMap;
 
-#[derive(Clone, Debug, Default)]
-pub struct CountryVote {
-    pub country: String,
-    pub weight: i64,
-    pub commit_unix: i64,
-}
-
 /// Vote on country from covering rows; flag conflict when runner-up ≥ 30% of winner.
 /// Ties prefer higher `commit_unix`, then weight. Empty countries are ignored.
 pub fn detect_country_conflict(rows: &[CoveringPrefix]) -> (String, bool) {

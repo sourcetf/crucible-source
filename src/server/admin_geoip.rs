@@ -1,6 +1,6 @@
 //! Admin GeoIP API handlers (Rust-only; no Python bridge).
 
-use crate::server::geoip_panel::{aliases, covering, db, iputil, lookup, sources};
+use crate::server::geoip_panel::{aliases, covering, db, iputil, lookup, sources, toml_store};
 use crate::server::h1::{full, BoxBody};
 use crate::server::live_config::LiveConfig;
 use http_body_util::BodyExt;
@@ -39,16 +39,222 @@ pub async fn handle_status_with_live(
     let exists = db_path.as_ref().map(|p| p.is_file()).unwrap_or(false);
     let panel = crate::server::geoip_panel::db::panel_db_path();
     let panel_exists = panel.is_file();
+    let panel_toml = toml_store::panel_path();
     json_ok(format!(
-        "{{\"enabled\":{},\"db_path\":{},\"exists\":{},\"panel_exists\":{},\"message\":\"rust geoip panel §23\"}}",
+        "{{\"enabled\":{},\"db_path\":{},\"exists\":{},\"panel_exists\":{},\
+\"path_priority_gain\":{},\"panel_toml\":{},\"panel_toml_exists\":{},\
+\"message\":\"rust geoip panel §23\"}}",
         snap.geoip.enabled,
         json_str(&path_s),
         exists,
-        panel_exists
+        panel_exists,
+        snap.geoip.path_priority_gain,
+        json_str(&panel_toml.display().to_string()),
+        panel_toml.is_file()
     ))
 }
 
+/// `GET|POST /api/geoip/settings` — 面板设置（G-17/G-18）。
+///
+/// GET：返回**真正生效**的设置（`panel.toml` > `config.toml [geoip]` > 默认）。
+/// POST：写 `data/geoip/panel.toml` 并热载，使 enabled/db_path/path_priority_gain
+/// 立即生效；优先级与启动时一致。body 支持 JSON（面板）与表单（curl）：
+/// `{"enabled":true,"db_path":"...","path_priority_gain":10}`。
+/// `db_path: null` / 空串 = 删除面板覆盖（回落 config.toml）。
+pub async fn handle_settings(
+    req: Request<Full<Bytes>>,
+    live: &Arc<LiveConfig>,
+) -> Response<BoxBody> {
+    let is_get = req.method() == Method::GET;
+    let is_post = req.method() == Method::POST;
+    if is_get {
+            let snap = live.snapshot();
+            let panel = toml_store::panel_path();
+            let db_s = snap
+                .geoip
+                .db_path
+                .as_ref()
+                .map(|p| p.display().to_string())
+                .unwrap_or_default();
+            let panel_over = match toml_store::load_effective() {
+                Ok(c) => serde_json::to_string(&c).unwrap_or_else(|_| "{}".into()),
+                Err(e) => {
+                    return json_ok(format!(
+                        "{{\"error\":{}}}",
+                        json_str(&format!("{e:#}"))
+                    ))
+                }
+            };
+            json_ok(format!(
+                "{{\"ok\":true,\"enabled\":{},\"db_path\":{},\
+\"path_priority_gain\":{},\"panel_path\":{},\"panel_overrides\":{}}}",
+                snap.geoip.enabled,
+                json_str(&db_s),
+                snap.geoip.path_priority_gain,
+                json_str(&panel.display().to_string()),
+                panel_over
+            ))
+    } else if is_post {
+            let (_parts, body) = req.into_parts();
+            let bytes = body
+                .collect()
+                .await
+                .map(|c| c.to_bytes())
+                .unwrap_or_default();
+            let text = String::from_utf8_lossy(&bytes).into_owned();
+            // JSON 优先（面板 UI），表单兜底（运维 curl）。
+            let mut enabled: Option<bool> = None;
+            let mut db_path: Option<Option<PathBuf>> = None; // Some(None) = 清除覆盖
+            let mut gain: Option<i64> = None;
+            match serde_json::from_str::<serde_json::Value>(&text) {
+                Ok(v) if v.is_object() => {
+                    if let Some(b) = v.get("enabled") {
+                        match b.as_bool() {
+                            Some(x) => enabled = Some(x),
+                            None => return bad_request("enabled 必须是布尔值"),
+                        }
+                    }
+                    if let Some(p) = v.get("db_path") {
+                        if p.is_null() {
+                            db_path = Some(None);
+                        } else if let Some(s) = p.as_str() {
+                            if s.trim().is_empty() {
+                                db_path = Some(None);
+                            } else {
+                                db_path = Some(Some(PathBuf::from(s.trim())));
+                            }
+                        } else {
+                            return bad_request("db_path 必须是字符串或 null");
+                        }
+                    }
+                    if let Some(g) = v.get("path_priority_gain") {
+                        match g.as_i64() {
+                            Some(x) => gain = Some(x),
+                            None => return bad_request("path_priority_gain 必须是整数"),
+                        }
+                    }
+                }
+                Ok(_) => return bad_request("body 必须是 JSON 对象"),
+                Err(_) => {
+                    if let Some(s) = form_field(&text, "enabled") {
+                        enabled = Some(s == "1" || s.eq_ignore_ascii_case("true"));
+                    }
+                    if let Some(s) = form_field(&text, "db_path") {
+                        db_path = Some(if s.trim().is_empty() {
+                            None
+                        } else {
+                            Some(PathBuf::from(s.trim()))
+                        });
+                    }
+                    if let Some(s) = form_field(&text, "path_priority_gain") {
+                        match s.parse::<i64>() {
+                            Ok(x) => gain = Some(x),
+                            Err(_) => return bad_request("path_priority_gain 必须是整数"),
+                        }
+                    }
+                    if enabled.is_none() && db_path.is_none() && gain.is_none() {
+                        return bad_request("没有可保存的设置（enabled/db_path/path_priority_gain）");
+                    }
+                }
+            }
+            if enabled.is_none() && db_path.is_none() && gain.is_none() {
+                return bad_request("没有可保存的设置（enabled/db_path/path_priority_gain）");
+            }
+            let mut panel = match toml_store::load_effective() {
+                Ok(c) => c,
+                Err(e) => {
+                    return bad_request(format!(
+                        "现有 panel.toml 非法，请先修正：{e:#}"
+                    ))
+                }
+            };
+            // 保存前的原始面板设置：热载失败时回滚到它，避免把一份会让**下次启动
+            // 失败**的 panel.toml 留在磁盘上（例如清掉唯一 db_path 但 enabled 仍为真）。
+            let panel_before = panel.clone();
+            if let Some(b) = enabled {
+                panel.enabled = Some(b);
+            }
+            if let Some(p) = db_path {
+                panel.db_path = p;
+            }
+            if let Some(g) = gain {
+                if !(0..=1000).contains(&g) {
+                    return bad_request(format!(
+                        "path_priority_gain = {g} 越界（允许 0..=1000）"
+                    ));
+                }
+                panel.path_priority_gain = Some(g);
+            }
+            // 保存前检查组合合法性：enabled=true 而生效配置没有任何 db_path 时，
+            // 运行期开关显示已启用但 country 规则永不命中（stored 后才在 reload
+            // 失败，会让下次启动也起不来）。这里先拒绝，文件保持原样。
+            {
+                let snap = live.snapshot();
+                let eff_enabled = panel.enabled.unwrap_or(snap.geoip.enabled);
+                let eff_db = panel
+                    .db_path
+                    .clone()
+                    .or_else(|| snap.geoip.db_path.clone());
+                if eff_enabled && eff_db.is_none() {
+                    return bad_request(
+                        "geoip.enabled=true 但 config.toml 与 panel.toml 都没有 db_path（要关闭请同时传 enabled=false）",
+                    );
+                }
+            }
+            if let Err(e) = toml_store::save_effective(&panel) {
+                return json_ok(format!(
+                    "{{\"error\":{}}}",
+                    json_str(&format!("{e:#}"))
+                ));
+            }
+            // 立即生效：重读 config.toml + panel.toml（与重启同一套加载顺序）。
+            if let Err(e) = live.reload() {
+                let rolled_back = toml_store::save_effective(&panel_before).is_ok();
+                if rolled_back {
+                    // 回到旧设置；这次失败不影响正在服务的配置。
+                    let _ = live.reload();
+                }
+                return json_ok(format!(
+                    "{{\"ok\":false,\"rolled_back\":{},\"error\":{}}}",
+                    rolled_back,
+                    json_str(&format!("panel.toml 已保存但热载失败：{e:#}"))
+                ));
+            }
+            let snap = live.snapshot();
+            let db_s = snap
+                .geoip
+                .db_path
+                .as_ref()
+                .map(|p| p.display().to_string())
+                .unwrap_or_default();
+            json_ok(format!(
+                "{{\"ok\":true,\"enabled\":{},\"db_path\":{},\
+\"path_priority_gain\":{},\"panel_path\":{}}}",
+                snap.geoip.enabled,
+                json_str(&db_s),
+                snap.geoip.path_priority_gain,
+                json_str(&toml_store::panel_path().display().to_string())
+            ))
+    } else {
+        method_not_allowed()
+    }
+}
+
+fn bad_request(msg: impl Into<String>) -> Response<BoxBody> {
+    Response::builder()
+        .status(StatusCode::BAD_REQUEST)
+        .header(http::header::CONTENT_TYPE, "application/json; charset=utf-8")
+        .body(full(format!(
+            "{{\"error\":{}}}",
+            json_str(&msg.into())
+        )))
+        .unwrap()
+}
+
 /// `GET /api/geoip/lookup?ip=…` — standalone (env / default path).
+/// 目前路由只接 `handle_lookup_with_live`；保留 standalone 版本供无 LiveConfig 的
+/// 部署/脚本使用（G-19：显式标注，避免误以为死代码可以随手删）。
+#[allow(dead_code)]
 pub async fn handle_lookup(req: &Request<Full<Bytes>>) -> Response<BoxBody> {
     if req.method() != Method::GET {
         return method_not_allowed();
@@ -128,19 +334,37 @@ pub async fn handle_filter_with_live(
 pub async fn handle_sources(_req: &Request<Full<Bytes>>) -> Response<BoxBody> {
     let panel_path = crate::server::geoip_panel::db::panel_db_path();
     let panel_path = panel_path.as_path();
+    // G-18：源权重/启停的面板设置以 panel.toml 为准（覆盖 panel_sources 里的旧值；
+    // panel.toml 只含显式写下的子键）。旧 sqlite 仍是数据源，未见 panel.toml 的源
+    // 原样展示 sqlite 值 —— 旧库无需迁移。
+    let overrides = toml_store::source_overrides();
     let mut items = String::new();
+    let mut n = 0usize;
+    let mut seen: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     if panel_path.is_file() {
         if let Ok(conn) = db::open_panel(panel_path) {
             if let Ok(rows) = sources::list_sources(&conn) {
-                for (i, s) in rows.iter().enumerate() {
-                    if i > 0 {
+                for s in rows.iter() {
+                    seen.insert(s.name.clone());
+                    let mut weight = s.weight;
+                    let mut enabled = s.enabled;
+                    if let Some(o) = overrides.get(&s.name) {
+                        if let Some(w) = o.weight {
+                            weight = w;
+                        }
+                        if let Some(e) = o.enabled {
+                            enabled = e;
+                        }
+                    }
+                    if n > 0 {
                         items.push(',');
                     }
+                    n += 1;
                     items.push_str(&format!(
                         "{{\"name\":{},\"weight\":{},\"enabled\":{},\"url\":{},\"last_commit\":{},\"last_unix\":{}}}",
                         json_str(&s.name),
-                        s.weight,
-                        s.enabled,
+                        weight,
+                        enabled,
                         json_str(&s.url),
                         json_str(&s.last_commit),
                         s.last_unix
@@ -148,6 +372,22 @@ pub async fn handle_sources(_req: &Request<Full<Bytes>>) -> Response<BoxBody> {
                 }
             }
         }
+    }
+    // panel.toml 里有、旧 sqlite 里没有的源也要出现（否则面板保存后看不到）。
+    for (name, o) in overrides.iter() {
+        if seen.contains(name) {
+            continue;
+        }
+        if n > 0 {
+            items.push(',');
+        }
+        n += 1;
+        items.push_str(&format!(
+            "{{\"name\":{},\"weight\":{},\"enabled\":{},\"url\":\"\",\"last_commit\":\"\",\"last_unix\":0}}",
+            json_str(name),
+            o.weight.unwrap_or(50),
+            o.enabled.unwrap_or(true)
+        ));
     }
     let sources_json = std::path::Path::new("data/geoip/current/SOURCES.json");
     // `meta` 是**外部文件**（离线脚本产物）的内容，此前直接拼进 JSON 体。文件一旦不是
@@ -456,13 +696,24 @@ pub async fn handle_source_set(req: Request<Full<Bytes>>) -> Response<BoxBody> {
     let panel_path = crate::server::geoip_panel::db::panel_db_path();
     let panel_path = panel_path.as_path();
     match db::open_panel(panel_path) {
-        Ok(conn) => {
-            if crate::server::geoip_panel::ops::set_source(&conn, &name, enabled, weight).is_ok() {
-                json_ok("{\"ok\":true}".into())
-            } else {
-                json_ok("{\"error\":\"source update failed\"}".into())
+        Ok(conn) => match crate::server::geoip_panel::ops::set_source(&conn, &name, enabled, weight)
+        {
+            Ok(()) => {
+                // G-18：源权重/启停同时写入 panel.toml（面板设置以它为准）。
+                // sqlite 写成功但 toml 写失败时明确告知，而不是假装全部成功。
+                match toml_store::update_source(&name, weight, enabled) {
+                    Ok(()) => json_ok("{\"ok\":true}".into()),
+                    Err(e) => json_ok(format!(
+                        "{{\"ok\":true,\"panel_toml_saved\":false,\"warning\":{}}}",
+                        json_str(&format!("source 已写入 panel.sqlite，但 panel.toml 保存失败：{e:#}"))
+                    )),
+                }
             }
-        }
+            Err(e) => json_ok(format!(
+                "{{\"error\":{}}}",
+                json_str(&format!("source update failed: {e:#}"))
+            )),
+        },
         Err(e) => json_ok(format!("{{\"error\":{}}}", json_str(&format!("{e:#}")))),
     }
 }
@@ -584,7 +835,8 @@ pub async fn handle_update_status(req: &Request<Full<Bytes>>) -> Response<BoxBod
     json_ok(resp.to_string())
 }
 
-/// `GET /api/geoip/status` — standalone env path.
+/// `GET /api/geoip/status` — standalone env path（同上，路由只用 `_with_live` 版本）。
+#[allow(dead_code)]
 pub async fn handle_status(_req: &Request<Full<Bytes>>) -> Response<BoxBody> {
     let db_path = crate::server::apps::env_lock::read_static_env("CRUCIBLE_GEOIP_DB")
         .unwrap_or_else(|| "data/geoip/current/geoip.sqlite".into());
@@ -689,27 +941,33 @@ fn lookup_json(ip_s: &str, db_path: Option<&std::path::Path>) -> Response<BoxBod
                         .collect();
                     json_ok(format!(
                         "{{\"ip\":{},\"status\":\"ok\",\
-\"country\":{},\"province\":{},\"city\":{},\"district\":{},\
-\"isp\":{},\"asn\":{},\"as_org\":{},\
+\"country\":{},\"province\":{},\"region\":{},\"city\":{},\"district\":{},\
+\"isp\":{},\"asn\":{},\"as_org\":{},\"net_org\":{},\
 \"cloud_provider\":{},\"cloud_region\":{},\"cloud_service\":{},\
 \"hosting\":{},\"division_code\":{},\"dc\":{},\
-\"bits\":{},\"prefixes_merged\":{},\"label\":{},\
+\"prefix\":{},\"bits\":{},\"weight\":{},\"commit_unix\":{},\
+\"prefixes_merged\":{},\"label\":{},\
 \"covering\":[{}]}}",
                         json_str(ip_s),
                         json_str(&gr.country),
                         json_str(&gr.province),
+                        json_str(&gr.region),
                         json_str(&gr.city),
                         json_str(&gr.district),
                         json_str(&gr.isp),
                         json_str(&gr.asn),
                         json_str(&gr.as_org),
+                        json_str(&gr.net_org),
                         json_str(&gr.cloud_provider),
                         json_str(&gr.cloud_region),
                         json_str(&gr.cloud_service),
                         json_str(&gr.hosting),
                         json_str(&gr.division_code),
                         json_str(&gr.dc),
+                        json_str(&gr.prefix),
                         gr.bits,
+                        gr.weight,
+                        gr.commit_unix,
                         gr.prefixes_merged,
                         json_str(&gr.label),
                         covering_json.join(","),

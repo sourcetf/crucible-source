@@ -433,11 +433,73 @@ pub fn frame_datagram_capsule(payload: &[u8]) -> Result<Vec<u8>, String> {
     Ok(out)
 }
 
+/// RFC 9297 §2.2：HTTP/3 **DATAGRAM 帧**（QUIC DATAGRAM frame，不是流内 capsule）。
+///
+/// 线格式（RFC 9297 §2.2，`HTTP/3 Datagram`）：
+///
+/// ```text
+/// HTTP/3 Datagram {
+///   Quarter Stream ID (i),      // 请求流 id / 4
+///   HTTP Datagram Payload (..), // = Context ID (i) + UDP Proxying Payload
+/// }
+/// ```
+///
+/// 注意两个容易混的点：
+///   * `Quarter Stream ID` 是 **请求流 id / 4**（客户端发起的双向流 id 都是 4 的倍数），
+///     不是请求流 id 本身，也不是 capsule 的 type 字段；
+///   * 它由 HTTP/3 层（RFC 9297 §2.2）加上，和 aioquic 的
+///     `H3Connection.send_datagram(stream_id, data)` 行为一致（它写
+///     `varint(stream_id / 4) + data`，其中 `data` 已含 Context ID）。
+///
+/// `payload` 是裸 UDP 载荷（本实现只用 Context ID 0）。
+pub fn frame_h3_datagram(quarter_stream_id: u64, payload: &[u8]) -> Result<Vec<u8>, String> {
+    if payload.len() > MAX_DATAGRAM {
+        return Err(format!(
+            "UDP payload {} exceeds {MAX_DATAGRAM} (RFC 9298 §5)",
+            payload.len()
+        ));
+    }
+    let mut out = Vec::with_capacity(payload.len() + 16);
+    encode_varint(quarter_stream_id, &mut out)?;
+    encode_varint(CONTEXT_ID_UDP, &mut out)?;
+    out.extend_from_slice(payload);
+    Ok(out)
+}
+
+/// [`frame_h3_datagram`] 的逆过程：解析 QUIC DATAGRAM 帧的载荷。
+///
+/// 返回 `(quarter_stream_id, udp_payload)`。非 0 Context ID 按 RFC 9298 §5
+/// 「丢弃该 datagram」处理（返回 Err，调用方只记 debug 并丢包，不关连接）。
+pub fn parse_h3_datagram(buf: &[u8]) -> Result<(u64, &[u8]), String> {
+    let (quarter_stream_id, used) =
+        decode_varint(buf).ok_or_else(|| "DATAGRAM 缺少 Quarter Stream ID".to_string())?;
+    let (context_id, used2) = decode_varint(&buf[used..])
+        .ok_or_else(|| "DATAGRAM 缺少 Context ID".to_string())?;
+    let payload = &buf[used + used2..];
+    if context_id != CONTEXT_ID_UDP {
+        return Err(format!(
+            "未知 Context ID {context_id} 的 DATAGRAM（RFC 9298 §5：丢弃）"
+        ));
+    }
+    if payload.len() > MAX_DATAGRAM {
+        return Err(format!(
+            "UDP payload {} exceeds {MAX_DATAGRAM}（RFC 9298 §5 要求中止流）",
+            payload.len()
+        ));
+    }
+    Ok((quarter_stream_id, payload))
+}
+
 /// 隧道内的报文封装形态。
 ///
 /// RFC 9298 §3.2 规定客户端**应当**带 `?1`（capsule 协议）—— 真实 MASQUE 客户端
 /// （Chrome 等）就是这么发的；不带 `?1` 的裸长度前缀形态是早期草稿的写法。
 /// 两种形态必须各自解析，不能混：capsule 每帧多一个**类型**字段。
+///
+/// 第三种 [`Framing::Datagram`] 是 RFC 9297 §2.2 的 **QUIC DATAGRAM 帧**：
+/// 报文不在请求流上，而是每帧一个 QUIC DATAGRAM；请求流此时只可能承载
+/// CLOSE/未知 capsule（前向兼容）。它要求双方在 SETTINGS 里声明
+/// `H3_DATAGRAM` 且协商出 `max_datagram_frame_size`（见 `h3.rs` 的能力协商）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Framing {
     /// 早期 connect-udp 草案的裸长度前缀形态：`varint(len) + payload`。
@@ -447,6 +509,9 @@ pub enum Framing {
     /// RFC 9297 §3.5：`varint(type) + varint(len) + HTTP Datagram`（type 0x00 = DATAGRAM）。
     /// capsule 载荷是 RFC 9298 §5 的 HTTP Datagram = `Context ID (i) + UDP Payload`。
     Capsules,
+    /// RFC 9297 §2.2：QUIC DATAGRAM 帧（`Quarter Stream ID + Context ID + UDP Payload`）。
+    /// 请求流上若仍有数据，按 capsule 形态解析（只期望 CLOSE/未知类型）。
+    Datagram,
 }
 
 /// 从隧道字节流里解析出来的事件。
@@ -520,7 +585,10 @@ impl DatagramAssembler {
     pub fn next_event(&mut self) -> Result<Option<TunnelEvent>, String> {
         match self.framing {
             Framing::LengthPrefixed => Ok(self.next_datagram()?.map(TunnelEvent::Datagram)),
-            Framing::Capsules => {
+            // QUIC DATAGRAM 模式：报文本身不走流，但 RFC 9298 §3.2 允许对端在
+            // 请求流上发 CLOSE/未知 capsule（例如优雅收尾）。按 capsule 形态解析，
+            // 未知类型仍然跳过，DATAGRAM capsule 也接受（客户端混用时不丢报文）。
+            Framing::Capsules | Framing::Datagram => {
                 // **必须在自己内部循环**：未知 capsule 要「跳过并继续解析下一条」，
                 // 不能返回 `Ok(None)`（那是「字节不够」的语义）——否则调用方的
                 // `Ok(None) => break` 会退出，而缓冲里紧随其后的 DATAGRAM 在**没有新数据
@@ -855,6 +923,68 @@ mod tests {
         let mut b = DatagramAssembler::new(Framing::Capsules);
         b.push(&lp);
         assert_eq!(b.next_event().unwrap(), None, "同一串字节在 capsule 形态下不是报文");
+    }
+
+    /// RFC 9297 §2.2：QUIC DATAGRAM 帧 = `Quarter Stream ID + Context ID + UDP Payload`。
+    /// 往返一致；Quarter Stream ID / Context ID 都按 QUIC varint 编码。
+    #[test]
+    fn h3_datagram_roundtrip_and_context_id() {
+        for (qsid, payload) in [
+            (0u64, &b""[..]),
+            (1, &b"ping"[..]),
+            (16384, &vec![0xabu8; 300][..]),
+            ((1u64 << 40) + 7, &b"big-quarter"[..]),
+        ] {
+            let framed = frame_h3_datagram(qsid, payload).unwrap();
+            let (got_qsid, got_payload) = parse_h3_datagram(&framed).unwrap();
+            assert_eq!(got_qsid, qsid);
+            assert_eq!(got_payload, payload);
+            // 首个字段必须是 quarter stream id（不是请求流 id 本身）
+            let (first, _) = decode_varint(&framed).unwrap();
+            assert_eq!(first, qsid);
+        }
+
+        // 非 0 Context ID：RFC 9298 §5 要求丢弃（Err 由调用方 debug 后丢包）
+        let mut bad = Vec::new();
+        encode_varint(3, &mut bad).unwrap();
+        encode_varint(9, &mut bad).unwrap();
+        bad.extend_from_slice(b"x");
+        assert!(parse_h3_datagram(&bad).is_err());
+
+        // 缺 Quarter Stream ID / Context ID
+        assert!(parse_h3_datagram(&[]).is_err());
+        assert!(parse_h3_datagram(&[0x00]).is_err());
+
+        // 超过 RFC 9298 §5 的 UDP 载荷上限：拒绝
+        let huge = vec![0u8; MAX_DATAGRAM + 1];
+        assert!(frame_h3_datagram(0, &huge).is_err());
+    }
+
+    /// QUIC DATAGRAM 模式下的请求流：CLOSE / 未知 capsule 仍按 capsule 语法解析
+    /// （报文本身走 DATAGRAM 帧，流上只承载控制 capsule）。
+    #[test]
+    fn datagram_framing_parses_control_capsules_on_stream() {
+        let mut buf = Vec::new();
+        encode_varint(0x1234, &mut buf).unwrap();
+        encode_varint(2, &mut buf).unwrap();
+        buf.extend_from_slice(b"xx");
+        buf.extend_from_slice(&{
+            let mut c = Vec::new();
+            encode_varint(CAPSULE_CLOSE, &mut c).unwrap();
+            encode_varint(0, &mut c).unwrap();
+            c
+        });
+        let mut asm = DatagramAssembler::new(Framing::Datagram);
+        asm.push(&buf);
+        assert_eq!(asm.next_event().unwrap(), Some(TunnelEvent::Close));
+
+        // 混用：流上出现 DATAGRAM capsule 时也接受（不丢报文）
+        let mut asm = DatagramAssembler::new(Framing::Datagram);
+        asm.push(&frame_datagram_capsule(b"stream-capsule").unwrap());
+        assert_eq!(
+            asm.next_event().unwrap(),
+            Some(TunnelEvent::Datagram(b"stream-capsule".to_vec()))
+        );
     }
 
     /// RFC 9297 §3.2：**未知 capsule 类型必须跳过负载**（前向兼容），而不是报错。

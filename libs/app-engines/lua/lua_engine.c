@@ -292,6 +292,132 @@ static void inject_ngx(lua_State *L, const char *method, const char *path,
 }
 #endif /* CRUCIBLE_HAVE_LUA */
 
+/* ═══════════════ R-03：每请求 `.env` 视图（os.getenv 覆盖） ═══════════════
+ *
+ * 本引擎自报 `appengine_env_isolation()=1` 后，宿主不再把请求 `.env` 装进进程
+ * 环境（也不再持有全局 env 锁），只经 ABI `extra` JSON 下发。Lua 应用读环境
+ * 的标准入口是 `os.getenv`；这里在**每请求新建的 lua_State** 里把它换成一个
+ * C 闭包：
+ *   1) 先查本请求覆盖表（`extra.env`；空值 = 键不存在，不插入）；
+ *   2) 再查启动期基底（`appengine_base_env_block()`，宿主经
+ *      appengine_set_base_env 交付）；
+ *   3) 基底不可用（极旧宿主）时才回退到真实 `os.getenv`。
+ *
+ * 请求期**绝不**回退到真实 getenv —— 进程 env 里可能有别的（仍走 env 锁的）
+ * 引擎的临时 `.env`，本引擎已与它们并发。
+ *
+ * 诚实边界：Lua 里 `os.getenv` 的替代只覆盖标准库入口；第三方 C 模块直接
+ * 调 `getenv(2)` 不受保护（与 cgi 的 env_isolation 同一信任边界），应用自己
+ * 用 `os.execute` 起的子进程也不继承请求 `.env`。
+ */
+typedef struct {
+    lua_State *L;
+    int table_idx; /* 正数栈下标（绝对） */
+} lua_env_fill_ctx;
+
+static int lua_env_fill_cb(void *ctx, const char *k, const char *v)
+{
+    lua_env_fill_ctx *c = (lua_env_fill_ctx *)ctx;
+
+    if (c == NULL || c->L == NULL || k == NULL || k[0] == '\0')
+        return 0;
+    lua_pushstring(c->L, k);
+    if (v == NULL || v[0] == '\0') {
+        /* `.env` 空值 = 键不存在（与 cgi/cgi_script 子进程 envp 一致：连启动期
+         * 基底里的同名键也必须不可见）。用 `false` 当删除哨兵：只跳过本项会让
+         * 基底表里的同名值重新露出来，与进程 env 的 remove_var 语义分叉。 */
+        lua_pushboolean(c->L, 0);
+    } else {
+        lua_pushstring(c->L, v);
+    }
+    lua_settable(c->L, c->table_idx);
+    return 0;
+}
+
+static int l_crucible_getenv(lua_State *L)
+{
+    const char *key;
+    int i;
+
+    if (lua_gettop(L) < 1 || !lua_isstring(L, 1)) {
+        lua_pushnil(L);
+        return 1;
+    }
+    key = lua_tostring(L, 1);
+    /* upvalue 1 = 本请求覆盖表；2 = 启动期基底表；3 = 真实 os.getenv 或 nil */
+    for (i = 1; i <= 2; i++) {
+        lua_pushstring(L, key);
+        lua_rawget(L, lua_upvalueindex(i));
+        if (!lua_isnil(L, -1)) {
+            /* 请求覆盖表里的 `false` = `.env` 显式空值（删除），必须返回 nil 且
+             * **不再**回落到启动期基底（否则空值语义与 cgi 子进程 envp 分叉）。 */
+            if (lua_isboolean(L, -1) && !lua_toboolean(L, -1)) {
+                lua_pop(L, 1);
+                lua_pushnil(L);
+            }
+            return 1;
+        }
+        lua_pop(L, 1);
+    }
+    if (!lua_isnil(L, lua_upvalueindex(3))) {
+        lua_pushvalue(L, lua_upvalueindex(3));
+        lua_pushstring(L, key);
+        lua_call(L, 1, 1);
+        return 1;
+    }
+    lua_pushnil(L);
+    return 1;
+}
+
+/* 安装每请求环境视图（须在 luaL_openlibs 之后、luaL_dofile 之前调用）。 */
+static void lua_inject_env(lua_State *L, const char *extra)
+{
+    const char *base = appengine_base_env_block();
+    lua_env_fill_ctx ctx;
+
+    lua_newtable(L); /* 1: 请求覆盖 */
+    ctx.L = L;
+    ctx.table_idx = lua_gettop(L);
+    if (extra != NULL)
+        (void)appengine_extra_env_foreach(extra, lua_env_fill_cb, &ctx);
+
+    lua_newtable(L); /* 2: 启动期基底 */
+    ctx.table_idx = lua_gettop(L);
+    if (base != NULL) {
+        const char *p = base;
+        while (*p != '\0') {
+            const char *eq = strchr(p, '=');
+            if (eq == NULL)
+                break;
+            lua_pushlstring(L, p, (size_t)(eq - p));
+            lua_pushstring(L, eq + 1);
+            lua_settable(L, ctx.table_idx);
+            p = eq + strlen(eq) + 1;
+        }
+        lua_pushnil(L); /* 基底可用 ⇒ 不回退真实 getenv */
+    } else {
+        lua_getglobal(L, "os");
+        if (lua_istable(L, -1)) {
+            lua_getfield(L, -1, "getenv");
+            lua_remove(L, -2);
+        } else {
+            lua_pop(L, 1);
+            lua_pushnil(L);
+        }
+    }
+
+    /* os.getenv = _crucible_getenv(req, base, real) */
+    lua_getglobal(L, "os");
+    if (lua_istable(L, -1)) {
+        lua_pushvalue(L, 1);
+        lua_pushvalue(L, 2);
+        lua_pushvalue(L, 3);
+        lua_pushcclosure(L, l_crucible_getenv, 3);
+        lua_setfield(L, -2, "getenv");
+    }
+    lua_pop(L, 4); /* os, real, base, req */
+}
+
 static int g_inited;
 
 int appengine_init(const char *engine, const char *lib_hint) {
@@ -332,7 +458,6 @@ int appengine_execute(
     (void)body_len;
     (void)server_name;
     (void)server_port;
-    (void)extra;
     if (!out) {
         return -1;
     }
@@ -368,6 +493,8 @@ int appengine_execute(
             return -1;
         }
         luaL_openlibs(L);
+        /* R-03：每请求 `.env` 视图（os.getenv 覆盖；不碰进程 env）。 */
+        lua_inject_env(L, extra);
         ngx_ctx_bind(L, &ctx);
         inject_ngx(L, method, path, query, remote, headers);
 
@@ -446,6 +573,21 @@ int appengine_execute(
         appengine_result_set_body(out, buf, strlen(buf));
         return 0;
     }
+}
+
+/* R-03：`.env` 隔离自报（可选符号，见 appengine.h）。
+ *
+ * 返回非 0 = 本引擎不依赖进程 env：请求 `.env` 只走 ABI `extra` JSON，落进每请求
+ * lua_State 的 os.getenv 覆盖表；从不 setenv/putenv，也不继承 environ。宿主因此
+ * 可以跳过全局 env 锁 —— 慢的空请求不再挡住随后带 `.env` 的 lua 请求。
+ * 没有内置 Lua（stub 构建）时无法保证脚本读环境的行为，诚实回答 0。 */
+int appengine_env_isolation(void)
+{
+#ifdef CRUCIBLE_HAVE_LUA
+    return 1;
+#else
+    return 0;
+#endif
 }
 
 void appengine_shutdown(void) {

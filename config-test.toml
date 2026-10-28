@@ -147,6 +147,10 @@ paths = ["/rust"]
 docroot = "www-apps/c"
 enabled = true
 engine = "c"
+# G-15 / §16.9：FFI 优先（libapp_c.so）；把这只 .so 移走后同一路由自动回落到
+# www-apps/c/init.sh 用 `cc -O2 -pthread` 编译出的 deps/bin/index —— 常驻
+# pthread-per-connection UDS HTTP/1.1 sidecar（响应头 X-Crucible-Engine
+# 区分 c-ffi / c-sidecar）。
 lib = "target/app-engines/libapp_c.so"
 paths = ["/c"]
 

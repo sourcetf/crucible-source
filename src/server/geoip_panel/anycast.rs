@@ -65,6 +65,10 @@ static EXTRA_ANYCAST: Lazy<Mutex<Vec<(String, u32)>>> = Lazy::new(|| Mutex::new(
 /// 但存下的字符串会经 `anycast_prefixes()` 外泄给下游（面板展示 / 写回 anycast 表 /
 /// 生成视图）；原样存 `10.0.0.1/8` 一旦被当成区间起点就退化成「隐式 /32」，
 /// 覆盖查询静默漏行。归一化与校验都走 iputil，保证与查询侧同一套口径。
+// G-19：这两个函数目前**没有 HTTP/面板调用点**（§2.6 的「面板追加 anycast」
+// 功能尚未接线，anycast 表由离线脚本写入）。保留为进程内 API 并用 allow 标注，
+// 而不是删除：`is_anycast` 已经消费 EXTRA_ANYCAST，接线时只需要一个 handler。
+#[allow(dead_code)]
 pub fn add_anycast_prefix(base: &str, bits: u32) -> anyhow::Result<()> {
     let net = crate::server::geoip_panel::iputil::normalize_v4_prefix(base, bits)
         .ok_or_else(|| anyhow::anyhow!("invalid anycast prefix {base:?}/{bits}"))?;
@@ -73,6 +77,7 @@ pub fn add_anycast_prefix(base: &str, bits: u32) -> anyhow::Result<()> {
 }
 
 /// 当前生效的 anycast 前缀表（内置种子 + 面板追加）。
+#[allow(dead_code)] // 见 add_anycast_prefix 的说明（面板端点未接线）。
 pub fn anycast_prefixes() -> Vec<(String, u32)> {
     let mut out: Vec<(String, u32)> = ANYCAST_V4
         .iter()

@@ -93,7 +93,12 @@ async fn accept_connection_inner(
     }
 
     // 早期规格 8：sni_only——空/错 SNI 直接静默丢弃（不发 reset 不回包，性能优先）。
-    if ssl_cfg.sni_only {
+    //
+    // G-08：开了 `[dns.dot] reuse_tls_port` 时，DoT 客户端用**自己的 SNI**（如
+    // dot.example）连同一个站点 TLS 口；sni_only 是针对站点名的过滤，不能把这条
+    // 分流连接先杀掉。判据与 boring 侧完全一致（ALPN dot + dot.sni 白名单）。
+    // 只在 sni_only 真的开着时才做这次判定：默认配置下热路径零额外开销。
+    if ssl_cfg.sni_only && dot_reuse_config(&live, &peek).is_none() {
         let want = ssl_cfg
             .sni_name
             .as_deref()
@@ -272,6 +277,115 @@ pub(crate) fn record_need(buf: &[u8]) -> Option<usize> {
     }
 }
 
+/// G-08：ClientHello 的 ALPN 扩展里是否声明了协议 `want`（通常是 `b"dot"`）。
+///
+/// 输入是 TLS record 起始的 peek 缓冲（与 [`client_hello::parse_sni`] 同一前提）。
+/// 所有长度都做上界检查：peek 来自匿名对端，任何越界读都是可远程触发的 panic。
+/// 返回 `false` 表示「没声明」或「报文不完整/畸形」—— 调用方据此走普通 HTTP，
+/// 因此截断/畸形输入是 fail-open 到 HTTP（而不是误入 DNS handler）。
+pub(crate) fn client_offers_alpn(peek: &[u8], want: &[u8]) -> bool {
+    // TLS record: type(1)=0x16 version(2) length(2)
+    if peek.len() < 5 || peek[0] != 0x16 {
+        return false;
+    }
+    let rec_len = u16::from_be_bytes([peek[3], peek[4]]) as usize;
+    let rec_end = match 5usize.checked_add(rec_len) {
+        Some(e) if e <= peek.len() => e,
+        _ => return false,
+    };
+    let hs = &peek[5..rec_end];
+    // Handshake: type(1)=ClientHello(0x01) length(3)
+    if hs.len() < 4 || hs[0] != 0x01 {
+        return false;
+    }
+    let hl = ((hs[1] as usize) << 16) | ((hs[2] as usize) << 8) | hs[3] as usize;
+    if hl > hs.len().saturating_sub(4) {
+        return false;
+    }
+    let body = &hs[4..4 + hl];
+    // legacy_version(2) random(32) session_id_len(1) ...
+    if body.len() < 35 {
+        return false;
+    }
+    let mut p = 34usize;
+    let sid = body[p] as usize;
+    p += 1 + sid;
+    if p + 2 > body.len() {
+        return false;
+    }
+    let cs = u16::from_be_bytes([body[p], body[p + 1]]) as usize;
+    p += 2 + cs;
+    if p + 1 > body.len() {
+        return false;
+    }
+    let comp = body[p] as usize;
+    p += 1 + comp;
+    if p + 2 > body.len() {
+        return false;
+    }
+    let ext_len = u16::from_be_bytes([body[p], body[p + 1]]) as usize;
+    p += 2;
+    let ext_end = p.saturating_add(ext_len).min(body.len());
+    while p + 4 <= ext_end {
+        let etype = u16::from_be_bytes([body[p], body[p + 1]]);
+        let elen = u16::from_be_bytes([body[p + 2], body[p + 3]]) as usize;
+        let s = p + 4;
+        let e = match s.checked_add(elen) {
+            Some(e) if e <= ext_end => e,
+            _ => break,
+        };
+        // ALPN (type 0x0010): u16 ProtocolNameList length, then (u8 len + name)*
+        if etype == 0x0010 && e >= s + 2 {
+            let list_len = u16::from_be_bytes([body[s], body[s + 1]]) as usize;
+            let list_end = (s + 2).saturating_add(list_len).min(e);
+            let mut q = s + 2;
+            while q + 1 <= list_end {
+                let l = body[q] as usize;
+                let name_end = match q.checked_add(1 + l) {
+                    Some(n) if n <= list_end => n,
+                    _ => break,
+                };
+                if &body[q + 1..name_end] == want {
+                    return true;
+                }
+                q = name_end;
+            }
+        }
+        p = e;
+    }
+    false
+}
+
+/// G-08：这条 TLS 连接是否应分流到 DoT handler（端口复用）。
+///
+/// 判据（全部满足）：
+/// * `[dns] enabled` 且 `[dns.dot] enabled` 且 `reuse_tls_port = true`；
+/// * ClientHello 的 ALPN 里声明了 `dot`（RFC 7858；未声明 = 普通 HTTP，零影响）；
+/// * `[dns.dot] sni` 非空时，SNI 必须匹配其中一项（fail-closed：取不到 SNI 即不匹配）。
+///
+/// 返回的是**当前生效**的 `[dns]` 配置（panel.toml 覆盖已应用）。调用方在握手后
+/// 仍要按连接重新读取，配置热载（关掉 reuse/收紧 ACL）对已建立连接同样生效。
+pub(crate) fn dot_reuse_config(
+    live: &LiveConfig,
+    peek: &[u8],
+) -> Option<Arc<crate::server::dns::DnsConfig>> {
+    let dc = crate::server::dns::effective(&live.snapshot());
+    if !dc.enabled || !dc.dot.enabled || !dc.dot.reuse_tls_port {
+        return None;
+    }
+    if !client_offers_alpn(peek, b"dot") {
+        return None;
+    }
+    if !dc.dot.sni.is_empty() {
+        let sni = client_hello::parse_sni(peek)?;
+        if !dc.dot.sni.iter().any(|n| sni_host_eq(n, &sni)) {
+            log::debug!("dot reuse: ALPN=dot 但 SNI={sni:?} 不在 [dns.dot].sni 白名单，按站点流量处理");
+            return None;
+        }
+    }
+    Some(dc)
+}
+
 /// SNI 主机名比较：大小写不敏感，且忽略末尾的点
 /// （`example.com.` 是合法的 FQDN 写法，语义与 `example.com` 相同）。
 pub(crate) fn sni_host_eq(a: &str, b: &str) -> bool {
@@ -309,5 +423,83 @@ mod tests {
         // 明文 HTTP 不做补齐。
         assert_eq!(record_need(b"GET / HTTP/1.1\r\n"), None);
         assert_eq!(record_need(&[]), None);
+    }
+
+    /// G-08：构造带 SNI / ALPN 的最小真实布局 ClientHello（record 起始）。
+    fn hello_with(sni: Option<&str>, alpn: &[&[u8]]) -> Vec<u8> {
+        let mut ext = Vec::new();
+        if let Some(name) = sni {
+            let nb = name.as_bytes();
+            let mut ed = Vec::new();
+            ed.extend_from_slice(&((1 + 2 + nb.len()) as u16).to_be_bytes());
+            ed.push(0x00);
+            ed.extend_from_slice(&(nb.len() as u16).to_be_bytes());
+            ed.extend_from_slice(nb);
+            ext.extend_from_slice(&0x0000u16.to_be_bytes());
+            ext.extend_from_slice(&(ed.len() as u16).to_be_bytes());
+            ext.extend_from_slice(&ed);
+        }
+        if !alpn.is_empty() {
+            let mut list = Vec::new();
+            for p in alpn {
+                list.push(p.len() as u8);
+                list.extend_from_slice(p);
+            }
+            let mut ed = Vec::new();
+            ed.extend_from_slice(&(list.len() as u16).to_be_bytes());
+            ed.extend_from_slice(&list);
+            ext.extend_from_slice(&0x0010u16.to_be_bytes());
+            ext.extend_from_slice(&(ed.len() as u16).to_be_bytes());
+            ext.extend_from_slice(&ed);
+        }
+        let mut hs = Vec::new();
+        hs.extend_from_slice(&[0x03, 0x03]);
+        hs.extend_from_slice(&[0u8; 32]);
+        hs.push(0x00); // session id
+        hs.extend_from_slice(&2u16.to_be_bytes());
+        hs.extend_from_slice(&[0x13, 0x01]);
+        hs.push(1);
+        hs.push(0x00);
+        hs.extend_from_slice(&(ext.len() as u16).to_be_bytes());
+        hs.extend_from_slice(&ext);
+        let mut rec = vec![0x16, 0x03, 0x01];
+        rec.extend_from_slice(&((4 + hs.len()) as u16).to_be_bytes());
+        rec.push(0x01);
+        let hl = hs.len();
+        rec.extend_from_slice(&[(hl >> 16) as u8, (hl >> 8) as u8, hl as u8]);
+        rec.extend_from_slice(&hs);
+        rec
+    }
+
+    #[test]
+    fn alpn_dot_detected_in_client_hello() {
+        let dot = hello_with(Some("dot.example"), &[b"dot"]);
+        assert!(client_offers_alpn(&dot, b"dot"));
+        assert!(!client_offers_alpn(&dot, b"h2"));
+
+        // 多协议：dot 排在后面也必须找到。
+        let both = hello_with(Some("site.example"), &[b"h2", b"http/1.1", b"dot"]);
+        assert!(client_offers_alpn(&both, b"dot"));
+        assert!(client_offers_alpn(&both, b"h2"));
+
+        // 没有 ALPN 扩展 / 只有别的协议 ⇒ false（普通 HTTPS 不受影响）。
+        assert!(!client_offers_alpn(&hello_with(Some("site.example"), &[]), b"dot"));
+        assert!(!client_offers_alpn(
+            &hello_with(Some("site.example"), &[b"h2", b"http/1.1"]),
+            b"dot"
+        ));
+        // 前缀相同但不同的名字不能误判。
+        let sneaky = hello_with(Some("x"), &[b"dotx"]);
+        assert!(!client_offers_alpn(&sneaky, b"dot"));
+    }
+
+    /// 不完整/畸形输入只能返回 false（不能 panic/越界）。
+    #[test]
+    fn alpn_parser_survives_truncation() {
+        let full = hello_with(Some("dot.example"), &[b"dot"]);
+        for cut in 0..full.len() {
+            assert!(!client_offers_alpn(&full[..cut], b"dot") || cut == full.len());
+        }
+        assert!(!client_offers_alpn(b"GET / HTTP/1.1\r\n\r\n", b"dot"));
     }
 }

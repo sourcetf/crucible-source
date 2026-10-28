@@ -84,14 +84,19 @@ fn apply_version_profile(
 }
 
 pub fn build_acceptor(ssl: &SslConfig, lc: &ListenerConfig) -> Result<SslAcceptor> {
-    build_acceptor_profile(ssl, lc, VersionProfile::Default)
+    build_acceptor_profile(ssl, lc, VersionProfile::Default, false)
 }
 
 /// [`build_acceptor`] 的带版本档位版本（accept 热路径按 ClientHello 选档位）。
+///
+/// `allow_dot_alpn`：G-08 端口复用 DoT。true 时 accept 的 ALPN 列表额外提供
+/// `dot`（RFC 7858）并**优先于** h2/http1.1 —— 只有调用方已确认这条 ClientHello
+/// 声明了 dot 才会传 true，因此站点流量永远不会命中这个分支。
 pub(crate) fn build_acceptor_profile(
     ssl: &SslConfig,
     lc: &ListenerConfig,
     profile: VersionProfile,
+    allow_dot_alpn: bool,
 ) -> Result<SslAcceptor> {
     let mut builder = SslAcceptor::mozilla_modern(SslMethod::tls())?;
     // boring 的 mozilla_modern 预设带 SSL_OP_NO_TLSV1_3,不清掉 TLS1.3 永远握手失败(
@@ -125,7 +130,7 @@ pub(crate) fn build_acceptor_profile(
     apply_ech(&mut builder, ssl)?;
     apply_ocsp(&mut builder, ssl, &ocsp)?;
     apply_psk(&mut builder, ssl)?;
-    apply_alpn(&mut builder, lc)?;
+    apply_alpn(&mut builder, lc, allow_dot_alpn)?;
     Ok(builder.build())
 }
 
@@ -1390,7 +1395,7 @@ fn psk_material(spec: &str) -> Result<Vec<u8>> {
     ssl_material::load_bytes(s).map_err(|e| anyhow::anyhow!("ssl.psk_key: {e:#}"))
 }
 
-fn apply_alpn(builder: &mut SslAcceptorBuilder, lc: &ListenerConfig) -> Result<()> {
+fn apply_alpn(builder: &mut SslAcceptorBuilder, lc: &ListenerConfig, allow_dot: bool) -> Result<()> {
     // 任务 2 实测发现（P1）：set_alpn_protos 是【客户端】API——服务端用它永远不会
     // 回应 ALPN，浏览器在 TLS 上全部回落 HTTP/1.1（h2 形同虚设）。服务端必须装
     // select 回调，并从客户端列表内回显所选协议（RFC 7301 要求回显原字节）。
@@ -1403,6 +1408,7 @@ fn apply_alpn(builder: &mut SslAcceptorBuilder, lc: &ListenerConfig) -> Result<(
         let mut h2_span: Option<&[u8]> = None;
         let mut h1_span: Option<&[u8]> = None;
         let mut qmux_span: Option<&[u8]> = None;
+        let mut dot_span: Option<&[u8]> = None;
         let mut i = 0usize;
         while i < client_protos.len() {
             let l = client_protos[i] as usize;
@@ -1414,6 +1420,9 @@ fn apply_alpn(builder: &mut SslAcceptorBuilder, lc: &ListenerConfig) -> Result<(
             match name {
                 b"h2" if offer_h2 => h2_span = Some(name),
                 b"http/1.1" if offer_h1 => h1_span = Some(name),
+                // G-08：只有本 acceptor 明确为「DoT 端口复用」构建时才提供 dot；
+                // 站点 acceptor（allow_dot=false）的 ALPN 行为逐字节不变。
+                b"dot" if allow_dot => dot_span = Some(name),
                 n if offer_qmux && n == crate::server::qmux::conn::QMUX_ALPN => {
                     qmux_span = Some(name)
                 }
@@ -1421,9 +1430,10 @@ fn apply_alpn(builder: &mut SslAcceptorBuilder, lc: &ListenerConfig) -> Result<(
             }
             i = end;
         }
-        // 服务端偏好 h2 > http/1.1 > QMux：**开启 qmux 不改变老客户端的行为**，
-        // 想要 QMux 的客户端在 ALPN 里只给 `h1-02qx` 即可。
-        h2_span
+        // 服务端偏好：DoT 连接必须拿到 dot（它接下来只说长度前缀的 DNS wire）；
+        // 站点连接保持 h2 > http/1.1 > QMux 的历史偏好不变。
+        dot_span
+            .or(h2_span)
             .or(h1_span)
             .or(qmux_span)
             .ok_or(boring::ssl::AlpnError::NOACK)
@@ -1464,11 +1474,15 @@ fn acceptor_fingerprint(
     ssl: &SslConfig,
     lc: &ListenerConfig,
     profile: VersionProfile,
+    allow_dot: bool,
 ) -> u64 {
     let mut h = DefaultHasher::new();
     // G-12：同一个 listener 会同时存在 1.3-only 与 max=1.2 两套 acceptor，档位必须
     // 进指纹，否则其中一套会命中另一套（把「prefer」语义抹掉）。
     profile.hash(&mut h);
+    // G-08：同一个 listener 的站点 acceptor（不提供 dot）与复用 acceptor（提供 dot）
+    // 必须分开缓存，否则 ALPN 行为会串。
+    allow_dot.hash(&mut h);
     ssl.cert.hash(&mut h);
     ssl.key.hash(&mut h);
     ssl.cert_ec.hash(&mut h);
@@ -1542,12 +1556,13 @@ pub(crate) fn build_acceptor_cached(
     ssl: &SslConfig,
     lc: &ListenerConfig,
     profile: VersionProfile,
+    allow_dot: bool,
 ) -> Result<Arc<SslAcceptor>> {
-    let fp = acceptor_fingerprint(ssl, lc, profile);
+    let fp = acceptor_fingerprint(ssl, lc, profile, allow_dot);
     if let Some(a) = ACCEPTOR_CACHE.lock().get(&fp) {
         return Ok(Arc::clone(a));
     }
-    let a = Arc::new(build_acceptor_profile(ssl, lc, profile)?);
+    let a = Arc::new(build_acceptor_profile(ssl, lc, profile, allow_dot)?);
     let mut map = ACCEPTOR_CACHE.lock();
     if map.len() >= ACCEPTOR_CACHE_CAP {
         map.clear();
@@ -1584,7 +1599,13 @@ pub async fn accept_and_serve(
         // 「prefer_tls13 到底选了哪套 SSL_CTX」。
         log::debug!("tls prefer_tls13: peer={peer} profile={profile:?} peek={}", peek.len());
     }
-    let acceptor = build_acceptor_cached(ssl, &lc, profile)?;
+    // G-08：这条 ClientHello 是否声明了 ALPN `dot`（且 SNI 通过 `[dns.dot].sni`
+    // 白名单）。命中后仍在**同一个 TLS listener** 上完成握手，只是按 DoT 证书
+    // （若配置）建立 acceptor，握手后交给 DNS handler —— HTTP 站点流量完全不走这里。
+    if let Some(dc) = crate::server::tls::accept::dot_reuse_config(&live, &peek) {
+        return accept_dot_reuse(stream, peek, ssl, lc, peer, live, dc, profile).await;
+    }
+    let acceptor = build_acceptor_cached(ssl, &lc, profile, false)?;
     let io = PrefixedStream::new(stream, peek);
     // 握手必须有**截止时间**。`tokio_boring::accept` 自己没有任何超时：一个匿名客户端
     // 只要发一个**完整合法**的 ClientHello、然后在握手中途停下（不回 Finished），
@@ -1600,6 +1621,85 @@ pub async fn accept_and_serve(
             return Ok(());
         }
     };
+    dispatch_alpn(tls, live, lc, peer).await
+}
+
+/// G-08：在站点 TLS listener 上服务一条 DoT 连接（ALPN `dot` / SNI 白名单已由
+/// [`crate::server::tls::accept::dot_reuse_config`] 判定）。
+///
+/// 证书策略：
+/// * `[dns.dot] cert/key` **已配置** ⇒ 用 DoT 专用 acceptor（站点证书与 DoT 证书可
+///   完全不同，DoT 客户端按自己的 SNI 校验）；构建失败（cert 缺失/ACME 未签发）
+///   时 fail-closed 丢弃并节流告警，绝不拿站点证书冒充。
+/// * 未配置 ⇒ 复用站点 acceptor（只把 `dot` 加进 ALPN 列表），证书仍是站点证书。
+///
+/// 握手完成后仍以**协商出的 ALPN** 为准：只有真的选中 `dot` 才进入 DNS 帧循环；
+/// 站点 acceptor 分支里客户端若把 h2/http1.1 也给了且 dot 未被选中，则落回 HTTP。
+#[cfg(feature = "tls_boring")]
+async fn accept_dot_reuse(
+    stream: TcpStream,
+    peek: Vec<u8>,
+    ssl: &SslConfig,
+    lc: ListenerConfig,
+    peer: SocketAddr,
+    live: Arc<LiveConfig>,
+    dc: Arc<crate::server::dns::DnsConfig>,
+    profile: VersionProfile,
+) -> Result<()> {
+    let io = PrefixedStream::new(stream, peek);
+    let has_dot_cert = dc.dot.cert.is_some() && dc.dot.key.is_some();
+    let (tls, dot_only_acceptor) = if has_dot_cert {
+        let acceptor = match crate::server::dns::dot_doh::reuse_acceptor(&dc.dot) {
+            Ok(a) => a,
+            Err(e) => {
+                // 匿名客户端可触发（每个 dot 连接一次）⇒ 按类别节流；证书就绪后自动恢复。
+                crate::server::log_throttle::warn_every(
+                    "dot-reuse-cert",
+                    std::time::Duration::from_secs(60),
+                    &format!(
+                        "dot reuse: [dns.dot] 证书不可用，DoT 连接被拒（站点 TLS 不受影响）：{e:#}"
+                    ),
+                );
+                return Ok(());
+            }
+        };
+        match tokio::time::timeout(HANDSHAKE_TIMEOUT, tokio_boring::accept(&acceptor, io)).await {
+            Ok(Ok(t)) => (t, true),
+            Ok(Err(e)) => {
+                log::debug!("dot reuse: DoT acceptor 握手失败 peer={peer}: {e:?}");
+                return Ok(());
+            }
+            Err(_) => {
+                log::debug!("dot reuse: 握手超时（{HANDSHAKE_TIMEOUT:?}）peer={peer}");
+                return Ok(());
+            }
+        }
+    } else {
+        let acceptor = build_acceptor_cached(ssl, &lc, profile, true)?;
+        match tokio::time::timeout(HANDSHAKE_TIMEOUT, tokio_boring::accept(&acceptor, io)).await {
+            Ok(Ok(t)) => (t, false),
+            Ok(Err(e)) => return Err(anyhow::anyhow!("boringssl accept failed: {e:?}")),
+            Err(_) => {
+                log::debug!("dot reuse: 握手超时（{HANDSHAKE_TIMEOUT:?}）peer={peer}");
+                return Ok(());
+            }
+        }
+    };
+    let alpn = tls.ssl().selected_alpn_protocol().map(|p| p.to_vec());
+    if alpn.as_deref() == Some(b"dot") {
+        log::info!("dot: reuse handshake ok from {peer} (TLS listener :{})", lc.port);
+        return crate::server::dns::dot_doh::serve_reused_tls(tls, peer, live).await;
+    }
+    if dot_only_acceptor {
+        // DoT acceptor 的 ALPN 列表只有 dot：没选中说明客户端其实没给（或给了畸形值），
+        // 不能把 DNS 帧循环套在一条 HTTP 意图的连接上。
+        log::debug!("dot reuse: 未协商出 dot，丢弃 peer={peer}");
+        drop(tls);
+        return Ok(());
+    }
+    // 站点 acceptor 分支：dot 优先级最高，走到这里说明这条连接没有可用的 dot；
+    // 按正常 HTTP 分发（与未开启 reuse 时一致）。
+    log::debug!("dot reuse: ALPN={alpn:?} 非 dot，按站点 HTTP 处理 peer={peer}");
     dispatch_alpn(tls, live, lc, peer).await
 }
 
@@ -1660,29 +1760,29 @@ mod fingerprint_tests {
         };
         let lc = crate::config::ListenerConfig::default();
 
-        let fp1 = acceptor_fingerprint(&ssl, &lc, VersionProfile::Default);
+        let fp1 = acceptor_fingerprint(&ssl, &lc, VersionProfile::Default, false);
         assert_eq!(
             fp1,
-            acceptor_fingerprint(&ssl, &lc, VersionProfile::Default),
+            acceptor_fingerprint(&ssl, &lc, VersionProfile::Default, false),
             "同样的材料必须得到同样的指纹（否则缓存永不命中）"
         );
 
         // ① 长度不同的替换
         std::thread::sleep(std::time::Duration::from_millis(20));
         std::fs::write(&cert, b"second-cert-content").expect("rewrite");
-        let fp2 = acceptor_fingerprint(&ssl, &lc, VersionProfile::Default);
+        let fp2 = acceptor_fingerprint(&ssl, &lc, VersionProfile::Default, false);
         assert_ne!(fp1, fp2, "证书被替换后指纹必须变化（否则继续用旧证书）");
 
         // ② **同样长度**、不同内容（只把 size 编进指纹的实现会在这条上漏掉）
         std::thread::sleep(std::time::Duration::from_millis(20));
         std::fs::write(&cert, b"THIRD-cert-content!").expect("rewrite2");
-        let fp3 = acceptor_fingerprint(&ssl, &lc, VersionProfile::Default);
+        let fp3 = acceptor_fingerprint(&ssl, &lc, VersionProfile::Default, false);
         assert_ne!(fp2, fp3, "等长替换也必须改变指纹（要靠 mtime）");
 
         // ③ 与内容无关的字段变化同样要影响指纹
         let mut ssl2 = ssl.clone();
         ssl2.prefer_tls13 = true;
-        assert_ne!(fp3, acceptor_fingerprint(&ssl2, &lc, VersionProfile::Default), "配置字段变化必须影响指纹");
+        assert_ne!(fp3, acceptor_fingerprint(&ssl2, &lc, VersionProfile::Default, false), "配置字段变化必须影响指纹");
 
         let _ = std::fs::remove_dir_all(&dir);
     }

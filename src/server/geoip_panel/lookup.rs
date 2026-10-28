@@ -1,16 +1,15 @@
 //! GeoIP lookup — covering merge, label, anycast (§23 / §23.2).
 
-use super::covering::{self, MergedFields};
-use super::db;
-use anyhow::Result;
-use std::net::IpAddr;
-use std::path::Path;
+use super::covering::MergedFields;
 
 /// Unified query result schema per §23.2.
 #[derive(Debug, Clone, Default)]
 pub struct GeoResult {
     pub country: String,
     pub province: String,
+    /// 省/州（Rust 内部合并结果里有 `region`，面板 §23.2 输出也带上，
+    /// 便于与 Python 离线合并逐字段对照）。
+    pub region: String,
     pub city: String,
     pub district: String,
     pub isp: String,
@@ -26,6 +25,10 @@ pub struct GeoResult {
     pub prefixes_merged: usize,
     pub label: String,
     pub dc: String,
+    /// 命中的最长覆盖前缀与对应行权重 / commit（§23.2 查询结果展示用）。
+    pub prefix: String,
+    pub weight: i64,
+    pub commit_unix: i64,
 }
 
 impl GeoResult {
@@ -33,6 +36,7 @@ impl GeoResult {
         let mut r = Self {
             country: m.country,
             province: m.province,
+            region: m.region,
             city: m.city,
             district: m.district,
             isp: m.isp,
@@ -48,6 +52,9 @@ impl GeoResult {
             prefixes_merged: m.prefixes_merged,
             label: String::new(),
             dc: m.dc,
+            prefix: m.prefix,
+            weight: m.weight,
+            commit_unix: m.commit_unix,
         };
         r.label = format_label(&r);
         r
@@ -108,19 +115,9 @@ fn format_asn(asn: &str, as_org: &str) -> String {
     s
 }
 
-pub fn lookup(db_path: &Path, ip: IpAddr) -> Result<Option<GeoResult>> {
-    let conn = db::open(db_path)?;
-    let m = covering::lookup_merged(&conn, &ip.to_string())?;
-    if m.country.is_empty()
-        && m.city.is_empty()
-        && m.isp.is_empty()
-        && m.asn.is_empty()
-        && m.cloud_provider.is_empty()
-    {
-        return Ok(None);
-    }
-    Ok(Some(GeoResult::from_merged(m)))
-}
+// G-19：原来的 `lookup(db_path, ip)` 全树无调用者（admin_geoip 用的是
+// `covering::lookup_merged_with_rows`）。直接删掉，避免它绕过 `db::open` 的
+// 只读库容忍逻辑被未来调用者误用。
 
 #[cfg(test)]
 mod tests {

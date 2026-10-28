@@ -133,6 +133,7 @@ mod imp {
     use crate::server::h1::{BoxBody, REQUEST_BODY_CAP};
     use crate::server::connect_udp;
     use crate::server::static_files;
+    use ::h3::ConnectionState as _; // peer SETTINGS（H3_DATAGRAM 能力协商）
     use anyhow::Context;
     use bytes::{Buf, Bytes};
     use http::{Request, Response, StatusCode};
@@ -140,6 +141,17 @@ mod imp {
     use quinn::{Endpoint, ServerConfig};
     use quinn_boring::server_crypto::BoringQuicServerCrypto;
     use rustls::pki_types::CertificateDer; // peer_identity downcast only
+
+    /// 规格 §16.17 的 `enable_http_datagram` 开关。
+    ///
+    /// `h3` 0.0.8 没有同名 API；等价物是 `server::Builder::enable_datagram(true)`，
+    /// 它在 SETTINGS 里发 `H3_DATAGRAM (0x33) = 1`（RFC 9297 §2.1）。只有声明了
+    /// 这个设置，合规客户端才会使用 QUIC DATAGRAM 帧；客户端也必须在自己的
+    /// SETTINGS 里回同样的值，我们才在 CONNECT-UDP 上选 DATAGRAM 模式
+    /// （见 [`proxy_connect_udp`] 的能力协商）。
+    fn enable_http_datagram(builder: &mut ::h3::server::Builder) {
+        builder.enable_datagram(true);
+    }
 
     /// Serve HTTP/3 on UDP `bind` using listener TLS material and static root.
     pub async fn serve(
@@ -571,12 +583,21 @@ mod imp {
         }
 
         // `::h3` / `::h3_quinn` — avoid clashing with this module name `server::h3`.
+        // 保留一个 quinn 连接句柄：QUIC DATAGRAM 的收发必须在 `quinn::Connection`
+        // 上做（h3 0.0.8 的 RequestStream 没有 datagram API），见 `DatagramRouter`。
+        let quinn_conn = connection.clone();
         let h3_conn = ::h3_quinn::Connection::new(connection);
         // RFC 9298 的扩展 CONNECT 需要服务端声明 SETTINGS_ENABLE_CONNECT_PROTOCOL。
         // h3 0.0.8 的默认值是 false（`h3::config::Settings::default`），不显式打开的话
         // 守规矩的客户端根本不会发 `:protocol: connect-udp`。
         let mut h3_builder = ::h3::server::builder();
         h3_builder.enable_extended_connect(true);
+        // G-16 / §16.17：CONNECT-UDP listener 声明 `H3_DATAGRAM`（SETTINGS 0x33=1），
+        // 客户端才会使用 RFC 9297 §2.2 的 QUIC DATAGRAM 帧；是否真的用还要看
+        // 客户端 SETTINGS + transport 参数（见 `proxy_connect_udp` 的协商）。
+        if lc.connect_udp {
+            enable_http_datagram(&mut h3_builder);
+        }
         // 头部区上限：**必须显式设**。h3 0.0.8 的默认是 `VarInt::MAX`（≈2^62），
         // 而它是在**收齐整个帧之后**才做 QPACK 解码与长度校验的 —— 也就是说
         // 一个声明「HEADERS 帧长 4GiB」再慢慢发的客户端，能让我们按发送速率 1:1 吃内存，
@@ -594,6 +615,15 @@ mod imp {
                 );
                 return Ok(());
             }
+        };
+        // 对端 SETTINGS（含 H3_DATAGRAM）在控制流上解析后写进 SharedState；
+        // 每个请求读它做能力协商（不是启动快照）。
+        let h3_shared = server.inner.shared.clone();
+        // 一条连接一个 DATAGRAM 分发器（多条隧道共享同一个 QUIC datagram 队列）。
+        let datagram_router = if lc.connect_udp {
+            Some(DatagramRouter::start(quinn_conn.clone(), peer))
+        } else {
+            None
         };
 
         // 每连接一份的 QMux 流预算（见 qmux.rs）：闸门是每连接的，
@@ -662,9 +692,15 @@ mod imp {
                     let live_c = Arc::clone(&live);
                     let lc_c = lc.clone();
                     let qmux_c = Arc::clone(&qmux);
+                    let conn_c = quinn_conn.clone();
+                    let shared_c = h3_shared.clone();
+                    let datagrams_c = datagram_router.clone();
                     tokio::spawn(async move {
-                        if let Err(e) =
-                            handle_resolver(resolver, live_c, lc_c, peer, qmux_c).await
+                        if let Err(e) = handle_resolver(
+                            resolver, live_c, lc_c, peer, qmux_c, conn_c, shared_c,
+                            datagrams_c,
+                        )
+                        .await
                         {
                             // Client reset, idle timeout, or cancel — common; keep serving.
                             log::debug!("h3 request soft-fail peer={peer}: {e:#}");
@@ -759,12 +795,114 @@ mod imp {
         crate::server::h2::prohibited_request_field(headers)
     }
 
+    /// 每条隧道最多缓存的入向 DATAGRAM 数（满了丢最新；QUIC DATAGRAM 不可靠）。
+    const H3_DATAGRAM_QUEUE: usize = 128;
+
+    /// 每连接一个 QUIC DATAGRAM 分发器。
+    ///
+    /// 为什么需要分发器：一条 QUIC 连接的 DATAGRAM 是**共享队列**，而同一连接上
+    /// 可能同时有多条 CONNECT-UDP 隧道（不同请求流）。如果每条隧道各自
+    /// `read_datagram()`，别的隧道的报文会被抢走。这里只起**一个**读任务，
+    /// 按 RFC 9297 §2.2 的 Quarter Stream ID 投递到对应隧道的 mpsc。
+    /// 队列满就丢：QUIC DATAGRAM 本来就是不可靠、可丢的传输。
+    struct DatagramRouter {
+        subs: parking_lot::Mutex<
+            std::collections::HashMap<u64, tokio::sync::mpsc::Sender<Bytes>>,
+        >,
+    }
+
+    /// 单条隧道的 DATAGRAM 订阅；Drop 时从 router 注销
+    /// （请求流结束后不再占用 sender，迟到的报文直接丢）。
+    struct DatagramSubscription {
+        router: std::sync::Weak<DatagramRouter>,
+        quarter_stream_id: u64,
+        rx: tokio::sync::mpsc::Receiver<Bytes>,
+    }
+
+    impl Drop for DatagramSubscription {
+        fn drop(&mut self) {
+            if let Some(r) = self.router.upgrade() {
+                r.subs.lock().remove(&self.quarter_stream_id);
+            }
+        }
+    }
+
+    impl DatagramRouter {
+        /// 启动每连接唯一的读任务。连接关闭/对端停止发 DATAGRAM 时任务自然退出。
+        fn start(conn: quinn::Connection, peer: SocketAddr) -> Arc<Self> {
+            let router = Arc::new(Self {
+                subs: parking_lot::Mutex::new(std::collections::HashMap::new()),
+            });
+            let weak = Arc::downgrade(&router);
+            tokio::spawn(async move {
+                loop {
+                    let dg = match conn.read_datagram().await {
+                        Ok(d) => d,
+                        Err(e) => {
+                            log::debug!("h3 peer={peer} read_datagram end: {e}");
+                            break;
+                        }
+                    };
+                    let Some(router) = weak.upgrade() else {
+                        break;
+                    };
+                    match connect_udp::parse_h3_datagram(&dg) {
+                        Ok((qsid, payload)) => {
+                            let tx = router.subs.lock().get(&qsid).cloned();
+                            match tx {
+                                Some(tx) => {
+                                    // 不可靠语义：队列满 = 隧道侧处理不过来，丢这一帧。
+                                    if tx
+                                        .try_send(Bytes::copy_from_slice(payload))
+                                        .is_err()
+                                    {
+                                        log::debug!(
+                                            "h3 DATAGRAM qsid={qsid} dropped (tunnel queue full/closed)"
+                                        );
+                                    }
+                                }
+                                None => log::trace!(
+                                    "h3 DATAGRAM qsid={qsid} dropped (no tunnel for stream)"
+                                ),
+                            }
+                        }
+                        Err(e) => log::debug!("h3 peer={peer} DATAGRAM dropped: {e}"),
+                    }
+                }
+            });
+            router
+        }
+
+        fn subscribe(self: &Arc<Self>, quarter_stream_id: u64) -> DatagramSubscription {
+            let (tx, rx) = tokio::sync::mpsc::channel::<Bytes>(H3_DATAGRAM_QUEUE);
+            self.subs.lock().insert(quarter_stream_id, tx);
+            DatagramSubscription {
+                router: Arc::downgrade(self),
+                quarter_stream_id,
+                rx,
+            }
+        }
+    }
+
+    /// 取客户端 → 目标的下一帧；没有订阅时永久 Pending
+    /// （`select!` 分支保持安静，不空转）。
+    async fn recv_client_datagram(sub: &mut Option<DatagramSubscription>) -> Option<Bytes> {
+        match sub {
+            Some(s) => s.rx.recv().await,
+            None => std::future::pending().await,
+        }
+    }
+
     async fn handle_resolver(
         resolver: ::h3::server::RequestResolver<::h3_quinn::Connection, Bytes>,
         live: Arc<LiveConfig>,
         lc: ListenerConfig,
         peer: SocketAddr,
         qmux: Arc<crate::server::qmux::QmuxBudget>,
+        // QUIC DATAGRAM 通道（G-16）：同一连接的所有 CONNECT-UDP 隧道共享。
+        quinn_conn: quinn::Connection,
+        h3_shared: Arc<::h3::SharedState>,
+        datagrams: Option<Arc<DatagramRouter>>,
     ) -> Result<()> {
         let (req, mut stream) = match resolver.resolve_request().await {
             Ok(pair) => pair,
@@ -1047,7 +1185,17 @@ mod imp {
                     return Ok(());
                 }
             };
-            let r = proxy_connect_udp(&req, stream, &live, peer, lc.access_log.as_ref()).await;
+            let r = proxy_connect_udp(
+                &req,
+                stream,
+                &live,
+                peer,
+                lc.access_log.as_ref(),
+                &quinn_conn,
+                &h3_shared,
+                datagrams.as_ref(),
+            )
+            .await;
             drop(permit);
             return r;
         }
@@ -1929,6 +2077,9 @@ use chunked uploads (Content-Range) or HTTP/1.1 for larger bodies",
         live: &Arc<LiveConfig>,
         peer: SocketAddr,
         per: Option<&crate::config::ListenerAccessLogConfig>,
+        quinn_conn: &quinn::Connection,
+        h3_shared: &::h3::SharedState,
+        datagrams: Option<&Arc<DatagramRouter>>,
     ) -> Result<()> {
         let t0 = std::time::Instant::now();
         let path = req.uri().path().to_string();
@@ -1967,21 +2118,38 @@ use chunked uploads (Content-Range) or HTTP/1.1 for larger bodies",
             return Ok(());
         }
 
-        // 2. capsule 形态没实现。RFC 9297 §3 下 `Capsule-Protocol: ?1` 的流上是 capsule，
-        //    不是裸长度前缀报文；按错格式解析会解出垃圾，所以直接拒绝。
+        // 2. 封装形态协商（三种，互斥）。
+        //
+        //    a) RFC 9297 §2.2 QUIC DATAGRAM 帧（G-16）：**双方**都要声明
+        //       `SETTINGS_H3_DATAGRAM`（本端在 `handle_incoming` 里用
+        //       `enable_http_datagram` 打开；对端从其 SETTINGS 读），并且 QUIC
+        //       transport 协商出 `max_datagram_frame_size`（`max_datagram_size()`）；
+        //    b) RFC 9297 §3.5 capsule：客户端带 `Capsule-Protocol: ?1`；
+        //    c) RFC 9298 §4.3 裸长度前缀：两者都没有（老客户端）。
+        //
+        //    能力协商务必**每请求**读 `h3_shared.settings()`：对端 SETTINGS 在控制流上，
+        //    不能在连接建立时做快照（它可能比首个请求晚到）。
         let capsule = req
             .headers()
             .get("capsule-protocol")
             .and_then(|v| v.to_str().ok());
-        // RFC 9298 §3.2：客户端**应当**带 `?1`（capsule 协议），真实 MASQUE 客户端就是这么发的。
-        // 之前这里直接回 501，等于对标准客户端不可用。现在两种形态都支持：
-        //   `?1` → RFC 9297 capsule（type+len+payload，DATAGRAM=0x00）
-        //   不带 → RFC 9298 §4.3 的裸长度前缀（早期草稿形态）
-        let framing = if connect_udp::wants_capsule_protocol(capsule) {
+        let peer_datagram = h3_shared.settings().enable_datagram();
+        let quic_datagram = quinn_conn.max_datagram_size().is_some();
+        let quarter_stream_id = stream.id().index();
+        let datagram_ok = peer_datagram && quic_datagram && stream.id().is_request();
+        let framing = if datagram_ok {
+            connect_udp::Framing::Datagram
+        } else if connect_udp::wants_capsule_protocol(capsule) {
             connect_udp::Framing::Capsules
         } else {
             connect_udp::Framing::LengthPrefixed
         };
+        log::info!(
+            "h3 CONNECT-UDP peer={peer} path={path}: framing={:?} \
+             (peer_h3_datagram={peer_datagram} quic_datagram={quic_datagram} \
+             quarter_stream_id={quarter_stream_id})",
+            framing
+        );
 
         // 3. 目标解析 + 准入。
         let (host, port) = match connect_udp::parse_target_path(&path) {
@@ -2093,9 +2261,32 @@ use chunked uploads (Content-Range) or HTTP/1.1 for larger bodies",
         log::info!("h3 CONNECT-UDP established peer={peer} target={target} path={path}");
 
         // 6. 拆成收发两半，跑双向转发；结束时正常收尾（FIN）而不是让 quinn reset。
+        //
+        //    DATAGRAM 模式：先按本请求流的 Quarter Stream ID 订阅（同一连接上多条
+        //    隧道由 DatagramRouter 按 id 分发）；Drop 即注销。其它两种模式流内封装。
+        let datagram = match (framing, datagrams) {
+            (connect_udp::Framing::Datagram, Some(router)) => {
+                Some(DatagramTunnel {
+                    conn: quinn_conn.clone(),
+                    quarter_stream_id,
+                    sub: router.subscribe(quarter_stream_id),
+                })
+            }
+            _ => None,
+        };
         let (mut send_half, mut recv_half) = stream.split();
         let idle = std::time::Duration::from_secs(connect_udp::DEFAULT_IDLE_TIMEOUT_SECS);
-        run_udp_tunnel(&mut send_half, &mut recv_half, udp, idle, peer, target, framing).await;
+        run_udp_tunnel(
+            &mut send_half,
+            &mut recv_half,
+            udp,
+            idle,
+            peer,
+            target,
+            framing,
+            datagram,
+        )
+        .await;
         if let Err(e) = send_half.finish().await {
             log::debug!("h3 CONNECT-UDP finish peer={peer}: {e:#}");
         }
@@ -2103,16 +2294,35 @@ use chunked uploads (Content-Range) or HTTP/1.1 for larger bodies",
         Ok(())
     }
 
-    /// RFC 9298 §4.3 的双向转发循环。
+    /// 一条隧道的 QUIC DATAGRAM 通道：发送用连接句柄 + Quarter Stream ID，
+    /// 接收用 [`DatagramSubscription`]（Drop 时自动从 router 注销）。
+    struct DatagramTunnel {
+        conn: quinn::Connection,
+        quarter_stream_id: u64,
+        sub: DatagramSubscription,
+    }
+
+    /// 下行回到客户端的结果。
+    enum Downlink {
+        /// 流内封装（capsule / 长度前缀）：调用方把 `Bytes` 写进响应流。
+        Stream(Bytes),
+        /// QUIC DATAGRAM 已发送（或按 RFC 允许地丢弃了一个过大报文）。
+        Datagram,
+    }
+
+    /// RFC 9298 的双向转发循环（三种封装形态共用）。
     ///
-    /// 上行：请求流 DATA 帧里的字节按 varint 长度前缀重组，逐个 `send()` 给目标；
-    /// 下行：`recv()` 到的报文加长度前缀，写回响应流。
+    /// * [`connect_udp::Framing::LengthPrefixed`]：请求流 `varint(len)+payload`；
+    /// * [`connect_udp::Framing::Capsules`]：请求流 RFC 9297 capsule；
+    /// * [`connect_udp::Framing::Datagram`]：每个 UDP 报文是**一个 QUIC DATAGRAM 帧**
+    ///   （RFC 9297 §2.2，G-16）；请求流上仍接受 CLOSE/未知 capsule。
+    ///
+    /// 上行：客户端 → 目标；下行：目标 → 客户端。
     /// 结束条件：请求流结束（FIN/trailers）、UDP 出错、空闲超时、分帧非法。
     ///
     /// 结构上刻意让每个 `select!` 分支的处理器都**不碰**其它分支 future 借用的变量：
-    /// 下行收包封在 [`recv_framed`] 里（它自己借 `buf`，只交出已分帧的 `Bytes`），
-    /// 处理器因此不需要再读 `buf`，借用关系一眼可读，也不必依赖 `select!` 内部
-    /// future 的存放与析构时机。
+    /// 下行收包封在 [`recv_downlink`] 里（它自己借 `buf`，只交出已分帧的 `Bytes`
+    /// 或已发送的 DATAGRAM），处理器因此不需要再读 `buf`，借用关系一眼可读。
     async fn run_udp_tunnel(
         send: &mut ::h3::server::RequestStream<::h3_quinn::SendStream<Bytes>, Bytes>,
         recv: &mut ::h3::server::RequestStream<::h3_quinn::RecvStream, Bytes>,
@@ -2121,15 +2331,22 @@ use chunked uploads (Content-Range) or HTTP/1.1 for larger bodies",
         peer: SocketAddr,
         target: SocketAddr,
         framing: connect_udp::Framing,
+        datagram: Option<DatagramTunnel>,
     ) {
         let mut asm = connect_udp::DatagramAssembler::new(framing);
         let mut udp_buf = vec![0u8; connect_udp::MAX_DATAGRAM];
+        // 拆开字段，避免 `select!` 里同时借 `datagram` 的不同部分。
+        let (dg_conn, dg_qsid, mut dg_sub) = match datagram {
+            Some(d) => (Some(d.conn), Some(d.quarter_stream_id), Some(d.sub)),
+            None => (None, None, None),
+        };
         let idle = tokio::time::sleep(idle_timeout);
         tokio::pin!(idle);
 
         loop {
             tokio::select! {
-                // 上行：客户端 → 目标。
+                // 上行（流）：客户端 → 目标（长度前缀 / capsule；DATAGRAM 模式下
+                // 只用于 CLOSE/未知 capsule 这类控制帧）。
                 chunk = recv.recv_data() => {
                     let mut buf = match chunk {
                         Ok(Some(b)) => b,
@@ -2183,15 +2400,29 @@ use chunked uploads (Content-Range) or HTTP/1.1 for larger bodies",
                         }
                     }
                 }
+                // 上行（QUIC DATAGRAM）：客户端 → 目标。DATAGRAM 模式之外这条
+                // future 永久 Pending，不参与唤醒。
+                dg = recv_client_datagram(&mut dg_sub) => {
+                    match dg {
+                        Some(dg) => {
+                            if let Err(e) = udp.send(&dg).await {
+                                log::debug!("h3 CONNECT-UDP peer={peer} udp send (DATAGRAM): {e}");
+                                return;
+                            }
+                        }
+                        None => return, // 订阅被注销（隧道收尾）
+                    }
+                }
                 // 下行：目标 → 客户端。
-                framed = recv_framed(&udp, &mut udp_buf, framing) => {
-                    match framed {
-                        Ok(f) => {
+                down = recv_downlink(&udp, &mut udp_buf, framing, dg_conn.as_ref(), dg_qsid) => {
+                    match down {
+                        Ok(Downlink::Stream(f)) => {
                             if let Err(e) = send.send_data(f).await {
                                 log::debug!("h3 CONNECT-UDP peer={peer} send_data: {e:#}");
                                 return;
                             }
                         }
+                        Ok(Downlink::Datagram) => {}
                         Err(e) => {
                             log::debug!("h3 CONNECT-UDP peer={peer} udp recv: {e}");
                             return;
@@ -2208,21 +2439,47 @@ use chunked uploads (Content-Range) or HTTP/1.1 for larger bodies",
         }
     }
 
-    /// 收一个 UDP 报文并加上 RFC 9298 的长度前缀，返回可写回流的 `Bytes`。
+    /// 收一个 UDP 报文并按当前封装形态送到客户端。
     ///
     /// 独立成函数是为了把 `&mut buf` 的借用关在 future 内部：
     /// `select!` 的处理器拿到的只有返回值，不再需要读 `buf`。
-    async fn recv_framed(
+    async fn recv_downlink(
         udp: &tokio::net::UdpSocket,
         buf: &mut [u8],
         framing: connect_udp::Framing,
-    ) -> Result<Bytes, String> {
+        dg_conn: Option<&quinn::Connection>,
+        dg_qsid: Option<u64>,
+    ) -> Result<Downlink, String> {
         let n = udp.recv(buf).await.map_err(|e| e.to_string())?;
-        let framed = match framing {
-            connect_udp::Framing::Capsules => connect_udp::frame_datagram_capsule(&buf[..n])?,
-            connect_udp::Framing::LengthPrefixed => connect_udp::frame_datagram(&buf[..n])?,
-        };
-        Ok(Bytes::from(framed))
+        match framing {
+            connect_udp::Framing::Capsules => Ok(Downlink::Stream(Bytes::from(
+                connect_udp::frame_datagram_capsule(&buf[..n])?,
+            ))),
+            connect_udp::Framing::LengthPrefixed => Ok(Downlink::Stream(Bytes::from(
+                connect_udp::frame_datagram(&buf[..n])?,
+            ))),
+            connect_udp::Framing::Datagram => {
+                let conn = dg_conn
+                    .ok_or_else(|| "DATAGRAM mode without quinn connection".to_string())?;
+                let qsid = dg_qsid
+                    .ok_or_else(|| "DATAGRAM mode without quarter stream id".to_string())?;
+                let framed = connect_udp::frame_h3_datagram(qsid, &buf[..n])?;
+                match conn.send_datagram(Bytes::from(framed)) {
+                    Ok(()) => Ok(Downlink::Datagram),
+                    Err(quinn::SendDatagramError::TooLarge) => {
+                        // QUIC DATAGRAM 必须装进单个 QUIC 包。大于 path MTU 的 UDP
+                        // 报文在 DATAGRAM 模式下无法转发（RFC 9298 不要求代理分片）；
+                        // 丢这一帧并记录 —— 不能退回流内封装（客户端按 DATAGRAM 解析）。
+                        log::warn!(
+                            "h3 CONNECT-UDP DATAGRAM too large for peer path \
+                             ({n} byte UDP payload), dropped"
+                        );
+                        Ok(Downlink::Datagram)
+                    }
+                    Err(e) => Err(format!("send_datagram: {e}")),
+                }
+            }
+        }
     }
 
     /// CONNECT 类请求的失败出口：回状态码 + 记一条访问日志。

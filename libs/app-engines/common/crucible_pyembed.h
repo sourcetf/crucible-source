@@ -928,6 +928,334 @@ static void crucible_py_envwin_leave(void)
     crucible_py_xdecref(view); /* 引用释放放在锁外（dealloc 不占窗口锁） */
 }
 
+/* ═══════════════ R-03：每请求环境覆盖视图（os.environ 线程感知代理） ═══════════════
+ *
+ * 背景：本引擎自报 `appengine_env_isolation()=1` 后，宿主**不再**把请求 `.env`
+ * 装进进程环境（也不再持有全局 env 锁）。`.env` 只经 ABI 的 `extra` JSON 下发。
+ * WSGI/ASGI/uWSGI 应用读的是 Python 的 `os.environ` / `os.getenv`，而
+ * `os.environ` 是解释器**全局**对象：若每请求直接改它，两个不同 `.env` 的并发
+ * 请求会互相覆盖/删除对方的值（apps6-wave11 §7.1 的 `<unset>` 形态）。
+ *
+ * 修法：安装一次线程感知代理（与 script-ffi 的 `_CrucibleEnv` 同一语义）：
+ *   * `_cro_tls.env` 是**本线程**的请求覆盖 dict（键 → 值；None = 该键不存在）；
+ *   * 有覆盖时，读 = 覆盖 → 启动期基底（`appengine_base_env_block()`），
+ *     **绝不回退到真实 `_data`** —— 后者可能正装着别的引擎（仍走进程 env 的
+ *     引擎）的临时 `.env`，本引擎已与它们并发；
+ *   * 没有覆盖时（应用自己起的后台线程等）行为保持原样（读 `_real`）。
+ *
+ * 为什么用线程本地：引擎调用是同步的，应用代码跑在请求线程上（ASGI 的
+ * `asyncio.run` 也在同一线程），一次请求只碰自己的那份覆盖。
+ *
+ * 诚实边界：应用若显式 `os.putenv`/`ctypes` 改 C environ，或自己起线程读
+ * `os.environ`，不受本机制保护（与 cgi 的 env_isolation 同一信任边界）。
+ */
+static void *g_py_reqenv_set;   /* _cro_set(env)   （新引用） */
+static void *g_py_reqenv_clear; /* _cro_clear()    （新引用） */
+
+static const char *g_py_reqenv_shim_src =
+    "import collections.abc as _croc\n"
+    "import os as _cro_os\n"
+    "import threading as _cro_th\n"
+    "_cro_tls = _cro_th.local()\n"
+    "class _CrucibleReqEnv(_croc.MutableMapping):\n"
+    "    def __init__(self, real, base):\n"
+    "        self._real = real\n"
+    "        self._base = base\n"
+    "    def _ov(self):\n"
+    "        return getattr(_cro_tls, 'env', None)\n"
+    "    def __getitem__(self, k):\n"
+    "        ov = self._ov()\n"
+    "        if ov is not None:\n"
+    "            if k in ov:\n"
+    "                v = ov[k]\n"
+    "                if v is None:\n"
+    "                    raise KeyError(k)\n"
+    "                return v\n"
+    "            if k in self._base:\n"
+    "                return self._base[k]\n"
+    "            raise KeyError(k)\n"
+    "        return self._real[k]\n"
+    "    def __setitem__(self, k, v):\n"
+    "        ov = self._ov()\n"
+    "        if ov is not None:\n"
+    "            ov[k] = v\n"
+    "        else:\n"
+    "            self._real[k] = v\n"
+    "    def __delitem__(self, k):\n"
+    "        ov = self._ov()\n"
+    "        if ov is not None:\n"
+    "            ov[k] = None\n"
+    "            return\n"
+    "        del self._real[k]\n"
+    "    def _merged(self):\n"
+    "        d = dict(self._base)\n"
+    "        ov = self._ov()\n"
+    "        if ov is not None:\n"
+    "            for k, v in ov.items():\n"
+    "                if v is None:\n"
+    "                    d.pop(k, None)\n"
+    "                else:\n"
+    "                    d[k] = v\n"
+    "        return d\n"
+    "    def __iter__(self):\n"
+    "        ov = self._ov()\n"
+    "        return iter(self._real if ov is None else self._merged())\n"
+    "    def __len__(self):\n"
+    "        ov = self._ov()\n"
+    "        return len(self._real) if ov is None else len(self._merged())\n"
+    "    def copy(self):\n"
+    "        ov = self._ov()\n"
+    "        return dict(self._real) if ov is None else self._merged()\n"
+    "_cro_os.environ = _CrucibleReqEnv(_cro_os.environ, _cro_base)\n"
+    "def _cro_set(env):\n"
+    "    _cro_tls.env = env\n"
+    "def _cro_clear():\n"
+    "    _cro_tls.env = None\n";
+
+/* 启动期基底 → Python dict（str 键值）。基底块由宿主 appengine_set_base_env 交付；
+ * 旧宿主没有该符号时退化为当前 os.environ 的副本（保持旧行为，绝不凭空清空）。 */
+static void *crucible_py_reqenv_base_dict(void)
+{
+    const char *base = appengine_base_env_block();
+    void *d = NULL;
+
+    if (base == NULL) {
+        void *os_mod = g_py.import_module("os");
+        void *envmap = NULL, *bi = NULL;
+
+        if (os_mod != NULL)
+            envmap = g_py.object_get_attr_string(os_mod, "environ");
+        if (envmap != NULL)
+            bi = g_py.import_module("builtins");
+        if (bi != NULL)
+            d = g_py.object_call_method(bi, "dict", "O", envmap);
+        if (d == NULL)
+            crucible_py_clear_error();
+        crucible_py_xdecref(os_mod);
+        crucible_py_xdecref(envmap);
+        crucible_py_xdecref(bi);
+        return d;
+    }
+    d = g_py.dict_new();
+    if (d == NULL) {
+        crucible_py_clear_error();
+        return NULL;
+    }
+    while (*base != '\0') {
+        const char *eq = strchr(base, '=');
+        void *k, *v;
+
+        if (eq == NULL)
+            break;
+        k = g_py.unicode_from_string_and_size(base, (long)(eq - base));
+        if (k == NULL) {
+            crucible_py_clear_error();
+        } else {
+            v = g_py.unicode_from_string_and_size(eq + 1, (long)strlen(eq + 1));
+            if (v != NULL) {
+                if (g_py.dict_set_item(d, k, v) != 0)
+                    crucible_py_clear_error();
+                g_py.dec_ref(v);
+            } else {
+                crucible_py_clear_error();
+            }
+            g_py.dec_ref(k);
+        }
+        base = eq + strlen(eq) + 1;
+    }
+    return d;
+}
+
+/* 安装代理（须持 GIL；幂等）。返回 1 = 可用。 */
+static int crucible_py_reqenv_install_locked(void)
+{
+    void *bi = NULL, *exec_fn = NULL, *globals = NULL, *base = NULL;
+    void *src = NULL, *args = NULL, *res = NULL;
+    int ok = 0;
+
+    if (g_py_state != 1)
+        return 0;
+    if (g_py_reqenv_set != NULL)
+        return 1;
+    bi = g_py.import_module("builtins");
+    if (bi == NULL) {
+        crucible_py_clear_error();
+            return 0;
+    }
+    exec_fn = g_py.object_get_attr_string(bi, "exec");
+    g_py.dec_ref(bi);
+    if (exec_fn == NULL) {
+        crucible_py_clear_error();
+        return 0;
+    }
+    globals = g_py.dict_new();
+    base = globals != NULL ? crucible_py_reqenv_base_dict() : NULL;
+    src = (globals != NULL && base != NULL)
+              ? g_py.unicode_from_string_and_size(
+                    g_py_reqenv_shim_src, (long)strlen(g_py_reqenv_shim_src))
+              : NULL;
+    args = (src != NULL) ? g_py.tuple_new(2) : NULL;
+    if (args == NULL) {
+        crucible_py_xdecref(src);
+        crucible_py_xdecref(base);
+        crucible_py_xdecref(globals);
+        g_py.dec_ref(exec_fn);
+        crucible_py_clear_error();
+        return 0;
+    }
+    if (g_py.dict_set_item_string(globals, "_cro_base", base) != 0)
+        crucible_py_clear_error();
+    crucible_py_xdecref(base); /* dict 持有一份引用 */
+    /* PyTuple_SetItem 偷引用（失败时也会释放 item）⇒ src 之后不可再用。 */
+    if (g_py.tuple_set_item(args, 0, src) != 0) {
+        crucible_py_clear_error();
+        g_py.dec_ref(args);
+        g_py.dec_ref(globals);
+        g_py.dec_ref(exec_fn);
+        return 0;
+    }
+    g_py.inc_ref(globals); /* args 持有一份；我们那份留到函数结束 */
+    if (g_py.tuple_set_item(args, 1, globals) != 0) {
+        /* 失败时 increment 已被释放；args 不再持有 globals。 */
+        crucible_py_clear_error();
+        g_py.dec_ref(args);
+        g_py.dec_ref(globals);
+        g_py.dec_ref(exec_fn);
+        return 0;
+    }
+    res = g_py.object_call(exec_fn, args, NULL);
+    if (res == NULL) {
+        crucible_py_clear_error();
+    } else {
+        g_py.dec_ref(res);
+        /* 注意：exec 的命名空间是 **dict**，函数名是 dict 的键，不是 dict 对象的
+         * 属性 —— 必须用 PyDict_GetItemString（借用引用），不能用
+         * PyObject_GetAttrString（那会得到 AttributeError）。 */
+        g_py_reqenv_set = g_py.dict_get_item_string(globals, "_cro_set");
+        if (g_py_reqenv_set != NULL)
+            g_py.inc_ref(g_py_reqenv_set);
+        g_py_reqenv_clear = g_py.dict_get_item_string(globals, "_cro_clear");
+        if (g_py_reqenv_clear != NULL)
+            g_py.inc_ref(g_py_reqenv_clear);
+        if (g_py_reqenv_set != NULL && g_py_reqenv_clear != NULL) {
+            ok = 1;
+        } else {
+            crucible_py_clear_error();
+            crucible_py_xdecref(g_py_reqenv_set);
+            crucible_py_xdecref(g_py_reqenv_clear);
+            g_py_reqenv_set = NULL;
+            g_py_reqenv_clear = NULL;
+        }
+    }
+    g_py.dec_ref(args);   /* args 释放它对 globals 的引用 */
+    g_py.dec_ref(globals); /* 我们自己的引用 */
+    g_py.dec_ref(exec_fn);
+    return ok;
+}
+
+/* 供引擎 `appengine_env_isolation()` 调用（宿主在 set_base_env 之后、装载期调用）：
+ * 安装代理并自报「不依赖进程 env」。失败 = 0 ⇒ 宿主继续把本 .so 留在 env 锁内。 */
+static int crucible_py_env_isolation_selfcheck(void)
+{
+    int gil, ok;
+
+    if (g_py_state != 1 || g_py.gil_ensure == NULL)
+        return 0;
+    gil = g_py.gil_ensure();
+    ok = crucible_py_reqenv_install_locked();
+    g_py.gil_release(gil);
+    return ok;
+}
+
+struct crucible_py_reqenv_ctx {
+    void *dict;
+};
+
+static int crucible_py_reqenv_cb(void *ctx, const char *k, const char *v)
+{
+    void *dict = ((struct crucible_py_reqenv_ctx *)ctx)->dict;
+    void *ko, *vo;
+    int rc;
+
+    if (dict == NULL || k == NULL || k[0] == '\0')
+        return 0;
+    ko = g_py.unicode_from_string_and_size(k, (long)strlen(k));
+    if (ko == NULL) {
+        crucible_py_clear_error();
+        return 0;
+    }
+    if (v == NULL || v[0] == '\0') {
+        /* `.env` 空值 = 该键不存在（与 cgi/cgi_script 的子进程 envp 语义一致）。 */
+        vo = crucible_py_none_obj();
+        if (vo != NULL)
+            g_py.inc_ref(vo);
+    } else {
+        vo = g_py.unicode_from_string_and_size(v, (long)strlen(v));
+    }
+    if (vo == NULL) {
+        crucible_py_clear_error();
+        g_py.dec_ref(ko);
+        return 0;
+    }
+    rc = g_py.dict_set_item(dict, ko, vo);
+    g_py.dec_ref(vo);
+    g_py.dec_ref(ko);
+    if (rc != 0)
+        crucible_py_clear_error();
+    return 0;
+}
+
+/* 请求开始（须持 GIL）：把 ABI `extra` 里的 `.env` 装进**本线程**覆盖视图。
+ * 返回 1 = 已安装覆盖（请求结束必须调用 end）；0 = 代理不可用（调用方回落 envwin）。 */
+static int crucible_py_request_env_begin(const char *extra)
+{
+    struct crucible_py_reqenv_ctx ctx;
+    void *args, *res;
+
+    if (g_py_reqenv_set == NULL || g_py.dict_new == NULL)
+        return 0;
+    ctx.dict = g_py.dict_new();
+    if (ctx.dict == NULL) {
+        crucible_py_clear_error();
+        return 0;
+    }
+    if (extra != NULL)
+        (void)appengine_extra_env_foreach(extra, crucible_py_reqenv_cb, &ctx);
+    args = g_py.tuple_new(1);
+    if (args == NULL) {
+        crucible_py_clear_error();
+        g_py.dec_ref(ctx.dict);
+        return 0;
+    }
+    if (g_py.tuple_set_item(args, 0, ctx.dict) != 0) {
+        /* 失败时 item 已被释放，args 仍可 dec。 */
+        g_py.dec_ref(args);
+        crucible_py_clear_error();
+        return 0;
+    }
+    res = g_py.object_call_object(g_py_reqenv_set, args);
+    g_py.dec_ref(args);
+    if (res == NULL) {
+        crucible_py_clear_error();
+        return 0;
+    }
+    g_py.dec_ref(res);
+    return 1;
+}
+
+static void crucible_py_request_env_end(void)
+{
+    void *res;
+
+    if (g_py_reqenv_clear == NULL)
+        return;
+    res = g_py.object_call_object(g_py_reqenv_clear, NULL);
+    if (res == NULL)
+        crucible_py_clear_error();
+    else
+        g_py.dec_ref(res);
+}
+
 /* 引擎级失败：填 out->error 并返回 -1（app_ffi 把它变成 502 文本，不会假装成功）。 */
 static int crucible_py_fail(AppEngineResult *out, const char *fmt, ...)
 {
@@ -1483,7 +1811,7 @@ static int crucible_py_wsgi_request(const char *label, const char *script,
                                     const char *content_type, const char *body,
                                     size_t body_len, const char *remote,
                                     const char *server_name, int server_port,
-                                    int env_dirty, const char *headers,
+                                    const char *extra, const char *headers,
                                     AppEngineResult *out)
 {
     crucible_buf hb, bb;
@@ -1492,7 +1820,8 @@ static int crucible_py_wsgi_request(const char *label, const char *script,
     char lenbuf[32];
     char hostbuf[320];
     char *trace = NULL;
-    int gil = 0, rc = -1, we_gil = 0, envwin = 0;
+    int gil = 0, rc = -1, we_gil = 0, envwin = 0, reqenv = 0;
+    int env_dirty = extra != NULL && strchr(extra, '{') != NULL;
     crucible_py_path_guard path_guard;
     void *app = NULL;
     void *environ = NULL, *args = NULL, *sr = NULL, *result = NULL, *it = NULL;
@@ -1540,7 +1869,10 @@ static int crucible_py_wsgi_request(const char *label, const char *script,
     we_gil = 1;
     /* 带 .env 的请求才同步（env_dirty）——先登记进「同内容组」的 os.environ 同步窗口，
      * 再同步：同组并发请求共享一份请求前状态，**最后一个离开者**才恢复（见 envwin 段）。 */
-    if (env_dirty && crucible_py_envwin_enter() == 0) {
+    /* R-03：优先每请求覆盖视图（线程本地 dict，不碰进程 env、不参与全局 env 锁）。
+     * 代理不可用（极旧宿主/安装失败）时才回落到旧的「C environ → os.environ 同步窗口」。 */
+    reqenv = crucible_py_request_env_begin(extra);
+    if (!reqenv && env_dirty && crucible_py_envwin_enter() == 0) {
         envwin = 1;
         crucible_py_sync_environ_locked();
     }
@@ -1751,6 +2083,8 @@ done:
      * 最后一个同组请求离开时才把 os.environ 还原到窗口开启前的状态 —— 否则这些键
      * 会永久留在 os.environ（泄漏给后续应用），或被先走的同组请求提前删掉
      * （本修复就是后者：并发同组请求互相抹掉 .env）。 */
+    if (reqenv)
+        crucible_py_request_env_end();
     if (envwin)
         crucible_py_envwin_leave();
     crucible_py_path_leave(&path_guard);
@@ -1885,7 +2219,7 @@ static int crucible_py_asgi_request(const char *label, const char *script,
                                     const char *content_type, const char *body,
                                     size_t body_len, const char *remote,
                                     const char *server_name, int server_port,
-                                    int env_dirty, const char *headers,
+                                    const char *extra, const char *headers,
                                     AppEngineResult *out)
 {
     crucible_buf hb, bb;
@@ -1893,7 +2227,8 @@ static int crucible_py_asgi_request(const char *label, const char *script,
     char hostbuf[320];
     char *htmp = NULL;
     char *trace = NULL;
-    int gil = 0, rc = -1, we_gil = 0, envwin = 0;
+    int gil = 0, rc = -1, we_gil = 0, envwin = 0, reqenv = 0;
+    int env_dirty = extra != NULL && strchr(extra, '{') != NULL;
     crucible_py_path_guard path_guard;
     void *g = NULL, *res = NULL, *pybody = NULL, *drv = NULL, *st = NULL, *hd = NULL;
     void *bdy = NULL, *portobj = NULL, *pyheaders = NULL;
@@ -1927,7 +2262,10 @@ static int crucible_py_asgi_request(const char *label, const char *script,
     we_gil = 1;
     /* 带 .env 的请求才同步，并登记进「同内容组」的 os.environ 同步窗口（理由同 WSGI
      * 路径：并发同组请求共享请求前状态，最后一个离开者才恢复）。 */
-    if (env_dirty && crucible_py_envwin_enter() == 0) {
+    /* R-03：优先每请求覆盖视图（线程本地 dict，不碰进程 env、不参与全局 env 锁）。
+     * 代理不可用（极旧宿主/安装失败）时才回落到旧的「C environ → os.environ 同步窗口」。 */
+    reqenv = crucible_py_request_env_begin(extra);
+    if (!reqenv && env_dirty && crucible_py_envwin_enter() == 0) {
         envwin = 1;
         crucible_py_sync_environ_locked();
     }
@@ -2021,6 +2359,8 @@ static int crucible_py_asgi_request(const char *label, const char *script,
 
 done:
     /* 窗口引用计数退场（须在释放 GIL 之前；理由同 WSGI 路径：最后一个离开者恢复）。 */
+    if (reqenv)
+        crucible_py_request_env_end();
     if (envwin)
         crucible_py_envwin_leave();
     crucible_py_path_leave(&path_guard);

@@ -1,7 +1,7 @@
 //! dlopen-based app engine FFI (RTLD_GLOBAL).
 //!
-//! §7.3 最终态：**所有**引擎都走有界线程池（通用 clamp(4..=8)，rack/psgi 串行单线程，
-//! cgi 独立窄池）+ 按内容分锁。
+//! §7.3 最终态：**所有**引擎都走有界线程池（通用 `clamp(ncpu, 2..=4)`，可用
+//! `CRUCIBLE_APP_POOL_WIDTH` 覆盖；rack/psgi 串行单线程，cgi 独立窄池）+ 按内容分锁。
 //!
 //! 这里曾经给 c/go/rust 留了一条「同线程内联、跳过 env 锁」的快路。那条快路的前提是错的：
 //! 它以为这些引擎拿 `.env` 变量走的是「extra JSON 下发、不碰进程级 env」，而 C 侧的
@@ -508,7 +508,10 @@ async fn exec_dispatch(
     // 首次装载 ~0.64s），在内联路径会在 tokio worker 上直接阻塞 —— 2 个 worker 都
     // 被占住时整个 listener（含静态/其它引擎）一起停摆。未装载时交给进程池的
     // worker 装载，请求照旧异步等待；装载完成后所有后续请求走内联快路径。
-    if inline_engine(&engine) && lib_is_loaded(lib_key_cow.as_ref()) {
+    if inline_engine(&engine)
+        && !sandbox_enabled_for(&engine)
+        && lib_is_loaded(lib_key_cow.as_ref())
+    {
         return inline_exec(
             &engine, &lib_path, lib_key_cow.as_ref(), &script, docroot, method, path, query,
             content_type, body, peer, port, server_name, env_vars, headers,
@@ -604,7 +607,11 @@ async fn exec_dispatch(
     // **同步提交**（见 `EnginePool::submit`）：到这里作业已在队列里，第一段的「等 started」
     // 才是真的在等排队。
     let result_rx = pool.submit(job)?;
-    let exec_timeout = engine_call_timeout();
+    // R-04：沙箱路径自己用 poll deadline + SIGKILL 回收卡死调用，**不**走外层的
+    // 「超时 → 永久隔离 .so」分支（否则第一次死循环就把引擎永久封掉，沙箱的
+    // 「杀进程 + 下次重建」就失去意义）。
+    let sandboxed = sandbox_enabled_for(&engine_for_pool);
+    let exec_timeout = if sandboxed { None } else { engine_call_timeout() };
     let queue_timeout = engine_queue_timeout();
     if exec_timeout.is_none() && queue_timeout.is_none() {
         // 看门狗整体关闭（两个上限都为 None）：回到「无限等」的旧行为。
@@ -997,24 +1004,55 @@ static GENERIC_POOL: Lazy<Arc<EnginePool>> =
 static SERIAL_POOLS: Lazy<Mutex<HashMap<String, Arc<EnginePool>>>> =
     Lazy::new(|| Mutex::new(HashMap::new()));
 
+/// 通用池宽度（§7.3 / §22.4.2：`clamp(num_cpus, 2, 4)`）。
+///
+/// 为什么是 2..=4（而不是旧实现的 4..=8）：规格两处明确写「≈ CPU clamp 2..4」。
+/// 这些线程绝大部分时间阻塞在引擎 I/O / 子进程上，4 条已经能覆盖「少量慢请求 +
+/// 其余请求」的混合负载；再宽只是在小型机器上白占栈（每线程 8MiB 虚拟地址空间）
+/// 与调度份额，并不提高吞吐。
+///
+/// **1 核饿死安全阀**：`clamp` 在 1 核机器上给出 2 条 worker。两个慢引擎请求
+/// （例如两个 `sleep` CGI，或一个慢 wsgi + 一个慢 lua）同时占满时，后续引擎请求
+/// 会排队到排队 deadline（503，可重试），**静态/HTTP 面不受影响**（它们不走
+/// FFI 池）。若部署方确实需要更多并发（例如 1 核但引擎全是 I/O 等待型），用
+/// `CRUCIBLE_APP_POOL_WIDTH=<n>` 显式覆盖（1..=64）。旧的
+/// `CRUCIBLE_APP_POOL_THREADS` 保留为兼容别名（新名优先）。
+///
+/// 环境变量在进程内只读一次（[`env_lock::read_static_env`] 缓存），运行期改无效
+/// —— 与其它 `CRUCIBLE_*` 启动期配置一致。
 fn generic_pool_threads() -> usize {
-    // 本 wave 测量用覆盖：`CRUCIBLE_APP_POOL_THREADS`（1..=64）。
-    if let Some(raw) = env_lock::read_static_env("CRUCIBLE_APP_POOL_THREADS") {
-        if let Ok(n) = raw.trim().parse::<usize>() {
-            if n > 0 {
-                return n.min(64);
-            }
-        }
-    }
-    let cpu = std::thread::available_parallelism()
+    let cpus = std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(2);
-    // 池宽决定「同时能有多少个引擎请求在飞」。这些线程绝大部分时间阻塞在 I/O 上
-    // （等 sidecar 回包、等 fork 出来的 CGI 子进程），不是 CPU 密集，所以与核数脱钩、
-    // 给足冗余更划算：实测本机只有 1 核 → 旧下限 2 条线程，两个 `sleep 120` 的 CGI
-    // 就把池占满，**其它引擎的请求全部排队**（验收里 lua/asp/python 被饿到客户端超时）。
-    // 单个 CGI 最长可占 30s（CGI_TIMEOUT_MS），所以下限提到 4、上限 8。
-    cpu.clamp(4, 8)
+    let width = env_lock::read_static_env("CRUCIBLE_APP_POOL_WIDTH");
+    let legacy = env_lock::read_static_env("CRUCIBLE_APP_POOL_THREADS");
+    let n = generic_pool_threads_with(cpus, width.as_deref(), legacy.as_deref());
+    // 启动期一行可观测证据：规格宽度（clamp 2..4）与显式覆盖的关系在压测里必须能
+    // 直接从日志确认，而不是靠反推。只在首次真正用到通用池时打印一次（`Lazy`）。
+    log::info!(
+        "app_ffi: generic pool width = {n} (ncpu={cpus}, CRUCIBLE_APP_POOL_WIDTH={:?}, legacy CRUCIBLE_APP_POOL_THREADS={:?})",
+        width.as_deref(),
+        legacy.as_deref()
+    );
+    n
+}
+
+/// [`generic_pool_threads`] 的纯函数部分（便于单测；不读进程环境）。
+fn generic_pool_threads_with(
+    cpus: usize,
+    width: Option<&str>,
+    legacy_threads: Option<&str>,
+) -> usize {
+    // 1) 显式覆盖（新名优先）：`CRUCIBLE_APP_POOL_WIDTH`，钳到 1..=64。
+    let explicit = width
+        .or(legacy_threads)
+        .and_then(|raw| raw.trim().parse::<usize>().ok())
+        .filter(|n| *n > 0);
+    if let Some(n) = explicit {
+        return n.min(64);
+    }
+    // 2) 规格默认：clamp(ncpu, 2, 4)。
+    cpus.clamp(2, 4)
 }
 
 fn serial_engine(engine: &str) -> bool {
@@ -1337,6 +1375,437 @@ fn with_abi_cstrings<R>(parts: [&[u8]; 10], f: impl FnOnce([*const c_char; 10]) 
     })
 }
 
+// ---------------------------------------------------------------- R-04 沙箱（可选）
+//
+// `CRUCIBLE_APP_SANDBOX=1` 时，把**指定引擎**的 FFI 调用放进一个 fork 出来的
+// worker 子进程：子进程里跑 `appengine_execute`，宿主通过两根管道交换请求/响应。
+// 调用超过墙钟 deadline 时宿主 `SIGKILL` 子进程并清空句柄，**下一个请求自动
+// 重建** —— 死循环/自死锁的 C 调用因此不再永久烧主进程的一个核，也不再需要
+// 永久隔离该 .so（进程隔离是唯一能安全「回收」卡死 C 代码的手段：杀线程会在
+// 任意指令处损坏堆/解释器状态）。
+//
+// 默认**关**（开关打开才 fork）。限制与取舍（写进报告，不隐藏）：
+//   * 只用于**自报 env-free**（`EngineLib::env_free`）的引擎：长驻子进程在 fork
+//     时继承当时的进程环境；若引擎还依赖进程 env，后续请求会看到「第一次
+//     fork 时那个请求的 .env」。默认白名单只有 `lua`（per-request lua_State，
+//     fork 后无 GIL/解释器锁问题）。
+//   * Python 系（wsgi/asgi/uwsgi/python）**不可**沙箱化：fork 一个已初始化、
+//     多线程的 CPython 会在子进程里丢 GIL/线程状态（死锁）。cgi/cgi_script
+//     本来就 fork 子进程；rack/psgi 是串行解释器池，也不需要。
+//   * 每个 .so 一个常驻 worker（同一 .so 的调用串行）；引擎自身的并发度靠
+//     多 .so / 多应用，不靠同一 .so 内并发。
+//   * `CRUCIBLE_APP_SANDBOX_ENGINES` 可覆盖白名单（逗号分隔，小写）。
+//   * 子进程启动时关闭继承来的所有 fd（监听 socket/连接/日志），只留两根管道；
+//     否则子进程会拖住端口与连接。父进程退出 ⇒ 请求管道 EOF ⇒ 子进程 `_exit`。
+
+use std::os::fd::RawFd;
+
+/// `CRUCIBLE_APP_SANDBOX=1` 才启用；默认白名单 `lua`。
+fn sandbox_enabled_for(engine: &str) -> bool {
+    sandbox_enabled_for_with(
+        env_lock::read_static_env("CRUCIBLE_APP_SANDBOX").as_deref(),
+        env_lock::read_static_env("CRUCIBLE_APP_SANDBOX_ENGINES").as_deref(),
+        engine,
+    )
+}
+
+/// [`sandbox_enabled_for`] 的纯函数部分（单测用）。
+fn sandbox_enabled_for_with(switch: Option<&str>, allow: Option<&str>, engine: &str) -> bool {
+    if !matches!(switch.map(str::trim), Some("1" | "true" | "yes" | "on")) {
+        return false;
+    }
+    // 硬拒绝：Python 系嵌入解释器在 `fork()` 一个已初始化、多线程的进程后，
+    // 子进程里的 GIL/线程状态不完整（可能永久死锁），即使运维把引擎名写进
+    // `CRUCIBLE_APP_SANDBOX_ENGINES` 也不能让它把 `/wsgi/` 变成挂死入口。
+    // rack/psgi 同样是带后台线程的解释器，一并拒绝。
+    if matches!(
+        engine.to_ascii_lowercase().as_str(),
+        "wsgi" | "asgi" | "uwsgi" | "python" | "rack" | "psgi"
+    ) {
+        return false;
+    }
+    let list = allow.unwrap_or("lua");
+    list.split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .any(|s| s.eq_ignore_ascii_case(engine))
+}
+
+struct Sandbox {
+    pid: libc::pid_t,
+    req_w: RawFd,
+    resp_r: RawFd,
+}
+
+impl Drop for Sandbox {
+    fn drop(&mut self) {
+        // 父进程主动丢弃/替换句柄：确保子进程不会变成孤儿（正常路径已在 timeout
+        // 时 kill+wait；Drop 只兜底）。
+        unsafe {
+            libc::kill(self.pid, libc::SIGKILL);
+            let mut st = 0;
+            libc::waitpid(self.pid, &mut st, libc::WNOHANG);
+            libc::close(self.req_w);
+            libc::close(self.resp_r);
+        }
+    }
+}
+
+static SANDBOXES: Lazy<Mutex<HashMap<String, Arc<Mutex<Option<Sandbox>>>>>> =
+    Lazy::new(|| Mutex::new(HashMap::new()));
+
+fn sandbox_slot(lib_key: &str) -> Arc<Mutex<Option<Sandbox>>> {
+    SANDBOXES
+        .lock()
+        .entry(lib_key.to_string())
+        .or_insert_with(|| Arc::new(Mutex::new(None)))
+        .clone()
+}
+
+fn write_all_fd(fd: RawFd, mut buf: &[u8]) -> std::io::Result<()> {
+    while !buf.is_empty() {
+        let n = unsafe { libc::write(fd, buf.as_ptr() as *const libc::c_void, buf.len()) };
+        if n < 0 {
+            let e = std::io::Error::last_os_error();
+            if e.kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(e);
+        }
+        buf = &buf[n as usize..];
+    }
+    Ok(())
+}
+
+fn read_exact_fd(fd: RawFd, mut buf: &mut [u8]) -> std::io::Result<()> {
+    while !buf.is_empty() {
+        let n = unsafe { libc::read(fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
+        if n < 0 {
+            let e = std::io::Error::last_os_error();
+            if e.kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(e);
+        }
+        if n == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "sandbox worker closed the pipe",
+            ));
+        }
+        buf = &mut buf[n as usize..];
+    }
+    Ok(())
+}
+
+/// 子进程：从管道读帧 → 调引擎 → 写帧。永远不返回（`_exit`）。
+unsafe fn sandbox_child(req_r: RawFd, resp_w: RawFd, exec_addr: usize, free_addr: usize) -> ! {
+    // 关闭继承来的所有 fd（监听 socket、连接、日志、其它管道），只留协议两端。
+    // 上限 8192：足够覆盖常规 RLIMIT_NOFILE，且只在 fork 时跑一次。
+    for fd in 3..8192 {
+        if fd != req_r && fd != resp_w {
+            libc::close(fd);
+        }
+    }
+    // 忽略 SIGPIPE：对端关闭时 write 返回 EPIPE，而不是杀死 worker。
+    libc::signal(libc::SIGPIPE, libc::SIG_IGN);
+    let exec: ExecFn = std::mem::transmute(exec_addr);
+    let free: FreeFn = std::mem::transmute(free_addr);
+
+    loop {
+        let mut hdr = [0u8; 48];
+        if read_exact_fd(req_r, &mut hdr).is_err() {
+            libc::_exit(0);
+        }
+        let mut lens = [0usize; 11];
+        for (i, l) in lens.iter_mut().enumerate() {
+            *l = u32::from_le_bytes([hdr[i * 4], hdr[i * 4 + 1], hdr[i * 4 + 2], hdr[i * 4 + 3]])
+                as usize;
+        }
+        let port = i32::from_le_bytes([hdr[44], hdr[45], hdr[46], hdr[47]]);
+        let body_cap = crate::server::h1::UPSTREAM_BODY_CAP;
+        if lens[..10].iter().any(|n| *n > (1 << 20)) || lens[10] > body_cap {
+            libc::_exit(2);
+        }
+        let mut args: [Vec<u8>; 10] =
+            std::array::from_fn(|i| vec![0u8; lens[i].saturating_add(1)]);
+        for i in 0..10 {
+            if lens[i] > 0 && read_exact_fd(req_r, &mut args[i][..lens[i]]).is_err() {
+                libc::_exit(0);
+            }
+            // vec![0; n+1] 已保证末尾 NUL。
+        }
+        let mut body = vec![0u8; lens[10]];
+        if lens[10] > 0 && read_exact_fd(req_r, &mut body).is_err() {
+            libc::_exit(0);
+        }
+        let mut out = AppEngineResult {
+            status: 500,
+            headers: std::ptr::null_mut(),
+            headers_len: 0,
+            body: std::ptr::null_mut(),
+            body_len: 0,
+            error: std::ptr::null_mut(),
+        };
+        let rc = exec(
+            args[0].as_ptr() as *const c_char,
+            args[1].as_ptr() as *const c_char,
+            args[2].as_ptr() as *const c_char,
+            args[3].as_ptr() as *const c_char,
+            args[4].as_ptr() as *const c_char,
+            args[5].as_ptr() as *const c_char,
+            if body.is_empty() {
+                std::ptr::null()
+            } else {
+                body.as_ptr()
+            },
+            body.len(),
+            args[6].as_ptr() as *const c_char,
+            args[7].as_ptr() as *const c_char,
+            port as c_int,
+            args[8].as_ptr() as *const c_char,
+            args[9].as_ptr() as *const c_char,
+            &mut out,
+        );
+        // 结果只按 C 字符串/长度取，并全部做上界钳制：引擎写坏字段时不让 worker
+        // 读越界（宿主侧还会再校验一次）。
+        let mut hb: Vec<u8> = Vec::new();
+        if !out.headers.is_null() {
+            let n = libc::strlen(out.headers).min(1 << 20);
+            hb.extend_from_slice(std::slice::from_raw_parts(out.headers as *const u8, n));
+        }
+        let mut eb: Vec<u8> = Vec::new();
+        if !out.error.is_null() {
+            let n = libc::strlen(out.error).min(64 * 1024);
+            eb.extend_from_slice(std::slice::from_raw_parts(out.error as *const u8, n));
+        }
+        let bl = if out.body.is_null() { 0 } else { out.body_len };
+        let body_out: Vec<u8> = if bl == 0 || bl > body_cap {
+            Vec::new()
+        } else {
+            std::slice::from_raw_parts(out.body, bl).to_vec()
+        };
+        let hlen = hb.len() as u32;
+        let elen = eb.len() as u32;
+        let blen = body_out.len() as u32;
+        let mut rhdr = [0u8; 20];
+        rhdr[0..4].copy_from_slice(&(rc as i32).to_le_bytes());
+        rhdr[4..8].copy_from_slice(&(out.status as i32).to_le_bytes());
+        rhdr[8..12].copy_from_slice(&hlen.to_le_bytes());
+        rhdr[12..16].copy_from_slice(&blen.to_le_bytes());
+        rhdr[16..20].copy_from_slice(&elen.to_le_bytes());
+        free(&mut out);
+        if write_all_fd(resp_w, &rhdr).is_err()
+            || write_all_fd(resp_w, &hb).is_err()
+            || write_all_fd(resp_w, &body_out).is_err()
+            || write_all_fd(resp_w, &eb).is_err()
+        {
+            libc::_exit(0);
+        }
+    }
+}
+
+fn sandbox_spawn(lib: &EngineLib) -> Result<Sandbox> {
+    let mut req_pipe = [0 as RawFd; 2];
+    let mut resp_pipe = [0 as RawFd; 2];
+    unsafe {
+        if libc::pipe(req_pipe.as_mut_ptr()) != 0 || libc::pipe(resp_pipe.as_mut_ptr()) != 0 {
+            return Err(std::io::Error::last_os_error()).context("sandbox pipe");
+        }
+        let pid = libc::fork();
+        if pid < 0 {
+            // 父进程：关掉四条 fd（子进程未创建）。
+            for fd in req_pipe.iter().chain(resp_pipe.iter()) {
+                libc::close(*fd);
+            }
+            return Err(std::io::Error::last_os_error()).context("sandbox fork");
+        }
+        if pid == 0 {
+            // 子进程
+            libc::close(req_pipe[1]);
+            libc::close(resp_pipe[0]);
+            sandbox_child(
+                req_pipe[0],
+                resp_pipe[1],
+                lib.exec as usize,
+                lib.free as usize,
+            );
+        }
+        // 父进程
+        libc::close(req_pipe[0]);
+        libc::close(resp_pipe[1]);
+        Ok(Sandbox {
+            pid,
+            req_w: req_pipe[1],
+            resp_r: resp_pipe[0],
+        })
+    }
+}
+
+/// 在子进程里执行一次引擎调用（父侧）。调用方已持有该 .so 的 per-slot 锁。
+#[allow(clippy::too_many_arguments)]
+fn sandbox_call(
+    lib: &EngineLib,
+    lib_key: &str,
+    engine: &str,
+    parts: [&[u8]; 10],
+    body: &[u8],
+    port: u16,
+) -> Result<ExecOutcome> {
+    let slot = sandbox_slot(lib_key);
+    let mut guard = slot.lock();
+    let deadline = engine_call_timeout()
+        .unwrap_or(Duration::from_secs(ENGINE_WATCHDOG_DEFAULT_SECS))
+        .max(Duration::from_millis(100));
+    if guard.is_none() {
+        match sandbox_spawn(lib) {
+            Ok(sb) => {
+                log::info!(
+                    "app_ffi: engine `{engine}` 进入进程沙箱（pid={}，lib={lib_key}）",
+                    sb.pid
+                );
+                *guard = Some(sb);
+            }
+            Err(e) => return Err(e.context("sandbox spawn failed")),
+        }
+    }
+    // 只取两个 fd 的副本，不长期借用 `guard`（超时/出错路径要 `guard.take()`）。
+    let (req_w, resp_r) = {
+        let sb = guard.as_ref().expect("spawned above");
+        (sb.req_w, sb.resp_r)
+    };
+    // 帧：10 个字符串长度 + body 长度 + port。
+    let mut hdr = [0u8; 48];
+    for (i, p) in parts.iter().enumerate() {
+        hdr[i * 4..i * 4 + 4].copy_from_slice(&(p.len() as u32).to_le_bytes());
+    }
+    hdr[40..44].copy_from_slice(&(body.len() as u32).to_le_bytes());
+    hdr[44..48].copy_from_slice(&(port as i32).to_le_bytes());
+    let mut req =
+        Vec::with_capacity(48 + body.len() + parts.iter().map(|p| p.len()).sum::<usize>());
+    req.extend_from_slice(&hdr);
+    for p in parts {
+        req.extend_from_slice(p);
+    }
+    req.extend_from_slice(body);
+    let fail = |guard: &mut Option<Sandbox>, why: String| -> Result<ExecOutcome> {
+        if let Some(sb) = guard.take() {
+            unsafe {
+                libc::kill(sb.pid, libc::SIGKILL);
+                let mut st = 0;
+                libc::waitpid(sb.pid, &mut st, 0);
+            }
+            // Drop 会再 close fd；已 take 的 Sandbox 在这里被 drop。
+            drop(sb);
+        }
+        Err(anyhow::anyhow!("{why}"))
+    };
+    if let Err(e) = write_all_fd(req_w, &req) {
+        return fail(&mut guard, format!("sandbox write failed: {e}"));
+    }
+    // 用 poll 实现墙钟 deadline；超时即杀子进程（这是「可回收」的核心）。
+    let start = std::time::Instant::now();
+    let mut rhdr = [0u8; 20];
+    let mut got = 0usize;
+    while got < rhdr.len() {
+        let remain = deadline.saturating_sub(start.elapsed());
+        if remain.is_zero() {
+            return fail(
+                &mut guard,
+                format!(
+                    "engine `{engine}` exceeded {}s wall clock in sandbox — worker killed and will be rebuilt on the next request",
+                    deadline.as_secs()
+                ),
+            );
+        }
+        let mut pfd = libc::pollfd {
+            fd: resp_r,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let ms = remain.as_millis().min(i32::MAX as u128) as i32;
+        let pr = unsafe { libc::poll(&mut pfd, 1, ms) };
+        if pr < 0 {
+            let e = std::io::Error::last_os_error();
+            if e.kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            return fail(&mut guard, format!("sandbox poll failed: {e}"));
+        }
+        if pr == 0 {
+            continue; // 下一轮 remain 归零 → 走超时分支
+        }
+        let n = unsafe {
+            libc::read(
+                resp_r,
+                rhdr[got..].as_mut_ptr() as *mut libc::c_void,
+                rhdr.len() - got,
+            )
+        };
+        if n < 0 {
+            let e = std::io::Error::last_os_error();
+            if e.kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            return fail(&mut guard, format!("sandbox read failed: {e}"));
+        }
+        if n == 0 {
+            return fail(
+                &mut guard,
+                format!("sandbox worker for `{engine}` exited unexpectedly"),
+            );
+        }
+        got += n as usize;
+    }
+    let rc = i32::from_le_bytes([rhdr[0], rhdr[1], rhdr[2], rhdr[3]]);
+    let status = i32::from_le_bytes([rhdr[4], rhdr[5], rhdr[6], rhdr[7]]);
+    let hlen = u32::from_le_bytes([rhdr[8], rhdr[9], rhdr[10], rhdr[11]]) as usize;
+    let blen = u32::from_le_bytes([rhdr[12], rhdr[13], rhdr[14], rhdr[15]]) as usize;
+    let elen = u32::from_le_bytes([rhdr[16], rhdr[17], rhdr[18], rhdr[19]]) as usize;
+    if hlen > (1 << 20) || blen > crate::server::h1::UPSTREAM_BODY_CAP || elen > 64 * 1024 {
+        return fail(
+            &mut guard,
+            format!("sandbox response exceeds caps (h={hlen} b={blen} e={elen})"),
+        );
+    }
+    let mut hb = vec![0u8; hlen];
+    let mut bb = vec![0u8; blen];
+    let mut eb = vec![0u8; elen];
+    for (buf, what) in [
+        (&mut hb, "headers"),
+        (&mut bb, "body"),
+        (&mut eb, "error"),
+    ] {
+        if !buf.is_empty() {
+            if let Err(e) = read_exact_fd(resp_r, buf) {
+                return fail(&mut guard, format!("sandbox read {what} failed: {e}"));
+            }
+        }
+    }
+    if rc != 0 {
+        let msg = String::from_utf8_lossy(&eb).into_owned();
+        return Err(anyhow::anyhow!(if msg.is_empty() {
+            format!("engine `{engine}` exec rc={rc} (sandbox)")
+        } else {
+            msg
+        }));
+    }
+    // 复用既有的头净化/状态码校验（与进程内路径逐字一致）。
+    hb.push(0);
+    let headers = parse_result_headers(hb.as_mut_ptr() as *mut c_char, hb.len() - 1);
+    Ok(ExecOutcome {
+        // 与进程内路径一致：原始状态码交给 response_from_outcome 统一校验。
+        status,
+        headers,
+        body: Bytes::from(bb),
+    })
+}
+
+/// R-04：沙箱是否接管本次调用（只对自报 env-free 的 .so 生效）。
+fn sandbox_handles(lib: &EngineLib, engine: &str) -> bool {
+    sandbox_enabled_for(engine) && lib.env_free
+}
+
 #[allow(clippy::too_many_arguments)]
 fn call_exec(
     lib: &EngineLib,
@@ -1383,6 +1852,7 @@ fn call_exec(
         let _ = write!(cur, "{}", peer.ip());
         cur.position() as usize
     };
+    let lib_key_for_sandbox = lib.path.clone();
     let parts: [&[u8]; 10] = [
         script_s.as_bytes(),
         docroot_s.as_bytes(),
@@ -1395,6 +1865,10 @@ fn call_exec(
         extra,
         headers,
     ];
+    // R-04：可选进程沙箱（只接管自报 env-free 的引擎；默认关）。
+    if sandbox_handles(lib, engine) {
+        return sandbox_call(lib, &lib_key_for_sandbox, engine, parts, body, port);
+    }
     let (body_ptr, body_len) = if body.is_empty() {
         (std::ptr::null(), 0usize)
     } else {
@@ -2020,5 +2494,63 @@ mod status_and_rel_tests {
         }
         // 未装载的 .so 不能走内联（首次 dlopen 在 tokio worker 上会阻塞整个 listener）。
         assert!(!lib_is_loaded("/nonexistent/crucible/libapp_nope.so"));
+    }
+
+    /// G-03：通用池宽度必须按规格 `clamp(ncpu, 2, 4)`，并保留显式覆盖
+    /// （`CRUCIBLE_APP_POOL_WIDTH` / 兼容旧名 `CRUCIBLE_APP_POOL_THREADS`）。
+    ///
+    /// 1 核是**安全阀**场景：规格下限 2 条 worker，两个慢引擎并发就会占满池；
+    /// 部署方可用 `CRUCIBLE_APP_POOL_WIDTH=8` 覆盖。这里把三种输入都钉住，
+    /// 防止以后有人把 `clamp(2,4)` 又改回 `clamp(4,8)`（正是 G-03 的缺口）。
+    #[test]
+    fn generic_pool_width_is_spec_clamped_with_override() {
+        // 规格默认：clamp(ncpu, 2, 4)。
+        assert_eq!(generic_pool_threads_with(1, None, None), 2, "1 核 → 下限 2");
+        assert_eq!(generic_pool_threads_with(2, None, None), 2);
+        assert_eq!(generic_pool_threads_with(3, None, None), 3);
+        assert_eq!(generic_pool_threads_with(4, None, None), 4);
+        assert_eq!(generic_pool_threads_with(32, None, None), 4, "32 核 → 上限 4");
+        // 显式覆盖（新名优先）：1 核也能开到 8 条，避开「两个慢请求占满池」。
+        assert_eq!(generic_pool_threads_with(1, Some("8"), None), 8);
+        assert_eq!(generic_pool_threads_with(32, Some("2"), None), 2);
+        // 旧名仍生效，但新名优先；非法/0 回退规格默认（0 不能被当成显式值）。
+        assert_eq!(generic_pool_threads_with(1, None, Some("8")), 8);
+        assert_eq!(generic_pool_threads_with(1, Some("6"), Some("8")), 6);
+        assert_eq!(generic_pool_threads_with(1, Some("0"), None), 2);
+        assert_eq!(generic_pool_threads_with(1, Some("bogus"), None), 2);
+        // 上限 64：防 `CRUCIBLE_APP_POOL_WIDTH=100000` 重演「线程打满 RLIMIT_NPROC」。
+        assert_eq!(generic_pool_threads_with(1, Some("100000"), None), 64);
+    }
+
+    /// R-04：沙箱开关与白名单的解析（默认关；只有白名单内的引擎被接管）。
+    #[test]
+    fn sandbox_selection_is_opt_in_and_engine_scoped() {
+        assert!(!sandbox_enabled_for_with(None, None, "lua"));
+        assert!(!sandbox_enabled_for_with(Some("0"), None, "lua"));
+        assert!(sandbox_enabled_for_with(Some("1"), None, "lua"));
+        assert!(sandbox_enabled_for_with(Some("true"), None, "lua"));
+        // 默认白名单只有 lua（Python 系在 fork 后 GIL 不安全）。
+        for e in ["wsgi", "asgi", "uwsgi", "python", "php", "cgi", "rack"] {
+            assert!(
+                !sandbox_enabled_for_with(Some("1"), None, e),
+                "{e} must not be sandboxed by default"
+            );
+        }
+        // 白名单可覆盖（逗号分隔、忽略大小写/空白）。
+        assert!(sandbox_enabled_for_with(
+            Some("1"),
+            Some(" lua, asp ,ASPNet "),
+            "aspnet"
+        ));
+        assert!(!sandbox_enabled_for_with(Some("1"), Some("lua"), "asp"));
+        assert!(!sandbox_enabled_for_with(Some("1"), Some(""), "lua"));
+        // 即使显式写进白名单，Python 系/带后台线程的解释器也不能被沙箱化：
+        // fork 一个已初始化的 CPython 会在子进程里丢 GIL/线程状态（死锁）。
+        for e in ["wsgi", "asgi", "uwsgi", "python", "rack", "psgi", "WSGI"] {
+            assert!(
+                !sandbox_enabled_for_with(Some("1"), Some(e), e),
+                "{e} must be hard-denied even if explicitly allow-listed"
+            );
+        }
     }
 }

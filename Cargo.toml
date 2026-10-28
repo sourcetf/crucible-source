@@ -43,7 +43,12 @@ tokio-boring = { version = "5", optional = true }
 quinn-boring = { path = "libs/quinn-boring" }
 quinn = { version = "0.11", default-features = false, features = [
     "runtime-tokio", "rustls"] }
-h3 = "0.0.8"
+# G-16：CONNECT-UDP 的 HTTP/3 DATAGRAM 模式需要读对端 SETTINGS_H3_DATAGRAM
+# （`h3::SharedState::settings()`）。h3 0.0.8 只在
+# `i-implement-a-third-party-backend-and-opt-into-breaking-changes` feature 下
+# 导出 `SharedState` / `ConnectionState`（纯可见性开关，不改变协议行为）。
+h3 = { version = "0.0.8", features = [
+    "i-implement-a-third-party-backend-and-opt-into-breaking-changes"] }
 h3-quinn = "0.0.10"
 hyper = { version = "1", features = [
     "full"] }
@@ -64,6 +69,9 @@ toml = "0.8"
 log = "0.4"
 env_logger = "0.11"
 libc = "0.2"
+# G-13：可选 SO_REUSEPORT 多 accept loop（`ListenerConfig::reuse_port`）。
+# 与 tokio 传递依赖的 socket2 同一版本（Cargo.lock 0.6.5），显式声明只为直接使用。
+socket2 = "0.6"
 argon2 = { version = "0.5", features = [
     "std"] }
 password-hash = { version = "0.5", features = [

@@ -1,32 +1,12 @@
 //! GeoIP panel maintenance operations (import, purge, rebuild, hand edits).
 
 use crate::server::geoip_panel::covering::MergedFields;
-use crate::server::geoip_panel::db;
 use anyhow::{Context, Result};
 use rusqlite::Connection;
 use std::path::Path;
 
-/// Rebuild covering indexes and normalize prefix metadata in `geoip.sqlite`.
-pub fn rebuild_covering(db_path: &Path) -> Result<()> {
-    let conn = db::open(db_path)?;
-    rebuild_covering_conn(&conn)?;
-    Ok(())
-}
-
-/// Same as [`rebuild_covering`] using an open connection.
-pub fn rebuild_covering_conn(conn: &Connection) -> Result<()> {
-    conn.execute_batch(
-        "CREATE INDEX IF NOT EXISTS idx_geoip_cover ON geoip(ip_start, ip_end);
-         CREATE INDEX IF NOT EXISTS idx_geoip_start ON geoip(ip_start);
-         UPDATE geoip SET bits = COALESCE(bits, 0) WHERE bits IS NULL;
-         UPDATE geoip SET weight = COALESCE(weight, 0) WHERE weight IS NULL;
-         UPDATE geoip SET prefix = ip_start || '-' || ip_end
-           WHERE prefix IS NULL OR prefix = '';
-         ANALYZE geoip;",
-    )
-    .context("geoip rebuild_covering")?;
-    Ok(())
-}
+// G-19：`rebuild_covering` / `rebuild_covering_conn` 全树无调用者（索引由
+// `db::open` 的迁移 DDL 与离线 `geoip_common.init_schema` 维护），已删除。
 
 /// 面板可编辑字段白名单（与 [`apply_field`] 一一对应）。落库前校验：
 /// 旧实现字段拼错照样入库、接口回 ok，但 `apply_field` 的 `_ => {}` 让它永远不生效。

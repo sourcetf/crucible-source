@@ -1208,42 +1208,94 @@ async fn dot_accept_loop(
     }
 }
 
-/// 单条 DoT 连接：有截止时间的握手 + 有超时的帧循环。
+/// 缓存版 DoT acceptor（G-08 端口复用路径也用它）。
+///
+/// 配置了 `[dns.dot] cert/key` 时，复用连接必须出示 **DoT 证书**（可能与站点证书
+/// 完全不同）；这个入口与独立 853 监听共用同一份 acceptor 缓存/证书指纹逻辑，
+/// ACME 续期后同样自动生效。
 #[cfg(feature = "tls_boring")]
-async fn dot_connection(
-    rx: tokio::sync::watch::Receiver<Arc<DotLive>>,
-    sock: tokio::net::TcpStream,
+pub(crate) fn reuse_acceptor(dot: &crate::config::DotCfg) -> Result<Arc<boring::ssl::SslAcceptor>> {
+    build_dot_acceptor_cached(dot)
+}
+
+/// G-08：443/站点 TLS 端口复用 —— 握手已由站点 TLS 栈完成，本函数只负责 DoT 帧循环。
+///
+/// ACL/限速/并发上限与独立 DoT 监听完全一致（同一个 `dot_peer_allowed` /
+/// `rate_limit` / `dot_max_conns`）；`require_reuse = true` 让配置热载关闭
+/// `reuse_tls_port` 后，已建立连接在下一次读超时/下一次查询时收尾。
+#[cfg(feature = "tls_boring")]
+pub(crate) async fn serve_reused_tls<S>(
+    mut tls: S,
     peer: std::net::SocketAddr,
-    acceptor: Arc<boring::ssl::SslAcceptor>,
-) {
-    // 握手截止时间：`tokio_boring::accept` 无内部超时，匿名对端不发/不发完 ClientHello
-    // 就能永久挂住这条连接（占 permit/fd/任务）。超时即 drop，permit 随任务结束释放。
-    let mut tls = match tokio::time::timeout(
-        DOT_HANDSHAKE_TIMEOUT,
-        tokio_boring::accept(&acceptor, sock),
-    )
-    .await
-    {
-        Ok(Ok(s)) => s,
-        Ok(Err(e)) => {
-            warn_throttled("dot-tls", &format!("dot: tls accept failed from {peer}: {e}"));
-            return;
+    live: Arc<crate::server::live_config::LiveConfig>,
+) -> Result<()>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    let dc = super::effective(&live.snapshot());
+    if !dc.enabled || !dc.dot.enabled || !dc.dot.reuse_tls_port {
+        return Ok(());
+    }
+    if !dot_peer_allowed(&dc, peer) {
+        warn_throttled(
+            "dot-acl",
+            &format!("dot: reject {peer}（reuse）: 不在 DoT 白名单（见 [dns.dot] allow / [dns] recursion_acl）"),
+        );
+        return Ok(());
+    }
+    if !crate::server::rate_limit::allow(peer.ip(), dot_rate(&dc), dot_burst(&dc)) {
+        warn_throttled(
+            "dot-rate-accept",
+            &format!("dot: rate limit exceeded from {}（reuse）", peer.ip()),
+        );
+        return Ok(());
+    }
+    // 并发连接上限：与独立监听同一语义（0 = 默认 128）。独立监听用信号量；这里
+    // 在 accept 之后、帧循环之前用一个 RAII 计数守卫，保证任何退出路径都归还。
+    static REUSE_ACTIVE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    struct ReuseGuard;
+    impl Drop for ReuseGuard {
+        fn drop(&mut self) {
+            REUSE_ACTIVE.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
         }
-        Err(_) => {
-            warn_throttled(
-                "dot-tls-timeout",
-                &format!("dot: TLS 握手超时（{DOT_HANDSHAKE_TIMEOUT:?}），丢弃 {peer}"),
-            );
-            return;
-        }
-    };
-    log::info!("dot: tls handshake ok from {peer}");
+    }
+    let max = dot_max_conns(&dc);
+    if REUSE_ACTIVE.fetch_add(1, std::sync::atomic::Ordering::AcqRel) >= max {
+        REUSE_ACTIVE.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+        warn_throttled(
+            "dot-conns",
+            &format!("dot: 并发连接已达上限 {max}，拒绝 {peer}（reuse）"),
+        );
+        return Ok(());
+    }
+    let _guard = ReuseGuard;
+    dot_serve_frames(&mut tls, peer, true, || {
+        super::effective(&live.snapshot())
+    })
+    .await;
+    Ok(())
+}
+
+/// DoT 帧循环（独立监听与端口复用共用）。
+///
+/// `cfg_of` 每条查询调用一次：ACL 收紧 / 关闭 DoT / 改限速对已建立连接同样即时生效。
+/// `require_reuse`：复用连接额外要求 `reuse_tls_port` 仍为 true（配置热载可关掉它）。
+#[cfg(feature = "tls_boring")]
+async fn dot_serve_frames<S, F>(
+    tls: &mut S,
+    peer: std::net::SocketAddr,
+    require_reuse: bool,
+    mut cfg_of: F,
+) where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+    F: FnMut() -> Arc<crate::server::dns::DnsConfig>,
+{
     // RFC7858：2 字节大端长度前缀的 DNS 报文，可多查询串行处理
     loop {
         let mut len_buf = [0u8; 2];
         match tokio::time::timeout(
             DOT_FRAME_TIMEOUT,
-            tokio::io::AsyncReadExt::read_exact(&mut tls, &mut len_buf),
+            tokio::io::AsyncReadExt::read_exact(tls, &mut len_buf),
         )
         .await
         {
@@ -1263,9 +1315,8 @@ async fn dot_connection(
         }
         // 每轮循环都读**当前** live 配置：ACL 收紧 / 关掉 DoT 后，已建立连接在下一次
         // 查询/下一次读超时时收尾（空闲连接 10s 内必被清理），不会继续服务。
-        let live = rx.borrow().clone();
-        let cfg = Arc::clone(&live.cfg);
-        if !cfg.enabled || !cfg.dot.enabled {
+        let cfg = cfg_of();
+        if !cfg.enabled || !cfg.dot.enabled || (require_reuse && !cfg.dot.reuse_tls_port) {
             log::info!("dot: config disabled —— 关闭连接 {peer}");
             return;
         }
@@ -1288,7 +1339,7 @@ async fn dot_connection(
         // 这条连接（permit/fd 不释放）。
         match tokio::time::timeout(
             DOT_FRAME_TIMEOUT,
-            tokio::io::AsyncReadExt::read_exact(&mut tls, &mut msg),
+            tokio::io::AsyncReadExt::read_exact(tls, &mut msg),
         )
         .await
         {
@@ -1318,6 +1369,44 @@ async fn dot_connection(
             }
         }
     }
+}
+
+/// 单条 DoT 连接（独立端口）：有截止时间的握手 + 有超时的帧循环。
+#[cfg(feature = "tls_boring")]
+async fn dot_connection(
+    rx: tokio::sync::watch::Receiver<Arc<DotLive>>,
+    sock: tokio::net::TcpStream,
+    peer: std::net::SocketAddr,
+    acceptor: Arc<boring::ssl::SslAcceptor>,
+) {
+    // 握手截止时间：`tokio_boring::accept` 无内部超时，匿名对端不发/不发完 ClientHello
+    // 就能永久挂住这条连接（占 permit/fd/任务）。超时即 drop，permit 随任务结束释放。
+    let mut tls = match tokio::time::timeout(
+        DOT_HANDSHAKE_TIMEOUT,
+        tokio_boring::accept(&acceptor, sock),
+    )
+    .await
+    {
+        Ok(Ok(s)) => s,
+        Ok(Err(e)) => {
+            warn_throttled("dot-tls", &format!("dot: tls accept failed from {peer}: {e}"));
+            return;
+        }
+        Err(_) => {
+            warn_throttled(
+                "dot-tls-timeout",
+                &format!("dot: TLS 握手超时（{DOT_HANDSHAKE_TIMEOUT:?}），丢弃 {peer}"),
+            );
+            return;
+        }
+    };
+    log::info!("dot: tls handshake ok from {peer}");
+    // 每条查询读当前 live 快照（ACL/限速/关停即时生效）。
+    dot_serve_frames(&mut tls, peer, false, || {
+        let live = rx.borrow().clone();
+        Arc::clone(&live.cfg)
+    })
+    .await;
 }
 
 #[cfg(test)]

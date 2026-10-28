@@ -106,7 +106,6 @@ int appengine_execute(
 {
     char pathbuf[1024];
     const char *use;
-    int env_dirty = extra != NULL && strchr(extra, '{') != NULL;
 
     if (!g_inited || out == NULL)
         return -1;
@@ -122,16 +121,35 @@ int appengine_execute(
     /* uwsgi 语义 = WSGI 主机；uwsgi.version 由 pyembed 侧统一注入 environ。 */
     return crucible_py_wsgi_request("uwsgi", use, docroot, method, path, query,
                                     content_type, body, body_len, remote, server_name,
-                                    server_port, env_dirty, headers, out);
+                                    server_port, extra, headers, out);
 #else
     (void)script;
     (void)docroot;
     (void)pathbuf;
-    (void)env_dirty;
+    (void)extra;
     (void)headers;
     return uwsgi_fail(out,
                       "uwsgi: 本引擎构建时未嵌入 CPython（-DCRUCIBLE_EMBED_PYTHON_OFF）。"
                       "uwsgi 禁止每请求 spawn 解释器，故不提供 popen 回退");
+#endif
+}
+
+/* R-03：`.env` 隔离自报（可选符号，见 appengine.h）。
+ *
+ * 返回非 0 = 本 .so **不依赖进程 env**：宿主把启动期基底经 appengine_set_base_env
+ * 交给我们，每请求 `.env` 只走 ABI `extra` JSON；本引擎把它装进 `os.environ` 的
+ * 线程本地覆盖视图（`_CrucibleReqEnv`，见 pyembed），从不 setenv/putenv，也不
+ * 继承 `environ` 里的请求期临时值。于是宿主可以跳过全局 env 锁 —— 慢的空请求
+ * 不再挡住随后带 `.env` 的 wsgi/asgi/uwsgi 请求。
+ *
+ * 失败（没有 libpython / 代理装不上）必须诚实回答 0：宿主会继续把本 .so 留在
+ * env 锁内，退回旧的「C environ → os.environ 同步窗口」路径。 */
+int appengine_env_isolation(void)
+{
+#if defined(CRUCIBLE_HAVE_PYTHON)
+    return g_inited ? crucible_py_env_isolation_selfcheck() : 0;
+#else
+    return 0;
 #endif
 }
 

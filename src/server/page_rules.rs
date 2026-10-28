@@ -79,6 +79,7 @@ impl<'a> MatchCtx<'a> {
     /// 从任意协议的请求构造：method/host/headers 是所有协议共有的
     /// （h2/h3 的 `:method`/`:authority` 经 hyper/h3 已落到 `Method`/URI authority
     /// 或 Host 头）。h1/h2/h3 的调用点都用它，保证三协议判定一致。
+    #[allow(dead_code)] // 保留给无 peer 的调用点；协议入口均用 *_with_peer（G-19 标注）。
     pub fn from_request<B>(req: &'a Request<B>) -> Self {
         Self {
             method: Some(req.method().as_str()),
@@ -90,6 +91,7 @@ impl<'a> MatchCtx<'a> {
 
     /// 只有路径、无请求上下文（纯路径调用点/单测）：所有维度都缺失，
     /// 于是只按 URL 判定（规则未声明其它维度时行为与旧实现一致）。
+    #[allow(dead_code)] // release 构建无调用点（单测用）；G-19 显式标注。
     pub const fn path_only() -> Self {
         Self {
             method: None,
@@ -108,6 +110,7 @@ impl<'a> MatchCtx<'a> {
     /// 于是带 host 约束的后续规则（`block` / `pass` / `header`）在 rewrite 之后
     /// **静默不命中**：安全规则被绕过，且只在 h2/h3 上发生（h1 的 Host 头始终在）。
     /// 调用方在改写前用 [`host_snapshot`] 存一份，改写后经本函数传入即可与 h1 一致。
+    #[allow(dead_code)] // h2/h3 用 from_request_with_host_and_peer（含 peer + 快照）。
     pub fn from_request_with_host<B>(req: &'a Request<B>, host: Option<&'a str>) -> Self {
         Self {
             method: Some(req.method().as_str()),
@@ -533,6 +536,9 @@ pub fn apply(
 /// → pass（也在新路径上判定）**。h2/h3 此前是「先 redirect/block 再 rewrite 且改写后
 /// 不再判定」，导致 `rewrite /secret/* → /admin` 的流量绕过 `block /admin*`（浏览器默认
 /// 走 h2/h3，安全规则整体失效）。
+// `rewritten`/`pass` 是「一次拿到三项决策」的调用方接口；当前 h2/h3 仍分步调用
+// （plan 取 immediate → rewrite_path/pass_upstream），语义一致。G-19 显式标注。
+#[allow(dead_code)]
 #[derive(Debug, Default)]
 pub struct RulePlan {
     /// 命中的 rewrite 之后的**新请求路径**（调用方需要用它更新 `req.uri()`，并用它

@@ -64,10 +64,6 @@ pub struct MergedFields {
     pub prefixes_merged: usize,
 }
 
-pub fn overlapping_prefix_count(conn: &Connection, ip: &str) -> Result<usize> {
-    Ok(load_covering_prefixes(conn, ip)?.len())
-}
-
 pub fn load_covering_prefixes(conn: &Connection, ip: &str) -> Result<Vec<CoveringPrefix>> {
     // 入口归一化：v4-mapped（`::ffff:a.b.c.d`）折回 v4，并把地址重写成规范字符串。
     //
@@ -186,7 +182,7 @@ fn load_from_geoip(conn: &Connection, ip: &str) -> Result<Vec<CoveringPrefix>> {
          ORDER BY COALESCE(commit_unix, 0) ASC, COALESCE(weight, 0) ASC, COALESCE(bits, 0) ASC, rowid ASC",
     )?;
     let rows = stmt.query_map([target_i], |row| {
-        let mut p = map_covering_row(row)?;
+        let p = map_covering_row(row)?;
         let start: String = row.get(31)?;
         let end: String = row.get(32)?;
         Ok((p, start, end))
@@ -308,7 +304,18 @@ fn sanitize<'a>(field: &str, row_country: &str, value: &'a str) -> &'a str {
     value
 }
 
+/// 用当前生效的路径优先级增益做字段合并（运行期入口）。
 pub fn merge_covering_fields(rows: &[CoveringPrefix]) -> CoveringPrefix {
+    merge_covering_fields_with_gain(rows, path_priority_gain())
+}
+
+/// 用**显式**增益做字段合并（单测 / golden 向量 / 与 Python 离线侧对齐）。
+///
+/// 评分口径（G-10，Rust 与 `scripts/geoip_common.py::merge_covering` 逐字一致）：
+/// `(weight + bits * gain, epoch, bits)`，同分时**后行胜**（`>=`；行序由
+/// `load_covering_prefixes` 的 `ORDER BY commit,weight,bits,rowid` 固定，等价于
+/// 第 4 个确定性 tiebreak 分量 = 行序号）。空值永不覆盖非空。
+pub fn merge_covering_fields_with_gain(rows: &[CoveringPrefix], gain: i64) -> CoveringPrefix {
     let mut out = CoveringPrefix::default();
     let mut scores = [FieldScore::default(); 15];
 
@@ -321,6 +328,7 @@ pub fn merge_covering_fields(rows: &[CoveringPrefix]) -> CoveringPrefix {
             row.commit_unix,
             row.weight,
             row.bits,
+            gain,
         );
         prefer_field(
             &mut out.province,
@@ -330,6 +338,7 @@ pub fn merge_covering_fields(rows: &[CoveringPrefix]) -> CoveringPrefix {
             row.commit_unix,
             row.weight,
             row.bits,
+            gain,
         );
         prefer_field(
             &mut out.region,
@@ -339,6 +348,7 @@ pub fn merge_covering_fields(rows: &[CoveringPrefix]) -> CoveringPrefix {
             row.commit_unix,
             row.weight,
             row.bits,
+            gain,
         );
         prefer_field(
             &mut out.city,
@@ -348,6 +358,7 @@ pub fn merge_covering_fields(rows: &[CoveringPrefix]) -> CoveringPrefix {
             row.commit_unix,
             row.weight,
             row.bits,
+            gain,
         );
         prefer_field(
             &mut out.district,
@@ -357,6 +368,7 @@ pub fn merge_covering_fields(rows: &[CoveringPrefix]) -> CoveringPrefix {
             row.commit_unix,
             row.weight,
             row.bits,
+            gain,
         );
         prefer_field(
             &mut out.isp,
@@ -366,6 +378,7 @@ pub fn merge_covering_fields(rows: &[CoveringPrefix]) -> CoveringPrefix {
             row.commit_unix,
             row.weight,
             row.bits,
+            gain,
         );
         prefer_field(
             &mut out.dc,
@@ -375,6 +388,7 @@ pub fn merge_covering_fields(rows: &[CoveringPrefix]) -> CoveringPrefix {
             row.commit_unix,
             row.weight,
             row.bits,
+            gain,
         );
         prefer_field(
             &mut out.asn,
@@ -384,6 +398,7 @@ pub fn merge_covering_fields(rows: &[CoveringPrefix]) -> CoveringPrefix {
             row.commit_unix,
             row.weight,
             row.bits,
+            gain,
         );
         prefer_field(
             &mut out.as_org,
@@ -393,6 +408,7 @@ pub fn merge_covering_fields(rows: &[CoveringPrefix]) -> CoveringPrefix {
             row.commit_unix,
             row.weight,
             row.bits,
+            gain,
         );
         prefer_field(
             &mut out.net_org,
@@ -402,6 +418,7 @@ pub fn merge_covering_fields(rows: &[CoveringPrefix]) -> CoveringPrefix {
             row.commit_unix,
             row.weight,
             row.bits,
+            gain,
         );
         prefer_field(
             &mut out.cloud_provider,
@@ -411,6 +428,7 @@ pub fn merge_covering_fields(rows: &[CoveringPrefix]) -> CoveringPrefix {
             row.commit_unix,
             row.weight,
             row.bits,
+            gain,
         );
         prefer_field(
             &mut out.cloud_region,
@@ -420,6 +438,7 @@ pub fn merge_covering_fields(rows: &[CoveringPrefix]) -> CoveringPrefix {
             row.commit_unix,
             row.weight,
             row.bits,
+            gain,
         );
         prefer_field(
             &mut out.cloud_service,
@@ -429,6 +448,7 @@ pub fn merge_covering_fields(rows: &[CoveringPrefix]) -> CoveringPrefix {
             row.commit_unix,
             row.weight,
             row.bits,
+            gain,
         );
         prefer_field(
             &mut out.hosting,
@@ -438,6 +458,7 @@ pub fn merge_covering_fields(rows: &[CoveringPrefix]) -> CoveringPrefix {
             row.commit_unix,
             row.weight,
             row.bits,
+            gain,
         );
         prefer_field(
             &mut out.division_code,
@@ -447,6 +468,7 @@ pub fn merge_covering_fields(rows: &[CoveringPrefix]) -> CoveringPrefix {
             row.commit_unix,
             row.weight,
             row.bits,
+            gain,
         );
         if out.prefix.is_empty() || row.bits >= out.bits {
             out.prefix = row.prefix.clone();
@@ -484,9 +506,40 @@ pub fn merge_covering(rows: &[CoveringPrefix]) -> MergedFields {
     }
 }
 
-/// Prefer newer commit_unix (or field epoch), then weight + path-priority gain, then bits.
-/// §23.6 path-priority: longer prefixes get `bits * PATH_PRIORITY_GAIN` added to weight.
-pub const PATH_PRIORITY_GAIN: i64 = 10;
+/// §23.6 路径优先级增益的默认值（`[geoip] path_priority_gain` 的 serde 默认）。
+///
+/// G-17：原来是编译期常量，运维无法按数据源调整。现在由
+/// `[geoip] path_priority_gain`（config.toml）或 `data/geoip/panel.toml`
+/// （面板设置，优先级更高）决定，启动/热载时经 [`set_path_priority_gain`] 生效。
+/// 默认 10 与旧行为逐位一致（零变化）。
+pub const DEFAULT_PATH_PRIORITY_GAIN: i64 = 10;
+
+/// 当前生效的路径优先级增益。
+///
+/// 用原子量而不是把 gain 穿进每个调用点：`merge_covering` 在请求热路径上被
+/// 页面规则 country 维度与面板 lookup 调用，签名保持不变才能避免改动 10+ 个
+/// 跨协议调用方；配置热载/面板保存是低频事件，写侧一次 store 即可。
+static PATH_PRIORITY_GAIN: std::sync::atomic::AtomicI64 =
+    std::sync::atomic::AtomicI64::new(DEFAULT_PATH_PRIORITY_GAIN);
+
+/// 当前生效的路径优先级增益（默认 [`DEFAULT_PATH_PRIORITY_GAIN`]）。
+pub fn path_priority_gain() -> i64 {
+    PATH_PRIORITY_GAIN.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// 设置路径优先级增益（配置加载 / 面板保存 / 热载时调用）。
+pub fn set_path_priority_gain(gain: i64) {
+    PATH_PRIORITY_GAIN.store(gain, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// 单个字段的评分：`(weight + bits * gain, epoch, bits)`，同分后行胜。
+///
+/// 公开给 golden 向量单测与跨语言对照用；`epoch` 取字段 epoch（`e_*`），
+/// 为 0 时回落该行的 `commit_unix`。saturating 运算防止畸形大权重溢出。
+pub fn field_score(weight: i64, bits: u32, epoch: i64, gain: i64) -> FieldScore {
+    let effective_weight = weight.saturating_add((bits as i64).saturating_mul(gain));
+    (effective_weight, epoch, bits as i64)
+}
 
 fn prefer_field(
     dst: &mut String,
@@ -496,6 +549,7 @@ fn prefer_field(
     commit_unix: i64,
     weight: i64,
     bits: u32,
+    gain: i64,
 ) {
     if src.is_empty() {
         return;
@@ -505,9 +559,10 @@ fn prefer_field(
     } else {
         commit_unix
     };
-    let effective_weight = weight.saturating_add((bits as i64).saturating_mul(PATH_PRIORITY_GAIN));
     // 标准：score = weight * 10^10 + commit_unix 的元组等价形式（权重优先）。
-    let score: FieldScore = (effective_weight, epoch, bits as i64);
+    // G-10：`bits * gain` 参与第一分量；三端（Rust 运行期 / Python 离线 / golden
+    // 向量）必须是同一公式，否则同一个 IP 在离线库与面板里会选出不同字段。
+    let score: FieldScore = field_score(weight, bits, epoch, gain);
     if dst.is_empty() || score >= *dst_score {
         *dst = src.to_string();
         *dst_score = score;
@@ -829,6 +884,141 @@ mod tests {
         // 大写 / 压缩形态的 v6 也应被规范化后正常查询（不改变结果）。
         let rows6 = load_covering_prefixes(&conn, "::FFFF:10.1.2.3").unwrap();
         assert_eq!(rows6.len(), 1);
+    }
+
+    /// G-10：与 Python 离线合并共享同一组 golden 向量。
+    ///
+    /// 向量文件由 Python `scripts/geoip_golden_test.py` 读取并跑**同一份输入**；
+    /// 两侧都必须得到 `expected`。任何一侧改了评分公式而另一侧没跟上，这个测试
+    /// 或 Python 侧的 `OK: N golden cases` 就会失败。
+    #[test]
+    fn golden_vectors_match_python_expectations() {
+        let raw = include_str!("../../../scripts/geoip_golden_vectors.json");
+        let doc: serde_json::Value = serde_json::from_str(raw).unwrap();
+        let default_gain = doc["path_priority_gain"]
+            .as_i64()
+            .unwrap_or(DEFAULT_PATH_PRIORITY_GAIN);
+        let empty = serde_json::Map::new();
+        for case in doc["cases"].as_array().unwrap() {
+            let name = case["name"].as_str().unwrap();
+            let gain = case
+                .get("gain")
+                .and_then(|v| v.as_i64())
+                .unwrap_or(default_gain);
+            let mut rows = Vec::new();
+            for r in case["rows"].as_array().unwrap() {
+                let s = |k: &str| {
+                    r.get(k)
+                        .and_then(|v| v.as_str())
+                        .unwrap_or_default()
+                        .to_string()
+                };
+                let i = |k: &str| r.get(k).and_then(|v| v.as_i64()).unwrap_or(0);
+                let u = |k: &str| r.get(k).and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+                rows.push(CoveringPrefix {
+                    country: s("country"),
+                    province: s("province"),
+                    region: s("region"),
+                    city: s("city"),
+                    district: s("district"),
+                    isp: s("isp"),
+                    dc: s("dc"),
+                    asn: s("asn"),
+                    as_org: s("as_org"),
+                    net_org: s("net_org"),
+                    cloud_provider: s("cloud_provider"),
+                    cloud_region: s("cloud_region"),
+                    cloud_service: s("cloud_service"),
+                    hosting: s("hosting"),
+                    division_code: s("division_code"),
+                    e_country: i("e_country"),
+                    e_province: i("e_province"),
+                    e_city: i("e_city"),
+                    e_district: i("e_district"),
+                    e_isp: i("e_isp"),
+                    e_asn: i("e_asn"),
+                    e_as_org: i("e_as_org"),
+                    e_net_org: i("e_net_org"),
+                    e_cloud_provider: i("e_cloud_provider"),
+                    e_cloud_region: i("e_cloud_region"),
+                    e_cloud_service: i("e_cloud_service"),
+                    e_hosting: i("e_hosting"),
+                    bits: u("bits"),
+                    weight: i("weight"),
+                    commit_unix: i("commit_unix"),
+                    ..Default::default()
+                });
+            }
+            let got = merge_covering_fields_with_gain(&rows, gain);
+            let expected = case.get("expected").and_then(|v| v.as_object()).unwrap_or(&empty);
+            let pairs = [
+                ("country", got.country.as_str()),
+                ("province", got.province.as_str()),
+                ("region", got.region.as_str()),
+                ("city", got.city.as_str()),
+                ("district", got.district.as_str()),
+                ("isp", got.isp.as_str()),
+                ("dc", got.dc.as_str()),
+                ("asn", got.asn.as_str()),
+                ("as_org", got.as_org.as_str()),
+                ("net_org", got.net_org.as_str()),
+                ("cloud_provider", got.cloud_provider.as_str()),
+                ("cloud_region", got.cloud_region.as_str()),
+                ("cloud_service", got.cloud_service.as_str()),
+                ("hosting", got.hosting.as_str()),
+                ("division_code", got.division_code.as_str()),
+            ];
+            for (field, value) in pairs {
+                let want = expected
+                    .get(field)
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default();
+                assert_eq!(value, want, "golden case {name:?} gain={gain} field={field}");
+            }
+        }
+    }
+
+    /// G-17：路径优先级增益必须真的改变选择结果（0 / 10 / 50 三档）。
+    #[test]
+    fn path_priority_gain_changes_field_selection() {
+        let rows = vec![
+            CoveringPrefix {
+                country: "AA".into(),
+                weight: 700,
+                bits: 8,
+                commit_unix: 5,
+                ..Default::default()
+            },
+            CoveringPrefix {
+                country: "BB".into(),
+                weight: 0,
+                bits: 24,
+                commit_unix: 5,
+                ..Default::default()
+            },
+        ];
+        assert_eq!(
+            merge_covering_fields_with_gain(&rows, 0).country,
+            "AA",
+            "gain=0 时纯权重：/8 的 700 胜 /24 的 0"
+        );
+        assert_eq!(
+            merge_covering_fields_with_gain(&rows, 10).country,
+            "AA",
+            "默认 gain=10 时 /8 仍胜（700+80 > 0+240）"
+        );
+        assert_eq!(
+            merge_covering_fields_with_gain(&rows, 50).country,
+            "BB",
+            "gain=50 时 /24 胜（0+1200 > 700+400）"
+        );
+    }
+
+    /// 默认增益就是 10（旧行为零变化）。不断言运行时全局值：单测并行时别的用例
+    /// 可能正在验证 set_path_priority_gain 的写侧。
+    #[test]
+    fn default_gain_is_ten() {
+        assert_eq!(DEFAULT_PATH_PRIORITY_GAIN, 10);
     }
 
     /// 合并确定性：同 (commit_unix, weight, bits) 的多行（含跨 geoip / ipv4 两张表）

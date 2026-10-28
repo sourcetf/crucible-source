@@ -1136,6 +1136,9 @@ mod dns_admin_api_tests {
             rate_per_sec: 7,
             burst: 9,
             max_conns: 33,
+            // G-08 新增字段：本用例不涉及端口复用，取默认值即可。
+            reuse_tls_port: false,
+            sni: Vec::new(),
         };
         // 面板风格 payload：只有 enabled/port/cert/key（cert/key 用 null 表示清空）
         let merged = merge_json_object(

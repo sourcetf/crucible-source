@@ -6,16 +6,15 @@ pub mod config;
 pub mod conflict;
 pub mod covering;
 pub mod db;
-pub mod filter_agg;
 pub mod iputil;
 pub mod lookup;
 pub mod ops;
-pub mod schema;
 pub mod sources;
 pub mod toml_store;
 
-use crate::config::Config;
-
-pub fn enabled(cfg: &Config) -> bool {
-    cfg.geoip.enabled && cfg.geoip.db_path.is_some()
-}
+// G-19：`enabled(&Config)` 曾在这里，但全树无调用者。真正的开关判定有两处，
+// 且语义更细，不需要这层包装：
+//   * 页面规则 country 维度：`Config::inject_shared_listener_config` 只在
+//     `geoip.enabled` 时注入 `ListenerConfig::geoip_db`；
+//   * 面板/状态：`Config::load` 先应用 `panel.toml` 覆盖，`snap.geoip.enabled`
+//     就是真正生效值（见 `admin_geoip::handle_status_with_live`）。

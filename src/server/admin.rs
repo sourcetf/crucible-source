@@ -403,6 +403,11 @@ async fn handle_inner(
     if path.ends_with("/api/geoip/status") && method == Method::GET {
         return admin_geoip::handle_status_with_live(&req, &live).await;
     }
+    // G-17/G-18：面板设置读写（data/geoip/panel.toml 持久化 + 热载）。
+    // GET 返回真正生效的设置；POST 保存并热载。方法判定由 handler 负责。
+    if path.ends_with("/api/geoip/settings") {
+        return admin_geoip::handle_settings(req, &live).await;
+    }
     // 必须与上面那条**并列**：`/api/geoip/update/status` 并不以 `/api/geoip/status`
     // 结尾，之前把它套在 status 分支内部，等于永远进不去（那条路径会一路落到
     // 末尾的 "admin route not found"）。用 ends_with 做路由时，嵌套顺序就是语义。
@@ -1070,6 +1075,17 @@ async fn handle_inner(
             if let Some(p) = db_path {
                 table.insert("db_path".into(), toml::Value::String(p));
             }
+            // G-17：整表替换不能把已有的路径增益静默抹掉（缺省回落到当前生效值）。
+            // 面板新入口 /api/geoip/settings 会把设置写进 panel.toml；这个旧接口
+            // 仍写 config.toml，二者都保留该键。
+            let gain = v
+                .get("path_priority_gain")
+                .and_then(|g| g.as_i64())
+                .unwrap_or_else(|| live.snapshot().geoip.path_priority_gain);
+            table.insert(
+                "path_priority_gain".into(),
+                toml::Value::Integer(gain),
+            );
             if let Err(e) = cfg_edit::set_top_level_table(
                 &mut tree,
                 "geoip",

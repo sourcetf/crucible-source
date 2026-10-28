@@ -260,12 +260,32 @@ fn default_syncookie_interval() -> u64 {
     5000
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GeoIpConfig {
     #[serde(default)]
     pub db_path: Option<PathBuf>,
     #[serde(default)]
     pub enabled: bool,
+    /// §23.6「路径优先级增益」：更细的 CIDR 每多一位，就按 `bits * gain` 加到
+    /// 该行的合并权重上（`covering::prefer_field`）。默认 10（旧硬编码值，零变化），
+    /// 面板设置 `data/geoip/panel.toml` 可覆盖本字段。
+    #[serde(default = "default_path_priority_gain")]
+    pub path_priority_gain: i64,
+}
+
+/// 路径优先级增益的 serde 默认值（与 `geoip_panel::covering::DEFAULT_PATH_PRIORITY_GAIN` 相同）。
+pub fn default_path_priority_gain() -> i64 {
+    crate::server::geoip_panel::covering::DEFAULT_PATH_PRIORITY_GAIN
+}
+
+impl Default for GeoIpConfig {
+    fn default() -> Self {
+        Self {
+            db_path: None,
+            enabled: false,
+            path_priority_gain: default_path_priority_gain(),
+        }
+    }
 }
 
 /// §18: `autoindex = true` 或 `autoindex = { enabled, paths }`
@@ -579,8 +599,37 @@ pub struct ListenerConfig {
     pub status_path: Option<String>,
     #[serde(default)]
     pub address_v6: Option<String>,
+    /// **明文口 TLS ClientHello 嗅探/SNI 路由**（历史实现，与下面的 `reuse_port` 无关）。
+    ///
+    /// 打开后，明文 listener 收到 TLS 记录时会读出 SNI，并把整条 TCP 连接转发到
+    /// `server_name`/`ssl.sni_name` 匹配的 TLS listener（规格 §16.1 的「80 口复用」）。
+    /// 名字容易与 `SO_REUSEPORT` 混淆，这里明确：本字段**不是** socket 选项，
+    /// 不产生额外 accept loop，只做协议嗅探 + 转发。
     #[serde(default)]
     pub port_reuse: bool,
+    /// 可选 **SO_REUSEPORT 多 accept loop**（规格 §22 P3 实验项，默认关）。
+    ///
+    /// 与上面的 `port_reuse` 完全无关：本字段给同一 `address:port` 创建
+    /// `reuse_port_workers` 个监听 socket（每个都设 `SO_REUSEPORT`），每个 socket
+    /// 一个独立 accept loop，由内核在它们之间分发连接（Linux/OpenBSD 同名选项）。
+    ///
+    /// * `false`（默认）= 完全保持现状：一个 socket、一个 accept loop，不设任何新
+    ///   socket 选项（零行为变化）。
+    /// * `true` = 多 socket 多 accept loop。TLS/h2/h3/qmux 等协议分发路径不变
+    ///   （每个 accept 出来的连接仍走 `listener::handle_connection`）。
+    /// * 需要**同一进程内**有多个 acceptor 竞争时才用（例如 CPU 多、单 accept loop
+    ///   的唤醒开销可观测）。真实新连接分发比例由内核哈希决定，不保证均分。
+    ///
+    /// 注意：`SO_REUSEPORT` 也让**同 uid 的其它进程**能绑同一端口（这是该选项的
+    /// 固有语义）；只应在受控部署里开。
+    #[serde(default)]
+    pub reuse_port: bool,
+    /// `reuse_port = true` 时的 accept loop 数（默认 = `nproc`，钳到 1..=32）。
+    ///
+    /// 每个 loop 一个监听 socket（同地址 + `SO_REUSEPORT`）。0/未配 = 自动按 CPU 数；
+    /// 配置值超过 32 会被钳制（防止误配把 fd/任务数放大）。
+    #[serde(default)]
+    pub reuse_port_workers: Option<usize>,
     #[serde(default)]
     pub rate_limit: Option<RateLimitConfig>,
     /// §16.1：**每 listener 独立**的 IP 访问控制。
@@ -667,7 +716,9 @@ impl Default for ListenerConfig {
             status_path: None,
             address_v6: None,
             port_reuse: false,
-             rate_limit: None,
+            reuse_port: false,
+            reuse_port_workers: None,
+            rate_limit: None,
             ip_access: None,
             l4_forward: None,
             quic_ecn: false,
@@ -1451,12 +1502,42 @@ impl Config {
         check_roots_do_not_expose_config(&cfg, &base)?;
         check_tor_hs_data_dir(&cfg, &base)?;
         cfg.normalize_tls_version_ranges()?;
+        // 校验只针对 config.toml 本身（panel.toml 的覆盖值必须也有机会被
+        // 独立校验，而不是用一份合法面板值把写错的 config 值掩盖过去）。
         cfg.validate()?;
+        // G-18：面板设置（data/geoip/panel.toml）优先于 config.toml `[geoip]`。
+        // 放在 validate 之后、注入 listener 之前：页面规则的 country 维度看到的是
+        // 真正生效的 enabled/db_path；同时把路径优先级增益发布给 covering。
+        cfg.apply_geoip_panel_settings()?;
         // 全局页面规则 / GeoIP 库路径是**跨 listener 的共享配置**：注入到每个
         // listener 的运行期字段（`#[serde(skip)]`，不参与序列化）。放在 validate
         // 之后：校验只看磁盘上的真实配置，注入后的副本不再回写。
         cfg.inject_shared_listener_config();
         Ok(cfg)
+    }
+
+    /// G-18：加载 `data/geoip/panel.toml` 并覆盖 `[geoip]`，随后发布运行期状态。
+    ///
+    /// 面板设置文件缺失时是纯 no-op（旧部署零变化）；文件存在但非法时**报错**
+    /// 并指名文件 —— 静默忽略会让运维以为自己的修改已生效。
+    /// `db_path`/`enabled` 的覆盖也发生在 [`Config::validate`] 之后：config.toml
+    /// 写错（如 enabled=true 但无 db_path）仍会被拦下，不会被面板值掩盖。
+    pub fn apply_geoip_panel_settings(&mut self) -> Result<()> {
+        self.geoip = crate::server::geoip_panel::toml_store::effective_geoip(&self.geoip)?;
+        // 覆盖之后也要保证组合合法：config.toml 里 enabled=false（没有 db_path 也合法）
+        // 被 panel.toml 改成 enabled=true 时，若两份文件都没有 db_path，运行期只会
+        // 「开关显示已启用、country 规则永不命中」——在加载期点名，而不是静默。
+        if self.geoip.enabled && self.geoip.db_path.is_none() {
+            anyhow::bail!(
+                "生效的 geoip.enabled = true 但没有 db_path（config.toml [geoip] 与 {} 都未提供）",
+                crate::server::geoip_panel::toml_store::panel_path().display()
+            );
+        }
+        // G-17：把真正生效的路径优先级增益发布给 covering（热载同样经过这里）。
+        crate::server::geoip_panel::covering::set_path_priority_gain(
+            self.geoip.path_priority_gain,
+        );
+        Ok(())
     }
 
     /// 把顶层 `page_rules` 与 `[geoip].db_path` 复制进每个 listener 的运行期字段。
@@ -1466,8 +1547,9 @@ impl Config {
     /// 全局与每站规则（`page_rules::ordered` 合并两份切片）。规则条数很少（上限 512），
     /// 配置热重载时才复制一次。
     ///
-    /// GeoIP 库只在 `[geoip] enabled = true` 时注入：`enabled = false` 是运营方的
-    /// 显式关闭开关（与 `geoip_panel::enabled`、公开 `/api/geoip/*` 的判定同口径）。
+    /// GeoIP 库只在 `[geoip] enabled = true` 时注入（`panel.toml` 的覆盖已在本函数
+    /// 之前由 [`Self::apply_geoip_panel_settings`] 应用）：`enabled = false` 是运营方的
+    /// 显式关闭开关（与面板 `/api/geoip/status` 的判定同口径）。
     /// 否则「关掉 GeoIP」后页面规则的 country 维度仍会查库并拦流量，开关等于失效。
     pub fn inject_shared_listener_config(&mut self) {
         let global = self.page_rules.clone();
@@ -1877,6 +1959,15 @@ cover 只用于「未使用 / 被拒 ECH」的连接，ECH 关闭时它会成为
                 "geoip.enabled = true 但没有配置 geoip.db_path —— 查询会全部落空（面板仍显示已启用）"
             );
         }
+        // ①b 路径优先级增益（G-17）：负数会把「更细前缀更可信」反过来（越细越差），
+        // 超大值则让 bits 完全压过源权重 —— 两种都不是 §23.6 的「详细度增益」语义。
+        if !(0..=1000).contains(&self.geoip.path_priority_gain) {
+            anyhow::bail!(
+                "geoip.path_priority_gain = {} 越界（允许 0..=1000；默认 {}）",
+                self.geoip.path_priority_gain,
+                default_path_priority_gain()
+            );
+        }
 
         // ①c `[dns]` 的「开了但配不全」**不能**在 `validate()` 里当错误拦：
         // `state/dns/etc/panel.toml` 存在时会把 `[dns]` **整体覆盖**（见 `dns::effective`），
@@ -2166,31 +2257,82 @@ fn validate_page_rule_list(rules: &[PageRuleConfig], where_: &str) -> Result<()>
                 "{where_}[{i}]（{action}）缺少 target —— 运行期会静默跳过这条规则"
             );
         }
-        // rewrite 的 target 会与请求路径做前缀拼接；相对路径拼出来的东西不再是
-        // 合法请求路径（后续 404，日志里也看不出原因）。
-        if action == "rewrite" {
-            if let Some(t) = target_trimmed.filter(|t| !t.is_empty()) {
-                if !t.starts_with('/') {
+        // cache 的 target 会**原样**作为 Cache-Control 值（运行期不 trim）；控制字符
+        // 在 `trim()` 之后才检查会被行尾 `\n` 绕过，所以这里用未 trim 的原文。
+        if action == "cache" {
+            if let Some(raw) = r.target.as_deref() {
+                if raw.bytes().any(|b| b < 0x20 || b == 0x7f) {
                     anyhow::bail!(
-                        "{where_}[{i}]（rewrite）的 target 必须以 `/` 开头（当前 {t:?}）"
+                        "{where_}[{i}]（cache）的 target 含控制字符（运行期会静默丢弃这条规则）: {raw:?}"
                     );
                 }
             }
         }
-        // redirect target 会进 Location 响应头；HeaderValue 拒绝控制字符与非 ASCII。
-        if action == "redirect" {
-            let t = r.target.as_deref().unwrap_or("/");
-            let loc = match t.split_once(':') {
-                Some(("301" | "307" | "308", u)) => u,
-                _ => t,
-            };
-            if !safe_header_value(loc) {
-                anyhow::bail!(
-                    "{where_}[{i}]（redirect）的 target 不能作为 Location 响应头（含控制字符、非 ASCII、引号或反斜杠）: {loc:?}"
-                );
+        if let Some(t) = target_trimmed.filter(|t| !t.is_empty()) {
+            if t.len() > 4096 {
+                anyhow::bail!("{where_}[{i}]（{action}）的 target 过长（{} > 4096）", t.len());
+            }
+            match action.as_str() {
+                // rewrite 的 target 会与请求路径做前缀拼接；相对路径拼出来的东西不再是
+                // 合法请求路径（后续 404，日志里也看不出原因）。
+                "rewrite" => {
+                    if !t.starts_with('/') {
+                        anyhow::bail!(
+                            "{where_}[{i}]（rewrite）的 target 必须以 `/` 开头（当前 {t:?}）"
+                        );
+                    }
+                }
+                // pass 的 target 直接当上游 URL 用：proxy::upstream_parts 只认
+                // http/https + host。非法值 = 该路径的每个请求都 502，
+                // 而配置加载/面板保存都显示成功。
+                "pass" => {
+                    if !rule_upstream_url_is_valid(t) {
+                        anyhow::bail!(
+                            "{where_}[{i}]（pass）的 target 不是合法上游 URL（需 http:// 或 https:// 且带主机名）: {t:?}"
+                        );
+                    }
+                }
+                // header 的 target 形如 "Name: value"：运行期按 ':' 拆开，名字/值
+                // 非法或属于逐跳/定界头时**静默丢弃**（response_headers 的 continue），
+                // 管理员配的头永远不生效。
+                "header" => {
+                    let Some((name, value)) = t.split_once(':') else {
+                        anyhow::bail!(
+                            "{where_}[{i}]（header）的 target 必须是 \"Name: value\" 形式: {t:?}"
+                        );
+                    };
+                    let (name, value) = (name.trim(), value.trim());
+                    if !rule_header_pair_is_valid(name, value) {
+                        anyhow::bail!(
+                            "{where_}[{i}]（header）的 \"{name}: {value}\" 非法（头名须是 RFC 9110 token；值只能是可见 ASCII/制表符）"
+                        );
+                    }
+                    if !crate::server::headers_mod::response_header_injectable(name) {
+                        anyhow::bail!(
+                            "{where_}[{i}]（header）拒绝注入定界/逐跳响应头 {name:?}（Content-Length/Transfer-Encoding/Connection/Host 等）——运行期会静默丢弃"
+                        );
+                    }
+                }
+                // redirect target 会进 Location 响应头；HeaderValue 拒绝控制字符与非 ASCII。
+                "redirect" => {
+                    let raw = r.target.as_deref().unwrap_or("/");
+                    let loc = match raw.split_once(':') {
+                        Some(("301" | "307" | "308", u)) => u,
+                        _ => raw,
+                    };
+                    if !safe_header_value(loc) {
+                        anyhow::bail!(
+                            "{where_}[{i}]（redirect）的 target 不能作为 Location 响应头（含控制字符、非 ASCII、引号或反斜杠）: {loc:?}"
+                        );
+                    }
+                }
+                _ => {}
             }
         }
         // match_url：只有**结尾**的 `*` 是受支持的通配；中间的 `*` 按字面比较。
+        if r.match_url.len() > 2048 {
+            anyhow::bail!("{where_}[{i}].match_url 过长（{} > 2048）", r.match_url.len());
+        }
         if let Some(pos) = r.match_url.find('*') {
             if pos != r.match_url.len() - 1 {
                 anyhow::bail!(
@@ -2205,26 +2347,70 @@ fn validate_page_rule_list(rules: &[PageRuleConfig], where_: &str) -> Result<()>
                 r.match_url
             );
         }
-        // country：逗号分隔、可带 `!` 前缀；空 token / 空国家码会让语义不可预测。
+        // ── §16.11 匹配维度：运行期对非法值只会「不匹配」（规则永不生效），
+        //    配置期按运行期同一口径拒绝，避免「加载成功、从不命中」。
+        if let Some(host) = r.host.as_deref() {
+            if !rule_host_pattern_is_valid(host) {
+                anyhow::bail!(
+                    "{where_}[{i}].host 不合法: {host:?}（允许 * / 精确主机名 / *.suffix，可带端口）——运行期永不匹配"
+                );
+            }
+        }
+        if let Some(method) = r.method.as_deref() {
+            if !rule_method_pattern_is_valid(method) {
+                anyhow::bail!(
+                    "{where_}[{i}].method 不合法: {method:?}（逗号分隔的 HTTP 方法，如 \"GET, HEAD\"）"
+                );
+            }
+        }
+        if let Some(spec) = r.header.as_deref() {
+            let (name, value) = match spec.split_once(':') {
+                Some((n, v)) => (n.trim(), v.trim()),
+                None => (spec.trim(), ""),
+            };
+            if !rule_header_pair_is_valid(name, value) {
+                anyhow::bail!(
+                    "{where_}[{i}].header 不合法: {spec:?}（\"Name\" 或 \"Name: value\"；头名须是 RFC 9110 token，值只能是可见 ASCII）"
+                );
+            }
+        }
+        // country：逗号分隔、可带 `!` 前缀；别名（China/中国）先归一成 ISO2。
         if let Some(spec) = r.country.as_deref() {
             if spec.len() > 256 {
                 anyhow::bail!("{where_}[{i}].country 过长（{} > 256）", spec.len());
             }
             let mut any = false;
+            let mut n = 0usize;
             for tok in spec.split(',') {
                 let t = tok.trim();
                 if t.is_empty() {
                     continue;
                 }
-                let code = t.strip_prefix('!').unwrap_or(t).trim();
-                if code.is_empty() {
+                n += 1;
+                if n > 64 {
+                    anyhow::bail!("{where_}[{i}].country 条目过多（> 64）");
+                }
+                let raw = t.strip_prefix('!').unwrap_or(t).trim();
+                if raw.is_empty() {
                     anyhow::bail!(
                         "{where_}[{i}].country 含空的排除项（`!` 后必须有国家码）: {spec:?}"
                     );
                 }
-                if code.chars().any(char::is_control) || code.len() > 64 {
+                if raw.chars().any(char::is_control) {
                     anyhow::bail!(
-                        "{where_}[{i}].country 含控制字符或超长国家码（≤64 字节）: {code:?}"
+                        "{where_}[{i}].country 含控制字符: {raw:?}"
+                    );
+                }
+                let Some(code) = rule_country_code(raw) else {
+                    anyhow::bail!(
+                        "{where_}[{i}].country 的国家码不合法: {raw:?}（用 ISO2 如 CN/US，或 China/中国 等别名；运行期按 ISO2 精确比较）"
+                    );
+                };
+                // ZZ/XX/A1/A2 在查询期被 country_vote_ok 过滤，永远不可能成为
+                // 「实际国家」——拿它写规则等于永不命中。
+                if matches!(code.as_str(), "ZZ" | "XX" | "A1" | "A2") {
+                    anyhow::bail!(
+                        "{where_}[{i}].country 使用了查询期会被过滤的特殊码 {code:?} —— 规则永不命中"
                     );
                 }
                 any = true;
@@ -2235,6 +2421,99 @@ fn validate_page_rule_list(rules: &[PageRuleConfig], where_: &str) -> Result<()>
         }
     }
     Ok(())
+}
+
+/// pass 的 target 是否是可用的上游 URL（与 `proxy::upstream_parts` 同口径）。
+fn rule_upstream_url_is_valid(t: &str) -> bool {
+    match t.parse::<http::Uri>() {
+        Ok(uri) => {
+            let scheme_ok = uri
+                .scheme_str()
+                .map(|s| s.eq_ignore_ascii_case("http") || s.eq_ignore_ascii_case("https"))
+                .unwrap_or(false);
+            scheme_ok && uri.host().map(|h| !h.is_empty()).unwrap_or(false)
+        }
+        Err(_) => false,
+    }
+}
+
+/// 头名/头值是否可安全放进 HTTP 头（`Name: value` 与 header 维度共用）。
+fn rule_header_pair_is_valid(name: &str, value: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 128
+        && value.len() <= 4096
+        && http::header::HeaderName::from_bytes(name.as_bytes()).is_ok()
+        && http::header::HeaderValue::from_bytes(value.as_bytes()).is_ok()
+        // 非 ASCII 按 obs-text 发出（h2/h3/中间缓存处理不一），header 维度比较时
+        // `to_str()` 也会失败 ⇒ 永远不匹配。统一拒绝。
+        && value.bytes().all(|b| (0x20..0x7f).contains(&b) || b == b'\t')
+}
+
+/// host 维度：`*` / 精确主机名 / `*.suffix`，可带端口；与 `page_rules::host_matches`
+/// 的可表达形态一致（不支持正则、不支持无括号 IPv6）。
+fn rule_host_pattern_is_valid(h: &str) -> bool {
+    let h = h.trim();
+    if h.is_empty() || h.len() > 261 || h.bytes().any(|b| b < 0x21 || b == b' ') {
+        return false;
+    }
+    if h == "*" {
+        return true;
+    }
+    let body = h.strip_prefix("*.").unwrap_or(h);
+    if body.is_empty() {
+        return false;
+    }
+    let name = if let Some(rest) = body.strip_prefix('[') {
+        let Some(end) = rest.find(']') else {
+            return false;
+        };
+        let after = &rest[end + 1..];
+        if !after.is_empty() {
+            let Some(port) = after.strip_prefix(':') else {
+                return false;
+            };
+            if port.is_empty() || !port.bytes().all(|b| b.is_ascii_digit()) {
+                return false;
+            }
+        }
+        &body[..end + 2]
+    } else {
+        match body.rsplit_once(':') {
+            Some((n, p)) if !n.contains(':') => {
+                if n.is_empty() || p.is_empty() || !p.bytes().all(|b| b.is_ascii_digit()) {
+                    return false;
+                }
+                n
+            }
+            Some(_) => return false,
+            None => body,
+        }
+    };
+    name != "."
+        && name.bytes().all(|b| {
+            b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'_' | b':' | b'[' | b']')
+        })
+}
+
+/// method 维度：逗号分隔、1..=16 个合法 HTTP 方法 token。
+fn rule_method_pattern_is_valid(spec: &str) -> bool {
+    let mut n = 0usize;
+    for t in spec.split(',').map(str::trim).filter(|t| !t.is_empty()) {
+        n += 1;
+        if n > 16 || t.len() > 32 || http::Method::from_bytes(t.as_bytes()).is_err() {
+            return false;
+        }
+    }
+    n > 0
+}
+
+/// country token → ISO2（别名先归一；只接受 2 个 ASCII 字母）。
+fn rule_country_code(raw: &str) -> Option<String> {
+    let code = crate::server::geoip_panel::aliases::resolve_country_alias(raw)
+        .trim()
+        .to_ascii_uppercase();
+    let b = code.as_bytes();
+    (b.len() == 2 && b.iter().all(u8::is_ascii_alphabetic)).then_some(code)
 }
 
 /// 所有会进 `WWW-Authenticate: Basic realm="…"` 的 realm（管理面 + 每个 listener 的 basic_auth）。
@@ -3235,6 +3514,15 @@ target = "/moved"
             ("pass", None, "缺少 target"),
             ("header", None, "缺少 target"),
             ("rewrite", Some("relative"), "必须以 `/` 开头"),
+            // G-20：面板保存早已校验、但手写配置此前放行的形态。
+            ("pass", Some("not a url"), "合法上游 URL"),
+            ("pass", Some("ftp://example.com/x"), "合法上游 URL"),
+            ("pass", Some("http:///nohost"), "合法上游 URL"),
+            ("header", Some("X-Test"), "\"Name: value\""),
+            ("header", Some("Bad Name: v"), "非法"),
+            ("header", Some("Content-Length: 5"), "定界/逐跳"),
+            ("header", Some("X-Test: 中文"), "非法"),
+            ("cache", Some("no-store\n"), "控制字符"),
         ];
         for (n, (action, target, want)) in cases.iter().enumerate() {
             let dir = std::env::temp_dir().join(format!(
@@ -3274,6 +3562,171 @@ action = {action:?}
             );
             let _ = std::fs::remove_dir_all(&dir);
         }
+    }
+
+    /// G-20：页面规则的 host/method/header/country 维度在配置期按运行期同一口径校验。
+    /// 这些值写错时配置能加载、运行期只是「永不匹配」，运维完全看不出来。
+    #[test]
+    fn page_rule_dimensions_validated_at_load() {
+        let cases = [
+            (r#"host = "bad host""#, "host"),
+            (r#"host = "*.""#, "host"),
+            (r#"host = "[::1""#, "host"),
+            (r#"method = """#, "method"),
+            (r#"method = "GET, BAD METHOD""#, "method"),
+            (r#"header = "Bad Name""#, "header"),
+            (r#"header = "X-Test: 中文""#, "header"),
+            (r#"country = "CHN""#, "国家码不合法"),
+            (r#"country = "ZZ""#, "特殊码"),
+            (r#"country = "!""#, "空的排除项"),
+            (r#"country = "1""#, "国家码不合法"),
+        ];
+        for (n, (dim, want)) in cases.iter().enumerate() {
+            let dir = std::env::temp_dir().join(format!(
+                "crucible-page-rule-dim-{}-{n}",
+                std::process::id()
+            ));
+            let _ = std::fs::create_dir_all(&dir);
+            let path = dir.join("config.toml");
+            std::fs::write(
+                &path,
+                format!(
+                    r#"
+[[page_rules]]
+match_url = "/x*"
+action = "block"
+{dim}
+
+[[listeners]]
+address = "127.0.0.1"
+port = 18085
+root = "www"
+"#
+                ),
+            )
+            .unwrap();
+            let err = Config::load(&path).unwrap_err().to_string();
+            assert!(
+                err.contains(want),
+                "case {dim:?} 的错误必须指名 {want:?}，实际: {err}"
+            );
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
+    /// DEL(0x7f) 也是运行期会被静默丢弃的控制字符；TOML 基本字符串不允许裸 DEL，
+    /// 所以直接对结构体调用校验器（不经过配置文件解析）。
+    #[test]
+    fn page_rule_cache_del_rejected_directly() {
+        let r = PageRuleConfig {
+            match_url: "/x".into(),
+            action: "cache".into(),
+            target: Some("no-store\u{7f}".into()),
+            priority: 0,
+            host: None,
+            method: None,
+            header: None,
+            country: None,
+        };
+        let e = validate_page_rule_list(&[r], "t").unwrap_err().to_string();
+        assert!(e.contains("控制字符"), "{e}");
+    }
+
+    /// G-20 正例：合法 pass URL / `Name: value` / 无控制字符 cache / 别名 country /
+    /// host/method 维度必须照常加载（不能把正确配置误拒）。
+    #[test]
+    fn page_rule_valid_forms_still_load() {
+        let dir = std::env::temp_dir().join(format!(
+            "crucible-page-rule-valid-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("config.toml");
+        std::fs::write(
+            &path,
+            r#"
+[[page_rules]]
+match_url = "/pass*"
+action = "pass"
+target = "http://127.0.0.1:9/base"
+
+[[page_rules]]
+match_url = "/h*"
+action = "header"
+target = "X-Test: yes"
+
+[[page_rules]]
+match_url = "/c*"
+action = "cache"
+target = "public, max-age=60"
+
+[[page_rules]]
+match_url = "/cy*"
+action = "block"
+country = "China, !CN, 中国"
+host = "*.example.com:8080"
+method = "GET, HEAD"
+header = "X-Requested-With: XMLHttpRequest"
+
+[[listeners]]
+address = "127.0.0.1"
+port = 18086
+root = "www"
+"#,
+        )
+        .unwrap();
+        let cfg = Config::load(&path).expect("合法页面规则必须能加载");
+        assert_eq!(cfg.page_rules.len(), 4);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// G-17：`geoip.path_priority_gain` 默认 10；越界在配置期点名拒绝。
+    #[test]
+    fn geoip_path_priority_gain_validated() {
+        let base = |gain: &str| {
+            format!(
+                r#"
+[geoip]
+enabled = false
+path_priority_gain = {gain}
+
+[[listeners]]
+address = "127.0.0.1"
+port = 18087
+root = "www"
+"#
+            )
+        };
+        for (n, gain) in ["10", "0", "50", "1000"].iter().enumerate() {
+            let dir = std::env::temp_dir().join(format!(
+                "crucible-geoip-gain-ok-{}-{n}",
+                std::process::id()
+            ));
+            let _ = std::fs::create_dir_all(&dir);
+            let path = dir.join("config.toml");
+            std::fs::write(&path, base(gain)).unwrap();
+            let cfg = Config::load(&path).unwrap_or_else(|e| panic!("gain={gain} 应合法: {e}"));
+            assert_eq!(cfg.geoip.path_priority_gain, gain.parse::<i64>().unwrap());
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+        for (n, gain) in ["-1", "1001", "-9223372036854775808"].iter().enumerate() {
+            let dir = std::env::temp_dir().join(format!(
+                "crucible-geoip-gain-bad-{}-{n}",
+                std::process::id()
+            ));
+            let _ = std::fs::create_dir_all(&dir);
+            let path = dir.join("config.toml");
+            std::fs::write(&path, base(gain)).unwrap();
+            let err = Config::load(&path).unwrap_err().to_string();
+            assert!(
+                err.contains("path_priority_gain"),
+                "gain={gain} 的错误必须指名字段，实际: {err}"
+            );
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+        // 缺省 = 默认 10（旧配置零变化）。
+        let cfg: GeoIpConfig = toml::from_str("enabled = false").unwrap();
+        assert_eq!(cfg.path_priority_gain, 10);
     }
 
     /// `[geoip] enabled = false` 是显式关闭开关：页面规则的 country 维度不得再查库

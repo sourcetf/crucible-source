@@ -91,9 +91,14 @@ static void *envwin_run_one(void *arg)
     j->status = 0;
     j->body[0] = '\0';
     /* 与 app_ffi::call_exec 同一条路径（env_dirty = 本请求带 .env）。 */
-    rc = crucible_py_wsgi_request("wsgi", j->script, NULL, "GET", "/", j->query,
-                                  NULL, NULL, 0, "127.0.0.1", "localhost", 80,
-                                  j->env_dirty, NULL, &out);
+    /* R-03：请求 `.env` 现以 ABI `extra` JSON 下发（不再依赖进程 env）。 */
+    rc = crucible_py_wsgi_request(
+        "wsgi", j->script, NULL, "GET", "/", j->query, NULL, NULL, 0, "127.0.0.1",
+        "localhost", 80,
+        j->env_dirty
+            ? "{\"engine\":\"wsgi\",\"env\":{\"WINDOWMARK\":\"from-selftest\"}}"
+            : "wsgi",
+        NULL, &out);
     j->status = out.status;
     if (rc == 0 && out.body != NULL && out.body_len > 0 &&
         out.body_len < sizeof(j->body)) {
