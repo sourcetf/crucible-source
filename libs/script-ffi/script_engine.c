@@ -1822,7 +1822,7 @@ static int run_perl_inprocess(const char *script, const char *method, const char
                               size_t body_len, const char *remote, const char *headers,
                               char **out_body, size_t *out_len)
 {
-    char *embedding[] = {"", (char *)script};
+    static char *embedding[] = {"", (char *)"crucible"};
     int argc = 2;
     char **argv = embedding;
     char **env = NULL;
@@ -1831,6 +1831,8 @@ static int run_perl_inprocess(const char *script, const char *method, const char
     STRLEN n;
     char *s;
     int rc = -1;
+    /* 解释器只 parse/run 一次（见下方说明）。 */
+    static int perl_parsed;
 
     PERL_LOCK();
     if (!my_perl) {
@@ -1846,9 +1848,22 @@ static int run_perl_inprocess(const char *script, const char *method, const char
      * `segfault at 0x40 in libperl.so.5.40`，整个 webserver 被打死）。
      * 每次进入锁后都显式 set：线程无关、幂等（非 ithreads 构建上是 no-op）。 */
     PERL_SET_CONTEXT(my_perl);
-    {
-        char *args[] = {"", (char *)script};
-        perl_parse(my_perl, NULL, 2, args, NULL);
+    /* **只在初始化时 parse/run 一次**：
+     * Perl API 规定 `perl_parse` 对同一解释器只能调用一次；每请求重复 parse 会不断
+     * 新建 op 树/符号表且永不释放 —— soak-wave22 实测 `/perl/` 每请求泄漏 **~78 KB**
+     * （60 s 窗口 +4.05 GB / +1.85 GB，长稳 46 分钟被系统 OOM 护栏杀掉），
+     * 而 `perl_run` 只用于执行 BEGIN 块，同样不需要每请求调用。
+     * 请求期只做 ENV/body 注入 + eval 脚本（脚本内容每请求可不同，故仍按请求执行）。 */
+    if (!perl_parsed) {
+        /* `-e 0`：argv[1] 会被 perl_parse 当成**脚本文件**去打开（传普通名字会直接
+         * 失败：Can't open perl script "…"），所以既不给它脚本文件、也不让它跑任何
+         * 用户代码 —— 只把解释器初始化好；脚本在请求期由 eval 执行（rack 引擎同款）。 */
+        /* static：perl_parse 会保留 argv 指针（PL_origargv），指向栈上的数组会在
+         * 之后被 GC/错误路径解引用 —— 真机实测段错误。 */
+        static char *args[] = {(char *)"crucible-perl", (char *)"-e", (char *)"0"};
+        perl_parse(my_perl, NULL, 3, args, NULL);
+        perl_run(my_perl);
+        perl_parsed = 1;
     }
     /* ENV（含 CONTENT_LENGTH/CONTENT_TYPE；P2 body 丢失修复）。 */
     {
@@ -1880,9 +1895,15 @@ static int run_perl_inprocess(const char *script, const char *method, const char
         sv_setsv(gv, bsv);
         SvREFCNT_dec(bsv);
     }
-    perl_run(my_perl);
     /* Best-effort: scripts that print go to real stdout; capture via tie is heavy.
-     * Read script and eval into scalar when file is small CGI-style. */
+     * Read script and eval into scalar when file is small CGI-style.
+     *
+     * **自己开一个 Perl 作用域**：`eval_pv` 返回的是 **mortal** SV，只在下一次
+     * `FREETMPS` 时释放；而嵌入宿主从不进 Perl 作用域 ⇒ 每请求的 body SV 永久堆在
+     * 该线程的临时栈上（soak-wave22 实测 `/perl/` 每请求 ~78 KB，长稳 46 分钟被系统
+     * OOM 护栏杀掉）。ENTER/SAVETMPS…FREETMPS/LEAVE 把本次请求的临时值全部收干净。 */
+    ENTER;
+    SAVETMPS;
     out_sv = eval_pv("do { local $/; open my $fh, '<', $ENV{SCRIPT_FILENAME} or die $!; "
                      "my $c = <$fh>; close $fh; "
                      "my $buf = ''; open my $o, '>', \\$buf; "
@@ -1892,17 +1913,23 @@ static int run_perl_inprocess(const char *script, const char *method, const char
                      "select $old; $buf }",
                      0);
     if (!out_sv || !SvOK(out_sv)) {
+        FREETMPS;
+        LEAVE;
         PERL_UNLOCK();
         return -1;
     }
     s = SvPV(out_sv, n);
     if (!s || n == 0) {
+        FREETMPS;
+        LEAVE;
         PERL_UNLOCK();
         return -1;
     }
     if ((unsigned long)n > CRUCIBLE_SCRIPT_OUT_CAP) {
         fprintf(stderr, "scriptffi: perl 脚本输出超过 %u 字节上限\n",
                 CRUCIBLE_SCRIPT_OUT_CAP);
+        FREETMPS;
+        LEAVE;
         PERL_UNLOCK();
         return -1;
     }
@@ -1916,6 +1943,8 @@ static int run_perl_inprocess(const char *script, const char *method, const char
             rc = 0;
         }
     }
+    FREETMPS;
+    LEAVE;
     PERL_UNLOCK();
     return rc;
 }

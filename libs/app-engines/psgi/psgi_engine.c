@@ -323,11 +323,69 @@ static int psgi_request(const char *script, const char *method, const char *path
     /* ABI 请求头块：驱动片段展开为 $env->{HTTP_*} 并同步 %ENV。 */
     psgi_hv_put(req, "headers", headers != NULL ? headers : "");
 
-    driver_ret = eval_pv(psgi_driver, 0);
+    /* **驱动片段只编译一次**：把 `do { … }` 包成匿名 sub 存进 Perl 全局，请求期只调用
+     * 它的 coderef。`eval_pv(psgi_driver)` 会在每个请求里重新编译这 ~1.5 KB 源码
+     * （soak-wave22 实测 `/psgi/` 每请求泄漏 **~6.7 KB**，60 s 窗口 +0.49~0.84 GB）。
+     *
+     * 另外两处配套修正（同一泄漏面）：
+     *   * Perl 5.40 的 `Perl_call_sv` 返回 **SSize_t**（返回值的个数），不是 SV*，
+     *     取值必须走 Perl 栈（PUSHMARK/call_sv/SPAGAIN/POPs）；
+     *   * 旧代码调用 `eval_pv` 却从不 `FREETMPS`，mortals 只增不减 —— 用
+     *     ENTER/SAVETMPS…FREETMPS/LEAVE 把临时值收干净。 */
+    {
+        SV *cv = get_sv("Crucible::psgi_driver_cv", 0);
+
+        if (cv == NULL || !SvOK(cv)) {
+            size_t dn = strlen(psgi_driver) + 64;
+            char *dsrc = (char *)malloc(dn);
+
+            if (dsrc == NULL) {
+                PSGI_UNLOCK();
+                return crucible_err(out, "psgi: 驱动编译缓冲分配失败");
+            }
+            snprintf(dsrc, dn, "$Crucible::psgi_driver_cv = sub { %s }; 1;", psgi_driver);
+            ENTER;
+            SAVETMPS;
+            (void)eval_pv(dsrc, 0);
+            FREETMPS;
+            LEAVE;
+            free(dsrc);
+            if (SvTRUE(ERRSV)) {
+                STRLEN elen = 0;
+                char *emsg = SvPV(ERRSV, elen);
+                (void)elen;
+                PSGI_UNLOCK();
+                return crucible_err(out, "psgi: 驱动编译失败: %s",
+                                    emsg != NULL ? emsg : "(unknown)");
+            }
+            cv = get_sv("Crucible::psgi_driver_cv", 0);
+        }
+        driver_ret = NULL;
+        if (cv != NULL && SvOK(cv)) {
+            dSP;
+
+            ENTER;
+            SAVETMPS;
+            PUSHMARK(SP);
+            if (call_sv(cv, G_SCALAR | G_EVAL) > 0) {
+                SPAGAIN;
+                /* 复制一份自有引用：LEAVE 之后栈上的值即失效。 */
+                driver_ret = newSVsv(POPs);
+                PUTBACK;
+            }
+            FREETMPS;
+            LEAVE;
+        }
+    }
     if (driver_ret == NULL || SvTRUE(ERRSV)) {
         STRLEN elen = 0;
         char *emsg = SvPV(ERRSV, elen);
         char *trace = NULL;
+
+        if (driver_ret != NULL) {
+            SvREFCNT_dec(driver_ret);
+            driver_ret = NULL;
+        }
 
         if (emsg != NULL && elen > 0) {
             trace = (char *)malloc((size_t)elen + 1);
@@ -374,6 +432,10 @@ static int psgi_request(const char *script, const char *method, const char *path
             (void)crucible_buf_puts(&hb, "Content-Type: text/plain; charset=utf-8\r\n");
         appengine_result_set_headers(out, hb.p != NULL ? hb.p : "");
         appengine_result_set_body(out, bstr != NULL ? bstr : "", (size_t)blen);
+    }
+    if (driver_ret != NULL) {
+        SvREFCNT_dec(driver_ret); /* 自有引用，用完即还 */
+        driver_ret = NULL;
     }
     PSGI_UNLOCK();
     crucible_buf_free(&hb);
