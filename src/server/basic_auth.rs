@@ -374,8 +374,23 @@ pub const ADMIN_SESSION_COOKIE: &str = "__Host-crucible_admin";
 /// 会话表容量上限（无界内存防护）。超出时优先淘汰**最早到期**的条目。
 const ADMIN_SESSION_CAP: usize = 4096;
 
-/// 令牌 → **绝对过期时刻**（单调 `Instant`；不是创建时间，也不滑动续期）。
-static ADMIN_SESSIONS: Lazy<Mutex<HashMap<String, Instant>>> =
+/// 会话条目：**绝对到期时刻** + **传输绑定**。
+///
+/// R-07：cookie 只在**签发它的 listener** 上有效。登录只在 TLS listener 上签发
+/// （`__Host-` 前缀本身要求 `Secure`），故会话一律 `tls_only = true`；校验时与当前
+/// listener 的 TLS 状态比对 —— 明文 listener 手工重放 TLS 签发的 cookie 必须被拒
+///（浏览器受 `Secure` 约束本不会发送）。`listeners_allow` 内的其它 TLS 端口仍可复用
+///（白名单语义不变：非白名单端口在鉴权前就 404，根本没有管理面）。
+#[derive(Clone, Copy, Debug)]
+struct AdminSession {
+    /// 绝对过期时刻（单调 `Instant`；创建时固定，不滑动续期）。
+    expires_at: Instant,
+    /// true = 只能在该会话被签发的那类 listener（TLS）上使用。
+    tls_only: bool,
+}
+
+/// 令牌 → 会话条目。
+static ADMIN_SESSIONS: Lazy<Mutex<HashMap<String, AdminSession>>> =
     Lazy::new(|| Mutex::new(HashMap::new()));
 
 /// 创建会话令牌并写入服务端表。返回令牌原文（只出现在 Set-Cookie 里）。
@@ -399,40 +414,51 @@ pub fn create_admin_session(ttl: Duration) -> String {
     let expires_at = now
         .checked_add(ttl)
         .unwrap_or_else(|| now + Duration::from_secs(crate::config::ADMIN_SESSION_TTL_MAX_SECS));
+    let entry = AdminSession {
+        expires_at,
+        // 只在 TLS listener 上签发（调用方 `handle_login` 已保证），故一律 TLS 绑定。
+        tls_only: true,
+    };
     let mut map = ADMIN_SESSIONS.lock();
     // 惰性清理过期项；仍超上限时淘汰最早到期的一条（不整表清空 —— 否则全站会话被
     // 一次批量登录挤掉，等于一个廉价的全局登出 DoS）。
-    map.retain(|_, exp| *exp > now);
+    map.retain(|_, e| e.expires_at > now);
     if map.len() >= ADMIN_SESSION_CAP {
         if let Some(k) = map
             .iter()
-            .min_by_key(|(_, exp)| **exp)
+            .min_by_key(|(_, e)| e.expires_at)
             .map(|(k, _)| k.clone())
         {
             map.remove(&k);
         }
     }
-    map.insert(token.clone(), expires_at);
+    map.insert(token.clone(), entry);
     token
+}
+
+/// 令牌 → 有效会话条目；**过期项顺手删除**；不存在/空 ⇒ `None`。
+fn lookup_session(token: &str) -> Option<AdminSession> {
+    if token.is_empty() {
+        return None;
+    }
+    let now = Instant::now();
+    let mut map = ADMIN_SESSIONS.lock();
+    match map.get(token).copied() {
+        Some(e) if e.expires_at > now => Some(e),
+        Some(_) => {
+            map.remove(token);
+            None
+        }
+        None => None,
+    }
 }
 
 /// 校验会话令牌（存在且未到**绝对过期时刻**）。过期项顺手删除。
 ///
 /// 不刷新任何时间戳：访问多少次都不会延长会话寿命（防永久续期）。
+/// **不校验传输绑定**（见 [`validate_request_session_bound`]）。
 pub fn validate_admin_session(token: &str) -> bool {
-    if token.is_empty() {
-        return false;
-    }
-    let now = Instant::now();
-    let mut map = ADMIN_SESSIONS.lock();
-    match map.get(token) {
-        Some(exp) if *exp > now => true,
-        Some(_) => {
-            map.remove(token);
-            false
-        }
-        None => false,
-    }
+    lookup_session(token).is_some()
 }
 
 /// 登出：删除会话令牌（幂等）。
@@ -459,10 +485,31 @@ pub fn session_token_from_headers(headers: &HeaderMap) -> Option<String> {
 }
 
 /// 请求是否携带**有效**会话 cookie。
+///
+/// 只判「令牌存在且未过期」，**不校验传输绑定**：这是三协议入口的 admin 前置门
+/// （`admin_gate_path`）用的判定 —— 它拿不到 listener 的 TLS 状态，只做廉价的存在性
+/// 判断，把请求放进 `admin::handle`；**传输绑定在那里由 [`validate_request_session_bound`]
+/// 用真实 `tls` 强制**（明文重放集中在 handler 处被 401 拒绝，无需改动 h1/h2/h3 入口）。
 pub fn validate_request_session(headers: &HeaderMap) -> bool {
     session_token_from_headers(headers)
         .as_deref()
-        .is_some_and(validate_admin_session)
+        .and_then(lookup_session)
+        .is_some()
+}
+
+/// 完整会话校验：令牌有效 **且** 传输满足绑定（R-07）。
+///
+/// TLS 签发的会话（`tls_only`，当前全部）在 `tls == false` 的 listener 上一律无效 ——
+/// 明文 listener 手工重放同一 cookie 必须被拒（浏览器受 `Secure` 约束本不会发送）。
+/// 无效/过期令牌返回 false（过期顺手清理）。
+pub fn validate_request_session_bound(headers: &HeaderMap, tls: bool) -> bool {
+    match session_token_from_headers(headers)
+        .as_deref()
+        .and_then(lookup_session)
+    {
+        Some(e) => !e.tls_only || tls,
+        None => false,
+    }
 }
 
 /// `Set-Cookie` 值：`__Host-` 前缀 + Secure/HttpOnly/SameSite=Strict，
@@ -491,10 +538,16 @@ pub fn admin_session_clear_cookie() -> String {
 }
 
 /// 单测专用：以指定**到期时刻**插入会话（供 `admin.rs` 的 CSRF/鉴权顺序测试
-/// 构造「已过期会话」，避免墙钟 sleep 或暴露整个会话表）。
+/// 构造「已过期会话」，避免墙钟 sleep 或暴露整个会话表）。与真实会话一致：TLS 绑定。
 #[cfg(test)]
 pub(crate) fn insert_session_with_deadline_for_test(token: &str, expires_at: Instant) {
-    ADMIN_SESSIONS.lock().insert(token.to_string(), expires_at);
+    ADMIN_SESSIONS.lock().insert(
+        token.to_string(),
+        AdminSession {
+            expires_at,
+            tls_only: true,
+        },
+    );
 }
 
 /// 登录表单的口令校验（§16.13：UI 只收明文、后端 argon2id/yescrypt 验证）。
@@ -933,6 +986,60 @@ mod tests {
     /// 单测里的默认会话 TTL（与配置默认一致：8h）。
     const TEST_TTL: Duration = Duration::from_secs(8 * 60 * 60);
 
+    /// 构造一个 TLS 绑定的会话条目（与 `create_admin_session` 同绑定）。
+    fn mk_session(expires_at: Instant) -> AdminSession {
+        AdminSession {
+            expires_at,
+            tls_only: true,
+        }
+    }
+
+    fn cookie_headers(tok: &str) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        h.insert(
+            header::COOKIE,
+            http::HeaderValue::from_str(&format!("{ADMIN_SESSION_COOKIE}={tok}")).unwrap(),
+        );
+        h
+    }
+
+    /// R-07：TLS 签发的会话 cookie 只能在 TLS listener 上使用；明文 listener 重放
+    /// 同一 cookie 必须被拒（浏览器受 `Secure` 约束本不会发送）。
+    #[test]
+    fn session_cookie_is_bound_to_tls_transport() {
+        let tok = create_admin_session(TEST_TTL);
+        let h = cookie_headers(&tok);
+        // 完整校验（admin::handle 用的那个）：TLS 通过，明文拒绝。
+        assert!(
+            validate_request_session_bound(&h, true),
+            "TLS listener 上必须有效"
+        );
+        assert!(
+            !validate_request_session_bound(&h, false),
+            "明文 listener 重放同一 cookie 必须无效"
+        );
+        // 前置门的廉价判定（不校验传输）仍能识别令牌，交由 handler 用真实 tls 强制。
+        assert!(validate_request_session(&h));
+        // 无效令牌在两种传输上都无效。
+        let bad = cookie_headers("not-a-real-token");
+        assert!(!validate_request_session_bound(&bad, true));
+        assert!(!validate_request_session_bound(&bad, false));
+        destroy_admin_session(&tok);
+    }
+
+    /// 过期会话即使传输是 TLS 也必须无效（绑定不掩盖过期）。
+    #[test]
+    fn expired_session_invalid_on_tls_too() {
+        let tok = "r07-expired-tls";
+        ADMIN_SESSIONS
+            .lock()
+            .insert(tok.to_string(), mk_session(Instant::now() - Duration::from_secs(1)));
+        let h = cookie_headers(tok);
+        assert!(!validate_request_session_bound(&h, true));
+        assert!(!validate_request_session_bound(&h, false));
+        assert!(!ADMIN_SESSIONS.lock().contains_key(tok), "过期条目必须被清理");
+    }
+
     #[test]
     fn session_lifecycle_create_validate_destroy() {
         let tok = create_admin_session(TEST_TTL);
@@ -1055,7 +1162,7 @@ mod tests {
         // 把到期时刻改成「刚过期」：validate 必须拒绝并顺手删除条目。
         ADMIN_SESSIONS
             .lock()
-            .insert(tok.clone(), Instant::now() - Duration::from_secs(1));
+            .insert(tok.clone(), mk_session(Instant::now() - Duration::from_secs(1)));
         assert!(!validate_admin_session(&tok));
         assert!(
             !ADMIN_SESSIONS.lock().contains_key(&tok),
@@ -1074,11 +1181,11 @@ mod tests {
         // 0.9×TTL 的寿命 ⇒ 到期时刻在 now + 900s（仍有效）。
         ADMIN_SESSIONS
             .lock()
-            .insert(alive.to_string(), now + ttl.mul_f64(0.9));
+            .insert(alive.to_string(), mk_session(now + ttl.mul_f64(0.9)));
         // 已活了 1.1×TTL ⇒ 到期时刻在 100s 前（必须失效）。
         ADMIN_SESSIONS
             .lock()
-            .insert(stale.to_string(), now - Duration::from_secs(100));
+            .insert(stale.to_string(), mk_session(now - Duration::from_secs(100)));
         assert!(validate_admin_session(alive), "0.9×TTL 内必须有效");
         assert!(!validate_admin_session(stale), "1.1×TTL 必须过期");
         assert!(
@@ -1092,11 +1199,11 @@ mod tests {
     #[test]
     fn session_deadline_is_absolute_and_never_refreshed() {
         let tok = create_admin_session(Duration::from_secs(60));
-        let deadline = *ADMIN_SESSIONS.lock().get(&tok).expect("会话存在");
+        let deadline = ADMIN_SESSIONS.lock().get(&tok).expect("会话存在").expires_at;
         for _ in 0..5 {
             assert!(validate_admin_session(&tok));
         }
-        let after = *ADMIN_SESSIONS.lock().get(&tok).expect("会话仍在");
+        let after = ADMIN_SESSIONS.lock().get(&tok).expect("会话仍在").expires_at;
         assert_eq!(deadline, after, "validate 不得刷新/延长会话到期时刻");
         destroy_admin_session(&tok);
     }
@@ -1107,7 +1214,7 @@ mod tests {
         let stale = "u13-expired-before-create";
         ADMIN_SESSIONS
             .lock()
-            .insert(stale.to_string(), Instant::now() - Duration::from_secs(1));
+            .insert(stale.to_string(), mk_session(Instant::now() - Duration::from_secs(1)));
         let tok = create_admin_session(Duration::from_secs(60));
         assert!(
             !ADMIN_SESSIONS.lock().contains_key(stale),

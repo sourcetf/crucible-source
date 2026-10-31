@@ -1,4 +1,13 @@
 //! Linux `/proc/sys/net/ipv4/tcp_syncookies` read/write + evaluate loop (feature-gated).
+//!
+//! **OpenBSD（真实生产平台）没有对应的 sysctl**：`net.inet.tcp.syncookies` 在
+//! OpenBSD 8.0 上不存在（`sysctl net.inet.tcp.syncookies` → `fourth level name
+//! syncookies ... is invalid`，本机实测）。OpenBSD 的 syncookies 是 **pf(4)**
+//! 功能，由 `pf.conf` 的 `set syncookies never|always|adaptive` 控制（默认
+//! `never`；本生产机 pf.conf 里该行是注释）。因此本模块在非 Linux 平台整体
+//! no-op —— 不读、不写任何 sysctl，也不会因此影响启动。若运维在 config.toml
+//! 里把 `enabled` 打开，这里只**提示一次**该开关在本平台无效，避免「配了以为
+//! 生效」。见 `.agents/1009/reports/openbsd-wave22.md`。
 
 use crate::server::live_config::LiveConfig;
 use anyhow::Result;
@@ -67,7 +76,20 @@ pub fn spawn_evaluator(live: Arc<LiveConfig>) {
             }
             #[cfg(not(all(target_os = "linux", feature = "linux_syncookie")))]
             {
-                // OpenBSD 等平台：内核自行管理 syncookies，评估循环保持 no-op。
+                // OpenBSD 等平台：内核/pf(4) 自行管理 syncookies，本模块整体 no-op
+                //（没有可读写的 sysctl）。若配置里 `enabled=true`，只报警**一次**：
+                // 否则运维会以为这个开关在 OpenBSD 上有效。用法应改为 pf.conf 的
+                // `set syncookies always|adaptive`。
+                if cfg.enabled {
+                    static WARNED: std::sync::Once = std::sync::Once::new();
+                    WARNED.call_once(|| {
+                        log::warn!(
+                            "syncookie.enabled=true 在非 Linux 平台（含 OpenBSD）无效：\
+                             本平台无 net.inet.tcp.syncookies，syncookies 由 pf.conf \
+                             的 `set syncookies never|always|adaptive` 控制"
+                        );
+                    });
+                }
                 let _ = (cfg, delta);
                 log::trace!("syncookie evaluate no-op on this platform");
             }

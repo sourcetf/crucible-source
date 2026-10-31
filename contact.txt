@@ -6336,3 +6336,42 @@ MAX_CONCURRENT_STREAMS(16/64/1024)、COALESCE(0/1)、MAX_INFLIGHT(64/1024/4096) 
 **交主会话**：m10 追平 h2o 属**架构项** —— 保留 crates.io h2 0.4 不可达（裸 crate 自己就 0.60×）。
 应用层微调上限 ~0.36→0.45；要 1.0 需替换/分叉 crate（方案 D 低风险 2–4 人日 / C 分叉 5–8 人日 / A nghttp2 FFI 1–2 周 / B 自研 3–5 周，
 见 `reports/h2perf-wave21.md` §6）。报告 `.agents/1009/reports/h2perf-wave21.md`、修复 `.agents/1009/fixes/h2perf-wave21.md`。
+
+# 【agent-matrix3 / 工号 1009 · Wave-22】规格矩阵 + 文档刷新到最终态 + 权威最终缺口清单（2026-10-31）
+
+**scope**：只写文档 —— `.agents/1009/reports/spec-matrix.md`、`spec-matrix-notes.md`、
+`.agents/1009/reports/matrix3-wave22.md`、`.agents/1009/fixes/matrix3-wave22.md`、
+`OPERATOR-TODO.md`（刷新）、`README.md`（新建）、`contact.txt`（本节）。
+未 commit/push/checkout/reset/stash/clean；未改产品代码。
+
+**工作树**：`/home/dev123/crucible-git`，HEAD **`3245a03`**（Wave-21b 收口；= Wave-18..22 全部并行 agent
+在途工作的聚合提交，3817 文件 / +44591 行）。**构建核验**：cargo check 被他人未提交 WIP
+（`src/server/apps/sidecar_engine.rs:796/802/803` 4 错误）阻塞，非本 scope；HEAD 本身在 wave21b 收口记录
+662 passed / 0 failed / 1 ignored。
+
+**矩阵终态（341 行）**：**✅ 323 / ⚠️ 8 / ❌ 0 / 🔵 10**。Wave-18..22 已闭项全部 ⚠️→✅：
+遗留栈（NSS/TomCrypt 1 线程/连接、SSLv2 全状态机）、ECS 端到端（unbound 递归后端）、DNS 7 项
+（also-notify/rotation=0/dns-01/DoT443/ns-glue/迁移/UI+ACME 日志）、TLS 5 项（自定义 CA/prefer_tls13/OCSP/ECH/PSK-0RTT）、
+SO_REUSEPORT、FFI 池宽 clamp(2,4)、GeoIP G-10/17/18/19、页面规则 G-20、C pthread sidecar、H3 DATAGRAM、
+引擎延迟门禁、Admin TTL、Lua 高并发、孤儿根因、远程部署（47be71b 四 feature/19 apps/真 Jetty/0 孤儿）。
+仍 ⚠️ 的 8 行：dlopen/RTLD_NODELETE（可选开关）、Ruby 默认 sidecar + Perl/PSGI 泄漏、GeoIP 精度×2、
+GeoIP merge_pipeline DDL、h2 m10、过夜 iter28 历史快照。
+
+**权威最终缺口清单（41 条）= 代码/能力 14（P1×2、P2×5、P3×7）+ 未验证 13 + 残余风险 14（P1×1）**，逐条 `file:line`/影响/owner/工作量见 `spec-matrix-notes.md` §A：
+- **P1**：`CG-01` Perl 每请求 `perl_parse`+`perl_run` 泄漏 ~78KB/req、PSGI ~6.7KB/req（`script_engine.c:1851/1883`、`psgi_engine.c:326`；60min soak 被 8GB 护栏强杀）；
+  `CG-02` Admin 全量配置保存 round-trip 丢 `[listeners.autoindex]` 的 `enable_upload`/`upload_threads`（`config.rs:402-427`；保存后上传 405）。
+- **P2**：`CG-03` 服务端 mTLS 未实现；`CG-04` 自管 unbound 缺 validator（`dns/mod.rs:3161`，拿不到 `ad`）；
+  `CG-05` Ruby 嵌入默认关；`CG-06` admin 面板缺 XFO/CSP/nosniff/COOP（`admin.rs:224`，`headers_mod.rs:61` 死代码）；`CG-07` `/tsx/` 405 不排空 body/不宣告 close（`tsx.rs:1263`）。
+
+**h2 多路复用 = crate 级架构限制（notes §B 量化）**：c50 m10 ours 0.359× / 裸 crates.io h2 0.4.19 floor 0.601× / h2o 1.0；
+**每请求指令 25,977（ours） vs 5,232（h2o）**；h2 crate 全部连接级参数对 m10 均 ≤±2.5% 噪声，无收益。
+4 条替代路线：**D 保留+应用层微调 2–4 人日（推荐）**、C vendor+patch 5–8 人日、A nghttp2 FFI 1–2 周、B 自研 3–5 周。
+
+**文档**：`OPERATOR-TODO.md` 刷成 wave-22（部署/回滚/已知限制/待拍板/一键验收）；新建 `README.md`
+（从零构建 + 运行 + 测试 + 性能门禁 + 引擎矩阵 + 遗留栈 + DNS 后端选择 + 常见坑 + 已知限制）。
+
+**交主会话**：① 清共享树 `sidecar_engine.rs` WIP（当前阻塞 cargo check）；
+② 修 CG-01/CG-02（P1，均有最小复现）；③ 决定 TLS-h1 延迟门禁是否允许关访问日志（NU-01）与是否推进 h2 方案 D/C。
+
+报告 `.agents/1009/reports/matrix3-wave22.md`；修复 `.agents/1009/fixes/matrix3-wave22.md`；
+矩阵 `.agents/1009/reports/spec-matrix.md`；附注 `.agents/1009/reports/spec-matrix-notes.md`。

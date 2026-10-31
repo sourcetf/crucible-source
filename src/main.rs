@@ -80,12 +80,28 @@ fn main() -> Result<()> {
         #[cfg(feature = "tls_boring")]
         for l in &cfg.listeners {
             if let Some(ssl) = l.ssl.as_ref() {
-                server::tls::boring_path::build_acceptor(ssl, l).with_context(|| {
-                    format!(
-                        "listener {}:{} 的 TLS acceptor 构建失败（证书/密钥/ECH/密码套件/群）",
-                        l.address, l.port
-                    )
-                })?;
+                let built = server::tls::boring_path::build_acceptor(ssl, l);
+                if let Err(e) = built {
+                    // U-16：ECH listener 的证书材料是**部署期 provision** 的资产（仓库
+                    // `state/`、`*.pem` 均 gitignore）。在尚未 provision 的机器上跑预检，
+                    // 这些文件必然不存在 —— 此时把「材料还没落地」误报成「acceptor 构建
+                    // 失败」会让出厂 `config.toml` 永远 rc=1。对 **ECH listener** 降级为
+                    // 警告（`config.rs::validate` 已对 ECH 缺材料打警告，且对「开了 ECH 却
+                    // 无任何密钥材料」fail-fast），其余 listener 仍 fail-fast。
+                    if ssl.ech {
+                        eprintln!(
+                            "WARN: listener {}:{} 的 TLS acceptor 构建失败（ECH listener，材料可在目标机用 `--gen-cert` / `scripts/ech_demo.sh` 生成；预检降级为警告）: {e:#}",
+                            l.address, l.port
+                        );
+                    } else {
+                        return Err(e).with_context(|| {
+                            format!(
+                                "listener {}:{} 的 TLS acceptor 构建失败（证书/密钥/ECH/密码套件/群）",
+                                l.address, l.port
+                            )
+                        });
+                    }
+                }
             }
         }
         println!(

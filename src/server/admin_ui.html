@@ -971,7 +971,12 @@ function initTlsTab(){
 function fillTlsForm(){
   const l=listenerByPort($('tlsPort').value);
   if(!l)return;
-  const s=l.ssl;
+  // 必须用 let：下面要 `s=s||{}` 兜底 null。这里曾是 `const s=l.ssl`，
+  // 每次调用都会抛 "Assignment to constant variable"，函数在回填 cert/key/
+  // versions/ciphers **之前**就中断 —— TLS 面板永远显示空白，一点「保存 TLS」
+  // 就把配置里的 cert/key 以 null 提交，后端按「表单拥有的键」删除它们，
+  // 站点 TLS 静默降级成明文 HTTP。
+  let s=l.ssl;
   $('tlsEnabled').value=s?'1':'0';
   s=s||{};
   const vs=(s.versions||[]).map(v=>v.toLowerCase());

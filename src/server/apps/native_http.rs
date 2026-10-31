@@ -52,13 +52,13 @@ struct Sidecar {
     sock: PathBuf,
     #[allow(dead_code)]
     child: Child,
-    /// 启动该 sidecar 时应用的 `.env`（指纹）与 docroot。
+    /// 启动该 sidecar 时应用的完整身份（`.env` 摘要 + docroot + 引擎 + 二进制 mtime）。
     ///
-    /// 长驻 sidecar 的进程 env 只在 spawn 时定型：`.env` 改动或配置重载换了 app
-    /// （app_idx 相同但 docroot 不同）后，旧进程必须重启，否则「新配置 + 旧环境/旧 docroot」
-    /// 会一直服务下去（跨应用错配 + .env 陈旧）。指纹不同即杀旧拉新。
-    env_fp: u64,
-    docroot: PathBuf,
+    /// 长驻 sidecar 的进程 env / cwd / 可执行映像只在 spawn 时定型：`.env` 改动、配置
+    /// 重载换了 app（app_idx 相同但 docroot 不同）、或 `deps/bin/index` 被重建后，旧进程
+    /// 必须重启，否则「新配置 + 旧环境/旧 docroot/旧代码」会一直服务下去。身份任一项不同
+    /// 即杀旧拉新；**跨注册表/跨协议**复用也以此为准（见 `.envfp`）。
+    identity: SidecarIdentity,
 }
 
 /// `.env` 变量集的内容指纹（与键序无关；进程内比较用）。
@@ -80,14 +80,95 @@ pub(crate) fn env_fingerprint(vars: &[(String, String)]) -> u64 {
     h.finish()
 }
 
-// ---------------------------------------------------- sidecar `.env` 指纹文件 ---
+/// 目录/路径的内容指纹（跨进程稳定；进程内比较用）。
+///
+/// 为什么用「路径字符串的哈希」而不是「目录 mtime/inode」：跨注册表复用的判据要求
+/// **同一条 sock 路径**上的 sidecar 在 docroot 变更后必须被识别为陈旧。docroot 变化
+/// 属于配置变更（不落盘任何目录 mtime），直接对最终规范化路径做哈希最忠实、无副作用。
+pub(crate) fn path_fingerprint(p: &Path) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    p.to_string_lossy().hash(&mut h);
+    h.finish()
+}
+
+/// 引擎名进入指纹文件时的安全化（文件按空白分词，引擎名不得含空白）。
+/// 引擎名只用于「同一 sock 期望同一引擎」的核验，未知字符统一替换为 `_`。
+fn sanitize_engine(engine: &str) -> String {
+    let mut s: String = engine
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.') {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    if s.is_empty() {
+        s.push('-');
+    }
+    s
+}
+
+/// `deps/bin/index`（或显式 `deps_dir`）的 mtime（纳秒；文件缺失 = 0）。
+///
+/// 二进制被重建（mtime 变）后，运行中的长驻 sidecar 仍是**旧可执行映像**，必须重启
+/// 才能换到新代码 —— 否则「已构建新 sidecar，但线上还在跑旧的」会一直不自愈。
+fn mtime_nanos(p: &Path) -> u64 {
+    fs::metadata(p)
+        .ok()
+        .and_then(|m| m.modified().ok())
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0)
+}
+
+/// sidecar 二进制（自动探测 `deps/bin/index`）的 mtime。
+pub(crate) fn sidecar_binary_mtime(app: &AppRouteConfig, lc: &ListenerConfig) -> u64 {
+    sidecar_binary(app, lc).map(|p| mtime_nanos(&p)).unwrap_or(0)
+}
+
+/// 一条受管 sidecar 的**完整身份**：跨注册表/跨协议复用前必须四项全等。
+///
+/// 四项缺一不可（R-06）：
+///   * `env_fp`：spawn 时注入进程 env 的 `.env`（含启动期基底之外本 app 的键）摘要；
+///   * `docroot_fp`：进程 `cwd` / `DOCUMENT_ROOT`（配置改 docroot 后旧进程必须重启）；
+///   * `bin_mtime`：`deps/bin/index` 的 mtime（二进制重建后旧映像必须重启）；
+///   * `engine`：引擎名（防御性；sock 路径本身已含引擎，仍显式核验）。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct SidecarIdentity {
+    pub env_fp: u64,
+    pub docroot_fp: u64,
+    pub bin_mtime: u64,
+    pub engine: String,
+}
+
+impl SidecarIdentity {
+    /// 由「本次请求的应用配置 + 已规范化 docroot + `.env`」计算期望身份。
+    pub(crate) fn compute(
+        app: &AppRouteConfig,
+        lc: &ListenerConfig,
+        docroot: &Path,
+        env_vars: &[(String, String)],
+    ) -> Self {
+        Self {
+            env_fp: env_fingerprint(env_vars),
+            docroot_fp: path_fingerprint(docroot),
+            bin_mtime: sidecar_binary_mtime(app, lc),
+            engine: sanitize_engine(&app.engine),
+        }
+    }
+}
+
+// ---------------------------------------------------- sidecar 身份指纹文件 ---
 //
-// 为什么需要（P2）：h1 与 h2/h3 各有一张 sidecar 注册表，却服务**同一个** UDS 路径。
-// 「sock 活着就复用」让后到的协议无法核验先到协议那次 spawn 用的 `.env` —— `.env`
-// 改了但只有对方协议先请求时，会一直沿用旧进程的旧环境（长驻进程 env 只在 spawn 时
-// 定型）。现在 spawner 在 sock 旁写 `app.sock.envfp`（内容 = 指纹 + pid），复用前
-// **一律核验**；不一致就杀掉所有者并重建（见 [`evict_sidecar_for_env_change`]）。
-// 相同指纹 → 不重启（来回切协议不会抖动）。
+// 为什么需要（P2/R-06）：h1 与 h2/h3 各有一张 sidecar 注册表，却服务**同一个** UDS 路径。
+// 「sock 活着就复用」让后到的协议无法核验先到协议那次 spawn 用的环境 —— 长驻进程的
+// 进程 env / cwd / 可执行映像都只在 spawn 时定型。现在 spawner 在 sock 旁写
+// `app.sock.envfp`（内容 = `.env` 摘要 + docroot + 引擎 + 二进制 mtime + pid），
+// **跨注册表/跨协议复用前一律核验全部四项**；任一项不一致就杀掉所有者并重建
+//（见 [`evict_sidecar_for_env_change`]）。全等 → 不重启（来回切协议不会抖动）。
 
 /// 与 UDS 相邻的指纹文件路径（`.../app.sock` → `.../app.sock.envfp`）。
 pub(crate) fn sidecar_env_fp_path(sock: &Path) -> PathBuf {
@@ -96,27 +177,57 @@ pub(crate) fn sidecar_env_fp_path(sock: &Path) -> PathBuf {
     PathBuf::from(os)
 }
 
-/// 指纹文件内容：第一行 `v1 <16 位十六进制指纹> <spawner pid>`。
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// 指纹文件内容（v2）：`v2 <env_fp> <docroot_fp> <bin_mtime> <engine> [spawner pid]`
+/// （前三个为 16 位十六进制）。v1（`v1 <env_fp> [pid]`，只有 `.env` 摘要）仍可解析，
+/// 但缺 docroot/引擎/二进制 mtime ⇒ 永不与新期望相等（当作不一致，重启一次）。
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct SidecarEnvFp {
-    pub fp: u64,
+    pub identity: SidecarIdentity,
     pub pid: Option<i32>,
 }
 
 pub(crate) fn read_sidecar_env_fp(sock: &Path) -> Option<SidecarEnvFp> {
     let text = fs::read_to_string(sidecar_env_fp_path(sock)).ok()?;
-    let mut it = text.split_whitespace();
-    if it.next()? != "v1" {
-        return None;
+    let t: Vec<&str> = text.split_whitespace().collect();
+    match t.first().copied()? {
+        "v2" => {
+            let env_fp = u64::from_str_radix(t.get(1)?, 16).ok()?;
+            let docroot_fp = u64::from_str_radix(t.get(2)?, 16).ok()?;
+            let bin_mtime = u64::from_str_radix(t.get(3)?, 16).ok()?;
+            let engine = (*t.get(4)?).to_string();
+            let pid = t.get(5).and_then(|s| s.parse::<i32>().ok());
+            Some(SidecarEnvFp {
+                identity: SidecarIdentity {
+                    env_fp,
+                    docroot_fp,
+                    bin_mtime,
+                    engine,
+                },
+                pid,
+            })
+        }
+        "v1" => {
+            let env_fp = u64::from_str_radix(t.get(1)?, 16).ok()?;
+            let pid = t.get(2).and_then(|s| s.parse::<i32>().ok());
+            Some(SidecarEnvFp {
+                identity: SidecarIdentity {
+                    env_fp,
+                    docroot_fp: 0,
+                    bin_mtime: 0,
+                    engine: String::new(),
+                },
+                pid,
+            })
+        }
+        _ => None,
     }
-    let fp = u64::from_str_radix(it.next()?, 16).ok()?;
-    let pid = it.next().and_then(|s| s.parse::<i32>().ok());
-    Some(SidecarEnvFp { fp, pid })
 }
 
-/// 复用前核验：指纹文件存在且与本次请求的 `.env` 指纹一致。
-pub(crate) fn sidecar_env_fp_matches(sock: &Path, fp: u64) -> bool {
-    read_sidecar_env_fp(sock).map(|i| i.fp == fp).unwrap_or(false)
+/// 复用前核验：指纹文件存在且与本次请求的**完整身份**一致（四项全等）。
+pub(crate) fn sidecar_fp_matches(sock: &Path, expected: &SidecarIdentity) -> bool {
+    read_sidecar_env_fp(sock)
+        .map(|i| i.identity == *expected)
+        .unwrap_or(false)
 }
 
 /// 「这个 sock 上的 sidecar 属于本进程」的缓存：sock → `.envfp` 里的 pid。
@@ -161,23 +272,26 @@ fn forget_owned_sock(sock: &Path) {
     OWNED_SOCKS.lock().remove(sock);
 }
 
-/// 受管 sidecar 可复用 = `.env` 指纹一致 **且** 进程属于本进程这一代。
-pub(crate) fn sidecar_reusable(sock: &Path, fp: u64) -> bool {
-    sidecar_env_fp_matches(sock, fp) && sidecar_owned_by_this_process(sock)
+/// 受管 sidecar 可复用 = 身份四项全等 **且** 进程属于本进程这一代。
+pub(crate) fn sidecar_reusable(sock: &Path, identity: &SidecarIdentity) -> bool {
+    sidecar_fp_matches(sock, identity) && sidecar_owned_by_this_process(sock)
 }
 
 /// spawn 成功、sock 就绪后写指纹文件（原子写：临时文件 + rename）。
 ///
 /// 写失败只记日志、不影响服务：最坏情况是下一次复用把它当作「无法核验」→ 重启一次。
-pub(crate) fn write_sidecar_env_fp(sock: &Path, fp: u64, pid: u32) {
+pub(crate) fn write_sidecar_env_fp(sock: &Path, identity: &SidecarIdentity, pid: u32) {
     let p = sidecar_env_fp_path(sock);
     let tmp = p.with_extension("envfp.tmp");
-    let body = format!("v1 {fp:016x} {pid}\n");
+    let body = format!(
+        "v2 {:016x} {:016x} {:016x} {} {}\n",
+        identity.env_fp, identity.docroot_fp, identity.bin_mtime, identity.engine, pid
+    );
     let res = fs::write(&tmp, body.as_bytes()).and_then(|_| fs::rename(&tmp, &p));
     if let Err(e) = res {
         let _ = fs::remove_file(&tmp);
         log::warn!(
-            "native_http: 写 sidecar .env 指纹失败 {}: {e}（下次复用会重启一次）",
+            "native_http: 写 sidecar 身份指纹失败 {}: {e}（下次复用会重启一次）",
             p.display()
         );
     }
@@ -237,14 +351,16 @@ fn kill_sidecar_pid(sock: &Path, pid: i32) {
     let _ = unsafe { libc::kill(pid, libc::SIGKILL) };
 }
 
-/// 同一个 sock 上的 sidecar 存在、但 `.env` 指纹与本次请求不一致 → 杀掉重建。
+/// 同一个 sock 上的 sidecar 存在、但**身份四项**（`.env`/docroot/二进制 mtime/引擎）与本次
+/// 请求不完全一致 → 杀掉重建。
 ///
 /// 调用前提：已持有该 sock 的 [`sidecar_spawn_lock`]（跨注册表串行化）。
 /// 顺序：先让两个注册表各自 kill 自己表里的进程（能 wait 回收）→ 都不认领时按指纹
 /// 文件里的 pid 杀（已核验 ppid）→ 删除监听 socket，让调用方重新 spawn。
-pub(crate) fn evict_sidecar_for_env_change(sock: &Path, new_fp: u64) {
+pub(crate) fn evict_sidecar_for_env_change(sock: &Path, new_identity: &SidecarIdentity) {
     let info = read_sidecar_env_fp(sock);
-    let old_fp = info.map(|i| i.fp);
+    let old_identity = info.as_ref().map(|i| i.identity.clone());
+    let old_pid = info.as_ref().and_then(|i| i.pid);
     let mut reaped = false;
     if let Some(mut child) = take_managed_sidecar_by_sock(sock) {
         crate::server::apps::child_registry::kill_child(&mut child);
@@ -259,17 +375,17 @@ pub(crate) fn evict_sidecar_for_env_change(sock: &Path, new_fp: u64) {
         }
     }
     if !reaped {
-        if let Some(pid) = info.and_then(|i| i.pid) {
+        if let Some(pid) = old_pid {
             kill_sidecar_pid(sock, pid);
         }
     }
     forget_owned_sock(sock);
     let _ = fs::remove_file(sock);
     log::warn!(
-        "native_http: sidecar {} 不可复用（运行中 .env 指纹 {:?} / 本次 {:016x}，或进程不属于本进程）→ 杀掉旧进程并重建",
+        "native_http: sidecar {} 不可复用（运行中身份 {:?} / 本次 {:?}，或进程不属于本进程）→ 杀掉旧进程并重建",
         sock.display(),
-        old_fp.map(|f| format!("{f:016x}")).unwrap_or_else(|| "无指纹文件".into()),
-        new_fp
+        old_identity.map(|i| i),
+        new_identity
     );
 }
 
@@ -312,8 +428,10 @@ async fn ensure_sidecar(
     app: &AppRouteConfig,
     env_vars: &[(String, String)],
 ) -> Result<PathBuf> {
-    let fp = env_fingerprint(env_vars);
     let docroot_current = abs_canon(&app.docroot.clone().unwrap_or_else(|| lc.root.clone()));
+    // 完整身份（`.env` + docroot + 二进制 mtime + 引擎）：跨注册表/跨协议复用前核验，
+    // 也用于本注册表内的快路径（`.env` 改 / 配置换 docroot / 二进制重建都要重启）。
+    let identity = SidecarIdentity::compute(app, lc, &docroot_current, env_vars);
     // state/sock 的计算必须**早于**创建锁：锁是按 **sock 路径**取的（跨注册表共享，
     // 见 `sidecar_spawn_lock`）。mkdir 在锁外做无害（幂等）。
     let state = abs_path(&PathBuf::from(format!("state/native/{key}")));
@@ -322,7 +440,7 @@ async fn ensure_sidecar(
     {
         let map = SIDECARS.lock();
         if let Some(s) = map.get(key) {
-            if sock_alive(&s.sock) && s.env_fp == fp && s.docroot == docroot_current {
+            if sock_alive(&s.sock) && s.identity == identity {
                 return Ok(s.sock.clone());
             }
         }
@@ -336,37 +454,37 @@ async fn ensure_sidecar(
     {
         let map = SIDECARS.lock();
         if let Some(s) = map.get(key) {
-            if sock_alive(&s.sock) && s.env_fp == fp && s.docroot == docroot_current {
+            if sock_alive(&s.sock) && s.identity == identity {
                 return Ok(s.sock.clone());
             }
         }
     }
     // Remove dead entry（顺带收掉它的子进程：只从表里删掉等于把它变成没人管的孤儿，
-    // sock 死了不代表进程已经退出）。**指纹/docroot 变化**也走这里：旧进程带着旧 `.env`
-    // 或旧 docroot，必须回收重建（否则跨应用错配会一直服务下去）。
+    // sock 死了不代表进程已经退出）。**身份变化**也走这里：旧进程带着旧 `.env`/旧 docroot/
+    // 旧映像，必须回收重建（否则跨应用错配或旧代码会一直服务下去）。
     if let Some(mut dead) = SIDECARS.lock().remove(key) {
         log::info!(
-            "native_http: sidecar {key} 需要重启（.env 指纹或 docroot 变化 / sock 不可用），回收旧进程"
+            "native_http: sidecar {key} 需要重启（.env/docroot/二进制 mtime/引擎 或 sock 不可用），回收旧进程"
         );
         crate::server::apps::child_registry::kill_child(&mut dead.child);
     }
 
     let docroot = docroot_current;
     // **别的协议/别的注册表**（h2/h3 的 `sidecar_engine::SIDECARS_SIMPLE`）已经在同一个
-    // sock 路径上服务：先核验它 spawn 时写下的 `.env` 指纹（sock 旁的 `app.sock.envfp`）。
-    //   * 一致 → 直接复用；
-    //   * 不一致/文件缺失 → `.env`（或 spawn 者版本）已变，旧进程的进程 env 是陈旧的：
-    //     杀掉并重建（`evict_sidecar_for_env_change` 会同时清理两个注册表里的条目）。
+    // sock 路径上服务：先核验它 spawn 时写下的**身份指纹**（sock 旁的 `app.sock.envfp`）。
+    //   * 全等 → 直接复用；
+    //   * 不一致/文件缺失 → `.env`/docroot/二进制 mtime/引擎 已变或 spawn 者版本过旧，
+    //     旧进程是陈旧的：杀掉并重建（`evict_sidecar_for_env_change` 会同时清理两个注册表）。
     // 绝不直接 `remove_file` + spawn（那会偷走对方的监听 socket、留下孤儿进程）。
     if sock_alive(&sock) {
-        // 「指纹一致」还不够：进程必须属于**本进程这一代**（`.envfp` 里的 pid 是直系
+        // 「身份全等」还不够：进程必须属于**本进程这一代**（`.envfp` 里的 pid 是直系
         // 子进程）。上一代遗留的 sidecar 复用后会永久脱离 kill_all 的管理（孤儿），
         // 必须杀掉重建。
-        if sidecar_reusable(&sock, fp) {
-            log::debug!("native_http: sidecar {key} 已由其它注册表拉起（sock 存活、.env 指纹一致且进程属于本进程），复用");
+        if sidecar_reusable(&sock, &identity) {
+            log::debug!("native_http: sidecar {key} 已由其它注册表拉起（sock 存活、身份指纹全等且进程属于本进程），复用");
             return Ok(sock);
         }
-        evict_sidecar_for_env_change(&sock, fp);
+        evict_sidecar_for_env_change(&sock, &identity);
     }
 
     let deps_bin = app
@@ -414,16 +532,15 @@ async fn ensure_sidecar(
     let start = std::time::Instant::now();
     while start.elapsed() < Duration::from_secs(5) {
         if sock_alive(&sock) {
-            // 先落指纹再进表/返回：并发的另一协议拿锁后会读它核验（见
-            // `sidecar_env_fp_matches`）。写失败只影响下次复用（会重启一次）。
-            write_sidecar_env_fp(&sock, fp, child.id());
+            // 先落身份指纹再进表/返回：并发的另一协议拿锁后会读它核验（见
+            // `sidecar_fp_matches`）。写失败只影响下次复用（会重启一次）。
+            write_sidecar_env_fp(&sock, &identity, child.id());
             SIDECARS.lock().insert(
                 key.to_string(),
                 Sidecar {
                     sock: sock.clone(),
                     child,
-                    env_fp: fp,
-                    docroot: docroot.clone(),
+                    identity: identity.clone(),
                 },
             );
             return Ok(sock);
@@ -807,6 +924,7 @@ mod sidecar_env_fp_tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     /// 指纹文件：落盘/读取/比较/覆盖（跨注册表复用判据的存储面）。
+    /// v2 身份含 `.env`/docroot/二进制 mtime/引擎四项；任一项不同即不一致。
     #[test]
     fn env_fp_file_roundtrip_and_mismatch() {
         let dir = std::env::temp_dir().join(format!(
@@ -820,22 +938,97 @@ mod sidecar_env_fp_tests {
         fs::create_dir_all(&dir).unwrap();
         let sock = dir.join("app.sock");
         assert!(read_sidecar_env_fp(&sock).is_none(), "文件不存在 = 无法核验");
-        assert!(!sidecar_env_fp_matches(&sock, 7));
-        write_sidecar_env_fp(&sock, 7, 4242);
+        let id = SidecarIdentity {
+            env_fp: 7,
+            docroot_fp: 0xabc,
+            bin_mtime: 0x123,
+            engine: "go".to_string(),
+        };
+        assert!(!sidecar_fp_matches(&sock, &id));
+        write_sidecar_env_fp(&sock, &id, 4242);
         assert_eq!(
             read_sidecar_env_fp(&sock),
             Some(SidecarEnvFp {
-                fp: 7,
+                identity: id.clone(),
                 pid: Some(4242)
             })
         );
-        assert!(sidecar_env_fp_matches(&sock, 7));
-        assert!(!sidecar_env_fp_matches(&sock, 8), "指纹不同必须判不一致");
+        assert!(sidecar_fp_matches(&sock, &id));
+        // 四项各自不同都必须判不一致（R-06：跨注册表复用不只看 .env）。
+        for mutated in [
+            SidecarIdentity { env_fp: 8, ..id.clone() },
+            SidecarIdentity { docroot_fp: 0xdead, ..id.clone() },
+            SidecarIdentity { bin_mtime: 0x999, ..id.clone() },
+            SidecarIdentity { engine: "rust".to_string(), ..id.clone() },
+        ] {
+            assert!(
+                !sidecar_fp_matches(&sock, &mutated),
+                "身份任一项不同必须判不一致: {mutated:?}"
+            );
+        }
         // 覆盖写（原子的临时文件 + rename）
-        write_sidecar_env_fp(&sock, 0xdead_beef, 4243);
-        assert_eq!(read_sidecar_env_fp(&sock).unwrap().fp, 0xdead_beef);
-        assert_eq!(read_sidecar_env_fp(&sock).unwrap().pid, Some(4243));
+        let id2 = SidecarIdentity {
+            env_fp: 0xdead_beef,
+            docroot_fp: 1,
+            bin_mtime: 2,
+            engine: "c".to_string(),
+        };
+        write_sidecar_env_fp(&sock, &id2, 4243);
+        let read = read_sidecar_env_fp(&sock).unwrap();
+        assert_eq!(read.identity, id2);
+        assert_eq!(read.pid, Some(4243));
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// v1 旧指纹文件（只有 `.env` 摘要）仍能解析出 pid 供回收，但绝不被判为与新身份一致。
+    #[test]
+    fn legacy_v1_fingerprint_parses_but_never_matches() {
+        let dir = std::env::temp_dir().join(format!(
+            "crucible-fp-v1-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let sock = dir.join("app.sock");
+        fs::write(sidecar_env_fp_path(&sock), "v1 0000000000000007 555\n").unwrap();
+        let got = read_sidecar_env_fp(&sock).expect("v1 必须可解析");
+        assert_eq!(got.pid, Some(555));
+        assert_eq!(got.identity.env_fp, 7);
+        // v1 里没有 docroot/引擎/二进制 mtime：真实期望身份（docroot_fp 是路径哈希、
+        // engine 非空、mtime 非零）永不与之相等 ⇒ 跨注册表复用会判「无法核验」并重启一次。
+        assert!(
+            !sidecar_fp_matches(
+                &sock,
+                &SidecarIdentity {
+                    env_fp: 7,
+                    docroot_fp: 0x1234,
+                    bin_mtime: 0x99,
+                    engine: "go".to_string(),
+                },
+            ),
+            "v1 缺 docroot/引擎/二进制 mtime，永不与真实完整身份相等"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// 引擎名安全化：含空白/未知字符的引擎名不破坏指纹文件的分词。
+    #[test]
+    fn engine_sanitization_has_no_whitespace() {
+        assert_eq!(sanitize_engine("go"), "go");
+        assert_eq!(sanitize_engine("my engine"), "my_engine");
+        assert_eq!(sanitize_engine(""), "-");
+    }
+
+    /// 路径指纹：同路径同值、不同路径不同值。
+    #[test]
+    fn path_fingerprint_distinguishes_paths() {
+        let a = path_fingerprint(Path::new("/srv/x"));
+        let b = path_fingerprint(Path::new("/srv/y"));
+        assert_eq!(a, path_fingerprint(Path::new("/srv/x")));
+        assert_ne!(a, b);
     }
 
     /// 指纹与键序无关；内容不同则不同（不能有拼接碰撞）。

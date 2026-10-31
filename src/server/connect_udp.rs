@@ -554,6 +554,21 @@ pub fn select_framing(
     }
 }
 
+/// RFC 9298 §3.1：目标方向 `send()` 返回的错误是否只是「这个 UDP 报文对目标地址族太大」。
+///
+/// 代理 "MUST NOT introduce fragmentation at the IP layer"，且 "overly large datagrams
+/// are silently dropped"。客户端在 HTTP 层**可以**发最大 65527 字节的 UDP Proxying
+/// Payload（§5），但落到 IPv4 目标的线路上限是 65507（65535 − 20 IP − 8 UDP；IPv6 是
+/// 65487），超出的报文内核以 `EMSGSIZE` 拒绝。此时必须**丢弃这一条报文并保持隧道存活**，
+/// 而不是把整条隧道拆掉 —— 与「目标回复过大」的处置（RFC 9298 §6.1：丢弃 + 隧道存活）
+/// 一致。
+///
+/// 只认 `EMSGSIZE`：其它错误（如目标端口无监听、ICMP 触发的 `ECONNREFUSED`）仍按隧道
+/// 故障处理。入参是 `std::io::Error::raw_os_error()`，纯函数、便于单测。
+pub fn is_udp_payload_too_large(raw_os_error: Option<i32>) -> bool {
+    raw_os_error == Some(libc::EMSGSIZE)
+}
+
 /// 从隧道字节流里解析出来的事件。
 #[derive(Debug, PartialEq, Eq)]
 pub enum TunnelEvent {
@@ -1082,6 +1097,17 @@ mod tests {
         let mut asm = DatagramAssembler::new(Framing::Capsules);
         asm.push(&buf);
         assert!(asm.next_event().is_err());
+    }
+
+    /// RFC 9298 §3.1：目标方向 `send()` 的 `EMSGSIZE`（报文超出目标地址族上限）必须
+    /// 判为「丢弃这一条、隧道存活」，其余 OS 错误仍按隧道故障收尾。判据（纯函数）钉在
+    /// 这里：`Some(EMSGSIZE)` ⇒ true；`ECONNREFUSED`/`None`/其它 ⇒ false。
+    #[test]
+    fn udp_payload_too_large_only_on_emsgsize() {
+        assert!(is_udp_payload_too_large(Some(libc::EMSGSIZE)));
+        assert!(!is_udp_payload_too_large(Some(libc::ECONNREFUSED)));
+        assert!(!is_udp_payload_too_large(Some(0)));
+        assert!(!is_udp_payload_too_large(None));
     }
 
     /// G-16：`connect_udp_framing` 的策略 × 协商结果 → 形态。

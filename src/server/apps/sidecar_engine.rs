@@ -658,10 +658,9 @@ fn sock_alive(sock: &std::path::Path) -> bool {
 struct SimpleSidecar {
     sock: std::path::PathBuf,
     child: std::process::Child,
-    /// 与 `native_http::Sidecar` 同判据：`.env` 指纹 / docroot 变了就重启（长驻进程的
-    /// env 与 cwd 只在 spawn 时定型）。
-    env_fp: u64,
-    docroot: std::path::PathBuf,
+    /// 与 `native_http::Sidecar` 同判据：完整身份（`.env` 摘要 / docroot / 二进制 mtime /
+    /// 引擎）变了就重启（长驻进程的 env、cwd 与可执行映像只在 spawn 时定型）。
+    identity: native_http::SidecarIdentity,
 }
 
 /// h2/h3 字节路径的 sidecar 注册表（键与 native_http 相同：port-app_idx-engine）。
@@ -693,23 +692,25 @@ async fn ensure_sidecar_simple(
     let state = abs_path(&std::path::PathBuf::from(format!("state/native/{key}")));
     std::fs::create_dir_all(&state).context("mkdir native state")?;
     let sock = abs_canon(&state.join("app.sock"));
-    let fp = native_http::env_fingerprint(env_vars);
     let docroot_desired = abs_canon(&app.docroot.clone().unwrap_or_else(|| lc.root.clone()));
+    // 与 h1 完全相同的完整身份（`.env` 摘要 + docroot + 二进制 mtime + 引擎）。
+    let identity = native_http::SidecarIdentity::compute(app, lc, &docroot_desired, env_vars);
 
-    // 别的协议（h1）或本注册表之外的实例已经把这个 socket 起好了：**核验 `.env` 指纹后**
+    // 别的协议（h1）或本注册表之外的实例已经把这个 socket 起好了：**核验完整身份后**
     // 复用。sock 旁有 spawner 写下的 `app.sock.envfp`：
-    //   * 指纹一致 → 复用（不重启，反复切协议无抖动）；
-    //   * 不一致/缺失 → 旧进程的进程 env 是陈旧的（`.env` 已变），必须重启；
+    //   * 身份全等 → 复用（不重启，反复切协议无抖动）；
+    //   * 不一致/缺失 → 旧进程的 env/cwd/映像 是陈旧的（`.env`/docroot/二进制/引擎 已变），
+    //     必须重启；
     //   * 不能直接 remove_file 抢走对方的监听 socket（会让对方进程成孤儿）。
     if sock_alive(&sock) {
         let owned_ok = {
             let map = SIDECARS_SIMPLE.lock();
             match map.get(&key) {
-                Some(s) => s.env_fp == fp && s.docroot == docroot_desired,
+                Some(s) => s.identity == identity,
                 // 本表没有条目 = 由另一条协议拉起：靠指纹文件核验，**并且**要求
-                // `.envfp` 里的 pid 仍是本进程的直系子进程（指纹一致但 pid 已被
+                // `.envfp` 里的 pid 仍是本进程的直系子进程（身份一致但 pid 已被
                 // reparent = 上一代遗留，复用会把它变成永久孤儿）。
-                None => native_http::sidecar_reusable(&sock, fp),
+                None => native_http::sidecar_reusable(&sock, &identity),
             }
         };
         if owned_ok {
@@ -719,7 +720,7 @@ async fn ensure_sidecar_simple(
     {
         let map = SIDECARS_SIMPLE.lock();
         if let Some(s) = map.get(&key) {
-            if sock_alive(&s.sock) && s.env_fp == fp && s.docroot == docroot_desired {
+            if sock_alive(&s.sock) && s.identity == identity {
                 return Ok(s.sock.clone());
             }
         }
@@ -731,7 +732,7 @@ async fn ensure_sidecar_simple(
     {
         let map = SIDECARS_SIMPLE.lock();
         if let Some(s) = map.get(&key) {
-            if sock_alive(&s.sock) && s.env_fp == fp && s.docroot == docroot_desired {
+            if sock_alive(&s.sock) && s.identity == identity {
                 return Ok(s.sock.clone());
             }
         }
@@ -742,17 +743,17 @@ async fn ensure_sidecar_simple(
     // 为真即代表「有人在服务」⇒ 复用。绝不 `remove_file` + 抢 spawn（那会偷走它的监听
     // socket、把它变成无人回收的孤儿）。
     if sock_alive(&sock) {
-        // 本表里仍有条目 ⇒ 它在上面两处检查里都没通过（指纹/docroot 过期），必须重建。
+        // 本表里仍有条目 ⇒ 它在上面两处检查里都没通过（身份过期），必须重建。
         let own_entry_stale = SIDECARS_SIMPLE.lock().contains_key(&key);
-        if !own_entry_stale && native_http::sidecar_reusable(&sock, fp) {
+        if !own_entry_stale && native_http::sidecar_reusable(&sock, &identity) {
             log::debug!(
-                "sidecar(simple): {key} 已由其它注册表拉起（sock 存活、.env 指纹一致且进程属于本进程），复用"
+                "sidecar(simple): {key} 已由其它注册表拉起（sock 存活、身份指纹全等且进程属于本进程），复用"
             );
             return Ok(sock);
         }
-        native_http::evict_sidecar_for_env_change(&sock, fp);
+        native_http::evict_sidecar_for_env_change(&sock, &identity);
     }
-    // 死条目 / 指纹或 docroot 变化的旧条目：杀进程再摘除（只删表会留下孤儿）。
+    // 死条目 / 身份变化的旧条目：杀进程再摘除（只删表会留下孤儿）。
     if let Some(mut dead) = SIDECARS_SIMPLE.lock().remove(&key) {
         crate::server::apps::child_registry::kill_child(&mut dead.child);
     }
@@ -791,15 +792,14 @@ async fn ensure_sidecar_simple(
     let start = Instant::now();
     while start.elapsed() < Duration::from_secs(5) {
         if sock_alive(&sock) {
-            // 先落 `.env` 指纹再进表：h1 侧拿同一把 per-sock 锁后会读它核验。
-            native_http::write_sidecar_env_fp(&sock, fp, child.id());
+            // 先落身份指纹再进表：h1 侧拿同一把 per-sock 锁后会读它核验。
+            native_http::write_sidecar_env_fp(&sock, &identity, child.id());
             SIDECARS_SIMPLE.lock().insert(
                 key,
                 SimpleSidecar {
                     sock: sock.clone(),
                     child,
-                    env_fp: fp,
-                    docroot: docroot.clone(),
+                    identity: identity.clone(),
                 },
             );
             return Ok(sock);

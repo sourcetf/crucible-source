@@ -489,6 +489,32 @@ pub fn sync_explicit_keys_for_listeners(
         let Some(path) = ssl.ech_keys.as_deref() else {
             continue;
         };
+        // U-16：显式 `ssl.ech_keys` 指向一个**文件路径**，但该文件缺失（出厂
+        // `config.toml` 在尚未 provision 的目标机上就是这样），同时配了
+        // `ssl.ech_public_name` ⇒ 用 ech_auto 生成材料并落盘到该路径。这样
+        // 「声明了显式密钥 + 给了 public-name」的部署开机即可用，不必先手工
+        // `scripts/generate_ech.sh`；`--check-config` 也据此对「缺 ech_keys 文件
+        // 但有 public-name」放行（见 `config.rs::validate`）。
+        // 注意：只在**文件缺失**时生成；已存在的文件从不覆盖（可能是生产私钥）。
+        if !path.contains("-----BEGIN") && !Path::new(path).exists() {
+            if let Some(pubname) =
+                ssl.ech_public_name.as_deref().filter(|s| !s.trim().is_empty())
+            {
+                match provision_explicit_key_file(
+                    path,
+                    pubname,
+                    ssl.ech_cipher_suite.as_deref(),
+                    ssl.ech_max_name_length,
+                ) {
+                    Ok(()) => log::info!(
+                        "ech: 显式 ech_keys={path} 缺失，已按 ssl.ech_public_name={pubname} 生成并落盘"
+                    ),
+                    Err(e) => log::warn!(
+                        "ech: 为显式 ech_keys={path} 生成材料失败（该 listener 的 ECH 不会生效）: {e:#}"
+                    ),
+                }
+            }
+        }
         let Ok(pem) = crate::server::ssl_material::load_bytes(path) else {
             continue;
         };
@@ -503,6 +529,23 @@ pub fn sync_explicit_keys_for_listeners(
         }
     }
     written
+}
+
+/// U-16：生成一份新的 ECH 材料并落盘到**显式 `ssl.ech_keys` 指定的路径**。
+///
+/// 与 [`EchMaterial::persist`]（固定写 `state/ech/ech_keys.pem`）的区别：这里写的是
+/// 配置里声明的路径，供「显式 ech_keys + public-name」的部署在文件缺失时自愈。
+fn provision_explicit_key_file(
+    path: &str,
+    public_name: &str,
+    cipher_suite: Option<&str>,
+    max_name_length: Option<u16>,
+) -> Result<()> {
+    let spec = EchSpec::from_config(Some(public_name), cipher_suite, max_name_length)?;
+    let mat = generate(&spec)?;
+    // 私钥 0600 由 write_pem_file 保证。
+    crate::server::ssl_material::write_pem_file(Path::new(path), &mat.to_pem())?;
+    Ok(())
 }
 
 /// 读回已落盘的 ECHConfigList（type65 记录用）。

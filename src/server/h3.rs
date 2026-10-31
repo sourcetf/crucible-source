@@ -2338,6 +2338,17 @@ use chunked uploads (Content-Range) or HTTP/1.1 for larger bodies",
         Datagram,
     }
 
+    /// 目标方向 `send()` 失败是否只是「这个 UDP 报文对目标地址族太大」。
+    ///
+    /// 判据在 [`connect_udp::is_udp_payload_too_large`]（RFC 9298 §3.1：代理
+    /// "MUST NOT introduce fragmentation at the IP layer"，"overly large datagrams are
+    /// silently dropped"）。为真时调用方**丢弃这一条报文并保持隧道存活**，而不是拆隧道
+    /// —— 与下方 [`recv_downlink`] 对「回复过大」的处置（RFC 9298 §6.1）一致。其它
+    /// 错误（如目标无监听回 ICMP 触发的 `ECONNREFUSED`）仍按隧道故障收尾。
+    fn udp_send_too_large(e: &std::io::Error) -> bool {
+        connect_udp::is_udp_payload_too_large(e.raw_os_error())
+    }
+
     /// RFC 9298 的双向转发循环（三种封装形态共用）。
     ///
     /// * [`connect_udp::Framing::LengthPrefixed`]：请求流 `varint(len)+payload`；
@@ -2410,6 +2421,17 @@ use chunked uploads (Content-Range) or HTTP/1.1 for larger bodies",
                         match asm.next_event() {
                             Ok(Some(connect_udp::TunnelEvent::Datagram(dg))) => {
                                 if let Err(e) = udp.send(&dg).await {
+                                    // 过大报文按 RFC 9298 §3.1 丢弃（隧道存活），
+                                    // 其余错误视为隧道故障。
+                                    if udp_send_too_large(&e) {
+                                        log::warn!(
+                                            "h3 CONNECT-UDP peer={peer} target={target}: UDP payload \
+                                             {} bytes too large to send to target (EMSGSIZE), \
+                                             dropped per RFC 9298 section 3.1; tunnel stays up",
+                                            dg.len()
+                                        );
+                                        continue;
+                                    }
                                     log::debug!("h3 CONNECT-UDP peer={peer} udp send: {e}");
                                     return;
                                 }
@@ -2436,6 +2458,15 @@ use chunked uploads (Content-Range) or HTTP/1.1 for larger bodies",
                     match dg {
                         Some(dg) => {
                             if let Err(e) = udp.send(&dg).await {
+                                if udp_send_too_large(&e) {
+                                    log::warn!(
+                                        "h3 CONNECT-UDP peer={peer} target={target}: UDP payload \
+                                         {} bytes too large to send to target (EMSGSIZE), dropped \
+                                         per RFC 9298 section 3.1; tunnel stays up",
+                                        dg.len()
+                                    );
+                                    continue;
+                                }
                                 log::debug!("h3 CONNECT-UDP peer={peer} udp send (DATAGRAM): {e}");
                                 return;
                             }

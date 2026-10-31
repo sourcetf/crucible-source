@@ -265,9 +265,11 @@ async fn handle_inner(
     }
 
     // 两种凭据任一生效：HTTP Basic（向后兼容）或 secure cookie 会话。
+    // R-07：会话 cookie 绑定签发它的传输 —— 完整校验收 `tls`（明文 listener 重放
+    // TLS 签发的 cookie 无效）；Basic 仍可在明文口使用（向后兼容不变）。
     let needs_auth = crate::server::basic_auth::admin_requires_auth(&cfg.admin);
     let basic_ok = needs_auth && crate::server::basic_auth::check_admin(&req, &cfg.admin);
-    let session_ok = crate::server::basic_auth::validate_request_session(req.headers());
+    let session_ok = crate::server::basic_auth::validate_request_session_bound(req.headers(), tls);
     if needs_auth && !(basic_ok || session_ok) {
         return Response::builder()
             .status(StatusCode::UNAUTHORIZED)

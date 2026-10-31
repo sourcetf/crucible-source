@@ -404,7 +404,15 @@ impl Serialize for AutoindexConfig {
     where
         S: Serializer,
     {
-        if self.paths == ["/".to_string()] {
+        // 只有当「没有附加信息」时才折叠成 `autoindex = true|false`：旧实现只看
+        // `paths == ["/"]` 就折叠，于是 `enable_upload` / `upload_threads` 在
+        // `/api/config/json` 回显时被**静默丢弃**。面板读回 `autoindex:true` 就把
+        // 上传开关当成关闭，下一次保存任何 listener 都会把站点上传功能悄悄关掉
+        // （属回显→保存往返丢字段）。带上非默认上传参数时保留表形态。
+        if self.paths == ["/".to_string()]
+            && !self.enable_upload
+            && self.upload_threads == default_upload_threads()
+        {
             serializer.serialize_bool(self.enabled)
         } else {
             #[derive(serde::Serialize)]
@@ -1886,6 +1894,48 @@ cover 只用于「未使用 / 被拒 ECH」的连接，ECH 关闭时它会成为
             }
         }
 
+        // U-16：`ssl.ech = true` 但**既没有 `ssl.ech_keys` 也没有 `ssl.ech_public_name`**
+        // ⇒ 装载不了任何密钥，也**无从自动生成**（`ech_auto` 需要 public-name）——
+        // `apply_ech` 只会打一条 warn 后返回，ECH 实际静默关闭。而 `ech_advertise` 的
+        // serde 默认值是 **true**，于是「关掉的 ECH」还会被当成「已启用并发布」。
+        // 这是典型的「配置看着开了、端口其实没开」，必须报出来。
+        //
+        // 与之相对，只要**有** `ech_keys`（显式密钥）或**有** `ech_public_name`（可自动
+        // 生成并落盘 `state/ech/ech_keys.pem`），就不算「缺必要 ECH 资产」，放行。
+        for l in &self.listeners {
+            let Some(ssl) = &l.ssl else { continue };
+            if !ssl.ech {
+                continue;
+            }
+            let has_keys = ssl.ech_keys.as_deref().is_some_and(|s| !s.trim().is_empty());
+            let has_pub = ssl
+                .ech_public_name
+                .as_deref()
+                .is_some_and(|s| !s.trim().is_empty());
+            if has_keys || has_pub {
+                continue;
+            }
+            if ssl.ech_advertise {
+                anyhow::bail!(
+                    "listener {}:{}: ssl.ech = true，但没有 ssl.ech_keys，也没有 ssl.ech_public_name —— \
+ECH 既无法装载（无密钥）也无法自动生成（缺 public-name），实际会静默关闭。请任选其一：\
+① 配 `ssl.ech_keys`（显式密钥，可用 scripts/generate_ech.sh 生成）；\
+② 配 `ssl.ech_public_name`（让 ech_auto 自动生成并落盘 state/ech/ech_keys.pem）；\
+③ 若确实不用 ECH，显式写 `ssl.ech = false`，或 `ssl.ech_advertise = false` 仅关发布",
+                    l.address,
+                    l.port
+                );
+            } else {
+                // `ech_advertise = false` + 无密钥：不发布、也不装载，属「明确声明不用」，
+                // 按警告处理（仍 rc=0），不阻断预检。
+                log::warn!(
+                    "listener {}:{}: ssl.ech = true 但无密钥材料且 ech_advertise = false —— ECH 不会生效（已显式关闭发布，按警告处理）",
+                    l.address,
+                    l.port
+                );
+            }
+        }
+
         // QMux/Hidden Service 之类的「开了但配不全」在运行期只会静默不生效，
         // 配置期一律拦住（见各自 validate 的注释）。
         crate::server::tor_hs::validate(&self.tor_hs)?;
@@ -2170,6 +2220,56 @@ cover 只用于「未使用 / 被拒 ECH」的连接，ECH 关闭时它会成为
                         continue; // 内联 PEM 内容，不做存在性检查
                     }
                     if !std::path::Path::new(t).exists() {
+                        // U-16：**ECH listener 的证书材料是「部署期 provision」的资产**。
+                        // 内层/外层证书与 `ech_keys` 由 `--gen-cert` / `scripts/ech_demo.sh`
+                        // 在**目标机**生成；仓库的 `state/` 与 `*.pem` 都被 gitignore（私钥
+                        // 不入库）。于是出厂的 `config.toml`（带 8443 ECH listener）在**尚未
+                        // provision** 的机器上必然缺这些文件；若照旧 fail-fast，`--check-config`
+                        // 会永远 rc=1，把「配置本身没错、只是资产还没落地」误报成配置错误。
+                        //
+                        // 分三类：
+                        //   * `ssl.ech_keys` 且**配了 `ssl.ech_public_name`**：服务端可用
+                        //     `ech_auto` 生成材料并落盘到该路径（启动期 provision，见
+                        //     `ech_auto::sync_explicit_keys_for_listeners`），所以文件缺失
+                        //     不是配置错误 —— 降级为**响亮警告**，预检仍 rc=0；
+                        //   * 证书/私钥（cert/cert_ec/key/key_ec/cover/cover_ec）：可用
+                        //     `--gen-cert` 一条命令重新生成，同样降级为**响亮警告**并给出
+                        //     可操作指引，预检仍 rc=0；
+                        //   * `ssl.ech_keys` 且**没配 `ssl.ech_public_name`**：既无可用密钥、
+                        //     又无从自动生成 ⇒ fail-fast（rc=1）并给出三条明确出路。
+                        let can_autogen = ssl
+                            .ech_public_name
+                            .as_deref()
+                            .is_some_and(|s| !s.trim().is_empty());
+                        if ssl.ech && what == "ssl.ech_keys" && can_autogen {
+                            log::warn!(
+                                "listener {}:{}: ssl.ech_keys 指向的文件不存在：{t} —— 已配 ssl.ech_public_name，\
+启动时 ech_auto 会按该名字生成并落盘此文件；--check-config 据此放行（仍 rc=0）",
+                                l.address,
+                                l.port
+                            );
+                            continue;
+                        }
+                        if ssl.ech && what == "ssl.ech_keys" {
+                            anyhow::bail!(
+                                "listener {}:{}: ssl.ech = true 且 ssl.ech_keys 指向的文件不存在：{t} —— \
+该端口没有可用 ECH 密钥（只会发 cover 证书，真实证书永不出现）。请任选其一：\
+① 修正 ssl.ech_keys 路径（可用 scripts/generate_ech.sh 生成该 PEM）；\
+② 删掉 ssl.ech_keys 并配 ssl.ech_public_name，让服务端自动生成；\
+③ 确认不用 ECH 时写 ssl.ech = false",
+                                l.address,
+                                l.port
+                            );
+                        }
+                        if ssl.ech {
+                            log::warn!(
+                                "listener {}:{}: {what} 指向的文件不存在：{t} —— 该 ECH 端口在 provision 前无法完成 TLS 握手。\
+运行 `sh scripts/ech_demo.sh`，或用 `--gen-cert` 生成内层/外层证书（见 OPERATOR-TODO.md A）。--check-config 对此降级为警告（仍 rc=0）",
+                                l.address,
+                                l.port
+                            );
+                            continue;
+                        }
                         anyhow::bail!(
                             "listener {}:{}: {what} 指向的文件不存在：{t} —— 配置能加载但该端口的每次 TLS 握手都会失败（连接被静默丢弃）",
                             l.address,
