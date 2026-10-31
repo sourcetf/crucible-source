@@ -399,6 +399,55 @@ impl<'de> Deserialize<'de> for AutoindexConfig {
     }
 }
 
+
+#[cfg(test)]
+mod autoindex_roundtrip_tests {
+    use super::*;
+
+    /// 回显→保存往返必须**不丢字段**：`paths == ["/"]` 时旧实现把整表折叠成
+    /// `autoindex = true`，于是 `enable_upload` / `upload_threads` 被静默丢弃
+    /// （面板读回即把上传关掉；soak-wave22 实测：PUT 201 → 保存配置 → PUT 405）。
+    ///
+    /// 用**外层结构**序列化（TOML 顶层只能是表；`toml::to_string` 对裸 bool 会报
+    /// `UnsupportedType`），这也正是真实用法（`[[listeners]]` 里的 `autoindex` 键）。
+    #[test]
+    fn autoindex_serialize_keeps_upload_fields() {
+        #[derive(serde::Serialize, serde::Deserialize)]
+        struct Wrap {
+            autoindex: AutoindexConfig,
+        }
+        let w = Wrap {
+            autoindex: AutoindexConfig {
+                enabled: true,
+                paths: vec!["/".into()],
+                enable_upload: true,
+                upload_threads: 3,
+            },
+        };
+        let text = toml::to_string(&w).expect("serialize");
+        assert!(text.contains("enable_upload"), "{text}");
+        assert!(text.contains("upload_threads"), "{text}");
+        let back: Wrap = toml::from_str(&text).expect("deserialize");
+        assert!(back.autoindex.enable_upload);
+        assert_eq!(back.autoindex.upload_threads, 3);
+        assert_eq!(back.autoindex.paths, vec!["/".to_string()]);
+
+        // 全默认（除 enabled）时才折叠为紧凑写法，且回读语义不变。
+        let plain = Wrap {
+            autoindex: AutoindexConfig {
+                enabled: true,
+                paths: vec!["/".into()],
+                enable_upload: false,
+                upload_threads: default_upload_threads(),
+            },
+        };
+        let t2 = toml::to_string(&plain).expect("serialize");
+        assert!(!t2.contains("enable_upload"), "{t2}");
+        let back2: Wrap = toml::from_str(&t2).expect("deserialize");
+        assert!(back2.autoindex.enabled && !back2.autoindex.enable_upload);
+    }
+}
+
 impl Serialize for AutoindexConfig {
     fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
     where
