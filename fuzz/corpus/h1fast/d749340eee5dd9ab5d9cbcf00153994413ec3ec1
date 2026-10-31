@@ -1,0 +1,12 @@
+GET /inde HTTP/1.1
+Host:9:30081
+If-None-!atch: จจจจจจจจจจจจจจจจจ
+If-None-!atch:จจจจจจจจจจจจจจจจจจจจจจ"1
+If-None-!!tch: "ab,GET /a f /a จจจ"1
+If-None-!!tch: "a0081
+If-None-!atch: จจจจจจจจ
+If-None-!atch:จจจจจจจจจจจจจจจจจจจจจจ"1
+If-None-!!tch: "b,EGaT /a f /a ,จจจจจจจจจจจ"1
+If-None-!!tch: "abX-		r
+X-
+4

@@ -295,7 +295,7 @@ pub async fn handle_filter_with_live(
     // 但此前**没有任何调用者** ⇒ 传中文名时筛选结果为空、看起来像「库里没有数据」。
     let country_norm = country
         .as_deref()
-        .map(|c| crate::server::geoip_panel::aliases::resolve_country_alias(c));
+        .map(crate::server::geoip_panel::aliases::resolve_country_alias);
     match db::open(&db_path) {
         Ok(conn) => match crate::server::geoip_panel::ops::filter_prefixes(
             &conn,
@@ -612,8 +612,8 @@ pub async fn handle_audit(req: &Request<Full<Bytes>>) -> Response<BoxBody> {
 pub async fn handle_cron(req: Request<Full<Bytes>>) -> Response<BoxBody> {
     let panel_path = crate::server::geoip_panel::db::panel_db_path();
     let panel_path = panel_path.as_path();
-    match req.method() {
-        &Method::GET => {
+    match *req.method() {
+        Method::GET => {
             if !panel_path.is_file() {
                 return json_ok("{\"cron\":[]}".into());
             }
@@ -640,7 +640,7 @@ pub async fn handle_cron(req: Request<Full<Bytes>>) -> Response<BoxBody> {
                 Err(e) => json_ok(format!("{{\"error\":{}}}", json_str(&format!("{e:#}")))),
             }
         }
-        &Method::POST => {
+        Method::POST => {
             let (_parts, body) = req.into_parts();
             let bytes = body
                 .collect()
@@ -1101,7 +1101,7 @@ pub async fn handle_conflict_source(req: Request<Full<Bytes>>) -> Response<BoxBo
         "prefix": prefix,
         "field": f
     });
-    json_ok(serde_json::to_string(&resp).unwrap_or_default().into())
+    json_ok(serde_json::to_string(&resp).unwrap_or_default())
 }
 
 fn url_decode(s: &str) -> String {

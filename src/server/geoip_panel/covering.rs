@@ -541,6 +541,8 @@ pub fn field_score(weight: i64, bits: u32, epoch: i64, gain: i64) -> FieldScore 
     (effective_weight, epoch, bits as i64)
 }
 
+// 参数由调用面决定，拆结构体会改变调用签名（本波只清 warning，不重构）。
+#[allow(clippy::too_many_arguments)]
 fn prefer_field(
     dst: &mut String,
     dst_score: &mut FieldScore,
@@ -884,6 +886,89 @@ mod tests {
         // 大写 / 压缩形态的 v6 也应被规范化后正常查询（不改变结果）。
         let rows6 = load_covering_prefixes(&conn, "::FFFF:10.1.2.3").unwrap();
         assert_eq!(rows6.len(), 1);
+    }
+
+    /// ASN 选择：同前缀先看源权重（BGP 850 > iptoasn 820 > geolite2 810）；
+    /// 权重差小于 bits*gain 时，更具体前缀（BGP /24）可以胜出更宽的 /8。
+    /// 与 `geoip_resolve_asn_bgp.py` 的权重/去重策略互锁。
+    #[test]
+    fn asn_selection_weight_then_more_specific() {
+        let same_prefix = vec![
+            CoveringPrefix {
+                asn: "64500".into(),
+                weight: 850,
+                bits: 24,
+                commit_unix: 1,
+                ..Default::default()
+            },
+            CoveringPrefix {
+                asn: "64501".into(),
+                weight: 820,
+                bits: 24,
+                commit_unix: 1,
+                ..Default::default()
+            },
+        ];
+        assert_eq!(
+            merge_covering_fields_with_gain(&same_prefix, 10).asn,
+            "64500",
+            "同前缀 BGP 源权重更高"
+        );
+        let more_specific = vec![
+            CoveringPrefix {
+                asn: "64600".into(),
+                weight: 850,
+                bits: 8,
+                commit_unix: 1,
+                ..Default::default()
+            },
+            CoveringPrefix {
+                asn: "64601".into(),
+                weight: 820,
+                bits: 24,
+                commit_unix: 1,
+                ..Default::default()
+            },
+        ];
+        assert_eq!(
+            merge_covering_fields_with_gain(&more_specific, 10).asn,
+            "64601",
+            "820+240 > 850+80，更具体 BGP 前缀胜出"
+        );
+        // gain=0 时退回纯权重（运维把路径增益关掉的可预期行为）。
+        assert_eq!(
+            merge_covering_fields_with_gain(&more_specific, 0).asn,
+            "64600"
+        );
+    }
+
+    /// v6 ASN 行写在 `ipv6` range 表（`upsert_range` 的分流目标）时，查询侧必须
+    /// 读出 asn/as_org —— 旧脚本把 v6 塞进 geoip 主表，而 `load_from_geoip` 对 v6
+    /// 直接返回空，等价于「导入成功但永远查不到」。
+    #[test]
+    fn ipv6_range_table_asn_row_is_found() {
+        let conn = crate::server::geoip_panel::db::open(std::path::Path::new(":memory:")).unwrap();
+        let start = "2001:db8::";
+        let end = "2001:db8::ffff";
+        let si = crate::server::geoip_panel::iputil::range_numeric_key(start).unwrap();
+        let ei = crate::server::geoip_panel::iputil::range_numeric_key(end).unwrap();
+        conn.execute(
+            "INSERT INTO ipv6(start, end, bits, weight, country, asn, as_org, prefix,
+                              e_asn, commit_unix, start_i, end_i)
+             VALUES(?1, ?2, 112, 850, 'US', '64700', 'BGP-V6', '2001:db8::/112',
+                    7, 7, ?3, ?4)",
+            rusqlite::params![start, end, si, ei],
+        )
+        .unwrap();
+        let rows = load_covering_prefixes(&conn, "2001:db8::7").unwrap();
+        assert_eq!(rows.len(), 1);
+        let m = merge_covering(&rows);
+        assert_eq!(m.asn, "64700");
+        assert_eq!(m.as_org, "BGP-V6");
+        // v4-mapped 不得误命中 v6 行。
+        assert!(load_covering_prefixes(&conn, "::ffff:203.0.113.1")
+            .unwrap()
+            .is_empty());
     }
 
     /// G-10：与 Python 离线合并共享同一组 golden 向量。

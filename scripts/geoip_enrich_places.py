@@ -10,9 +10,9 @@ import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
-from geoip_common import DEFAULT_DB, init_schema  # noqa: E402
+from geoip_common import DEFAULT_DB, current_dir, init_schema  # noqa: E402
 
-ADCODE = Path("data/geoip/current/adcode_names.json")
+ADCODE = current_dir() / "adcode_names.json"
 
 
 def main() -> int:

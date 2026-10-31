@@ -1,0 +1,4 @@
+GETig.bin HTTP/1.1
+Host: 1227.0.0.1:30081
+Connection: close
+

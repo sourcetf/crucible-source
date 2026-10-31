@@ -250,8 +250,8 @@ pub async fn doh_prepared(
     if *method == http::Method::OPTIONS {
         return Some(doh_options());
     }
-    let wire: Vec<u8> = match method {
-        &http::Method::GET => {
+    let wire: Vec<u8> = match *method {
+        http::Method::GET => {
             let mut picked = None;
             for kv in uri.query().unwrap_or("").split('&') {
                 if let Some(v) = kv.strip_prefix("dns=") {
@@ -273,7 +273,7 @@ pub async fn doh_prepared(
                 None => return Some(resp_text(StatusCode::BAD_REQUEST, "bad dns message")),
             }
         }
-        &http::Method::POST => {
+        http::Method::POST => {
             let ct = headers
                 .get(http::header::CONTENT_TYPE)
                 .and_then(|v| v.to_str().ok())

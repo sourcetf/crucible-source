@@ -4,19 +4,49 @@ from __future__ import annotations
 
 import ipaddress
 import json
+import os
 import sqlite3
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-DEFAULT_DB = "data/geoip/current/geoip.sqlite"
-SOURCES_JSON = "data/geoip/current/SOURCES.json"
-PANEL_DB = "data/geoip/panel.sqlite"
-PANEL_TOML = "data/geoip/panel.toml"
+# 路径覆盖：离线更新链（geoip_update.sh）可以用环境变量把整条链指到非生产目录，
+# 便于 staging / 测试 / 原子切换验证（生产默认值逐字节不变）。Rust 侧对应的
+# 覆盖变量是 CRUCIBLE_GEOIP_PANEL_DB / CRUCIBLE_GEOIP_PANEL。
+DEFAULT_DB = os.environ.get("CRUCIBLE_GEOIP_DB") or "data/geoip/current/geoip.sqlite"
+SOURCES_JSON = os.environ.get("CRUCIBLE_GEOIP_SOURCES") or "data/geoip/current/SOURCES.json"
+PANEL_DB = os.environ.get("CRUCIBLE_GEOIP_PANEL_DB") or "data/geoip/panel.sqlite"
+PANEL_TOML = (
+    os.environ.get("CRUCIBLE_GEOIP_PANEL")
+    or os.environ.get("CRUCIBLE_GEOIP_PANEL_TOML")
+    or "data/geoip/panel.toml"
+)
 
 # G-10/G-17：Rust `covering::DEFAULT_PATH_PRIORITY_GAIN` 必须与此一致。
 DEFAULT_PATH_PRIORITY_GAIN = 10
+
+
+def data_root() -> Path:
+    """数据根目录：`CRUCIBLE_GEOIP_DATA_ROOT` 覆盖，默认 `data/geoip`（相对 CWD）。
+
+    离线脚本里大量 `data/geoip/sources/...`、`data/geoip/current/...` 的硬编码
+    在 staging/测试目录下会指回生产路径。更新链导出该变量后，这里统一解析，
+    避免每个脚本各自猜 CWD。
+    """
+    return Path(os.environ.get("CRUCIBLE_GEOIP_DATA_ROOT") or "data/geoip")
+
+
+def sources_dir() -> Path:
+    return data_root() / "sources"
+
+
+def current_dir() -> Path:
+    return data_root() / "current"
+
+
+def logs_dir() -> Path:
+    return data_root() / "logs"
 
 # Rust 侧用 i64 saturating 运算；Python 整数无界，必须显式模拟，否则极端权重下
 # 两侧的 (weight + bits*gain, epoch, bits) 评分会分叉（golden 向量把这条钉死）。
@@ -160,51 +190,6 @@ class MergedFields:
     extra: dict[str, str] = field(default_factory=dict)
 
 
-def _create_range_table(conn: sqlite3.Connection, name: str) -> None:
-    conn.execute(
-        f"""CREATE TABLE IF NOT EXISTS {name} (
-            start TEXT NOT NULL,
-            end TEXT NOT NULL,
-            bits INTEGER DEFAULT 0,
-            weight INTEGER DEFAULT 0,
-            country TEXT,
-            province TEXT,
-            region TEXT,
-            city TEXT,
-            district TEXT,
-            isp TEXT,
-            asn TEXT,
-            as_org TEXT,
-            net_org TEXT,
-            cloud_provider TEXT,
-            cloud_region TEXT,
-            cloud_service TEXT,
-            hosting TEXT,
-            division_code TEXT,
-            prefix TEXT,
-            source TEXT,
-            e_country INTEGER DEFAULT 0,
-            e_province INTEGER DEFAULT 0,
-            e_region INTEGER DEFAULT 0,
-            e_city INTEGER DEFAULT 0,
-            e_district INTEGER DEFAULT 0,
-            e_isp INTEGER DEFAULT 0,
-            e_asn INTEGER DEFAULT 0,
-            e_as_org INTEGER DEFAULT 0,
-            e_net_org INTEGER DEFAULT 0,
-            e_cloud_provider INTEGER DEFAULT 0,
-            e_cloud_region INTEGER DEFAULT 0,
-            e_cloud_service INTEGER DEFAULT 0,
-            e_hosting INTEGER DEFAULT 0,
-            e_dc INTEGER DEFAULT 0,
-            e_division_code INTEGER DEFAULT 0,
-            commit_unix INTEGER DEFAULT 0
-        )"""
-    )
-    conn.execute(f"CREATE INDEX IF NOT EXISTS idx_{name}_start ON {name}(start)")
-    conn.execute(f"CREATE INDEX IF NOT EXISTS idx_{name}_range ON {name}(start, end)")
-
-
 def _clean_ip_text(v: object) -> str:
     """去掉 NUL 填充与空白（历史写入用过定长 char 列）。"""
     return str(v or "").strip().rstrip("\x00").strip()
@@ -316,10 +301,13 @@ def _backfill_numeric(conn: sqlite3.Connection) -> int:
         return 0
     upd: list[tuple[int, int, int]] = []
     for rowid, s, e in rows:
-        try:
-            si = int(ipaddress.ip_address(_clean_ip_text(s)))
-            ei = int(ipaddress.ip_address(_clean_ip_text(e)))
-        except ValueError:
+        # 用 range_numeric_key 而不是 int(ip_address)：主表理论上只存 v4，但历史
+        # 导入/手工 SQL 可能塞进 v6 行；`int(v6)` 超出 SQLite INTEGER（i64）范围，
+        # 绑定时会抛 OverflowError 把整个 init_schema 打断。range_numeric_key 对
+        # v6 走「高 64 位保序映射」，与 Rust 查询侧同一把标尺。
+        si = range_numeric_key(s)
+        ei = range_numeric_key(e)
+        if si is None or ei is None:
             continue
         upd.append((si, ei, rowid))
     if upd:
@@ -409,6 +397,12 @@ def init_schema(conn: sqlite3.Connection) -> None:
     _backfill_range_numeric(conn, "ipv6")
     # §2.6：anycast 表——bgptools/anycast-prefixes 与 RIPE anycast 提取写入这里，
     # 查询侧（Rust anycast.rs）读表判定 + 国家票 30% 共识抑制。
+    #
+    # 必须建 (start,end) 唯一索引：`upsert_anycast` 用的是
+    # `INSERT … ON CONFLICT(start, end) DO UPDATE`，而 SQLite 的 UPSERT 只有在
+    # (start,end) 上存在 UNIQUE/PK 约束时才合法。旧 schema 只建了普通索引，于是
+    # 每次写入都抛 `ON CONFLICT clause does not match any PRIMARY KEY or UNIQUE
+    # constraint` —— anycast 表永远为空（RIPE anycast 提取/面板追加全部静默失效）。
     conn.execute(
         """CREATE TABLE IF NOT EXISTS anycast (
             start TEXT NOT NULL,
@@ -419,7 +413,34 @@ def init_schema(conn: sqlite3.Connection) -> None:
             commit_unix INTEGER DEFAULT 0
         )"""
     )
+    for col in ("start_i", "end_i"):
+        try:
+            conn.execute(f"ALTER TABLE anycast ADD COLUMN {col} INTEGER")
+        except sqlite3.OperationalError:
+            pass
+    # 老库可能已有重复段（普通索引不阻止重复）；先按 (start,end) 去重再做唯一索引。
+    conn.execute(
+        """DELETE FROM anycast WHERE rowid NOT IN (
+               SELECT MIN(rowid) FROM anycast GROUP BY start, end
+           )"""
+    )
+    conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_anycast_unique ON anycast(start, end)"
+    )
     conn.execute("CREATE INDEX IF NOT EXISTS idx_anycast_range ON anycast(start, end)")
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_anycast_numeric ON anycast(start_i, end_i)"
+    )
+    for rowid, s, e in conn.execute(
+        "SELECT rowid, start, end FROM anycast WHERE start_i IS NULL OR end_i IS NULL"
+    ).fetchall():
+        si = range_numeric_key(s)
+        ei = range_numeric_key(e)
+        if si is not None and ei is not None:
+            conn.execute(
+                "UPDATE anycast SET start_i = ?, end_i = ? WHERE rowid = ?",
+                (si, ei, rowid),
+            )
 
 
 def upsert_anycast(
@@ -445,13 +466,16 @@ def upsert_anycast(
     except ValueError:
         pass
     cu = int(commit_unix if commit_unix is not None else time.time())
+    si = range_numeric_key(start)
+    ei = range_numeric_key(end)
     conn.execute(
-        """INSERT INTO anycast(start, end, bits, prefix, source, commit_unix)
-           VALUES(?,?,?,?,?,?)
+        """INSERT INTO anycast(start, end, bits, prefix, source, commit_unix, start_i, end_i)
+           VALUES(?,?,?,?,?,?,?,?)
            ON CONFLICT(start, end) DO UPDATE SET
              bits=excluded.bits, prefix=excluded.prefix,
-             source=excluded.source, commit_unix=excluded.commit_unix""",
-        (start, end, bits, prefix, source, cu),
+             source=excluded.source, commit_unix=excluded.commit_unix,
+             start_i=excluded.start_i, end_i=excluded.end_i""",
+        (start, end, bits, prefix, source, cu, si, ei),
     )
 
 
@@ -569,6 +593,73 @@ def ip_to_int(ip: str) -> int:
     return int(ipaddress.ip_address(ip))
 
 
+def _covering_select(conn: sqlite3.Connection, table: str, key: int) -> list[sqlite3.Row]:
+    """单表 covering 查询（列语义与 Rust `covering.rs` 的 SELECT 逐列一致）。"""
+    if table == "geoip":
+        cols = """ip_start, ip_end, COALESCE(bits,0) AS bits,
+                  COALESCE(weight,0) AS weight, COALESCE(commit_unix,0) AS commit_unix,
+                  COALESCE(country,'') AS country,
+                  COALESCE(province, region, '') AS province,
+                  COALESCE(region,'') AS region, COALESCE(city,'') AS city,
+                  COALESCE(district,'') AS district, COALESCE(isp,'') AS isp,
+                  COALESCE(dc,'') AS dc, COALESCE(asn,'') AS asn,
+                  COALESCE(as_org,'') AS as_org, COALESCE(net_org,'') AS net_org,
+                  COALESCE(cloud_provider,'') AS cloud_provider,
+                  COALESCE(cloud_region,'') AS cloud_region,
+                  COALESCE(cloud_service,'') AS cloud_service,
+                  COALESCE(hosting,'') AS hosting,
+                  COALESCE(division_code,'') AS division_code,
+                  COALESCE(prefix, ip_start || '-' || ip_end) AS prefix,
+                  COALESCE(e_country,0) AS e_country, COALESCE(e_province,0) AS e_province,
+                  COALESCE(e_region,0) AS e_region, COALESCE(e_city,0) AS e_city,
+                  COALESCE(e_district,0) AS e_district, COALESCE(e_isp,0) AS e_isp,
+                  COALESCE(e_asn,0) AS e_asn, COALESCE(e_as_org,0) AS e_as_org,
+                  COALESCE(e_net_org,0) AS e_net_org,
+                  COALESCE(e_cloud_provider,0) AS e_cloud_provider,
+                  COALESCE(e_cloud_region,0) AS e_cloud_region,
+                  COALESCE(e_cloud_service,0) AS e_cloud_service,
+                  COALESCE(e_hosting,0) AS e_hosting,
+                  COALESCE(e_dc,0) AS e_dc,
+                  COALESCE(e_division_code,0) AS e_division_code"""
+        sql = f"""SELECT {cols} FROM geoip
+                  WHERE start_i IS NULL OR (start_i <= ? AND end_i >= ?)
+                  ORDER BY COALESCE(commit_unix, 0) ASC, COALESCE(weight, 0) ASC,
+                           COALESCE(bits, 0) ASC, rowid ASC"""
+        return list(conn.execute(sql, (key, key)).fetchall())
+    # ipv4/ipv6 range 表：列名 start/end，无 dc 文本列。为与 Rust 的 range SELECT
+    # 对齐，dc 返回 ''；province 走 COALESCE(province, region, '')。
+    cols = """start AS ip_start, end AS ip_end, COALESCE(bits,0) AS bits,
+              COALESCE(weight,0) AS weight, COALESCE(commit_unix,0) AS commit_unix,
+              COALESCE(country,'') AS country,
+              COALESCE(province, region, '') AS province,
+              COALESCE(region,'') AS region, COALESCE(city,'') AS city,
+              COALESCE(district,'') AS district, COALESCE(isp,'') AS isp,
+              '' AS dc, COALESCE(asn,'') AS asn,
+              COALESCE(as_org,'') AS as_org, COALESCE(net_org,'') AS net_org,
+              COALESCE(cloud_provider,'') AS cloud_provider,
+              COALESCE(cloud_region,'') AS cloud_region,
+              COALESCE(cloud_service,'') AS cloud_service,
+              COALESCE(hosting,'') AS hosting,
+              COALESCE(division_code,'') AS division_code,
+              COALESCE(prefix, start || '-' || end) AS prefix,
+              COALESCE(e_country,0) AS e_country, COALESCE(e_province,0) AS e_province,
+              COALESCE(e_region,0) AS e_region, COALESCE(e_city,0) AS e_city,
+              COALESCE(e_district,0) AS e_district, COALESCE(e_isp,0) AS e_isp,
+              COALESCE(e_asn,0) AS e_asn, COALESCE(e_as_org,0) AS e_as_org,
+              COALESCE(e_net_org,0) AS e_net_org,
+              COALESCE(e_cloud_provider,0) AS e_cloud_provider,
+              COALESCE(e_cloud_region,0) AS e_cloud_region,
+              COALESCE(e_cloud_service,0) AS e_cloud_service,
+              COALESCE(e_hosting,0) AS e_hosting,
+              COALESCE(e_dc,0) AS e_dc,
+              COALESCE(e_division_code,0) AS e_division_code"""
+    sql = f"""SELECT {cols} FROM {table}
+              WHERE start_i IS NULL OR (start_i <= ? AND end_i >= ?)
+              ORDER BY COALESCE(commit_unix, 0) ASC, COALESCE(weight, 0) ASC,
+                       COALESCE(bits, 0) ASC, rowid ASC"""
+    return list(conn.execute(sql, (key, key)).fetchall())
+
+
 def load_covering(conn: sqlite3.Connection, ip: str) -> list[sqlite3.Row]:
     conn.row_factory = sqlite3.Row
     # §23.8：必须用数值范围列（start_i/end_i）。按 TEXT 比较点分四段是**错的**——
@@ -581,22 +672,19 @@ def load_covering(conn: sqlite3.Connection, ip: str) -> list[sqlite3.Row]:
     # `covering::load_covering_prefixes` 在入口 unmap，Python 此前没做 ⇒ 双栈
     # listener 上的同一客户端在离线校验里查不到 v4 段。
     try:
-        addr = ipaddress.ip_address(ip)
+        # 与 Rust `iputil::parse_ip`（s.trim().parse()）同口径：允许首尾空白。
+        addr = ipaddress.ip_address(ip.strip())
     except ValueError:
         return []
     if isinstance(addr, ipaddress.IPv6Address) and addr.ipv4_mapped is not None:
         addr = addr.ipv4_mapped
-    n = int(addr)
-    cur = conn.execute(
-        """SELECT * FROM geoip
-           WHERE start_i <= ? AND end_i >= ?
-           -- 与 Rust `covering::load_from_geoip` 逐键一致（含 rowid 唯一键收尾）：
-           -- 同分行在合并侧「后行胜」，少了 rowid 会让结果依赖查询计划/索引存在性。
-           ORDER BY COALESCE(commit_unix, 0) ASC, COALESCE(weight, 0) ASC,
-                    COALESCE(bits, 0) ASC, rowid ASC""",
-        (n, n),
-    )
-    return list(cur.fetchall())
+    # 地址族分流必须与 Rust 一致：v4 → geoip 主表 + ipv4 range 表；
+    # v6 → ipv6 range 表（geoip 主表只存 v4）。旧 Python 只查 geoip：离线校验
+    # 看不到写入 ipv4/ipv6 表的行（demo/镜像/ASN 双栈），与运行期结果分叉。
+    if isinstance(addr, ipaddress.IPv4Address):
+        return _covering_select(conn, "geoip", int(addr)) + _covering_select(conn, "ipv4", int(addr))
+    key = range_numeric_key(str(addr))
+    return [] if key is None else _covering_select(conn, "ipv6", key)
 
 
 # §3.3 查询期过滤（与 Rust `covering::country_vote_ok` / `cn_city_polluted` 同一
@@ -657,7 +745,11 @@ def merge_covering(
             if not val:
                 continue
             epoch = 0
-            if e_col in keys:
+            # 与 Rust `merge_covering_fields_with_gain` 一致：region/dc/division_code
+            # 没有传字段 epoch（固定 0，回落 commit_unix）。此前 Python 会读
+            # e_region/e_dc/e_division_code，库里这些列一旦非零，离线/运行期就会
+            # 选出不同的省/DC/行政区。
+            if field not in ("region", "dc", "division_code") and e_col in keys:
                 epoch = int(r[e_col] or 0)
             cu = int(r["commit_unix"] or 0) if "commit_unix" in keys else 0
             if epoch <= 0:
@@ -706,6 +798,78 @@ def merge_covering(
     return out
 
 
+# §23.5.6：anycast 内置种子（与 Rust `anycast::ANYCAST_V4` 逐条一致）。表内行优先，
+# 无表/无命中时回落这批。离线校验必须与运行期同判定，否则冲突 IP 的城市抑制两侧不同。
+_ANYCAST_SEED_V4 = (
+    ("1.1.1.0", 24),
+    ("8.8.8.0", 24),
+    ("9.9.9.0", 24),
+    ("208.67.222.0", 24),
+)
+
+
+def detect_country_conflict(rows: list[sqlite3.Row]) -> tuple[str, bool]:
+    """国家票（§23.5.6）：与 Rust `conflict::detect_country_conflict` 逐位一致。
+
+    投票 = 每个国家的 `Σ max(weight,1)`（特殊码 ZZ/XX/A1/A2 不投），commit 取 max；
+    胜者按 `(票数 desc, commit desc, 国家码 asc)` 排序 —— 最后一键是确定性收尾
+    （Rust 的 votes 是 HashMap，无序会导致平票胜者随进程漂移）。次高 ≥ 胜者 30% 判冲突。
+    """
+    votes: dict[str, list[int]] = {}
+    for r in rows:
+        keys = r.keys()
+        cc = (r["country"] or "") if "country" in keys else ""
+        if not cc or not country_vote_ok(cc):
+            continue
+        w = int(r["weight"] or 0) if "weight" in keys else 0
+        cu = int(r["commit_unix"] or 0) if "commit_unix" in keys else 0
+        e = votes.setdefault(cc, [0, 0])
+        e[0] += max(w, 1)
+        e[1] = max(e[1], cu)
+    if not votes:
+        return ("", False)
+    ranked = sorted(
+        ((c, w, cu) for c, (w, cu) in votes.items()),
+        key=lambda t: (-t[1], -t[2], t[0]),
+    )
+    winner = ranked[0][0]
+    if len(ranked) < 2:
+        return (winner, False)
+    conflict = ranked[1][1] * 100 >= ranked[0][1] * 30
+    return (winner, conflict)
+
+
+def anycast_hit(conn: sqlite3.Connection, addr: ipaddress._BaseAddress) -> bool:
+    """`addr` 是否落在 anycast 表或内置种子里（与 Rust `anycast::is_anycast_conn` 同口径）。
+
+    表内起止是 TEXT：按地址族数值比较，v4-mapped 折回 v4；表缺失/无命中时回落内置
+    v4 种子。Rust 侧表扫描失败也会回落种子，这里用 try/except 覆盖「无 anycast 表」。
+    """
+    try:
+        rows = conn.execute("SELECT start, end FROM anycast").fetchall()
+    except sqlite3.OperationalError:
+        rows = []
+    for row in rows:
+        try:
+            a = ipaddress.ip_address(str(row[0]).strip())
+            b = ipaddress.ip_address(str(row[1]).strip())
+        except (ValueError, TypeError):
+            continue
+        if isinstance(a, ipaddress.IPv6Address) and a.ipv4_mapped is not None:
+            a = a.ipv4_mapped
+        if isinstance(b, ipaddress.IPv6Address) and b.ipv4_mapped is not None:
+            b = b.ipv4_mapped
+        if isinstance(a, ipaddress.IPv4Address) != isinstance(addr, ipaddress.IPv4Address):
+            continue
+        if int(a) <= int(addr) <= int(b):
+            return True
+    if isinstance(addr, ipaddress.IPv4Address):
+        for base, bits in _ANYCAST_SEED_V4:
+            if addr in ipaddress.ip_network(f"{base}/{bits}", strict=False):
+                return True
+    return False
+
+
 def format_label(m: MergedFields) -> str:
     if m.cloud_provider:
         head = m.cloud_provider
@@ -734,14 +898,217 @@ def format_label(m: MergedFields) -> str:
 
 
 def lookup_merged(conn: sqlite3.Connection, ip: str) -> MergedFields | None:
+    """离线合并 = Rust `covering::merge_pipeline` 的确定性核心（G-10 口径一致）。
+
+    此前只做 `merge_covering`，漏了运行期的 §23.5.6 抑制：国家票胜者覆盖
+    `merged.country`，且「国家冲突（次高 ≥30%）或 anycast」时清空
+    province/city/district。于是同一个冲突 IP，离线校验（本函数）会保留城市，而
+    面板 `/api/geoip/lookup`（`merge_pipeline`）抑制掉 —— 「同数据两端选出的字段
+    一致」不成立。这里补齐这两层；面板 `panel_edits` 是数据层、不在离线库语义内
+    （Rust 侧也只有面板端点会叠加），故此处不回放。
+    """
     try:
-        ipaddress.ip_address(ip)
+        addr = ipaddress.ip_address(ip.strip())
     except ValueError:
         return None
+    if isinstance(addr, ipaddress.IPv6Address) and addr.ipv4_mapped is not None:
+        addr = addr.ipv4_mapped
     rows = load_covering(conn, ip)
     if not rows:
         return None
-    return merge_covering(rows)
+    merged = merge_covering(rows)
+    country, conflict = detect_country_conflict(rows)
+    if country:
+        merged.country = country
+    if conflict or anycast_hit(conn, addr):
+        merged.province = ""
+        merged.city = ""
+        merged.district = ""
+    return merged
+
+
+_RANGE_INSERT_SQL = """INSERT INTO geoip (
+    ip_start, ip_end, bits, weight, prefix,
+    country, province, region, city, district, isp, dc,
+    asn, as_org, net_org, cloud_provider, cloud_region, cloud_service,
+    hosting, division_code, source,
+    e_country, e_province, e_city, e_district, e_isp,
+    e_asn, e_as_org, e_net_org, e_cloud_provider, e_cloud_region,
+    e_cloud_service, e_hosting, commit_unix,
+    start_i, end_i
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+          ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"""
+
+# §23 双 schema：v6 行走 `ipv6` 表（列名 start/end，无 dc 文本列；Rust
+# `covering::load_from_range_table` 对 index 10 固定返回 ''）。v4 继续走主表
+# `geoip`（Rust `load_from_geoip`）。旧 `upsert_range` 不区分地址族，v6 也被塞进
+# geoip 主表 —— 运行期 `load_from_geoip` 对 v6 直接 return empty，等价于「导入成功
+# 但永远查不到」。ASN/BGP 双栈导入必须按族分流。
+_IPV6_INSERT_SQL = """INSERT INTO ipv6 (
+    start, end, bits, weight,
+    country, province, region, city, district, isp,
+    asn, as_org, net_org, cloud_provider, cloud_region, cloud_service,
+    hosting, division_code, prefix, source,
+    e_country, e_province, e_region, e_city, e_district, e_isp,
+    e_asn, e_as_org, e_net_org, e_cloud_provider, e_cloud_region,
+    e_cloud_service, e_hosting, e_dc, e_division_code, commit_unix,
+    start_i, end_i
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+          ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"""
+
+
+def _as_text(v: object) -> str:
+    """把任意 JSON 值安全转成 TEXT 绑定值（源形状漂移兜底）。
+
+    上游 JSON 的字段类型会漂移（实测某云厂商层把 `hosting`/`tags` 写成数组）。
+    直接把 list/dict 绑进 sqlite3 会抛 `ProgrammingError: type 'list' is not
+    supported`，整批 merge 在最深处失败。这里把 list 用逗号连接、dict 用 JSON
+    文本、标量 str()，保证「一个怪字段」不会杀掉整条更新链。
+    """
+    if v is None:
+        return ""
+    if isinstance(v, str):
+        return v
+    if isinstance(v, (list, tuple)):
+        return ", ".join(_as_text(x) for x in v if x is not None)
+    if isinstance(v, dict):
+        return json.dumps(v, ensure_ascii=False, sort_keys=True)
+    return str(v)
+
+
+def _to_int(v: object, default: int = 0) -> int:
+    try:
+        return int(v)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return default
+
+
+def _range_insert_params(
+    start: str,
+    end: str,
+    fields: dict[str, Any],
+    weight: int,
+    source: str,
+    commit_unix: int | None,
+) -> tuple:
+    """把一行 range 记录归一成 `_RANGE_INSERT_SQL` 的参数元组。
+
+    抽出来是为了让 `upsert_range`（单行）与 `upsert_range_many`（批量，ASN/BGP
+    导入上百万行时用）共享**同一套**列顺序/epoch/数值键逻辑 —— 两份实现漂移正是
+    「34 个占位符对 36 个参数」那类静默失败的温床。所有文本字段都经 `_as_text`：
+    上游 JSON 的 list/dict 值不能直接绑定（否则整批 merge 在 sqlite3 绑参处失败）。
+    """
+    start = _as_text(start).strip()
+    end = _as_text(end).strip()
+    bits = 32
+    prefix = f"{start}/32"
+    try:
+        nets = list(
+            ipaddress.summarize_address_range(
+                ipaddress.ip_address(start), ipaddress.ip_address(end)
+            )
+        )
+        if len(nets) == 1:
+            prefix = str(nets[0])
+            bits = int(prefix.split("/")[1])
+        elif len(nets) > 1:
+            # 区间不能表示成单个 CIDR：仍按地址族给一个不会误导的长度。
+            bits = 128 if nets[0].version == 6 else 32
+            prefix = f"{start}-{end}"
+    except ValueError:
+        pass
+    cu = _to_int(
+        commit_unix if commit_unix is not None else fields.get("commit_unix"),
+        int(time.time()),
+    )
+    # §23.8 性能：数值范围列 + 索引——TEXT BETWEEN 无法用索引且比较错误。
+    # 必须用 range_numeric_key（v4=u32、v6=高 64 位保序映射）：直接 int(v6) 会
+    # 超出 SQLite i64，绑定时抛 OverflowError（IPv6 ASN/BGP 导入曾因此整段失败）。
+    si = range_numeric_key(start)
+    ei = range_numeric_key(end)
+    if si is None:
+        si = -1
+    if ei is None:
+        ei = -1
+    text = {f: _as_text(fields.get(f, "")) for f in (
+        "country", "region", "province", "city", "district", "isp", "dc",
+        "asn", "as_org", "net_org", "cloud_provider", "cloud_region",
+        "cloud_service", "hosting", "division_code", "source",
+    )}
+    epochs = {}
+    for f in EPOCH_FIELDS:
+        val = text.get(f, "")
+        epochs[f"e_{f}"] = cu if val else _to_int(fields.get(f"e_{f}"), 0)
+
+    return (
+        start,
+        end,
+        bits,
+        weight,
+        prefix,
+        text["country"],
+        text["province"] or text["region"],
+        text["region"],
+        text["city"],
+        text["district"],
+        text["isp"],
+        text["dc"],
+        text["asn"],
+        text["as_org"],
+        text["net_org"],
+        text["cloud_provider"],
+        text["cloud_region"],
+        text["cloud_service"],
+        text["hosting"],
+        text["division_code"],
+        source or text["source"],
+        epochs["e_country"],
+        epochs["e_province"],
+        epochs["e_city"],
+        epochs["e_district"],
+        epochs["e_isp"],
+        epochs["e_asn"],
+        epochs["e_as_org"],
+        epochs["e_net_org"],
+        epochs["e_cloud_provider"],
+        epochs["e_cloud_region"],
+        epochs["e_cloud_service"],
+        epochs["e_hosting"],
+        cu,
+        si,
+        ei,
+    )
+
+
+def _is_v6_addr(text: str) -> bool:
+    try:
+        return ipaddress.ip_address(str(text).strip()).version == 6
+    except ValueError:
+        return False
+
+
+def _ipv6_insert_params(p: tuple) -> tuple:
+    """把 v4 参数元组映射成 `ipv6` range 表列序（见 `_IPV6_INSERT_SQL`）。
+
+    v4 元组布局：start,end,bits,weight,prefix,country,province,region,city,
+    district,isp,dc,asn,as_org,net_org,cloud_{provider,region,service},hosting,
+    division_code,source,e_country,e_province,e_city,e_district,e_isp,e_asn,
+    e_as_org,e_net_org,e_cloud_{provider,region,service},e_hosting,commit,start_i,end_i。
+    ipv6 表没有 `dc`/`e_dc` 查询语义（Rust 固定 ''），这里写 0/空。
+    """
+    return (
+        p[0], p[1], p[2], p[3],          # start,end,bits,weight
+        p[5], p[6], p[7], p[8], p[9], p[10],  # country,province,region,city,district,isp
+        p[12], p[13], p[14],             # asn,as_org,net_org
+        p[15], p[16], p[17],             # cloud_provider/region/service
+        p[18], p[19],                    # hosting,division_code
+        p[4], p[20],                     # prefix,source
+        p[21], p[22], 0, p[23], p[24], p[25],          # e_country..e_isp (+e_region=0)
+        p[26], p[27], p[28],             # e_asn,e_as_org,e_net_org
+        p[29], p[30], p[31],             # e_cloud_*
+        p[32], 0, 0,                     # e_hosting, e_dc=0, e_division_code=0
+        p[33], p[34], p[35],             # commit_unix,start_i,end_i
+    )
 
 
 def upsert_range(
@@ -754,85 +1121,61 @@ def upsert_range(
     source: str = "",
     commit_unix: int | None = None,
 ) -> None:
-    bits = 32
-    prefix = f"{start}/32"
-    try:
-        nets = list(
-            ipaddress.summarize_address_range(
-                ipaddress.ip_address(start), ipaddress.ip_address(end)
-            )
-        )
-        if len(nets) == 1:
-            prefix = str(nets[0])
-            bits = int(prefix.split("/")[1])
-    except ValueError:
-        pass
-    cu = int(commit_unix if commit_unix is not None else fields.get("commit_unix") or time.time())
-    # §23.8 性能：数值范围列 + 索引——TEXT BETWEEN 无法用索引且比较错误。
-    try:
-        si = int(ipaddress.ip_address(start))
-        ei = int(ipaddress.ip_address(end))
-    except ValueError:
-        si = ei = -1
-    epochs = {}
-    for f in EPOCH_FIELDS:
-        val = fields.get(f, "")
-        epochs[f"e_{f}"] = cu if val else int(fields.get(f"e_{f}") or 0)
+    # 末尾的 start_i/end_i 是数值范围列（init_schema 的 ALTER + idx_geoip_numeric）。
+    # 绑定元组一直带着 si/ei，列清单却漏了它们 —— 34 个占位符对 36 个参数，
+    # upsert_range 每次都抛 ProgrammingError，所有走它的 enrich/seed 全部静默失败。
+    p = _range_insert_params(start, end, fields, weight, source, commit_unix)
+    if _is_v6_addr(start):
+        conn.execute(_IPV6_INSERT_SQL, _ipv6_insert_params(p))
+    else:
+        conn.execute(_RANGE_INSERT_SQL, p)
 
-    conn.execute(
-        # 末尾的 start_i/end_i 是数值范围列（init_schema 的 ALTER + idx_geoip_numeric）。
-        # 绑定元组一直带着 si/ei，列清单却漏了它们 —— 34 个占位符对 36 个参数，
-        # upsert_range 每次都抛 ProgrammingError，所有走它的 enrich/seed 全部静默失败。
-        """INSERT INTO geoip (
-            ip_start, ip_end, bits, weight, prefix,
-            country, province, region, city, district, isp, dc,
-            asn, as_org, net_org, cloud_provider, cloud_region, cloud_service,
-            hosting, division_code, source,
-            e_country, e_province, e_city, e_district, e_isp,
-            e_asn, e_as_org, e_net_org, e_cloud_provider, e_cloud_region,
-            e_cloud_service, e_hosting, commit_unix,
-            start_i, end_i
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                  ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-        (
-            start,
-            end,
-            bits,
-            weight,
-            prefix,
-            fields.get("country", ""),
-            fields.get("province", fields.get("region", "")),
-            fields.get("region", ""),
-            fields.get("city", ""),
-            fields.get("district", ""),
-            fields.get("isp", ""),
-            fields.get("dc", ""),
-            fields.get("asn", ""),
-            fields.get("as_org", ""),
-            fields.get("net_org", ""),
-            fields.get("cloud_provider", ""),
-            fields.get("cloud_region", ""),
-            fields.get("cloud_service", ""),
-            fields.get("hosting", ""),
-            fields.get("division_code", ""),
-            source or fields.get("source", ""),
-            epochs["e_country"],
-            epochs["e_province"],
-            epochs["e_city"],
-            epochs["e_district"],
-            epochs["e_isp"],
-            epochs["e_asn"],
-            epochs["e_as_org"],
-            epochs["e_net_org"],
-            epochs["e_cloud_provider"],
-            epochs["e_cloud_region"],
-            epochs["e_cloud_service"],
-            epochs["e_hosting"],
-            cu,
-            si,
-            ei,
-        ),
-    )
+
+def upsert_range_many(
+    conn: sqlite3.Connection,
+    rows,
+    *,
+    batch_size: int = 2000,
+) -> int:
+    """批量写入 range 行（ASN/BGP 等百万行导入用）。
+
+    `rows` 是 `(start, end, fields, weight, source, commit_unix)` 的可迭代对象；
+    返回写入行数。v4 写主表 `geoip`、v6 写 `ipv6` range 表（与 Rust 查询侧
+    按地址族分流的口径一致）。单行 `execute` 的 Python/SQLite 调用开销在百万级
+    数据上会占掉大部分运行时间，批量 `executemany` 后同一条 SQL 仍走
+    `_range_insert_params`，保证列顺序与单行写入完全一致。
+    """
+    n = 0
+    v4_batch: list[tuple] = []
+    v6_batch: list[tuple] = []
+
+    def flush_v4() -> None:
+        nonlocal n
+        if v4_batch:
+            conn.executemany(_RANGE_INSERT_SQL, v4_batch)
+            n += len(v4_batch)
+            v4_batch.clear()
+
+    def flush_v6() -> None:
+        nonlocal n
+        if v6_batch:
+            conn.executemany(_IPV6_INSERT_SQL, v6_batch)
+            n += len(v6_batch)
+            v6_batch.clear()
+
+    for start, end, fields, weight, source, cu in rows:
+        p = _range_insert_params(start, end, fields, weight, source, cu)
+        if _is_v6_addr(start):
+            v6_batch.append(_ipv6_insert_params(p))
+            if len(v6_batch) >= batch_size:
+                flush_v6()
+        else:
+            v4_batch.append(p)
+            if len(v4_batch) >= batch_size:
+                flush_v4()
+    flush_v4()
+    flush_v6()
+    return n
 
 
 def write_sources_meta(path: Path, meta: dict[str, Any]) -> None:

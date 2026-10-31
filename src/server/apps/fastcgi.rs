@@ -265,7 +265,14 @@ fn parse_cgi_response(raw: Bytes) -> Result<FcgiResponse> {
     let (head, body) = if let Some(i) = sep {
         (raw.slice(..i), raw.slice(i..))
     } else {
-        (Bytes::new(), raw)
+        // 没有头/体分隔 = 上游没有回合法的 CGI/FastCGI 响应（裸 body / 空输出）。
+        // nginx 对同形态回 502（"upstream sent no valid HTTP/1.0 header"）；旧实现把
+        // 整段当 body 回 200，于是「上游吐出垃圾」在客户端看起来像正常内容，与
+        // 「引擎崩溃 → 502」的其它路径不一致。细节只进日志（`engine_error` 节流）。
+        bail!(
+            "fastcgi: 上游输出不含 CGI 响应头（不是合法响应，{} 字节）",
+            raw.len()
+        );
     };
     // skip blank line bytes in body
     let body = if body.starts_with(b"\r\n\r\n") {
@@ -290,7 +297,14 @@ fn parse_cgi_response(raw: Bytes) -> Result<FcgiResponse> {
             if k.eq_ignore_ascii_case("Status") {
                 if let Some(code) = v.split_whitespace().next() {
                     if let Ok(n) = code.parse::<u16>() {
-                        status = StatusCode::from_u16(n).unwrap_or(StatusCode::OK);
+                        // 只接受 2xx..5xx（与 app_ffi::status_code 同口径）：0/1xx 会被
+                        // hyper 改成 500 并掐连接，>599 不是合法 HTTP 状态（h2 对端
+                        // PROTOCOL_ERROR）。合法段原样透传。
+                        status = if (200..=599).contains(&n) {
+                            StatusCode::from_u16(n).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR)
+                        } else {
+                            StatusCode::INTERNAL_SERVER_ERROR
+                        };
                     }
                 }
                 continue;
@@ -546,5 +560,36 @@ mod sanitize_tests {
         assert_eq!(find_header_sep(b"a: b\r\n\r\nx"), Some(4));
         // 纯 LF 分隔
         assert_eq!(find_header_sep(b"a: b\n\nx"), Some(4));
+    }
+}
+
+#[cfg(test)]
+mod parse_tests {
+    use super::*;
+
+    #[test]
+    fn bare_body_is_rejected() {
+        assert!(parse_cgi_response(Bytes::from_static(b"hello\n")).is_err());
+        assert!(parse_cgi_response(Bytes::new()).is_err());
+    }
+
+    #[test]
+    fn invalid_status_maps_to_500() {
+        for (raw, want) in [
+            (&b"Status: 999 Weird\r\n\r\nx"[..], 500u16),
+            (&b"Status: 101 Switching\r\n\r\nx"[..], 500),
+            (&b"Status: 0 Zero\r\n\r\nx"[..], 500),
+            (&b"Status: 418 Teapot\r\n\r\nx"[..], 418),
+        ] {
+            let r = parse_cgi_response(Bytes::copy_from_slice(raw)).unwrap();
+            assert_eq!(r.status.as_u16(), want);
+        }
+    }
+
+    #[test]
+    fn empty_header_block_is_valid() {
+        let r = parse_cgi_response(Bytes::from_static(b"\r\n\r\nhello")).unwrap();
+        assert_eq!(r.status, StatusCode::OK);
+        assert_eq!(r.body, Bytes::from_static(b"hello"));
     }
 }

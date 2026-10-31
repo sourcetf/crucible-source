@@ -39,7 +39,7 @@ pub fn has_rules(lc: &ListenerConfig) -> bool {
 ///
 /// 所有评估入口（apply / scan_immediate / rewrite_path / pass_upstream /
 /// response_headers）都经此遍历，保证「首个命中者胜」在协议间与优先级间一致。
-fn ordered<'a>(lc: &'a ListenerConfig) -> Vec<&'a PageRuleConfig> {
+fn ordered(lc: &ListenerConfig) -> Vec<&PageRuleConfig> {
     let g = &lc.global_page_rules;
     let l = &lc.page_rules;
     let mut v: Vec<&PageRuleConfig> = Vec::with_capacity(g.len() + l.len());
@@ -367,6 +367,40 @@ const COUNTRY_CACHE_TTL: Duration = Duration::from_secs(60);
 const COUNTRY_CACHE_CAP: usize = 4096;
 const COUNTRY_OPEN_RETRY: Duration = Duration::from_secs(30);
 
+/// GeoIP 库文件身份 `(dev, ino, mtime, mtime_nsec)`。
+///
+/// U-17：离线更新链是「staging 写好后 `mv` 原子换库」。旧缓存只按路径 + 60s TTL
+/// 失效，`mv` 之后旧连接仍指着**已删除的旧 inode**，最长 60s 内国家结论不更新
+/// （实测 61.5s 后仍返回旧国家）。每次请求顺手 stat 一次（本来就有 `is_file()`），
+/// 身份变化即整表失效并重开连接。
+type DbStamp = (u64, u64, i64, i64);
+
+fn db_stamp(path: &Path) -> Option<DbStamp> {
+    let meta = std::fs::metadata(path).ok()?;
+    if !meta.is_file() {
+        return None;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        Some((
+            meta.dev(),
+            meta.ino(),
+            meta.mtime(),
+            meta.mtime_nsec() as i64,
+        ))
+    }
+    #[cfg(not(unix))]
+    {
+        let modified = meta
+            .modified()
+            .ok()?
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()?;
+        Some((0, 0, modified.as_secs() as i64, i64::from(modified.subsec_nanos())))
+    }
+}
+
 /// 进程级 GeoIP 查询缓存。
 ///
 /// 为什么要缓存连接：`geoip_panel::db::open` 每次都会跑一遍迁移 DDL + 索引创建，
@@ -374,11 +408,14 @@ const COUNTRY_OPEN_RETRY: Duration = Duration::from_secs(30);
 /// 这里按库文件缓存一个只读查询连接，并把 (库, IP) → 国家 的结果缓存 60s：
 /// - 只有在规则声明 country 时才会走到；
 /// - 同一客户端 IP 的连续请求不再查库；
-/// - 库换文件（同名路径）时靠 60s TTL 自然切换（配置重载也会触发新 listener 快照）。
+/// - 库文件被替换/原地更新（`DbStamp` 变化）时立即失效，不依赖 60s TTL；
+/// - 条目数硬上限 [`COUNTRY_CACHE_CAP`]，高基数源 IP 不会让内存无界增长。
 ///
 /// 打开失败时退避 30s：库不存在不应让每个带 country 的请求都去撞一次文件系统。
 struct CountryCache {
     db: Option<PathBuf>,
+    /// 当前连接对应的库文件身份（原子换库检测）。
+    stamp: Option<DbStamp>,
     conn: Option<rusqlite::Connection>,
     open_failed_until: Option<Instant>,
     entries: HashMap<(PathBuf, IpAddr), (Instant, Option<String>)>,
@@ -387,6 +424,7 @@ struct CountryCache {
 static COUNTRY_CACHE: Lazy<Mutex<CountryCache>> = Lazy::new(|| {
     Mutex::new(CountryCache {
         db: None,
+        stamp: None,
         conn: None,
         open_failed_until: None,
         entries: HashMap::new(),
@@ -399,7 +437,18 @@ fn country_of_peer(db: &Path, peer: IpAddr) -> Option<String> {
     let ip = crate::server::geoip_panel::iputil::unmap_v4_mapped(peer);
     let key = (db.to_path_buf(), ip);
     let now = Instant::now();
+    // U-17：库文件身份变化（staging → 原子 mv 换库，或库被删/重建）时，旧连接
+    // 指向的 inode 已经过期。`db.is_file()` 本来就要 stat；这里复用同一次元数据
+    // 读取做身份比较。身份不同就清空全部 (库, IP) 结果并丢弃连接。
+    let stamp = db_stamp(db);
     let mut cache = COUNTRY_CACHE.lock();
+    if cache.stamp != stamp {
+        cache.entries.clear();
+        cache.conn = None;
+        cache.db = None;
+        cache.open_failed_until = None;
+        cache.stamp = stamp;
+    }
 
     if let Some((at, val)) = cache.entries.get(&key) {
         if now.duration_since(*at) <= COUNTRY_CACHE_TTL {
@@ -418,7 +467,7 @@ fn country_of_peer(db: &Path, peer: IpAddr) -> Option<String> {
     // 会在请求热路径上按配置里的笔误路径落下一个空 sqlite 文件。缺少库 = 无国家
     // 信息 ⇒ 直接 fail-closed（与「库存在但无记录」同语义），并缓存负结果，
     // 避免每个请求都 stat / 尝试建库。
-    if !db.is_file() {
+    if stamp.is_none() {
         crate::server::log_throttle::warn_every(
             "page-rules-geoip-missing",
             Duration::from_secs(300),
@@ -505,7 +554,7 @@ pub fn apply(
 ) -> Option<Response<BoxBody>> {
     let path = req.uri().path();
     for rule in ordered(lc) {
-        if rule_matches(rule, path, &ctx) {
+        if rule_matches(rule, path, ctx) {
             match rule.action.as_str() {
                 "redirect" => {
                     return Some(redirect_response(
@@ -1207,5 +1256,85 @@ mod tests {
         // 补上库路径但文件不存在 ⇒ 同样不命中（且不会 panic）。
         ctx.geoip_db = Some(Path::new("/nonexistent/crucible-geoip-test.sqlite"));
         assert_eq!(apply_simple(&lc, "/geo", &ctx), None);
+    }
+
+    /// U-17：country 结果缓存是硬上限 4096 —— 即使 5000+ 个不同源 IP 全命中/全未命中，
+    /// 条目数也不会无限增长（内存有界）。
+    #[test]
+    fn country_cache_is_bounded_under_high_cardinality() {
+        let mut cache = CountryCache {
+            db: None,
+            stamp: None,
+            conn: None,
+            open_failed_until: None,
+            entries: HashMap::new(),
+        };
+        let now = Instant::now();
+        let db = PathBuf::from("/tmp/crucible-u17.sqlite");
+        for i in 0..(COUNTRY_CACHE_CAP + 5000) {
+            let ip = IpAddr::V4(std::net::Ipv4Addr::from(0x0a00_0000u32 + i as u32));
+            cache_insert(&mut cache, (db.clone(), ip), now, None);
+        }
+        assert_eq!(
+            cache.entries.len(),
+            COUNTRY_CACHE_CAP,
+            "高基数源 IP 不得让缓存超过 {COUNTRY_CACHE_CAP} 条"
+        );
+    }
+
+    /// U-17：原子换库（同路径 rename 新 inode）必须改变 `db_stamp`，从而让
+    /// `country_of_peer` 丢弃旧连接/旧结果，而不是等满 60s TTL。
+    #[test]
+    fn db_stamp_changes_when_db_is_replaced() {
+        let dir = std::env::temp_dir().join(format!(
+            "crucible-page-rules-stamp-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let live = dir.join("geoip.sqlite");
+        let fresh = dir.join("geoip.new");
+        std::fs::write(&live, b"old-db").unwrap();
+        let s1 = db_stamp(&live).expect("existing file");
+        std::fs::write(&fresh, b"new-db-with-different-inode").unwrap();
+        std::fs::rename(&fresh, &live).unwrap();
+        let s2 = db_stamp(&live).expect("replaced file");
+        assert_ne!(s1, s2, "rename 换库必须改变文件身份");
+        // 非文件/不存在 → None（与 `is_file()` 同语义）。
+        assert!(db_stamp(&dir).is_none());
+        assert!(db_stamp(&dir.join("missing")).is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// U-17：`::ffff:a.b.c.d` 的 peer 必须按 v4 命中 `127.0.0.0/8` 行（双栈 listener
+    /// 在 Linux 上把 IPv4 客户端表示为 v4-mapped IPv6）。
+    #[test]
+    fn v4_mapped_peer_hits_v4_country_row() {
+        let dir = std::env::temp_dir().join(format!(
+            "crucible-page-rules-mapped-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("geoip.sqlite");
+        {
+            let conn = crate::server::geoip_panel::db::open(&db).unwrap();
+            conn.execute(
+                "INSERT INTO geoip(ip_start, ip_end, prefix, bits, weight, country,
+                                   commit_unix, start_i, end_i)
+                 VALUES('127.0.0.0','127.255.255.255','127.0.0.0/8',8,500,'CN',1,
+                        2130706432,2147483647)",
+                [],
+            )
+            .unwrap();
+        }
+        assert_eq!(
+            country_of_peer(&db, "::ffff:127.0.0.1".parse().unwrap()).as_deref(),
+            Some("CN"),
+            "v4-mapped peer 必须折回 v4 后命中 127.0.0.0/8"
+        );
+        assert_eq!(
+            country_of_peer(&db, "127.0.0.1".parse().unwrap()).as_deref(),
+            Some("CN")
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

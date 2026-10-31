@@ -27,9 +27,11 @@ pub fn metrics_body() -> String {
          crucible_requests_total {}\n\
          # HELP crucible_h3_streams_active Active HTTP/3 streams\n\
          # TYPE crucible_h3_streams_active gauge\n\
-         crucible_h3_streams_active {}\n",
+         crucible_h3_streams_active {}\n{}",
         REQUESTS_TOTAL.load(Ordering::Relaxed),
         H3_STREAMS_ACTIVE.load(Ordering::Relaxed),
+        // R-04 / G-14：引擎看门狗放弃的 worker、沙箱 spawn/kill、真卸载计数。
+        crate::server::apps::app_ffi::engine_metrics_lines(),
     )
 }
 

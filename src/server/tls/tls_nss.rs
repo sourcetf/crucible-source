@@ -1,38 +1,77 @@
 //! NSS legacy TLS handshake handler (SSLv3 / IE6 v2-compatible hello).
 //!
 //! Compiled only when feature `tls_nss` is enabled.
+//!
+//! # Thread model (G-04)
+//!
+//! Per connection:
+//! - handshake: one `spawn_blocking` slot running the C `SSL_ForceHandshake`
+//!   (blocking fd), bounded by [`LEGACY_HANDSHAKE_MAX_CONCURRENT`] and the 10s
+//!   [`LEGACY_HANDSHAKE_TIMEOUT`] deadline; on timeout `shutdown(2)` on the
+//!   relay interrupts `read(2)` and the slot is released;
+//! - established: **one** dedicated poll thread ("cruc-nss-io"). It calls
+//!   non-blocking `PR_Read`/`PR_Write` and blocks in `PR_Poll` on
+//!   {SSL fd, pollable event}; the async writer side sets the pollable event
+//!   (`crucible_nss_wakeup`) whenever it queues response bytes. The previous
+//!   design used one reader thread + one writer thread (2 OS threads); the
+//!   relay itself is a tokio task (`copy_bidirectional`, no OS thread).
+//!
+//! NSS's non-blocking `PR_Write` contract makes a single thread sufficient:
+//! `ssl3_SendApplicationData` never consumes the whole user buffer into its
+//! internal ciphertext `pendingBuf` without leaving the last byte unconsumed
+//! (`appDataBuffered`), so retrying the exact remainder sends the buffered
+//! ciphertext first. FIN on close stays an explicit `shutdown(SHUT_WR)` on the
+//! relay fd (legacy stacks have no close_notify).
 
 use crate::config::{ListenerConfig, SslConfig};
 use crate::server::live_config::LiveConfig;
 use crate::server::ssl_material;
-use crate::server::tls::legacy_io::{relay_with_peek, run_legacy_handshake, sync_io_bridge};
+use crate::server::tls::legacy_io::{relay_with_peek, run_legacy_handshake, LegacyRelay};
 use crate::server::{h1};
 use anyhow::{Context, Result};
-use std::io::{Read, Write};
+use std::io;
 use std::net::SocketAddr;
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context as TaskContext, Poll};
+use std::time::{Duration, Instant};
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::TcpStream;
 
 mod ffi {
-    use std::os::raw::c_int;
+    use std::os::raw::{c_int, c_uchar};
 
     #[link(name = "crucible_tls_nss", kind = "static")]
     extern "C" {
         pub fn crucible_nss_init(config_dir: *const u8) -> c_int;
         pub fn crucible_nss_accept(
             relay_fd: c_int,
-            cert_pem: *const u8,
+            cert_pem: *const c_uchar,
             cert_len: usize,
-            key_pem: *const u8,
+            key_pem: *const c_uchar,
             key_len: usize,
         ) -> *mut crucible_nss_conn;
-        pub fn crucible_nss_read(conn: *mut crucible_nss_conn, buf: *mut u8, len: usize) -> isize;
-        pub fn crucible_nss_write(conn: *mut crucible_nss_conn, buf: *const u8, len: usize) -> isize;
+        pub fn crucible_nss_read(conn: *mut crucible_nss_conn, buf: *mut c_uchar, len: usize) -> isize;
+        pub fn crucible_nss_write(
+            conn: *mut crucible_nss_conn,
+            buf: *const c_uchar,
+            len: usize,
+        ) -> isize;
+        /// Bitmask: 1=readable, 2=writable, 4=wakeup, 0=timeout, -1=error.
+        pub fn crucible_nss_poll(
+            conn: *mut crucible_nss_conn,
+            want_read: c_int,
+            want_write: c_int,
+            timeout_ms: c_int,
+        ) -> c_int;
+        pub fn crucible_nss_wakeup(conn: *mut crucible_nss_conn) -> c_int;
         pub fn crucible_nss_free(conn: *mut crucible_nss_conn);
     }
 
+    #[allow(non_camel_case_types)]
     pub enum crucible_nss_conn {}
 }
+
 
 pub fn global_init() -> Result<()> {
     // NSS_Init 进程级只做一次（此前每条连接重复 init，既慢又有状态泄漏风险）。
@@ -50,8 +89,11 @@ pub fn global_init() -> Result<()> {
     res.clone().map_err(anyhow::Error::msg)
 }
 
-/// NSS 连接共享指针：PR_Read/PR_Write 在同一描述符上并发调用由 NSPR 内部锁保护
-/// （TLS 全双工语义）；引用计数归零时释放，杜绝双重 free。
+/// NSS 连接共享指针：引用计数归零时释放，杜绝双重 free。
+///
+/// 所有 I/O 由唯一一条 poll 线程发起（见 [`spawn_poll_io`]），因此
+/// PR_Read/PR_Write 之间没有并发调用；`wakeup` 可从 async 写侧线程调用
+/// （NSPR pollable event 是线程安全的合并事件）。
 struct NssShared {
     conn: *mut ffi::crucible_nss_conn,
 }
@@ -59,34 +101,55 @@ struct NssShared {
 unsafe impl Send for NssShared {}
 unsafe impl Sync for NssShared {}
 
+/// `crucible_nss_read/write` 的返回值：>=0 字节数（0=EOF），-2=would-block，
+/// -1=错误（Shim 不把 NSPR 错误码当 errno 暴露，日志只记录类别）。
+fn map_io(n: isize) -> io::Result<usize> {
+    match n {
+        -2 => Err(io::Error::from(io::ErrorKind::WouldBlock)),
+        n if n < 0 => Err(io::Error::last_os_error()),
+        n => Ok(n as usize),
+    }
+}
+
 impl NssShared {
-    fn read(&self, buf: &mut [u8]) -> std::io::Result<usize> {
+    fn read(&self, buf: &mut [u8]) -> io::Result<usize> {
         if self.conn.is_null() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::NotConnected,
-                "nss closed",
-            ));
+            return Err(io::Error::new(io::ErrorKind::NotConnected, "nss closed"));
         }
-        let n = unsafe { ffi::crucible_nss_read(self.conn, buf.as_mut_ptr(), buf.len()) };
-        if n < 0 {
-            Err(std::io::Error::last_os_error())
+        map_io(unsafe { ffi::crucible_nss_read(self.conn, buf.as_mut_ptr(), buf.len()) })
+    }
+
+    fn write(&self, buf: &[u8]) -> io::Result<usize> {
+        if self.conn.is_null() {
+            return Err(io::Error::new(io::ErrorKind::NotConnected, "nss closed"));
+        }
+        map_io(unsafe { ffi::crucible_nss_write(self.conn, buf.as_ptr(), buf.len()) })
+    }
+
+    fn poll(&self, want_read: bool, want_write: bool, timeout_ms: i32) -> io::Result<i32> {
+        if self.conn.is_null() {
+            return Err(io::Error::new(io::ErrorKind::NotConnected, "nss closed"));
+        }
+        let rc = unsafe {
+            ffi::crucible_nss_poll(
+                self.conn,
+                want_read as i32,
+                want_write as i32,
+                timeout_ms,
+            )
+        };
+        if rc < 0 {
+            Err(io::Error::last_os_error())
         } else {
-            Ok(n as usize)
+            Ok(rc)
         }
     }
 
-    fn write(&self, buf: &[u8]) -> std::io::Result<usize> {
-        if self.conn.is_null() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::NotConnected,
-                "nss closed",
-            ));
-        }
-        let n = unsafe { ffi::crucible_nss_write(self.conn, buf.as_ptr(), buf.len()) };
-        if n < 0 {
-            Err(std::io::Error::last_os_error())
-        } else {
-            Ok(n as usize)
+    fn wakeup(&self) {
+        if !self.conn.is_null() {
+            unsafe {
+                ffi::crucible_nss_wakeup(self.conn);
+            }
         }
     }
 }
@@ -102,25 +165,250 @@ impl Drop for NssShared {
     }
 }
 
-/// 读写 half：Clone 共享同一 NssShared，分别交给桥的读/写线程。
-#[derive(Clone)]
-struct NssHalf {
+/// 已建立 NSS 连接的 async 侧。写方向把明文块交给 poll 线程并唤醒它；
+/// 读方向从 poll 线程的通道取解密后的明文。
+struct NssPollIo {
+    rx: tokio::sync::mpsc::Receiver<io::Result<Vec<u8>>>,
+    chunk: Option<Vec<u8>>,
+    off: usize,
+    tx: Option<tokio::sync::mpsc::UnboundedSender<Vec<u8>>>,
+    /// 仅用于 Drop 时唤醒即将退出的 poll 线程（持 Arc 保证 conn 指针有效）。
     shared: Arc<NssShared>,
 }
 
-impl Read for NssHalf {
-    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        self.shared.read(buf)
+impl Drop for NssPollIo {
+    fn drop(&mut self) {
+        // 关闭写通道，让 poll 线程写完剩余数据后收尾并发 FIN。
+        self.tx.take();
+        self.shared.wakeup();
     }
 }
 
-impl Write for NssHalf {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        self.shared.write(buf)
+impl AsyncRead for NssPollIo {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut TaskContext<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        // 消费上次取回但未读完的残余。
+        if self.chunk.is_none() {
+            match self.rx.poll_recv(cx) {
+                Poll::Pending => return Poll::Pending,
+                Poll::Ready(Some(Ok(data))) => {
+                    if data.is_empty() {
+                        return Poll::Ready(Ok(())); // 读线程显式 EOF
+                    }
+                    self.chunk = Some(data);
+                    self.off = 0;
+                }
+                Poll::Ready(Some(Err(e))) => return Poll::Ready(Err(e)),
+                Poll::Ready(None) => return Poll::Ready(Ok(())),
+            }
+        }
+        let n = {
+            let chunk = self.chunk.as_ref().expect("chunk set above");
+            let take = (chunk.len() - self.off).min(buf.remaining());
+            buf.put_slice(&chunk[self.off..self.off + take]);
+            take
+        };
+        self.off += n;
+        if self
+            .chunk
+            .as_ref()
+            .is_some_and(|c| self.off >= c.len())
+        {
+            self.chunk = None;
+            self.off = 0;
+        }
+        Poll::Ready(Ok(()))
+    }
+}
+
+impl AsyncWrite for NssPollIo {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        _cx: &mut TaskContext<'_>,
+        data: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        if data.is_empty() {
+            return Poll::Ready(Ok(0));
+        }
+        let Some(tx) = self.tx.as_ref() else {
+            return Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "nss poll thread gone",
+            )));
+        };
+        match tx.send(data.to_vec()) {
+            Ok(()) => {
+                // 只有写侧知道队列里出现了新数据；唤醒可能正阻塞在 PR_Poll
+                // 的 poll 线程。
+                self.shared.wakeup();
+                Poll::Ready(Ok(data.len()))
+            }
+            Err(_) => Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "nss poll thread gone",
+            ))),
+        }
     }
 
-    fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
+    fn poll_flush(self: Pin<&mut Self>, _cx: &mut TaskContext<'_>) -> Poll<io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut TaskContext<'_>) -> Poll<io::Result<()>> {
+        // legacy 栈无 close_notify；写线程收尾时对 relay 做 SHUT_WR。
+        Poll::Ready(Ok(()))
+    }
+}
+
+const NSS_IO_BUF: usize = 16 * 1024;
+/// 写侧「零进展」上限：有排队响应但 NSS 连续这么久一个字节都没能交给内核
+/// （对端不读、内核发送缓冲全满）就强制关断，线程必有界。只要还在前进，
+/// 慢客户端可以慢慢下载（响应体 ≤16MiB）；与 h1 的 body 空闲超时同量级。
+const NSS_IO_WRITE_IDLE: Duration = Duration::from_secs(60);
+
+/// 启动唯一一条 poll 线程：非阻塞 PR_Read/PR_Write + PR_Poll 双向驱动。
+fn spawn_poll_io(shared: Arc<NssShared>, relay: LegacyRelay) -> NssPollIo {
+    let (r_tx, r_rx) = tokio::sync::mpsc::channel::<io::Result<Vec<u8>>>(8);
+    let (w_tx, mut w_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
+    let thread_shared = Arc::clone(&shared);
+
+    let _ = std::thread::Builder::new()
+        .name("cruc-nss-io".into())
+        .spawn(move || poll_loop(thread_shared, relay, r_tx, &mut w_rx));
+
+    NssPollIo {
+        rx: r_rx,
+        chunk: None,
+        off: 0,
+        tx: Some(w_tx),
+        shared,
+    }
+}
+
+fn poll_loop(
+    shared: Arc<NssShared>,
+    relay: LegacyRelay,
+    r_tx: tokio::sync::mpsc::Sender<io::Result<Vec<u8>>>,
+    w_rx: &mut tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>,
+) {
+    let mut relay = Some(relay);
+    let mut pending: Vec<u8> = Vec::new();
+    let mut off = 0usize;
+    let mut read_open = true;
+    let mut write_closed = false;
+    let mut last_write_progress = Instant::now();
+    let mut rbuf = vec![0u8; NSS_IO_BUF];
+
+    loop {
+        // 1. 收集 async 写侧排队的明文。通道断开 = h1 处理完整条连接。
+        loop {
+            match w_rx.try_recv() {
+                Ok(data) => pending.extend_from_slice(&data),
+                Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
+                Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
+                    write_closed = true;
+                    break;
+                }
+            }
+        }
+        if off > 0 {
+            if off >= pending.len() {
+                pending.clear();
+                off = 0;
+            } else if off >= NSS_IO_BUF {
+                pending.drain(..off);
+                off = 0;
+            }
+        }
+
+        // 2. 非阻塞写。NSS 的 PR_Write 返回「已消费的明文字节数」；
+        //    按返回值前进、保留剩余字节重试，就等于让 NSS 先把内部
+        //    pendingBuf 里的密文发完（见模块文档）。
+        let mut write_err: Option<io::Error> = None;
+        while off < pending.len() {
+            match shared.write(&pending[off..]) {
+                Ok(0) => break,
+                Ok(n) => {
+                    off += n;
+                    last_write_progress = Instant::now();
+                }
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
+                Err(e) => {
+                    write_err = Some(e);
+                    break;
+                }
+            }
+        }
+        if let Some(e) = write_err {
+            log::debug!(target: "tls_nss", "nss poll write end: {e}");
+            let _ = r_tx.blocking_send(Err(e));
+            break;
+        }
+        if off >= pending.len() {
+            pending.clear();
+            off = 0;
+        }
+
+        // 3. 非阻塞读（先读再 poll：NSS 可能已在握手/上一次读时缓冲了明文）。
+        if read_open {
+            loop {
+                match shared.read(&mut rbuf) {
+                    Ok(0) => {
+                        let _ = r_tx.blocking_send(Ok(Vec::new()));
+                        read_open = false;
+                        break;
+                    }
+                    Ok(n) => {
+                        if r_tx.blocking_send(Ok(rbuf[..n].to_vec())).is_err() {
+                            read_open = false;
+                            break;
+                        }
+                    }
+                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
+                    Err(e) => {
+                        // 遗留客户端通常直接 close（无 close_notify），NSS 报
+                        // PR_END_OF_FILE_ERROR；按 EOF 处理，让已排队的响应仍能写完。
+                        log::debug!(target: "tls_nss", "nss poll read end: {e}");
+                        let _ = r_tx.blocking_send(Ok(Vec::new()));
+                        read_open = false;
+                        break;
+                    }
+                }
+            }
+        }
+
+        // 4. 退出条件。
+        let pending_done = off >= pending.len();
+        if write_closed && pending_done {
+            break;
+        }
+        if !pending_done && last_write_progress.elapsed() >= NSS_IO_WRITE_IDLE {
+            // 对端不读、内核发送缓冲持续满：先 shutdown 打断 relay，再放弃剩余响应。
+            if let Some(r) = relay.as_ref() {
+                r.interrupt();
+            }
+            break;
+        }
+
+        // 5. 阻塞等待：{SSL fd 可读/可写, wakeup event}。
+        // 有未写完数据时用短超时轮询「零进展」期限；否则阻塞到事件。
+        let want_write = !pending_done;
+        let timeout_ms = if pending_done { -1 } else { 250 };
+        match shared.poll(read_open, want_write, timeout_ms) {
+            Ok(_) => {}
+            Err(_) => {
+                let _ = r_tx.blocking_send(Ok(Vec::new()));
+                break;
+            }
+        }
+    }
+
+    // 统一收尾：显式 FIN（遗留栈没有 close_notify）；C 连接在 Arc 归零时释放。
+    if let Some(r) = relay.take() {
+        r.shutdown_send();
     }
 }
 
@@ -225,17 +513,11 @@ async fn accept_and_serve_inner(
         log::debug!(target: "tls_nss", "nss handshake failed peer={peer}: {e:#}");
         e
     })??;
-    // C 侧持有 relay fd 的 dup。Rust 这份的所有权交给写线程：响应写完后由它
-    // 对 relay 做 SHUT_WR，客户端才能收到 FIN（遗留栈无 close_notify）。
-    // 任务 6：阻塞 IO 移出 executor——读写线程 + mpsc 桥；同一描述符的并发读写
-    // 由 NSPR 内部锁保证（全双工），Drop 只在最后一个 half 释放时 free 一次。
-    let io = sync_io_bridge(
-        NssHalf {
-            shared: Arc::clone(&shared),
-        },
-        NssHalf { shared },
-        Some(relay),
-    );
+    // C 侧持有 relay fd 的 dup。Rust 这份的所有权交给唯一 poll 线程：响应写完后
+    // 由它对 relay 做 SHUT_WR，客户端才能收到 FIN（遗留栈无 close_notify）。
+    // G-04：已建立连接 1 条 OS 线程（旧实现读+写各 1 条，共 2 条；再早是 relay
+    // 2 条 + sync_io 2 条 = 4 条）。握手仍占 1 个 spawn_blocking 槽（≤128 并发）。
+    let io = spawn_poll_io(shared, relay);
     h1::serve_tls(io, live, lc, peer).await.map_err(|e| {
         log::error!(target: "tls_nss", "nss h1::serve_tls failed peer={peer}: {e:#}");
         e

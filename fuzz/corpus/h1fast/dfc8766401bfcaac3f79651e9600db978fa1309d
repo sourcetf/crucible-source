@@ -1,0 +1,4 @@
+GET /in HTTP/1.1
+Host:1
+If-Noneta!-ch: "bc"
+

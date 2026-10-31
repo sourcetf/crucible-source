@@ -264,7 +264,7 @@ fn raw_edit_drops_all_admins(base: &Toml, merged: &Toml) -> bool {
                 let legacy = a
                     .get("password_hash")
                     .and_then(|v| v.as_str())
-                    .map_or(false, |h| !h.trim().is_empty());
+                    .is_some_and(|h| !h.trim().is_empty());
                 (users, legacy)
             }
         }
@@ -378,7 +378,7 @@ pub fn remove_listener(tree: &mut Toml, port: u16) -> Result<bool> {
 }
 
 /// 定位某 listener 的可变表。
-pub fn listener_table_mut<'a>(tree: &'a mut Toml, port: u16) -> Result<&'a mut toml::map::Map<String, Toml>> {
+pub fn listener_table_mut(tree: &mut Toml, port: u16) -> Result<&mut toml::map::Map<String, Toml>> {
     let arr = listeners_mut(tree)?;
     let idx = arr
         .iter()

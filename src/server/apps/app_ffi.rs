@@ -25,8 +25,10 @@ use parking_lot::Mutex;
 use std::collections::{HashMap, HashSet};
 use std::ffi::{CStr, CString};
 use std::net::SocketAddr;
-use std::os::raw::{c_char, c_int, c_void};
+use std::ops::Deref;
+use std::os::raw::{c_char, c_int};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -91,6 +93,11 @@ const APPENGINE_ABI_VERSION: c_int = 2;
 /// 为什么自己定义：OpenBSD 的 `<dlfcn.h>` 有它（0x400），但 `libc` crate 的 OpenBSD
 /// 绑定没有导出。各平台取值不同，按平台写死；未知平台取 0（退化为普通 dlclose，
 /// 至少在那些平台上不会因常数写错而误置其它 flag）。
+///
+/// **G-14**：这个 flag 不再无条件使用。`CRUCIBLE_APP_UNLOAD=1` 打开后，只有**确有
+/// 后台线程/嵌入式运行时**的引擎（[`DEFAULT_NODELETE_ENGINES`] 白名单）才保留它；
+/// 其余引擎（c/rust/cgi/asp/aspnet/tsx）在热换/配置清理时**真正** `dlclose`，旧映射
+/// 不再常驻。开关默认**关**：所有引擎都保留映射（引入可选卸载之前的现状）。
 #[cfg(target_os = "openbsd")]
 const RTLD_NODELETE_EXT: libc::c_int = 0x400;
 #[cfg(any(target_os = "linux", target_os = "android", target_os = "freebsd"))]
@@ -105,6 +112,223 @@ const RTLD_NODELETE_EXT: libc::c_int = 0x80;
     target_os = "macos"
 )))]
 const RTLD_NODELETE_EXT: libc::c_int = 0;
+
+/// 默认保留 `RTLD_NODELETE` 的引擎（其余引擎在 `CRUCIBLE_APP_UNLOAD=1` 时真正卸载）。
+///
+/// 判据 = **该 `.so` 里有没有会活过 `appengine_shutdown()` 的后台执行体**
+/// （解释器线程 / Go runtime / Perl 全局解释器）。证据来自构建产物的真实依赖
+/// （`ldd target/app-engines/libapp_*.so`）与引擎源码：
+///
+/// * `python`/`wsgi`/`asgi`/`uwsgi` → `libpython3.14.so`：CPython 的 GC/atexit/
+///   GIL 状态与解释器线程；dlclose 解除映射后线程再跑即 SIGSEGV。
+/// * `ruby`/`rack` → `libruby-3.3.so`：引擎在独立线程里跑 MRI VM
+///   （`libs/script-ffi/script_engine.c` 的 `ruby_thread_main`），GVL 线程亲和。
+/// * `perl`/`psgi` → `libperl.so.5.40`：`PERL_SYS_INIT3` 建的是进程级解释器。
+/// * `lua` → 静态链接的 Lua 运行时；每请求 `lua_close`，但解释器自身属于
+///   「嵌入式运行时」白名单（任务口径）。
+/// * `go` → Go c-shared 运行时（`readelf -d` 显示该 `.so` **自带**
+///   `FLAGS_1: NODELETE`；Go sysmon/GC 线程无法回收）。
+///
+/// 不在表内的 `c`/`rust`/`cgi`/`asp`/`aspnet`/`tsx` 没有这类后台执行体：
+/// 热换后旧映射立即解除（`/proc/self/maps` 不累积，RSS 平稳）。
+///
+/// 可用 `CRUCIBLE_APP_NODELETE_ENGINES` 覆盖（逗号分隔；`-`/`none`/`off`/空 =
+/// 不保留任何 NODELETE —— 运维自担「dlclose 后解释器线程仍指向旧映射」的风险）。
+const DEFAULT_NODELETE_ENGINES: &str = "python,wsgi,asgi,uwsgi,ruby,rack,perl,psgi,lua,go";
+
+/// [`DEFAULT_NODELETE_ENGINES`] 的纯解析部分（便于单测，不读进程环境）。
+fn nodelete_engines_with(override_list: Option<&str>) -> HashSet<String> {
+    let raw = override_list.unwrap_or(DEFAULT_NODELETE_ENGINES);
+    if matches!(raw.trim().to_ascii_lowercase().as_str(), "" | "-" | "none" | "off") {
+        return HashSet::new();
+    }
+    raw.split(',')
+        .map(|s| s.trim().to_ascii_lowercase())
+        .filter(|s| !s.is_empty())
+        .collect()
+}
+
+/// 该引擎的 `.so` 是否必须保留映射（见 [`DEFAULT_NODELETE_ENGINES`]）。
+fn engine_needs_nodelete(engine: &str) -> bool {
+    static SET: Lazy<HashSet<String>> = Lazy::new(|| {
+        let set = nodelete_engines_with(
+            env_lock::read_static_env("CRUCIBLE_APP_NODELETE_ENGINES").as_deref(),
+        );
+        // 启动期一行可观测证据：哪些引擎热换时不会被真正卸载。
+        log::info!("app_ffi: RTLD_NODELETE 引擎白名单 = {:?}", set);
+        set
+    });
+    SET.contains(&engine.to_ascii_lowercase())
+}
+
+/// **G-14**：是否启用「非解释器引擎真正 dlclose」。默认**关**。
+///
+/// 默认关 = 保持现状：**所有**引擎沿用 `RTLD_NODELETE`，热换 `.so` 时不重新装载、
+/// 旧映射常驻（与引入本开关之前逐字相同的行为）。`CRUCIBLE_APP_UNLOAD=1` 打开后：
+///   * `DEFAULT_NODELETE_ENGINES` 白名单（python/ruby/perl/lua/go… 有后台执行体）
+///     **仍然**保留映射 —— dlclose 会抽走解释器线程正在跑的代码，是确定的 SIGSEGV；
+///   * 其余引擎（c/rust/cgi/asp/aspnet/tsx…）走 quiesce + 真 `dlclose`，热换 `.so`
+///     后旧映射被解除，`/proc/<pid>/maps` 不累积。
+///
+/// 打开时若某只引擎在**同一个路径**上被反复热换，`reconcile_unload`/慢路径会用
+/// `(dev,ino,size,mtime_ns)` 指纹发现替换并重装（默认关时不做这个检测，进程一直
+/// 用第一次装载的代码，直到重启 —— 这正是「维持现状」）。
+fn unload_enabled_with(switch: Option<&str>) -> bool {
+    matches!(switch.map(str::trim), Some("1" | "true" | "yes" | "on"))
+}
+
+fn unload_enabled() -> bool {
+    static ON: Lazy<bool> = Lazy::new(|| {
+        let on = unload_enabled_with(env_lock::read_static_env("CRUCIBLE_APP_UNLOAD").as_deref());
+        // 启动期一行可观测证据：真卸载是否启用（报告的热换映射对比依赖它）。
+        log::info!(
+            "app_ffi: CRUCIBLE_APP_UNLOAD={on}（true dlclose of non-runtime engines；\
+             NODELETE 白名单 = {:?}）",
+            nodelete_engines_with(
+                env_lock::read_static_env("CRUCIBLE_APP_NODELETE_ENGINES").as_deref()
+            )
+        );
+        on
+    });
+    *ON
+}
+
+/// 该引擎的 `.so` 在热换/卸载时是否**保留映射**（即用 `RTLD_NODELETE`）。
+///
+/// 默认（`CRUCIBLE_APP_UNLOAD` 关）恒为 `true`：所有引擎都不真正卸载 ——
+/// 这是引入可选卸载之前的现状，保证开关关闭时行为零变化。打开后只有
+/// [`engine_needs_nodelete`] 白名单里的解释器引擎保留，其余引擎真正 dlclose。
+fn lib_keeps_mapping(engine: &str) -> bool {
+    !unload_enabled() || engine_needs_nodelete(engine)
+}
+
+/// 一个 `.so` 文件在磁盘上的身份（G-14 热换检测）。
+///
+/// 为什么用 `(dev, ino, size, mtime_ns)` 而不是只比 mtime：`make engines` 有两种
+/// 常见写法 —— 「`mv` 新文件到同一路径」（inode 变）与「原地 `cp`」（mtime/size 变）；
+/// 单看 mtime 在 1s 粒度的文件系统上会漏掉同一秒内的两次替换。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct LibFingerprint {
+    dev: u64,
+    ino: u64,
+    size: u64,
+    mtime_ns: u128,
+}
+
+fn lib_fingerprint(path: &Path) -> Option<LibFingerprint> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let md = std::fs::metadata(path).ok()?;
+        Some(LibFingerprint {
+            dev: md.dev(),
+            ino: md.ino(),
+            size: md.size(),
+            mtime_ns: md.mtime() as u128 * 1_000_000_000 + md.mtime_nsec() as u128,
+        })
+    }
+    #[cfg(not(unix))]
+    {
+        let md = std::fs::metadata(path).ok()?;
+        let mtime_ns = md
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        Some(LibFingerprint {
+            dev: 0,
+            ino: 0,
+            size: md.len(),
+            mtime_ns,
+        })
+    }
+}
+
+/// G-14 quiesce 的最小状态机：在飞调用租约 + 「卸载中」闸门。
+///
+/// 不变量：`retiring` 一旦置位，[`DrainState::enter`] 不再发出新租约；
+/// 卸载方在 `retiring` 置位后等 `inflight == 0`（有界），期间**已经持有**的租约
+/// 可以继续跑完。租约在 `load_engine` **持 `LIBS` 锁时**登记，因此与
+/// `reconcile_unload` 的「出表 → 排空」之间不存在「刚查到句柄、还没开始调用」的
+/// 漏网窗口（那正是 dlclose 后 use-after-unmap 的来源）。
+struct DrainState {
+    inflight: AtomicUsize,
+    retiring: AtomicBool,
+    mu: Mutex<()>,
+    cv: parking_lot::Condvar,
+}
+
+impl DrainState {
+    fn new() -> Arc<DrainState> {
+        Arc::new(DrainState {
+            inflight: AtomicUsize::new(0),
+            retiring: AtomicBool::new(false),
+            mu: Mutex::new(()),
+            cv: parking_lot::Condvar::new(),
+        })
+    }
+
+    /// 尝试登记一次调用；`None` = 该 `.so` 已进入卸载，调用方必须拒绝新派发。
+    fn enter(self: &Arc<Self>) -> Option<DrainLease> {
+        if self.retiring.load(Ordering::Acquire) {
+            return None;
+        }
+        self.inflight.fetch_add(1, Ordering::AcqRel);
+        // 与 `begin_retire` 赛跑：它可能在两次检查之间置位并看到 inflight==0。
+        // 这里复查；若已置位则撤销登记（`leave` 会负责唤醒等待者）。
+        if self.retiring.load(Ordering::Acquire) {
+            self.leave();
+            return None;
+        }
+        Some(DrainLease {
+            state: Arc::clone(self),
+        })
+    }
+
+    fn leave(&self) {
+        if self.inflight.fetch_sub(1, Ordering::AcqRel) == 1
+            && self.retiring.load(Ordering::Acquire)
+        {
+            // 与 `wait_drained` 的「检查 → wait」配对：通知方必须持同一把锁，
+            // 否则通知可能落在检查与 wait 之间（丢失唤醒 → 卸载方白等满超时）。
+            let _g = self.mu.lock();
+            self.cv.notify_all();
+        }
+    }
+
+    fn begin_retire(&self) {
+        self.retiring.store(true, Ordering::Release);
+    }
+
+    /// 有界等待在飞调用归零。返回 false = 超时（调用方必须推迟 dlclose）。
+    fn wait_drained(&self, timeout: Duration) -> bool {
+        let deadline = std::time::Instant::now() + timeout;
+        let mut g = self.mu.lock();
+        loop {
+            if self.inflight.load(Ordering::Acquire) == 0 {
+                return true;
+            }
+            let remain = deadline.saturating_duration_since(std::time::Instant::now());
+            if remain.is_zero() {
+                return false;
+            }
+            self.cv.wait_for(&mut g, remain);
+        }
+    }
+}
+
+/// 一次调用的在飞租约（Drop 时归还，并唤醒等待排空的卸载方）。
+struct DrainLease {
+    state: Arc<DrainState>,
+}
+
+impl Drop for DrainLease {
+    fn drop(&mut self) {
+        self.state.leave();
+    }
+}
+
 
 struct EngineLib {
     engine: String,
@@ -127,6 +351,12 @@ struct EngineLib {
     /// `appengine_set_base_env` 符号**照样存在**）时若跳锁，那只 .so 就会在别人 `.env`
     /// 生效的窗口里读到别人的私密值 —— 跨应用泄漏又回来了。取自报后，这种 .so 自动留锁。
     env_free: bool,
+    /// dlopen 之后立刻拍下的文件身份（[`LibFingerprint`]），热换检测用。
+    fingerprint: LibFingerprint,
+    /// 在飞调用租约 / 卸载排空（G-14）。
+    drain: Arc<DrainState>,
+    /// 上次指纹复核时刻（进程启动后毫秒；`CRUCIBLE_APP_LIB_RELOAD_TTL_MS` 节流）。
+    fp_checked_ms: AtomicU64,
 }
 
 unsafe impl Send for EngineLib {}
@@ -136,8 +366,39 @@ impl Drop for EngineLib {
     fn drop(&mut self) {
         // Deferred reconcile unload: last Arc drops → shutdown + (libloading 自动 dlclose).
         unsafe { (self.shutdown)() };
+        // 该路径的「卸载中」标记随最后一个句柄消失解除（见 [`RETIRING`]）：
+        // 排空超时的卸载会让旧句柄活到最后一个调用结束，新装载必须一直挡到这一刻。
+        RETIRING.lock().remove(&self.path);
     }
 }
+
+/// 一次引擎调用的句柄：持有 `EngineLib` 的强引用 + 在飞租约（G-14）。
+///
+/// `load_engine` 在**持 `LIBS` 锁**时调用 [`LibLease::acquire`]，因此
+/// `reconcile_unload` 的出表操作与租约登记是互斥的：要么调用先登记（卸载方等它跑完），
+/// 要么出表先发生（这次调用看不到句柄、走慢路径重新装载或明确失败）。
+struct LibLease {
+    lib: Arc<EngineLib>,
+    _drain: DrainLease,
+}
+
+impl Deref for LibLease {
+    type Target = EngineLib;
+    fn deref(&self) -> &EngineLib {
+        &self.lib
+    }
+}
+
+impl LibLease {
+    fn acquire(lib: Arc<EngineLib>) -> Option<LibLease> {
+        let drain = lib.drain.enter()?;
+        Some(LibLease {
+            lib,
+            _drain: drain,
+        })
+    }
+}
+
 
 
 /// 缓存键 = .so 路径字符串（同引擎多 lib 并存时不串台）。
@@ -152,6 +413,83 @@ static LIBS: Lazy<Mutex<HashMap<String, Arc<EngineLib>>>> =
 /// 分路径加锁既消除重复装载，又不让不同引擎互相阻塞。
 static LOAD_LOCKS: Lazy<Mutex<HashMap<String, Arc<Mutex<()>>>>> =
     Lazy::new(|| Mutex::new(HashMap::new()));
+
+/// 正在卸载/热换的 `.so` 路径（G-14）。
+///
+/// 为什么需要它：卸载的 quiesce 是有界的。若在飞调用在超时内没排空，旧映射要活到
+/// 最后一个调用结束（`EngineLib::drop` 才 dlclose）。这段窗口里**不能**重新 dlopen
+/// 同一路径（dlopen 会复用仍在映射中的旧对象，随后新旧两个 `EngineLib` 各调一次
+/// `appengine_init`，旧者的 `shutdown` 会把新实例拆掉）。慢路径见到本表即明确失败，
+/// 由客户端重试；最后一个句柄 Drop 时由 `EngineLib::drop` 移除。
+static RETIRING: Lazy<Mutex<HashSet<String>>> = Lazy::new(|| Mutex::new(HashSet::new()));
+
+/// 卸载 quiesce 的等待上限（毫秒）。`0` = 不等待（立即转为「最后一个引用 Drop 时
+/// dlclose」，仍然不再接受新调用）。默认 2s：正常引擎调用是毫秒级，长请求（cgi 30s）
+/// 不应把一次配置 reload 拖住更久；超时不是错误，只是映射晚一点解除。
+const UNLOAD_TIMEOUT_MS_DEFAULT: u64 = 2000;
+const UNLOAD_TIMEOUT_MS_MAX: u64 = 60_000;
+
+fn unload_timeout_with(raw: Option<&str>) -> Duration {
+    match raw.map(str::trim) {
+        None => Duration::from_millis(UNLOAD_TIMEOUT_MS_DEFAULT),
+        Some(v) => match v.parse::<u64>() {
+            Ok(n) => Duration::from_millis(n.min(UNLOAD_TIMEOUT_MS_MAX)),
+            Err(_) => Duration::from_millis(UNLOAD_TIMEOUT_MS_DEFAULT),
+        },
+    }
+}
+
+fn unload_timeout() -> Duration {
+    static T: Lazy<Duration> = Lazy::new(|| {
+        unload_timeout_with(
+            env_lock::read_static_env("CRUCIBLE_APP_UNLOAD_TIMEOUT_MS").as_deref(),
+        )
+    });
+    *T
+}
+
+/// 热换指纹复核的节流窗口（毫秒）。默认 1s（与 `native_http::lib_available` 的
+/// 判活 TTL 同量级）；`0` = 每个请求都 stat（回归/测试用）。
+fn lib_reload_ttl() -> Duration {
+    static TTL: Lazy<Duration> = Lazy::new(|| {
+        match env_lock::read_static_env("CRUCIBLE_APP_LIB_RELOAD_TTL_MS") {
+            Some(v) => v
+                .trim()
+                .parse::<u64>()
+                .map(Duration::from_millis)
+                .unwrap_or(Duration::from_millis(1000)),
+            None => Duration::from_millis(1000),
+        }
+    });
+    *TTL
+}
+
+fn now_ms() -> u64 {
+    static T0: Lazy<std::time::Instant> = Lazy::new(std::time::Instant::now);
+    T0.elapsed().as_millis().min(u64::MAX as u128) as u64
+}
+
+/// 是否到了下一次指纹复核时间（用 CAS 抢占，避免并发请求同时 stat）。
+fn fp_check_due(lib: &EngineLib) -> bool {
+    // 保留映射（NODELETE）的引擎重新 dlopen 只会拿到同一份旧代码，检测指纹没有意义。
+    // 默认（`CRUCIBLE_APP_UNLOAD` 关）对所有引擎都成立 ⇒ 不做热换检测（维持现状）。
+    if lib_keeps_mapping(&lib.engine) {
+        return false;
+    }
+    let ttl = lib_reload_ttl();
+    if ttl.is_zero() {
+        return true;
+    }
+    let now = now_ms();
+    let last = lib.fp_checked_ms.load(Ordering::Relaxed);
+    if now.saturating_sub(last) < ttl.as_millis() as u64 {
+        return false;
+    }
+    lib.fp_checked_ms
+        .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
+        .is_ok()
+}
+
 
 // ------------------------------------------------------------------ 看门狗（墙钟）
 
@@ -320,15 +658,11 @@ pub async fn execute(
     // §7.10 热路径：GET/HEAD 无 body 时不 collect，保持 rust≈static 的延迟。
     // 任务 6（OOM 防护）：引擎请求体上限 32MiB，超限 413。
     let body_bytes = if request_has_body(&parts.method, &parts.headers) {
-        match http_body_util::Limited::new(body, crate::server::h1::APP_BODY_CAP).collect().await
-        {
-            Ok(c) => c.to_bytes(),
-            Err(_) => {
-                return Ok(Response::builder()
-                    .status(StatusCode::PAYLOAD_TOO_LARGE)
-                    .body(full("request body too large"))
-                    .unwrap())
-            }
+        // 上限 + **帧间空闲超时**（408），与 h1 的 proxy/static 路径同口径；
+        // 旧实现只有 `Limited::collect()`，慢 body 可把请求任务与 32MiB 缓冲无限期占住。
+        match crate::server::apps::collect_app_body(body, crate::server::h1::APP_BODY_CAP).await {
+            Ok(b) => b,
+            Err(e) => return Ok(e.into_response()),
         }
     } else {
         Bytes::new()
@@ -455,6 +789,8 @@ fn request_headers_block(headers: &http::HeaderMap, authority: Option<&http::uri
     out
 }
 
+// 参数由调用面决定，拆结构体会改变调用签名（本波只清 warning，不重构）。
+#[allow(clippy::too_many_arguments)]
 async fn exec_dispatch(
     method: &str,
     path: &str,
@@ -468,6 +804,10 @@ async fn exec_dispatch(
     headers: &[u8],
 ) -> Result<ExecOutcome> {
     let engine = app.engine.to_ascii_lowercase();
+    // 文件解析与引擎可见的 `path`（PATH_INFO/SCRIPT_NAME 的来源）都必须用**解码后**
+    // 的路径（见 [`decode_path`] 说明）。`query` 保持原样（CGI QUERY_STRING 不解码）。
+    let decoded_path = decode_path(path);
+    let path: &str = &decoded_path;
     let lib_path = resolve_lib(app, &engine)?;
     // docroot / server_name 在热路径上**只借不克隆**：内联路径不需要任何 owned 拷贝，
     // 池路径再克隆（见下方 `docroot_owned`）。
@@ -572,6 +912,17 @@ async fn exec_dispatch(
             bail!(
                 "engine `{engine}` is quarantined (a previous call exceeded the wall clock); \
                  restart webserver to recover"
+            );
+        }
+        // R-04：外层按「引擎名在白名单里」把执行 deadline 置为 None（沙箱自己用
+        // poll + SIGKILL 管超时）。若这只 .so **没有**自报 env-free，沙箱不会接管它
+        // （见 `sandbox_handles`）—— 那就等于「没有看门狗」，绝不能退回进程内执行：
+        // 明确失败，让运维改配置或先让引擎自报隔离。
+        if sandbox_enabled_for(&engine) && !lib.env_free {
+            bail!(
+                "engine `{engine}` is listed in CRUCIBLE_APP_SANDBOX_ENGINES but does not \
+                 self-report appengine_env_isolation(); refusing to run it in-process \
+                 without the wall-clock watchdog (remove it from the sandbox list or rebuild the engine)"
             );
         }
         if lib.env_free {
@@ -767,6 +1118,23 @@ fn request_has_body(m: &http::Method, h: &http::HeaderMap) -> bool {
         > 0
 }
 
+
+/// URL 路径的 percent-decode（UTF-8）。
+///
+/// 用途：CGI/1.1 §4.1.5 明确 `PATH_INFO` **不是** URL 编码形态（"Unlike a URI path, the
+/// PATH_INFO is not URL-encoded"），`SCRIPT_NAME` 同理；而 hyper 把请求路径原样保留
+/// （含 `%E4%B8%AD`、`%20`）。不做解码时：
+///   * `GET /sg/a%20b.cgi` 找不到 docroot 下的 `a b.cgi`（恒 404）；
+///   * 脚本看到的 `PATH_INFO` 是 `/%E4%B8%AD%E6%96%87` 而不是 `/中文`（WSGI/ASGI 的
+///     PATH_INFO 规范同样要求已解码）。
+///     非法转义（`%zz`）原样保留（percent_encoding 的行为）；非 UTF-8 字节用 U+FFFD 替换
+///     （我们只用它做文件系统查找/环境变量；这类文件名无法用 Rust `String` 无损表示，
+///     替换后自然找不到文件 ⇒ 404，不会误执行别的文件）。
+pub(crate) fn decode_path(path: &str) -> String {
+    percent_encoding::percent_decode_str(path)
+        .decode_utf8_lossy()
+        .into_owned()
+}
 
 /// §3.3：请求路径 → 引擎脚本相对路径。
 /// 剥掉命中的 app 前缀（前缀必须整体匹配，/ 边界对齐，避免 /phplint 命中 /php）；
@@ -988,6 +1356,48 @@ type PoolJob = Box<dyn FnOnce() + Send + 'static>;
 /// 且同一只 .so 一旦隔离就不会再产生新的超时调用）。
 const MAX_REPLACEMENT_WORKERS: usize = 32;
 
+// ---------------------------------------------------------------- 观测计数器（R-04 / G-14）
+//
+// 进程级单调计数，供 `/__metrics`（Prometheus 文本）与本地排障使用。全部是原子加，
+// 热路径零锁。`engine_metrics_lines()` 把它们拼成 Prometheus 文本。
+/// 因看门狗超时被放弃、并补了替补的 worker 线程总数（上限见 [`MAX_REPLACEMENT_WORKERS`]）。
+static ABANDONED_WORKERS_TOTAL: AtomicU64 = AtomicU64::new(0);
+/// 沙箱 worker 子进程的 spawn 次数（含超时被杀后的重建）。
+static SANDBOX_SPAWNS_TOTAL: AtomicU64 = AtomicU64::new(0);
+/// 沙箱 worker 子进程被 SIGKILL 回收的次数（超时/协议错误/退出/卸载）。
+static SANDBOX_KILLS_TOTAL: AtomicU64 = AtomicU64::new(0);
+/// 真正 `dlclose` 掉的引擎 `.so` 次数（`CRUCIBLE_APP_UNLOAD=0` 或解释器引擎不计）。
+static LIBS_UNLOADED_TOTAL: AtomicU64 = AtomicU64::new(0);
+
+/// R-04 / G-14 观测指标（Prometheus 文本行，由 `telemetry::metrics_body` 汇总）。
+///
+/// 这些计数回答运维的三个问题：卡死引擎放弃了多少 worker（是否逼近上限 32）、
+/// 沙箱杀/重建了多少次、可选真卸载到底卸了几只 `.so`（`CRUCIBLE_APP_UNLOAD=1` 时才有意义）。
+pub fn engine_metrics_lines() -> String {
+    format!(
+        "# HELP crucible_app_abandoned_workers_total FFI workers abandoned and replaced after a watchdog timeout\n\
+         # TYPE crucible_app_abandoned_workers_total counter\n\
+         crucible_app_abandoned_workers_total {}\n\
+         # HELP crucible_app_sandbox_spawns_total Sandbox worker subprocess spawns\n\
+         # TYPE crucible_app_sandbox_spawns_total counter\n\
+         crucible_app_sandbox_spawns_total {}\n\
+         # HELP crucible_app_sandbox_kills_total Sandbox worker subprocesses SIGKILL-reaped\n\
+         # TYPE crucible_app_sandbox_kills_total counter\n\
+         crucible_app_sandbox_kills_total {}\n\
+         # HELP crucible_app_libs_unloaded_total Engine .so files truly dlclose'd\n\
+         # TYPE crucible_app_libs_unloaded_total counter\n\
+         crucible_app_libs_unloaded_total {}\n\
+         # HELP crucible_app_libs_loaded Engine .so files currently loaded\n\
+         # TYPE crucible_app_libs_loaded gauge\n\
+         crucible_app_libs_loaded {}\n",
+        ABANDONED_WORKERS_TOTAL.load(Ordering::Relaxed),
+        SANDBOX_SPAWNS_TOTAL.load(Ordering::Relaxed),
+        SANDBOX_KILLS_TOTAL.load(Ordering::Relaxed),
+        LIBS_UNLOADED_TOTAL.load(Ordering::Relaxed),
+        LIBS.lock().len(),
+    )
+}
+
 struct EnginePool {
     tx: std::sync::mpsc::Sender<PoolJob>,
     /// 池名（线程名/日志用）。
@@ -996,6 +1406,9 @@ struct EnginePool {
     rx: Arc<Mutex<std::sync::mpsc::Receiver<PoolJob>>>,
     /// 已补的替补 worker 数（见 [`MAX_REPLACEMENT_WORKERS`]）。
     replaced: std::sync::atomic::AtomicUsize,
+    /// 真正 spawn 出去的替补 worker 数（≤ [`MAX_REPLACEMENT_WORKERS`]；`replaced` 是
+    /// **尝试**计数，含超过上限后被拒绝的那些 —— 指标与「线程数有界」看这个）。
+    spawned_replacements: std::sync::atomic::AtomicUsize,
 }
 
 static GENERIC_POOL: Lazy<Arc<EnginePool>> =
@@ -1083,6 +1496,7 @@ impl EnginePool {
             name: name.to_string(),
             rx: Arc::new(Mutex::new(rx)),
             replaced: std::sync::atomic::AtomicUsize::new(0),
+            spawned_replacements: std::sync::atomic::AtomicUsize::new(0),
         };
         for i in 0..threads.max(1) {
             pool.spawn_worker(i);
@@ -1130,6 +1544,9 @@ impl EnginePool {
             return;
         }
         self.spawn_worker(1000 + n);
+        self.spawned_replacements
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        ABANDONED_WORKERS_TOTAL.fetch_add(1, Ordering::Relaxed);
         log::warn!(
             "app_ffi: engine `{engine}` 的调用超时且无法安全中止 → 放弃该 worker 线程，\
              为池 `{}` 补充替补 worker（{}/{}）",
@@ -1197,31 +1614,80 @@ fn lib_is_loaded(lib_key: &str) -> bool {
     LIBS.lock().contains_key(lib_key)
 }
 
-fn load_engine(engine: &str, lib_path: &Path) -> Result<Arc<EngineLib>> {
+/// 装载（或复用）一只引擎 `.so`，返回**带在飞租约**的句柄（G-14）。
+///
+/// 三条路径：
+/// 1. **快路径**（已装载、未到指纹复核窗口）：一次表查找 + 一次原子加；
+/// 2. **热换**（指纹变了）：在同一把 per-path `LOAD_LOCK` 内「出表 → quiesce →
+///    dlclose 旧映射 → dlopen 新文件」——旧句柄被在飞调用持有也不会被抽走代码；
+/// 3. **冷装载**：per-path 串行化，避免并发 `dlopen`/`appengine_init`。
+///
+/// 租约必须在持 `LIBS` 锁时登记（见 [`LibLease`]），这是 quiesce 不漏调用的前提。
+fn load_engine(engine: &str, lib_path: &Path) -> Result<LibLease> {
     // 热路径**不分配**：HashMap<String, _> 支持用 &str 查询。
     let key = lib_path.to_string_lossy();
-    // 快路径：已装载
+    // 快路径：已装载 + 不需要指纹复核。
     {
         let map = LIBS.lock();
         if let Some(l) = map.get(key.as_ref()) {
-            return Ok(Arc::clone(l));
+            if !l.drain.retiring.load(Ordering::Acquire) && !fp_check_due(l) {
+                // retire 可能恰好在此刻置位：`acquire` 会拒绝，落到慢路径。
+                if let Some(lease) = LibLease::acquire(Arc::clone(l)) {
+                    return Ok(lease);
+                }
+            }
         }
     }
-    // 慢路径：按路径串行化，避免并发重复 dlopen + 重复 appengine_init。
+    // 慢路径：按路径串行化（装载、热换、卸载共用同一把锁）。
     let path_lock = {
         let mut locks = LOAD_LOCKS.lock();
         Arc::clone(locks.entry(key.to_string()).or_default())
     };
     let _guard = path_lock.lock();
-    // 等到锁之后必须复查：这段时间里另一个线程可能已经装载完成。
+    // 等锁期间可能已装载/已被替换；复查。
+    let mut need_reload = false;
     {
         let map = LIBS.lock();
         if let Some(l) = map.get(key.as_ref()) {
-            return Ok(Arc::clone(l));
+            if l.drain.retiring.load(Ordering::Acquire) {
+                drop(map);
+                // 理论上持 LOAD_LOCK 时不会有同路径的卸载在跑；保守地让请求重试。
+                bail!("engine `{engine}` is being unloaded; retry shortly");
+            }
+            if fp_check_due(l) {
+                match lib_fingerprint(lib_path) {
+                    Some(fp) if fp == l.fingerprint => {
+                        l.fp_checked_ms.store(now_ms(), Ordering::Relaxed);
+                    }
+                    // 文件被替换/删除：旧映射必须按 quiesce 规则退场。
+                    _ => need_reload = true,
+                }
+            }
+            if !need_reload {
+                if let Some(lease) = LibLease::acquire(Arc::clone(l)) {
+                    return Ok(lease);
+                }
+                bail!("engine `{engine}` is being unloaded; retry shortly");
+            }
+        }
+    }
+    if need_reload {
+        let stale = { LIBS.lock().remove(key.as_ref()) };
+        if let Some(stale) = stale {
+            log::info!(
+                "app_ffi: engine `{engine}` 的 .so 指纹变化（{}）→ quiesce 后 dlclose 旧映射并重新装载",
+                lib_path.display()
+            );
+            retire_lib(engine, stale, "lib 文件已替换（热换）");
         }
     }
     if !lib_path.is_file() {
         bail!("missing engine lib {}", lib_path.display());
+    }
+    // 排空超时的旧映射可能还没 drop：这段时间内不得重新 dlopen 同一路径
+    //（否则新旧两个 EngineLib 会在同一份映射上各 init 一次，旧者 shutdown 拆新者）。
+    if RETIRING.lock().contains(key.as_ref()) {
+        bail!("engine `{engine}` is being unloaded; retry shortly");
     }
     // libloading 0.8 type-safe: Symbol<T> 在获取时校验符号类型与 T 签名，
     // 杜绝 std::mem::transmute 的隐藏 UB。
@@ -1235,22 +1701,19 @@ fn load_engine(engine: &str, lib_path: &Path) -> Result<Arc<EngineLib>> {
     //   * LOCAL ⇒ 引擎及其依赖不进全局作用域，多个 `.so` 之间靠
     //     `dlsym(RTLD_DEFAULT)` 共享符号的用法失效。
     // 因此这里显式用 os::unix::Library::open 传 flag，再转回安全包装（From 已实现）。
+    //
+    // G-14：`CRUCIBLE_APP_UNLOAD` 打开时 NODELETE 只给**有后台执行体**的引擎；
+    // 其余引擎（c/rust/cgi/asp/aspnet/tsx）用普通 dlclose —— 热换 50 次后
+    // `/proc/self/maps` 里旧映射不累积。关闭（默认）时全部保留映射（现状）。
+    let nodelete = lib_keeps_mapping(engine);
     #[cfg(unix)]
     let lib: libloading::Library = {
         let raw = unsafe {
             libloading::os::unix::Library::open(
                 Some(lib_path),
-                // RTLD_NODELETE：热重载卸载引擎时**不解除映射**。
-                //
-                // 为什么必须加：`reconcile` 在没有引用时会 `shutdown()` + dlclose。
-                // 但嵌入式解释器（本项目的 libapp_rack.so 嵌 MRI、libapp_python.so 嵌
-                // CPython、libapp_perl.so 嵌 Perl）会在 dlopen 时**创建后台线程/注册
-                // atexit 与 GC 定时器**，它们的代码/数据指针仍指向该 .so。dlclose 之后
-                // 这些线程一跑就 SIGSEGV —— 实测：`GET /rack/` 之后几十秒内**整个服务器
-                // 进程崩溃**（core 454MB），全部监听口一起下线。
-                // NODELETE 让映射常驻（每个引擎几百 KB，代价可忽略），shutdown 钩子照常
-                // 执行、符号解析与状态清理语义不变，只是不再有「代码被抽走」的窗口。
-                libc::RTLD_NOW | libc::RTLD_GLOBAL | RTLD_NODELETE_EXT,
+                libc::RTLD_NOW
+                    | libc::RTLD_GLOBAL
+                    | if nodelete { RTLD_NODELETE_EXT } else { 0 },
             )
         }
         .map_err(|e| anyhow::anyhow!("dlopen {}: {e}", lib_path.display()))?;
@@ -1328,6 +1791,16 @@ fn load_engine(engine: &str, lib_path: &Path) -> Result<Arc<EngineLib>> {
             }
         }
     }
+    if nodelete {
+        log::debug!(
+            "app_ffi: engine `{engine}` 保留 RTLD_NODELETE（嵌入式运行时，映射常驻）: {}",
+            lib_path.display()
+        );
+    }
+    // 指纹必须在 init 之后、插入表之前取：init 可能把 .so 的 mtime 弄变（构建脚本）
+    // 也覆盖「装载期间文件被替换」的窗口（取到的就是下一次热换要比较的基线）。
+    let fingerprint = lib_fingerprint(lib_path)
+        .ok_or_else(|| anyhow::anyhow!("stat engine lib {} failed", lib_path.display()))?;
     let lib = Arc::new(EngineLib {
         engine: engine.to_string(),
         path: key.to_string(),
@@ -1338,10 +1811,60 @@ fn load_engine(engine: &str, lib_path: &Path) -> Result<Arc<EngineLib>> {
         free,
         shutdown,
         env_free,
+        fingerprint,
+        drain: DrainState::new(),
+        fp_checked_ms: AtomicU64::new(now_ms()),
     });
-    LIBS.lock().insert(key.into_owned(), Arc::clone(&lib));
-    Ok(lib)
+    // **持 LIBS 锁登记租约**再插入：`reconcile_unload` 的出表与这里互斥，
+    // 不可能出现「句柄已克隆、租约未登记」的窗口（那会让 dlclose 与 exec 并发）。
+    let mut map = LIBS.lock();
+    let lease = LibLease::acquire(Arc::clone(&lib))
+        .ok_or_else(|| anyhow::anyhow!("engine `{engine}` was retired during load"))?;
+    map.insert(key.into_owned(), lib);
+    Ok(lease)
 }
+
+/// quiesce 卸载：置「卸载中」→ 有界等待在飞调用归零 → 释放最后一个句柄（shutdown+dlclose）。
+///
+/// 调用方必须持有该路径的 `LOAD_LOCK`，并已把它从 [`LIBS`] 摘除。
+/// 超时**不是错误**：旧映射推迟到最后一个调用结束（`EngineLib::drop`）时解除，
+/// 期间 [`RETIRING`] 会挡住同路径的重新装载。
+fn retire_lib(engine: &str, lib: Arc<EngineLib>, reason: &str) {
+    let path = lib.path.clone();
+    lib.drain.begin_retire();
+    RETIRING.lock().insert(path.clone());
+    let timeout = unload_timeout();
+    let drained = lib.drain.wait_drained(timeout);
+    if drained {
+        // R-04：沙箱子进程的代码指针指向旧映射 —— 必须与库一起回收（Drop = SIGKILL+wait）。
+        if let Some(slot) = SANDBOXES.lock().remove(&path) {
+            drop(slot.lock().take());
+        }
+    }
+    if drained {
+        if !lib_keeps_mapping(engine) {
+            // 保留映射的引擎不算「真卸载」：Drop 只跑 shutdown，映射仍在。
+            LIBS_UNLOADED_TOTAL.fetch_add(1, Ordering::Relaxed);
+        }
+        let left = Arc::strong_count(&lib).saturating_sub(1);
+        log::info!(
+            "app_ffi: 卸载引擎 `{engine}` ({path})：{reason}；在飞调用已排空{}",
+            if left > 0 {
+                format!("（另有 {left} 个借用句柄，最后一个释放时 dlclose）")
+            } else {
+                String::new()
+            }
+        );
+    } else {
+        log::warn!(
+            "app_ffi: 卸载引擎 `{engine}` ({path})：{reason}；{}ms 内仍有在飞调用 → \
+             不再接受新派发，旧映射推迟到最后一个调用结束时 shutdown+dlclose",
+            timeout.as_millis()
+        );
+    }
+    drop(lib);
+}
+
 
 /// 每线程复用的 ABI 字符串暂存（避免每请求 ~9 次 malloc/free）。
 ///
@@ -1441,6 +1964,7 @@ impl Drop for Sandbox {
     fn drop(&mut self) {
         // 父进程主动丢弃/替换句柄：确保子进程不会变成孤儿（正常路径已在 timeout
         // 时 kill+wait；Drop 只兜底）。
+        SANDBOX_KILLS_TOTAL.fetch_add(1, Ordering::Relaxed);
         unsafe {
             libc::kill(self.pid, libc::SIGKILL);
             let mut st = 0;
@@ -1660,6 +2184,7 @@ fn sandbox_call(
     if guard.is_none() {
         match sandbox_spawn(lib) {
             Ok(sb) => {
+                SANDBOX_SPAWNS_TOTAL.fetch_add(1, Ordering::Relaxed);
                 log::info!(
                     "app_ffi: engine `{engine}` 进入进程沙箱（pid={}，lib={lib_key}）",
                     sb.pid
@@ -2081,7 +2606,7 @@ fn is_engine_hop_by_hop(lower: &str) -> bool {
 /// `Transfer-Encoding: chunked`（或 `Connection: close`）与重建后的 `Full<Bytes>`
 /// body 语义不符时，hyper 服务端会按 TE 分支重排/与 CL 冲突掐连接，且把逐跳语义
 /// 泄漏给客户端 —— 此前 app_ffi 只处理了 Content-Length（agent-9 遗留项）。
-fn sanitize_engine_headers(
+pub(crate) fn sanitize_engine_headers(
     headers: &[(String, String)],
     body_len: usize,
 ) -> (Vec<(String, String)>, bool) {
@@ -2134,47 +2659,90 @@ pub fn simple_response_from_outcome(outcome: ExecOutcome) -> Response<Bytes> {
 /// 强制卸载指定引擎的全部 .so（admin / 配置清理入口）。
 #[allow(dead_code)]
 pub fn shutdown_engine(engine: &str) {
-    // 只把条目取出来，**释放 LIBS 锁后再 drop**：drop 会执行 C 侧
-    // `appengine_shutdown()` + dlclose，而外部 .so 的 shutdown 可能阻塞
-    //（等自己的线程/IO）。持锁执行会把所有 `load_engine` 快路径一起卡死。
-    let removed: Vec<Arc<EngineLib>> = {
-        let mut map = LIBS.lock();
-        let keys: Vec<String> = map
-            .iter()
+    let snapshot: Vec<(String, String, Arc<EngineLib>)> = {
+        let map = LIBS.lock();
+        map.iter()
             .filter(|(_, l)| l.engine == engine)
-            .map(|(k, _)| k.clone())
-            .collect();
-        keys.into_iter().filter_map(|k| map.remove(&k)).collect()
+            .map(|(k, l)| (k.clone(), l.engine.clone(), Arc::clone(l)))
+            .collect()
     };
-    drop(removed); // 锁外 Drop → shutdown + dlclose
-}
-
-/// §7.3 热卸载：配置不再引用、且无在途请求（强引用仅剩缓存表）的引擎 →
-/// shutdown + dlclose。有在途请求时仅出表，句柄随最后一个引用释放。
-pub fn reconcile_unload(active: &[(String, String)]) {
-    // 同上：先出表、放锁，再在锁外 drop（shutdown 可能阻塞）。
-    let stale: Vec<Arc<EngineLib>> = {
-        let mut map = LIBS.lock();
-        let keys: Vec<String> = map
-            .iter()
-            .filter(|(_, l)| !active.iter().any(|(e, p)| e == &l.engine && p == &l.path))
-            .map(|(k, _)| k.clone())
-            .collect();
-        keys.into_iter().filter_map(|k| map.remove(&k)).collect()
-    };
-    for lib in stale {
-        if Arc::strong_count(&lib) == 1 {
-            log::info!("app_ffi: unload engine {} ({})", lib.engine, lib.path);
-        } else {
-            log::debug!(
-                "app_ffi: engine {} in-flight; defer dlclose via Drop",
-                lib.engine
-            );
-        }
-        // Drop impl performs shutdown+dlclose（无在途请求时；否则最后一个引用 Drop 时执行）。
+    for (key, eng, lib) in snapshot {
+        // 与 load_engine 的装载/热换串行；出表后再 quiesce，**不持 LIBS 锁**等待
+        //（shutdown 可能阻塞，持锁会把所有 load 快路径一起卡死）。
+        let path_lock = {
+            let mut locks = LOAD_LOCKS.lock();
+            Arc::clone(locks.entry(key.clone()).or_default())
+        };
+        let _guard = path_lock.lock();
+        let removed = {
+            let mut map = LIBS.lock();
+            match map.get(&key) {
+                Some(cur) if Arc::ptr_eq(cur, &lib) => map.remove(&key),
+                _ => None,
+            }
+        };
+        // 释放快照持有的那份 Arc 再做 quiesce 计数：否则 strong_count 恒多 1，
+        // 日志会误报「有借用句柄」，dlclose 也会推迟到本轮循环末尾。
         drop(lib);
+        if let Some(removed) = removed {
+            retire_lib(&eng, removed, "显式卸载（admin/配置清理）");
+        }
     }
 }
+
+/// §7.3/G-14 热卸载：配置不再引用、或 `.so` 文件已被替换（热换）、或文件消失的引擎
+/// → quiesce（停止新派发 → 有界等待在飞调用 → shutdown + dlclose）。
+///
+/// 有在飞调用且超过 `CRUCIBLE_APP_UNLOAD_TIMEOUT_MS` 时仅出表并置 `RETIRING`，
+/// 句柄随最后一个调用结束 Drop（那时才 shutdown + dlclose）。NODELETE 白名单里的
+/// 引擎（python/ruby/perl/lua/go）只做 shutdown，映射按设计常驻。
+pub fn reconcile_unload(active: &[(String, String)]) {
+    // 先快照（键、引擎、句柄），再逐路径处理：每个 key 的「出表 → 排空 → drop」
+    // 都在该路径的 LOAD_LOCK 内，与 `load_engine` 的装载/热换严格串行。
+    let snapshot: Vec<(String, String, Arc<EngineLib>)> = {
+        let map = LIBS.lock();
+        map.iter()
+            .map(|(k, l)| (k.clone(), l.engine.clone(), Arc::clone(l)))
+            .collect()
+    };
+    for (key, engine, lib) in snapshot {
+        let still_active = active.iter().any(|(e, p)| e == &engine && p == &key);
+        let reason = if !still_active {
+            Some("配置不再引用该引擎")
+        } else if !lib_keeps_mapping(&engine) {
+            // 热换检测：同路径文件被替换/删除也要卸载（否则旧代码永远生效）。
+            // 保留映射的引擎无法真正解除映射，重新 dlopen 只会拿到旧代码 —— 跳过，
+            // 并在装载期日志里已说明「热换需重启」。
+            match lib_fingerprint(Path::new(&key)) {
+                Some(fp) if fp != lib.fingerprint => Some("lib 文件已替换（热换）"),
+                None => Some("lib 文件已消失"),
+                _ => None,
+            }
+        } else {
+            None
+        };
+        let Some(reason) = reason else { continue };
+        let path_lock = {
+            let mut locks = LOAD_LOCKS.lock();
+            Arc::clone(locks.entry(key.clone()).or_default())
+        };
+        let _guard = path_lock.lock();
+        // 复查：另一个线程可能已经卸载/替换了同一路径。
+        let removed = {
+            let mut map = LIBS.lock();
+            match map.get(&key) {
+                Some(cur) if Arc::ptr_eq(cur, &lib) => map.remove(&key),
+                _ => None,
+            }
+        };
+        // 同上：快照 Arc 不能算进「借用句柄」，也不该拖延 dlclose。
+        drop(lib);
+        if let Some(removed) = removed {
+            retire_lib(&engine, removed, reason);
+        }
+    }
+}
+
 
 #[cfg(test)]
 mod status_and_rel_tests {
@@ -2415,6 +2983,24 @@ mod status_and_rel_tests {
         release_tx.send(()).unwrap();
     }
 
+    /// R-04：替补 worker 必须**有界** —— 超过 [`MAX_REPLACEMENT_WORKERS`] 后不再新增
+    /// 线程（`replaced` 计数仍增长，但实际 spawn 数被封顶）。这是「一个毒引擎反复超时
+    /// 也不会把线程数打爆 RLIMIT_NPROC）的承重墙。
+    #[test]
+    fn abandoned_worker_replacements_are_capped() {
+        use std::sync::atomic::Ordering;
+        let pool = EnginePool::start(1, "utcap");
+        for _ in 0..(MAX_REPLACEMENT_WORKERS + 5) {
+            pool.replace_abandoned_worker("ut");
+        }
+        assert_eq!(pool.replaced.load(Ordering::SeqCst), MAX_REPLACEMENT_WORKERS + 5);
+        assert_eq!(
+            pool.spawned_replacements.load(Ordering::SeqCst),
+            MAX_REPLACEMENT_WORKERS,
+            "实际补位线程数必须被 MAX_REPLACEMENT_WORKERS 封顶"
+        );
+    }
+
     /// 脚本路径热缓存：同一 (docroot, rel) 连续解析必须命中并返回同一路径；
     /// 穿越（`..`）仍必须被 `script_rel` 拒绝，且拒绝结果也可缓存。
     #[test]
@@ -2552,5 +3138,121 @@ mod status_and_rel_tests {
                 "{e} must be hard-denied even if explicitly allow-listed"
             );
         }
+    }
+
+    /// G-14：NODELETE 白名单必须覆盖**确有后台执行体**的引擎，其余引擎必须真正卸载
+    /// （否则热换 200 次后 `/proc/self/maps` 会累积旧映射）。
+    #[test]
+    fn nodelete_whitelist_covers_only_embedded_runtimes() {
+        let def = nodelete_engines_with(None);
+        for e in ["python", "wsgi", "asgi", "uwsgi", "ruby", "rack", "perl", "psgi", "lua", "go"] {
+            assert!(
+                def.contains(e),
+                "{e} 有嵌入式运行时/后台线程，必须保留映射（否则 dlclose 后线程踩空）"
+            );
+        }
+        for e in ["c", "rust", "cgi", "asp", "aspnet", "tsx", "php", "jsp"] {
+            assert!(
+                !def.contains(e),
+                "{e} 没有后台解释器线程，热换时必须真正 dlclose（旧映射不得累积）"
+            );
+        }
+        // 覆盖：大小写/空白/空项；`-`/`none`/`off`/空 = 不保留任何 NODELETE。
+        let custom = nodelete_engines_with(Some(" Lua , python ,, "));
+        assert_eq!(custom.len(), 2, "{custom:?}");
+        assert!(custom.contains("lua") && custom.contains("python"));
+        for raw in ["-", "none", "off", "  ", ""] {
+            assert!(
+                nodelete_engines_with(Some(raw)).is_empty(),
+                "{raw:?} 必须解析为空集合"
+            );
+        }
+    }
+
+    /// G-14：可选真卸载开关 —— 默认**关**（所有引擎保留映射 ＝ 现状）；
+    /// 打开后只有解释器白名单保留，纯 FFI 引擎真正 dlclose。
+    #[test]
+    fn unload_switch_defaults_off_and_scopes_whitelist() {
+        assert!(!unload_enabled_with(None), "默认必须关（维持现状）");
+        assert!(!unload_enabled_with(Some("0")));
+        assert!(!unload_enabled_with(Some("false")));
+        for v in ["1", "true", "yes", "on", " on "] {
+            assert!(unload_enabled_with(Some(v)), "{v:?} 必须打开真卸载");
+        }
+        // 打开后保留映射的白名单：解释器/嵌入式运行时在；纯 FFI 引擎不在（会被真卸载）。
+        let keep = nodelete_engines_with(None);
+        for e in ["python", "perl", "psgi", "ruby", "rack", "lua"] {
+            assert!(keep.contains(e), "{e} 打开卸载后仍必须保留映射");
+        }
+        for e in ["c", "rust", "cgi", "asp", "aspnet", "tsx"] {
+            assert!(!keep.contains(e), "{e} 打开卸载后必须真正 dlclose");
+        }
+    }
+
+    /// G-14：quiesce 状态机 —— retire 后不再发新租约；必须等最后一个在飞租约释放
+    /// 才算排空（这是「dlclose 前停止新派发、等在飞调用」的承重墙）。
+    #[test]
+    fn drain_gate_quiesces_and_rejects_new_entries_after_retire() {
+        let st = DrainState::new();
+        let a = st.enter().expect("retire 前必须接受调用");
+        let b = st.enter().expect("同一 .so 的在飞调用可以并存");
+        st.begin_retire();
+        assert!(st.enter().is_none(), "retire 置位后不得再发出新租约");
+        assert!(
+            !st.wait_drained(Duration::from_millis(30)),
+            "仍有在飞调用时不得判定为已排空"
+        );
+        drop(a);
+        assert!(!st.wait_drained(Duration::from_millis(30)));
+        drop(b);
+        assert!(
+            st.wait_drained(Duration::from_millis(500)),
+            "最后一个租约释放后必须立即排空"
+        );
+        assert!(st.enter().is_none(), "排空后仍不得重新进入");
+    }
+
+    /// G-14：热换检测的指纹必须对「原地覆盖」与「文件消失」都敏感。
+    #[test]
+    fn lib_fingerprint_detects_replacement_and_disappearance() {
+        let dir = std::env::temp_dir().join(format!(
+            "crucible-libfp-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("libfake.so");
+        std::fs::write(&p, b"v1").unwrap();
+        let f1 = lib_fingerprint(&p).expect("fingerprint");
+        assert_eq!(Some(f1), lib_fingerprint(&p), "同一文件重复取指纹必须幂等");
+        std::fs::write(&p, b"v2-longer").unwrap();
+        let f2 = lib_fingerprint(&p).expect("fingerprint after replace");
+        assert_ne!(f1, f2, "size/mtime 变化必须被发现（热换检测）");
+        std::fs::remove_file(&p).unwrap();
+        assert!(lib_fingerprint(&p).is_none(), "文件消失必须返回 None");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// G-14：卸载等待必须有界且可配（0 = 不等待；超上限钳制，防止 reload 被拖死）。
+    #[test]
+    fn unload_timeout_is_bounded_and_configurable() {
+        assert_eq!(
+            unload_timeout_with(None),
+            Duration::from_millis(UNLOAD_TIMEOUT_MS_DEFAULT)
+        );
+        assert_eq!(
+            unload_timeout_with(Some("750")),
+            Duration::from_millis(750)
+        );
+        assert_eq!(unload_timeout_with(Some("0")), Duration::ZERO);
+        assert_eq!(
+            unload_timeout_with(Some("bogus")),
+            Duration::from_millis(UNLOAD_TIMEOUT_MS_DEFAULT)
+        );
+        assert_eq!(
+            unload_timeout_with(Some("999999999")),
+            Duration::from_millis(UNLOAD_TIMEOUT_MS_MAX)
+        );
     }
 }

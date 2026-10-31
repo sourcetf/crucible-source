@@ -13,11 +13,10 @@ import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
-from geoip_common import DEFAULT_DB, init_schema, upsert_range  # noqa: E402
+from geoip_common import DEFAULT_DB, init_schema, sources_dir, upsert_range  # noqa: E402
 
 WEIGHT = 990
-DUMPS = [Path("data/geoip/sources/ripe.db"), Path("data/geoip/sources/apnic.db"),
-         Path("data/geoip/sources/afrinic.db"), Path("data/geoip/sources/lacnic.db")]
+DUMPS = [sources_dir() / n for n in ("ripe.db", "apnic.db", "afrinic.db", "lacnic.db")]
 GEOFEED_RE = re.compile(r"(https?://[^\s\"',]+geofeed[^\s\"',]*\.csv)", re.I)
 
 

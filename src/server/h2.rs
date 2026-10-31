@@ -18,7 +18,7 @@ use h2::{
 use http::{Request, Response, StatusCode};
 use http_body_util::{BodyExt, Full};
 use hyper::body::Body as _;
-use std::io::{self, Write};
+use std::io::{self};
 use std::future::Future;
 use std::net::SocketAddr;
 use std::pin::Pin;
@@ -38,6 +38,30 @@ pub fn h2_batch_cap() -> usize {
 }
 
 pub const H2_BATCH_CAP: usize = BATCH_CAP;
+
+/// 连接级 knob 的运行期覆盖（与 `h2_batch_cap` 同风格）：只在**建连**时读一次
+/// `env_lock`（不是每请求），所以即便不缓存也无热路径代价。作用是把 fair-gate
+/// 扫参（window / send buffer / max concurrent streams / coalesce）从「改常量重编译」
+/// 变成「同二进制换环境变量」，便于同窗口 A/B（`bench/h2_fair_gate.py` 口径）。
+///
+/// 取值越界一律回落到默认常量（绝不把非法值透传给 h2 `Builder`）。
+fn h2_env_usize(name: &str, default: usize, lo: usize, hi: usize) -> usize {
+    crate::server::apps::env_lock::read_static_env(name)
+        .and_then(|s| s.parse::<usize>().ok())
+        .filter(|n| *n >= lo && *n <= hi)
+        .unwrap_or(default)
+}
+
+/// `CRUCIBLE_H2_COALESCE`：覆盖 [`H2_COALESCE_WRITES`]。默认仍为 `false`
+/// （coalesce 会把响应帧推迟到 cap/16KiB 再落 socket，纯静态公平口径实测无收益，
+/// 见 `reports/h2perf-wave21.md`；保留开关供 TLS 记录合并等场景验证）。
+fn h2_coalesce_enabled() -> bool {
+    match crate::server::apps::env_lock::read_static_env("CRUCIBLE_H2_COALESCE").as_deref() {
+        Some("0") => false,
+        Some("1") => true,
+        _ => H2_COALESCE_WRITES,
+    }
+}
 /// 全局同时在飞 h2 流上限（含排队等配额的阶段）。见 [`H2_INFLIGHT_WAIT`] 与
 /// [`serve_io`] 里的说明：配额**只能**在 spawn 出来的任务里获取。
 pub const H2_MAX_INFLIGHT: usize = 256;
@@ -50,7 +74,12 @@ pub const H2_INFLIGHT_WAIT: Duration = Duration::from_secs(5);
 /// 停顿发生在两次请求**之间**，不受影响。
 pub const H2_BODY_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 static H2_INFLIGHT: once_cell::sync::Lazy<Arc<tokio::sync::Semaphore>> =
-    once_cell::sync::Lazy::new(|| Arc::new(tokio::sync::Semaphore::new(H2_MAX_INFLIGHT)));
+    once_cell::sync::Lazy::new(|| {
+        // `CRUCIBLE_H2_MAX_INFLIGHT`：进程级覆盖（默认 [`H2_MAX_INFLIGHT`]=256）。
+        // 高多路复用（c×m 远大于 256）时用来验证「全局在飞闸门是否是墙」。
+        let n = h2_env_usize("CRUCIBLE_H2_MAX_INFLIGHT", H2_MAX_INFLIGHT, 1, 1 << 20);
+        Arc::new(tokio::sync::Semaphore::new(n))
+    });
 
 /// 本连接在飞请求数守卫（配合 `serve_io` 的空闲超时）。
 ///
@@ -88,6 +117,47 @@ fn h2_flag(name: &str, default_on: bool) -> bool {
         Some("1") => true,
         _ => default_on,
     }
+}
+
+/// 热路径开关的进程级缓存。
+///
+/// `h2_flag` 每次调用都要拿 `env_lock` 的**全局 Mutex**、做一次 `BTreeMap` 查找并
+/// `clone` 一个 `Option<String>`（堆分配）；而这两个开关读的是「启动期环境变量」
+/// （`read_static_env` 本身就是启动后固定的语义）。h2_tail 每请求读
+/// `CRUCIBLE_H2_FASTSTATIC`，profile 里 `read_static_env` + 锁是请求路径上的固定开销。
+/// `OnceLock` 把判定缓存到第一次读取：零锁、零分配，语义与 `read_static_env` 的缓存一致。
+static H2_LOCALTASKS_ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+static H2_FASTSTATIC_ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+
+#[inline]
+fn h2_local_mode() -> bool {
+    *H2_LOCALTASKS_ON.get_or_init(|| h2_flag("CRUCIBLE_H2_LOCALTASKS", true))
+}
+
+#[inline]
+fn h2_faststatic_enabled() -> bool {
+    *H2_FASTSTATIC_ON.get_or_init(|| h2_flag("CRUCIBLE_H2_FASTSTATIC", true))
+}
+
+/// [`crate::server::access::is_admin_path`] 的**无分配**等价实现。
+///
+/// 原实现每调用一次都 `format!("{}/", admin_path.trim_end_matches('/'))` 分配一个
+/// `String`；h2 请求路径上每请求要判一次（前置门与 handle_h2 共用同一结果）。
+/// 语义逐条对齐：
+/// - `path == admin_path` ⇒ true；
+/// - 否则 `path` 以 `trim_end_matches('/')` 后的前缀 + `/` 开头 ⇒ true。
+///
+/// 单测 `admin_path_fast_matches_access` 用同一张输入表与 `access::is_admin_path`
+/// 对拍（含 `/`、带/不带尾斜杠、空串、前缀相近但边界不同的路径），判据变更必须两处同步。
+#[inline]
+fn admin_path_fast(admin_path: &str, path: &str) -> bool {
+    if path == admin_path {
+        return true;
+    }
+    let base = admin_path.trim_end_matches('/');
+    path.len() > base.len()
+        && path.as_bytes().starts_with(base.as_bytes())
+        && path.as_bytes()[base.len()] == b'/'
 }
 
 /// h2 静态响应快车道。
@@ -135,6 +205,9 @@ fn h2_fast_id(m: &std::fs::Metadata) -> H2FastId {
 }
 
 struct H2FastEntry {
+    /// 缓存的 URL path（= 全局表里的键）。连接级读缓存用它做 O(1) 命中判定，
+    /// 避免每请求都去全局表（parking_lot Mutex + 哈希）里查一遍。
+    url_path: String,
     fs_path: std::path::PathBuf,
     /// 填充时打开的只读 fd：命中用 `fstat(fd)` 复核，比每次 `lstat(path)` 便宜
     /// （h1 快车道同做法）。fd 钉住的是填充时的 inode；无法打开时此条目不入缓存。
@@ -145,14 +218,41 @@ struct H2FastEntry {
     at: std::time::Instant,
 }
 
+/// FNV-1a 64 位哈希（h2 静态缓存键是短路径字符串）。
+///
+/// 为什么不用 std 默认的 SipHash13：静态快车道每请求要做两次查表（root 与 URL path），
+/// profile 里 `hash::sip::Hasher::write` 在请求路径上约 1.5%。键不可被外部控制到
+/// 「构造碰撞」的程度（root 来自配置、URL path 只用于查缓存；即使碰撞也只是回
+/// 完整路径重新产出响应，不影响正确性），FNV 足够。
+struct Fnv64(u64);
+impl Default for Fnv64 {
+    #[inline]
+    fn default() -> Self {
+        // FNV-1a offset basis
+        Fnv64(0xcbf2_9ce4_8422_2325)
+    }
+}
+impl std::hash::Hasher for Fnv64 {
+    #[inline]
+    fn finish(&self) -> u64 {
+        self.0
+    }
+    #[inline]
+    fn write(&mut self, bytes: &[u8]) {
+        let mut h = self.0;
+        for &b in bytes {
+            h ^= b as u64;
+            h = h.wrapping_mul(0x1000_0000_01b3);
+        }
+        self.0 = h;
+    }
+}
+type FnvBuild = std::hash::BuildHasherDefault<Fnv64>;
+type FastMap<K, V> = std::collections::HashMap<K, V, FnvBuild>;
+
 static H2_FAST: once_cell::sync::Lazy<
-    parking_lot::Mutex<
-        std::collections::HashMap<
-            std::path::PathBuf,
-            std::collections::HashMap<String, Arc<H2FastEntry>>,
-        >,
-    >,
-> = once_cell::sync::Lazy::new(|| parking_lot::Mutex::new(std::collections::HashMap::new()));
+    parking_lot::Mutex<FastMap<std::path::PathBuf, FastMap<String, Arc<H2FastEntry>>>>,
+> = once_cell::sync::Lazy::new(|| parking_lot::Mutex::new(FastMap::default()));
 
 #[inline]
 fn h2_fast_eligible<T>(req: &Request<T>, lc: &ListenerConfig) -> bool {
@@ -209,32 +309,53 @@ fn h2_fast_candidate(root: &std::path::Path, url_path: &str) -> Option<std::path
     }
 }
 
-fn h2_fast_lookup(root: &std::path::Path, url_path: &str) -> Option<Response<Bytes>> {
-    let e = {
-        let cache = H2_FAST.lock();
-        cache.get(root)?.get(url_path)?.clone()
-    };
-    if e.at.elapsed() >= H2_FAST_TTL {
-        return None;
+/// 全局表查表（不校验）。连接级读缓存命中时不再走这里。
+#[inline]
+fn h2_fast_get(root: &std::path::Path, url_path: &str) -> Option<Arc<H2FastEntry>> {
+    let cache = H2_FAST.lock();
+    Some(cache.get(root)?.get(url_path)?.clone())
+}
+
+/// 条目有效性复核。
+///
+/// - `check_ttl`：TTL 只防「父目录被改名」这类 fstat 看不见的变化；调用方可以按
+///   ≤1s 的节奏才做一次 TTL 判定（[`serve_io`] 的 inline 快车道），把每请求的
+///   `Instant::now()`（vDSO clock_gettime，profile 里约 0.9%）省掉。
+/// - fd 指纹：内容/替换/unlink **每请求**都立即失效（与 h1 快车道同判据）。
+fn h2_fast_valid(e: &H2FastEntry, check_ttl: bool) -> bool {
+    if check_ttl && e.at.elapsed() >= H2_FAST_TTL {
+        return false;
     }
     match &e.file {
         // fd 复核：fstat 只认 inode，不受路径改名/替换影响；nlink 能看见
         // rename-over（旧目标被 unlink）与 unlink。父目录被改名走 TTL 兜底。
-        Some(f) => {
-            let m = f.metadata().ok()?;
-            if !m.is_file() || h2_fast_id(&m) != e.id {
-                return None;
-            }
-        }
+        Some(f) => match f.metadata() {
+            Ok(m) => m.is_file() && h2_fast_id(&m) == e.id,
+            Err(_) => false,
+        },
         // 无 fd（打开失败/关闭开关）：回 lstat 路径（与 h1 `serve_fast` 同判据）。
-        None => {
-            let m = std::fs::symlink_metadata(&e.fs_path).ok()?;
-            if m.file_type().is_symlink() || !m.is_file() || h2_fast_id(&m) != e.id {
-                return None;
-            }
-        }
+        None => match std::fs::symlink_metadata(&e.fs_path) {
+            Ok(m) => !m.file_type().is_symlink() && m.is_file() && h2_fast_id(&m) == e.id,
+            Err(_) => false,
+        },
     }
-    Some(Response::from_parts(e.parts.clone(), e.data.clone()))
+}
+
+#[inline]
+fn h2_fast_response(e: &H2FastEntry) -> Response<Bytes> {
+    Response::from_parts(e.parts.clone(), e.data.clone())
+}
+
+fn h2_fast_lookup(
+    root: &std::path::Path,
+    url_path: &str,
+    check_ttl: bool,
+) -> Option<Response<Bytes>> {
+    let e = h2_fast_get(root, url_path)?;
+    if !h2_fast_valid(&e, check_ttl) {
+        return None;
+    }
+    Some(h2_fast_response(&e))
 }
 
 /// 完整路径产出 200 后填充。只缓存小文件、非 FileSource、无扩展的普通响应。
@@ -282,6 +403,7 @@ fn h2_fast_store(root: &std::path::Path, url_path: &str, resp: &Response<Bytes>)
     }
     let (parts, _) = resp.clone().into_parts();
     let e = H2FastEntry {
+        url_path: url_path.to_string(),
         fs_path,
         file: Some(Arc::new(file)),
         id: h2_fast_id(&m2),
@@ -346,30 +468,49 @@ where
 {
     // Materialize BatchWriter knobs so they are never silently discarded: they
     // configure CoalescingIo which wraps the socket before handshake.
-    let live_cap = h2_batch_cap();
-    let batch = BatchWriter::new(())
-        .with_cap(live_cap)
-        .with_coalesce(H2_COALESCE_WRITES);
-    let coalesce = batch.coalesce_enabled();
-    let cap = batch.cap();
+    // 运行期可覆盖（见 `h2_env_usize` / `h2_coalesce_enabled`），默认 = 编译期常量。
+    let cap = h2_batch_cap();
+    let coalesce = h2_coalesce_enabled();
+    let max_send = h2_env_usize("CRUCIBLE_H2_MAX_SEND_BUFFER", H2_MAX_SEND_BUFFER, 4096, 16 * 1024 * 1024);
+    let win = h2_env_usize(
+        "CRUCIBLE_H2_INITIAL_WINDOW",
+        H2_INITIAL_WINDOW_SIZE as usize,
+        1024,
+        1 << 30,
+    ) as u32;
+    let max_streams = h2_env_usize(
+        "CRUCIBLE_H2_MAX_CONCURRENT_STREAMS",
+        H2_MAX_CONCURRENT_STREAMS as usize,
+        1,
+        65535,
+    ) as u32;
     log::info!(
-        "h2 knobs peer={peer} BATCH_CAP={cap} coalesce={coalesce} max_send_buffer={H2_MAX_SEND_BUFFER} \
-         max_concurrent_streams={H2_MAX_CONCURRENT_STREAMS} initial_window={H2_INITIAL_WINDOW_SIZE}"
+        "h2 knobs peer={peer} BATCH_CAP={cap} coalesce={coalesce} max_send_buffer={max_send} \
+         max_concurrent_streams={max_streams} initial_window={win}"
     );
 
     let io = CoalescingIo::new(stream, coalesce, cap);
 
     let mut builder = H2Builder::new();
-    builder.max_send_buffer_size(H2_MAX_SEND_BUFFER);
+    builder.max_send_buffer_size(max_send);
     // Apply every Builder option the crates.io h2 API exposes for these knobs.
-    builder.initial_window_size(H2_INITIAL_WINDOW_SIZE);
-    builder.initial_connection_window_size(H2_INITIAL_WINDOW_SIZE);
-    builder.max_concurrent_streams(H2_MAX_CONCURRENT_STREAMS);
+    builder.initial_window_size(win);
+    builder.initial_connection_window_size(win);
+    builder.max_concurrent_streams(max_streams);
     builder.max_header_list_size(H2_MAX_HEADER_LIST_SIZE);
     // Note: h2 0.4 Builder has no enable_push / coalesce setter — coalesce is
     // applied via CoalescingIo + BatchWriter above; logged so knobs are visible.
 
     let mut conn = builder.handshake(io).await?;
+    // `ListenerConfig` 只在建连时取一份，之后整条连接共享。此前每个请求都 `lc.clone()`
+    // —— 那是一份含 `Vec`/`Option<BasicAuth>`/`Option<RateLimit>`/`Option<access_log>`
+    // 的深拷贝，perf 里 `ListenerConfig::clone` 占 ~1.2%，且每请求至少两次分配。
+    // 改成 `Arc` 后每请求只做一次引用计数自增。
+    let lc = Arc::new(lc);
+    // 每连接预格式化一次访问日志前缀（`{proto} {peer} `）。此前每请求用
+    // `ProtoPeer` 走 `core::fmt` 格式化 `SocketAddr`（perf: SocketAddrV4::fmt
+    // + Ipv4Addr::fmt 约 1.4%），而 `peer` 在连接生命周期内恒定。
+    let log_prefix = Arc::new(crate::server::access_log::ConnPrefix::new("h2", peer));
     // 建连时的 listener 代数：h2 上与 h1 是同一个问题 —— 这一整条连接（多路复用上的每个流）
     // 都用**建连时**那一份 `lc`，所以 per-listener 策略（root/basic_auth/page_rules/
     // file_open/限流）改过之后对已建立的连接不生效。发现代数变了就发一次 GOAWAY：
@@ -380,8 +521,22 @@ where
     let mut goaway_sent = false;
     // 本连接在飞请求计数（见 `ConnInflight` 与 `H2_IDLE_TIMEOUT` 的说明）。
     let conn_inflight = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let mut idle = tokio::time::sleep(H2_IDLE_TIMEOUT);
+    let idle = tokio::time::sleep(H2_IDLE_TIMEOUT);
     tokio::pin!(idle);
+    let mut idle_reset_at = tokio::time::Instant::now();
+    // 连接级 DNS 生效配置缓存（≤1s 刷新）。`dns::effective` 内部对 panel.toml 的
+    // stat 本来就是 1s 节流，这里按同一节奏复用结果，语义等价；收益是每请求不再
+    // 做 `state_root()` 路径拼接 + 全局锁 + `Instant::now`（profile 约 1.1%）。
+    let mut dns_eff = crate::server::dns::effective(&live.snapshot());
+    let mut dns_checked_at = tokio::time::Instant::now();
+    // 静态缓存 TTL 判定节流（≤1s 一次，见 [`h2_fast_lookup`]）。
+    let mut fast_ttl_checked_at = tokio::time::Instant::now();
+    // 连接级静态读缓存（单条目）：命中同一 URL 的连接（真实负载里绝大多数就是
+    // 「一条 keep-alive 连接反复拉同一路径」以及 h2 多路复用下的同构请求）不必每请求
+    // 去抢全局 `H2_FAST` 的 parking_lot Mutex + 两次 FNV 查表 + Arc 克隆，直接复用上一条
+    // 目的 `Arc<H2FastEntry>`。**只跳过查表，不跳过复核**：每请求仍走 [`h2_fast_valid`]
+    // （fd fstat 指纹 + ≤1s TTL），失效判据与全局路径逐条相同，语义不变。
+    let mut inline_slot: Option<Arc<H2FastEntry>> = None;
     // 每连接的流任务集合（`CRUCIBLE_H2_LOCALTASKS=1`）：请求 future 直接在连接任务里
     // 用 `FuturesUnordered` 驱动，不再 `tokio::spawn` 到全局调度器。
     //
@@ -390,7 +545,7 @@ where
     // 在单连接内用本地 future 集合驱动可以省掉这两次唤醒与一次任务分配，同时**保留**
     // 多路复用（Pending 的 future 不会阻塞同连接其它流）。
     // `ConnInflight` 计数与全局配额语义不变（配额仍在 future 内获取）。
-    let local_mode = h2_flag("CRUCIBLE_H2_LOCALTASKS", true);
+    let local_mode = h2_local_mode();
     let mut local: futures_util::stream::FuturesUnordered<
         std::pin::Pin<Box<dyn Future<Output = ()> + Send>>,
     > = futures_util::stream::FuturesUnordered::new();
@@ -399,7 +554,14 @@ where
             tokio::select! {
                 r = conn.accept() => r,
                 _ = futures_util::StreamExt::next(&mut local), if !local.is_empty() => {
-                    idle.as_mut().reset(tokio::time::Instant::now() + H2_IDLE_TIMEOUT);
+                    // 空闲超时的语义是「最后一次活动后 300s」；每请求 reset 一次会让 tokio
+                    // 重新注册定时器（profile 里 `Sleep::reset` 约 1.1% + 一次 clock_gettime）。
+                    // 改成最多每秒重置一次：最坏只提前 ≤1s 关闭一条已经空闲的连接。
+                    let now = tokio::time::Instant::now();
+                    if now.duration_since(idle_reset_at) >= Duration::from_secs(1) {
+                        idle.as_mut().reset(now + H2_IDLE_TIMEOUT);
+                        idle_reset_at = now;
+                    }
                     continue;
                 }
                 _ = &mut idle => {
@@ -430,7 +592,22 @@ where
                 }
             }
         };
-        idle.as_mut().reset(tokio::time::Instant::now() + H2_IDLE_TIMEOUT);
+        // 同上：只在距上次重置 ≥1s 时才动定时器（见上一条注释）。这一次
+        // `Instant::now()` 同时服务三件事（空闲定时器 / DNS 生效配置刷新 /
+        // 静态缓存 TTL 判定），每请求只读一次时钟。
+        let now = tokio::time::Instant::now();
+        if now.duration_since(idle_reset_at) >= Duration::from_secs(1) {
+            idle.as_mut().reset(now + H2_IDLE_TIMEOUT);
+            idle_reset_at = now;
+        }
+        if now.duration_since(dns_checked_at) >= Duration::from_secs(1) {
+            dns_eff = crate::server::dns::effective(&live.snapshot());
+            dns_checked_at = now;
+        }
+        let ttl_check = now.duration_since(fast_ttl_checked_at) >= Duration::from_secs(1);
+        if ttl_check {
+            fast_ttl_checked_at = now;
+        }
         let Some(result) = accepted else {
             if local_mode && !local.is_empty() {
                 // 连接收尾（GOAWAY 完成 / 对端关闭）：把已在跑的流跑完（语义与
@@ -469,17 +646,34 @@ where
             log::info!("h2 peer={peer}: listener 配置已变，发 GOAWAY 让后续请求换用新配置的连接");
             conn.graceful_shutdown();
         }
+        // 本请求的配置快照：admin 前置门、handle_h2 的路由判定、完成侧访问日志
+        // 共用同一份。在 accept 循环里取而不是在 future 里取 —— 静态快车道
+        // （[`try_inline_static`]）也要用同一份，且失败回退时 future 可以直接复用。
+        let snap = live.snapshot();
+        // admin 判定每请求只算一次（前置门 / handle_h2 / inline 快车道共用）：
+        // `access::is_admin_path` 每次都会 `format!` 一个 String（profile 里约 1.6%）。
+        // [`admin_path_fast`] 是它的无分配等价实现，判据由单测对拍锁定。
+        let admin_hit = admin_path_fast(&snap.admin.path, request.uri().path());
+        // inline 静态快车道：直接在本循环里完成「无 body GET + 静态缓存命中」的回包，
+        // 不创建每请求 future（Box::pin 搬 13.5KiB）。任何前置条件不满足即返回 false，
+        // 原通用路径（future）行为完全不变。见 [`try_inline_static`] 的判据说明。
+        if h2_faststatic_enabled()
+            && try_inline_static(
+                &request, &mut respond, &lc, &log_prefix, peer, admin_hit, &snap, &dns_eff,
+                ttl_check, &mut inline_slot,
+            )
+        {
+            continue;
+        }
         let live = Arc::clone(&live);
-        let lc = lc.clone();
+        let lc = Arc::clone(&lc);
+        let log_prefix = Arc::clone(&log_prefix);
         let sem = H2_INFLIGHT.clone();
         conn_inflight.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let conn_inflight_c = Arc::clone(&conn_inflight);
         let fut = async move {
             // 守卫覆盖任务内**所有**返回路径（含提前 return），保证计数归还。
             let _inflight = ConnInflight(conn_inflight_c);
-            // 本请求的配置快照：admin 前置门、handle_h2 的路由判定、完成侧访问日志
-            // 共用同一份（此前每请求取 3 次 `RwLock` 读 + `Arc` 克隆）。
-            let snap = live.snapshot();
             // P0（DoS）：配额**绝不能**在 accept 循环里 await —— await 期间 `conn` 不被
             // poll，连接驱动停摆（回应写不出、WINDOW_UPDATE 发不出、其他流全部卡住），
             // 一条恶意连接持满 256 个慢速流即可让**所有** h2 连接失去响应。
@@ -500,10 +694,9 @@ where
                             .status(StatusCode::SERVICE_UNAVAILABLE)
                             .header(http::header::RETRY_AFTER, "1");
                         b = b.header(http::header::CONTENT_TYPE, "text/plain; charset=utf-8");
-                        crate::server::access_log::log_response_with(
+                        crate::server::access_log::log_response_prefixed_with(
                             &snap,
-                            peer,
-                            "h2",
+                            &log_prefix,
                             request.method().as_str(),
                             request.uri().path(),
                             StatusCode::SERVICE_UNAVAILABLE.as_u16(),
@@ -525,8 +718,9 @@ where
             // 与 h1 同序的 admin 前置门（见 basic_auth::admin_gate）：**先判鉴权/CSRF、
             // 再收 body**。否则不带凭据的并发 POST 每个都能占住 REQUEST_BODY_CAP（8MiB）
             // 的缓冲，等于不用通过鉴权就能放大内存。
+            // `admin_hit` 在 accept 循环里算好（与 inline 快车道共用；见那里的说明）。
             {
-                if crate::server::access::is_admin_path(&snap.admin.path, parts.uri.path()) {
+                if admin_hit {
                     let t0 = std::time::Instant::now();
                     use crate::server::basic_auth::{admin_gate_path, retry_after_secs, AdminGate};
                     // (状态码, Retry-After, 文案)；None = 已过鉴权门，交给 admin::handle
@@ -565,10 +759,9 @@ where
                         // 安全拒绝也要落访问日志（h1 的同类分支在 handle_request 完成侧统一记，
                         // 这里提前 return 会绕过下面那段日志 —— 否则爆破/扫描命中的这条路径
                         // 在 access log 里完全不可见）。
-                        crate::server::access_log::log_response_with(
+                        crate::server::access_log::log_response_prefixed_with(
                             &snap,
-                            peer,
-                            "h2",
+                            &log_prefix,
                             parts.method.as_str(),
                             parts.uri.path(),
                             status.as_u16(),
@@ -656,11 +849,11 @@ where
                 }
             };
             let t0 = std::time::Instant::now();
-            // HSTS 判定要在 handle_h2 之前取：lc 会被 move 进去。
             let is_https = lc.ssl.is_some();
-            // §16.12：每站访问日志覆盖也要在 move 之前取出（完成侧日志在下面）。
+            // §16.12：每站访问日志覆盖（完成侧日志在下面）。
             let access_override = lc.access_log.clone();
-            let mut response = handle_h2(req, live.clone(), lc, peer, snap.clone()).await;
+            // `admin_hit` 由上面的前置门算好传进去，handle_h2 不再重复判一次。
+            let mut response = handle_h2(req, live.clone(), &lc, peer, snap.clone(), admin_hit).await;
             // 访问日志用的路径：与旧实现一致，记**改写前**的请求路径（改写发生在
             // handle_h2 内部的副本上，这里拿不到也不需要）。
             let path = pre_path;
@@ -686,10 +879,9 @@ where
                 .map(|t| t.0)
                 .unwrap_or("http");
             // P1-11：完成侧全字段访问日志；h2 侧拿得到精确响应字节数。
-            crate::server::access_log::log_response_with(
+            crate::server::access_log::log_response_prefixed_with(
                 &snap,
-                peer,
-                "h2",
+                &log_prefix,
                 &method,
                 &path,
                 parts.status.as_u16(),
@@ -1264,14 +1456,142 @@ pub(crate) fn prohibited_request_field(headers: &http::HeaderMap) -> Option<&'st
     None
 }
 
+/// h2 静态响应 **inline 快车道**（在 accept 循环里同步完成，不创建每请求 future）。
+///
+/// 背景（profile，见 `.agents/1009/reports/h2mux-wave22.md`）：每请求 `Box::pin(fut)`
+/// 要把一个 13.5KiB 的 future 搬进堆，加上 `FuturesUnordered` 的 push/poll/唤醒、
+/// 全局配额与空闲定时器维护，占 m10 请求路径的显著比例；而这些开销对「静态文件
+/// 缓存命中 + 无 body GET」这种最热的请求形态没有任何收益（该路径本来就没有真正的
+/// await 让步点）。满足下面**一组保守前置条件**时，直接在本函数里回包：
+///
+/// - 方法 GET 且 `END_STREAM` 已在 HEADERS（无请求体、无 trailer）；
+/// - 不是 admin 路径（含前置门的判定结果）、没有 listener basic_auth、
+///   没有启用的 rate_limit、没有 page_rules（block/redirect/rewrite/header/pass）、
+///   路径不是 status_path、不命中 proxy 规则、不是 telemetry（/__metrics）路径；
+/// - `:authority`/Host 值合法（与 handle_h2 的第一个检查同判据）；
+/// - DoH 不会接管该请求（TLS 上 DoH 走 DoH 分支；明文口 DoH 按 RFC 8484 §5 回 400）；
+/// - `ip_access` 放行；`h2_fast_eligible`（apps/file_open 为空、路径安全、无 Range/If-*）；
+/// - [`h2_fast_lookup`] 命中（每条目一次 `fstat` 复核，语义与通用快车道相同）。
+///
+/// 任何一条不满足都返回 `false`，调用方走**原通用路径**（行为零变化）。成功时与
+/// 通用路径逐字节等价：HSTS 补头、访问日志（engine=static、字节数、耗时）、
+/// `telemetry::record_request`、`send_response` + `send_data` 的位置与语义一致。
+///
+/// 配额：先 `try_acquire_owned`（拿不到就回退通用路径去排队），保证全局在飞上限
+/// 语义不变；本路径无 body、只持有一个缓存 `Bytes` 的引用计数，内存有界。
+#[allow(clippy::too_many_arguments)]
+fn try_inline_static(
+    request: &Request<h2::RecvStream>,
+    respond: &mut h2::server::SendResponse<Bytes>,
+    lc: &ListenerConfig,
+    log_prefix: &crate::server::access_log::ConnPrefix<'_>,
+    peer: SocketAddr,
+    admin_hit: bool,
+    snap: &crate::config::Config,
+    // 连接级缓存（≤1s 刷新）的 DNS 生效配置：`dns::effective` 自带同一节奏的
+    // panel stat 节流，这里只是不再每请求重做 state_root()/路径 join/全局锁。
+    dns_eff: &crate::server::dns::DnsConfig,
+    // 是否做一次缓存 TTL 判定（按 ≤1s 的节奏；见 [`h2_fast_lookup`]）。
+    ttl_check: bool,
+    // 连接级单条目读缓存（见 `serve_io` 里 `inline_slot` 的说明）。
+    slot: &mut Option<Arc<H2FastEntry>>,
+) -> bool {
+    if request.method() != http::Method::GET || !request.body().is_end_stream() {
+        return false;
+    }
+    let path = request.uri().path();
+    if admin_hit
+        || lc.basic_auth.is_some()
+        || lc.rate_limit.as_ref().is_some_and(|r| r.enabled)
+        || !lc.page_rules.is_empty()
+        || !lc.global_page_rules.is_empty()
+        || lc.status_path.as_deref() == Some(path)
+        || would_proxy(lc, path)
+        || (snap.telemetry.enabled && path == snap.telemetry.path)
+        || request_authority_ok(request.uri(), request.headers()).is_err()
+    {
+        return false;
+    }
+    // DoH 与 handle_h2 同判：命中 DoH 形态（TLS 上由 DoH 接管；明文口回 400）就回退。
+    if dns_eff.enabled && dns_eff.doh.enabled {
+        let is_doh = crate::server::dns::dot_doh::is_doh_request_uri(dns_eff, request.uri());
+        if is_doh && (lc.ssl.is_some() || !lc.port_reuse) {
+            return false;
+        }
+    }
+    if !crate::server::listener::ip_allowed(&snap.ip_access, lc, peer) {
+        return false;
+    }
+    if !h2_fast_eligible(request, lc) {
+        return false;
+    }
+    // 连接级读缓存优先（同 URL 复用，不抢全局锁）；不命中/失效才回落全局表。
+    // 两条路径的判据完全一致：命中只复用条目、**每请求仍复核**（[`h2_fast_valid`]）。
+    let cached = match slot.as_ref() {
+        Some(e) if e.url_path == path && h2_fast_valid(e, ttl_check) => Some(e.clone()),
+        _ => None,
+    };
+    let entry = match cached {
+        Some(e) => Some(e),
+        None => match h2_fast_get(&lc.root, path) {
+            Some(e) if h2_fast_valid(&e, ttl_check) => {
+                *slot = Some(e.clone());
+                Some(e)
+            }
+            _ => None,
+        },
+    };
+    let Some(entry) = entry else {
+        return false;
+    };
+    let mut resp = h2_fast_response(&entry);
+    // 全局在飞配额：拿不到就让通用路径去排队（保持 503 快速失败语义）。
+    let Ok(_permit) = H2_INFLIGHT.clone().try_acquire_owned() else {
+        return false;
+    };
+    let t0 = std::time::Instant::now();
+    // HTTPS 响应统一补 HSTS（与 serve_io 完成侧同语义：不覆盖分支已显式设置的值）。
+    if lc.ssl.is_some() {
+        resp.headers_mut()
+            .entry(http::header::STRICT_TRANSPORT_SECURITY)
+            .or_insert_with(|| {
+                http::HeaderValue::from_static(crate::server::h1::hsts_header())
+            });
+    }
+    let (parts, data) = resp.into_parts();
+    crate::server::telemetry::record_request();
+    crate::server::access_log::log_response_prefixed_with(
+        snap,
+        log_prefix,
+        "GET",
+        path,
+        parts.status.as_u16(),
+        Some(data.len() as u64),
+        t0.elapsed(),
+        "static",
+        lc.access_log.as_ref(),
+    );
+    let end = data.is_empty();
+    match respond.send_response(Response::from_parts(parts, ()), end) {
+        Ok(mut send) => {
+            if !data.is_empty() {
+                let _ = send.send_data(data, true);
+            }
+        }
+        Err(e) => log::debug!("h2 inline static send peer={peer}: {e}"),
+    }
+    true
+}
+
 async fn handle_h2(
     req: Request<H2Body>,
     live: Arc<LiveConfig>,
-    lc: ListenerConfig,
+    lc: &ListenerConfig,
     peer: SocketAddr,
     snap: Arc<crate::config::Config>,
+    admin_hit: bool,
 ) -> Response<Bytes> {
-    use crate::server::static_files;
+    
 
     let mut req = req;
     // RFC 9113 §8.3.1：`:authority` / `Host` 的值必须在**任何路由判定之前**校验，
@@ -1291,7 +1611,7 @@ async fn handle_h2(
     // `snap` 由调用方（serve_io 的每请求任务）提供，完成侧访问日志复用同一份；
     // 此前这里再取一次 `live.snapshot()` 纯属重复。
     // DoH 分流已下移到 ACL/限速之后（见下方），此处不再提前返回。
-    if !crate::server::listener::ip_allowed(&snap.ip_access, &lc, peer) {
+    if !crate::server::listener::ip_allowed(&snap.ip_access, lc, peer) {
         return tag(
             Response::builder()
                 .status(StatusCode::FORBIDDEN)
@@ -1413,7 +1733,8 @@ async fn handle_h2(
     // 头，却要同时过「站点口令」与「管理员口令」两道 Basic 门 ⇒ 面板在该端口不可达
     //（除非两组凭据恰好相同）。admin 路径的鉴权不会因此变松：admin_gate 对未配置
     // 用户/无凭据一律 fail-closed（basic_auth::check_admin_headers）。
-    let admin_path = crate::server::access::is_admin_path(&snap.admin.path, &path);
+    // 由 serve_io 的前置门算好传入（同一请求只判一次；见那里的说明）。
+    let admin_path = admin_hit;
     if let Some(ba) = &lc.basic_auth {
         if !admin_path {
             match crate::server::basic_auth::check_listener_headers_at(
@@ -1502,7 +1823,7 @@ async fn handle_h2(
     let has_rules = !lc.page_rules.is_empty() || !lc.global_page_rules.is_empty();
     if has_rules {
         if let Some((status, location)) =
-            crate::server::page_rules::apply_simple(&lc, &path, &crate::server::page_rules::MatchCtx::from_request_with_peer(&req, peer.ip(), &lc))
+            crate::server::page_rules::apply_simple(lc, &path, &crate::server::page_rules::MatchCtx::from_request_with_peer(&req, peer.ip(), lc))
         {
             if status == StatusCode::FORBIDDEN {
                 return tag(
@@ -1526,8 +1847,8 @@ async fn handle_h2(
         // 见 `from_request_with_host` 的说明）。
         let pr_host = crate::server::page_rules::host_snapshot(&req);
         {
-            let pr_ctx = crate::server::page_rules::MatchCtx::from_request_with_peer(&req, peer.ip(), &lc);
-            if let Some(np) = crate::server::page_rules::rewrite_path(&lc, &path, &pr_ctx) {
+            let pr_ctx = crate::server::page_rules::MatchCtx::from_request_with_peer(&req, peer.ip(), lc);
+            if let Some(np) = crate::server::page_rules::rewrite_path(lc, &path, &pr_ctx) {
                 let pq = match req.uri().query() {
                     Some(q) => format!("{np}?{q}"),
                     None => np,
@@ -1548,10 +1869,10 @@ async fn handle_h2(
             &req,
             pr_host.as_deref(),
             peer.ip(),
-            &lc,
+            lc,
         );
         // P1-5：h1 的 pass_upstream（page rule pass 动作）在 h2 同样生效。
-        if let Some((murl, upstream)) = crate::server::page_rules::pass_upstream(&lc, &path, &pr_ctx) {
+        if let Some((murl, upstream)) = crate::server::page_rules::pass_upstream(lc, &path, &pr_ctx) {
             // proxy_page_rule 需要 h1 体类型（Bytes）：先收齐（≤8MiB）。
             let req = match collect_bytes(req, REQUEST_BODY_CAP).await {
                 Ok(r) => r,
@@ -1567,7 +1888,7 @@ async fn handle_h2(
             .await;
             return tag(collect_to_bytes(resp).await, "proxy");
         }
-        let resp_mods = crate::server::page_rules::response_headers(&lc, &path, &pr_ctx);
+        let resp_mods = crate::server::page_rules::response_headers(lc, &path, &pr_ctx);
         let mut resp = h2_tail(req, live, lc, peer, path).await;
         for (name, value) in resp_mods {
             if let (Ok(nn), Ok(vv)) = (
@@ -1585,7 +1906,7 @@ async fn handle_h2(
 async fn h2_tail(
     req: Request<H2Body>,
     live: Arc<LiveConfig>,
-    lc: ListenerConfig,
+    lc: &ListenerConfig,
     peer: SocketAddr,
     path: String,
 ) -> Response<Bytes> {
@@ -1596,13 +1917,13 @@ async fn h2_tail(
     let upload_like = matches!(
         *req.method(),
         http::Method::PUT | http::Method::PATCH | http::Method::POST
-    ) && !crate::server::apps::would_handle(&lc, &path)
-        && !would_proxy(&lc, &path)
-        && crate::server::upload_api::enabled_for(&live, &lc, &path);
+    ) && !crate::server::apps::would_handle(lc, &path)
+        && !would_proxy(lc, &path)
+        && crate::server::upload_api::enabled_for(&live, lc, &path);
     if upload_like {
         // 流式上传：body 不进内存，逐帧落盘（上限 2GiB，见 upload_resume::MAX_UPLOAD_BYTES）。
         return tag(
-            crate::server::upload_api::handle_stream(req, &live, &lc, peer).await,
+            crate::server::upload_api::handle_stream(req, &live, lc, peer).await,
             "upload",
         );
     }
@@ -1611,12 +1932,12 @@ async fn h2_tail(
         Ok(r) => r,
         Err(resp) => return tag(resp, "static"),
     };
-    if let Some(resp) = crate::server::apps::try_handle_simple(&req, &lc, peer).await {
+    if let Some(resp) = crate::server::apps::try_handle_simple(&req, lc, peer).await {
         return tag(resp, "app");
     }
-    if would_proxy(&lc, &path) {
+    if would_proxy(lc, &path) {
         if let Some((_matched, resp)) =
-            crate::server::proxy::try_proxy(&lc, req.map(Full::new), peer.ip()).await
+            crate::server::proxy::try_proxy(lc, req.map(Full::new), peer.ip()).await
         {
             return tag(collect_to_bytes(resp).await, "proxy");
         }
@@ -1633,23 +1954,23 @@ async fn h2_tail(
     if matches!(
         *req.method(),
         http::Method::PUT | http::Method::PATCH | http::Method::POST
-    ) && crate::server::upload_api::enabled_for(&live, &lc, &path)
+    ) && crate::server::upload_api::enabled_for(&live, lc, &path)
     {
         return tag(
-            crate::server::upload_api::handle_bytes(req, &live, &lc, peer).await,
+            crate::server::upload_api::handle_bytes(req, &live, lc, peer).await,
             "upload",
         );
     }
     // 静态快车道（h2 侧，见 [`H2_FAST`] 的说明）：命中 = 1 次 lstat 复核 + 查表 + 克隆，
     // 跳过 resolve_path/mime/validators/Response 组装。未命中/不满足条件走完整路径，
     // 成功后再填充（每 TTL 一次）。
-    let fast_ok = h2_flag("CRUCIBLE_H2_FASTSTATIC", true) && h2_fast_eligible(&req, &lc);
+    let fast_ok = h2_faststatic_enabled() && h2_fast_eligible(&req, lc);
     if fast_ok {
-        if let Some(r) = h2_fast_lookup(&lc.root, req.uri().path()) {
+        if let Some(r) = h2_fast_lookup(&lc.root, req.uri().path(), true) {
             return tag(r, "static");
         }
     }
-    match crate::server::static_files::serve_simple(&req, &lc).await {
+    match crate::server::static_files::serve_simple(&req, lc).await {
         Ok(r) => {
             if fast_ok {
                 h2_fast_store(&lc.root, req.uri().path(), &r);
@@ -1785,6 +2106,52 @@ mod tests {
             "example.com ",
         ] {
             assert!(!authority_value_ok(bad), "应拒绝非法 authority: {bad:?}");
+        }
+    }
+
+    /// [`admin_path_fast`] 必须与 `access::is_admin_path` 逐输入同判据（h2 热路径用它
+    /// 取代会分配 `String` 的原实现；两处判据若分叉，admin 门就会在 h2 上静默失效）。
+    #[test]
+    fn admin_path_fast_matches_access() {
+        let admin_paths = [
+            "/__admin",
+            "/__admin/",
+            "/",
+            "",
+            "___admin",
+            "/a/b",
+            "/a/b/",
+            "/a/b///",
+        ];
+        let paths = [
+            "",
+            "/",
+            "//",
+            "/__admin",
+            "/__admin/",
+            "/__admin/api/x",
+            "/__adminx",
+            "/__adminx/",
+            "/__admin/api",
+            "/a",
+            "/a/",
+            "/a/b",
+            "/a/b/",
+            "/a/b/c",
+            "/a/bc",
+            "/a/bc/d",
+            "/ab/c",
+            "/x/__admin",
+            "___admin/x",
+        ];
+        for ap in admin_paths {
+            for p in paths {
+                assert_eq!(
+                    admin_path_fast(ap, p),
+                    crate::server::access::is_admin_path(ap, p),
+                    "admin_path={ap:?} path={p:?}"
+                );
+            }
         }
     }
 
@@ -2026,7 +2393,7 @@ mod tests {
             .body(Bytes::from_static(b"0123456789"))
             .unwrap();
         h2_fast_store(&root, "/", &resp);
-        let hit = h2_fast_lookup(&root, "/").expect("first lookup must hit");
+        let hit = h2_fast_lookup(&root, "/", true).expect("first lookup must hit");
         assert_eq!(hit.body().as_ref(), b"0123456789");
         assert_eq!(
             hit.headers().get(http::header::CONTENT_TYPE).unwrap(),
@@ -2043,7 +2410,7 @@ mod tests {
             f.write_all(b"abcdefghij").unwrap();
             f.sync_all().unwrap();
         }
-        assert!(h2_fast_lookup(&root, "/").is_none(), "in-place rewrite must miss");
+        assert!(h2_fast_lookup(&root, "/", true).is_none(), "in-place rewrite must miss");
 
         // 重新填充（响应体必须与当前文件内容一致，store 会逐字节校验）后
         // rename 替换 → inode 变化 → miss
@@ -2054,17 +2421,17 @@ mod tests {
             .body(Bytes::from_static(b"abcdefghij"))
             .unwrap();
         h2_fast_store(&root, "/", &resp2);
-        assert!(h2_fast_lookup(&root, "/").is_some());
+        assert!(h2_fast_lookup(&root, "/", true).is_some());
         let tmp = root.join(".tmp-new");
         std::fs::write(&tmp, b"0123456789").unwrap();
         std::fs::rename(&tmp, &idx).unwrap();
-        assert!(h2_fast_lookup(&root, "/").is_none(), "rename-over must miss");
+        assert!(h2_fast_lookup(&root, "/", true).is_none(), "rename-over must miss");
 
         // 重新填充后 unlink → nlink=0 → miss
         h2_fast_store(&root, "/", &resp);
-        assert!(h2_fast_lookup(&root, "/").is_some());
+        assert!(h2_fast_lookup(&root, "/", true).is_some());
         std::fs::remove_file(&idx).unwrap();
-        assert!(h2_fast_lookup(&root, "/").is_none(), "unlink must miss");
+        assert!(h2_fast_lookup(&root, "/", true).is_none(), "unlink must miss");
 
         let _ = std::fs::remove_dir_all(&root);
     }

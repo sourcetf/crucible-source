@@ -12,10 +12,10 @@ import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
-from geoip_common import DEFAULT_DB, init_schema, upsert_range  # noqa: E402
+from geoip_common import DEFAULT_DB, init_schema, sources_dir, upsert_range  # noqa: E402
 
 WEIGHT = 780  # 低于 GeoCN(820)
-SRC = Path("data/geoip/sources/ipip_free.ipdb")
+SRC = sources_dir() / "ipip_free.ipdb"
 
 
 def ipdb_read(path: Path):

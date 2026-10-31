@@ -16,7 +16,6 @@
 
 use crate::config::Config;
 use std::path::PathBuf;
-use std::sync::Arc;
 
 /// ACME 配置（[dns.acme]）。
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -153,57 +152,70 @@ pub fn resolve_key_path(spec: &str) -> PathBuf {
     }
 }
 
-/// 启动入口：（1）**先**拉起 HTTP-01 :80 并等待 bind 结果（2）后台执行签发/续期循环。
+/// 启动入口：拉起 HTTP-01 监听（如已配置）并启动**监视线程**。
 ///
-/// 顺序为什么必须这样：旧实现在 `await` 完整个外部工具签发流程（可能数十秒）之后才
-/// bind :80 —— 而首次签发时 :80 上根本没有服务（web listener 还没起，也不服务 ACME
-/// webroot），LE 的 HTTP-01 校验必然拉取失败 ⇒ 全新部署永远拿不到证书，还要等
-/// `renew_days`（默认 60 天）后的下一轮。签发放后台同时保证不阻塞启动。
-pub async fn startup(cfg: &AcmeCfg, dns: std::sync::Arc<super::DnsConfig>) {
-    if !cfg.enabled || cfg.domain.is_empty() {
-        return;
-    }
-    if safe_domain_segment(&cfg.domain).is_none() {
-        log::warn!("dns-acme: refusing unsafe domain {:?}", cfg.domain);
-        return;
-    }
-    if cfg.challenge_kind().is_none() {
-        log::warn!(
-            "dns-acme: 未知 challenge {:?}（只支持 http-01 / dns-01），跳过签发",
-            cfg.challenge
-        );
-        return;
-    }
-    let domain = cfg.domain.clone();
-    let webroot = cfg
-        .webroot
-        .clone()
-        .unwrap_or_else(|| acme_root().join("www").display().to_string());
-    // (1) HTTP-01 challenge 监听：仅 http-01 需要；dns-01 不占 :80。
-    if !cfg.challenge_is_dns01() {
-        let port = if cfg.http_port == 0 { 80 } else { cfg.http_port };
-        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
-        tokio::spawn(http01_listener(webroot.clone(), port, Some(ready_tx)));
-        match tokio::time::timeout(std::time::Duration::from_secs(3), ready_rx).await {
-            Ok(Ok(true)) => log::info!("dns-acme: http-01 challenge listener ready on :{port}"),
-            Ok(Ok(false)) => log::warn!("dns-acme: bind :{port} failed —— HTTP-01 不可用，签发会失败"),
-            _ => log::warn!("dns-acme: http-01 listener bind 未在 3s 内确认，继续尝试签发"),
+/// 与旧实现的关键差异（状态机修复）：
+/// - 旧实现在 `cfg.enabled=false` 或 domain 为空时**直接 return**：之后在面板里启用
+///   ACME / 填好域名，后台续期循环永远不存在，只有手动点「立即签发」才会工作；
+///   面板改域名/改 challenge 对已经在跑的循环也完全不可见（循环闭包持有启动快照）。
+/// - 现在监视线程每轮都从 `effective(live.snapshot())` 取**当前**配置：禁用后停止
+///   （每 5min 轮询一次以便重新启用）、域名/challenge/renew_days 变化下一轮生效。
+///
+/// 顺序（首次签发）：先确认 HTTP-01 监听已 bind，再执行外部工具 —— 旧实现在 `await`
+/// 完整个签发流程之后才 bind，首次签发必然拿不到证书。
+pub async fn startup(cfg: &AcmeCfg, live: std::sync::Arc<crate::server::live_config::LiveConfig>) {
+    if cfg.enabled {
+        if safe_domain_segment(&cfg.domain).is_none() {
+            log::warn!("dns-acme: refusing unsafe domain {:?}", cfg.domain);
+        } else if cfg.challenge_kind().is_none() {
+            log::warn!(
+                "dns-acme: 未知 challenge {:?}（只支持 http-01 / dns-01），跳过签发",
+                cfg.challenge
+            );
+        } else if !cfg.challenge_is_dns01() {
+            let webroot = cfg
+                .webroot
+                .clone()
+                .unwrap_or_else(|| acme_root().join("www").display().to_string());
+            let port = if cfg.http_port == 0 { 80 } else { cfg.http_port };
+            if start_http01_listener_once(&webroot, port).await {
+                log::info!("dns-acme: http-01 challenge listener ready on :{port}");
+            } else {
+                log::warn!("dns-acme: bind :{port} failed —— HTTP-01 不可用（面板/后台签发会再试）");
+            }
+        } else {
+            log::info!("dns-acme: challenge=dns-01（TXT 写入本机权威区，不监听 :80）");
         }
-    } else {
-        log::info!("dns-acme: challenge=dns-01（TXT 写入本机权威区，不监听 :80）");
     }
-    // (2) 签发/续期循环（后台）：失败按退避重试而不是死等 renew_days；成功按 renew_days
-    //     ±抖动再查。renew_days 下限钳到 30 天（LE 证书 90 天，面板把它设成 1 会持续
-    //     撞 CA 的失败限额 5 次/小时）。
-    let days = cfg.renew_days.max(30);
-    let c = cfg.clone();
-    let dns_cfg = std::sync::Arc::clone(&dns);
+    // 监视线程无条件启动（DNS 模块启用时）：它自己按当前配置决定签发/等待/停止。
     tokio::spawn(async move {
         let mut fails: u32 = 0;
         loop {
-            let c2 = c.clone();
-            let d2 = std::sync::Arc::clone(&dns_cfg);
-            let r = tokio::task::spawn_blocking(move || issue_if_missing(&c2, &d2)).await;
+            let cur = super::effective(&live.snapshot());
+            if !cur.enabled || !cur.acme.enabled {
+                fails = 0;
+                tokio::time::sleep(std::time::Duration::from_secs(ACME_DISABLED_POLL_SECS)).await;
+                continue;
+            }
+            // 配置不完整/非法时不要每轮都派生外部工具：给面板/日志一条可定位的告警，
+            // 5min 后重读配置（用户可能正在面板里填域名）。
+            if cur.acme.domain.trim().is_empty()
+                || safe_domain_segment(&cur.acme.domain).is_none()
+                || cur.acme.challenge_kind().is_none()
+            {
+                log::warn!(
+                    "dns-acme: 当前 [dns.acme] 配置不完整/非法（domain={:?} challenge={:?}），等待修改",
+                    cur.acme.domain,
+                    cur.acme.challenge
+                );
+                tokio::time::sleep(std::time::Duration::from_secs(ACME_DISABLED_POLL_SECS)).await;
+                continue;
+            }
+            let domain = cur.acme.domain.clone();
+            let days = cur.acme.renew_days.max(30);
+            let a = cur.acme.clone();
+            let d = std::sync::Arc::clone(&cur);
+            let r = tokio::task::spawn_blocking(move || issue_if_missing(&a, &d)).await;
             match r {
                 Ok(Ok(())) => {
                     if fails == 0 {
@@ -234,6 +246,10 @@ pub async fn startup(cfg: &AcmeCfg, dns: std::sync::Arc<super::DnsConfig>) {
         }
     });
 }
+
+/// ACME 未启用/配置不完整时的配置轮询间隔（秒）。
+const ACME_DISABLED_POLL_SECS: u64 = 300;
+
 
 /// 签发失败后的退避阶梯（秒）：5min → 30min → 2h → 6h → 24h 封顶。
 /// 旧实现失败后要再等一整个 `renew_days`（默认 60 天）才重试；配置错误时每次重启
@@ -443,7 +459,7 @@ fn summarize_client_failure(stderr: &str) -> String {
 /// hook 把 `_acme-challenge.<domain>` TXT 交给本进程 worker（spool 协议），worker
 /// 通过模块 zone API 写入/清理；certbot 走 `--manual --preferred-challenges dns`
 /// + auth/cleanup hook。
-/// acme-client 没有 hook 机制（只做 webroot http-01），dns-01 下跳过。
+///   acme-client 没有 hook 机制（只做 webroot http-01），dns-01 下跳过。
 fn issue(cfg: &AcmeCfg, dns: &super::DnsConfig) -> anyhow::Result<()> {
     // 面板「立即签发」与续期循环共用本函数：同一时刻只允许一个签发进程，
     // 避免并发 --issue 触发 CA 的 duplicate-certificate 限额。
@@ -474,6 +490,13 @@ fn issue(cfg: &AcmeCfg, dns: &super::DnsConfig) -> anyhow::Result<()> {
         .unwrap_or_else(|| acme_root().join("www").display().to_string());
     std::fs::create_dir_all(&out_dir)?;
     std::fs::create_dir_all(std::path::Path::new(&www).join(".well-known/acme-challenge"))?;
+    // http-01：监听器过去只在 startup() 里启动。面板「立即签发」/后台循环在
+    // `acme.enabled=false` 启动后首次启用时并没有监听器，CA 拉取必然失败。
+    // 这里按当前配置懒启动（已启动则 no-op）。
+    if !dns01 {
+        let port = if cfg.http_port == 0 { 80 } else { cfg.http_port };
+        ensure_http01_listener_blocking(&www, port);
+    }
 
     // dns-01 的写路径：hook 把请求写进 spool 目录，本进程的 worker 线程通过模块
     // 自己的 zone API（records 表 + reconcile）写入 `_acme-challenge.<domain>` TXT。
@@ -598,8 +621,8 @@ fn issue(cfg: &AcmeCfg, dns: &super::DnsConfig) -> anyhow::Result<()> {
         if run_client(&mut cmd, "acme-client", &mut failures).is_some() {
             // acme-client 默认产出 /etc/acme/<domain>/{fullchain,privkey}.pem
             let src = std::path::Path::new("/etc/acme").join(&cfg.domain);
-            let _ = std::fs::copy(src.join("fullchain.pem"), out_dir.join("fullchain.pem"));
-            let _ = std::fs::copy(src.join("privkey.pem"), out_dir.join("privkey.pem"));
+            install_cert_file(&src.join("fullchain.pem"), &out_dir.join("fullchain.pem"), 0o644)?;
+            install_cert_file(&src.join("privkey.pem"), &out_dir.join("privkey.pem"), 0o600)?;
             ensure_installed(&out_dir, "acme-client")?;
             return Ok(());
         }
@@ -648,8 +671,8 @@ fn issue(cfg: &AcmeCfg, dns: &super::DnsConfig) -> anyhow::Result<()> {
             }
             if run_client(&mut cmd, "certbot", &mut failures).is_some() {
                 let src = std::path::Path::new("/etc/letsencrypt/live").join(domain);
-                let _ = std::fs::copy(src.join("fullchain.pem"), out_dir.join("fullchain.pem"));
-                let _ = std::fs::copy(src.join("privkey.pem"), out_dir.join("privkey.pem"));
+                install_cert_file(&src.join("fullchain.pem"), &out_dir.join("fullchain.pem"), 0o644)?;
+                install_cert_file(&src.join("privkey.pem"), &out_dir.join("privkey.pem"), 0o600)?;
                 ensure_installed(&out_dir, "certbot")?;
                 if dns01 {
                     post_issue_reconcile(dns, "issue");
@@ -957,12 +980,23 @@ fn write_certbot_dns_hook(home: &str) -> anyhow::Result<std::path::PathBuf> {
 pub fn ensure_installed(out_dir: &std::path::Path, who: &str) -> anyhow::Result<()> {
     let fc = out_dir.join("fullchain.pem");
     let kp = out_dir.join("privkey.pem");
-    if !fc.is_file() || !kp.is_file() {
-        anyhow::bail!(
-            "{who}: 证书未落盘（缺 {} 或 {}）—— 安装步骤失败",
-            fc.display(),
-            kp.display()
-        );
+    // 证书/私钥必须是普通文件：指向别处的符号链接既可能是本地攻击者预置的写入跳板，
+    // 也会让 DoT/DoH 读到非预期材料（而 is_file() 跟随符号链接、看起来一切正常）。
+    for (p, what) in [(&fc, "fullchain.pem"), (&kp, "privkey.pem")] {
+        if let Ok(md) = std::fs::symlink_metadata(p) {
+            if md.file_type().is_symlink() {
+                anyhow::bail!(
+                    "{who}: {} 是符号链接（证书安装只接受普通文件）",
+                    p.display()
+                );
+            }
+        }
+        if !p.is_file() {
+            anyhow::bail!(
+                "{who}: 证书未落盘（缺 {what} {}）—— 安装步骤失败",
+                p.display()
+            );
+        }
     }
     tighten_key_permissions(&kp);
     // 证书/私钥必须配对：不匹配的 DoT 材料会在每次握手才失败，错误很难定位。
@@ -1053,11 +1087,43 @@ pub(crate) fn install_acme_sh(
     if !ok {
         // install-cert 失败时直接拷贝（acme.sh 的 ECC 产物文件名固定）。
         let src = std::path::Path::new(&src_dir);
-        let _ = std::fs::copy(src.join("fullchain.cer"), out_dir.join("fullchain.pem"));
-        let _ = std::fs::copy(src.join(format!("{domain}.key")), out_dir.join("privkey.pem"));
+        if let Err(e) =
+            install_cert_file(&src.join("fullchain.cer"), &out_dir.join("fullchain.pem"), 0o644)
+        {
+            log::warn!("dns-acme: acme.sh --install-cert 与兜底拷贝都失败（证书）: {e:#}");
+        }
+        if let Err(e) = install_cert_file(
+            &src.join(format!("{domain}.key")),
+            &out_dir.join("privkey.pem"),
+            0o600,
+        ) {
+            log::warn!("dns-acme: acme.sh --install-cert 与兜底拷贝都失败（私钥）: {e:#}");
+        }
     }
     ensure_installed(out_dir, "acme.sh")?;
     Ok(())
+}
+
+/// 把外部客户端的证书/私钥安装到 `out_dir`。
+///
+/// 旧实现对每条安装路径都用 `std::fs::copy` + `let _ =`：目标若是符号链接会**跟随**
+/// 写到链接指向的任意文件（`state/dns` 归 named 运行账户可写时，本地攻击者可预置
+/// 软链让签发流程覆写任意路径），拷贝失败也被吞掉、只在最后报「文件缺失」。
+/// 这里改为「读入内存 → O_NOFOLLOW 临时文件 → rename」原子替换：目标是符号链接时
+/// 明确拒绝；私钥 0600、证书 0644。
+fn install_cert_file(
+    src: &std::path::Path,
+    dst: &std::path::Path,
+    mode: u32,
+) -> anyhow::Result<()> {
+    if let Ok(md) = std::fs::symlink_metadata(dst) {
+        if md.file_type().is_symlink() {
+            anyhow::bail!("拒绝覆盖符号链接 {}（证书安装只接受普通文件）", dst.display());
+        }
+    }
+    let data = std::fs::read(src)
+        .map_err(|e| anyhow::anyhow!("读取 {} 失败: {e}", src.display()))?;
+    super::write_atomic(dst, &data, mode, None)
 }
 
 /// 面板「立即签发」的统一入口（admin API 改调它，替代自己拼 acme.sh 命令）：
@@ -1086,6 +1152,76 @@ const HTTP01_MAX_CONNS: usize = 64;
 const HTTP01_HEADER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 /// 单连接总寿命上限（keep-alive 已关，正常请求毫秒级完成）。
 const HTTP01_CONN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// 已成功 bind 的 HTTP-01 监听（端口 → webroot），进程级。
+///
+/// 为什么需要：监听器过去只在 `acme::startup()` 里 bind，而 startup 在
+/// `acme.enabled=false` 时直接 return。之后运维在面板里启用 ACME 并点「立即签发」
+/// （或后台监视线程触发）时，:80 上**根本没有** challenge 服务 —— CA 拉取必然失败，
+/// 面板只看到 acme.sh 的 connection refused。现在签发路径会按当前配置懒启动监听器，
+/// 这里记录已启动的端口避免重复 bind（重复 bind 会 EADDRINUSE，日志刷屏）。
+static HTTP01_STARTED: once_cell::sync::Lazy<std::sync::Mutex<Vec<(u16, String)>>> =
+    once_cell::sync::Lazy::new(|| std::sync::Mutex::new(Vec::new()));
+
+fn http01_already_started(port: u16) -> bool {
+    HTTP01_STARTED
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .any(|(p, _)| *p == port)
+}
+
+/// 启动一次 HTTP-01 监听器并等待 bind 结果（已启动则直接返回 true）。
+async fn start_http01_listener_once(webroot: &str, port: u16) -> bool {
+    if http01_already_started(port) {
+        return true;
+    }
+    let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+    tokio::spawn(http01_listener(webroot.to_string(), port, Some(ready_tx)));
+    let ok = match tokio::time::timeout(std::time::Duration::from_secs(3), ready_rx).await {
+        Ok(Ok(true)) => true,
+        Ok(Ok(false)) => false,
+        _ => false,
+    };
+    if ok {
+        let mut g = HTTP01_STARTED.lock().unwrap_or_else(|e| e.into_inner());
+        // 端口已存在但 webroot 不同：监听器仍服务旧目录。记录一条可定位的警告
+        // （重新 bind 不可能；正确做法是重启进程或改端口）。
+        if let Some((_, root)) = g.iter().find(|(p, _)| *p == port) {
+            if root != webroot {
+                log::warn!(
+                    "dns-acme: http-01 端口 {port} 已由旧 webroot（{root}）监听，新配置的 webroot（{webroot}）不会生效，需重启"
+                );
+            }
+        } else {
+            g.push((port, webroot.to_string()));
+        }
+    }
+    ok
+}
+
+/// [`issue()`] 的同步形态：从 spawn_blocking 线程按需启动监听器并等待 bind。
+fn ensure_http01_listener_blocking(webroot: &str, port: u16) {
+    if http01_already_started(port) {
+        return;
+    }
+    let Ok(handle) = tokio::runtime::Handle::try_current() else {
+        log::warn!("dns-acme: 无 tokio runtime，无法按需启动 http-01 监听（: {port}）");
+        return;
+    };
+    let root = webroot.to_string();
+    let (tx, rx) = std::sync::mpsc::channel::<bool>();
+    handle.spawn(async move {
+        let ok = start_http01_listener_once(&root, port).await;
+        let _ = tx.send(ok);
+    });
+    // 3s bind + 余量；监听器内部日志已给出失败原因，这里只补充「签发仍会尝试」。
+    match rx.recv_timeout(std::time::Duration::from_secs(4)) {
+        Ok(true) => log::info!("dns-acme: http-01 challenge listener ready on :{port}（签发路径按需启动）"),
+        Ok(false) => log::warn!("dns-acme: 按需启动 http-01 监听失败（: {port}）—— 签发可能失败"),
+        Err(_) => log::warn!("dns-acme: 启动 http-01 监听超时（: {port}）—— 继续尝试签发"),
+    }
+}
 
 /// :80（或配置的 `http_port`）HTTP-01 challenge 静态服务（极简 h1，只 serve
 /// .well-known/acme-challenge/*）。
@@ -1245,8 +1381,8 @@ fn _unused(_c: &Config) {}
 #[cfg(test)]
 mod tests {
     use super::{
-        ensure_installed, fail_backoff_secs, safe_domain_segment, summarize_client_failure,
-        with_jitter, AcmeCfg,
+        ensure_installed, fail_backoff_secs, install_cert_file, safe_domain_segment,
+        summarize_client_failure, with_jitter, AcmeCfg,
     };
 
     /// G-25：HTML 错误页必须被压成可读摘要，`error code:` / `detail` 行优先保留。
@@ -1341,5 +1477,30 @@ mod tests {
             assert!((1000..=1100).contains(&j), "jitter out of range: {j}");
         }
         assert!(with_jitter(0) <= 1);
+    }
+
+    /// 证书安装不得跟随符号链接：旧实现 `std::fs::copy` 会写穿到链接目标
+    /// （state/dns 归 named 运行账户可写时是可利用的本地提权/覆写面）。
+    #[cfg(unix)]
+    #[test]
+    fn install_rejects_symlinked_destination() {
+        let dir = std::env::temp_dir().join(format!(
+            "crucible-acme-install-symlink-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let src = dir.join("src.pem");
+        std::fs::write(&src, b"new").unwrap();
+        let outside = dir.join("outside.pem");
+        std::fs::write(&outside, b"orig").unwrap();
+        let dst = dir.join("fullchain.pem");
+        std::os::unix::fs::symlink(&outside, &dst).unwrap();
+        assert!(install_cert_file(&src, &dst, 0o644).is_err(), "符号链接必须拒绝");
+        assert_eq!(std::fs::read(&outside).unwrap(), b"orig", "不得写穿链接目标");
+        // ensure_installed 也必须拒绝（is_file() 会跟随符号链接，看起来正常）
+        std::fs::write(dir.join("privkey.pem"), b"k").unwrap();
+        assert!(ensure_installed(&dir, "test").is_err());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

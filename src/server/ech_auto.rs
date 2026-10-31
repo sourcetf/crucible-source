@@ -376,7 +376,7 @@ pub fn parse_config(config: &[u8]) -> Result<(String, u8, Vec<(u16, u16)>)> {
     let pk_len = u16::from_be_bytes(take(config, &mut p, 2)?.try_into().unwrap()) as usize;
     let _pk = take(config, &mut p, pk_len)?;
     let suites_len = u16::from_be_bytes(take(config, &mut p, 2)?.try_into().unwrap()) as usize;
-    if suites_len % 4 != 0 {
+    if !suites_len.is_multiple_of(4) {
         bail!("cipher_suites 长度非 4 的倍数");
     }
     let mut suites = Vec::new();
@@ -419,7 +419,7 @@ fn pem_block(text: &str, label: &str) -> Option<String> {
 /// 复用条件（全部满足才复用）：
 ///   - 磁盘上存在可解析的 config + 32 字节私钥；
 ///   - config 的 public_name / maximum_name_length / cipher_suites 与当前配置一致。
-/// 任一不满足 → 重新生成并落盘。
+///     任一不满足 → 重新生成并落盘。
 pub fn ensure_material(spec: &EchSpec) -> Result<EchMaterial> {
     if let Some((config, key)) = load_persisted() {
         match parse_config(&config) {

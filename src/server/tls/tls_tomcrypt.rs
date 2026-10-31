@@ -7,13 +7,17 @@
 use crate::config::{ListenerConfig, SslConfig};
 use crate::server::live_config::LiveConfig;
 use crate::server::ssl_material;
-use crate::server::tls::legacy_io::{relay_bridge_only, run_legacy_handshake, sync_io_bridge};
+use crate::server::tls::legacy_io::{relay_bridge_only, run_legacy_handshake, LegacyRelay};
 use crate::server::{h1};
 use anyhow::{Context, Result};
 use std::ffi::CString;
-use std::io::{Read, Write};
+use std::io;
 use std::net::SocketAddr;
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context as TaskContext, Poll};
+use std::time::{Duration, Instant};
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::TcpStream;
 
 mod ffi {
@@ -31,16 +35,32 @@ mod ffi {
             key_pem: *const u8,
             key_len: usize,
         ) -> *mut crucible_tomcrypt_conn;
+        /// >=0 bytes (0 = EOF), -2 = would block, -1 = error.
         pub fn crucible_tomcrypt_read(conn: *mut crucible_tomcrypt_conn, buf: *mut u8, len: usize) -> isize;
         pub fn crucible_tomcrypt_write(conn: *mut crucible_tomcrypt_conn, buf: *const u8, len: usize) -> isize;
+        /// 0 = drained, -2 = would block (partial), -1 = error.
+        pub fn crucible_tomcrypt_flush(conn: *mut crucible_tomcrypt_conn) -> isize;
+        /// Bytes still queued for the socket.
+        pub fn crucible_tomcrypt_out_pending(conn: *mut crucible_tomcrypt_conn) -> isize;
+        /// Bitmask: 1=readable, 2=writable, 4=wakeup, 0=timeout, -1=error.
+        pub fn crucible_tomcrypt_poll(
+            conn: *mut crucible_tomcrypt_conn,
+            want_read: c_int,
+            want_write: c_int,
+            timeout_ms: c_int,
+        ) -> c_int;
+        pub fn crucible_tomcrypt_wakeup(conn: *mut crucible_tomcrypt_conn) -> c_int;
         pub fn crucible_tomcrypt_free(conn: *mut crucible_tomcrypt_conn);
     }
 
     pub enum crucible_tomcrypt_conn {}
 }
 
-/// TomCrypt 连接共享指针：读写 half 共享（桥的读/写线程分用）；
-/// shim 的记录层按方向加锁（TLS 全双工）；引用计数归零时释放一次。
+/// TomCrypt 连接共享指针：引用计数归零时释放一次。
+///
+/// 所有 I/O 由唯一一条 poll 线程发起（见 [`spawn_poll_io`]），异步写侧只通过
+/// mpsc 排队 + `wakeup()`（自管道）通知 poll 线程；因此 `crucible_tomcrypt_read`
+/// 与 `flush` 之间没有并发调用。
 struct TomcryptShared {
     conn: *mut ffi::crucible_tomcrypt_conn,
 }
@@ -48,34 +68,88 @@ struct TomcryptShared {
 unsafe impl Send for TomcryptShared {}
 unsafe impl Sync for TomcryptShared {}
 
+/// `crucible_tomcrypt_read/flush` 的返回值：-2=would-block，其它负值=错误。
+fn map_io(n: isize) -> io::Result<usize> {
+    match n {
+        -2 => Err(io::Error::from(io::ErrorKind::WouldBlock)),
+        n if n < 0 => Err(io::Error::last_os_error()),
+        n => Ok(n as usize),
+    }
+}
+
 impl TomcryptShared {
-    fn read(&self, buf: &mut [u8]) -> std::io::Result<usize> {
+    fn read(&self, buf: &mut [u8]) -> io::Result<usize> {
         if self.conn.is_null() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::NotConnected,
+            return Err(io::Error::new(
+                io::ErrorKind::NotConnected,
                 "tomcrypt closed",
             ));
         }
-        let n = unsafe { ffi::crucible_tomcrypt_read(self.conn, buf.as_mut_ptr(), buf.len()) };
+        map_io(unsafe { ffi::crucible_tomcrypt_read(self.conn, buf.as_mut_ptr(), buf.len()) })
+    }
+
+    fn write(&self, buf: &[u8]) -> io::Result<usize> {
+        if self.conn.is_null() {
+            return Err(io::Error::new(
+                io::ErrorKind::NotConnected,
+                "tomcrypt closed",
+            ));
+        }
+        map_io(unsafe { ffi::crucible_tomcrypt_write(self.conn, buf.as_ptr(), buf.len()) })
+    }
+
+    /// Drain the C-side encrypted queue. `Ok(())` when fully written; would-block
+    /// is surfaced as `ErrorKind::WouldBlock` so the poll loop can wait.
+    fn flush(&self) -> io::Result<()> {
+        if self.conn.is_null() {
+            return Err(io::Error::new(
+                io::ErrorKind::NotConnected,
+                "tomcrypt closed",
+            ));
+        }
+        let n = unsafe { ffi::crucible_tomcrypt_flush(self.conn) };
+        map_io(n).map(|_| ())
+    }
+
+    fn out_pending(&self) -> usize {
+        if self.conn.is_null() {
+            return 0;
+        }
+        let n = unsafe { ffi::crucible_tomcrypt_out_pending(self.conn) };
         if n < 0 {
-            Err(std::io::Error::last_os_error())
+            0
         } else {
-            Ok(n as usize)
+            n as usize
         }
     }
 
-    fn write(&self, buf: &[u8]) -> std::io::Result<usize> {
+    fn poll(&self, want_read: bool, want_write: bool, timeout_ms: i32) -> io::Result<i32> {
         if self.conn.is_null() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::NotConnected,
+            return Err(io::Error::new(
+                io::ErrorKind::NotConnected,
                 "tomcrypt closed",
             ));
         }
-        let n = unsafe { ffi::crucible_tomcrypt_write(self.conn, buf.as_ptr(), buf.len()) };
-        if n < 0 {
-            Err(std::io::Error::last_os_error())
+        let rc = unsafe {
+            ffi::crucible_tomcrypt_poll(
+                self.conn,
+                want_read as i32,
+                want_write as i32,
+                timeout_ms,
+            )
+        };
+        if rc < 0 {
+            Err(io::Error::last_os_error())
         } else {
-            Ok(n as usize)
+            Ok(rc)
+        }
+    }
+
+    fn wakeup(&self) {
+        if !self.conn.is_null() {
+            unsafe {
+                ffi::crucible_tomcrypt_wakeup(self.conn);
+            }
         }
     }
 }
@@ -91,25 +165,227 @@ impl Drop for TomcryptShared {
     }
 }
 
-/// 读写 half：Clone 共享同一 TomcryptShared。
-#[derive(Clone)]
-struct TomcryptHalf {
+/// 已建立 TomCrypt 连接的 async 侧。写方向把明文块交给 poll 线程并唤醒它；
+/// 读方向从 poll 线程的通道取解密后的明文。
+struct TomcryptPollIo {
+    rx: tokio::sync::mpsc::Receiver<io::Result<Vec<u8>>>,
+    chunk: Option<Vec<u8>>,
+    off: usize,
+    tx: Option<tokio::sync::mpsc::UnboundedSender<Vec<u8>>>,
+    /// 仅用于 Drop 时唤醒即将退出的 poll 线程（持 Arc 保证 conn 指针有效）。
     shared: Arc<TomcryptShared>,
 }
 
-impl Read for TomcryptHalf {
-    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        self.shared.read(buf)
+impl Drop for TomcryptPollIo {
+    fn drop(&mut self) {
+        // 关闭写通道，让 poll 线程写完剩余数据后收尾并发 FIN。
+        self.tx.take();
+        self.shared.wakeup();
     }
 }
 
-impl Write for TomcryptHalf {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        self.shared.write(buf)
+impl AsyncRead for TomcryptPollIo {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut TaskContext<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        if self.chunk.is_none() {
+            match self.rx.poll_recv(cx) {
+                Poll::Pending => return Poll::Pending,
+                Poll::Ready(Some(Ok(data))) => {
+                    if data.is_empty() {
+                        return Poll::Ready(Ok(())); // 读线程显式 EOF
+                    }
+                    self.chunk = Some(data);
+                    self.off = 0;
+                }
+                Poll::Ready(Some(Err(e))) => return Poll::Ready(Err(e)),
+                Poll::Ready(None) => return Poll::Ready(Ok(())),
+            }
+        }
+        let n = {
+            let chunk = self.chunk.as_ref().expect("chunk set above");
+            let take = (chunk.len() - self.off).min(buf.remaining());
+            buf.put_slice(&chunk[self.off..self.off + take]);
+            take
+        };
+        self.off += n;
+        if self
+            .chunk
+            .as_ref()
+            .is_some_and(|c| self.off >= c.len())
+        {
+            self.chunk = None;
+            self.off = 0;
+        }
+        Poll::Ready(Ok(()))
+    }
+}
+
+impl AsyncWrite for TomcryptPollIo {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        _cx: &mut TaskContext<'_>,
+        data: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        if data.is_empty() {
+            return Poll::Ready(Ok(0));
+        }
+        let Some(tx) = self.tx.as_ref() else {
+            return Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "tomcrypt poll thread gone",
+            )));
+        };
+        match tx.send(data.to_vec()) {
+            Ok(()) => {
+                // 只有写侧知道队列里出现了新数据；唤醒可能正阻塞在 poll 的线程。
+                self.shared.wakeup();
+                Poll::Ready(Ok(data.len()))
+            }
+            Err(_) => Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "tomcrypt poll thread gone",
+            ))),
+        }
     }
 
-    fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
+    fn poll_flush(self: Pin<&mut Self>, _cx: &mut TaskContext<'_>) -> Poll<io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut TaskContext<'_>) -> Poll<io::Result<()>> {
+        // legacy 栈无 close_notify；poll 线程收尾时对 relay 做 SHUT_WR。
+        Poll::Ready(Ok(()))
+    }
+}
+
+const TC_IO_BUF: usize = 16 * 1024;
+/// 写侧「零进展」上限：有排队响应但连续的 socket 写一个字节都推不进去（对端
+/// 不读、内核发送缓冲持续全满）就强制关断，线程必有界。
+const TC_IO_WRITE_IDLE: Duration = Duration::from_secs(60);
+
+/// 启动唯一一条 poll 线程：非阻塞 read + flush + poll 双向驱动。
+fn spawn_poll_io(shared: Arc<TomcryptShared>, relay: LegacyRelay) -> TomcryptPollIo {
+    let (r_tx, r_rx) = tokio::sync::mpsc::channel::<io::Result<Vec<u8>>>(8);
+    let (w_tx, mut w_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
+    let thread_shared = Arc::clone(&shared);
+
+    let _ = std::thread::Builder::new()
+        .name("cruc-tc-io".into())
+        .spawn(move || tc_poll_loop(thread_shared, relay, r_tx, &mut w_rx));
+
+    TomcryptPollIo {
+        rx: r_rx,
+        chunk: None,
+        off: 0,
+        tx: Some(w_tx),
+        shared,
+    }
+}
+
+fn tc_poll_loop(
+    shared: Arc<TomcryptShared>,
+    relay: LegacyRelay,
+    r_tx: tokio::sync::mpsc::Sender<io::Result<Vec<u8>>>,
+    w_rx: &mut tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>,
+) {
+    let mut relay = Some(relay);
+    let mut read_open = true;
+    let mut write_closed = false;
+    let mut last_progress = Instant::now();
+    let mut last_pending = 0usize;
+    let mut rbuf = vec![0u8; TC_IO_BUF];
+
+    loop {
+        // 1. 收集 async 写侧排队的明文并加密入 C 队列。通道断开 = h1 处理完整条连接。
+        loop {
+            match w_rx.try_recv() {
+                Ok(data) => {
+                    if let Err(e) = shared.write(&data) {
+                        let _ = r_tx.blocking_send(Err(e));
+                        if let Some(r) = relay.take() {
+                            r.shutdown_send();
+                        }
+                        return;
+                    }
+                }
+                Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
+                Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
+                    write_closed = true;
+                    break;
+                }
+            }
+        }
+
+        // 2. 把 C 队列里的密文推给内核（非阻塞；排空或 would-block）。
+        if let Err(e) = shared.flush() {
+            if e.kind() != io::ErrorKind::WouldBlock {
+                let _ = r_tx.blocking_send(Err(e));
+                break;
+            }
+        }
+
+        // 3. 非阻塞读：staged 整条记录 → 明文；would-block 则等待。
+        if read_open {
+            loop {
+                match shared.read(&mut rbuf) {
+                    Ok(0) => {
+                        let _ = r_tx.blocking_send(Ok(Vec::new()));
+                        read_open = false;
+                        break;
+                    }
+                    Ok(n) => {
+                        if r_tx.blocking_send(Ok(rbuf[..n].to_vec())).is_err() {
+                            read_open = false;
+                            break;
+                        }
+                    }
+                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
+                    Err(e) => {
+                        // 遗留客户端通常直接 close（无 close_notify）：按 EOF 处理，
+                        // 让已排队的响应仍能写完。
+                        log::debug!(target: "tls_tomcrypt", "tomcrypt poll read end: {e}");
+                        let _ = r_tx.blocking_send(Ok(Vec::new()));
+                        read_open = false;
+                        break;
+                    }
+                }
+            }
+        }
+
+        // 4. 退出/防永久阻塞：排队响应零进展超时则强行关断。
+        let pending = shared.out_pending();
+        if pending != last_pending {
+            last_pending = pending;
+            last_progress = Instant::now();
+        }
+        if write_closed && pending == 0 {
+            break;
+        }
+        if pending > 0 && last_progress.elapsed() >= TC_IO_WRITE_IDLE {
+            if let Some(r) = relay.as_ref() {
+                r.interrupt();
+            }
+            break;
+        }
+
+        // 5. 阻塞等待：{relay fd 可读/可写, wakeup event}。
+        let want_write = pending > 0;
+        let timeout_ms = if want_write { 250 } else { -1 };
+        match shared.poll(read_open, want_write, timeout_ms) {
+            Ok(_) => {}
+            Err(_) => {
+                let _ = r_tx.blocking_send(Ok(Vec::new()));
+                break;
+            }
+        }
+    }
+
+    // 统一收尾：显式 FIN（遗留栈没有 close_notify）；C 连接在 Arc 归零时释放。
+    if let Some(r) = relay.take() {
+        r.shutdown_send();
     }
 }
 
@@ -227,16 +503,11 @@ async fn accept_and_serve_inner(
     })
     .await
     .context("tomcrypt handshake")??;
-    // C 侧持有 relay fd 的 dup。Rust 这份的所有权交给写线程：响应写完后由它
-    // 对 relay 做 SHUT_WR，客户端才能收到 FIN（遗留栈无 close_notify）。
-    // 任务 6：阻塞 IO 移出 executor——读写线程 + mpsc 桥（ halves 共享同一连接）。
-    let io = sync_io_bridge(
-        TomcryptHalf {
-            shared: Arc::clone(&shared),
-        },
-        TomcryptHalf { shared },
-        Some(relay),
-    );
+    // C 侧持有 relay fd 的 dup。Rust 这份的所有权交给唯一 poll 线程：响应写完后
+    // 由它对 relay 做 SHUT_WR，客户端才能收到 FIN（遗留栈无 close_notify）。
+    // G-04：已建立连接 1 条 OS 线程（旧实现读+写各 1 条 = 2 条；relay 是 tokio
+    // 任务，无 OS 线程）。非阻塞 read/flush + poll 在同一线程内多路复用。
+    let io = spawn_poll_io(shared, relay);
     h1::serve_tls(io, live, lc, peer).await
 }
 

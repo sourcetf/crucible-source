@@ -1,0 +1,5 @@
+PUT /up-x.txt HTTP/1.1
+Host: 127.0.0.1:30094
+Content-Length: 100
+
+abc

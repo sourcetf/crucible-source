@@ -1,0 +1,11 @@
+GET /a HTTP/1.1
+Hng: P/1.1
+H:301,8
+If-None-Matae: "ab ,8
+If-None-Matae: "ab 1301,8
+If-None-Matae:301,8
+If-None-Matae: "ab ÿÿÿÿÿ!: 6
+T"
+
+
+

@@ -5,10 +5,18 @@ from __future__ import annotations
 import argparse
 import json
 import sqlite3
+import sys
 import time
 from pathlib import Path
 
-from geoip_common import SEED_RANGES, init_schema, upsert_range, write_sources_meta
+from geoip_common import (
+    DEFAULT_DB,
+    SEED_RANGES,
+    current_dir,
+    init_schema,
+    upsert_range,
+    write_sources_meta,
+)
 
 # §5 信任权重（最终保留侧）：目录名前两位 → 权重。
 LAYER_WEIGHTS = {
@@ -33,25 +41,41 @@ def import_layer_dir(
 ) -> int:
     n = 0
     for path in sorted(layer_dir.glob("*.jsonl")):
-        for line in path.read_text(encoding="utf-8").splitlines():
-            line = line.strip()
-            if not line:
-                continue
-            row = json.loads(line)
-            start = row.get("ip_start") or row.get("start")
-            end = row.get("ip_end") or row.get("end") or start
-            if not start:
-                continue
-            fields = {k: row.get(k, "") for k in (
-                "country", "region", "province", "city", "district", "isp", "dc",
-                "asn", "as_org", "cloud_provider", "cloud_region", "cloud_service",
-                "hosting", "division_code",
-            )}
-            row_cu = int(row.get("commit_unix") or commit_unix)
-            upsert_range(
-                conn, start, end, fields, weight=weight, source=source, commit_unix=row_cu
-            )
-            n += 1
+        # 逐行流式读取：真实层文件可达数百 MB（GeoLite2/ASN 层），
+        # `read_text().splitlines()` 会同时分配原文 + 行列表，峰值内存翻几倍。
+        with path.open(encoding="utf-8", errors="replace") as f:
+            for lineno, line in enumerate(f, 1):
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    row = json.loads(line)
+                except json.JSONDecodeError as e:
+                    print(
+                        f"warn: {path}:{lineno}: bad JSON ({e.msg}), skipped",
+                        file=sys.stderr,
+                    )
+                    continue
+                if not isinstance(row, dict):
+                    continue
+                start = row.get("ip_start") or row.get("start")
+                end = row.get("ip_end") or row.get("end") or start
+                if not start:
+                    continue
+                fields = {k: row.get(k, "") for k in (
+                    "country", "region", "province", "city", "district", "isp", "dc",
+                    "asn", "as_org", "net_org",
+                    "cloud_provider", "cloud_region", "cloud_service",
+                    "hosting", "division_code",
+                )}
+                try:
+                    row_cu = int(row.get("commit_unix") or commit_unix)
+                except (TypeError, ValueError):
+                    row_cu = commit_unix
+                upsert_range(
+                    conn, start, end, fields, weight=weight, source=source, commit_unix=row_cu
+                )
+                n += 1
     return n
 
 
@@ -70,8 +94,8 @@ def seed_samples(conn: sqlite3.Connection, commit_unix: int) -> int:
 
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--db", default="data/geoip/current/geoip.sqlite")
-    ap.add_argument("--layers", default="data/geoip/current", help="scan 01-cloud … subdirs")
+    ap.add_argument("--db", default=DEFAULT_DB)
+    ap.add_argument("--layers", default=str(current_dir()), help="scan 01-cloud … subdirs")
     ap.add_argument("--init-schema", action="store_true")
     ap.add_argument("--seed", action="store_true")
     ap.add_argument("--import-layers", action="store_true")

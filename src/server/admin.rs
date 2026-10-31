@@ -191,9 +191,14 @@ async fn handle_login(
                 .to_string(),
         );
     }
-    let token = crate::server::basic_auth::create_admin_session();
+    // U-13：会话 TTL 来自 `[admin] session_ttl_secs`（默认 8h）。服务端与会话
+    // cookie 的 Max-Age/Expires 使用同一份值，客户端与服务端同时到期。
+    let ttl = cfg.admin.session_ttl();
+    let token = crate::server::basic_auth::create_admin_session(ttl);
     let mut resp = json_ok("{\"ok\":true,\"cookie_set\":true}".to_string());
-    match http::HeaderValue::from_str(&crate::server::basic_auth::admin_session_set_cookie(&token)) {
+    match http::HeaderValue::from_str(&crate::server::basic_auth::admin_session_set_cookie(
+        &token, ttl,
+    )) {
         Ok(v) => {
             resp.headers_mut().append(header::SET_COOKIE, v);
         }
@@ -1598,7 +1603,7 @@ fn save_listener(live: &Arc<LiveConfig>, v: &Json) -> Response<BoxBody> {
 
 /// body: {"port": 9095, "apps": [AppRouteConfig...]}
 fn save_apps(live: &Arc<LiveConfig>, v: &Json) -> Response<BoxBody> {
-    let port = match json_port(&v, "port") {
+    let port = match json_port(v, "port") {
         Ok(p) => p,
         Err(resp) => return resp,
     };
@@ -1643,7 +1648,7 @@ fn save_apps(live: &Arc<LiveConfig>, v: &Json) -> Response<BoxBody> {
 
 /// body: {"port": 9446, "ssl": {...} | null}；null 表示去掉该站点的 TLS。
 fn save_ssl(live: &Arc<LiveConfig>, v: &Json) -> Response<BoxBody> {
-    let port = match json_port(&v, "port") {
+    let port = match json_port(v, "port") {
         Ok(p) => p,
         Err(resp) => return resp,
     };
@@ -1728,7 +1733,7 @@ fn save_ssl(live: &Arc<LiveConfig>, v: &Json) -> Response<BoxBody> {
 /// body: {"port": 9095, "entries": [{"path": "/x", "mode": "preview|download|execute|auto"}]}
 /// 键可为 URL 路径（/a/b）或扩展名（pdf）或 *；file_open 优先级高于应用引擎（§3.2）。
 fn save_file_open(live: &Arc<LiveConfig>, v: &Json) -> Response<BoxBody> {
-    let port = match json_port(&v, "port") {
+    let port = match json_port(v, "port") {
         Ok(p) => p,
         Err(resp) => return resp,
     };
@@ -1786,7 +1791,7 @@ fn save_file_open(live: &Arc<LiveConfig>, v: &Json) -> Response<BoxBody> {
 
 /// body: {"port": 9081, "enabled": true, "paths": ["/"]}
 fn save_autoindex(live: &Arc<LiveConfig>, v: &Json) -> Response<BoxBody> {
-    let port = match json_port(&v, "port") {
+    let port = match json_port(v, "port") {
         Ok(p) => p,
         Err(resp) => return resp,
     };
@@ -1882,7 +1887,7 @@ fn save_page_rules(live: &Arc<LiveConfig>, v: &Json) -> Response<BoxBody> {
     let port = if global {
         0
     } else {
-        match json_port(&v, "port") {
+        match json_port(v, "port") {
             Ok(p) => p,
             Err(resp) => return resp,
         }
@@ -1997,7 +2002,7 @@ const SSL_MODES: &[&str] = &[
 /// body: {"port": 9081, "rules": [{"path": "/api", "upstream": "http://127.0.0.1:8080",
 ///   "ssl_mode": "verify", "modify_request_headers": {}, "modify_response_headers": {}}]}
 fn save_proxy_rules(live: &Arc<LiveConfig>, v: &Json) -> Response<BoxBody> {
-    let port = match json_port(&v, "port") {
+    let port = match json_port(v, "port") {
         Ok(p) => p,
         Err(resp) => return resp,
     };
@@ -2100,6 +2105,17 @@ fn save_proxy_rules(live: &Arc<LiveConfig>, v: &Json) -> Response<BoxBody> {
                 t.insert("tor_socks".into(), toml::Value::String(ts.into()));
             }
         }
+        // G-11：回源信任锚/证书固定/mTLS 身份。这四项此前不在白名单里，
+        // 面板每保存一次就把它们静默抹掉（整段 rules 是重写），
+        // 运维配好的自定义 CA 会「保存成功但功能消失」。
+        for key in ["upstream_ca", "upstream_ca_sha256", "client_cert", "client_key"] {
+            if let Some(val) = r.get(key).and_then(|x| x.as_str()) {
+                let val = val.trim();
+                if !val.is_empty() {
+                    t.insert(key.into(), toml::Value::String(val.into()));
+                }
+            }
+        }
         out.push(toml::Value::Table(t));
     }
     let mut tree = match cfg_edit::load_tree(live.path()) {
@@ -2156,6 +2172,9 @@ const MAX_APP_WORKERS: u64 = 128;
 const MAX_SHORT_STR: usize = 128;
 /// 路径类字符串（docroot/root/匹配路径/file_open 键）。
 const MAX_PATH_STR: usize = 512;
+/// 长字符串（证书文件路径 / PEM 正文 / 指纹等）。PEM 正文可能有好几 KB，
+/// 但 16 KiB 足够放下常见链；更长的基本是把整个文件粘错了地方。
+const MAX_LONG_STR: usize = 16384;
 /// URL / 回源地址类字符串（上游、redirect target）。
 const MAX_URL_STR: usize = 2048;
 /// 注入头的名字/值长度上限（真实头名 <64、值通常 <1KB；超长只是把配置与每个
@@ -2399,260 +2418,82 @@ fn check_ip_access_list(list: &str, items: &[Json]) -> Result<Vec<toml::Value>, 
     Ok(out)
 }
 
-/// 页面规则校验（save_page_rules 与 /api/pagerules 共用；idx 用于指出是第几条）。
+/// 页面规则校验（save_page_rules / check_listener_json / 快捷添加共用；idx 指出第几条）。
+///
+/// **与手写 config.toml 共用唯一口径**：这里只做 JSON 形态的类型检查，再把值装进
+/// [`crate::config::PageRuleConfig`] 交给 [`crate::config::validate_page_rule`] 做全部
+/// 语义校验（action / target / match_url / host / method / header / country / priority）。
+/// 旧实现是一份与 config 平行的独立校验，口径会漂移：面板放行 `Content-Length` 等
+/// 定界/逐跳注入头、接受非 ISO2 国家码（运行期永不命中），而配置期却拒绝 —— 同一份
+/// JSON 走「面板保存」与「写进 toml 再加载」结论不一致。
+///
+/// `action` 在交给校验器前**归一化成小写**：`apply` 是精确匹配，面板历来容忍大小写
+/// 并在保存时统一小写；手写配置则必须自己写小写（否则配置期报错，见
+/// `config::validate_page_rule`）。
 fn check_page_rule(rule: &Json, idx: usize) -> Result<(), String> {
+    let label = format!("rule[{idx}]");
+    // match_url：必填、必须是字符串。
     let match_url = rule
         .get("match_url")
         .and_then(|m| m.as_str())
-        .map(str::trim)
-        .unwrap_or("");
-    if match_url.is_empty() {
-        return Err(format!("rule[{idx}] 缺少 match_url"));
-    }
-    if match_url.len() > MAX_PATH_STR {
-        return Err(format!("rule[{idx}].match_url 过长（{} > {MAX_PATH_STR}）", match_url.len()));
-    }
-    // 请求路径恒以 `/` 开头，`path_matches` 是字面前缀/全等比较 ——
-    // 不以 `/` 开头的规则永远匹配不上（面板显示已保存、实际从不生效）。
-    if !match_url.starts_with('/') {
-        return Err(format!(
-            "rule[{idx}].match_url 必须以 / 开头（当前 {match_url:?}），否则永远匹配不到请求"
-        ));
-    }
-    let action = rule
-        .get("action")
-        .and_then(|a| a.as_str())
-        .unwrap_or("redirect")
+        .ok_or_else(|| format!("{label}.match_url 必填且必须是字符串"))?
         .trim()
-        .to_ascii_lowercase();
-    if !PAGE_RULE_ACTIONS.contains(&action.as_str()) {
-        return Err(format!(
-            "rule[{idx}] action 不合法: {action:?}（只能是 {}）",
-            PAGE_RULE_ACTIONS.join("/")
-        ));
-    }
-    // §16.11 优先级：必须能解析成整数（面板可能传来 "abc"/空串）；缺省视为 0。
-    if let Some(p) = rule.get("priority") {
-        if !p.is_null() && p.as_i64().is_none() {
-            return Err(format!("rule[{idx}].priority 必须是整数（当前 {p:?}）"));
-        }
-    }
-    // §16.11 匹配维度 host/method/header/country：运行期对非法值只会「不匹配」
-    // （不会 panic），但那意味着面板存进去的规则**永不生效**且没有任何提示 ——
-    // 保存时按运行期同一口径拒绝。null/缺省 = 不约束；显式写了就必须能生效。
-    for (key, check) in [
-        ("host", check_page_rule_host as fn(usize, &str) -> Result<(), String>),
-        ("method", check_page_rule_method as fn(usize, &str) -> Result<(), String>),
-        ("header", check_page_rule_header as fn(usize, &str) -> Result<(), String>),
-        ("country", check_page_rule_country as fn(usize, &str) -> Result<(), String>),
-    ] {
-        if let Some(v) = rule.get(key) {
-            if !v.is_null() {
-                let Some(s) = v.as_str() else {
-                    return Err(format!("rule[{idx}].{key} 必须是字符串（当前 {v:?}）"));
-                };
-                check(idx, s)?;
-            }
-        }
-    }
-    let target = rule.get("target").and_then(|t| t.as_str()).map(str::trim);
-    if let Some(t) = target {
-        if !t.is_empty() {
-            if t.len() > MAX_URL_STR {
-                return Err(format!("rule[{idx}].target 过长（{} > {MAX_URL_STR}）", t.len()));
-            }
-            // redirect 的 target 会直接进 `Location:` 头（page_rules::redirect_response
-            // 用 `.header(...).unwrap()` 构造响应）：含控制字符（换行等）时 HeaderValue
-            // 构造失败 → **每个命中该规则的请求都 panic**。非 ASCII 会被按 obs-text 原样
-            // 发出（h2/h3 与中间缓存处理不一），一并拒绝。
-            if action == "redirect" {
-                check_header_pair(&format!("rule[{idx}].target(Location)"), "location", t)?;
-            }
-            match action.as_str() {
-                // rewrite 的 target 会与请求路径做前缀拼接，非绝对路径拼出来的东西
-                // 不再是合法请求路径（后续 404，且日志里看不出原因）。
-                "rewrite" => {
-                    if !t.starts_with('/') {
-                        return Err(format!(
-                            "rule[{idx}].target（rewrite）必须以 / 开头: {t:?}"
-                        ));
-                    }
-                }
-                // pass 的 target 当上游 URL 用（proxy::upstream_parts 只认 http/https
-                // 且有 host），非法值 = 该路径每个请求都失败。
-                "pass" => check_upstream(&format!("rule[{idx}].target(pass)"), t)?,
-                // header 的 target 形如 "Name: value"，运行期按 ':' 拆开，
-                // 名字/值非法时**静默丢弃**（page_rules::response_headers 的 continue）
-                // —— 管理员配的头永远不生效。
-                "header" => {
-                    let (name, value) = t.split_once(':').ok_or_else(|| {
-                        format!("rule[{idx}].target（header）必须是 \"Name: value\" 形式: {t:?}")
-                    })?;
-                    check_header_pair(&format!("rule[{idx}].target(header)"), name.trim(), value.trim())?;
-                }
-                // cache 的 target 就是 Cache-Control 值：含控制字符时运行期静默丢弃。
-                "cache" => {
-                    if t.chars().any(|c| c.is_control()) {
-                        return Err(format!("rule[{idx}].target（cache）含控制字符"));
-                    }
-                }
-                _ => {}
-            }
-        }
-    }
-    // header / rewrite / pass 缺 target 时运行期直接 `continue`（静默忽略整条规则）。
-    if target.map(|t| t.is_empty()).unwrap_or(true)
-        && matches!(action.as_str(), "header" | "rewrite" | "pass")
-    {
-        return Err(format!(
-            "rule[{idx}] action={action} 必须给 target（缺 target 时运行期会静默跳过这条规则）"
-        ));
-    }
-    Ok(())
-}
-
-/// §16.11 host 维度校验：`*` / 精确主机名 / `*.suffix` 通配；可带端口（运行期忽略）。
-/// 与 `page_rules::host_matches` 同一口径 —— 保存时能过、运行期就能命中。
-fn check_page_rule_host(idx: usize, host: &str) -> Result<(), String> {
-    let h = host.trim();
-    if h.is_empty() {
-        return Err(format!(
-            "rule[{idx}].host 不能为空（要匹配全部主机请写 \"*\"）"
-        ));
-    }
-    if h.len() > MAX_DNS_NAME_LEN + 8 {
-        return Err(format!(
-            "rule[{idx}].host 过长（{} > {}）",
-            h.len(),
-            MAX_DNS_NAME_LEN + 8
-        ));
-    }
-    if h == "*" {
-        return Ok(());
-    }
-    let body = h.strip_prefix("*.").unwrap_or(h);
-    // 剥端口（与 host_without_port 同口径）：IPv6 字面量 `[..]` 可跟 `:port`；
-    // 无括号形态最多一个冒号且后面必须是纯数字端口 —— 否则是无效主机名。
-    let name_and_rest: (&str, &str) = if let Some(r) = body.strip_prefix('[') {
-        let Some(end) = r.find(']') else {
-            return Err(format!("rule[{idx}].host 的 IPv6 字面量缺少 ']': {host:?}"));
-        };
-        (&body[..end + 2], &r[end + 1..])
-    } else {
-        match body.rsplit_once(':') {
-            Some((n, p)) if !n.contains(':') && !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()) => {
-                (n, "")
-            }
-            Some(_) => {
-                return Err(format!(
-                    "rule[{idx}].host 不合法（冒号后必须是纯数字端口）: {host:?}"
-                ))
-            }
-            None => (body, ""),
-        }
-    };
-    let (name, rest) = name_and_rest;
-    if name.is_empty() {
-        return Err(format!("rule[{idx}].host 缺少主机名: {host:?}"));
-    }
-    if !rest.is_empty() {
-        let digits = rest.strip_prefix(':').unwrap_or(rest);
-        if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
-            return Err(format!("rule[{idx}].host 的端口部分必须全是数字: {host:?}"));
-        }
-    }
-    if name
-        .bytes()
-        .any(|b| !(b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'_' | b':' | b'[' | b']')))
-    {
-        return Err(format!(
-            "rule[{idx}].host 含非法字符（只允许字母/数字/./-/_/:/[]）: {host:?}"
-        ));
-    }
-    Ok(())
-}
-
-/// §16.11 方法维度校验：逗号分隔的 HTTP 方法（token），大小写不敏感；至少一个。
-fn check_page_rule_method(idx: usize, method: &str) -> Result<(), String> {
-    let toks: Vec<&str> = method
-        .split(',')
-        .map(str::trim)
-        .filter(|t| !t.is_empty())
-        .collect();
-    if toks.is_empty() {
-        return Err(format!(
-            "rule[{idx}].method 不能为空（至少一个方法，如 \"GET, HEAD\"）"
-        ));
-    }
-    if toks.len() > 16 {
-        return Err(format!(
-            "rule[{idx}].method 方法数过多（{} > 16）",
-            toks.len()
-        ));
-    }
-    for t in toks {
-        if t.len() > 32 || http::Method::from_bytes(t.as_bytes()).is_err() {
-            return Err(format!("rule[{idx}].method 含非法方法 token: {t:?}"));
-        }
-    }
-    Ok(())
-}
-
-/// §16.11 header 维度校验：`Name`（存在即命中）或 `Name: value`（值精确）。
-/// 头名必须是 RFC 9110 token；值沿用 `check_header_pair`（拒 CR/LF/控制字符/非 ASCII）。
-fn check_page_rule_header(idx: usize, spec: &str) -> Result<(), String> {
-    let (name, value) = match spec.split_once(':') {
-        Some((n, v)) => (n.trim(), v.trim()),
-        None => (spec.trim(), ""),
-    };
-    if name.is_empty() {
-        return Err(format!("rule[{idx}].header 缺少头名: {spec:?}"));
-    }
-    check_header_pair(&format!("rule[{idx}].header"), name, value)
-}
-
-/// §16.11 country 维度校验：逗号分隔、`!` 前缀排除、ISO2/别名。
-///
-/// 与 `page_rules::country_matches` 同一口径：每个 token 去掉 `!` 后必须能被
-/// `resolve_country_alias` 归一化成 2..=8 位 ASCII 字母数字（`CN`/`China`→`CN`）；
-/// 空 token 忽略，但整串至少要有一个有效 token（否则规则永不命中）。
-fn check_page_rule_country(idx: usize, spec: &str) -> Result<(), String> {
-    let mut any = false;
-    let mut n = 0usize;
-    for tok in spec.split(',') {
-        let t = tok.trim();
-        if t.is_empty() {
-            continue;
-        }
-        n += 1;
-        if n > 64 {
-            return Err(format!("rule[{idx}].country 条目过多（> 64）"));
-        }
-        let raw = t.strip_prefix('!').unwrap_or(t).trim();
-        if raw.is_empty() {
-            return Err(format!(
-                "rule[{idx}].country 的排除项 `!` 后缺少国家码: {spec:?}"
-            ));
-        }
-        let code = crate::server::geoip_panel::aliases::resolve_country_alias(raw)
+        .to_string();
+    // action：缺省 = redirect；给了就必须是字符串（归一化成小写，与保存一致）。
+    let action = match rule.get("action") {
+        None => "redirect".to_string(),
+        Some(v) if v.is_null() => "redirect".to_string(),
+        Some(v) => v
+            .as_str()
+            .ok_or_else(|| format!("{label}.action 必须是字符串（当前 {v}）"))?
             .trim()
-            .to_ascii_uppercase();
-        if code.is_empty()
-            || code.len() > 8
-            || !code.bytes().all(|b| b.is_ascii_alphanumeric())
-        {
-            return Err(format!(
-                "rule[{idx}].country 的国家码不合法: {raw:?}（用 ISO2 如 CN/US，或 China/中国 等别名）"
-            ));
+            .to_ascii_lowercase(),
+    };
+    // target：缺省 / null / 空串 = 未配置（保存时同样不落盘）。
+    let target = match rule.get("target") {
+        None => None,
+        Some(v) if v.is_null() => None,
+        Some(v) => {
+            let s = v
+                .as_str()
+                .ok_or_else(|| format!("{label}.target 必须是字符串（当前 {v}）"))?
+                .trim();
+            (!s.is_empty()).then(|| s.to_string())
         }
-        any = true;
-    }
-    if !any {
-        return Err(format!(
-            "rule[{idx}].country 不能为空（留空请删掉该字段）"
-        ));
-    }
-    Ok(())
+    };
+    // priority：必须是整数（面板可能传来 "abc" / 1.5 / 数组）。
+    let priority = match rule.get("priority") {
+        None => 0,
+        Some(v) if v.is_null() => 0,
+        Some(v) => v
+            .as_i64()
+            .ok_or_else(|| format!("{label}.priority 必须是整数（当前 {v}）"))?,
+    };
+    // §16.11 维度 host/method/header/country：null/缺省 = 不约束；**显式空串不是
+    // 「不约束」**（运行期声明了空值的规则永不命中），原样交给校验器按非法值拒绝。
+    let dim = |key: &str| -> Result<Option<String>, String> {
+        match rule.get(key) {
+            None => Ok(None),
+            Some(v) if v.is_null() => Ok(None),
+            Some(v) => Ok(Some(
+                v.as_str()
+                    .ok_or_else(|| format!("{label}.{key} 必须是字符串（当前 {v}）"))?
+                    .trim()
+                    .to_string(),
+            )),
+        }
+    };
+    let cfg = crate::config::PageRuleConfig {
+        match_url,
+        action,
+        target,
+        priority,
+        host: dim("host")?,
+        method: dim("method")?,
+        header: dim("header")?,
+        country: dim("country")?,
+    };
+    crate::config::validate_page_rule(&cfg, &label).map_err(|e| e.to_string())
 }
 
 /// 上游地址校验（proxy.rs 的 `upstream_parts`：必须是 http/https 且带 host）。
@@ -2743,6 +2584,33 @@ fn check_proxy_rule(rule: &Json, idx: usize) -> Result<(), String> {
             }
             if ts.chars().any(|c| c.is_control()) {
                 return Err(format!("rule[{idx}].tor_socks 含控制字符"));
+            }
+        }
+    }
+    // G-11：回源自定义信任锚 / 证书固定 / mTLS 身份。
+    // 只在配置期挡「一定错」的值（超长、含控制字符、指纹不是 64 位 hex），
+    // 不做文件存在性/内容解析——那是运行期建连时的职责（proxy.rs 已有明确报错）。
+    for key in ["upstream_ca", "client_cert", "client_key"] {
+        if let Some(v) = rule.get(key).and_then(|x| x.as_str()) {
+            let v = v.trim();
+            if v.len() > MAX_LONG_STR {
+                return Err(format!(
+                    "rule[{idx}].{key} 过长（{} > {MAX_LONG_STR}）",
+                    v.len()
+                ));
+            }
+            if v.chars().any(|c| c.is_control()) {
+                return Err(format!("rule[{idx}].{key} 含控制字符"));
+            }
+        }
+    }
+    if let Some(fp) = rule.get("upstream_ca_sha256").and_then(|x| x.as_str()) {
+        let fp = fp.trim();
+        if !fp.is_empty() {
+            if fp.len() != 64 || !fp.bytes().all(|b| b.is_ascii_hexdigit()) {
+                return Err(format!(
+                    "rule[{idx}].upstream_ca_sha256 不是合法 SHA-256 指纹（需 64 个 hex 字符）: {fp:?}"
+                ));
             }
         }
     }
@@ -2871,9 +2739,7 @@ fn check_listener_json(l: &Json) -> Result<(), String> {
                 "listener.root 不能是空串/. /..（会把 config.toml 所在目录当站点根）: {r:?}"
             ));
         }
-        if let Err(e) = check_str("listener.root", r, 4096) {
-            return Err(e);
-        }
+        check_str("listener.root", r, 4096)?;
     }
     if let Some(sn) = l.get("server_name").and_then(|x| x.as_str()) {
         if sn.len() > MAX_DNS_NAME_LEN || sn.chars().any(|c| c.is_control()) {
@@ -3553,7 +3419,7 @@ async fn handle_rules_api(
 
     // Validate + atomic write via shared pipeline (rejects bad roots/ports).
     let _ = cfg_path;
-    if let Err(e) = cfg_edit::write_tree(&live, &doc) {
+    if let Err(e) = cfg_edit::write_tree(live, &doc) {
         return text_err(StatusCode::BAD_REQUEST, format!("{e:#}"));
     }
     text_ok("ok")
@@ -3626,9 +3492,13 @@ mod tests {
     /// 非法枚举：page rule action / file_open mode / ssl_mode / 回源版本 / http_versions。
     #[test]
     fn invalid_enums_are_rejected() {
-        // page rule action
+        // page rule action（与手写配置共用 config::validate_page_rule 的口径：
+        // 错误必须点名 `rule[0].action` 与非法值）
         let e = check_page_rule(&j(r#"{"match_url":"/x","action":"delete"}"#), 0).unwrap_err();
-        assert!(e.contains("action 不合法"), "unexpected: {e}");
+        assert!(
+            e.contains("rule[0].action") && e.contains("不合法") && e.contains("delete"),
+            "unexpected: {e}"
+        );
         assert!(check_page_rule(&j(r#"{"match_url":"/x","action":"redirect","target":"/y"}"#), 0).is_ok());
         // proxy ssl_mode
         let e = check_proxy_rule(
@@ -3711,6 +3581,47 @@ mod tests {
         assert!(ok(r#","country":"C N""#).is_err());
         // null/缺省 = 不约束，合法。
         assert!(ok(r#","host":null,"method":null,"header":null,"country":null"#).is_ok());
+    }
+
+    /// G-20：面板保存与手写 config.toml 必须**同一口径**（都走
+    /// `config::validate_page_rule`）。这些形态以前两侧结论不一致：配置拒绝、
+    /// 面板放行（存进去也是死规则）。现在两侧都拒绝且都点名 `rule[0].<字段>`。
+    #[test]
+    fn page_rule_panel_shares_config_validator() {
+        // 1) header 动作注入定界/逐跳头：运行期 response_headers 静默丢弃。
+        let e = check_page_rule(
+            &j(r#"{"match_url":"/x","action":"header","target":"Content-Length: 5"}"#),
+            0,
+        )
+        .unwrap_err();
+        assert!(e.contains("rule[0]"), "必须点名 rule[0]: {e}");
+        assert!(e.contains("定界") || e.contains("逐跳"), "unexpected: {e}");
+        // 2) 非 ISO2 国家码（旧面板按 2..=8 位放行，运行期永不命中）。
+        assert!(check_page_rule(&j(r#"{"match_url":"/x","action":"block","country":"CHN"}"#), 0).is_err());
+        // 3) 查询期被过滤的特殊码。
+        assert!(check_page_rule(&j(r#"{"match_url":"/x","action":"block","country":"ZZ"}"#), 0).is_err());
+        // 4) priority 越界 / 非整数（旧面板只查「是整数」，不查范围）。
+        let e = check_page_rule(
+            &j(r#"{"match_url":"/x","action":"block","priority":2000000}"#),
+            0,
+        )
+        .unwrap_err();
+        assert!(e.contains("priority"), "unexpected: {e}");
+        assert!(check_page_rule(&j(r#"{"match_url":"/x","action":"block","priority":1000000}"#), 0).is_ok());
+        assert!(check_page_rule(&j(r#"{"match_url":"/x","action":"block","priority":-1000000}"#), 0).is_ok());
+        assert!(check_page_rule(&j(r#"{"match_url":"/x","action":"block","priority":"high"}"#), 0).is_err());
+        // 5) match_url 形态：绝对 URL / 缺前导 / / 中间的 *。
+        for bad in [
+            r#"{"match_url":"http://h/x","action":"block"}"#,
+            r#"{"match_url":"x","action":"block"}"#,
+            r#"{"match_url":"/a*b","action":"block"}"#,
+        ] {
+            assert!(check_page_rule(&j(bad), 0).is_err(), "{bad} 必须被拒绝");
+        }
+        // 6) 类型错误仍然在面板侧指名（config 的强类型结构体无法表达）。
+        assert!(check_page_rule(&j(r#"{"match_url":123,"action":"block"}"#), 0).is_err());
+        assert!(check_page_rule(&j(r#"{"match_url":"/x","action":123}"#), 0).is_err());
+        assert!(check_page_rule(&j(r#"{"match_url":"/x","action":"block","target":123}"#), 0).is_err());
     }
 
     /// 非法 CIDR：`access::cidr_or_exact` 把解析不了的条目当「不匹配」——
@@ -3912,5 +3823,45 @@ mod tests {
             &[("origin", "https://evil.example")],
             true
         )));
+    }
+
+    /// U-13：会话过期后 CSRF / 鉴权的判定顺序必须保持：
+    /// - CSRF 只与请求头（Origin/Referer/Sec-Fetch-Site/Content-Type）有关，
+    ///   **与凭据是否过期无关** —— 同源 JSON POST 会正常进入鉴权；
+    /// - 过期会话在鉴权门被拒绝（不是 200），旧 cookie 不能因为「带着 CSRF
+    ///   放行标记」而被接受。跨站请求在 admin handler 里先被 403，二者的边界
+    ///   由请求头决定（真机用例见 reports/u13admin-wave22.md）。
+    #[test]
+    fn expired_session_cannot_pass_admin_gate_even_with_csrf_marker() {
+        // 同源、非简单请求：CSRF 这一层放行。
+        assert!(allowed(&[
+            ("host", "admin.example"),
+            ("content-type", "application/json"),
+        ]));
+        let cfg = Config::default();
+        let ip: IpAddr = "10.9.9.32".parse().unwrap();
+        let tok = "u13-expired-cookie-token";
+        crate::server::basic_auth::insert_session_with_deadline_for_test(
+            tok,
+            std::time::Instant::now() - std::time::Duration::from_secs(1),
+        );
+        let mut h = HeaderMap::new();
+        h.insert(
+            header::COOKIE,
+            http::HeaderValue::from_str(&format!(
+                "{}={tok}",
+                crate::server::basic_auth::ADMIN_SESSION_COOKIE
+            ))
+            .unwrap(),
+        );
+        assert!(matches!(
+            crate::server::basic_auth::admin_gate_path(
+                &h,
+                &cfg.admin,
+                ip,
+                "/__admin/api/logout"
+            ),
+            crate::server::basic_auth::AdminGate::Unauthorized
+        ));
     }
 }

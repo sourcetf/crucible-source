@@ -7,10 +7,17 @@
  * 之后每请求在**同一线程**里构造 Rack env → 调 app.call(env) → 收集
  * [status, headers, body]（body 二进制安全，上限 32MiB，超限截断并标注）。
  *
- * 线程模型：MRI 必须串行进入同一 VM（app_ffi 已给 rack 配了单线程池，本引擎再用
- * pthread_mutex 兜底），所以不需要 GVL 穿越；不调用 ruby_cleanup —— 解释器随进程
- * 常驻（与 pyembed/psgi 同一约定），且 dlclose 卸载引擎 .so 时有 RTLD_NODELETE
- * 钉住 libruby，避免把仍在跑定时器线程的 libruby 解除映射（见 rack_pin_libruby）。
+ * 线程模型（wave22 起）：MRI 的 VM/GVL 是**进程全局且线程亲和**的，一个进程只能
+ * 有一次成功的 ruby_init。同仓库同时构建 libapp_ruby.so（脚本引擎）与
+ * libapp_rack.so 时，由**先 boot 的 libapp_ruby** 充当唯一宿主：本引擎通过
+ * dlsym(RTLD_DEFAULT)/同目录 dlopen 发现 crucible_ruby_host_ensure/submit，把
+ * 整个 Rack 调用（shim 加载 + dispatch）作为 host_fn 作业投递到那条专用 MRI
+ * 线程，自己**不再 ruby_init**。找不到宿主（旧版/未构建 libapp_ruby）时退回
+ * wave19 的纪律：自己在本线程 boot + flock/env 选举（二次 boot 者显式 502）。
+ * 两条路径都要求调用串行（app_ffi 给 rack 配单线程池，本引擎再用 pthread_mutex
+ * 兜底）；不调用 ruby_cleanup —— 解释器随进程常驻（与 pyembed/psgi 同一约定），
+ * 且 dlclose 卸载引擎 .so 时有 RTLD_NODELETE 钉住 libruby，避免把仍在跑定时器
+ * 线程的 libruby 解除映射（见 rack_pin_libruby）。
  *
  * rack gem 取舍：宿主装了 rack 就 require 并用真正的 Rack::Builder.parse_file；
  * 没装（或真 Builder 处理不了「裸 lambda」config.ru）时用编进 .so 的最小兼容层
@@ -27,6 +34,12 @@
  * 编译期兜底：若构建脚本因参数拼接问题漏掉 -D 但 -I 里确实有 ruby.h（目标机
  * 现状），自动启用嵌入，避免引擎永远停在诚实失败。
  */
+/* dladdr()/Dl_info 需要 _GNU_SOURCE（glibc 的 dlfcn.h 在 !__USE_GNU 下不声明它们）：
+ * 本引擎用 dladdr 从自己的 .so 位置找同目录的 libapp_ruby.so，把请求投递到它建立的
+ * 唯一 MRI 宿主线程（见 rack_lookup_host_symbol）。必须在所有系统头文件之前定义。 */
+#if !defined(_WIN32) && !defined(_GNU_SOURCE)
+#define _GNU_SOURCE 1
+#endif
 #include "appengine.h"
 #include "appengine_common.h"
 
@@ -131,6 +144,9 @@ static int rack_fail(AppEngineResult *out, const char *fmt, ...)
     va_start(ap, fmt);
     vsnprintf(buf, sizeof(buf), fmt, ap);
     va_end(ap);
+    /* 先释放可能的部分结果（超时/异常路径可能已经在 out 里挂了指针）；字段由
+     * 宿主零初始化，free(NULL) 安全。 */
+    appengine_result_free(out);
     appengine_result_alloc(out);
     appengine_result_set_error(out, buf);
     return -1;
@@ -170,6 +186,82 @@ static const char *resolve_script(const char *script, const char *docroot, char 
 static int g_ruby_ready;
 static int g_ruby_vm_booted; /* 本 .so 已在本线程 boot 过 VM（shim 重试时不再 ruby_init） */
 static void *g_libruby_pin; /* RTLD_NODELETE 句柄，故意不 dlclose */
+
+/* ---------------- 共享 MRI 宿主（libapp_ruby.so）ABI ----------------
+ * 与 libs/script-ffi/script_engine.c 的 crucible_ruby_host_* 严格一致：
+ *   ensure(): 0 = 宿主线程就绪；-2 = VM 已被别的引擎占用；-1 = 不可用/创建失败
+ *   submit(fn, ctx): 0/1 = fn 的返回值（0 成功、1 已填 out->error 的失败）；
+ *                    -1 = 未执行（宿主不可用）；-2 = Ruby 异常逃逸；-3 = 引擎墙钟超时
+ * 结构体/签名变化时必须两边同步（同一构建脚本产出，不存在跨版本混用）。 */
+typedef int (*crucible_ruby_host_fn)(void *);
+typedef int (*crucible_ruby_host_ensure_fn)(void);
+typedef int (*crucible_ruby_host_submit_fn)(crucible_ruby_host_fn, void *);
+
+static crucible_ruby_host_ensure_fn g_host_ensure_fn;
+static crucible_ruby_host_submit_fn g_host_submit_fn;
+static int g_host_state; /* 0=未探测 1=可用 -1=不可用 */
+static int g_using_host;
+
+/* 先查全局符号（app_ffi 以 RTLD_GLOBAL 装载引擎），再按同目录 libapp_ruby.so
+ * dlopen。返回 NULL = 该进程没有可用的共享宿主（退回流派：旧版/未构建 libapp_ruby）。 */
+static void *rack_lookup_host_symbol(const char *name)
+{
+    void *p = dlsym(RTLD_DEFAULT, name);
+
+    if (p != NULL)
+        return p;
+    {
+        Dl_info info;
+        char path[PATH_MAX];
+        char *slash;
+        void *h;
+
+        if (dladdr((void *)appengine_execute, &info) == 0 || info.dli_fname == NULL)
+            return NULL;
+        snprintf(path, sizeof(path), "%s", info.dli_fname);
+        slash = strrchr(path, '/');
+        if (slash == NULL)
+            return NULL;
+        snprintf(slash + 1, sizeof(path) - (size_t)(slash + 1 - path), "libapp_ruby.so");
+        h = dlopen(path, RTLD_NOW | RTLD_GLOBAL);
+        if (h == NULL)
+            return NULL;
+        return dlsym(h, name);
+    }
+}
+
+/* 探测并确保宿主线程就绪。首次请求调用一次；结果缓存在 g_host_state。
+ * 注意：宿主 boot 有自己的锁，这里不持有 RACK_LOCK（避免与宿主提交互等）。 */
+static int rack_host_ready(void)
+{
+    int rc;
+
+    if (g_host_state != 0)
+        return g_host_state > 0;
+    g_host_ensure_fn =
+        (crucible_ruby_host_ensure_fn)rack_lookup_host_symbol("crucible_ruby_host_ensure");
+    g_host_submit_fn =
+        (crucible_ruby_host_submit_fn)rack_lookup_host_symbol("crucible_ruby_host_submit");
+    if (g_host_ensure_fn == NULL || g_host_submit_fn == NULL) {
+        g_host_state = -1;
+        return 0;
+    }
+    rc = g_host_ensure_fn();
+    if (rc == 0) {
+        g_host_state = 1;
+        g_using_host = 1;
+        fprintf(stderr,
+                "libapp_rack: 使用 libapp_ruby 的共享 MRI 宿主线程（进程内单 VM；"
+                "本引擎不再 ruby_init，无 spawn）\n");
+        return 1;
+    }
+    g_host_state = -1;
+    fprintf(stderr,
+            "libapp_rack: 共享 MRI 宿主不可用（ensure rc=%d），回退到自建 VM；"
+            "若 VM 已被其它引擎 boot，本引擎会显式 502（不会二次 ruby_init）\n",
+            rc);
+    return 0;
+}
 
 /* 把当前 Ruby 异常（rb_errinfo / $!）格式化成多行文本；格式化本身失败时写 fallback。 */
 static void rack_capture_error(char *buf, size_t cap, const char *fallback)
@@ -259,14 +351,33 @@ static void rack_pin_libruby(void)
 
 /* 一次初始化：ruby_init / ruby_init_loadpath / ruby_options + 载入 shim
  *（含 try require 'rack'）。必须持有 g_rack_lock。 */
-static int rack_ruby_ensure_locked(char *err, size_t errsz)
+static int rack_shim_ensure_locked(char *err, size_t errsz)
 {
     int state = 0;
     VALUE v;
 
     if (g_ruby_ready)
         return 0;
-    if (!g_ruby_vm_booted) {
+    v = rb_eval_string_protect(rack_shim_rb, &state);
+    if (state != 0 || v == Qnil) {
+        rack_capture_error(err, errsz, "rack shim 加载失败（异常无法格式化）");
+        return -1;
+    }
+    rack_pin_libruby();
+    g_ruby_ready = 1;
+    fprintf(stderr, "libapp_rack: 嵌入式 MRI Ruby %s 就绪（rack gem %s）\n", ruby_version,
+            RTEST(rb_gv_get("$crucible_have_rack")) ? "已加载，用真 Rack::Builder"
+                                                    : "未安装，用内置 Builder 兼容层");
+    return 0;
+}
+
+/* 一次初始化：宿主模式下只加载 shim（VM 由 libapp_ruby 提供）；回退模式下
+ * boot VM + 加载 shim。必须持有 g_rack_lock（或运行在唯一 MRI 宿主线程上）。 */
+static int rack_ruby_ensure_locked(char *err, size_t errsz)
+{
+    if (g_ruby_ready)
+        return 0;
+    if (!g_using_host && !g_ruby_vm_booted) {
         int lockfd = rack_boot_lock_acquire();
 
         /* 先看 MRI VM 是否已被另一个嵌入式 Ruby 引擎（libapp_ruby.so）启动。 */
@@ -275,8 +386,9 @@ static int rack_ruby_ensure_locked(char *err, size_t errsz)
             snprintf(err, errsz,
                      "本进程的 MRI VM 已被另一个嵌入式 Ruby 引擎（libapp_ruby）初始化；"
                      "MRI 的 VM/GVL 是进程全局且线程亲和的，二次 ruby_init 会 SIGSEGV 整个 "
-                     "webserver。默认构建应只启用一个嵌入式 Ruby 引擎（Ruby 脚本走 sidecar、"
-                     "Rack 走嵌入），见 scripts/build_script_ffi.sh。");
+                     "webserver。本构建的 libapp_rack 会自动投递到 libapp_ruby 的共享宿主"
+                     "（crucible_ruby_host_*）；只有旧版/无法发现宿主的 .so 才回退到这里，"
+                     "此时显式 502 而不是崩进程。");
             return -1;
         }
         /* RUBY_INIT_STACK：本线程是 app_ffi 的池线程（不是进程 main 线程），
@@ -319,62 +431,69 @@ static int rack_ruby_ensure_locked(char *err, size_t errsz)
         g_ruby_vm_booted = 1;
     }
 
-    v = rb_eval_string_protect(rack_shim_rb, &state);
-    if (state != 0 || v == Qnil) {
-        rack_capture_error(err, errsz, "rack shim 加载失败（异常无法格式化）");
-        return -1;
-    }
-    rack_pin_libruby();
-    g_ruby_ready = 1;
-    fprintf(stderr, "libapp_rack: 嵌入式 MRI Ruby %s 就绪（rack gem %s）\n", ruby_version,
-            RTEST(rb_gv_get("$crucible_have_rack")) ? "已加载，用真 Rack::Builder"
-                                                    : "未安装，用内置 Builder 兼容层");
-    return 0;
+    return rack_shim_ensure_locked(err, errsz);
 }
 
-/* 一次 Rack 请求（在 g_rack_lock 内）：0 = out 已填；-1 = 显式引擎失败（rc != 0）。 */
-static int rack_request(const char *script, const char *method, const char *path,
-                        const char *query, const char *content_type, const char *body,
-                        size_t body_len, const char *remote, const char *server_name,
-                        int server_port, const char *headers, AppEngineResult *out)
+/* 一次 Rack 调用的全部参数。回调在 MRI 宿主线程（或回退模式的本线程）上执行。 */
+struct rack_call {
+    const char *script;
+    const char *method;
+    const char *path;
+    const char *query;
+    const char *content_type;
+    const char *body;
+    size_t body_len;
+    const char *remote;
+    const char *server_name;
+    int server_port;
+    const char *headers;
+    AppEngineResult *out;
+};
+
+/* 在 MRI 线程上执行：0 = out 已填成功；1 = 已通过 rack_fail 填好 out->error。
+ * 宿主线程的超时中断（-3）与逃逸异常（-2）由 crucible_ruby_host_submit 返回，
+ * 不会走到这里的返回值。 */
+static int rack_run_call(void *arg)
 {
+    struct rack_call *c = (struct rack_call *)arg;
     char portbuf[16];
     char lenbuf[32];
     char errbuf[1024];
     int state = 0;
     VALUE req, res, vs, vh, vb, vt;
 
-    RACK_LOCK();
-    if (rack_ruby_ensure_locked(errbuf, sizeof(errbuf)) != 0) {
-        RACK_UNLOCK();
-        return rack_fail(out, "rack: 嵌入式 MRI Ruby 初始化失败: %s", errbuf);
-    }
+    if (rack_ruby_ensure_locked(errbuf, sizeof(errbuf)) != 0)
+        return rack_fail(c->out, "rack: 嵌入式 MRI Ruby 初始化失败: %s", errbuf) == 0 ? 0 : 1;
 
     /* 请求值经全局哈希 $crucible_req 传入（不碰进程 ENV；.env 已由 Rust 侧临时注入）。 */
-    snprintf(portbuf, sizeof(portbuf), "%d", server_port > 0 ? server_port : 80);
-    snprintf(lenbuf, sizeof(lenbuf), "%lu", (unsigned long)body_len);
+    snprintf(portbuf, sizeof(portbuf), "%d", c->server_port > 0 ? c->server_port : 80);
+    snprintf(lenbuf, sizeof(lenbuf), "%lu", (unsigned long)c->body_len);
     req = rb_hash_new();
-    rb_hash_aset(req, rb_str_new_cstr("script"), rb_str_new_cstr(script));
+    rb_hash_aset(req, rb_str_new_cstr("script"),
+                 rb_str_new_cstr(c->script != NULL ? c->script : ""));
     rb_hash_aset(req, rb_str_new_cstr("method"),
-                 rb_str_new_cstr(method != NULL ? method : "GET"));
-    rb_hash_aset(req, rb_str_new_cstr("path"), rb_str_new_cstr(path != NULL ? path : "/"));
-    rb_hash_aset(req, rb_str_new_cstr("query"), rb_str_new_cstr(query != NULL ? query : ""));
+                 rb_str_new_cstr(c->method != NULL ? c->method : "GET"));
+    rb_hash_aset(req, rb_str_new_cstr("path"),
+                 rb_str_new_cstr(c->path != NULL ? c->path : "/"));
+    rb_hash_aset(req, rb_str_new_cstr("query"),
+                 rb_str_new_cstr(c->query != NULL ? c->query : ""));
     rb_hash_aset(req, rb_str_new_cstr("content_type"),
-                 rb_str_new_cstr(content_type != NULL ? content_type : ""));
+                 rb_str_new_cstr(c->content_type != NULL ? c->content_type : ""));
     rb_hash_aset(req, rb_str_new_cstr("content_length"), rb_str_new_cstr(lenbuf));
     rb_hash_aset(req, rb_str_new_cstr("remote"),
-                 rb_str_new_cstr(remote != NULL ? remote : ""));
+                 rb_str_new_cstr(c->remote != NULL ? c->remote : ""));
     rb_hash_aset(req, rb_str_new_cstr("server_name"),
-                 rb_str_new_cstr(server_name != NULL && server_name[0] != '\0'
-                                     ? server_name
+                 rb_str_new_cstr(c->server_name != NULL && c->server_name[0] != '\0'
+                                     ? c->server_name
                                      : "crucible"));
     rb_hash_aset(req, rb_str_new_cstr("server_port"), rb_str_new_cstr(portbuf));
     /* body 二进制安全（rb_str_new 保留 NUL 字节），供 rack.input 使用。 */
     rb_hash_aset(req, rb_str_new_cstr("body"),
-                 body != NULL ? rb_str_new(body, (long)body_len) : rb_str_new("", 0));
+                 c->body != NULL ? rb_str_new(c->body, (long)c->body_len)
+                                 : rb_str_new("", 0));
     /* ABI 请求头块；shim 展开为 env 的 HTTP_*（Cookie/Authorization 等）。 */
     rb_hash_aset(req, rb_str_new_cstr("headers"),
-                 headers != NULL ? rb_str_new_cstr(headers) : rb_str_new("", 0));
+                 c->headers != NULL ? rb_str_new_cstr(c->headers) : rb_str_new("", 0));
     rb_gv_set("$crucible_req", req);
 
     /* 全部加载/调用逻辑在 shim 的 CrucibleRack.dispatch 里（读 $crucible_req）。
@@ -397,33 +516,94 @@ static int rack_request(const char *script, const char *method, const char *path
             rack_capture_error(detail, sizeof(detail),
                                "rack: 应用或加载脚本抛出异常（无法格式化）");
         }
-        RACK_UNLOCK();
-        return rack_fail(out, "rack: 脚本执行失败（script=%s）：%s", script, detail);
+        rb_set_errinfo(Qnil);
+        /* 引擎级超时（宿主看门狗 raise 的 CrucibleRequestTimeout）会被 shim 的
+         * `rescue Exception` 格式化后重抛；这里识别出来回 -3，让 rack_request 报
+         * “超时”而不是“应用脚本错误”（两者都用 502，但排障方向完全不同）。 */
+        if (strstr(detail, "CrucibleRequestTimeout") != NULL)
+            return -3;
+        return rack_fail(c->out, "rack: 脚本执行失败（script=%s）：%s",
+                         c->script != NULL ? c->script : "(null)", detail) == 0
+                   ? 0
+                   : 1;
     }
-    if (!RB_TYPE_P(res, T_ARRAY) || RARRAY_LEN(res) < 3) {
-        RACK_UNLOCK();
-        return rack_fail(out, "rack: 驱动未返回 [status, headers, body]（script=%s）", script);
-    }
+    if (!RB_TYPE_P(res, T_ARRAY) || RARRAY_LEN(res) < 3)
+        return rack_fail(c->out, "rack: 驱动未返回 [status, headers, body]（script=%s）",
+                         c->script != NULL ? c->script : "(null)") == 0
+                   ? 0
+                   : 1;
     vs = rb_ary_entry(res, 0);
     vh = rb_ary_entry(res, 1);
     vb = rb_ary_entry(res, 2);
     vt = rb_ary_entry(res, 3);
-    if (!RB_INTEGER_TYPE_P(vs) || !RB_TYPE_P(vh, T_STRING) || !RB_TYPE_P(vb, T_STRING)) {
-        RACK_UNLOCK();
-        return rack_fail(out, "rack: 驱动返回类型非法（script=%s）", script);
-    }
-    if (appengine_result_alloc(out) != 0) {
-        RACK_UNLOCK();
-        return -1;
-    }
-    out->status = NUM2INT(vs); /* shim 已把 status 规整到 100..599，转换不会 raise */
-    appengine_result_set_headers(out, RSTRING_PTR(vh)); /* MRI 保证 NUL 结尾 */
-    appengine_result_set_body(out, RSTRING_PTR(vb), (size_t)RSTRING_LEN(vb));
+    if (!RB_INTEGER_TYPE_P(vs) || !RB_TYPE_P(vh, T_STRING) || !RB_TYPE_P(vb, T_STRING))
+        return rack_fail(c->out, "rack: 驱动返回类型非法（script=%s）",
+                         c->script != NULL ? c->script : "(null)") == 0
+                   ? 0
+                   : 1;
+    if (appengine_result_alloc(c->out) != 0)
+        return rack_fail(c->out, "rack: 结果内存分配失败（script=%s）",
+                         c->script != NULL ? c->script : "(null)") == 0
+                   ? 0
+                   : 1;
+    c->out->status = NUM2INT(vs); /* shim 已把 status 规整到 100..599，转换不会 raise */
+    appengine_result_set_headers(c->out, RSTRING_PTR(vh)); /* MRI 保证 NUL 结尾 */
+    appengine_result_set_body(c->out, RSTRING_PTR(vb), (size_t)RSTRING_LEN(vb));
     /* 第 4 个元素只在响应体被截断等「服务到了但要留痕」的场合非空（rc 仍为 0）。 */
     if (RB_TYPE_P(vt, T_STRING) && RSTRING_LEN(vt) > 0)
-        appengine_result_set_error(out, RSTRING_PTR(vt));
-    RACK_UNLOCK();
+        appengine_result_set_error(c->out, RSTRING_PTR(vt));
     return 0;
+}
+
+/* 一次 Rack 请求：0 = out 已填；-1 = 显式引擎失败（rc != 0）。
+ * 优先投递到 libapp_ruby 的共享 MRI 宿主线程；没有宿主时回退到「本线程 boot
+ * + RACK_LOCK」的 wave19 路径（同样只 boot 一次、只在一个线程里碰 VM）。 */
+static int rack_request(const char *script, const char *method, const char *path,
+                        const char *query, const char *content_type, const char *body,
+                        size_t body_len, const char *remote, const char *server_name,
+                        int server_port, const char *headers, AppEngineResult *out)
+{
+    struct rack_call c;
+    int rc;
+
+    memset(&c, 0, sizeof(c));
+    c.script = script;
+    c.method = method;
+    c.path = path;
+    c.query = query;
+    c.content_type = content_type;
+    c.body = body;
+    c.body_len = body_len;
+    c.remote = remote;
+    c.server_name = server_name;
+    c.server_port = server_port;
+    c.headers = headers;
+    c.out = out;
+
+    if (rack_host_ready()) {
+        rc = g_host_submit_fn(rack_run_call, &c);
+        if (rc == 0 || rc == 1)
+            return rc == 0 ? 0 : -1;
+        if (rc == -3)
+            return rack_fail(out,
+                             "rack: 请求超过引擎墙钟（script=%s），已在 MRI 宿主线程内异步中断；"
+                             "解释器保持可用（阈值 CRUCIBLE_RUBY_TIMEOUT_SECS，0=关闭）",
+                             script != NULL ? script : "(null)");
+        if (rc == -2)
+            return rack_fail(out,
+                             "rack: Ruby 异常逃逸出 shim（script=%s）；已清除 errinfo，"
+                             "宿主线程继续服务",
+                             script != NULL ? script : "(null)");
+        return rack_fail(out,
+                         "rack: 无法把请求投递到共享 MRI 宿主线程（rc=%d，script=%s）",
+                         rc, script != NULL ? script : "(null)");
+    }
+
+    /* 回退：本 .so 自建 VM（只在一个池线程里 boot；app_ffi 已给 rack 单线程池）。 */
+    RACK_LOCK();
+    rc = rack_run_call(&c);
+    RACK_UNLOCK();
+    return rc == 0 ? 0 : -1;
 }
 
 #endif /* CRUCIBLE_HAVE_RUBY */

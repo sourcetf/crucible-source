@@ -128,59 +128,98 @@ fn classify_tls_record(buf: &[u8]) -> HelloRoute {
     HelloRoute::Boring
 }
 
-/// Scan ClientHello extensions for supported_versions containing TLS 1.3 (0x0304).
+/// 把 peek 里**连续的 TLS handshake record**（content type 0x16）拼成一条
+/// handshake 消息（含 4 字节 type+length）。
 ///
-/// `pub(crate)`：`boring_path` 的 `prefer_tls13` 分流复用它（两套 SSL_CTX 按
-/// ClientHello 选择，与 legacy 分流同一套 wire 探测，见 G-12）。
-pub(crate) fn has_tls13_supported_versions(buf: &[u8]) -> bool {
-  // Handshake: type(1) len(3) version(2) random(32) session_id_len(1) ...
-    if buf.len() < 43 {
+/// RFC 8446 §5.1：握手消息可以跨多个 TLS record 分片，record 边界与消息边界无关。
+/// 旧实现只看第一个 record：SNI / `supported_versions` 落在第二个 record 时会被判成
+/// 「没有」，于是 `sni_only` 误杀正常客户端、`prefer_tls13` 把 1.3 客户端压到 1.2。
+///
+/// 只使用 peek 中已经收到的完整 record；**最后一个不完整 record 的已收字节也保留**
+/// （partial）：调用方至少能解析到截断点之前的内容（例如 SNI 常在扩展区最前面），
+/// 未收全的部分由调用方的「完整性」判据另行处理（fail-closed）。
+fn reassemble_client_hello(peek: &[u8]) -> Option<Vec<u8>> {
+    if peek.len() < 5 || peek[0] != 0x16 {
+        return None;
+    }
+    let mut out: Vec<u8> = Vec::new();
+    let mut p = 0usize;
+    while p + 5 <= peek.len() && peek[p] == 0x16 {
+        let len = u16::from_be_bytes([peek[p + 3], peek[p + 4]]) as usize;
+        let start = p + 5;
+        let end = start.saturating_add(len);
+        if end > peek.len() {
+            // 该 record 未收全：保留已收部分（见上面的 partial 说明）。
+            out.extend_from_slice(&peek[start..]);
+            break;
+        }
+        out.extend_from_slice(&peek[start..end]);
+        p = end;
+        if out.len() >= 4 {
+            if out[0] != 0x01 {
+                return None;
+            }
+            let hl = ((out[1] as usize) << 16) | ((out[2] as usize) << 8) | out[3] as usize;
+            if out.len() >= 4 + hl {
+                out.truncate(4 + hl);
+                return Some(out);
+            }
+        }
+        // 握手消息上限 2^24；peek 本身有上限，这里显式兜底防无界累积。
+        if out.len() > 16 * 1024 * 1024 {
+            return None;
+        }
+    }
+    if out.len() >= 4 && out[0] == 0x01 {
+        Some(out)
+    } else {
+        None
+    }
+}
+
+/// 在**完整/partial 的 ClientHello handshake 字节**（从 handshake type 开始）里扫描
+/// `supported_versions` 是否包含 TLS 1.3 (0x0304)。
+///
+/// 偏移（handshake 视图）：type(0) len(1..4) legacy_version(4..6) random(6..38)
+/// session_id_len(38) …
+fn handshake_has_tls13(hs: &[u8]) -> bool {
+    if hs.len() < 39 {
         return false;
     }
-    if buf.len() <= 43 {
+    let sid_len = hs[38] as usize;
+    let mut off = 39 + sid_len;
+    if hs.len() < off + 2 {
         return false;
     }
-    let sid_len = buf[43] as usize;
-    let mut off = 44 + sid_len;
-    if buf.len() < off + 2 {
-        return false;
-    }
-    let cipher_len = u16::from_be_bytes([buf[off], buf[off + 1]]) as usize;
+    let cipher_len = u16::from_be_bytes([hs[off], hs[off + 1]]) as usize;
     off += 2 + cipher_len;
-    if buf.len() < off + 1 {
+    if hs.len() < off + 1 {
         return false;
     }
-    let comp_len = buf[off] as usize;
+    let comp_len = hs[off] as usize;
     off += 1 + comp_len;
-    if buf.len() < off + 2 {
+    if hs.len() < off + 2 {
         return false;
     }
-    let ext_len = u16::from_be_bytes([buf[off], buf[off + 1]]) as usize;
+    let ext_len = u16::from_be_bytes([hs[off], hs[off + 1]]) as usize;
     off += 2;
-    let ext_end = off.saturating_add(ext_len);
-    if ext_end > buf.len() {
-        return false;
-    }
+    let ext_end = off.saturating_add(ext_len).min(hs.len());
     while off + 4 <= ext_end {
-        let etype = u16::from_be_bytes([buf[off], buf[off + 1]]);
-        let elen = u16::from_be_bytes([buf[off + 2], buf[off + 3]]) as usize;
+        let etype = u16::from_be_bytes([hs[off], hs[off + 1]]);
+        let elen = u16::from_be_bytes([hs[off + 2], hs[off + 3]]) as usize;
         off += 4;
         if off + elen > ext_end {
             break;
         }
         if etype == 0x002b && elen >= 3 {
             // supported_versions: length(1) versions...
-            let vlen = buf[off] as usize;
+            let vlen = hs[off] as usize;
             let mut vo = off + 1;
-            // 版本列表的两个字节都必须落在 **扩展数据内**。vlen 是 1 字节长度，
-            // 与 elen 无一致性约束（攻击者可控）。旧条件 `vo < ext_end` 只约束了
-            // 第一个字节：当该扩展正好结束在 record/peek 末尾、且 vlen > 剩余字节数
-            // 时，`vo` 会落在 ext_end-1 上，于是 `buf[vo + 1]` 读到缓冲区外一字节
-            // → 索引越界 panic（route() 在 sni_only/证书检查之前就被调用，任何能连上
-            // TLS 监听口的客户端都能触发）。把 vlen 也夹进扩展长度即可。
+            // 版本列表的两个字节都必须落在 **扩展数据内**（vlen 与 elen 无一致性约束，
+            // 攻击者可控；旧条件曾让 `vo` 落到 ext_end-1 并读越界一字节）。
             let vend = (vo + vlen).min(ext_end);
             while vo + 2 <= vend {
-                let ver = u16::from_be_bytes([buf[vo], buf[vo + 1]]);
+                let ver = u16::from_be_bytes([hs[vo], hs[vo + 1]]);
                 if ver == 0x0304 {
                     return true;
                 }
@@ -190,6 +229,45 @@ pub(crate) fn has_tls13_supported_versions(buf: &[u8]) -> bool {
         off += elen;
     }
     false
+}
+
+/// ClientHello 是否**完整可见**（单 record 收全，或跨 record 分片已全部收到）。
+///
+/// `prefer_tls13` 用它决定「能不能根据 wire 下结论」：不完整时必须回库默认，
+/// 不能把一个 1.3 客户端误判成 1.2（见 boring_path::pick_version_profile）。
+pub(crate) fn client_hello_is_complete(buf: &[u8]) -> bool {
+    let Some(hs) = reassemble_client_hello(buf) else {
+        return false;
+    };
+    if hs.len() < 4 || hs[0] != 0x01 {
+        return false;
+    }
+    let hl = ((hs[1] as usize) << 16) | ((hs[2] as usize) << 8) | hs[3] as usize;
+    hs.len() >= 4 + hl
+}
+
+/// Scan ClientHello extensions for supported_versions containing TLS 1.3 (0x0304).
+///
+/// `pub(crate)`：`boring_path` 的 `prefer_tls13` 分流复用它（两套 SSL_CTX 按
+/// ClientHello 选择，与 legacy 分流同一套 wire 探测，见 G-12）。
+///
+/// 支持跨 record 分片的握手消息（见 [`reassemble_client_hello`]）；调用方若需要
+/// 「只有完整 ClientHello 才能下结论」的语义，应先用 [`client_hello_is_complete`]。
+pub(crate) fn has_tls13_supported_versions(buf: &[u8]) -> bool {
+    // 快路径：**首个 record 自身**已包含完整 ClientHello（注意不能拿 peek 总长度
+    // 判断：跨 record 分片时总长度也会「够」，但 `buf[5..]` 中间夹着下一条 record
+    // 头，直接按 handshake 布局解析会错位 —— 这是本函数第一版的真实 bug）。
+    if buf.len() >= 9 && buf[0] == 0x16 && buf[5] == 0x01 {
+        let hl = ((buf[6] as usize) << 16) | ((buf[7] as usize) << 8) | buf[8] as usize;
+        let rec_end = 5 + u16::from_be_bytes([buf[3], buf[4]]) as usize;
+        if rec_end >= 9 + hl && rec_end <= buf.len() {
+            return handshake_has_tls13(&buf[5..9 + hl]);
+        }
+    }
+    match reassemble_client_hello(buf) {
+        Some(hs) => handshake_has_tls13(&hs),
+        None => false,
+    }
 }
 
 #[cfg(test)]
@@ -287,6 +365,102 @@ mod tests {
         assert_eq!(route(&hello), HelloRoute::Boring);
     }
 
+    /// 构造带任意扩展的最小 ClientHello（record 起始）。
+    fn hello_with_exts(exts: &[(u16, Vec<u8>)]) -> Vec<u8> {
+        let mut ext = Vec::new();
+        for (t, body) in exts {
+            ext.extend_from_slice(&t.to_be_bytes());
+            ext.extend_from_slice(&(body.len() as u16).to_be_bytes());
+            ext.extend_from_slice(body);
+        }
+        let mut hs = Vec::new();
+        hs.extend_from_slice(&[0x03, 0x03]);
+        hs.extend_from_slice(&[0u8; 32]);
+        hs.push(0x00); // session id
+        hs.extend_from_slice(&2u16.to_be_bytes());
+        hs.extend_from_slice(&[0x13, 0x01]);
+        hs.push(1);
+        hs.push(0x00);
+        hs.extend_from_slice(&(ext.len() as u16).to_be_bytes());
+        hs.extend_from_slice(&ext);
+        let mut rec = vec![0x16, 0x03, 0x01];
+        rec.extend_from_slice(&((4 + hs.len()) as u16).to_be_bytes());
+        rec.push(0x01);
+        let hl = hs.len();
+        rec.extend_from_slice(&[(hl >> 16) as u8, (hl >> 8) as u8, hl as u8]);
+        rec.extend_from_slice(&hs);
+        rec
+    }
+
+    fn sni_ext(name: &str) -> (u16, Vec<u8>) {
+        let nb = name.as_bytes();
+        let mut ed = Vec::new();
+        ed.extend_from_slice(&((1 + 2 + nb.len()) as u16).to_be_bytes());
+        ed.push(0x00);
+        ed.extend_from_slice(&(nb.len() as u16).to_be_bytes());
+        ed.extend_from_slice(nb);
+        (0x0000, ed)
+    }
+
+    fn versions_ext(versions: &[u16]) -> (u16, Vec<u8>) {
+        let mut ed = vec![(versions.len() * 2) as u8];
+        for v in versions {
+            ed.extend_from_slice(&v.to_be_bytes());
+        }
+        (0x002b, ed)
+    }
+
+    /// 把单 record 的 ClientHello 拆成两条握手 record（RFC 8446 §5.1 允许的分片）。
+    fn split_records(full: &[u8], at: usize) -> Vec<u8> {
+        assert_eq!(full[0], 0x16);
+        let hs = &full[5..];
+        let at = at.min(hs.len());
+        let (a, b) = hs.split_at(at);
+        let mut out = Vec::new();
+        out.extend_from_slice(&[0x16, 0x03, 0x01]);
+        out.extend_from_slice(&(a.len() as u16).to_be_bytes());
+        out.extend_from_slice(a);
+        out.extend_from_slice(&[0x16, 0x03, 0x01]);
+        out.extend_from_slice(&(b.len() as u16).to_be_bytes());
+        out.extend_from_slice(b);
+        out
+    }
+
+    /// 回归：SNI 落在第二个 record 时也必须解析出来 —— 否则 sni_only 会把
+    /// 跨 record 分片的正常客户端静默丢弃（旧实现只看第一个 record）。
+    #[test]
+    fn sni_detected_across_record_fragments() {
+        let full = hello_with_exts(&[sni_ext("frag.example")]);
+        for at in [1usize, 10, 20, 40, 60] {
+            let frag = split_records(&full, at);
+            assert_eq!(
+                parse_sni(&frag).as_deref(),
+                Some("frag.example"),
+                "split at {at}: SNI lost across records"
+            );
+        }
+    }
+
+    /// 回归：`supported_versions` 落在第二个 record 时 prefer_tls13 的 wire 探测
+    /// 也必须看到 1.3（旧实现只看第一个 record ⇒ 1.3 客户端被压到 1.2 上下文）。
+    #[test]
+    fn tls13_version_detected_across_record_fragments() {
+        let full = hello_with_exts(&[sni_ext("frag.example"), versions_ext(&[0x0304, 0x0303])]);
+        assert!(has_tls13_supported_versions(&full));
+        for at in [1usize, 10, 20, 40, 60] {
+            let frag = split_records(&full, at);
+            assert!(
+                has_tls13_supported_versions(&frag),
+                "split at {at}: TLS1.3 supported_versions lost across records"
+            );
+            assert_eq!(parse_sni(&frag).as_deref(), Some("frag.example"));
+        }
+        // 只给第一个分片（第二个 record 尚未到达）：不能谎报 1.3（fail-closed）；
+        // SNI 若已在第一片里则应仍可解析。
+        let first_only = &split_records(&full, 20)[..25 + 20];
+        assert!(!has_tls13_supported_versions(first_only));
+    }
+
     #[test]
     fn tls10_client_hello_routes_nss() {
         // TLS1.0 client hello in TLS record (no TLS1.3 ext).
@@ -327,29 +501,47 @@ mod tests {
 
 /// 早期规格 8：从 ClientHello 提取 SNI（server_name 扩展，type 0x0000）。
 /// 输入为 TLS record 起始的 peek 缓冲（type 0x16）。失败返回 None。
+///
+/// 支持握手消息跨 record 分片（见 [`reassemble_client_hello`]）：旧实现只解析
+/// 第一个 record，SNI 落在第二个 record 时 `sni_only` 会把正常客户端静默丢弃。
 pub fn parse_sni(buf: &[u8]) -> Option<String> {
-    if buf.len() < 43 || buf[0] != 0x16 {
+    if buf.len() < 5 || buf[0] != 0x16 {
         return None;
     }
-    let hs_len = u16::from_be_bytes([buf[3], buf[4]]) as usize;
-    let end = (5 + hs_len).min(buf.len());
-    // 握手类型在 buf[5]（record 头 5 字节之后才是 handshake type/len）。
-    // 此前写成 `buf[p - 2]` 且 p=43，检查的其实是 random 的第 31 个字节——
-    // 等于「只有 1/256 的 ClientHello 能通过」：sni_only 会误杀几乎所有正常
-    // 客户端，port_reuse 的 TLS SNI 分流也永远匹配不到目标 listener。
-    let mut p = 5 + 38; // 握手头(4) + 版本(2) + random(32) = session_id_len 偏移
-    if p + 2 > end || buf[5] != 0x01 {
+    // 快路径：**首个 record 自身**已包含完整 ClientHello（不能按 peek 总长度判断，
+    // 跨 record 分片时直接按 handshake 布局解析会错位；见 has_tls13 的说明）。
+    if buf.len() >= 9 && buf[5] == 0x01 {
+        let hl = ((buf[6] as usize) << 16) | ((buf[7] as usize) << 8) | buf[8] as usize;
+        let rec_end = 5 + u16::from_be_bytes([buf[3], buf[4]]) as usize;
+        if rec_end >= 9 + hl && rec_end <= buf.len() {
+            return parse_sni_handshake(&buf[5..9 + hl]);
+        }
+    }
+    let hs = reassemble_client_hello(buf)?;
+    parse_sni_handshake(&hs)
+}
+
+/// 在 handshake 字节（从 type 开始）里解析 SNI。
+fn parse_sni_handshake(hs: &[u8]) -> Option<String> {
+    if hs.len() < 4 || hs[0] != 0x01 {
+        return None;
+    }
+    let hl = ((hs[1] as usize) << 16) | ((hs[2] as usize) << 8) | hs[3] as usize;
+    let end = hs.len().min(4 + hl);
+    // 握手头(4) + 版本(2) + random(32) = session_id_len 偏移 38
+    let mut p = 38;
+    if p + 1 > end {
         return None;
     }
     // session_id 是 **1 字节长度** + N 字节（u8 session_id_len），不是 u16。
     // 旧实现按 u16 读并 `p += 2 + sid_len`，从这一位起所有后续字段全部错位：
     // cipher_suites_len 会被读成 0x0200 之类的值，扩展区永远走不到。
-    let sid_len = buf[p] as usize;
+    let sid_len = hs[p] as usize;
     p += 1 + sid_len;
     if p + 2 > end {
         return None;
     }
-    let cs_len = u16::from_be_bytes([buf[p], buf[p + 1]]) as usize;
+    let cs_len = u16::from_be_bytes([hs[p], hs[p + 1]]) as usize;
     p += 2 + cs_len;
     if p >= end {
         return None;
@@ -357,17 +549,17 @@ pub fn parse_sni(buf: &[u8]) -> Option<String> {
     // compression_methods 同样是 **1 字节长度** + N 字节。旧实现只 `p += 1`
     // 跳过长度字节，却把 `compression_methods[0]` 当成扩展区长度的高位来读，
     // ext_len 得到一个荒唐的值，扩展循环一次都进不去。
-    let comp_len = buf[p] as usize;
+    let comp_len = hs[p] as usize;
     p += 1 + comp_len;
     if p + 2 > end {
         return None;
     }
-    let ext_len = u16::from_be_bytes([buf[p], buf[p + 1]]) as usize;
+    let ext_len = u16::from_be_bytes([hs[p], hs[p + 1]]) as usize;
     p += 2;
     let ext_end = (p + ext_len).min(end);
     while p + 4 <= ext_end {
-        let etype = u16::from_be_bytes([buf[p], buf[p + 1]]);
-        let elen = u16::from_be_bytes([buf[p + 2], buf[p + 3]]) as usize;
+        let etype = u16::from_be_bytes([hs[p], hs[p + 1]]);
+        let elen = u16::from_be_bytes([hs[p + 2], hs[p + 3]]) as usize;
         let (s, e) = (p + 4, (p + 4 + elen).min(ext_end));
         if etype == 0x0000 && e >= s + 5 {
             // extension_data = ServerNameList:
@@ -378,7 +570,7 @@ pub fn parse_sni(buf: &[u8]) -> Option<String> {
             // list_len 是 0x000c 之类的非零值，于是**永远匹配不上**，
             // SNI 解析对任何真实客户端都返回 None（与上面握手类型的偏移 bug 叠加，
             // 使 sni_only 与 port_reuse 的 SNI 分流彻底失效）。
-            let list = &buf[s..e];
+            let list = &hs[s..e];
             if list[2] == 0x00 {
                 // name_type == 0 (host_name)
                 let nlen = u16::from_be_bytes([list[3], list[4]]) as usize;

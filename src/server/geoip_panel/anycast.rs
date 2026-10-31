@@ -21,31 +21,55 @@ pub fn is_anycast_conn(conn: &Connection, ip: IpAddr) -> bool {
 
 /// 扫 anycast 表判断 ip 是否落在任一区间（v4 行与 v6 行分别按地址族解析）。
 ///
-/// 全表扫描 + Rust 逐行解析：TEXT 起止地址在 SQLite 里没有可比数值列（表由 Python
-/// 侧建，只有 start/end TEXT + idx_anycast_range），推不了数值过滤 —— 要在 SQL 层
-/// 收窄需要 Python schema 增加 start_i/end_i（跨组，见修复总结）。
+/// 性能：Python `init_schema` 现在写入 `start_i`/`end_i` 数值列 + `idx_anycast_numeric`；
+/// 有该列时用「数值键 → 必要区间」把候选行压到极少数（v6 用高 64 位保序映射，
+/// 精确 128 位判定仍在下面做）。老库没有这两列时 prepare 失败，自动回落全表扫描，
+/// 行为不变。此前每次 lookup 都全表扫描 + 逐行 `parse`，5000 个不同客户端 IP 会把
+/// anycast 表扫 5000 遍（U-17 压测里的主要冷查询成本之一）。
 fn anycast_table_hit(conn: &Connection, ip: IpAddr) -> rusqlite::Result<bool> {
+    let ip_s = ip.to_string();
+    let key = crate::server::geoip_panel::iputil::range_numeric_key(&ip_s).unwrap_or(0);
+    if let Ok(mut stmt) = conn.prepare(
+        "SELECT start, end FROM anycast
+         WHERE start_i IS NULL OR (start_i <= ?1 AND end_i >= ?1)",
+    ) {
+        let rows = stmt.query_map([key], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        for row in rows {
+            let (s, e) = row?;
+            if range_hit(ip, &s, &e) {
+                return Ok(true);
+            }
+        }
+        return Ok(false);
+    }
+    // 兼容老库（没有 start_i/end_i 列）。
     let mut stmt = conn.prepare("SELECT start, end FROM anycast")?;
     let rows = stmt.query_map([], |row| {
         Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
     })?;
     for row in rows {
         let (s, e) = row?;
-        let hit = match ip {
-            IpAddr::V4(v4) => match (s.parse::<Ipv4Addr>(), e.parse::<Ipv4Addr>()) {
-                (Ok(a), Ok(b)) => u32::from(v4) >= u32::from(a) && u32::from(v4) <= u32::from(b),
-                _ => false,
-            },
-            IpAddr::V6(v6) => match (s.parse::<Ipv6Addr>(), e.parse::<Ipv6Addr>()) {
-                (Ok(a), Ok(b)) => u128::from(v6) >= u128::from(a) && u128::from(v6) <= u128::from(b),
-                _ => false,
-            },
-        };
-        if hit {
+        if range_hit(ip, &s, &e) {
             return Ok(true);
         }
     }
     Ok(false)
+}
+
+/// 精确区间判定（文本起止 → 对应地址族数值比较）。
+fn range_hit(ip: IpAddr, start: &str, end: &str) -> bool {
+    match ip {
+        IpAddr::V4(v4) => match (start.parse::<Ipv4Addr>(), end.parse::<Ipv4Addr>()) {
+            (Ok(a), Ok(b)) => u32::from(v4) >= u32::from(a) && u32::from(v4) <= u32::from(b),
+            _ => false,
+        },
+        IpAddr::V6(v6) => match (start.parse::<Ipv6Addr>(), end.parse::<Ipv6Addr>()) {
+            (Ok(a), Ok(b)) => u128::from(v6) >= u128::from(a) && u128::from(v6) <= u128::from(b),
+            _ => false,
+        },
+    }
 }
 
 /// Well-known anycast / CDN prefixes (RIR 提取集的内置种子).
@@ -178,5 +202,43 @@ mod tests {
         assert!(is_anycast_conn(&conn, "198.51.100.7".parse().unwrap()));
         assert!(is_anycast_conn(&conn, "::ffff:198.51.100.7".parse().unwrap()));
         assert!(is_anycast_conn(&conn, "::ffff:8.8.8.8".parse().unwrap()));
+    }
+
+    /// 新 schema（start_i/end_i + 索引）走数值预过滤，命中/不命中与全表扫描一致；
+    /// v6 的数值键必须与 Python `range_numeric_key` 同口径，否则 v6 anycast 行
+    /// 会被 `start_i <= key <= end_i` 预过滤直接排掉（合法数据静默丢失）。
+    #[test]
+    fn anycast_table_numeric_columns_match() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE anycast(
+                 start TEXT, end TEXT, bits INTEGER, prefix TEXT, source TEXT,
+                 commit_unix INTEGER, start_i INTEGER, end_i INTEGER);
+             CREATE INDEX idx_anycast_numeric ON anycast(start_i, end_i);",
+        )
+        .unwrap();
+        let cases = [
+            (
+                "2606:4700::",
+                "2606:4700:ffff:ffff:ffff:ffff:ffff:ffff",
+            ),
+            ("198.51.100.0", "198.51.100.255"),
+            ("2001:db8::", "2001:db8::ffff"),
+        ];
+        for (s, e) in cases {
+            let si = crate::server::geoip_panel::iputil::range_numeric_key(s).unwrap();
+            let ei = crate::server::geoip_panel::iputil::range_numeric_key(e).unwrap();
+            conn.execute(
+                "INSERT INTO anycast(start,end,start_i,end_i) VALUES(?1,?2,?3,?4)",
+                rusqlite::params![s, e, si, ei],
+            )
+            .unwrap();
+        }
+        assert!(is_anycast_conn(&conn, "2606:4700::1111".parse().unwrap()));
+        assert!(is_anycast_conn(&conn, "2001:db8::42".parse().unwrap()));
+        assert!(is_anycast_conn(&conn, "198.51.100.7".parse().unwrap()));
+        assert!(is_anycast_conn(&conn, "::ffff:198.51.100.7".parse().unwrap()));
+        assert!(!is_anycast_conn(&conn, "2606:4701::1".parse().unwrap()));
+        assert!(!is_anycast_conn(&conn, "203.0.113.1".parse().unwrap()));
     }
 }

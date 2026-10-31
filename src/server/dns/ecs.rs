@@ -8,7 +8,8 @@
 //! - 入站 SOURCE=0 是隐私退出（§7.1.2/§7.5）：出站保持 SOURCE=0 且不带地址，
 //!   **绝不**用查询源 IP 重新生成 —— 那正是用户明确要求不要做的事。
 //! - 畸形 ECS（未知 FAMILY、地址长度与 SOURCE 不符、同一 OPT 里多个 ECS）不转发
-//!   该 option；[`malformed_ecs`] 供调用方按 §7.2.1 回 FORMERR 时判定。
+//!   该 option；多条 OPT RR、OPT RR 的 RDLEN 越过报文末尾同样判畸形（RFC 6891
+//!   §6.1.1）。[`malformed_ecs`] 供调用方按 §7.2.1 回 FORMERR 时判定。
 //!
 //! 出站（应答 → 客户端，RFC 7871 §7.2.2）：[`apply_response_ecs`] 在应答里回显
 //! ECS option —— 上游响应已带 ECS 者原样保留，否则按查询的 FAMILY/SOURCE/ADDRESS
@@ -72,7 +73,14 @@ struct ParsedOptions {
 /// 在 DNS 查询报文上挂/改 EDNS Client Subnet。失败返回 None（调用方回退为不带 ECS 转发）。
 pub fn inject_ecs(msg: &[u8], client: IpAddr) -> Option<Vec<u8>> {
     let off = question_end(msg)?;
-    let opt = find_opt(msg, off);
+    let (opt, opt_count, opt_truncated) = scan_opts(msg, off);
+    if opt_truncated || opt_count > 1 {
+        // RFC 6891 §6.1.1：多条 OPT RR / OPT RDATA 被截断都是畸形报文。旧实现按
+        // 「没有 OPT」处理并在包尾再追加一条 ⇒ 转发出去的是「截断 OPT + 新 OPT」
+        // （或三条 OPT）。这里 fail-closed，交回调用方；DoH/DoT 入口的
+        // `malformed_ecs` 会先判畸形并回 FORMERR。
+        return None;
+    }
     let client = unmap_v4_mapped(client);
     let (payload, ttl, parsed) = match &opt {
         Some(o) => (o.payload, o.ttl, parse_options(&o.rdata)),
@@ -112,12 +120,18 @@ pub fn inject_ecs(msg: &[u8], client: IpAddr) -> Option<Vec<u8>> {
 /// 判据：同一 OPT 里出现多个 ECS option；FAMILY 不是 1/2；SOURCE 超出该族位宽；
 /// ADDRESS 字节数少于 SOURCE 所需、或超出该族完整长度；SOURCE 之外的尾随位非零；
 /// **OPT rdata 无法按 TLV 完整解析**（某 option 的 olen 越过 rdata 末尾 —— 即
-/// 「声明的长度与实际不符」，或尾部剩 1~3 字节凑不满 option 头）。
+/// 「声明的长度与实际不符」，或尾部剩 1~3 字节凑不满 option 头）；
+/// **报文里出现多条 OPT RR**（RFC 6891 §6.1.1 MUST FORMERR）；
+/// **OPT RR 的 RDLEN 越过报文末尾**（RDATA 截断，同样无法按 TLV 解析）。
 pub fn malformed_ecs(msg: &[u8]) -> bool {
     let Some(off) = question_end(msg) else {
         return false;
     };
-    let Some(opt) = find_opt(msg, off) else {
+    let (opt, opt_count, opt_truncated) = scan_opts(msg, off);
+    if opt_truncated || opt_count > 1 {
+        return true;
+    }
+    let Some(opt) = opt else {
         return false;
     };
     let parsed = parse_options(&opt.rdata);
@@ -237,7 +251,7 @@ fn default_ecs(client: &IpAddr) -> (u16, u8, Vec<u8>) {
 /// 地址截断到 SOURCE 位：保留 ceil(source/8) 字节，最后一个字节的高位以外清零。
 fn truncate_address(family: u16, addr: &[u8], source: u8) -> Vec<u8> {
     let full = if family == 2 { 16 } else { 4 };
-    let need = ((source as usize) + 7) / 8;
+    let need = (source as usize).div_ceil(8);
     let n = need.min(full);
     let mut out = vec![0u8; n];
     for (dst, src) in out.iter_mut().zip(addr.iter().take(n)) {
@@ -263,7 +277,7 @@ fn ecs_valid(e: &EcsOption) -> bool {
     if e.source > max_bits {
         return false;
     }
-    let need = ((e.source as usize) + 7) / 8;
+    let need = (e.source as usize).div_ceil(8);
     if e.address.len() < need {
         return false;
     }
@@ -274,7 +288,7 @@ fn ecs_valid(e: &EcsOption) -> bool {
     if e.address[need..].iter().any(|b| *b != 0) {
         return false;
     }
-    if e.source % 8 != 0 && e.address.len() >= need && need > 0 {
+    if !e.source.is_multiple_of(8) && e.address.len() >= need && need > 0 {
         let mask = 0xFFu8 << (8 - (e.source % 8));
         if e.address[need - 1] & !mask != 0 {
             return false;
@@ -358,9 +372,26 @@ fn question_end(msg: &[u8]) -> Option<usize> {
 }
 
 /// 从 `off` 起扫所有 RR 段找 OPT（type=41）。
-fn find_opt(msg: &[u8], mut cur: usize) -> Option<OptFound> {
-    while cur + 1 <= msg.len() {
-        let name_end = skip_name(msg, cur)?;
+fn find_opt(msg: &[u8], cur: usize) -> Option<OptFound> {
+    scan_opts(msg, cur).0
+}
+
+/// 扫过 `off` 之后的全部 RR，返回：
+/// * 第一条 OPT（保持旧 `find_opt` 的「第一条」语义，供 splice 定位）；
+/// * OPT RR 的条数（RFC 6891 §6.1.1：多余一条必须 FORMERR）；
+/// * 是否遇到「OPT RR 头完整、但 RDLEN 越过报文末尾」的截断 OPT。
+///
+/// 旧 `find_opt` 遇到 RDATA 截断直接 `break` 返回 None —— 调用方于是把它当「没有
+/// OPT」再追加一条（产出畸形转发报文）；也不统计第二条 OPT。这里把两种畸形都显式
+/// 暴露出来，同时保持「第一条 OPT」的定位语义不变。
+fn scan_opts(msg: &[u8], mut cur: usize) -> (Option<OptFound>, usize, bool) {
+    let mut first: Option<OptFound> = None;
+    let mut count = 0usize;
+    let mut truncated = false;
+    while cur < msg.len() {
+        let Some(name_end) = skip_name(msg, cur) else {
+            break;
+        };
         if name_end + 10 > msg.len() {
             break;
         }
@@ -375,20 +406,28 @@ fn find_opt(msg: &[u8], mut cur: usize) -> Option<OptFound> {
         let rdlen = u16::from_be_bytes([msg[name_end + 8], msg[name_end + 9]]) as usize;
         let end = name_end + 10 + rdlen;
         if end > msg.len() {
+            // 只有「类型字段可读且是 OPT」时才能断言是截断 OPT；否则只是某条 RR
+            // 的 RDATA 越界，无法归因给 ECS，保持旧行为（停扫）。
+            if rtype == OPT_RR_TYPE {
+                truncated = true;
+            }
             break;
         }
         if rtype == OPT_RR_TYPE {
-            return Some(OptFound {
-                start: cur,
-                end,
-                payload: cls,
-                ttl,
-                rdata: msg[name_end + 10..end].to_vec(),
-            });
+            count += 1;
+            if first.is_none() {
+                first = Some(OptFound {
+                    start: cur,
+                    end,
+                    payload: cls,
+                    ttl,
+                    rdata: msg[name_end + 10..end].to_vec(),
+                });
+            }
         }
         cur = end;
     }
-    None
+    (first, count, truncated)
 }
 
 fn parse_options(rdata: &[u8]) -> ParsedOptions {
@@ -593,6 +632,50 @@ mod tests {
         rdata.extend_from_slice(&[0, 1, 24, 0, 203, 0]); // 6 字节，远少于声明的 40
         let q = query_with_opt(minimal_query(), &rdata);
         assert!(malformed_ecs(&q), "ECS option 声明长度与实际不符必须判畸形");
+    }
+
+    /// RFC 6891 §6.1.1：查询里出现**多个 OPT RR** 必须回 FORMERR。旧实现只看
+    /// `find_opt` 找到的**第一个** OPT（多 OPT 没被判畸形），`inject_ecs` 还会把新 OPT
+    /// 追加在包尾 ⇒ 畸形查询被原样转发且带上第三条 OPT。
+    #[test]
+    fn malformed_detects_multiple_opt_rrs() {
+        let mut q = query_with_opt(minimal_query(), &ecs_option_bytes(1, 24, 0, &[1, 2, 3]));
+        // 再追加一条 OPT（RDATA 合法，但 RFC 6891 只允许一条）。
+        q[11] = 2; // ARCOUNT=2
+        q.push(0);
+        q.extend_from_slice(&OPT_RR_TYPE.to_be_bytes());
+        q.extend_from_slice(&4096u16.to_be_bytes());
+        q.extend_from_slice(&[0, 0, 0, 0]);
+        let extra = ecs_option_bytes(1, 24, 0, &[]);
+        q.extend_from_slice(&(extra.len() as u16).to_be_bytes());
+        q.extend_from_slice(&extra);
+        assert!(
+            malformed_ecs(&q),
+            "多个 OPT RR 必须判畸形（RFC 6891 §6.1.1 MUST FORMERR）"
+        );
+        assert!(
+            inject_ecs(&q, v4(198, 51, 100, 7)).is_none(),
+            "多 OPT 的查询不得注入（会造出第三条 OPT）"
+        );
+    }
+
+    /// OPT RR 头完整、但 RDLEN 越过报文末尾（RDATA 被截断）：不能当「没有 OPT」
+    /// 再追加一条 —— 旧实现会产出「截断 OPT + 新 OPT」的畸形转发报文。
+    #[test]
+    fn malformed_detects_truncated_opt_rr() {
+        let mut q = minimal_query();
+        q[11] = 1; // ARCOUNT=1
+        q.push(0);
+        q.extend_from_slice(&OPT_RR_TYPE.to_be_bytes());
+        q.extend_from_slice(&4096u16.to_be_bytes());
+        q.extend_from_slice(&[0, 0, 0, 0]);
+        q.extend_from_slice(&40u16.to_be_bytes()); // 声明 40 字节 RDATA
+        q.extend_from_slice(&[0, 8, 0, 3, 1, 24, 0]); // 只给 7 字节
+        assert!(malformed_ecs(&q), "OPT RR 声明长度越过报文末尾必须判畸形");
+        assert!(
+            inject_ecs(&q, v4(198, 51, 100, 7)).is_none(),
+            "截断的 OPT 不得再追加第二条"
+        );
     }
 
     /// FORMERR 应答：QR=1、RCODE=1、AN/NS/ARCOUNT=0、回显 QUESTION、opcode/RD 保留。

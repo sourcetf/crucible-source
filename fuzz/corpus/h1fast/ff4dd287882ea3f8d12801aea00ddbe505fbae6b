@@ -1,0 +1,20 @@
+GET / HTTP/1.1
+Hout:1/
+Hout:/ 1.1
+Hout: a
+Hopt:(GET / H∞TP/1.1
+Hout: /1/
+Hout: /1.1
+Hout: a
+Hopt:(jTP/1.1
+Hout: /1/
+Hou': /1.1
+Hout: a
+Hopt:(P/1.1
+Hout: /1/
+Hout: /1.1
+Hout: a
+Hopt:(j
+
+,ÍHout
+-

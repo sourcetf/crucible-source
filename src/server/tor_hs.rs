@@ -123,7 +123,7 @@ fn write_file_nofollow(path: &Path, data: &[u8]) -> Result<()> {
         }
         f.write_all(data)
             .with_context(|| format!("写 {}", path.display()))?;
-        return Ok(());
+        Ok(())
     }
     #[cfg(not(unix))]
     {

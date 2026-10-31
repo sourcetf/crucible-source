@@ -1,6 +1,6 @@
 //! Static file serving, autoindex, small-file cache, Range support.
 
-use crate::config::{Config, FileOpenMode, ListenerConfig};
+use crate::config::{FileOpenMode, ListenerConfig};
 use crate::server::h1::{empty, full, BoxBody};
 use anyhow::{bail, Result};
 use bytes::Bytes;
@@ -24,8 +24,8 @@ const MAX_RANGE_BYTES: u64 = 32 * 1024 * 1024;
 ///
 /// 为什么需要它：`Response<BoxBody>` / `Response<Bytes>` 都把 body 放在内存里，于是
 /// >[`MAX_FULL_READ`] 的文件只能回 413（浏览器点一个 20MB 的文件直接报错）。
-/// 用「空 body + 附件里的来源描述」表达流式，改动面最小：静态层不需要认识三个协议，
-/// 各协议的发送路径各加一小段循环即可。
+/// > 用「空 body + 附件里的来源描述」表达流式，改动面最小：静态层不需要认识三个协议，
+/// > 各协议的发送路径各加一小段循环即可。
 #[derive(Clone, Debug)]
 pub struct FileSource {
     pub path: PathBuf,
@@ -237,7 +237,7 @@ pub async fn serve(req: &Request<Incoming>, lc: &ListenerConfig) -> Result<Respo
             }
         }
         if lc.autoindex.allows(path) {
-            return Ok(autoindex(&fs_path, path, lc.autoindex.enabled && lc.autoindex.enable_upload)?);
+            return autoindex(&fs_path, path, lc.autoindex.enabled && lc.autoindex.enable_upload);
         }
         bail!("directory");
     }

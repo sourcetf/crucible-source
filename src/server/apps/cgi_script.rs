@@ -8,7 +8,6 @@ use crate::server::h1::{full, BoxBody};
 use anyhow::{bail, Context, Result};
 use bytes::Bytes;
 use http::{Method, Request, Response, StatusCode, Uri};
-use http_body_util::BodyExt;
 use hyper::body::Incoming;
 use std::net::SocketAddr;
 use std::path::Path;
@@ -91,11 +90,10 @@ fn matched_app_prefix<'a>(app: &'a AppRouteConfig, path: &str) -> &'a str {
         if p.is_empty() {
             continue;
         }
-        if path == p || path.starts_with(&format!("{p}/")) {
-            if best.is_none_or(|b| p.len() > b.len()) {
+        if (path == p || path.starts_with(&format!("{p}/")))
+            && best.is_none_or(|b| p.len() > b.len()) {
                 best = Some(p);
             }
-        }
     }
     best.unwrap_or("")
 }
@@ -157,7 +155,9 @@ pub(crate) fn resolve_target(
     path: &str,
 ) -> Result<(std::path::PathBuf, String, String)> {
     let docroot = app.docroot.clone().unwrap_or_else(|| lc.root.clone());
-    let rel = crate::server::apps::app_ffi::rel_script_path(app, path);
+    // percent-decode：CGI PATH_INFO/SCRIPT_NAME 必须是解码后的形态（RFC 3875 §4.1.5），
+    // 文件解析同理（`/sg/a%20b.cgi` → docroot/`a b.cgi`）。查询串不在这里处理。
+    let rel = crate::server::apps::app_ffi::decode_path(&crate::server::apps::app_ffi::rel_script_path(app, path));
     let (script_url_rel, path_info) = split_path_info(&docroot, &rel).ok_or_else(|| {
         // 独立错误类型 ⇒ 调用方回 404（见 `ScriptNotFound` 说明）。
         anyhow::Error::new(ScriptNotFound {
@@ -174,8 +174,11 @@ pub(crate) fn resolve_target(
     Ok((script, script_name, path_info))
 }
 
+// 参数由调用面决定，拆结构体会改变调用签名（本波只清 warning，不重构）。
+#[allow(clippy::too_many_arguments)]
 pub async fn execute_binary(
     binary: &Path,
+    docroot: &Path,
     method: &Method,
     uri: &Uri,
     headers: &http::HeaderMap,
@@ -192,6 +195,7 @@ pub async fn execute_binary(
     let server_name = lc.server_name.clone().unwrap_or_else(|| "localhost".into());
     let bin = binary.to_path_buf();
     let script_filename = binary.display().to_string();
+    let docroot = docroot.to_path_buf();
     let method = method.as_str().to_string();
     let query = query.to_string();
     let peer_s = peer.ip().to_string();
@@ -216,6 +220,7 @@ pub async fn execute_binary(
             .env("PATH_INFO", &path_info)
             .env("QUERY_STRING", &query)
             .env("SCRIPT_FILENAME", &script_filename)
+            .env("DOCUMENT_ROOT", docroot.display().to_string())
             .env("SCRIPT_NAME", &script_name)
             .env("REMOTE_ADDR", &peer_s)
             .env("SERVER_NAME", &server_name)
@@ -357,11 +362,15 @@ pub async fn handle(
     // 与其它引擎一致：请求体必须**限量**收集（其余引擎都走 Limited::new(body, APP_BODY_CAP)）。
     // 这里是唯一的例外 —— 无上限 collect 意味着 h1 上任何 chunked/超大 POST 到 CGI 路由
     // 都能把请求体全量读进内存（同一个威胁模型下的漏网点）。
-    let body_bytes = http_body_util::Limited::new(body, crate::server::h1::APP_BODY_CAP)
-        .collect()
-        .await
-        .map_err(|e| anyhow::anyhow!("cgi_script: 请求体超出 {} 字节上限: {e}", crate::server::h1::APP_BODY_CAP))?
-        .to_bytes();
+    let body_bytes = match crate::server::apps::collect_app_body(
+        body,
+        crate::server::h1::APP_BODY_CAP,
+    )
+    .await
+    {
+        Ok(b) => b,
+        Err(e) => return Ok(e.into_response()),
+    };
     // 脚本解析（剥应用前缀 → 最长「已存在文件」前缀定界 → PATH_INFO）与 h2/h3 的
     // `apps::cgi_script_simple` 共用 [`resolve_target`]，保证跨协议同口径。
     // 「脚本不存在」= **404**（CGI 惯例，与 cgi 引擎口径一致），不是 502 引擎错误。
@@ -383,8 +392,10 @@ pub async fn handle(
         .get::<crate::server::apps::deps::DepsEnv>()
         .map(|d| (*d.vars).clone())
         .unwrap_or_default();
+    let docroot = app.docroot.clone().unwrap_or_else(|| lc.root.clone());
     execute_binary(
         &script,
+        &docroot,
         &parts.method,
         &parts.uri,
         &parts.headers,
@@ -405,7 +416,14 @@ fn parse_cgi_response(raw: Vec<u8>) -> Result<Response<BoxBody>> {
             String::from_utf8_lossy(&raw[..pos]).into_owned(),
             raw[pos..].to_vec(),
         ),
-        None => (String::new(), raw),
+        // 没有头/体分隔 = **不是合法 CGI 响应**（裸 body / 空输出）。CGI/1.1 要求脚本
+        // 先输出响应头；nginx/fcgiwrap 对同形态回 502。旧实现把整段当 body 回 200，
+        // 与「引擎崩溃/输出违规 → 502」的其它路径不一致（客户端无法区分正常内容与
+        // 引擎吐出的垃圾）。细节进日志，客户端拿统一 502 文本。
+        None => anyhow::bail!(
+            "cgi_script: 输出不含 CGI 响应头（不是合法的 CGI 响应，{} 字节）",
+            raw.len()
+        ),
     };
     if hdr_text.is_empty() {
         return Ok(Response::builder()
@@ -416,7 +434,7 @@ fn parse_cgi_response(raw: Vec<u8>) -> Result<Response<BoxBody>> {
     }
 
     let mut status = StatusCode::OK;
-    let mut content_type = "text/plain; charset=utf-8".to_string();
+    let mut content_type: Option<String> = None;
     // CGI 脚本可以设置任意响应头（Set-Cookie 最常见）。旧实现只透传 Status 与
     // Content-Type，其余全丢 —— CGI 语义不完整（其它引擎都全量透传头块）。
     // 头名/值用 `app_ffi::valid_header_kv` 做注入净化（token 名、可见 ASCII 值），
@@ -425,15 +443,22 @@ fn parse_cgi_response(raw: Vec<u8>) -> Result<Response<BoxBody>> {
     for line in hdr_text.lines() {
         let line = line.trim_end_matches('\r');
         if let Some(rest) = line.strip_prefix("Status:") {
-            if let Ok(code) = rest.trim().split_whitespace().next().unwrap_or("200").parse() {
-                status = StatusCode::from_u16(code).unwrap_or(StatusCode::OK);
+            if let Ok(code) = rest.split_whitespace().next().unwrap_or("200").parse() {
+                // **只接受 200..=599**（与 app_ffi::status_code 同口径）：0/1xx 会让 hyper
+                // 把最终响应改成 500 并掐连接（HEAD 上实测 h1 拿到 101、h2c 直接断流）；
+                // >599 的 999 不是合法 HTTP 状态（h2 对端判 PROTOCOL_ERROR）。
+                status = if (200..=599).contains(&code) {
+                    StatusCode::from_u16(code).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR)
+                } else {
+                    StatusCode::INTERNAL_SERVER_ERROR
+                };
             }
         } else if let Some((k, v)) = line.split_once(':') {
             let k = k.trim();
             let v = v.trim();
             if k.eq_ignore_ascii_case("Content-Type") {
                 if !v.is_empty() {
-                    content_type = v.to_string();
+                    content_type = Some(v.to_string());
                 }
             } else if crate::server::apps::app_ffi::valid_header_kv(k, v) {
                 extra.push((k.to_string(), v.to_string()));
@@ -441,10 +466,24 @@ fn parse_cgi_response(raw: Vec<u8>) -> Result<Response<BoxBody>> {
         }
     }
 
+    // 响应头净化（与 app_ffi / fastcgi / sidecar 同一口径）：此前 CGI 脚本回
+    // `Content-Length: 999` + 5 字节 body 时，h1 连接会按 999 等剩余字节（响应走私 /
+    // 连接失步），`Transfer-Encoding: chunked` 与 `Content-Length` 同时出现则直接被
+    // hyper 判非法而**掐掉连接**（真机：/headers 请求 status=000）。这里按真实 body
+    // 长度重写 CL、丢弃逐跳头（含 TE）与 Connection 点名的头。
+    let (extra, has_ct) =
+        crate::server::apps::app_ffi::sanitize_engine_headers(&extra, body.len());
     let mut builder = Response::builder()
         .status(status)
-        .header(http::header::CONTENT_TYPE, content_type)
         .header("X-Crucible-Engine", "cgi_script");
+    if let Some(ct) = content_type {
+        builder = builder.header(http::header::CONTENT_TYPE, ct);
+    } else if !has_ct {
+        builder = builder.header(
+            http::header::CONTENT_TYPE,
+            "text/plain; charset=utf-8",
+        );
+    }
     for (k, v) in &extra {
         builder = builder.header(k.as_str(), v.as_str());
     }
@@ -472,10 +511,54 @@ fn find_header_end(raw: &[u8]) -> Option<usize> {
 mod tests {
     use super::*;
 
+    /// 裸 body（没有 CGI 响应头）不是合法响应 → Err（调用方 502）。
+    /// 旧实现把它当 200 文本原样外发，与其它「引擎输出违规 → 502」路径不一致。
     #[test]
-    fn parse_plain_body() {
-        let r = parse_cgi_response(b"hello\n".to_vec()).unwrap();
+    fn bare_body_is_rejected() {
+        assert!(parse_cgi_response(b"hello\n".to_vec()).is_err());
+    }
+
+    /// 合法的「空头块 + body」仍是 200（CGI 允许无任何头）。
+    #[test]
+    fn empty_header_block_is_valid() {
+        let r = parse_cgi_response(b"\r\n\r\nhello".to_vec()).unwrap();
         assert_eq!(r.status(), StatusCode::OK);
+    }
+
+    /// 非法状态码（0/1xx/>599）→ 500；合法 2xx..5xx 原样透传（与 app_ffi 同口径）。
+    #[test]
+    fn invalid_status_is_mapped_to_500() {
+        for (raw, want) in [
+            (&b"Status: 999 Weird\r\n\r\nx"[..], 500),
+            (&b"Status: 101 Switching\r\n\r\nx"[..], 500),
+            (&b"Status: 0 Zero\r\n\r\nx"[..], 500),
+            (&b"Status: 418 Teapot\r\n\r\nx"[..], 418),
+            (&b"Status: 599 Odd\r\n\r\nx"[..], 599),
+        ] {
+            let r = parse_cgi_response(raw.to_vec()).unwrap();
+            assert_eq!(r.status().as_u16(), want, "{:?}", String::from_utf8_lossy(raw));
+        }
+    }
+
+    /// 响应头净化：CL 与真实 body 不符 → 丢弃；CL+TE 同时出现 → 只剩真实 CL
+    /// （否则 h1 响应走私 / hyper 直接掐连接）。
+    #[test]
+    fn response_headers_are_sanitized() {
+        let r = parse_cgi_response(
+            b"Content-Type: text/plain\r\nContent-Length: 999\r\nTransfer-Encoding: chunked\r\n\r\nhello"
+                .to_vec(),
+        )
+        .unwrap();
+        assert_eq!(r.status(), StatusCode::OK);
+        assert!(r.headers().get(http::header::TRANSFER_ENCODING).is_none());
+        assert!(r.headers().get(http::header::CONTENT_LENGTH).is_none());
+        assert_eq!(r.headers().get(http::header::CONTENT_TYPE).unwrap(), "text/plain");
+        // 正确 CL 保留
+        let r2 = parse_cgi_response(
+            b"Content-Type: text/plain\r\nContent-Length: 5\r\n\r\nhello".to_vec(),
+        )
+        .unwrap();
+        assert_eq!(r2.headers().get(http::header::CONTENT_LENGTH).unwrap(), "5");
     }
 
     fn app_with_paths(paths: &[&str]) -> AppRouteConfig {

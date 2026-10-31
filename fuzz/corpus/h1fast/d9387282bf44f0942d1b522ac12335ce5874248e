@@ -1,0 +1,4 @@
+GET / HTTP/1.1
+H:381
+If-None-Match: ck"
+

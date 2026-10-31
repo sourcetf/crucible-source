@@ -273,8 +273,8 @@ fn real_path_gate(lc: &ListenerConfig, target: &std::path::Path, rel: &str) -> O
 ///   * `deps/bin/index` —— `sidecar_engine` 把它当可执行 sidecar 二进制拉起（**RCE**）；
 ///   * `.env` —— `deps::parse_env_file` 把它注入引擎执行环境（**凭据注入/越权**）；
 ///   * `deps/**` —— 应用依赖产物，覆盖可影响后续执行。
-/// 出厂配置默认不开上传故不可达；一旦运维开整站上传（规格要求上传可用），`PUT /rust/init.sh`
-/// 就能覆盖它 → 下一次 `deps` 重跑 = 任意命令执行。这是**跨应用**的写面，必须按 docroot 拦。
+///     出厂配置默认不开上传故不可达；一旦运维开整站上传（规格要求上传可用），`PUT /rust/init.sh`
+///     就能覆盖它 → 下一次 `deps` 重跑 = 任意命令执行。这是**跨应用**的写面，必须按 docroot 拦。
 ///
 /// 判据用 `canon_best_effort`（与 `safe_join` 落盘用的真实路径对齐）：`www-apps/up/link ->
 /// www-apps/rust` 这种符号链接会被解析到真实 docroot 上，从而同样命中。

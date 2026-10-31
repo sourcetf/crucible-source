@@ -1,0 +1,3 @@
+GET http://example.co/a HTTP/1.0
+Host: excom
+

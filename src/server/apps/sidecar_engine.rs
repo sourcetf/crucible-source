@@ -32,8 +32,8 @@ const SIDECAR_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 ///   * 值相同 ⇒ 只发**一条**（客户端看到的值与两个键都一致，无信息丢失，不记日志）；
 ///   * 值不同 ⇒ **保留先出现的那个键**（= `.env` 文件顺序），后来的大小写变体**丢弃**并
 ///     记一条节流 warn（不静默：运维能看到自己写了两个只差大小写的键，而头通道无法区分）。
-///   判定在**头通道**这一层完成（spawn env 通道不受影响：POSIX 环境变量大小写敏感，
-///   `KEY`/`key` 都会如实进进程 env）。
+///     判定在**头通道**这一层完成（spawn env 通道不受影响：POSIX 环境变量大小写敏感，
+///     `KEY`/`key` 都会如实进进程 env）。
 ///
 /// 只对 JSP/do 生效（见调用点）：c/go/rust 样例 sidecar 不读 env，凭空多发头反而可能
 /// 改动它们的响应（例如自行打印全部请求头）。
@@ -476,7 +476,11 @@ fn is_hop_by_hop(lower: &str) -> bool {
 /// 上游响应 → 下游响应（字节版）：过滤 hop-by-hop（含 `Connection` 点名的头）与
 /// 和真实 body 长度不符的 `Content-Length`（否则 h1 keep-alive 上是响应走私，
 /// h2/h3 上对端判 CL 不符直接 RST 流）。与 proxy.rs 对同一天花板同一口径。
-fn upstream_response(rparts: http::response::Parts, body: Bytes) -> Result<Response<Bytes>> {
+fn upstream_response(
+    rparts: http::response::Parts,
+    body: Bytes,
+    is_head: bool,
+) -> Result<Response<Bytes>> {
     let conn_tokens: Vec<String> = rparts
         .headers
         .get_all(http::header::CONNECTION)
@@ -493,9 +497,14 @@ fn upstream_response(rparts: http::response::Parts, body: Bytes) -> Result<Respo
             continue;
         }
         if lower == "content-length" {
-            let declared = v.to_str().ok().and_then(|s| s.trim().parse::<u64>().ok());
-            if declared != Some(body.len() as u64) {
-                continue;
+            // HEAD：CL 描述的是对应 GET 的实体大小，body 本来就不上线 —— 必须保留
+            // （旧实现按 body.len()==0 判不符就丢掉，h2/h3 的 HEAD 于是没有 CL，
+            // 与 h1 的 sidecar 路径不一致）。其余方法仍按真实 body 长度核对。
+            if !is_head {
+                let declared = v.to_str().ok().and_then(|s| s.trim().parse::<u64>().ok());
+                if declared != Some(body.len() as u64) {
+                    continue;
+                }
             }
         }
         builder = builder.header(k, v);
@@ -606,7 +615,7 @@ pub(crate) async fn proxy_uds_simple(
         }
         anyhow::anyhow!("sidecar timeout after {SIDECAR_TIMEOUT:?}")
     })??;
-    upstream_response(rparts, rbytes)
+    upstream_response(rparts, rbytes, req.method() == http::Method::HEAD)
 }
 
 /// 代理超时后杀掉**受管**（`SIDECARS_SIMPLE` 表里登记的）sidecar 进程（见调用点说明）。
@@ -842,7 +851,7 @@ mod tests {
             .body(())
             .unwrap()
             .into_parts();
-        let r = upstream_response(parts, Bytes::from_static(b"hello")).unwrap();
+        let r = upstream_response(parts, Bytes::from_static(b"hello"), false).unwrap();
         assert!(r.headers().get("transfer-encoding").is_none());
         assert!(r.headers().get("connection").is_none());
         assert!(r.headers().get("keep-alive").is_none());
@@ -857,7 +866,7 @@ mod tests {
             .body(())
             .unwrap()
             .into_parts();
-        let r = upstream_response(parts, Bytes::from_static(b"hello")).unwrap();
+        let r = upstream_response(parts, Bytes::from_static(b"hello"), false).unwrap();
         assert_eq!(r.headers().get("content-length").unwrap(), "5");
     }
 

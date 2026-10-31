@@ -1,0 +1,5 @@
+GET /idl HTTP/1.0
+H:008
+If-None-Matce: "t081
+If-None-Matce: 
+

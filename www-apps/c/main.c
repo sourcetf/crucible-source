@@ -93,6 +93,70 @@ typedef struct {
     size_t cap;
 } Buf;
 
+/* ------------------------------------------------------------ shutdown --- */
+
+/*
+ * 优雅退出（规格 §16.9 的常驻 sidecar 生命周期）：
+ *   * SIGTERM/SIGINT 只置位 `g_stop`，并在信号处理函数里 unlink socket（幂等、
+ *     async-signal-safe），宿主 kill_child 的 500ms 宽限期内也能立刻看到 sock 消失；
+ *   * accept 循环用 poll 分段等待（200ms），醒来检查标志，不依赖 SA_RESTART 语义
+ *     （glibc 的 signal() 会带 SA_RESTART，阻塞 accept 不会被中断）；
+ *   * 停止接新连接后，等最多 2s 让在途连接把响应写完（正常空闲时立即退出）。
+ * 信号处理函数不能加锁，因此活跃连接计数用 pthread mutex 放在线程路径上。
+ */
+static volatile sig_atomic_t g_stop;
+static char g_sock_path[sizeof(((struct sockaddr_un *)0)->sun_path)];
+static pthread_mutex_t g_conn_mu = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t g_conn_cv = PTHREAD_COND_INITIALIZER;
+static int g_conn_active;
+
+static void on_stop_signal(int sig)
+{
+    (void)sig;
+    g_stop = 1;
+    if (g_sock_path[0] != '\0')
+        (void)unlink(g_sock_path); /* async-signal-safe */
+}
+
+static void conn_begin(void)
+{
+    pthread_mutex_lock(&g_conn_mu);
+    g_conn_active++;
+    pthread_mutex_unlock(&g_conn_mu);
+}
+
+static void conn_end(void)
+{
+    pthread_mutex_lock(&g_conn_mu);
+    g_conn_active--;
+    if (g_conn_active == 0)
+        pthread_cond_broadcast(&g_conn_cv);
+    pthread_mutex_unlock(&g_conn_mu);
+}
+
+/* 等待在途连接结束；最多 max_ms。返回退出时的剩余连接数。 */
+static int wait_connections(int max_ms)
+{
+    struct timespec ts;
+    int left;
+
+    clock_gettime(CLOCK_REALTIME, &ts);
+    ts.tv_sec += max_ms / 1000;
+    ts.tv_nsec += (long)(max_ms % 1000) * 1000000L;
+    if (ts.tv_nsec >= 1000000000L) {
+        ts.tv_sec++;
+        ts.tv_nsec -= 1000000000L;
+    }
+    pthread_mutex_lock(&g_conn_mu);
+    while (g_conn_active > 0) {
+        if (pthread_cond_timedwait(&g_conn_cv, &g_conn_mu, &ts) == ETIMEDOUT)
+            break;
+    }
+    left = g_conn_active;
+    pthread_mutex_unlock(&g_conn_mu);
+    return left;
+}
+
 static long long now_ms(void)
 {
     struct timespec ts;
@@ -254,13 +318,19 @@ static int reader_wait(int fd, long long deadline_ms)
 
         if (deadline_ms <= 0)
             return 0; /* 无 deadline：维持阻塞语义 */
+        if (g_stop) {
+            errno = ECANCELED;
+            return -1;
+        }
         remain = deadline_ms - now_ms();
         if (remain <= 0) {
             errno = ETIMEDOUT;
             return -1;
         }
-        if (remain > 60000)
-            remain = 60000; /* 单次 poll 上限；醒来后外层重算 */
+        /* 200ms 一片：既能精确计时，也让 shutdown 信号在 ≤200ms 内唤醒
+         * 空闲 keep-alive 连接（否则要等满 30s 空闲上限）。 */
+        if (remain > 200)
+            remain = 200;
         pfd.fd = fd;
         pfd.events = POLLIN;
         pfd.revents = 0;
@@ -268,8 +338,8 @@ static int reader_wait(int fd, long long deadline_ms)
         if (pr > 0)
             return 0; /* 可读 / EOF / 错误：交给 read() 判定 */
         if (pr == 0) {
-            errno = ETIMEDOUT;
-            return -1;
+            /* 时间片用完但请求 deadline 未到：重算剩余时间再等。 */
+            continue;
         }
         if (errno == EINTR)
             continue;
@@ -459,6 +529,22 @@ static int query_flag(const char *query, const char *key)
     return 0;
 }
 
+/*
+ * 路径形式的回显端点（任务/§16.9 示例用 `POST /echo`）。
+ * 宿主在转发前已剥掉应用路由前缀（`/c/echo` → `/echo`），因此这里比较的是
+ * 应用相对路径。`?echo=1` 继续保留（旧检查与手工调试用）。
+ */
+static int path_is_echo(const char *path)
+{
+    size_t n = strlen(path);
+
+    if (strcmp(path, "/echo") == 0)
+        return 1;
+    if (n > 5 && strcmp(path + n - 5, "/echo") == 0)
+        return 1; /* `/prefix/echo` 这类嵌套路径 */
+    return 0;
+}
+
 static int query_int(const char *query, const char *key, int dflt)
 {
     size_t vlen = 0;
@@ -644,10 +730,11 @@ static void *conn_thread(void *arg)
     Reader rd;
     int max_requests = DEFAULT_MAX_REQUESTS;
     const char *envn;
-    int req_no;
+    int req_no = 0;
 
     free(ca);
     pthread_detach(pthread_self());
+    conn_begin();
 
     envn = getenv("WEBSERVER_MAX_REQUESTS");
     if (envn != NULL && *envn != '\0') {
@@ -659,8 +746,7 @@ static void *conn_thread(void *arg)
     hs = calloc(MAX_HEADERS, sizeof(*hs));
     if (hs == NULL) {
         send_simple(fd, 500, "out of memory\n", 0, conn_id, 0, 0);
-        close(fd);
-        return NULL;
+        goto done;
     }
     memset(&rd, 0, sizeof(rd));
     rd.fd = fd;
@@ -693,6 +779,10 @@ static void *conn_thread(void *arg)
         const char *cls;
         const char *ct;
         Buf bodybuf = {0};
+
+        /* 宿主关闭中：不再复用当前连接（在途请求的响应已经写完才会到这里）。 */
+        if (g_stop)
+            break;
 
         /* 连接空闲阶段：用短 deadline 等下一请求；超时静默关闭。 */
         rd.deadline_ms = now_ms() + (long long)DEFAULT_IDLE_TIMEOUT_SECS * 1000LL;
@@ -906,7 +996,7 @@ static void *conn_thread(void *arg)
         if (req_no >= max_requests)
             keep_alive = 0;
 
-        echo = query_flag(query, "echo");
+        echo = query_flag(query, "echo") || path_is_echo(path);
         delay_ms = query_int(query, "delay_ms", 0);
         if (delay_ms < 0)
             delay_ms = 0;
@@ -941,11 +1031,11 @@ static void *conn_thread(void *arg)
         } else {
             const char *hello = getenv("APP_HELLO");
             if (hello == NULL || *hello == '\0')
-                hello = "hello from c";
-            buf_printf(&bodybuf, "%s path=%s method=%s engine=sidecar "
-                                 "conn=%lu thread=%lx body_len=%lld\n",
-                       hello, path, method, conn_id,
-                       thread_id(), clen);
+                hello = "hello from c sidecar";
+            /* §16.9 样例：`GET /` 返回 `hello from c sidecar`（`.env` 里配了
+             * APP_HELLO 就用它）。逐请求的形态信息走响应头（X-Crucible-*）。 */
+            buf_puts(&bodybuf, hello);
+            buf_puts(&bodybuf, "\n");
             n = send_response(fd, 200, "text/plain; charset=utf-8", NULL,
                               bodybuf.p ? bodybuf.p : "", bodybuf.len,
                               keep_alive, conn_id, req_no, head_only);
@@ -960,14 +1050,20 @@ req_done:
         free(body);
         if (!keep_alive)
             break;
+        if (g_stop) {
+            /* 宿主正在关闭：本次响应已写完，主动结束 keep-alive。 */
+            break;
+        }
     }
 
+done:
     free(hs);
     /* 错误响应后客户端可能还在发请求体/超长头：先排空再 close，避免 RST 吞掉响应。 */
     drain_input(fd);
     close(fd);
     fprintf(stderr, "c-sidecar: conn=%lu closed after %d request(s)\n",
             conn_id, req_no);
+    conn_end();
     return NULL;
 }
 
@@ -977,12 +1073,13 @@ int main(int argc, char **argv)
 {
     const char *sock = getenv("WEBSERVER_LISTEN_UNIX");
     struct sockaddr_un addr;
+    struct sigaction sa;
     int lfd;
     unsigned long next_conn = 0;
     const char *workers;
 
     if (sock == NULL || *sock == '\0') {
-        if (argc > 1)
+        if (argc > 1 && argv[1] != NULL && argv[1][0] != '\0')
             sock = argv[1];
         else
             sock = "/tmp/crucible-c-sidecar.sock";
@@ -991,6 +1088,19 @@ int main(int argc, char **argv)
         fprintf(stderr, "c-sidecar: socket path too long: %s\n", sock);
         return 1;
     }
+    snprintf(g_sock_path, sizeof(g_sock_path), "%s", sock);
+
+    /*
+     * 优雅退出：SIGTERM（宿主 child_registry::kill_child）与 SIGINT（手工运行）
+     * 都走 on_stop_signal。sa_flags=0：**不要** SA_RESTART；不过 accept 由 poll
+     * 驱动，本来也不依赖 EINTR。
+     */
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_handler = on_stop_signal;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = 0;
+    (void)sigaction(SIGTERM, &sa, NULL);
+    (void)sigaction(SIGINT, &sa, NULL);
 
     /* 宿主可能在超时/崩溃后留下 socket 文件；先删再 bind。 */
     unlink(sock);
@@ -1022,6 +1132,13 @@ int main(int argc, char **argv)
         unlink(sock);
         return 1;
     }
+    /* 非阻塞 listener：shutdown 与 accept 的竞态下 accept 也不会永久阻塞。 */
+    {
+        int fl = fcntl(lfd, F_GETFL, 0);
+
+        if (fl >= 0)
+            (void)fcntl(lfd, F_SETFL, fl | O_NONBLOCK);
+    }
 
     workers = getenv("WEBSERVER_WORKERS");
     fprintf(stderr,
@@ -1029,14 +1146,31 @@ int main(int argc, char **argv)
             "WEBSERVER_WORKERS=%s ignored: one thread per accepted socket)\n",
             sock, workers ? workers : "<unset>");
 
-    for (;;) {
-        int cfd = accept(lfd, NULL, NULL);
+    while (!g_stop) {
+        struct pollfd pfd;
+        int pr;
+        int cfd;
         ConnArg *ca;
         pthread_t th;
         int rc;
 
+        pfd.fd = lfd;
+        pfd.events = POLLIN;
+        pfd.revents = 0;
+        pr = poll(&pfd, 1, 200);
+        if (pr < 0) {
+            if (errno == EINTR)
+                continue;
+            fprintf(stderr, "c-sidecar: poll: %s\n", strerror(errno));
+            break;
+        }
+        if (pr == 0)
+            continue;
+        cfd = accept(lfd, NULL, NULL);
         if (cfd < 0) {
             if (errno == EINTR)
+                continue;
+            if (errno == EAGAIN || errno == EWOULDBLOCK)
                 continue;
             fprintf(stderr, "c-sidecar: accept: %s\n", strerror(errno));
             {
@@ -1044,6 +1178,11 @@ int main(int argc, char **argv)
                 nanosleep(&ts, NULL);
             }
             continue;
+        }
+        if (g_stop) {
+            /* 停止信号与 poll 返回之间的窄窗：不再服务新连接。 */
+            close(cfd);
+            break;
         }
         ca = malloc(sizeof(*ca));
         if (ca == NULL) {
@@ -1063,7 +1202,22 @@ int main(int argc, char **argv)
         }
         /* 线程自己 pthread_detach，连接结束即回收。 */
     }
+
+    /*
+     * 停止接新连接 → 立刻撤掉 socket 路径（信号处理函数已做，这里幂等）→
+     * 给在途连接最多 2s 写完响应。宿主 kill_child 只等 ~500ms 就会 SIGKILL，
+     * 因此空闲时（g_conn_active==0）必须立即退出，不额外拖延。
+     */
     close(lfd);
     unlink(sock);
+    {
+        int left = wait_connections(2000);
+
+        if (left > 0)
+            fprintf(stderr, "c-sidecar: shutting down with %d connection(s) "
+                            "still active after 2s drain\n", left);
+        else
+            fprintf(stderr, "c-sidecar: shut down cleanly\n");
+    }
     return 0;
 }

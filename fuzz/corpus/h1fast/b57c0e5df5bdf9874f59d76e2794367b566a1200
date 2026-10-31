@@ -1,0 +1,35 @@
+GET / HTTP/1.1
+H`ost: ..
+H`ost:in: H1
+H`ost: ..
+Conn#ectin: cloÿÿÿÿÿÿÿÿÿÿÿ
+Conn#ectin: H1ÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿ
+Conn#ectin: H1
+H`osq: ..
+Conn#ectin: cloÿÿÿÿÿÿÿÿÿ: ..
+Conn#ecH`ost: ..
+Conn#ectinst: ..
+H`ost: ..
+Conn#ectin: H1
+H`ost: ..
+Conn#ectin: cloÿÿÿÿÿÿÿÿÿÿÿÿÿÿ
+Conn#ectin:  ..
+Conn#ectin: (H1
+H`ost: ..
+Conn#ectinst: ..
+H`ost: ..
+Conn#ectin: H1
+H`ost: ..
+Conn#ectin: cloÿÿÿÿÿÿctin: cloÿÿÿÿnn#ectin: H1ÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿ
+Conn#ectin: H1
+H`ost: ..
+Conn#ectin: cloÿÿÿÿÿÿÿÿÿ: ..
+Conn#ecH`ost: ..
+Conn#ectinst: ..
+H`ost: ..
+Conn#ectin: H1
+H`ost: ..
+Conn#ectin: cloÿÿÿÿÿÿÿÿÿÿÿ H1
+H`ost: ..
+Conn#ectin: cloÿÿÿÿÿÿctin: cloÿÿÿÿÿÿÿÿÿÿÿ
+Conn#ectin: H1ÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿ

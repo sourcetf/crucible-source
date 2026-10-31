@@ -121,7 +121,7 @@ fn normalize_redirect_path(path_and_query: &str) -> String {
 ///   - HTTP/1.1 且请求目标是 origin-form / asterisk-form（URI 无 authority）时**缺 Host** ⇒ 拒绝；
 ///     absolute-form（`GET http://host/ …`）允许省略 Host（用 URI 的 authority，RFC 9112 §3.2.2）；
 ///   - Host 值非法（含空白/控制字符/`@`、`/`、`\`、`?`、`#`、`,` 等，或端口非数字）⇒ 拒绝。
-/// HTTP/1.0 及更早不要求 Host（仅「多行」一条仍生效）。
+///     HTTP/1.0 及更早不要求 Host（仅「多行」一条仍生效）。
 fn host_header_ok(req: &Request<Incoming>) -> bool {
     let n = req
         .headers()

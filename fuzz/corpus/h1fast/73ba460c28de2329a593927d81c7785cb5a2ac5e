@@ -1,0 +1,7 @@
+GET /k HTTP/1.1
+t:6.30
+If-R!tch: "á6.0
+If-R!tch: "abc
+If-R!tch: "aB6.0
+If-R!tch: "abc"
+

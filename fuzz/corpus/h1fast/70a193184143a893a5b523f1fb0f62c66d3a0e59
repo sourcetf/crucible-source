@@ -1,0 +1,5 @@
+GET /a HTTP/1.1
+Hog: tGET: 
+If-None-Matae:%LP/18
+If-None-Matae: "1
+Â: 

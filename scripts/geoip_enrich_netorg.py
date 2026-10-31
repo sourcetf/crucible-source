@@ -22,17 +22,23 @@ import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
-from geoip_common import DEFAULT_DB, init_schema, upsert_range  # noqa: E402
+from geoip_common import (  # noqa: E402
+    DEFAULT_DB,
+    init_schema,
+    logs_dir,
+    sources_dir,
+    upsert_range,
+)
 # fetch：geoip_http 的旧接口兼容名（get_dump 拉 RIR 全量 dump、rdap_ip 的非 Tor 分支
 # 都在调用它）。此前只导入了 http_get，两处调用直接 NameError:
 # "name 'fetch' is not defined" —— apnic/ripe 的 dump 每次都被跳过。
 from geoip_http import http_get, fetch, tor_socks_endpoints  # noqa: E402
 from geoip_tor_pool import ensure_tor_pool  # noqa: E402
 
-SOURCES = Path("data/geoip/sources")
-LOG = Path("data/geoip/logs/lacnic-rdap-resume.log")
-DONE = Path("data/geoip/sources/lacnic-rdap-done.txt")
-FAILED = Path("data/geoip/sources/lacnic-rdap-failed.txt")
+SOURCES = sources_dir()
+LOG = logs_dir() / "lacnic-rdap-resume.log"
+DONE = SOURCES / "lacnic-rdap-done.txt"
+FAILED = SOURCES / "lacnic-rdap-failed.txt"
 DUMPS = {
     "apnic": "https://ftp.apnic.net/public/apnic-db/apnic.db.gz",
     "ripe": "https://ftp.ripe.net/ripe/dbase/ripe.db.gz",

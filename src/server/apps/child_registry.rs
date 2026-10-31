@@ -683,11 +683,10 @@ fn scan_orphan_candidates(
         if row.pid == self_pid {
             continue;
         }
-        if is_our_engine_process(&row.cmd, anchors, pools) {
-            if orphan_pids.insert(row.pid) {
+        if is_our_engine_process(&row.cmd, anchors, pools)
+            && orphan_pids.insert(row.pid) {
                 orphans.push((row.pid, row.cmd.clone()));
             }
-        }
     }
     // php-fpm worker 没有路径锚点（cmdline 只有 `php-fpm: pool <name>`），靠 conf 里的
     // pool 名识别；只在「父 master 也是本仓库的孤儿」或「已被 reparent 到 init」时动手，
@@ -696,11 +695,10 @@ fn scan_orphan_candidates(
         if row.pid == self_pid || orphan_pids.contains(&row.pid) {
             continue;
         }
-        if php_pool_matches(&row.cmd, pools) && (row.ppid == 1 || orphan_pids.contains(&row.ppid)) {
-            if orphan_pids.insert(row.pid) {
+        if php_pool_matches(&row.cmd, pools) && (row.ppid == 1 || orphan_pids.contains(&row.ppid))
+            && orphan_pids.insert(row.pid) {
                 orphans.push((row.pid, row.cmd.clone()));
             }
-        }
     }
     (live_webserver, orphans)
 }
@@ -784,7 +782,7 @@ fn pidfile_orphan_candidates(root: &Path) -> Vec<(i32, String)> {
     let pools = php_pool_names(root);
     let self_pid = std::process::id() as i32;
 
-    let mut push = |pid: i32, cmd: String, from: &Path, out: &mut Vec<(i32, String)>| {
+    let push = |pid: i32, cmd: String, from: &Path, out: &mut Vec<(i32, String)>| {
         if pid <= 1 || pid == self_pid || !process_running(pid) {
             return;
         }

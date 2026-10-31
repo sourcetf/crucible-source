@@ -12,10 +12,10 @@ import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
-from geoip_common import DEFAULT_DB, init_schema, upsert_range  # noqa: E402
+from geoip_common import DEFAULT_DB, current_dir, init_schema, sources_dir, upsert_range  # noqa: E402
 
-JSONL = Path("data/geoip/sources/GeoCN.jsonl")
-ADCODE_OUT = Path("data/geoip/current/adcode_names.json")
+JSONL = sources_dir() / "GeoCN.jsonl"
+ADCODE_OUT = current_dir() / "adcode_names.json"
 WEIGHT = 820
 
 

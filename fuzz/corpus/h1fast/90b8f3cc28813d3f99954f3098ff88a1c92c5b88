@@ -1,0 +1,81 @@
+GET / HTTP/1.0
+Hg#zst: TP.1
+Hgst: TP/1.1
+Hqst: ..
+Connst: ..
+Connection: clConnection: closET / HT:P..
+Connection: clConnection: closET / HTTP/1.1
+Hqst: ..osEnst: ..
+Connection: clConnection: closETP/1.1
+Hqst: ..osETGETHgzst: TP.1
+Hgst: 
+Hgst: TP/0.1
+Hqst: ..
+Connst: ..
+Connection: clConnection: closET / HT:P..
+Connection: clConnection: closET / HTTP/2.1
+Hqst: ..osEnst: ..
+Connection: clConnection: cTP.1
+Hgst: TP/1.1
+Hqst: ..
+Connst: ..
+Ct: ..
+Connst: ..
+Connection: clConnection: closET / HT:P..
+Connection: clConnection: closET / HTTP/1.1
+Hqst: ..osEnst: ..
+Connection: clConnection: closETP/1.1
+Hqst: ..osETGETHgzst: TP.1
+Hgst: 
+Hgst: TP/0.1
+Hqst: ..
+Connst: ..
+Connection: clConnection: closET / HT:P..
+Connection: clConnection: closET / HTTP/2.1
+Hqst: ..osEnst: ..
+Connection: clConnection: cTP.1
+Hgst: TP/1.1
+Hqst: ..
+Connst: ..
+Connection: clCon / HTTP/1 / HTTP/1.1.
+Connection: alConT / HTTP/1 / /1.1.
+Connection: clConT / HTTP/1 / HTTP/1.1.
+CoConnection: cloTP/1.1
+Hqst: ..
+Connst: ..
+Connection: clConnecT / HTTP/1 / HTTP/1.1.
+Connection: cl1.1
+Hqst: ..osET / HTTP/1 / HTTP/1.1.
+Connection: c HTTP/
+Hqst: ..
+Connection: clolosETP/1.1
+Hqst: .
+Connection: clConT / HTTP/1 / HTTP/1.1.
+CoConnection: cloTP/1.1
+Hqst: ..
+Connst: ..
+Connection: clConnectioonT / HTTP/1 / /1.1.
+Connection: clConT / HTTP/1 / HTTP/1.1.
+CoConnection: cloTP/1.1
+Hqst: ..
+Connst: ..
+Connection: clConnecT / HTTP/1 / HTTP/1.1.
+Connection: cl1.1
+Hqst: ..osET / HTTP/1 / HTTP/1.1.
+Connection: c HTTP/
+Hqst: ..
+Connection: clolosETP/1.1
+Hqst: .
+Connection: CoConnection: cloTP/1.1
+Hqst: ..
+Connst: ..
+Connection: clConnection: closET / HTTP/1.1
+Hqst: ..osET / HTTP/1 / HTTP/1..1
+Connection: clConT / HTTP/1 / HTTP/1.1.
+Connection: cl1.1
+Hqst: ..osET / HTTP/1 / HTTP/1.1.
+Connection: c HTTP/
+Hqst: ..
+Connection: close
+
+eýõòõ

@@ -19,6 +19,12 @@
  * 安装一次的**线程感知代理**按线程分流（threading.local），不再逐请求替换解释器
  * 全局 sys.stdout / os.environ —— 并发请求之间不串输出、不串请求环境。
  */
+/* dladdr()/Dl_info 需要 _GNU_SOURCE（glibc 的 dlfcn.h 在 !__USE_GNU 下不声明它们）：
+ * Ruby 引擎用 dladdr 从 libruby 的真实映射位置反推用户级非重定位 ruby 的 stdlib
+ * 前缀（见 ruby_install_runtime_paths）。必须在所有系统头文件之前定义。 */
+#if !defined(_WIN32) && !defined(_GNU_SOURCE)
+#define _GNU_SOURCE 1
+#endif
 #include "../app-engines/include/appengine.h"
 #include "../app-engines/common/appengine_common.h"
 #include "../app-engines/common/crucible_pyinit.h"
@@ -852,6 +858,8 @@ done:
 /* ---------- in-process Ruby ---------- */
 #if defined(CRUCIBLE_HAVE_RUBY)
 #include <ruby.h>
+#include <ruby/version.h> /* RUBY_API_VERSION_MAJOR/MINOR（静态 load path 自愈） */
+#include <time.h>
 
 struct ruby_job {
     const char *script;
@@ -866,6 +874,12 @@ struct ruby_job {
     char *out_body;
     size_t out_len;
     int rc;
+    /* 通用宿主作业（libapp_rack.so 经 crucible_ruby_host_submit 投递）：
+     * host_fn != NULL 时在 MRI 线程上直接调用它，而不是执行脚本。 */
+    int (*host_fn)(void *);
+    void *host_ctx;
+    int script_error; /* 脚本自身抛异常（rc=-2 语义） */
+    int timed_out;    /* 引擎级墙钟中断（rc=-3 语义） */
 };
 
 #ifndef _WIN32
@@ -980,6 +994,293 @@ static int g_ruby_thread_state; /* 0=未建 1=已建 -1=建线程/boot 失败 */
 #define RUBY_UNLOCK() ((void)0)
 #endif
 
+/* ---------- 引擎级墙钟：中断死循环脚本（不依赖宿主 quarantine） ----------
+ *
+ * 为什么必须做在引擎里：宿主 app_ffi 的看门狗超时后只能「放弃 worker + 永久隔离该
+ * .so + 毒化 env 锁」——因为 C 调用无法安全杀死。对常驻 sidecar 这是一次进程重启；
+ * 对进程内 MRI 则是**此后所有 /ruby/ 请求 502 直到重启 webserver**（实测：一个
+ * `while true; end` 让整只 libapp_ruby.so 被隔离，随后 /ruby/ 立即 502）。
+ *
+ * MRI 自己有线程调度：纯 Ruby 死循环每 ~100ms 会被解释器抢占，因此同一 VM 里的
+ * 一个 Ruby 看门狗线程可以在超时后对主线程 `Thread#raise`（异步异常在下一个
+ * 中断检查点投递，被外层的 rb_protect 接住）——不需要杀线程，也不破坏解释器状态。
+ * 脚本里用 `rescue Exception` 吞掉超时是应用的显式选择（与 Ruby 的 Timeout 同语义）。
+ *
+ * 默认 30s，且自动小于宿主墙钟（CRUCIBLE_APP_ENGINE_TIMEOUT_SECS，默认 60s）：
+ * 引擎先超时 ⇒ 正常返回 -3 ⇒ 宿主**不会** quarantine/毒化。0 = 关闭引擎级中断。
+ */
+static double g_ruby_timeout_secs;
+static VALUE g_ruby_timeout_class = Qnil;
+
+static double ruby_mono_now(void)
+{
+#ifdef CLOCK_MONOTONIC
+    struct timespec ts;
+
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) == 0)
+        return (double)ts.tv_sec + (double)ts.tv_nsec / 1e9;
+#endif
+    return (double)time(NULL);
+}
+
+static double ruby_parse_secs(const char *raw, double fallback)
+{
+    char *end = NULL;
+    double v;
+
+    if (raw == NULL || raw[0] == '\0')
+        return fallback;
+    v = strtod(raw, &end);
+    if (end == raw || v < 0.0)
+        return fallback;
+    return v;
+}
+
+static void ruby_read_timeout(void)
+{
+    const char *own = getenv("CRUCIBLE_RUBY_TIMEOUT_SECS");
+    const char *host = getenv("CRUCIBLE_APP_ENGINE_TIMEOUT_SECS");
+    double host_secs = ruby_parse_secs(host, 60.0);
+
+    if (own != NULL) {
+        g_ruby_timeout_secs = ruby_parse_secs(own, 30.0);
+    } else if (host != NULL && host_secs > 0.0) {
+        /* 必须严格小于宿主墙钟：否则宿主先 quarantine，引擎级中断就白做了。 */
+        g_ruby_timeout_secs = host_secs > 2.0 ? host_secs - 1.0 : 1.0;
+        if (g_ruby_timeout_secs > 30.0)
+            g_ruby_timeout_secs = 30.0;
+    } else {
+        g_ruby_timeout_secs = 30.0;
+    }
+}
+
+/* 解释器自带的 load path 可能指向编译期前缀（用户级 aptlocal 解包后的 ruby 是
+ * 非重定位构建：$LOAD_PATH 硬编码 /usr/lib/ruby/3.3.0，而真实 stdlib 在
+ * ~/local/usr/lib/ruby/3.3.0）。没有 RUBYLIB 时 `require 'stringio'` 直接 LoadError，
+ * 脚本引擎会把每个请求都当成执行失败（实测 clean env 下 /ruby/ 恒 502）。
+ *
+ * 这里在 boot 后按 libruby 的真实位置自愈：dladdr(ruby_init) → 去掉
+ * /usr/lib/<multi>/libruby… 得到 prefix，把 prefix/usr/lib/ruby/<api> 等目录追加到
+ * $LOAD_PATH；发行版 gem（rubygems-integration）的 lib 目录也追加（放在末尾，
+ * 不遮蔽 stdlib），这样 rack gem 在未设 RUBYLIB/GEM_PATH 时仍能用真实
+ * Rack::Builder。已能 require stringio 的环境（系统 ruby/已设 RUBYLIB）只做 gem
+ * 路径补充，行为不变。 */
+static void ruby_install_runtime_paths(void)
+{
+    char prefix[PATH_MAX];
+    char multi[128];
+    char version[32];
+    int state = 0;
+
+    prefix[0] = '\0';
+    multi[0] = '\0';
+#ifndef _WIN32
+    {
+        Dl_info info;
+        char path[PATH_MAX];
+        char *slash;
+        const char *base;
+        char *usrlib;
+
+        if (dladdr((void *)ruby_init, &info) != 0 && info.dli_fname != NULL) {
+            snprintf(path, sizeof(path), "%s", info.dli_fname);
+            slash = strrchr(path, '/');
+            if (slash != NULL) {
+                *slash = '\0';
+                base = strrchr(path, '/');
+                base = base != NULL ? base + 1 : path;
+                if (strcmp(base, "lib") != 0 && strcmp(base, "lib64") != 0)
+                    snprintf(multi, sizeof(multi), "%s", base);
+                usrlib = strstr(path, "/usr/lib");
+                if (usrlib != NULL) {
+                    *usrlib = '\0';
+                    snprintf(prefix, sizeof(prefix), "%s", path);
+                }
+            }
+        }
+    }
+#else
+    (void)prefix;
+    (void)multi;
+#endif
+    snprintf(version, sizeof(version), "%d.%d.0", RUBY_API_VERSION_MAJOR,
+             RUBY_API_VERSION_MINOR);
+    rb_gv_set("$__crucible_prefix", rb_str_new_cstr(prefix));
+    rb_gv_set("$__crucible_multi", rb_str_new_cstr(multi));
+    rb_gv_set("$__crucible_api", rb_str_new_cstr(version));
+    (void)rb_eval_string_protect(
+        "begin\n"
+        "  $__crucible_loadpath_ok = false\n"
+        "  begin\n"
+        "    require 'stringio'\n"
+        "    $__crucible_loadpath_ok = true\n"
+        "  rescue LoadError, StandardError\n"
+        "  end\n"
+        "  rv = $__crucible_api.to_s\n"
+        "  p = $__crucible_prefix.to_s\n"
+        "  m = $__crucible_multi.to_s\n"
+        "  cands = []\n"
+        "  [p, ''].uniq.each do |root|\n"
+        "    cands << \"#{root}/usr/lib/ruby/#{rv}\"\n"
+        "    cands << \"#{root}/usr/lib/ruby/vendor_ruby/#{rv}\"\n"
+        "    cands << \"#{root}/usr/lib/ruby/vendor_ruby\"\n"
+        "    cands << \"#{root}/usr/lib/#{m}/ruby/#{rv}\" unless m.empty?\n"
+        "  end\n"
+        "  unless $__crucible_loadpath_ok\n"
+        "    cands.each { |d| $LOAD_PATH.unshift(d) if File.directory?(d) && !$LOAD_PATH.include?(d) }\n"
+        "    begin\n"
+        "      require 'stringio'\n"
+        "      $__crucible_loadpath_ok = true\n"
+        "    rescue LoadError, StandardError\n"
+        "    end\n"
+        "  end\n"
+        "  home = ENV['HOME'].to_s\n"
+        "  cands.concat(Dir.glob(\"#{p}/usr/lib/ruby/gems/#{rv}/gems/*/lib\"))\n"
+        "  cands.concat(Dir.glob(\"#{p}/usr/share/rubygems-integration/all/gems/*/lib\"))\n"
+        "  cands.concat(Dir.glob(\"#{home}/.local/share/gem/ruby/#{rv}/gems/*/lib\")) unless home.empty?\n"
+        "  cands.each { |d| $LOAD_PATH << d if File.directory?(d) && !$LOAD_PATH.include?(d) }\n"
+        "rescue Exception\n"
+        "end",
+        &state);
+    if (state != 0)
+        rb_set_errinfo(Qnil);
+    if (!RTEST(rb_gv_get("$__crucible_loadpath_ok")))
+        fprintf(stderr,
+                "scriptffi: ruby 标准库路径自愈失败（$LOAD_PATH 里没有可用的 stringio；"
+                "请设置 RUBYLIB 指向 ruby 的 lib 目录）\n");
+}
+
+/* 看门狗线程：只在有作业（$__crucible_deadline 非 nil）且墙钟到点时 raise。
+ * 它自己是普通 Ruby 线程，sleep 时让出 GVL，不会妨碍请求线程。 */
+static void ruby_install_watchdog(void)
+{
+    int state = 0;
+
+    (void)rb_eval_string_protect(
+        "class CrucibleRequestTimeout < Exception; end\n"
+        "$__crucible_deadline = nil\n"
+        "$__crucible_timeout_count = 0\n"
+        "$__crucible_watchdog = Thread.new do\n"
+        "  loop do\n"
+        "    sleep 0.05\n"
+        "    d = $__crucible_deadline\n"
+        "    next unless d\n"
+        "    begin\n"
+        "      now = Process.clock_gettime(Process::CLOCK_MONOTONIC)\n"
+        "    rescue Exception\n"
+        "      now = Time.now.to_f\n"
+        "    end\n"
+        "    if now >= d\n"
+        "      $__crucible_deadline = nil\n"
+        "      $__crucible_timeout_count = $__crucible_timeout_count.to_i + 1\n"
+        "      begin\n"
+        "        Thread.main.raise(CrucibleRequestTimeout,\n"
+        "                          'request exceeded the embedded Ruby engine timeout')\n"
+        "      rescue Exception\n"
+        "      end\n"
+        "    end\n"
+        "  end\n"
+        "end\n",
+        &state);
+    if (state != 0) {
+        rb_set_errinfo(Qnil);
+        fprintf(stderr, "scriptffi: ruby 看门狗线程安装失败；死循环脚本只能由宿主墙钟隔离\n");
+        return;
+    }
+    g_ruby_timeout_class = rb_eval_string_protect("CrucibleRequestTimeout", &state);
+    if (state != 0) {
+        g_ruby_timeout_class = Qnil;
+        rb_set_errinfo(Qnil);
+    }
+    if (g_ruby_timeout_secs > 0.0)
+        fprintf(stderr, "scriptffi: ruby 引擎级请求超时 %.1fs（宿主墙钟更小时自动取小）\n",
+                g_ruby_timeout_secs);
+}
+
+static int ruby_errinfo_is_timeout(void)
+{
+    VALUE e = rb_errinfo();
+
+    if (g_ruby_timeout_class == Qnil || NIL_P(e))
+        return 0;
+    return RTEST(rb_obj_is_kind_of(e, g_ruby_timeout_class)) ? 1 : 0;
+}
+
+/* 作业开始前把上一作业边界上可能残留的异步超时异常就地投递掉：
+ * 看门狗在「作业刚结束、deadline 尚未清空」的窄窗里 raise 时，异常会挂到主线程，
+ * 若不在新作业前消化，就会打在新请求上（假超时）。 */
+static void ruby_drain_pending_timeout(void)
+{
+    int state = 0;
+
+    if (g_ruby_timeout_class == Qnil)
+        return;
+    (void)rb_eval_string_protect(
+        "begin\n"
+        "  Thread.handle_interrupt(CrucibleRequestTimeout => :immediate) { Thread.pass }\n"
+        "rescue Exception\n"
+        "end",
+        &state);
+    if (state != 0)
+        rb_set_errinfo(Qnil);
+}
+
+static void ruby_arm_deadline(void)
+{
+    if (g_ruby_timeout_secs > 0.0)
+        rb_gv_set("$__crucible_deadline",
+                  rb_float_new(ruby_mono_now() + g_ruby_timeout_secs));
+    else
+        rb_gv_set("$__crucible_deadline", Qnil);
+}
+
+static void ruby_disarm_deadline(void)
+{
+    rb_gv_set("$__crucible_deadline", Qnil);
+}
+
+/* 把当前 Ruby 异常（消息 + backtrace）写进 stderr；失败时只写固定文本。 */
+static VALUE ruby_format_current_exception(VALUE unused)
+{
+    VALUE e = rb_errinfo();
+
+    (void)unused;
+    if (NIL_P(e))
+        return rb_str_new_cstr("(no exception)");
+    return rb_funcall(e, rb_intern("full_message"), 0);
+}
+
+static void ruby_log_exception(const char *script)
+{
+    int state = 0;
+    VALUE s;
+    char buf[2048];
+    size_t n;
+
+    s = rb_protect(ruby_format_current_exception, Qnil, &state);
+    if (state == 0 && RB_TYPE_P(s, T_STRING)) {
+        long len = RSTRING_LEN(s);
+
+        if (len < 0)
+            len = 0;
+        if ((size_t)len >= sizeof(buf))
+            len = (long)sizeof(buf) - 1;
+        memcpy(buf, RSTRING_PTR(s), (size_t)len);
+        buf[len] = '\0';
+        for (n = 0; n < (size_t)len; n++) {
+            if (buf[n] == '\n')
+                buf[n] = ' ';
+        }
+        fprintf(stderr, "scriptffi: ruby 脚本异常（script=%s）：%s\n",
+                script != NULL ? script : "(null)", buf);
+    } else {
+        fprintf(stderr, "scriptffi: ruby 脚本异常（script=%s，异常无法格式化）\n",
+                script != NULL ? script : "(null)");
+    }
+    /* protect 失败/格式化失败都会把异常挂在当前线程上；不带到下一个请求。 */
+    rb_set_errinfo(Qnil);
+}
+
 /* ENV 的写入**不能**用 rb_hash_aset()。
  *
  * MRI 的 ENV 不是 T_HASH：它是一个 T_DATA（`ruby -e 'p ENV.class'` → Object；
@@ -1008,6 +1309,14 @@ static void ruby_env_set(VALUE env, const char *key, VALUE val)
 static void ruby_env_set_cstr(VALUE env, const char *key, const char *val)
 {
     ruby_env_set(env, key, rb_str_new_cstr(val != NULL ? val : ""));
+}
+
+/* 删除一个 ENV 键。CONTENT_TYPE 等「本请求没有」的 CGI 变量必须**删除**而不是留
+ * 空串：sidecar 每请求 save/restore ENV，未带 Content-Type 的请求读到的是不存在；
+ * remain 空串会让两种形态的脚本看到不同结果（也把上一请求的值带进下一请求）。 */
+static void ruby_env_del(VALUE env, const char *key)
+{
+    rb_funcall(env, rb_intern("delete"), 1, rb_str_new_cstr(key));
 }
 
 /* ENV 是解释器级全局：清掉上一请求残留的 HTTP_*，避免请求 A 的 Cookie/Authorization
@@ -1059,7 +1368,9 @@ static int ruby_exec_job(struct ruby_job *job)
     const char *headers = job->headers;
 
     ruby_script(script);
-    /* ENV inject（含请求体长度/类型；P2 body 丢失修复）。 */
+    /* ENV inject（含请求体长度/类型；P2 body 丢失修复）。CGI 变量集合与
+     * www-apps/ruby/sidecar.rb 的 run_script 逐项对齐（GATEWAY_INTERFACE /
+     * SERVER_SOFTWARE / CONTENT_TYPE 的「不存在 vs 空串」语义都一致）。 */
     {
         VALUE env = rb_const_get(rb_cObject, rb_intern("ENV"));
         ruby_env_set_cstr(env, "REQUEST_METHOD", method ? method : "GET");
@@ -1067,10 +1378,14 @@ static int ruby_exec_job(struct ruby_job *job)
         ruby_env_set_cstr(env, "QUERY_STRING", query ? query : "");
         ruby_env_set_cstr(env, "REMOTE_ADDR", remote ? remote : "");
         ruby_env_set_cstr(env, "SCRIPT_FILENAME", script);
+        ruby_env_set_cstr(env, "GATEWAY_INTERFACE", "CGI/1.1");
+        ruby_env_set_cstr(env, "SERVER_SOFTWARE", "crucible/ruby");
         snprintf(lenbuf, sizeof(lenbuf), "%lu", (unsigned long)body_len);
         ruby_env_set_cstr(env, "CONTENT_LENGTH", lenbuf);
         if (content_type != NULL && content_type[0] != '\0')
             ruby_env_set_cstr(env, "CONTENT_TYPE", content_type);
+        else
+            ruby_env_del(env, "CONTENT_TYPE");
         /* 请求头 → HTTP_*（CGI 语义）。 */
         ruby_env_clear_http(env);
         {
@@ -1095,14 +1410,35 @@ static int ruby_exec_job(struct ruby_job *job)
         "$__crucible_old_stdin = $stdin; $stdin = StringIO.new($__crucible_body.to_s); "
         "rescue LoadError; $__crucible_out = nil; end",
         &state);
-    rb_load_protect(rb_str_new_cstr(script), 0, &state);
     if (state != 0)
-        rb_set_errinfo(Qnil); /* 不把上一请求的异常对象挂到下一请求 */
+        rb_set_errinfo(Qnil);
+    rb_load_protect(rb_str_new_cstr(script), 0, &state);
+    if (state != 0) {
+        /* 引擎级墙钟中断优先：看门狗 raise 的异步异常会在脚本的第一个中断检查点
+         * 出现，必须与用户脚本自己的异常区分（前者返回 -3，宿主据此只记一次 warn，
+         * 不 quarantine）。 */
+        if (ruby_errinfo_is_timeout())
+            job->timed_out = 1;
+        else {
+            job->script_error = 1;
+            ruby_log_exception(script);
+        }
+        rb_set_errinfo(Qnil);
+    }
     out = rb_eval_string_protect(
         "begin; r = $__crucible_out ? $__crucible_out.string : ''; "
         "ensure; $stdout = $__crucible_old_stdout if $__crucible_old_stdout; "
         "$stdin = $__crucible_old_stdin if $__crucible_old_stdin; end; r",
         &state);
+    if (state != 0) {
+        if (ruby_errinfo_is_timeout())
+            job->timed_out = 1;
+        rb_set_errinfo(Qnil);
+    }
+    if (job->timed_out)
+        return -3;
+    if (job->script_error)
+        return -2;
     if (state == 0 && TYPE(out) == T_STRING) {
         long n = RSTRING_LEN(out);
         if (n < 0 || (unsigned long)n > CRUCIBLE_SCRIPT_OUT_CAP) {
@@ -1123,12 +1459,17 @@ static int ruby_exec_job(struct ruby_job *job)
 }
 
 #ifndef _WIN32
-/* ruby_exec_job 的 rb_protect 包装：ENV[]=（rb_funcall）在值编码非法时可能抛异常，
- * 脚本里的非本地跳转也只有 protect 能兜住。任何逃逸的 Ruby 异常都不允许把专用
- * MRI 线程的 root tag 打穿（那会让后续请求全挂）。 */
-static VALUE ruby_exec_job_protected(VALUE arg)
+/* 作业的 rb_protect 包装：ENV[]=（rb_funcall）在值编码非法时可能抛异常，
+ * 脚本里的非本地跳转、以及看门狗投递的异步超时也只有 protect 能兜住。
+ * 任何逃逸的 Ruby 异常都不允许把专用 MRI 线程的 root tag 打穿（那会让后续请求
+ * 全挂）。host_fn 非空时执行 rack 投递的通用作业（同一线程、同一 VM）。 */
+static VALUE ruby_any_job_protected(VALUE arg)
 {
-    return (VALUE)ruby_exec_job((struct ruby_job *)arg);
+    struct ruby_job *job = (struct ruby_job *)arg;
+
+    if (job->host_fn != NULL)
+        return (VALUE)job->host_fn(job->host_ctx);
+    return (VALUE)ruby_exec_job(job);
 }
 
 /* MRI 专用线程：初始化 VM（只此线程碰 rb_*），然后循环取 job 执行。 */
@@ -1142,10 +1483,11 @@ static void *ruby_thread_main(void *arg)
     if (getenv(RUBY_BOOT_MARKER) != NULL) {
         fprintf(stderr,
                 "scriptffi: ruby 嵌入式 MRI 未启动：本进程已由另一个嵌入式 Ruby 引擎"
-                "（通常是 libapp_rack）初始化了 MRI VM（%s=1）。MRI 的 VM/GVL 是进程全局且"
-                "线程亲和的，二次 ruby_init 会 SIGSEGV 整个 webserver；本引擎改为显式失败"
-                "（502）。默认配置用常驻 sidecar 提供 /ruby/（CRUCIBLE_ENABLE_RUBY_EMBED=0）；"
-                "若要嵌入式 ruby，请在同一构建里关闭 rack embed。\n",
+                "（通常是旧版 libapp_rack 或未接入共享宿主的构建）初始化了 MRI VM"
+                "（%s=1）。MRI 的 VM/GVL 是进程全局且线程亲和的，二次 ruby_init 会 SIGSEGV "
+                "整个 webserver；本引擎改为显式失败（502），/ruby/ 的可用路径是常驻 "
+                "sidecar（www-apps/ruby/deps/bin/index）。若两个引擎同为本仓库构建，"
+                "libapp_rack 会自动经 crucible_ruby_host_* 投递到本线程，不会出现该错误。\n",
                 RUBY_BOOT_MARKER);
         pthread_mutex_lock(&g_ruby_q_mtx);
         g_ruby_boot_state = -2;
@@ -1186,6 +1528,11 @@ static void *ruby_thread_main(void *arg)
     }
     /* .so 常驻（RTLD_NODELETE）后再宣告「本进程的 VM 归我」，后来者据此显式失败。 */
     ruby_pin_libruby();
+    /* 标准库路径自愈（用户级非重定位 ruby）+ 引擎级超时看门狗。两者都必须在
+     * 宣告 ready 之前完成：第一个请求就可能需要 stringio / 死循环保护。 */
+    ruby_read_timeout();
+    ruby_install_runtime_paths();
+    ruby_install_watchdog();
     setenv(RUBY_BOOT_MARKER, "1", 1);
     ruby_boot_lock_release(lockfd);
     pthread_mutex_lock(&g_ruby_q_mtx);
@@ -1202,16 +1549,29 @@ static void *ruby_thread_main(void *arg)
         g_ruby_pending = NULL;
         pthread_mutex_unlock(&g_ruby_q_mtx);
 
+        /* 消化上一作业边界上可能残留的异步超时，再为本作业布防。 */
+        ruby_drain_pending_timeout();
+        ruby_arm_deadline();
         {
             int state = 0;
-            int rc = (int)rb_protect(ruby_exec_job_protected, (VALUE)job, &state);
+            int rc = (int)rb_protect(ruby_any_job_protected, (VALUE)job, &state);
 
             if (state != 0) {
+                /* 逃逸到作业外层的异常：超时 → -3；其它脚本/Ruby 异常 → -2。
+                 * 绝不能把异常留在 MRI 线程 root tag 上（后续请求会全挂）。 */
+                if (ruby_errinfo_is_timeout()) {
+                    job->timed_out = 1;
+                    rc = -3;
+                } else {
+                    if (!job->script_error)
+                        ruby_log_exception(job->script != NULL ? job->script : "(host job)");
+                    rc = -2;
+                }
                 rb_set_errinfo(Qnil);
-                rc = -1;
             }
             job->rc = rc;
         }
+        ruby_disarm_deadline();
 
         pthread_mutex_lock(&g_ruby_q_mtx);
         g_ruby_job_done = 1;
@@ -1221,6 +1581,54 @@ static void *ruby_thread_main(void *arg)
     return NULL;
 }
 #endif
+
+#ifndef _WIN32
+/* 确保 MRI 专用线程已创建并完成 boot。调用者必须持有 RUBY_LOCK。
+ * 返回：0 = ready；-2 = VM 已被别的 .so 拥有；-1 = 线程创建/boot 失败。 */
+static int ruby_ensure_thread_locked(void)
+{
+    if (g_ruby_thread_state == 0) {
+        pthread_t th;
+        pthread_attr_t attr;
+
+        pthread_attr_init(&attr);
+        /* MRI 的 GC 扫栈：给足 8MB（OpenBSD 默认 512KB 会偏紧）。 */
+        pthread_attr_setstacksize(&attr, 8UL * 1024 * 1024);
+        if (pthread_create(&th, &attr, ruby_thread_main, NULL) == 0) {
+            (void)pthread_detach(th);
+            /* 等 boot 结果：失败（VM 已被别家 .so 拥有 / ruby_init 失败）时不要把
+             * job 挂进去——否则没有消费者，请求线程会永久等 g_ruby_job_done。 */
+            pthread_mutex_lock(&g_ruby_q_mtx);
+            while (g_ruby_boot_state == 0)
+                pthread_cond_wait(&g_ruby_boot_cond, &g_ruby_q_mtx);
+            g_ruby_thread_state = (g_ruby_boot_state == 1) ? 1 : -1;
+            pthread_mutex_unlock(&g_ruby_q_mtx);
+        } else {
+            g_ruby_thread_state = -1;
+        }
+        pthread_attr_destroy(&attr);
+    }
+    if (g_ruby_thread_state == 1)
+        return 0;
+    if (g_ruby_boot_state == -2)
+        return -2;
+    return -1;
+}
+
+/* 把 job 挂到 MRI 线程并等完成。调用者必须持有 RUBY_LOCK（串行化调用者）。
+ * 返回 job->rc。 */
+static int ruby_submit_job_locked(struct ruby_job *job)
+{
+    pthread_mutex_lock(&g_ruby_q_mtx);
+    g_ruby_job_done = 0;
+    g_ruby_pending = job;
+    pthread_cond_signal(&g_ruby_q_cond);
+    while (!g_ruby_job_done)
+        pthread_cond_wait(&g_ruby_done_cond, &g_ruby_q_mtx);
+    pthread_mutex_unlock(&g_ruby_q_mtx);
+    return job->rc;
+}
+#endif /* !_WIN32 */
 
 static int run_ruby_inprocess(const char *script, const char *method, const char *path,
                               const char *query, const char *content_type, const char *body,
@@ -1243,40 +1651,19 @@ static int run_ruby_inprocess(const char *script, const char *method, const char
 
 #ifndef _WIN32
     RUBY_LOCK();
-    if (g_ruby_thread_state == 0) {
-        pthread_t th;
-        pthread_attr_t attr;
+    {
+        int erc = ruby_ensure_thread_locked();
 
-        pthread_attr_init(&attr);
-        /* MRI 的 GC 扫栈：给足 8MB（OpenBSD 默认 512KB 会偏紧）。 */
-        pthread_attr_setstacksize(&attr, 8UL * 1024 * 1024);
-        if (pthread_create(&th, &attr, ruby_thread_main, NULL) == 0) {
-            (void)pthread_detach(th);
-            /* 等 boot 结果：失败（VM 已被别家 .so 拥有 / ruby_init 失败）时不要把
-             * job 挂进去——否则没有消费者，请求线程会永久等 g_ruby_job_done。 */
-            pthread_mutex_lock(&g_ruby_q_mtx);
-            while (g_ruby_boot_state == 0)
-                pthread_cond_wait(&g_ruby_boot_cond, &g_ruby_q_mtx);
-            g_ruby_thread_state = (g_ruby_boot_state == 1) ? 1 : -1;
-            pthread_mutex_unlock(&g_ruby_q_mtx);
-        } else {
-            g_ruby_thread_state = -1;
+        if (erc != 0) {
+            RUBY_UNLOCK();
+            fprintf(stderr,
+                    "scriptffi: ruby 嵌入式引擎不可用（专用 MRI 线程创建或 VM boot 失败，"
+                    "rc=%d）；见上一条日志。\n",
+                    erc);
+            return -1;
         }
-        pthread_attr_destroy(&attr);
     }
-    if (g_ruby_thread_state != 1) {
-        RUBY_UNLOCK();
-        fprintf(stderr, "scriptffi: ruby 嵌入式引擎不可用（专用 MRI 线程创建或 VM boot 失败）；"
-                        "见上一条日志。\n");
-        return -1;
-    }
-    pthread_mutex_lock(&g_ruby_q_mtx);
-    g_ruby_job_done = 0;
-    g_ruby_pending = &job;
-    pthread_cond_signal(&g_ruby_q_cond);
-    while (!g_ruby_job_done)
-        pthread_cond_wait(&g_ruby_done_cond, &g_ruby_q_mtx);
-    pthread_mutex_unlock(&g_ruby_q_mtx);
+    job.rc = ruby_submit_job_locked(&job);
     RUBY_UNLOCK();
 #else
     {
@@ -1286,6 +1673,8 @@ static int run_ruby_inprocess(const char *script, const char *method, const char
         if (!ruby_started) {
             ruby_init();
             ruby_init_loadpath();
+            ruby_read_timeout();
+            ruby_install_runtime_paths();
             ruby_started = 1;
         }
         job.rc = ruby_exec_job(&job);
@@ -1297,6 +1686,64 @@ static int run_ruby_inprocess(const char *script, const char *method, const char
         *out_len = job.out_len;
     }
     return job.rc;
+}
+
+/*
+ * 跨 .so 的 MRI 宿主 ABI（libapp_rack.so 经 dlsym(RTLD_DEFAULT) 发现并使用）。
+ *
+ * MRI 的 VM/GVL 是进程全局且线程亲和的：libapp_ruby 与 libapp_rack 各自 ruby_init
+ * 必然二次初始化 → SIGSEGV 整个 webserver（wave19 根因 2）。根治办法不是「二选一」，
+ * 而是让**先 boot 的 libapp_ruby 成为唯一宿主**：rack 不再 boot VM，而是把整个
+ * Ruby 调用（shim 加载 + CrucibleRack.dispatch）作为一个 host_fn 作业投递到本线程。
+ * 这样两个引擎都保持进程内静态嵌入、共享同一 VM，没有任何 spawn。
+ *
+ * 旧版 libapp_rack / 旧版 libapp_ruby 互操作时符号缺失 → 退回 wave19 的
+ * flock+env 选举：后 boot 者显式 502，进程不崩（行为保持不变）。
+ */
+int crucible_ruby_host_ensure(void)
+{
+#ifdef _WIN32
+    return -1;
+#else
+    int rc;
+
+    RUBY_LOCK();
+    rc = ruby_ensure_thread_locked();
+    RUBY_UNLOCK();
+    return rc;
+#endif
+}
+
+int crucible_ruby_host_submit(int (*fn)(void *), void *ctx)
+{
+#ifdef _WIN32
+    (void)fn;
+    (void)ctx;
+    return -1;
+#else
+    struct ruby_job job;
+    int rc;
+
+    if (fn == NULL)
+        return -1;
+    memset(&job, 0, sizeof(job));
+    job.script = NULL;
+    job.host_fn = fn;
+    job.host_ctx = ctx;
+    job.rc = -1;
+    RUBY_LOCK();
+    if (g_ruby_thread_state != 1) {
+        int erc = ruby_ensure_thread_locked();
+
+        if (erc != 0) {
+            RUBY_UNLOCK();
+            return erc; /* -2 = VM 属于别人；-1 = 不可用 */
+        }
+    }
+    rc = ruby_submit_job_locked(&job);
+    RUBY_UNLOCK();
+    return rc;
+#endif
 }
 #endif /* CRUCIBLE_HAVE_RUBY */
 
@@ -1540,6 +1987,29 @@ int appengine_init(const char *engine, const char *lib_hint)
     return 0;
 }
 
+/* PATH_INFO 与 ruby sidecar 对齐：app_ffi 传给引擎的 path 是**原始请求路径**
+ * （/ruby/），而 sidecar 收到的是宿主 rel_script_path 后的应用相对路径
+ * （/ruby/ → /index.rb，/ruby/sub/ → /sub/index.rb）。脚本相对 docroot 的位置
+ * 正好就是 sidecar 的那个值，故从 resolved 反推；不匹配（docroot 形式不同/
+ * 脚本在 docroot 外）时返回 NULL、保持原始 path。 */
+static const char *ruby_path_info(const char *docroot, const char *resolved, char *buf,
+                                  size_t bufsz)
+{
+    size_t dl;
+
+    if (docroot == NULL || docroot[0] == '\0' || resolved == NULL)
+        return NULL;
+    dl = strlen(docroot);
+    while (dl > 1 && docroot[dl - 1] == '/')
+        dl--;
+    if (strncmp(resolved, docroot, dl) != 0)
+        return NULL;
+    if (resolved[dl] != '/')
+        return NULL;
+    snprintf(buf, bufsz, "%s", resolved + dl);
+    return buf;
+}
+
 int appengine_execute(
     const char *script,
     const char *docroot,
@@ -1588,16 +2058,32 @@ int appengine_execute(
     }
 
     {
-        int rc = run_lang(lang, resolved, method, path, query, content_type, body, body_len,
-                          remote, headers, extra, &result, &result_len, &mode);
+        const char *eff_path = path;
+        char relbuf[1024];
+        int rc;
+
+        if (strcmp(lang, "ruby") == 0) {
+            const char *rp = ruby_path_info(docroot, resolved, relbuf, sizeof(relbuf));
+
+            if (rp != NULL)
+                eff_path = rp;
+        }
+        rc = run_lang(lang, resolved, method, eff_path, query, content_type, body, body_len,
+                      remote, headers, extra, &result, &result_len, &mode);
         if (rc != 0) {
             free(result);
-            /* -2 = 脚本**跑起来了但抛了异常**（python 侧约定，见 run_python_inprocess）。
-             * 与 -1「嵌入解释器不可用」区分开：否则日志会把「应用代码有 bug」误报成
-             * 「引擎没编好」，排障方向直接跑偏。traceback 已由解释器写进服务端日志。 */
+            /* -2 = 脚本**跑起来了但抛了异常**（python/ruby 侧约定）；-3 = 引擎级
+             * 墙钟中断了死循环/超时脚本。两者都与 -1「嵌入解释器不可用」区分开：
+             * 否则日志会把「应用代码有 bug」误报成「引擎没编好」，排障方向直接跑偏。 */
             if (rc == -2)
                 return script_fail(out,
                                    "%s: 脚本执行失败（script=%s）；详细 traceback 见服务端日志",
+                                   lang, resolved);
+            if (rc == -3)
+                return script_fail(out,
+                                   "%s: 脚本执行超过引擎墙钟（script=%s），已被异步中断；"
+                                   "进程与解释器保持可用（阈值 CRUCIBLE_RUBY_TIMEOUT_SECS，"
+                                   "0=关闭）",
                                    lang, resolved);
             return script_fail(out,
                                "%s: 进程内解释器不可用（mode=%s，script=%s）。"

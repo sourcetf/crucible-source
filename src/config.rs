@@ -5,7 +5,7 @@
 
 use anyhow::{Context, Result};
 // DNS 模块类型 re-export（dot_doh / h1 / admin_api 经 crate::config 引用）
-pub use crate::server::dns::{DnsConfig, DohCfg, DotCfg};
+pub use crate::server::dns::{DnsConfig, DotCfg};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::collections::BTreeMap;
 use std::fmt;
@@ -123,6 +123,26 @@ pub struct AdminConfig {
     /// true 时保持旧行为（公开，但仍排在 ip_access + 限流之后）。
     #[serde(default)]
     pub metrics_public: bool,
+    /// U-13：管理面板 secure cookie 会话的**绝对**有效期（秒）。
+    ///
+    /// 默认 28800 = 8 小时（与旧实现固定的 8h 一致）。语义是**绝对过期**：
+    /// 登录时把 `created + ttl` 写进服务端会话表，之后任何请求都不续期
+    /// （不滑动），避免持续访问把会话永久延长。`Set-Cookie` 的 `Max-Age` /
+    /// `Expires` 使用同一份 TTL，客户端与服务端同时到期。
+    ///
+    /// 配置期拒绝 0、负数与 `> 30d`（`2592000`）：0/负数会让会话立即失效或
+    /// 语义不明，超长 TTL 等于把「secure cookie」变成长期凭据。
+    #[serde(default = "default_admin_session_ttl_secs")]
+    pub session_ttl_secs: u64,
+}
+
+/// 默认管理会话 TTL：8 小时（保持历史行为）。
+pub const DEFAULT_ADMIN_SESSION_TTL_SECS: u64 = 8 * 60 * 60;
+/// 管理会话 TTL 上限：30 天（配置期硬限制，避免把会话做成长期凭据）。
+pub const ADMIN_SESSION_TTL_MAX_SECS: u64 = 30 * 24 * 60 * 60;
+
+fn default_admin_session_ttl_secs() -> u64 {
+    DEFAULT_ADMIN_SESSION_TTL_SECS
 }
 
 impl Default for AdminConfig {
@@ -136,6 +156,7 @@ impl Default for AdminConfig {
             }],
             listeners_allow: Vec::new(),
             metrics_public: false,
+            session_ttl_secs: DEFAULT_ADMIN_SESSION_TTL_SECS,
         }
     }
 }
@@ -161,6 +182,15 @@ impl AdminConfig {
 
     pub fn primary_user(&self) -> Option<&AdminUser> {
         self.users.first()
+    }
+
+    /// U-13：会话绝对有效期（秒）。配置期已校验 `1..=30d`；这里再夹一次，
+    /// 保证以编程方式构造的 `AdminConfig`（单测/嵌入）也不会产生 0 或溢出的 TTL。
+    pub fn session_ttl(&self) -> std::time::Duration {
+        let secs = self
+            .session_ttl_secs
+            .clamp(1, ADMIN_SESSION_TTL_MAX_SECS);
+        std::time::Duration::from_secs(secs)
     }
 }
 
@@ -560,6 +590,47 @@ mod file_open_serde {
     }
 }
 
+/// §16.17 / G-16：CONNECT-UDP（RFC 9298）隧道内 UDP 报文的封装形态策略。
+///
+/// RFC 9298 允许 UDP 载荷走 RFC 9297 §2.2 的 **QUIC DATAGRAM 帧**（需要双方
+/// 在 SETTINGS 里声明 `H3_DATAGRAM`，且 QUIC 传输协商出 `max_datagram_frame_size`）、
+/// RFC 9297 §3.5 的 **DATAGRAM capsule**（客户端带 `Capsule-Protocol: ?1`），
+/// 或早期草稿的**裸长度前缀**。本字段只在**服务端策略**上选择/限制用哪一种；
+/// 实际能否用 QUIC DATAGRAM 仍受客户端能力协商约束
+/// （见 `server::h3::proxy_connect_udp` 的协商逻辑）。
+///
+/// * `auto`（默认）：按客户端能力协商 —— 双方都声明 `H3_DATAGRAM` 且 QUIC 协商出
+///   `max_datagram_frame_size` 时用 QUIC DATAGRAM 帧；否则客户端带
+///   `Capsule-Protocol: ?1` 时用 capsule；两者都没有时用裸长度前缀。
+///   **默认值与引入本字段前的行为逐字节一致**（不改变任何现有部署）。
+/// * `capsule`：强制 RFC 9297 capsule（响应里回 `Capsule-Protocol: ?1`），即使
+///   客户端支持 QUIC DATAGRAM 也不使用它。
+/// * `length`：强制 RFC 9298 §4.3 裸长度前缀形态。
+/// * `datagram`：要求 QUIC DATAGRAM 帧；客户端未声明 `H3_DATAGRAM`（或未协商出
+///   `max_datagram_frame_size`）时**拒绝**该 CONNECT（501），而不是静默降级 ——
+///   运维显式要求 datagram 时，降级成流内封装等于没落实该要求。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ConnectUdpFraming {
+    #[default]
+    Auto,
+    Capsule,
+    Length,
+    Datagram,
+}
+
+impl ConnectUdpFraming {
+    /// 规范配置名（小写）；也用于日志。
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Capsule => "capsule",
+            Self::Length => "length",
+            Self::Datagram => "datagram",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ListenerConfig {
     pub address: String,
@@ -687,6 +758,12 @@ pub struct ListenerConfig {
     /// 而不是不配任何东西就存在。开启时建议同时配 `ip_access` / basic_auth。
     #[serde(default)]
     pub connect_udp: bool,
+    /// §16.17 / G-16：CONNECT-UDP 隧道内 UDP 报文的封装形态（见 [`ConnectUdpFraming`]）。
+    ///
+    /// 默认 `auto` = 按客户端能力协商（引入本字段前的行为）。仅在该 listener
+    /// `connect_udp = true` 时有意义（否则 CONNECT 已被 403 拒绝）。
+    #[serde(default)]
+    pub connect_udp_framing: ConnectUdpFraming,
     /// §16.12 **每站（listener）** 访问日志覆盖（enable/level/realtime）。
     ///
     /// `None` = 完全继承全局 `[access_log]`（旧配置零变化）；`Some` = 逐字段覆盖
@@ -724,6 +801,7 @@ impl Default for ListenerConfig {
             quic_ecn: false,
             qmux: false,
             connect_udp: false,
+            connect_udp_framing: ConnectUdpFraming::Auto,
             access_log: None,
         }
     }
@@ -976,6 +1054,7 @@ impl SslConfig {
 /// - 通过 `Deref<Target = str>` 让既有 `app.engine.to_ascii_lowercase()` /
 ///   `format!("{}", app.engine)` 等字符串用法保持不变。
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Default)]
 pub enum AppEngineKind {
     Php,
     Fastcgi,
@@ -999,6 +1078,7 @@ pub enum AppEngineKind {
     Go,
     Rust,
     /// 显式声明为未知（`engine = "unknown"`）。
+    #[default]
     Unknown,
     /// 向后兼容：目录外/自定义引擎名，保留原始字符串。
     Other(String),
@@ -1069,11 +1149,6 @@ impl AppEngineKind {
     }
 }
 
-impl Default for AppEngineKind {
-    fn default() -> Self {
-        Self::Unknown
-    }
-}
 
 impl Deref for AppEngineKind {
     type Target = str;
@@ -1207,18 +1282,15 @@ fn default_libc_opt() -> Option<String> {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
+#[derive(Default)]
 pub enum FileOpenMode {
+    #[default]
     Auto,
     Preview,
     Download,
     Execute,
 }
 
-impl Default for FileOpenMode {
-    fn default() -> Self {
-        Self::Auto
-    }
-}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BasicAuthConfig {
@@ -1437,6 +1509,11 @@ struct AdminConfigRaw {
     listeners_allow: Vec<u16>,
     #[serde(default)]
     metrics_public: bool,
+    /// 用 `Option<i64>` 而不是 `u64`：负数要给出「必须是正整数秒」的明确报错，
+    /// 而不是 serde 的 `invalid value: integer -1, expected u64`（后者看不出是
+    /// 哪个字段、为什么会话配置会受影响）。
+    #[serde(default)]
+    session_ttl_secs: Option<i64>,
 }
 
 impl Config {
@@ -1460,6 +1537,21 @@ impl Config {
         let raw = fs::read_to_string(path)
             .with_context(|| format!("read {}", path.display()))?;
         let raw_cfg: ConfigRaw = toml::from_str(&raw).context("parse config.toml")?;
+        // U-13：`[admin] session_ttl_secs`。缺省 = 8h（历史行为）；显式 0/负数/
+        // >30d 在配置期就拒绝，避免「会话永不过期 / 立即过期」这类静默危险值。
+        let session_ttl_secs = match raw_cfg.admin.session_ttl_secs {
+            None => DEFAULT_ADMIN_SESSION_TTL_SECS,
+            Some(n) => {
+                if n <= 0 || n as u64 > ADMIN_SESSION_TTL_MAX_SECS {
+                    anyhow::bail!(
+                        "admin.session_ttl_secs = {n} 非法：必须是 1..={ADMIN_SESSION_TTL_MAX_SECS} 秒\
+                         （默认 {DEFAULT_ADMIN_SESSION_TTL_SECS} = 8h；0/负数会让会话立即失效或语义不明，\
+                         上限 30 天）"
+                    );
+                }
+                n as u64
+            }
+        };
         let mut admin = AdminConfig {
             realm: if raw_cfg.admin.realm.is_empty() {
                 default_admin_realm()
@@ -1474,6 +1566,7 @@ impl Config {
             users: raw_cfg.admin.users,
             listeners_allow: raw_cfg.admin.listeners_allow,
             metrics_public: raw_cfg.admin.metrics_public,
+            session_ttl_secs,
         };
         admin.normalize_legacy(
             (!raw_cfg.admin.username.is_empty()).then_some(raw_cfg.admin.username),
@@ -1727,8 +1820,8 @@ impl Config {
             let Some(ssl) = &l.ssl else { continue };
             // ECH cover 证书必须成对：只给一半会在握手时静默回落到「不能用于 public_name
             // 的真实证书」，客户端报证书不匹配 —— 与「只写 cert 不写 key」同类，配置期拦。
-            let cover_cert = ssl.ech_cover_cert.as_deref().map_or(false, |s| !s.trim().is_empty());
-            let cover_key = ssl.ech_cover_key.as_deref().map_or(false, |s| !s.trim().is_empty());
+            let cover_cert = ssl.ech_cover_cert.as_deref().is_some_and(|s| !s.trim().is_empty());
+            let cover_key = ssl.ech_cover_key.as_deref().is_some_and(|s| !s.trim().is_empty());
             if cover_cert != cover_key {
                 anyhow::bail!(
                     "listener {}:{}: ssl.ech_cover_cert 与 ssl.ech_cover_key 必须成对配置",
@@ -1746,9 +1839,9 @@ impl Config {
             }
             // 外层 EC 也必须成对（与上面 cover_cert/cover_key 同理）。
             let cover_ec_cert =
-                ssl.ech_cover_cert_ec.as_deref().map_or(false, |s| !s.trim().is_empty());
+                ssl.ech_cover_cert_ec.as_deref().is_some_and(|s| !s.trim().is_empty());
             let cover_ec_key =
-                ssl.ech_cover_key_ec.as_deref().map_or(false, |s| !s.trim().is_empty());
+                ssl.ech_cover_key_ec.as_deref().is_some_and(|s| !s.trim().is_empty());
             if cover_ec_cert != cover_ec_key {
                 anyhow::bail!(
                     "listener {}:{}: ssl.ech_cover_cert_ec 与 ssl.ech_cover_key_ec 必须成对配置",
@@ -1764,7 +1857,7 @@ impl Config {
             // ECH 接受前后证书类型会变；而且外层缺 EC 时，容器里唯一的 EC 证书正好是
             // **内层**那张 —— 实测（127.0.0.1:18443）三条探针（ECH / 非 ECH+RSA /
             // 非 ECH+仅 ECDSA）拿到的指纹**完全相同**，即内层真实证书被泄漏给非 ECH 客户端。
-            let inner_ec = ssl.cert_ec.as_deref().map_or(false, |s| !s.trim().is_empty());
+            let inner_ec = ssl.cert_ec.as_deref().is_some_and(|s| !s.trim().is_empty());
             if cover_cert && inner_ec != cover_ec_cert {
                 anyhow::bail!(
                     "listener {}:{}: ssl.cert_ec 与 ssl.ech_cover_cert_ec 必须同时配或同时不配 —— \
@@ -1823,8 +1916,8 @@ cover 只用于「未使用 / 被拒 ECH」的连接，ECH 关闭时它会成为
         // 必须在加载期拦住（用户明确要求：拒绝异常配置，而不是运行期悄悄跳过）。
         for l in &self.listeners {
             let Some(ssl) = &l.ssl else { continue };
-            let has_cert = ssl.cert.as_deref().map_or(false, |s| !s.trim().is_empty());
-            let has_key = ssl.key.as_deref().map_or(false, |s| !s.trim().is_empty());
+            let has_cert = ssl.cert.as_deref().is_some_and(|s| !s.trim().is_empty());
+            let has_key = ssl.key.as_deref().is_some_and(|s| !s.trim().is_empty());
             // ① 证书与私钥必须成对。只写 cert 不写 key 时，TLS 建不起来，而 accept 侧会把
             //    「未配置证书」当作「按明文 HTTP 服务」（规格要求 cert 未配置前一律走 HTTP）
             //    —— 于是少写一行 key = 该口静默变明文。这比启动失败危险得多。
@@ -1953,7 +2046,7 @@ cover 只用于「未使用 / 被拒 ECH」的连接，ECH 关闭时它会成为
                 .geoip
                 .db_path
                 .as_deref()
-                .map_or(true, |p| p.as_os_str().is_empty())
+                .is_none_or(|p| p.as_os_str().is_empty())
         {
             anyhow::bail!(
                 "geoip.enabled = true 但没有配置 geoip.db_path —— 查询会全部落空（面板仍显示已启用）"
@@ -2020,6 +2113,21 @@ cover 只用于「未使用 / 被拒 ECH」的连接，ECH 关闭时它会成为
             if ap == "/" {
                 anyhow::bail!("admin.path 不能是 `/`：那会让管理面匹配一切路径并接管整站（所有请求都走鉴权/CSRF 门）");
             }
+        }
+
+        // U-13：会话 TTL 必须在 1s..=30d。`Config::load` 走 `AdminConfigRaw` 时已经
+        // 拒过一次；这里覆盖「直接反序列化 Config / 代码构造」的入口（`Config` 自身
+        // 也实现了 Deserialize，面板与单测都可能走那条路）。
+        if self.admin.session_ttl_secs == 0 {
+            anyhow::bail!(
+                "admin.session_ttl_secs = 0 非法：会话会在创建瞬间过期（必须 >= 1 秒；默认 {DEFAULT_ADMIN_SESSION_TTL_SECS} = 8h）"
+            );
+        }
+        if self.admin.session_ttl_secs > ADMIN_SESSION_TTL_MAX_SECS {
+            anyhow::bail!(
+                "admin.session_ttl_secs = {} 过长（上限 {ADMIN_SESSION_TTL_MAX_SECS} 秒 = 30 天）—— 把 secure cookie 变成长期凭据",
+                self.admin.session_ttl_secs
+            );
         }
 
         // ③ realm 会被拼进 `WWW-Authenticate: Basic realm="…"`。含换行/引号/非 ASCII 时
@@ -2229,32 +2337,76 @@ cover 只用于「未使用 / 被拒 ECH」的连接，ECH 关闭时它会成为
     }
 }
 
+/// 页面规则 `priority` 允许范围。
+///
+/// 运行期按 `i64` 降序排序；越界值（手写笔误、面板粘贴）不会 panic，但会让一条
+/// 规则压倒/被压倒一切，且面板回显巨大数字难以排查。这里的对称范围远大于任何
+/// 合理配置，只用来拦截明显的笔误（如多打几个 0）。
+pub(crate) const PAGE_RULE_PRIORITY_MIN: i64 = -1_000_000;
+pub(crate) const PAGE_RULE_PRIORITY_MAX: i64 = 1_000_000;
+
 /// 页面规则列表校验（全局与每站共用）。
 ///
 /// 运行期对畸形输入只返回「不匹配」（绝不 panic），但配置期必须把「永远不可能
 /// 命中」的规则拦下来 —— 否则面板/手写配置显示保存成功，实际整条规则是死的。
 fn validate_page_rule_list(rules: &[PageRuleConfig], where_: &str) -> Result<()> {
     for (i, r) in rules.iter().enumerate() {
-        // action 必须是运行期认识的小写动作。面板保存已经拒绝未知动作，但手写
-        // config.toml 里写错一个字母时，加载会成功、每个请求却**静默跳过**这条
-        // 规则（`page_rules::apply` 对未知 action 直接 continue）——正是本函数
+        validate_page_rule(r, &format!("{where_}[{i}]"))?;
+    }
+    Ok(())
+}
+
+/// 单条页面规则的配置期校验 —— **面板保存（`admin::check_page_rule`）与手写
+/// config.toml 共用的唯一口径**。
+///
+/// `label` 是出错定位前缀：手写配置为 `page_rules（全局）[0]` /
+/// `listener 0.0.0.0:80: page_rules[1]`，面板保存为 `rule[0]`。每条报错都必须
+/// 带上它，让运维/管理员能直接定位「哪条规则、哪个字段」。
+///
+/// 运行期对以下形态一律**静默跳过或不匹配**（整条规则永不生效），因此配置期
+/// 必须拒绝，杜绝「rc=0 / 面板保存成功，但规则是死的」：
+/// - `action` 不是运行期认识的小写动作（各入口是**精确** match，含大小写/空白）；
+/// - `rewrite`/`pass`/`header` 缺 `target`；
+/// - `rewrite` target 非绝对路径、`pass` target 不是 http/https 上游 URL；
+/// - `header` target 不是 `Name: value`、头名/头值非法、或属于定界/逐跳头；
+/// - `cache` target 含控制字符；`redirect` target 不能作为 Location 头；
+/// - `match_url` 不以 `/` 开头、`*` 不在结尾、超长；
+/// - host/method/header/country 维度语法非法；`priority` 越界。
+pub(crate) fn validate_page_rule(r: &PageRuleConfig, label: &str) -> Result<()> {
+    // priority：运行期按 i64 降序排；越界值不会 panic，但会让规则排序失控。
+    if !(PAGE_RULE_PRIORITY_MIN..=PAGE_RULE_PRIORITY_MAX).contains(&r.priority) {
+        anyhow::bail!(
+            "{label}.priority {} 越界（允许 {}..={}）—— 数值越大越先评估，越界值会让规则排序失控",
+            r.priority,
+            PAGE_RULE_PRIORITY_MIN,
+            PAGE_RULE_PRIORITY_MAX
+        );
+    }
+
+    // 逐字段检查。整体置于一个块里（与旧的 `for` 循环体同缩进），改动最小、
+    // 且不会把每行缩进都动一遍（避免与其它 agent 的 diff 冲突）。
+    {
+        // action 必须是运行期认识的**小写**动作。运行期各入口（apply / rewrite_path /
+        // pass_upstream / response_headers）都是精确比较（`match rule.action.as_str()`）：
+        // `"Redirect"` / `" redirect "` 这类大小写或空白变体配置能加载、每个请求却
+        // **静默跳过**整条规则（面板保存会归一化成小写，手写 toml 不会）——正是本函数
         // 存在的意义（「永远不可能命中」的规则必须在配置期拦下）。
-        let action = r.action.trim().to_ascii_lowercase();
         const ACTIONS: &[&str] = &["redirect", "block", "rewrite", "pass", "cache", "header"];
-        if !ACTIONS.contains(&action.as_str()) {
+        if !ACTIONS.contains(&r.action.as_str()) {
             anyhow::bail!(
-                "{where_}[{i}].action {:?} 不合法（只能是 {} 的小写形式）——运行期对未知动作静默忽略，规则永不生效",
+                "{label}.action {:?} 不合法（只能是 {} 的**小写**形式）——运行期对未知动作静默忽略，规则永不生效",
                 r.action,
                 ACTIONS.join("/")
             );
         }
+        let action = r.action.clone();
         let target_trimmed = r.target.as_deref().map(str::trim);
         // rewrite/pass/header 缺 target 时运行期直接 continue（静默跳过整条规则）。
         if matches!(action.as_str(), "rewrite" | "pass" | "header")
             && target_trimmed.unwrap_or("").is_empty()
         {
             anyhow::bail!(
-                "{where_}[{i}]（{action}）缺少 target —— 运行期会静默跳过这条规则"
+                "{label}（{action}）缺少 target —— 运行期会静默跳过这条规则"
             );
         }
         // cache 的 target 会**原样**作为 Cache-Control 值（运行期不 trim）；控制字符
@@ -2263,14 +2415,14 @@ fn validate_page_rule_list(rules: &[PageRuleConfig], where_: &str) -> Result<()>
             if let Some(raw) = r.target.as_deref() {
                 if raw.bytes().any(|b| b < 0x20 || b == 0x7f) {
                     anyhow::bail!(
-                        "{where_}[{i}]（cache）的 target 含控制字符（运行期会静默丢弃这条规则）: {raw:?}"
+                        "{label}（cache）的 target 含控制字符（运行期会静默丢弃这条规则）: {raw:?}"
                     );
                 }
             }
         }
         if let Some(t) = target_trimmed.filter(|t| !t.is_empty()) {
             if t.len() > 4096 {
-                anyhow::bail!("{where_}[{i}]（{action}）的 target 过长（{} > 4096）", t.len());
+                anyhow::bail!("{label}（{action}）的 target 过长（{} > 4096）", t.len());
             }
             match action.as_str() {
                 // rewrite 的 target 会与请求路径做前缀拼接；相对路径拼出来的东西不再是
@@ -2278,7 +2430,7 @@ fn validate_page_rule_list(rules: &[PageRuleConfig], where_: &str) -> Result<()>
                 "rewrite" => {
                     if !t.starts_with('/') {
                         anyhow::bail!(
-                            "{where_}[{i}]（rewrite）的 target 必须以 `/` 开头（当前 {t:?}）"
+                            "{label}（rewrite）的 target 必须以 `/` 开头（当前 {t:?}）"
                         );
                     }
                 }
@@ -2288,7 +2440,7 @@ fn validate_page_rule_list(rules: &[PageRuleConfig], where_: &str) -> Result<()>
                 "pass" => {
                     if !rule_upstream_url_is_valid(t) {
                         anyhow::bail!(
-                            "{where_}[{i}]（pass）的 target 不是合法上游 URL（需 http:// 或 https:// 且带主机名）: {t:?}"
+                            "{label}（pass）的 target 不是合法上游 URL（需 http:// 或 https:// 且带主机名）: {t:?}"
                         );
                     }
                 }
@@ -2298,18 +2450,18 @@ fn validate_page_rule_list(rules: &[PageRuleConfig], where_: &str) -> Result<()>
                 "header" => {
                     let Some((name, value)) = t.split_once(':') else {
                         anyhow::bail!(
-                            "{where_}[{i}]（header）的 target 必须是 \"Name: value\" 形式: {t:?}"
+                            "{label}（header）的 target 必须是 \"Name: value\" 形式: {t:?}"
                         );
                     };
                     let (name, value) = (name.trim(), value.trim());
                     if !rule_header_pair_is_valid(name, value) {
                         anyhow::bail!(
-                            "{where_}[{i}]（header）的 \"{name}: {value}\" 非法（头名须是 RFC 9110 token；值只能是可见 ASCII/制表符）"
+                            "{label}（header）的 \"{name}: {value}\" 非法（头名须是 RFC 9110 token；值只能是可见 ASCII/制表符）"
                         );
                     }
                     if !crate::server::headers_mod::response_header_injectable(name) {
                         anyhow::bail!(
-                            "{where_}[{i}]（header）拒绝注入定界/逐跳响应头 {name:?}（Content-Length/Transfer-Encoding/Connection/Host 等）——运行期会静默丢弃"
+                            "{label}（header）拒绝注入定界/逐跳响应头 {name:?}（Content-Length/Transfer-Encoding/Connection/Host 等）——运行期会静默丢弃"
                         );
                     }
                 }
@@ -2322,7 +2474,7 @@ fn validate_page_rule_list(rules: &[PageRuleConfig], where_: &str) -> Result<()>
                     };
                     if !safe_header_value(loc) {
                         anyhow::bail!(
-                            "{where_}[{i}]（redirect）的 target 不能作为 Location 响应头（含控制字符、非 ASCII、引号或反斜杠）: {loc:?}"
+                            "{label}（redirect）的 target 不能作为 Location 响应头（含控制字符、非 ASCII、引号或反斜杠）: {loc:?}"
                         );
                     }
                 }
@@ -2331,19 +2483,22 @@ fn validate_page_rule_list(rules: &[PageRuleConfig], where_: &str) -> Result<()>
         }
         // match_url：只有**结尾**的 `*` 是受支持的通配；中间的 `*` 按字面比较。
         if r.match_url.len() > 2048 {
-            anyhow::bail!("{where_}[{i}].match_url 过长（{} > 2048）", r.match_url.len());
+            anyhow::bail!("{label}.match_url 过长（{} > 2048）", r.match_url.len());
         }
         if let Some(pos) = r.match_url.find('*') {
             if pos != r.match_url.len() - 1 {
                 anyhow::bail!(
-                    "{where_}[{i}].match_url {:?} 里的 `*` 只在结尾受支持（中间的 `*` 按字面比较，规则永不匹配）",
+                    "{label}.match_url {:?} 里的 `*` 只在结尾受支持（中间的 `*` 按字面比较，规则永不匹配）",
                     r.match_url
                 );
             }
         }
-        if !r.match_url.starts_with('/') && !r.match_url.starts_with("http") {
+        // 请求路径恒以 `/` 开头，`path_matches` 是字面前缀/全等比较：只有 `/` 开头的
+        // match_url 才可能命中。（旧实现额外放行 `http` 开头，但运行期拿的是
+        // `uri().path()`，绝对 URL 形态永远匹配不上 —— 又一条「rc=0 但规则是死的」。）
+        if !r.match_url.starts_with('/') {
             anyhow::bail!(
-                "{where_}[{i}].match_url {:?} 必须以 `/` 开头（路径规则）",
+                "{label}.match_url {:?} 必须以 `/` 开头（请求路径恒以 / 开头，其它形态永不匹配）",
                 r.match_url
             );
         }
@@ -2352,14 +2507,14 @@ fn validate_page_rule_list(rules: &[PageRuleConfig], where_: &str) -> Result<()>
         if let Some(host) = r.host.as_deref() {
             if !rule_host_pattern_is_valid(host) {
                 anyhow::bail!(
-                    "{where_}[{i}].host 不合法: {host:?}（允许 * / 精确主机名 / *.suffix，可带端口）——运行期永不匹配"
+                    "{label}.host 不合法: {host:?}（允许 * / 精确主机名 / *.suffix，可带端口）——运行期永不匹配"
                 );
             }
         }
         if let Some(method) = r.method.as_deref() {
             if !rule_method_pattern_is_valid(method) {
                 anyhow::bail!(
-                    "{where_}[{i}].method 不合法: {method:?}（逗号分隔的 HTTP 方法，如 \"GET, HEAD\"）"
+                    "{label}.method 不合法: {method:?}（逗号分隔的 HTTP 方法，如 \"GET, HEAD\"）"
                 );
             }
         }
@@ -2370,14 +2525,14 @@ fn validate_page_rule_list(rules: &[PageRuleConfig], where_: &str) -> Result<()>
             };
             if !rule_header_pair_is_valid(name, value) {
                 anyhow::bail!(
-                    "{where_}[{i}].header 不合法: {spec:?}（\"Name\" 或 \"Name: value\"；头名须是 RFC 9110 token，值只能是可见 ASCII）"
+                    "{label}.header 不合法: {spec:?}（\"Name\" 或 \"Name: value\"；头名须是 RFC 9110 token，值只能是可见 ASCII）"
                 );
             }
         }
         // country：逗号分隔、可带 `!` 前缀；别名（China/中国）先归一成 ISO2。
         if let Some(spec) = r.country.as_deref() {
             if spec.len() > 256 {
-                anyhow::bail!("{where_}[{i}].country 过长（{} > 256）", spec.len());
+                anyhow::bail!("{label}.country 过长（{} > 256）", spec.len());
             }
             let mut any = false;
             let mut n = 0usize;
@@ -2388,35 +2543,35 @@ fn validate_page_rule_list(rules: &[PageRuleConfig], where_: &str) -> Result<()>
                 }
                 n += 1;
                 if n > 64 {
-                    anyhow::bail!("{where_}[{i}].country 条目过多（> 64）");
+                    anyhow::bail!("{label}.country 条目过多（> 64）");
                 }
                 let raw = t.strip_prefix('!').unwrap_or(t).trim();
                 if raw.is_empty() {
                     anyhow::bail!(
-                        "{where_}[{i}].country 含空的排除项（`!` 后必须有国家码）: {spec:?}"
+                        "{label}.country 含空的排除项（`!` 后必须有国家码）: {spec:?}"
                     );
                 }
                 if raw.chars().any(char::is_control) {
                     anyhow::bail!(
-                        "{where_}[{i}].country 含控制字符: {raw:?}"
+                        "{label}.country 含控制字符: {raw:?}"
                     );
                 }
                 let Some(code) = rule_country_code(raw) else {
                     anyhow::bail!(
-                        "{where_}[{i}].country 的国家码不合法: {raw:?}（用 ISO2 如 CN/US，或 China/中国 等别名；运行期按 ISO2 精确比较）"
+                        "{label}.country 的国家码不合法: {raw:?}（用 ISO2 如 CN/US，或 China/中国 等别名；运行期按 ISO2 精确比较）"
                     );
                 };
                 // ZZ/XX/A1/A2 在查询期被 country_vote_ok 过滤，永远不可能成为
                 // 「实际国家」——拿它写规则等于永不命中。
                 if matches!(code.as_str(), "ZZ" | "XX" | "A1" | "A2") {
                     anyhow::bail!(
-                        "{where_}[{i}].country 使用了查询期会被过滤的特殊码 {code:?} —— 规则永不命中"
+                        "{label}.country 使用了查询期会被过滤的特殊码 {code:?} —— 规则永不命中"
                     );
                 }
                 any = true;
             }
             if !any {
-                anyhow::bail!("{where_}[{i}].country 不能为空（留空请删掉该字段）");
+                anyhow::bail!("{label}.country 不能为空（留空请删掉该字段）");
             }
         }
     }
@@ -2945,6 +3100,38 @@ root = \"/tmp\"
         assert!(on.connect_udp, "显式打开必须生效");
     }
 
+    /// G-16：`connect_udp_framing` 四个取值都能解析；默认必须是 `auto`
+    /// （引入本字段前的行为）；非法取值必须在配置期报错，而不是静默回落 ——
+    /// 否则运维以为固定了 datagram，实际却在用 capsule。
+    #[test]
+    fn connect_udp_framing_values_and_default() {
+        assert_eq!(ListenerConfig::default().connect_udp_framing, ConnectUdpFraming::Auto);
+        let base = "address = \"0.0.0.0\"
+port = 1
+root = \"/tmp\"
+";
+        // 未写该字段 = auto
+        let off: ListenerConfig = toml::from_str(base).expect("parse");
+        assert_eq!(off.connect_udp_framing, ConnectUdpFraming::Auto);
+        for (s, want) in [
+            ("auto", ConnectUdpFraming::Auto),
+            ("capsule", ConnectUdpFraming::Capsule),
+            ("length", ConnectUdpFraming::Length),
+            ("datagram", ConnectUdpFraming::Datagram),
+        ] {
+            let lc: ListenerConfig =
+                toml::from_str(&format!("{base}connect_udp_framing = \"{s}\"\n"))
+                    .unwrap_or_else(|e| panic!("{s} 必须能解析: {e}"));
+            assert_eq!(lc.connect_udp_framing, want, "{s}");
+            assert_eq!(lc.connect_udp_framing.as_str(), s);
+        }
+        // 大小写不敏感由 serde rename_all 决定（严格小写）；多余取值必须报错。
+        assert!(toml::from_str::<ListenerConfig>(&format!(
+            "{base}connect_udp_framing = \"datagrams\"\n"
+        ))
+        .is_err());
+    }
+
     /// ECH cover 证书的三种非法组合必须在配置期拦住。
     ///
     /// 第三种（cover 配了但 `ech = false`）最隐蔽：容器默认证书是 cover，而切换回调只在
@@ -3330,6 +3517,7 @@ versions = ["tls9.9"]
             users: raw_cfg.admin.users,
             listeners_allow: Vec::new(),
             metrics_public: false,
+            session_ttl_secs: DEFAULT_ADMIN_SESSION_TTL_SECS,
         };
         admin.normalize_legacy(
             Some(raw_cfg.admin.username),
@@ -3337,6 +3525,60 @@ versions = ["tls9.9"]
         );
         assert_eq!(admin.users.len(), 1);
         assert_eq!(admin.users[0].username, "legacy");
+    }
+
+    /// U-13：`[admin] session_ttl_secs` 默认 8h、显式值生效、0/负数/>30d 配置期拒绝。
+    #[test]
+    fn admin_session_ttl_defaults_and_bounds() {
+        fn parse(admin: &str) -> Result<Config, toml::de::Error> {
+            toml::from_str(&format!(
+                r#"
+{admin}
+[[listeners]]
+address = "127.0.0.1"
+port = 19095
+root = "/tmp/u13admin-root"
+"#
+            ))
+        }
+
+        // 缺省：8h，旧配置零变化。
+        let cfg = parse("").expect("parse");
+        assert_eq!(cfg.admin.session_ttl_secs, DEFAULT_ADMIN_SESSION_TTL_SECS);
+        assert_eq!(cfg.admin.session_ttl(), std::time::Duration::from_secs(28800));
+        assert!(cfg.validate().is_ok(), "缺省配置必须通过校验");
+
+        // 显式合法值（含边界 1s / 30d）。
+        for ttl in [1u64, 3, 28800, ADMIN_SESSION_TTL_MAX_SECS] {
+            let cfg = parse(&format!("[admin]\nsession_ttl_secs = {ttl}")).expect("parse");
+            assert_eq!(cfg.admin.session_ttl_secs, ttl);
+            assert!(cfg.validate().is_ok(), "TTL={ttl} 应合法");
+        }
+
+        // 编程方式构造的 0 由 helper 兜底到 1s（配置期仍由 validate 拒绝）。
+        let mut cfg = parse("").expect("parse");
+        cfg.admin.session_ttl_secs = 0;
+        assert_eq!(
+            cfg.admin.session_ttl(),
+            std::time::Duration::from_secs(1),
+            "helper 必须兜底 0"
+        );
+
+        // 0 / >30d：validate 拒绝并点名字段。
+        for ttl in [0i64, ADMIN_SESSION_TTL_MAX_SECS as i64 + 1] {
+            let cfg = parse(&format!("[admin]\nsession_ttl_secs = {ttl}")).expect("parse");
+            let e = cfg.validate().expect_err("越界 TTL 必须拒绝");
+            assert!(
+                format!("{e}").contains("session_ttl_secs"),
+                "报错必须点名 session_ttl_secs: {e}"
+            );
+        }
+
+        // 负数：`Config` 直接反序列化（u64 字段）在 parse 期就拒绝。
+        assert!(
+            parse("[admin]\nsession_ttl_secs = -1").is_err(),
+            "负 TTL 必须拒绝"
+        );
     }
 
     /// §18 样例字段名：`certificate` / `private_key` 必须被识别（无别名时 serde 静默丢弃，
@@ -3677,6 +3919,110 @@ root = "www"
         .unwrap();
         let cfg = Config::load(&path).expect("合法页面规则必须能加载");
         assert_eq!(cfg.page_rules.len(), 4);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// G-20（本波补全）：`action` 的大小写/空白变体、`priority` 越界、`match_url`
+    /// 非 `/` 开头 —— 这些形态运行期都**静默无效**（规则永不生效），配置期必须
+    /// 指名拒绝；面板保存走同一函数，故两侧结论一致。
+    #[test]
+    fn page_rule_action_case_priority_and_match_url_validated() {
+        // (规则片段, 期望错误子串, 说明)
+        let cases: &[(&str, &str, &str)] = &[
+            (
+                "match_url = \"/x\"\naction = \"Redirect\"",
+                "action",
+                "action 大小写变体（运行期精确匹配）",
+            ),
+            (
+                "match_url = \"/x\"\naction = \" redirect \"",
+                "action",
+                "action 周围空白",
+            ),
+            (
+                "match_url = \"/x\"\naction = \"block\"\npriority = 1000001",
+                "priority",
+                "priority 上越界",
+            ),
+            (
+                "match_url = \"/x\"\naction = \"block\"\npriority = -1000001",
+                "priority",
+                "priority 下越界",
+            ),
+            (
+                "match_url = \"http://h/x\"\naction = \"block\"",
+                "match_url",
+                "match_url 是绝对 URL（运行期取 path，永不匹配）",
+            ),
+            (
+                "match_url = \"x*\"\naction = \"block\"",
+                "match_url",
+                "match_url 缺前导 /",
+            ),
+            (
+                "match_url = \"/a*b\"\naction = \"block\"",
+                "match_url",
+                "中间的 *（按字面比较，永不匹配）",
+            ),
+        ];
+        for (n, (frag, want, why)) in cases.iter().enumerate() {
+            let dir = std::env::temp_dir().join(format!(
+                "crucible-page-rule-actpri-{}-{n}",
+                std::process::id()
+            ));
+            let _ = std::fs::create_dir_all(&dir);
+            let path = dir.join("config.toml");
+            std::fs::write(
+                &path,
+                format!(
+                    r#"
+[[page_rules]]
+{frag}
+
+[[listeners]]
+address = "127.0.0.1"
+port = 18088
+root = "www"
+"#
+                ),
+            )
+            .unwrap();
+            let err = Config::load(&path).unwrap_err().to_string();
+            assert!(
+                err.contains(want),
+                "{why} 必须被拒绝且指名 {want:?}，实际: {err}"
+            );
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+        // 边界 priority（±1_000_000）必须照常放行（不能把合法配置误拒）。
+        let dir = std::env::temp_dir().join(format!(
+            "crucible-page-rule-prio-ok-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("config.toml");
+        std::fs::write(
+            &path,
+            r#"
+[[page_rules]]
+match_url = "/a*"
+action = "block"
+priority = 1000000
+
+[[page_rules]]
+match_url = "/b*"
+action = "block"
+priority = -1000000
+
+[[listeners]]
+address = "127.0.0.1"
+port = 18089
+root = "www"
+"#,
+        )
+        .unwrap();
+        let cfg = Config::load(&path).expect("边界 priority 必须能加载");
+        assert_eq!(cfg.page_rules.len(), 2);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

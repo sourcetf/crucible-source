@@ -16,7 +16,9 @@ import argparse
 import json
 from pathlib import Path
 
-DEFAULT = Path("data/geoip/blacklist.json")
+from geoip_common import data_root
+
+DEFAULT = data_root() / "blacklist.json"
 
 # §3.1/§3.2 源库黑名单：source 名匹配（SQL LIKE 模式）+ 历史权重戳（purge 用）。
 SOURCE_BLACKLIST: list[dict] = [

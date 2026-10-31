@@ -1,24 +1,22 @@
 //! Bidirectional TCP ↔ relay bridge for legacy TLS handshakes (NSS / TomCrypt).
 //!
-//! # Thread model (O8)
+//! # Thread model (O8 / G-04)
 //!
 //! The relay direction is bridged by a **tokio task** (`copy_bidirectional`),
 //! not by the two `std::thread`s the old implementation spawned per connection.
-//! Together with [`LegacySyncIo`] (one reader + one writer thread, created only
-//! *after* a successful handshake) an established legacy connection uses at
-//! most two OS threads instead of four. During the handshake the C stack runs
-//! in one `spawn_blocking` slot, bounded by [`LEGACY_HANDSHAKE_MAX_CONCURRENT`]
-//! and a hard [`LEGACY_HANDSHAKE_TIMEOUT`] deadline.
+//! The established connection itself is then driven by a **single** dedicated
+//! poll thread inside each legacy stack (`tls_nss::spawn_poll_io` /
+//! `tls_tomcrypt::spawn_poll_io`) — see those modules. During the handshake the
+//! C stack runs in one `spawn_blocking` slot, bounded by
+//! [`LEGACY_HANDSHAKE_MAX_CONCURRENT`] and a hard [`LEGACY_HANDSHAKE_TIMEOUT`]
+//! deadline.
 
 use anyhow::Context as _;
-use std::io::{Read, Write};
+use std::io::Write as _;
 use std::net::{TcpListener, TcpStream as StdTcpStream};
 use std::os::unix::io::{IntoRawFd, RawFd};
-use std::pin::Pin;
 use std::sync::OnceLock;
-use std::task::{Context, Poll};
 use std::time::Duration;
-use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::TcpStream;
 use tokio::sync::Semaphore;
 
@@ -215,176 +213,4 @@ pub async fn relay_bridge_only(stream: TcpStream) -> anyhow::Result<LegacyRelay>
     Ok(LegacyRelay {
         fd: relay_rx.into_raw_fd(),
     })
-}
-
-/// 桥接阻塞 legacy Read/Write（NSS PR_Read / TomCrypt read）到 async。
-///
-/// 健壮性修复（任务 6）：旧实现把阻塞 read/write 直接放进 poll_read/poll_write 的
-/// `block_in_place`——worker_threads=2 时两个慢 legacy 客户端就能占死全部 executor
-/// 线程。新实现为每条连接开一对专用阻塞线程，经 tokio mpsc 与 async 侧交换：
-/// - 读侧 bounded(8)：`Receiver::poll_recv` 正确注册 waker，天然背压；
-/// - 写侧 unbounded：legacy 响应体在本服务侧已 ≤16MiB（read_file_capped），
-///   无无界内存面；Sender 无 poll_ready（tokio 1.53），unbounded 避免假 Pending 死锁。
-/// 调用方需把连接拆成读写两个 half（NSS/TomCrypt 的同一描述符并发读写由
-/// NSPR/shim 内部锁保护，TLS 全双工语义）。
-pub struct LegacySyncIo {
-    rx: tokio::sync::mpsc::Receiver<std::io::Result<Vec<u8>>>,
-    chunk: Option<Vec<u8>>,
-    off: usize,
-    tx: tokio::sync::mpsc::UnboundedSender<Vec<u8>>,
-}
-
-const LEGACY_READ_BUF: usize = 16 * 1024;
-
-impl LegacySyncIo {
-    fn new<R: Read + Send + 'static, W: Write + Send + 'static>(
-        mut reader: R,
-        mut writer: W,
-        shutdown: Option<LegacyRelay>,
-    ) -> Self {
-        let (r_tx, r_rx) = tokio::sync::mpsc::channel::<std::io::Result<Vec<u8>>>(8);
-        let (w_tx, mut w_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
-
-        // 读线程：阻塞 read → 通道（Ok(空 Vec) 表示 EOF）。
-        let _ = std::thread::Builder::new()
-            .name("cruc-legacy-rd".into())
-            .spawn(move || {
-                let mut buf = vec![0u8; LEGACY_READ_BUF];
-                loop {
-                    match reader.read(&mut buf) {
-                        Ok(0) => {
-                            let _ = r_tx.blocking_send(Ok(Vec::new()));
-                            break;
-                        }
-                        Ok(n) => {
-                            if r_tx.blocking_send(Ok(buf[..n].to_vec())).is_err() {
-                                break; // async 侧已 drop
-                            }
-                        }
-                        Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-                        Err(e) => {
-                            let _ = r_tx.blocking_send(Err(e));
-                            break;
-                        }
-                    }
-                }
-            });
-
-        // 写线程：通道 → 阻塞 write_all；通道关闭（async 侧 drop）后 flush 收尾，
-        // 然后对 relay 做 SHUT_WR，向客户端 bridge 发 FIN。
-        //
-        // 为什么必须显式 shutdown：遗留 C 栈没有 close_notify，而且读线程还阻塞在
-        // `read(2)` 里、C 连接对象也被它引用着 ⇒ 只 drop 写 half 不会关闭 socket。
-        // 没有这一步时，h1 处理完 `Connection: close` 的响应后客户端永远等不到 EOF
-        // （实测 OpenSSL 1.0.2 SSLv2/SSLv3 客户端会挂到自己的超时）。
-        let _ = std::thread::Builder::new()
-            .name("cruc-legacy-wr".into())
-            .spawn(move || {
-                while let Some(data) = w_rx.blocking_recv() {
-                    if writer.write_all(&data).is_err() {
-                        break;
-                    }
-                }
-                let _ = writer.flush();
-                if let Some(relay) = shutdown {
-                    relay.shutdown_send();
-                }
-                // writer 在通道关闭后 drop；读线程仍持有同一 C 连接（读方向）。
-            });
-
-        Self {
-            rx: r_rx,
-            chunk: None,
-            off: 0,
-            tx: w_tx,
-        }
-    }
-}
-
-impl AsyncRead for LegacySyncIo {
-    fn poll_read(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &mut ReadBuf<'_>,
-    ) -> Poll<std::io::Result<()>> {
-        // 先消费上次取回但未读完的残余。
-        if self.chunk.is_none() {
-            match self.rx.poll_recv(cx) {
-                Poll::Pending => return Poll::Pending,
-                Poll::Ready(Some(Ok(data))) => {
-                    if data.is_empty() {
-                        // 读线程显式 EOF
-                        return Poll::Ready(Ok(()));
-                    }
-                    self.chunk = Some(data);
-                    self.off = 0;
-                }
-                Poll::Ready(Some(Err(e))) => return Poll::Ready(Err(e)),
-                Poll::Ready(None) => return Poll::Ready(Ok(())), // 读线程退出 → EOF
-            }
-        }
-        // 借用拆分：chunk 借用域内只读，游标更新放在域外（E0502）。
-        let n = {
-            let chunk = self.chunk.as_ref().expect("chunk set above");
-            let take = (chunk.len() - self.off).min(buf.remaining());
-            buf.put_slice(&chunk[self.off..self.off + take]);
-            take
-        };
-        self.off += n;
-        if self
-            .chunk
-            .as_ref()
-            .is_some_and(|c| self.off >= c.len())
-        {
-            self.chunk = None;
-            self.off = 0;
-        }
-        Poll::Ready(Ok(()))
-    }
-}
-
-impl AsyncWrite for LegacySyncIo {
-    fn poll_write(
-        mut self: Pin<&mut Self>,
-        _cx: &mut Context<'_>,
-        data: &[u8],
-    ) -> Poll<std::io::Result<usize>> {
-        if data.is_empty() {
-            return Poll::Ready(Ok(0));
-        }
-        match self.tx.send(data.to_vec()) {
-            Ok(()) => Poll::Ready(Ok(data.len())),
-            Err(_) => Poll::Ready(Err(std::io::Error::new(
-                std::io::ErrorKind::BrokenPipe,
-                "legacy writer thread gone",
-            ))),
-        }
-    }
-
-    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-        // 写线程按序 write_all，无需额外 flush。
-        Poll::Ready(Ok(()))
-    }
-
-    fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-        // legacy 栈不支持 close_notify：drop 时由线程收尾（flush 后退出）。
-        Poll::Ready(Ok(()))
-    }
-}
-
-/// 把同一阻塞连接拆成「读 half + 写 half」交给桥的两个线程；
-/// 底层描述符的并发读写线程安全由 C 栈保证（见各 Half 文档）。
-///
-/// `shutdown` 是 relay fd 的所有权（握手成功后由调用方传入）：写线程在写完
-/// 最后一个响应后对它 `SHUT_WR`，让客户端收到 FIN（遗留栈没有 close_notify）。
-pub fn sync_io_bridge<R, W>(
-    reader: R,
-    writer: W,
-    shutdown: Option<LegacyRelay>,
-) -> LegacySyncIo
-where
-    R: Read + Send + 'static,
-    W: Write + Send + 'static,
-{
-    LegacySyncIo::new(reader, writer, shutdown)
 }

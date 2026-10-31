@@ -33,7 +33,6 @@
 //! 判定「这条路不能标 ECT」的黑洞退避又覆盖回去。这也是 [`enable_recv_ecn`] /
 //! [`outgoing_ecn`] 在 h3 侧只读（或只重设入向选项）不写出向码点的原因。
 
-use std::net::UdpSocket;
 
 /// ECN 码点（RFC 3168 §5）。QUIC 只用到 ECT(0) / ECT(1) / CE。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -252,7 +251,7 @@ mod sys {
     }
 }
 
-pub use sys::{enable_recv_ecn, outgoing_ecn, set_outgoing_ecn};
+pub use sys::{enable_recv_ecn, outgoing_ecn};
 
 /// 本平台是否有真实的 ECN socket 支持（Windows 上为 false）。
 pub fn platform_supported() -> bool {

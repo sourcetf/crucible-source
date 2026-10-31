@@ -29,7 +29,6 @@
 //! neither is a hard error. `client_cert`/`client_key` enable upstream mTLS.
 
 use crate::config::{ListenerConfig, ProxyRuleConfig};
-use crate::server::apps::env_lock;
 use crate::server::h1::{empty, full, BoxBody};
 
 use once_cell::sync::Lazy;
@@ -246,6 +245,8 @@ struct PoolKey {
 impl PoolKey {
     /// 池键维度：目的地 + scheme + HTTP 版本 + 出口（是否经 Tor、哪个 SOCKS）
     /// + TLS 策略/版本。少任何一个维度都可能把请求复用到语义不同的连接上（见各字段）。
+    // 参数由调用面决定，拆结构体会改变调用签名（本波只清 warning，不重构）。
+    #[allow(clippy::too_many_arguments)]
     fn new(
         host: &str,
         port: u16,
@@ -280,7 +281,7 @@ static POOL: Lazy<PLMutex<HashMap<PoolKey, Vec<UpSender>>>> =
 
 fn pool_give(key: PoolKey, sender: UpSender) {
     let mut p = POOL.lock();
-    let q = p.entry(key).or_insert_with(Vec::new);
+    let q = p.entry(key).or_default();
     if q.len() < POOL_CAP { q.push(sender); }
 }
 
@@ -517,13 +518,49 @@ const WS_SKIP: &[&str] = &[
     "content-length",
 ];
 
-/// 客户端提供的**转发头族**是否要剥离：`Forwarded`（RFC 7239）、整族 `X-Forwarded-*`、
-/// `X-Real-IP`。这些头描述的是「客户端自认为的来源链」，未认证客户端可以随意伪造
-/// （来源 IP/Host/协议）；此前只剥了 XFF/XFP 两个名字，`Forwarded`/`X-Forwarded-Host`/
-/// `X-Real-IP` 等仍原样进上游 —— 依赖它们的后端（Django USE_X_FORWARDED_HOST、按
-/// X-Real-IP 做 ACL/限流的网关）就会被伪造。权威值由代理自己注入。
+/// 客户端提供的**来源身份头**是否要剥离。
+///
+/// 这些头描述的是「客户端自认为的来源」（IP / Host / 协议），未认证客户端可以随意
+/// 伪造。权威值由代理自己注入（`X-Forwarded-For` / `X-Forwarded-Proto` / `Forwarded`）。
+///
+/// 覆盖范围：
+/// * RFC 7239 `Forwarded`；
+/// * 整族 `X-Forwarded-*`；
+/// * `X-Real-IP`；
+/// * 各 CDN/边缘/平台的「真实客户端 IP」头：`CF-Connecting-IP`（Cloudflare）、
+///   `True-Client-IP`（Cloudflare/Akamai）、`X-Client-IP`、`X-Originating-IP`、
+///   `X-Remote-IP`/`X-Remote-Addr`、`Client-IP`、`X-Cluster-Client-IP`、
+///   `Fastly-Client-IP`；
+/// * 路径重写头 `X-Original-URL` / `X-Rewrite-URL`：部分框架（Symfony、若干 Java
+///   网关）会把它们当成「真实请求路径」来做路由/鉴权。客户端自带一个
+///   `X-Original-URL: /admin` 就能在上游绕过基于路径的 ACL，或让审计看到别的路径。
+///   经反代进来时这两个头只应由**受信前置代理**写入，客户端那份必须剥掉。
+///
+/// 为什么必须包括后两组：它们在后端/网关里常被当作**可信**来源 IP/路径（比 XFF
+/// 更常被直接采用），而客户端发一个 `CF-Connecting-IP: 1.2.3.4` 就能让上游的 IP
+/// ACL/限流/审计全部按伪造值决策 —— 真机复现（本地回显上游）：这些头此前原样到达
+/// 上游。与 `Modify-Request-Headers` 无关，属代理自身必须维护的信任边界。
+///
+/// 注：`X-HTTP-Method-Override` 是**故意保留**的 —— 它把方法语义交给上游框架，
+/// 剥掉会破坏「HTML 表单经反代提交 PUT/DELETE」的既有应用；本服务自身不认这个头
+/// （管理面方法覆盖已实测无效），上游是否信任由应用自己决定。
 fn is_client_forwarded_header(name_lower: &str) -> bool {
-    name_lower == "forwarded" || name_lower == "x-real-ip" || name_lower.starts_with("x-forwarded-")
+    matches!(
+        name_lower,
+        "forwarded"
+            | "x-real-ip"
+            | "cf-connecting-ip"
+            | "true-client-ip"
+            | "x-client-ip"
+            | "x-originating-ip"
+            | "x-remote-ip"
+            | "x-remote-addr"
+            | "client-ip"
+            | "x-cluster-client-ip"
+            | "fastly-client-ip"
+            | "x-original-url"
+            | "x-rewrite-url"
+    ) || name_lower.starts_with("x-forwarded-")
 }
 
 /// 代理注入的 `Forwarded`（RFC 7239）值：只写我们自己看到的对端地址。
@@ -867,7 +904,7 @@ async fn proxy_once(
     let conn_tokens: Vec<String> = connection_tokens(&parts.headers);
     for (k, v) in parts.headers.iter() {
         let kl = k.as_str().to_ascii_lowercase();
-        if k == HOST || HOP_BY_HOP.contains(&kl.as_str()) || conn_tokens.iter().any(|t| *t == kl) {
+        if k == HOST || HOP_BY_HOP.contains(&kl.as_str()) || conn_tokens.contains(&kl) {
             continue;
         }
         // 整个转发头族（Forwarded / X-Forwarded-* / X-Real-IP）由下面自行计算后注入。
@@ -972,7 +1009,7 @@ async fn proxy_once(
         let out_headers = out.headers_mut();
         for (k, v) in rparts.headers.iter() {
             let kl = k.as_str().to_ascii_lowercase();
-            if HOP_BY_HOP.contains(&kl.as_str()) || conn_tokens.iter().any(|t| *t == kl) {
+            if HOP_BY_HOP.contains(&kl.as_str()) || conn_tokens.contains(&kl) {
                 continue;
             }
             // 上游声明的长度必须与**重建后**的 body 一致，否则不能透传。
@@ -1862,6 +1899,8 @@ async fn wrap_upstream_tls_rustls(
     Ok(io)
 }
 
+// 参数由调用面决定，拆结构体会改变调用签名（本波只清 warning，不重构）。
+#[allow(clippy::too_many_arguments)]
 async fn write_raw_request(
     stream: &mut UpstreamIo,
     parts: &http::request::Parts,
@@ -1904,7 +1943,7 @@ async fn write_raw_request(
         // `502 websocket upstream returned 200 OK, expected 101` —— WS 反代 100% 不通。
         // `connection` 本身不是 token（token 是它的值），排除它以防 `Connection: Connection`
         // 这类自指名写法。其余 token（`X-Secret` 等自定义逐跳头）照常剥离，逐跳语义不受损。
-        let conn_named_hop = conn_tokens.iter().any(|t| *t == kl) && kl != "upgrade" && kl != "connection";
+        let conn_named_hop = conn_tokens.contains(&kl) && kl != "upgrade" && kl != "connection";
         // WS 路径同样剥掉客户端转发头族（此前只剥了 XFF/XFP 两个名字），
         // 权威值在下面注入。
         if WS_SKIP.contains(&kl.as_str()) || is_client_forwarded_header(&kl) || conn_named_hop {
@@ -2254,7 +2293,7 @@ fn tor_ffi_probe_and_connect(lib_path: &str, host: &str, port: u16) -> Result<Op
             std_stream.set_nonblocking(true)?;
             let stream = TcpStream::from_std(std_stream)?;
             log::info!("tor FFI: connected via crucible_tor_connect fd={out_fd} → {host}:{port}");
-            return Ok(Some(stream));
+            Ok(Some(stream))
         }
     }
     #[cfg(not(unix))]
@@ -2589,10 +2628,23 @@ mod tor_socks_tests {
             "x-forwarded-port",
             "x-forwarded-ssl",
             "x-real-ip",
+            // CDN/边缘「真实客户端 IP」头：后端常把它们当可信来源 IP。
+            "cf-connecting-ip",
+            "true-client-ip",
+            "x-client-ip",
+            "x-originating-ip",
+            "x-remote-ip",
+            "x-remote-addr",
+            "client-ip",
+            "x-cluster-client-ip",
+            "fastly-client-ip",
+            // 路径重写头：部分上游框架按它做路由/鉴权，客户端自带可绕过路径 ACL。
+            "x-original-url",
+            "x-rewrite-url",
         ] {
             assert!(is_client_forwarded_header(h), "{h} 必须剥离");
         }
-        for h in ["x-custom", "forwarded-by", "x-real", "host", "x-forwardeds"] {
+        for h in ["x-custom", "forwarded-by", "x-real", "host", "x-forwardeds", "x-http-method-override"] {
             assert!(!is_client_forwarded_header(h), "{h} 不应被误剥");
         }
     }

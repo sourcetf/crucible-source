@@ -1,0 +1,17 @@
+GET / HTTP/1.1
+H`ost: ..
+H`ost: ..
+Conn#ectin: H1
+Hpost: ÿ
+Conn#ectin: H1
+H`: H1
+H`ost: ..
+Conn#ectin: cloÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿ
+Conn#ectin: H1
+H`ost: ..
+Conn#ectin:ÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿ: ..
+Conn#ectin: H1
+H`ost: ..
+Conn#ectin:n: H1
+H`ost: ..
+Conn#ectin: cloÿÿÿÿÿÿÿÿÿÿÿ/

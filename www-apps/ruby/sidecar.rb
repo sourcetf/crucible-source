@@ -3,10 +3,17 @@
 #
 # Crucible Ruby app engine — 常驻 sidecar（Unix domain socket 上的 HTTP/1.1）。
 #
-# 为什么不是「进程内嵌入 MRI」：OpenBSD + Ruby 3.4 下把 MRI 嵌进多线程宿主进程
-# 会在 boot 阶段 rb_bug → SIGSEGV 整个 webserver（见 libs/script-ffi/script_engine.c）。
-# 这里改成**一次拉起、长期驻留**的子进程：没有 per-request spawn（不是 CGI），
+# 定位（wave22 起）：**回落路径**。默认（Linux）是 libapp_ruby.so 的进程内静态
+# 嵌入（规格 §7.8，禁 spawn）；构建缺 libruby、显式 CRUCIBLE_ENABLE_RUBY_EMBED=0、
+# 或跨 .so MRI 宿主选举落败时，宿主才走这里。OpenBSD + Ruby 3.4 的嵌入 boot 期
+# 会崩，该平台仍默认 sidecar。
+# 这里是**一次拉起、长期驻留**的子进程：没有 per-request spawn（不是 CGI），
 # 崩溃也只是这个 sidecar 退出，由 webserver 重新拉起，不影响主进程。
+#
+# CGI 变量与嵌入引擎（script_engine.c 的 ruby_exec_job）逐项对齐：
+# REQUEST_METHOD/PATH_INFO/QUERY_STRING/CONTENT_TYPE/CONTENT_LENGTH/REMOTE_ADDR/
+# SCRIPT_FILENAME/GATEWAY_INTERFACE/SERVER_SOFTWARE + 全部请求头 → HTTP_*。
+# 两者只有引擎标签头（x-crucible-engine: ruby vs ruby-sidecar）不同。
 #
 # 约定（与 native_http sidecar 一致）：
 #   WEBSERVER_LISTEN_UNIX  socket 路径
@@ -98,15 +105,26 @@ def run_script(script, req)
   ENV['REQUEST_METHOD'] = req[:method]
   ENV['PATH_INFO'] = req[:path]
   ENV['QUERY_STRING'] = req[:query]
-  ENV['REMOTE_ADDR'] = ENV['REMOTE_ADDR'] || '127.0.0.1'
+  # 与进程内嵌入引擎一致：宿主在代理时写入真实 peer 的 x-forwarded-for
+  # （客户端自带的同名头已被宿主剥掉），sidecar 从这里恢复 REMOTE_ADDR。
+  xff = req[:headers]['x-forwarded-for'].to_s.split(',').first.to_s.strip
+  ENV['REMOTE_ADDR'] = xff.empty? ? (ENV['REMOTE_ADDR'] || '127.0.0.1') : xff
   ENV['SCRIPT_FILENAME'] = script
   ENV['GATEWAY_INTERFACE'] = 'CGI/1.1'
-  ENV['SERVER_SOFTWARE'] = 'crucible/ruby-sidecar'
+  ENV['SERVER_SOFTWARE'] = 'crucible/ruby'
   ENV['CONTENT_TYPE'] = req[:headers]['content-type'] if req[:headers]['content-type']
   ENV['CONTENT_LENGTH'] = req[:body].bytesize.to_s
+  # 普通请求头 → HTTP_*（CGI 语义）。旧实现只转 `http_` 前缀的头，等于把
+  # Host/Cookie/Authorization/X-* 全部丢掉 —— 嵌入引擎能看到这些变量，两种形态
+  # 的应用行为不一致（真机 A/B：sidecar 的 HTTP_HOST/HTTP_X_TEST 都是 <unset>）。
   req[:headers].each do |k, v|
-    next unless k.start_with?('http_')
-    ENV[k.upcase] = v
+    next if k == 'content-type' || k == 'content-length'
+    next if k.start_with?('x-crucible-env-') # 内部 .env 通道，不作为 CGI 头暴露
+
+    ek = k.upcase.tr('-', '_')
+    next unless ek.match?(/\A[A-Z0-9_]+\z/)
+
+    ENV["HTTP_#{ek}"] = v
   end
 
   out = StringIO.new

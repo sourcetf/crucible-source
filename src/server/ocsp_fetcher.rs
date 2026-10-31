@@ -38,6 +38,19 @@ const OCSP_IO_TIMEOUT: Duration = Duration::from_secs(15);
 /// 响应体上限：正常 OCSPResponse / caIssuers 证书都远小于此；超限即判对端异常并放弃
 /// （防止 `read_to_end` 被恶意/故障对端用无限 body 撑爆内存）。
 const OCSP_MAX_BODY: usize = 256 * 1024;
+
+/// 可装订 staple 的**硬上限**。
+///
+/// 为什么不是 `OCSP_MAX_BODY`（256 KiB）：TLS 1.3 的 `status_request` 扩展长度字段是
+/// u16 ⇒ 单条 OCSPResponse 一旦超过 65535 字节，BoringSSL 在编码 ServerHello 扩展时
+/// 直接 `cbb.cc: overflow` 失败，**整条握手被终止**（实测 70007 字节响应：`openssl
+/// s_client` 只看到 `unexpected eof`，服务端日志 `boringssl accept failed: … overflow`）。
+/// 而 `SSL_set_ocsp_status` 本身并不拒绝这个长度 —— 于是「一份超大 staple 进入槽」
+/// 会让该 listener 的**每一条** TLS1.3 连接都失败，直到槽被清空（最坏 23h）。
+///
+/// 16 KiB 对任何真实 OCSPResponse 都绰绰有余（常见 1–4 KiB），同时远低于 TLS1.3
+/// 扩展上限（65535）与 TLS1.2 CertificateStatus 上限（2^24-1），留足编码开销余量。
+pub(crate) const MAX_STAPLE_BYTES: usize = 16 * 1024;
 /// SHA-1 + NULL 的 **AlgorithmIdentifier 内容**（OID 2.16.840.1.101.3.4.2.26 + NULL），
 /// **不含** 外层 `30 len`。
 ///
@@ -215,7 +228,7 @@ fn ocsp_basic_response(resp: &[u8]) -> Option<&[u8]> {
     if t != 0x30 {
         return None;
     }
-    let mut p = der_next(resp, h)?; // responseStatus
+    let p = der_next(resp, h)?; // responseStatus
     let (t, _, eh) = der_head(resp, p)?;
     if t != 0xA0 {
         return None;
@@ -224,7 +237,7 @@ fn ocsp_basic_response(resp: &[u8]) -> Option<&[u8]> {
     if t != 0x30 {
         return None;
     }
-    let mut q = der_next(resp, p + eh + rh)?; // responseType OID
+    let q = der_next(resp, p + eh + rh)?; // responseType OID
     let (t, olen, oh) = der_head(resp, q)?;
     if t != 0x04 {
         return None;
@@ -651,6 +664,38 @@ fn ocsp_response_ok(der: &[u8]) -> bool {
 /// 相关，序列号是最便宜、最直接的比对项）。解析不出来时返回空表，调用方据此保持
 /// 宽容（只在能确定不匹配时才拒绝），避免误杀格式特殊的响应。
 fn response_serials(resp: &[u8]) -> Vec<Vec<u8>> {
+    single_response_entries(resp)
+        .into_iter()
+        .map(|(serial, _)| serial)
+        .collect()
+}
+
+/// `SingleResponse` 的 CertStatus tag。
+///
+/// ASN.1：`certStatus CHOICE { good [0] IMPLICIT NULL, revoked [1] IMPLICIT RevokedInfo,
+/// unknown [2] IMPLICIT NULL }` ⇒ 隐式 tag 分别是 0x80 / 0xA1 / 0x82。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CertStatus {
+    Good,
+    Revoked,
+    Unknown,
+}
+
+fn cert_status_from_tag(tag: u8) -> Option<CertStatus> {
+    match tag {
+        0x80 => Some(CertStatus::Good),
+        0xA1 => Some(CertStatus::Revoked),
+        0x82 => Some(CertStatus::Unknown),
+        _ => None,
+    }
+}
+
+/// 每个 `SingleResponse` 的 `(certID.serialNumber 内容, certStatus tag)`。
+///
+/// 与 [`response_serials`] 共用同一次结构遍历：拆成独立函数是为了让「序列号匹配」
+/// 与「CertStatus 判定」看到**完全一致**的解析结果（两套独立解析很容易再次漂移 ——
+/// 本文件曾经就因为「只校验响应外壳」而把 unknown/revoked 当 good 装订出去）。
+fn single_response_entries(resp: &[u8]) -> Vec<(Vec<u8>, u8)> {
     let mut out = Vec::new();
     let Some(basic) = ocsp_basic_response(resp) else {
         return out;
@@ -718,10 +763,21 @@ fn response_serials(resp: &[u8]) -> Vec<Vec<u8>> {
                     }
                 }
                 if ok {
-                    if let Some((st, slen, sh2)) = der_head(basic, c) {
-                        if st == 0x02 && c + sh2 + slen <= basic.len() {
-                            out.push(basic[c + sh2..c + sh2 + slen].to_vec());
+                    // serialNumber（INTEGER）
+                    let serial = match der_head(basic, c) {
+                        Some((st, slen, sh2))
+                            if st == 0x02 && c + sh2 + slen <= basic.len() =>
+                        {
+                            Some(basic[c + sh2..c + sh2 + slen].to_vec())
                         }
+                        _ => None,
+                    };
+                    // certStatus 紧跟在 serialNumber 之后。
+                    let status = der_next(basic, c)
+                        .and_then(|so| der_head(basic, so))
+                        .map(|(stag, _, _)| stag);
+                    if let (Some(serial), Some(tag)) = (serial, status) {
+                        out.push((serial, tag));
                     }
                 }
             }
@@ -732,6 +788,31 @@ fn response_serials(resp: &[u8]) -> Vec<Vec<u8>> {
         q = sr_end;
     }
     out
+}
+
+/// 与 `leaf_serial` 对应的 SingleResponse 的 CertStatus（无匹配/解析失败 → None）。
+fn response_status_for_serial(resp: &[u8], leaf_serial: &[u8]) -> Option<CertStatus> {
+    single_response_entries(resp)
+        .into_iter()
+        .find(|(s, _)| same_serial(s, leaf_serial))
+        .and_then(|(_, tag)| cert_status_from_tag(tag))
+}
+
+/// 响应的所有 SingleResponse 是否全部为 `good`。
+/// `None` = 解析不出任何 CertStatus（调用方按「无法证明是 good」处理）。
+fn all_statuses_good(resp: &[u8]) -> Option<bool> {
+    let entries = single_response_entries(resp);
+    if entries.is_empty() {
+        return None;
+    }
+    for (_, tag) in entries {
+        match cert_status_from_tag(tag) {
+            Some(CertStatus::Good) => {}
+            Some(_) => return Some(false),
+            None => return None,
+        }
+    }
+    Some(true)
 }
 
 /// DER INTEGER 内容比较：去掉前导 0x00 后逐字节相同
@@ -819,8 +900,15 @@ pub fn obtain(host: &str, leaf: &X509, chain_pem: &[u8]) -> Option<Vec<u8>> {
             // caIssuers 下载（阻塞）
             let url = cai_urls.first()?;
             let u = parse_simple(url)?;
-            let body = http_req(&u.host, u.port, u.https, "GET", &u.path, None, None).ok()?;
-            parse_issuer_from_body(&body, leaf)
+            match http_req(&u.host, u.port, u.https, "GET", &u.path, None, None) {
+                Ok(body) => parse_issuer_from_body(&body, leaf),
+                Err(e) => {
+                    // 旧实现 `.ok()?` 静默丢弃：超时/DNS 失败/HTTP 非 200 时运维
+                    // 只看到「没有 staple」，完全不知道是哪一步、哪个 URL 出错。
+                    log::warn!("ocsp: {host} caIssuers {url} 下载失败: {e:#}");
+                    None
+                }
+            }
         }
     }?;
     let issuer_der = issuer.to_der().ok()?;
@@ -828,9 +916,25 @@ pub fn obtain(host: &str, leaf: &X509, chain_pem: &[u8]) -> Option<Vec<u8>> {
     let spki = extract_spki_bits(&issuer_der)?;
     let req = build_ocsp_request(leaf, &name_der, &spki).ok()?;
     let u = parse_simple(&ocsp_url)?;
-    let resp = http_req(&u.host, u.port, u.https, "POST", &u.path,
-                        Some("application/ocsp-request"), Some(&req))
-        .ok()?;
+    let resp = match http_req(&u.host, u.port, u.https, "POST", &u.path,
+                              Some("application/ocsp-request"), Some(&req)) {
+        Ok(r) => r,
+        Err(e) => {
+            // 响应超时/连接失败同样必须留痕（responder 慢或不可达是常见运维事件）。
+            log::warn!("ocsp: {host} responder {ocsp_url} 请求失败: {e:#}");
+            return None;
+        }
+    };
+    if resp.len() > MAX_STAPLE_BYTES {
+        // 见 MAX_STAPLE_BYTES：>65535 会让 BoringSSL 编码 ServerHello 时 overflow，
+        // 该 listener 的**每条** TLS1.3 握手都会失败。手起刀落在入口就拒绝。
+        log::warn!(
+            "ocsp: {host} responder 返回 {} 字节响应，超过 staple 上限 {} 字节 —— 丢弃，不装订",
+            resp.len(),
+            MAX_STAPLE_BYTES
+        );
+        return None;
+    }
     if !ocsp_response_ok(&resp) {
         log::warn!(
             "ocsp: {host} responder 返回的响应未通过基本校验（不是合法 OCSPResponse）—— 丢弃，不装订"
@@ -844,6 +948,26 @@ pub fn obtain(host: &str, leaf: &X509, chain_pem: &[u8]) -> Option<Vec<u8>> {
     if response_covers_leaf(&resp, &leaf_serial) == Some(false) {
         log::warn!("ocsp: {host} 响应 CertID 序列号与站点证书不符，丢弃本次响应");
         return None;
+    }
+    // CertStatus 必须是 **good**。旧实现只看外层 `responseStatus == successful`：
+    // `unknown`（responder 不认识该序列号）与 `revoked` 的 SingleResponse 也会被原样
+    // 装订出去。unknown 对客户端毫无意义（must-staple 直接失败），而把一张**已撤销**
+    // 证书的 staple 继续发出去等于让服务端在撤销后继续「正常」握手 —— 两者都必须拒绝。
+    // 解析不出 CertStatus 时同样拒绝（无法证明是 good 就不能装订）。
+    match response_status_for_serial(&resp, &leaf_serial) {
+        Some(CertStatus::Good) => {}
+        Some(CertStatus::Unknown) => {
+            log::warn!("ocsp: {host} responder 返回 CertStatus=unknown（不认识的序列号），丢弃且不装订");
+            return None;
+        }
+        Some(CertStatus::Revoked) => {
+            log::warn!("ocsp: {host} responder 返回 CertStatus=revoked —— 证书已撤销，丢弃且不装订");
+            return None;
+        }
+        None => {
+            log::warn!("ocsp: {host} 响应中解析不出本站证书的 CertStatus（结构异常），丢弃且不装订");
+            return None;
+        }
     }
     let entry = Cached {
         fetched_unix: now_unix(),
@@ -908,7 +1032,7 @@ fn load_disk_cache(host: &str, leaf: &X509) -> Option<Vec<u8>> {
         _ => {
             let legacy = legacy_cache_file(host);
             let der = std::fs::read(&legacy).ok()?;
-            if der.is_empty() || !ocsp_response_ok(&der) {
+            if der.is_empty() || der.len() > MAX_STAPLE_BYTES || !ocsp_response_ok(&der) {
                 return None;
             }
             let serial = extract_serial(&leaf_der)?;
@@ -922,6 +1046,15 @@ fn load_disk_cache(host: &str, leaf: &X509) -> Option<Vec<u8>> {
             (legacy, der)
         }
     };
+    if der.len() > MAX_STAPLE_BYTES {
+        log::warn!(
+            "ocsp: {host} 磁盘缓存 {} 有 {} 字节，超过 staple 上限 {} 字节 —— 忽略（否则会让 TLS1.3 握手失败）",
+            path.display(),
+            der.len(),
+            MAX_STAPLE_BYTES
+        );
+        return None;
+    }
     if !ocsp_response_ok(&der) {
         return None;
     }
@@ -936,6 +1069,19 @@ fn load_disk_cache(host: &str, leaf: &X509) -> Option<Vec<u8>> {
             path.display()
         );
         return None;
+    }
+    // 缓存里也可能留着 unknown/revoked 的旧响应（旧版本抓取逻辑不判 CertStatus）。
+    // 与自动抓取同一判据：只有 good 才允许进入装订槽。
+    let serial = extract_serial(&leaf_der)?;
+    match response_status_for_serial(&der, &serial) {
+        Some(CertStatus::Good) => {}
+        Some(CertStatus::Unknown) | Some(CertStatus::Revoked) | None => {
+            log::warn!(
+                "ocsp: {host} 磁盘缓存 {} 的 CertStatus 不是 good（unknown/revoked/无法解析），忽略",
+                path.display()
+            );
+            return None;
+        }
     }
     let entry = Cached {
         fetched_unix: file_mtime_unix(&path).unwrap_or_else(now_unix),
@@ -987,7 +1133,7 @@ impl StapleSlot {
         })
     }
 
-    /// 当前可装订的响应（无 / 已过期则 None）。握手路径只调这个——纯内存读，不触网。
+    /// 当前可装订的响应（无 / 已过期 / 超限则 None）。握手路径只调这个——纯内存读，不触网。
     pub fn current(&self) -> Option<Vec<u8>> {
         let mut guard = self.entry.lock();
         let expired = match guard.as_ref() {
@@ -999,21 +1145,74 @@ impl StapleSlot {
             *guard = None;
             return None;
         }
+        // 纵深防御：即使某条旧路径把超大 DER 塞进了槽（旧版本磁盘缓存、未来调用方），
+        // 也不能让它进入握手（>65535 会让 BoringSSL 编码失败 → 该口所有 TLS1.3 连接失败）。
+        let oversized = guard.as_ref().is_some_and(|e| e.der.len() > MAX_STAPLE_BYTES);
+        if oversized {
+            log::warn!(
+                "ocsp: 槽内 staple 超过 {} 字节上限，丢弃并等待续期",
+                MAX_STAPLE_BYTES
+            );
+            *guard = None;
+            return None;
+        }
         guard.as_ref().map(|e| e.der.clone())
     }
 
     fn set(&self, der: Vec<u8>) {
         let next_update_unix = parse_next_update(&der);
-        // 纵深防御：`obtain()` 已经拒收过期响应，但续期线程/未来的调用方都不该能把
-        // 一份过期 DER 塞进槽里（那会被装订到下一次续期成功为止）。
+        // 纵深防御：`obtain()` 已经拒收过期/超限/非 good 响应，但续期线程/未来的调用方
+        // 都不该能把一份无效 DER 塞进槽里（那会被装订到下一次续期成功为止）。
+        if der.len() > MAX_STAPLE_BYTES {
+            log::warn!(
+                "ocsp: 拒绝把 {} 字节响应写入装订槽（上限 {} 字节）",
+                der.len(),
+                MAX_STAPLE_BYTES
+            );
+            return;
+        }
         if hard_expired(next_update_unix, now_unix()) {
             log::warn!("ocsp: 拒绝把已过期响应写入装订槽（保留旧槽/等待下次续期）");
+            return;
+        }
+        if all_statuses_good(&der) != Some(true) {
+            log::warn!("ocsp: 拒绝把 CertStatus 非 good（或无法解析）的响应写入装订槽");
             return;
         }
         *self.entry.lock() = Some(StapleEntry {
             der,
             next_update_unix,
         });
+    }
+}
+
+/// 校验一份**静态** staple（`ssl.ocsp_der_path` / `ssl.ech_cover_ocsp_der_path`）。
+///
+/// 静态路径历史上只做「读文件 → 装订」，完全不看内容：一份过期/unknown/超大 DER
+/// 会被原样发给客户端。前两者让 must-staple 客户端失败；后者（>65535）会让 BoringSSL
+/// 在编码 ServerHello 时 overflow，**整条 TLS1.3 握手被终止**。这里用与自动抓取
+/// 完全相同的判据，返回可读的拒绝原因让调用方明确禁用装订（而不是静默坏掉）。
+pub(crate) fn validate_staple_der(der: &[u8]) -> std::result::Result<(), String> {
+    if der.is_empty() {
+        return Err("内容为空".into());
+    }
+    if der.len() > MAX_STAPLE_BYTES {
+        return Err(format!(
+            "{} 字节超过 staple 上限 {} 字节（>65535 会让 BoringSSL 编码失败、TLS1.3 握手直接终止）",
+            der.len(),
+            MAX_STAPLE_BYTES
+        ));
+    }
+    if !ocsp_response_ok(der) {
+        return Err("不是合法 OCSPResponse（外层结构/responseStatus 校验失败）".into());
+    }
+    if hard_expired(parse_next_update(der), now_unix()) {
+        return Err("响应已过期（nextUpdate 已过）".into());
+    }
+    match all_statuses_good(der) {
+        Some(true) => Ok(()),
+        Some(false) => Err("CertStatus 不是 good（unknown/revoked）".into()),
+        None => Err("无法解析 CertStatus（结构异常）".into()),
     }
 }
 
@@ -1386,5 +1585,141 @@ mod tests {
         let name = hostile.file_name().unwrap().to_string_lossy().to_string();
         assert!(!name.contains('/') && !name.contains('\\'), "name={name}");
         assert_eq!(hostile.parent(), p1.parent());
+    }
+
+    // ---------------------------------------------------------------- staple 校验回归
+
+    /// 构造一份结构自洽的 OCSPResponse（单个 SingleResponse）。
+    fn test_ocsp(status_tag: &[u8], next_update: &str, serial: &[u8]) -> Vec<u8> {
+        let algid = der_tlv(
+            0x30,
+            &[0x06, 0x05, 0x2b, 0x0e, 0x03, 0x02, 0x1a, 0x05, 0x00],
+        );
+        let certid = der_tlv(
+            0x30,
+            &{
+                let mut b = algid.clone();
+                b.extend(der_tlv(0x04, &[0x11; 20]));
+                b.extend(der_tlv(0x04, &[0x22; 20]));
+                b.extend(der_tlv(0x02, serial));
+                b
+            },
+        );
+        let single = der_tlv(
+            0x30,
+            &{
+                let mut b = certid;
+                b.extend_from_slice(status_tag);
+                b.extend(der_tlv(0x18, b"20260101000000Z"));
+                b.extend(der_tlv(0xA0, &der_tlv(0x18, next_update.as_bytes())));
+                b
+            },
+        );
+        let responses = der_tlv(0x30, &single);
+        let tbs = der_tlv(
+            0x30,
+            &{
+                let mut b = der_tlv(0xA1, &der_tlv(0x30, &[])); // responderID byName
+                b.extend(der_tlv(0x18, b"20260101000000Z")); // producedAt
+                b.extend(responses);
+                b
+            },
+        );
+        let basic = der_tlv(
+            0x30,
+            &{
+                let mut b = tbs;
+                b.extend(algid);
+                b.extend(der_tlv(0x03, &[0u8; 64])); // signature BIT STRING（内容不验签）
+                b
+            },
+        );
+        let rb = der_tlv(
+            0x30,
+            &{
+                let mut b = der_tlv(0x06, &[0x2b, 0x06, 0x01, 0x05, 0x05, 0x07, 0x30, 0x01, 0x01]);
+                b.extend(der_tlv(0x04, &basic));
+                b
+            },
+        );
+        let mut out = der_tlv(0x0A, &[0]); // responseStatus successful
+        out.extend(der_tlv(0xA0, &rb));
+        der_tlv(0x30, &out)
+    }
+
+    /// 回归：`unknown` / `revoked` / 过期响应都不得通过静态 staple 校验。
+    ///
+    /// 旧实现只校验外层结构（responseStatus），这三类都会被原样装订：
+    /// unknown 对客户端无意义、revoked 等于撤销后继续「正常」握手、过期则必须重拉。
+    #[test]
+    fn staple_validation_rejects_unknown_revoked_and_expired() {
+        let serial = [0x01u8, 0x02, 0x03];
+        let good = test_ocsp(&[0x80, 0x00], "20300101000000Z", &serial);
+        assert_eq!(validate_staple_der(&good), Ok(()), "good 响应应通过");
+        assert_eq!(
+            response_status_for_serial(&good, &serial),
+            Some(CertStatus::Good)
+        );
+
+        let unknown = test_ocsp(&[0x82, 0x00], "20300101000000Z", &serial);
+        assert!(validate_staple_der(&unknown).is_err(), "unknown 不得装订");
+        assert_eq!(
+            response_status_for_serial(&unknown, &serial),
+            Some(CertStatus::Unknown)
+        );
+
+        let mut revoked_info = der_tlv(0x18, b"20200101000000Z");
+        revoked_info = der_tlv(0xA1, &revoked_info);
+        let revoked = test_ocsp(&revoked_info, "20300101000000Z", &serial);
+        assert!(validate_staple_der(&revoked).is_err(), "revoked 不得装订");
+        assert_eq!(
+            response_status_for_serial(&revoked, &serial),
+            Some(CertStatus::Revoked)
+        );
+
+        let expired = test_ocsp(&[0x80, 0x00], "20200101000000Z", &serial);
+        let err = validate_staple_der(&expired).unwrap_err();
+        assert!(err.contains("过期"), "{err}");
+    }
+
+    /// 回归（P1）：>65535 字节的 staple 必须在上槽/装订前被拒绝。
+    ///
+    /// 实测一份 70007 字节响应进入槽后，BoringSSL 在编码 TLS1.3 ServerHello 的
+    /// status_request 扩展时 `cbb.cc: overflow` ⇒ 该 listener 的**每条** TLS1.3
+    /// 握手都以 `unexpected eof` 告终（`SSL_set_ocsp_status` 自己不检查长度）。
+    #[test]
+    fn staple_validation_rejects_oversized() {
+        let big = vec![0u8; MAX_STAPLE_BYTES + 1];
+        let err = validate_staple_der(&big).unwrap_err();
+        assert!(err.contains("上限"), "{err}");
+
+        // 槽的纵深防御同样拒绝。
+        let slot = StapleSlot {
+            entry: Mutex::new(None),
+        };
+        slot.set(big);
+        assert!(slot.entry.lock().is_none(), "超大 DER 不得进槽");
+
+        // 已经躺在槽里的超大条目在读取时丢弃（旧缓存/旧版本路径）。
+        let slot = StapleSlot {
+            entry: Mutex::new(Some(StapleEntry {
+                der: vec![0u8; MAX_STAPLE_BYTES + 1],
+                next_update_unix: Some(now_unix() + 3600),
+            })),
+        };
+        assert!(slot.current().is_none());
+    }
+
+    /// 序列号与 CertStatus 必须来自同一次结构化遍历（防止两套解析再次漂移）。
+    #[test]
+    fn single_response_entries_expose_serial_and_status() {
+        let serial = [0x7fu8, 0xaa, 0x01];
+        let good = test_ocsp(&[0x80, 0x00], "20300101000000Z", &serial);
+        let entries = single_response_entries(&good);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].0, serial);
+        assert_eq!(cert_status_from_tag(entries[0].1), Some(CertStatus::Good));
+        // 序列号不匹配时 status 查询返回 None（调用方据此拒绝）。
+        assert_eq!(response_status_for_serial(&good, &[0x01]), None);
     }
 }

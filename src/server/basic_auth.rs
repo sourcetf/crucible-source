@@ -8,7 +8,7 @@ use once_cell::sync::Lazy;
 use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::net::IpAddr;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 /// True when admin panel must require credentials.
 ///
@@ -362,19 +362,28 @@ pub fn admin_gate(headers: &HeaderMap, admin: &AdminConfig, ip: IpAddr) -> Admin
 // - `HttpOnly`（JS 读不到）+ `SameSite=Strict`（跨站请求不携带）；
 // - 只在 **TLS listener** 上签发：`__Host-` 前缀本身要求 Secure，明文口签发
 //   会被浏览器丢弃/根本不该存在；明文口继续用 Basic（向后兼容）。
-// - 有过期（8h）与容量上限（4096）；登出/过期即从表中删除。
+// - TTL（`[admin] session_ttl_secs`，默认 8h）是**绝对过期**：创建时把
+//   `Instant::now() + ttl` 写进表里，之后任何请求都不续期（不滑动），防止
+//   持续访问把会话无限延长。`Instant` 是单调时钟：调整系统时间（`SystemTime`
+//   回拨/前跳）既不延长也不缩短已建会话的剩余寿命。
+// - `Set-Cookie` 的 `Max-Age` 与 `Expires` 用**同一份** ttl 生成，与服务端到期
+//   时刻一致；浏览器侧过期后不再发送 cookie，服务端仍独立校验（不依赖客户端）。
+// - 容量上限（4096）；登出/过期即从表中删除。
 
 pub const ADMIN_SESSION_COOKIE: &str = "__Host-crucible_admin";
-/// 会话有效期：8 小时（管理面板的一次工作日；过期后重新登录）。
-const ADMIN_SESSION_TTL: Duration = Duration::from_secs(8 * 60 * 60);
-/// 会话表容量上限（无界内存防护）。超出时优先淘汰最旧的条目。
+/// 会话表容量上限（无界内存防护）。超出时优先淘汰**最早到期**的条目。
 const ADMIN_SESSION_CAP: usize = 4096;
 
+/// 令牌 → **绝对过期时刻**（单调 `Instant`；不是创建时间，也不滑动续期）。
 static ADMIN_SESSIONS: Lazy<Mutex<HashMap<String, Instant>>> =
     Lazy::new(|| Mutex::new(HashMap::new()));
 
 /// 创建会话令牌并写入服务端表。返回令牌原文（只出现在 Set-Cookie 里）。
-pub fn create_admin_session() -> String {
+///
+/// `ttl` 是绝对有效期，来自 `[admin] session_ttl_secs`（默认 8h，配置期限制
+/// 1s..=30d）。这里再夹一次并防溢出，保证以编程方式调用（单测/嵌入）也不会
+/// 造出「立即过期」或 panic 的条目。
+pub fn create_admin_session(ttl: Duration) -> String {
     use rand_core::{OsRng, RngCore};
     let mut bytes = [0u8; 32];
     OsRng.fill_bytes(&mut bytes);
@@ -383,20 +392,33 @@ pub fn create_admin_session() -> String {
         token.push_str(&format!("{b:02x}"));
     }
     let now = Instant::now();
+    let ttl = ttl.clamp(
+        Duration::from_secs(1),
+        Duration::from_secs(crate::config::ADMIN_SESSION_TTL_MAX_SECS),
+    );
+    let expires_at = now
+        .checked_add(ttl)
+        .unwrap_or_else(|| now + Duration::from_secs(crate::config::ADMIN_SESSION_TTL_MAX_SECS));
     let mut map = ADMIN_SESSIONS.lock();
-    // 惰性清理过期项；仍超上限时淘汰最旧一条（不整表清空 —— 否则全站会话被
+    // 惰性清理过期项；仍超上限时淘汰最早到期的一条（不整表清空 —— 否则全站会话被
     // 一次批量登录挤掉，等于一个廉价的全局登出 DoS）。
-    map.retain(|_, at| now.duration_since(*at) <= ADMIN_SESSION_TTL);
+    map.retain(|_, exp| *exp > now);
     if map.len() >= ADMIN_SESSION_CAP {
-        if let Some(k) = map.iter().min_by_key(|(_, at)| **at).map(|(k, _)| k.clone()) {
+        if let Some(k) = map
+            .iter()
+            .min_by_key(|(_, exp)| **exp)
+            .map(|(k, _)| k.clone())
+        {
             map.remove(&k);
         }
     }
-    map.insert(token.clone(), now);
+    map.insert(token.clone(), expires_at);
     token
 }
 
-/// 校验会话令牌（存在且未过期）。过期项顺手删除。
+/// 校验会话令牌（存在且未到**绝对过期时刻**）。过期项顺手删除。
+///
+/// 不刷新任何时间戳：访问多少次都不会延长会话寿命（防永久续期）。
 pub fn validate_admin_session(token: &str) -> bool {
     if token.is_empty() {
         return false;
@@ -404,7 +426,7 @@ pub fn validate_admin_session(token: &str) -> bool {
     let now = Instant::now();
     let mut map = ADMIN_SESSIONS.lock();
     match map.get(token) {
-        Some(at) if now.duration_since(*at) <= ADMIN_SESSION_TTL => true,
+        Some(exp) if *exp > now => true,
         Some(_) => {
             map.remove(token);
             false
@@ -443,10 +465,21 @@ pub fn validate_request_session(headers: &HeaderMap) -> bool {
         .is_some_and(validate_admin_session)
 }
 
-/// `Set-Cookie` 值：`__Host-` 前缀 + Secure/HttpOnly/SameSite=Strict。
-pub fn admin_session_set_cookie(token: &str) -> String {
+/// `Set-Cookie` 值：`__Host-` 前缀 + Secure/HttpOnly/SameSite=Strict，
+/// 并用与服务端**同一份** `ttl` 生成 `Max-Age` / `Expires`。
+///
+/// 为什么不再发「浏览器会话 cookie」：服务端本来就会在 TTL 到期后拒绝；如果
+/// 浏览器把 cookie 留到进程重启后继续发送，用户会看到「明明还带着 cookie 却
+/// 一直被 401」。两个属性让客户端与服务端同时到期；`Max-Age` 优先级高于
+/// `Expires`，两者数值一致，不冲突。
+pub fn admin_session_set_cookie(token: &str, ttl: Duration) -> String {
+    let secs = ttl
+        .as_secs()
+        .clamp(1, crate::config::ADMIN_SESSION_TTL_MAX_SECS);
+    let expires = SystemTime::now() + Duration::from_secs(secs);
     format!(
-        "{ADMIN_SESSION_COOKIE}={token}; Path=/; Secure; HttpOnly; SameSite=Strict"
+        "{ADMIN_SESSION_COOKIE}={token}; Path=/; Secure; HttpOnly; SameSite=Strict; Max-Age={secs}; Expires={}",
+        httpdate::fmt_http_date(expires)
     )
 }
 
@@ -455,6 +488,13 @@ pub fn admin_session_clear_cookie() -> String {
     format!(
         "{ADMIN_SESSION_COOKIE}=; Path=/; Max-Age=0; Secure; HttpOnly; SameSite=Strict"
     )
+}
+
+/// 单测专用：以指定**到期时刻**插入会话（供 `admin.rs` 的 CSRF/鉴权顺序测试
+/// 构造「已过期会话」，避免墙钟 sleep 或暴露整个会话表）。
+#[cfg(test)]
+pub(crate) fn insert_session_with_deadline_for_test(token: &str, expires_at: Instant) {
+    ADMIN_SESSIONS.lock().insert(token.to_string(), expires_at);
 }
 
 /// 登录表单的口令校验（§16.13：UI 只收明文、后端 argon2id/yescrypt 验证）。
@@ -568,9 +608,9 @@ impl FailTable {
         let ip = fail_key(ip);
         let now = Instant::now();
         let mut map = self.map.lock();
-        let (last, until) = match map.get(&ip) {
-            Some(s) => (s.last, s.blocked_until),
-            None => return None,
+        let (last, until) = {
+            let s = map.get(&ip)?;
+            (s.last, s.blocked_until)
         };
         if now.duration_since(last) > FAIL_WINDOW {
             map.remove(&ip);
@@ -649,6 +689,7 @@ mod tests {
             }],
             listeners_allow: vec![],
             metrics_public: false,
+            session_ttl_secs: crate::config::DEFAULT_ADMIN_SESSION_TTL_SECS,
         }
     }
 
@@ -889,14 +930,17 @@ mod tests {
 
     // ===== §16.13 secure cookie 会话 =====
 
+    /// 单测里的默认会话 TTL（与配置默认一致：8h）。
+    const TEST_TTL: Duration = Duration::from_secs(8 * 60 * 60);
+
     #[test]
     fn session_lifecycle_create_validate_destroy() {
-        let tok = create_admin_session();
+        let tok = create_admin_session(TEST_TTL);
         assert_eq!(tok.len(), 64, "32 字节 CSPRNG → 64 hex 字符");
         assert!(tok.bytes().all(|b| b.is_ascii_hexdigit()));
         assert!(validate_admin_session(&tok));
         // 两个令牌不相同（CSPRNG）。
-        let tok2 = create_admin_session();
+        let tok2 = create_admin_session(TEST_TTL);
         assert_ne!(tok, tok2);
         destroy_admin_session(&tok);
         assert!(!validate_admin_session(&tok));
@@ -922,15 +966,49 @@ mod tests {
         assert_eq!(session_token_from_headers(&h2), None);
         assert_eq!(session_token_from_headers(&HeaderMap::new()), None);
 
-        let set = admin_session_set_cookie(tok);
+        let set = admin_session_set_cookie(tok, TEST_TTL);
         assert!(set.starts_with(&format!("{ADMIN_SESSION_COOKIE}={tok};")));
         assert!(set.contains("Path=/"));
         assert!(set.contains("Secure"));
         assert!(set.contains("HttpOnly"));
         assert!(set.contains("SameSite=Strict"));
+        // U-13：不再是「浏览器会话 cookie」，Max-Age/Expires 与服务端 TTL 一致。
+        assert!(set.contains("Max-Age=28800"), "Set-Cookie: {set}");
+        assert!(set.contains("Expires="), "Set-Cookie: {set}");
+        assert!(!set.contains("Domain"), "`__Host-` 前缀禁止 Domain: {set}");
         let clear = admin_session_clear_cookie();
         assert!(clear.contains("Max-Age=0"));
         assert!(clear.contains("Secure"));
+    }
+
+    /// `Max-Age` 与 `Expires` 必须来自**同一份** TTL，且 Expires 是
+    /// `now + ttl`（不是写死的 8h，也不是别的字段）。
+    #[test]
+    fn session_cookie_max_age_and_expires_match_ttl() {
+        let set = admin_session_set_cookie("deadbeef", Duration::from_secs(3));
+        assert!(set.contains("Max-Age=3"), "Set-Cookie: {set}");
+        let expires = set
+            .split("Expires=")
+            .nth(1)
+            .expect("Expires 必须存在")
+            .trim();
+        let when = httpdate::parse_http_date(expires).expect("合法 HTTP-date");
+        let delta = when
+            .duration_since(SystemTime::now())
+            .expect("Expires 必须在未来")
+            .as_secs();
+        // HTTP-date 只有秒级精度（向下取整）；3s TTL 实测为 2..=3s。
+        assert!((2..=3).contains(&delta), "Expires 与 TTL=3s 不一致：{delta}s");
+
+        let set8h = admin_session_set_cookie("deadbeef", TEST_TTL);
+        assert!(set8h.contains("Max-Age=28800"), "Set-Cookie: {set8h}");
+        let when = httpdate::parse_http_date(set8h.split("Expires=").nth(1).unwrap().trim())
+            .expect("合法 HTTP-date");
+        let delta = when.duration_since(SystemTime::now()).unwrap().as_secs();
+        assert!(
+            (28790..=28805).contains(&delta),
+            "默认 8h 的 Expires 与 TTL 不一致：{delta}s"
+        );
     }
 
     /// 会话 cookie 可以单独通过 admin 门；登录端点无凭据也可进入；
@@ -939,7 +1017,7 @@ mod tests {
     fn admin_gate_path_accepts_session_and_login_only() {
         let cfg = admin_with_hash("");
         let ip: IpAddr = "10.9.9.31".parse().unwrap();
-        let tok = create_admin_session();
+        let tok = create_admin_session(TEST_TTL);
         let mut h = HeaderMap::new();
         h.insert(
             header::COOKIE,
@@ -973,15 +1051,96 @@ mod tests {
 
     #[test]
     fn session_expiry_is_enforced_and_entry_is_removed() {
-        let tok = create_admin_session();
-        // 把创建时间改成「刚过期」：validate 必须拒绝并顺手删除条目。
-        if let Some(old) = Instant::now().checked_sub(ADMIN_SESSION_TTL + Duration::from_secs(1)) {
-            ADMIN_SESSIONS.lock().insert(tok.clone(), old);
-            assert!(!validate_admin_session(&tok));
-            assert!(
-                !ADMIN_SESSIONS.lock().contains_key(&tok),
-                "过期会话必须从表中删除"
-            );
+        let tok = create_admin_session(TEST_TTL);
+        // 把到期时刻改成「刚过期」：validate 必须拒绝并顺手删除条目。
+        ADMIN_SESSIONS
+            .lock()
+            .insert(tok.clone(), Instant::now() - Duration::from_secs(1));
+        assert!(!validate_admin_session(&tok));
+        assert!(
+            !ADMIN_SESSIONS.lock().contains_key(&tok),
+            "过期会话必须从表中删除"
+        );
+    }
+
+    /// U-13 边界：0.9×TTL 仍有效、1.1×TTL 必须过期且条目被删除。
+    /// 直接写绝对到期时刻，避免墙钟等待。
+    #[test]
+    fn session_ttl_boundary_90pct_alive_110pct_expired() {
+        let now = Instant::now();
+        let ttl = Duration::from_secs(1000);
+        let alive = "u13-alive-at-90pct";
+        let stale = "u13-stale-at-110pct";
+        // 0.9×TTL 的寿命 ⇒ 到期时刻在 now + 900s（仍有效）。
+        ADMIN_SESSIONS
+            .lock()
+            .insert(alive.to_string(), now + ttl.mul_f64(0.9));
+        // 已活了 1.1×TTL ⇒ 到期时刻在 100s 前（必须失效）。
+        ADMIN_SESSIONS
+            .lock()
+            .insert(stale.to_string(), now - Duration::from_secs(100));
+        assert!(validate_admin_session(alive), "0.9×TTL 内必须有效");
+        assert!(!validate_admin_session(stale), "1.1×TTL 必须过期");
+        assert!(
+            !ADMIN_SESSIONS.lock().contains_key(stale),
+            "过期条目必须被清理"
+        );
+        destroy_admin_session(alive);
+    }
+
+    /// TTL 是**绝对**的：反复访问不续期（防永久续期）。到期时刻在校验前后不变。
+    #[test]
+    fn session_deadline_is_absolute_and_never_refreshed() {
+        let tok = create_admin_session(Duration::from_secs(60));
+        let deadline = *ADMIN_SESSIONS.lock().get(&tok).expect("会话存在");
+        for _ in 0..5 {
+            assert!(validate_admin_session(&tok));
+        }
+        let after = *ADMIN_SESSIONS.lock().get(&tok).expect("会话仍在");
+        assert_eq!(deadline, after, "validate 不得刷新/延长会话到期时刻");
+        destroy_admin_session(&tok);
+    }
+
+    /// 新建会话时惰性清理已过期条目（不在读路径上的泄漏也会被收敛）。
+    #[test]
+    fn session_table_drops_expired_entries_on_create() {
+        let stale = "u13-expired-before-create";
+        ADMIN_SESSIONS
+            .lock()
+            .insert(stale.to_string(), Instant::now() - Duration::from_secs(1));
+        let tok = create_admin_session(Duration::from_secs(60));
+        assert!(
+            !ADMIN_SESSIONS.lock().contains_key(stale),
+            "create 必须清理过期条目"
+        );
+        destroy_admin_session(&tok);
+    }
+
+    /// 并发登录：令牌全局唯一、全部可校验；线程间无竞态/覆盖。
+    #[test]
+    fn session_concurrent_creation_is_unique_and_thread_safe() {
+        let mut handles = Vec::new();
+        for _ in 0..8 {
+            handles.push(std::thread::spawn(|| {
+                (0..32)
+                    .map(|_| create_admin_session(Duration::from_secs(60)))
+                    .collect::<Vec<_>>()
+            }));
+        }
+        let mut all: Vec<String> = handles
+            .into_iter()
+            .flat_map(|h| h.join().expect("thread"))
+            .collect();
+        assert_eq!(all.len(), 256, "全部登录都必须拿到令牌");
+        all.sort();
+        all.dedup();
+        assert_eq!(all.len(), 256, "令牌不得重复");
+        assert!(
+            all.iter().all(|t| validate_admin_session(t)),
+            "全部令牌都必须有效"
+        );
+        for t in &all {
+            destroy_admin_session(t);
         }
     }
 

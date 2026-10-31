@@ -211,18 +211,39 @@ pub fn write_file(root: &Path, rel: &str, data: &[u8]) -> Result<()> {
     // 原子写：旧实现直接 `fs::write`（= 先截断再写），写到一半失败（ENOSPC、被 OOM/强制退出
     // 打断，本项目都有先例）会把**原本完好的文件**毁成一个半截文件 —— 面板报「保存失败」，
     // 而磁盘上那份**旧文件已经被截断**，等于一次失败的保存造成永久数据丢失。
-    // 改为同目录临时文件 + rename（与 upload_resume / DNS 落盘同一套）；临时名带 pid + 单调
-    // 计数，不可预测（避免 docroot 里有写权限的应用预先放同名符号链接把我们重定向到 root 外）。
-    let tmp = path.with_file_name(temp_write_name(&path));
-    if let Err(e) = fs::write(&tmp, data) {
+    // 改为同目录临时文件 + rename（与 upload_resume / DNS 落盘同一套）。
+    //
+    // 临时文件必须用 **O_EXCL（create_new）** 创建：`fs::write` 是 O_CREAT|O_TRUNC，
+    // 会**跟随符号链接**。临时名里的 pid + 单调计数是可预测的，docroot 里若有写权限的
+    // 应用（或上传/应用漏洞）预先放一个同名符号链接指向 root 外，这一次「保存」就会把
+    // 内容写到 root 外的目标文件，随后 rename 又把那个链接改名成目标名（post-check 只能
+    // 事后删链接，外部文件已被改写）。create_new 命中已存在（含悬空链接）即失败 →
+    // 换下一个序号重试，攻击者无法命中我们的写路径。
+    let mut tmp = path.with_file_name(temp_write_name(&path));
+    let mut opened = None;
+    for _ in 0..8 {
+        match create_exclusive(&tmp) {
+            Ok(f) => {
+                opened = Some(f);
+                break;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                tmp = path.with_file_name(temp_write_name(&path));
+            }
+            Err(e) => return Err(e).with_context(|| format!("create {}", tmp.display())),
+        }
+    }
+    let Some(mut f) = opened else {
+        bail!("cannot create temp file next to {}", path.display());
+    };
+    // 内容持久化之后才让它以目标名出现（否则崩溃会留下「长度对、内容却是空洞」的目标文件）。
+    // sync 用同一个**可写**句柄：只读句柄上的 FlushFileBuffers 在 Windows 上会直接失败。
+    if let Err(e) = std::io::Write::write_all(&mut f, data).and_then(|_| f.sync_all()) {
+        drop(f);
         let _ = fs::remove_file(&tmp);
         return Err(e).with_context(|| format!("write {}", tmp.display()));
     }
-    // 内容持久化之后才让它以目标名出现（否则崩溃会留下「长度对、内容却是空洞」的目标文件）。
-    // 用**可写**句柄再 sync：只读句柄上的 FlushFileBuffers 在 Windows 上会直接失败。
-    if let Ok(f) = fs::OpenOptions::new().write(true).open(&tmp) {
-        let _ = f.sync_all();
-    }
+    drop(f);
     if let Err(e) = fs::rename(&tmp, &path) {
         let _ = fs::remove_file(&tmp);
         return Err(e).with_context(|| format!("rename {}", path.display()));
@@ -245,6 +266,14 @@ fn temp_write_name(path: &Path) -> String {
         std::process::id(),
         SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
     )
+}
+
+/// 以 O_EXCL 创建临时文件（已存在 / 是符号链接 → `AlreadyExists`，绝不跟随）。
+fn create_exclusive(path: &Path) -> std::io::Result<fs::File> {
+    fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
 }
 
 /// 在 root 下创建目录（含父目录）；已存在同名目录时报错。
@@ -587,8 +616,33 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
     }
 
-    /// `mkdir` 落在**已存在的普通文件**上时必须报错：否则 create_dir_all_within 把该
-    /// 文件当成「最深的已存在祖先」，一级都不建却返回 Ok，面板显示「已创建」。
+    /// 临时文件必须 O_EXCL 创建：目标位置被**符号链接**（或任何已存在文件）占住时，
+    /// 必须返回 AlreadyExists 而不是跟随链接写入。旧实现 `fs::write` 会跟随链接，
+    /// 于是可预测的临时名 + docroot 内预置链接 = 任意文件写（root 外）。
+    #[cfg(unix)]
+    #[test]
+    fn temp_file_creation_never_follows_preexisting_symlink() {
+        use std::os::unix::fs::symlink;
+        let base = std::env::temp_dir().join("crucible_admin_o_excl_test");
+        let _ = std::fs::remove_dir_all(&base);
+        let root = base.join("root");
+        let outside = base.join("outside.txt");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(&outside, b"original").unwrap();
+        let tmp = root.join("predicted.tmp");
+        symlink(&outside, &tmp).unwrap();
+
+        let err = create_exclusive(&tmp).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
+        assert_eq!(
+            std::fs::read(&outside).unwrap(),
+            b"original",
+            "follow-up write must not touch the symlink target"
+        );
+        // 普通新文件仍然可以创建。
+        create_exclusive(&root.join("fresh.tmp")).expect("fresh tmp file");
+        let _ = std::fs::remove_dir_all(&base);
+    }
     #[test]
     fn mkdir_over_existing_file_must_fail() {
         let root = std::env::temp_dir().join("crucible_admin_mkdir_file_test");

@@ -98,21 +98,15 @@ pub async fn handle(
         .unwrap_or_default()
         .into_iter()
         .collect();
-    // 任务 6（OOM 防护）：引擎请求体上限 32MiB，超限直接 413（不再无界缓冲）。
-    let body = match http_body_util::Limited::new(
+    // 任务 6（OOM 防护）+ slowloris：上限 32MiB，帧间空闲 60s ⇒ 413/408/400。
+    let body = match crate::server::apps::collect_app_body(
         req.into_body(),
         crate::server::h1::APP_BODY_CAP,
     )
-    .collect()
     .await
     {
-        Ok(c) => c.to_bytes(),
-        Err(_) => {
-            return Ok(Response::builder()
-                .status(http::StatusCode::PAYLOAD_TOO_LARGE)
-                .body(full("request body too large"))
-                .unwrap())
-        }
+        Ok(b) => b,
+        Err(e) => return Ok(e.into_response()),
     };
 
     match php_exchange(
@@ -239,7 +233,9 @@ async fn php_exchange(
     };
 
     let docroot = resolve_docroot(lc, app);
-    let uri_path = uri_path.to_string();
+    // percent-decode：文件解析与 SCRIPT_NAME/PATH_INFO 都用解码后的路径
+    // （CGI：PATH_INFO "is not URL-encoded"）。REQUEST_URI 保持原始编码形态。
+    let uri_path = crate::server::apps::app_ffi::decode_path(uri_path);
     let (script, path_info) = resolve_script(&docroot, app, &uri_path)?;
     if !script.is_file() {
         // **不要把路径发回客户端**：`script.display()` 是 `/crucible/www-apps/php/...` 这种
@@ -257,7 +253,7 @@ async fn php_exchange(
 
     let docroot_abs = canonicalize_display(&docroot);
     let script_abs = canonicalize_display(&script);
-    let script_name = script_name_from_uri(&uri_path, &path_info);
+    let script_name = script_name_for(&docroot, app, &uri_path, &script, &path_info);
 
     let fcgi = FcgiRequest {
         method,
@@ -321,21 +317,16 @@ pub async fn handle_external(
         .unwrap_or_default()
         .into_iter()
         .collect();
-    // 任务 6（OOM 防护）：同上，32MiB 上限。
-    let body = match http_body_util::Limited::new(
+    // 任务 6（OOM 防护）+ slowloris：上限 32MiB，帧间空闲 60s ⇒ 413/408/400
+    // （与 h1 的 proxy/static 收口同口径；旧实现只有 Limited，慢 body 无限挂起）。
+    let body = match crate::server::apps::collect_app_body(
         req.into_body(),
         crate::server::h1::APP_BODY_CAP,
     )
-    .collect()
     .await
     {
-        Ok(c) => c.to_bytes(),
-        Err(_) => {
-            return Ok(Response::builder()
-                .status(http::StatusCode::PAYLOAD_TOO_LARGE)
-                .body(full("request body too large"))
-                .unwrap())
-        }
+        Ok(b) => b,
+        Err(e) => return Ok(e.into_response()),
     };
 
     match external_exchange(
@@ -451,14 +442,16 @@ async fn external_exchange(
         .context("fastcgi engine requires socket= (unix:/path or host:port)")?;
     let addr = FcgiAddr::parse(sock)?;
     let docroot = resolve_docroot(lc, app);
-    let uri_path = uri_path.to_string();
+    // percent-decode：文件解析与 SCRIPT_NAME/PATH_INFO 都用解码后的路径
+    // （CGI：PATH_INFO "is not URL-encoded"）。REQUEST_URI 保持原始编码形态。
+    let uri_path = crate::server::apps::app_ffi::decode_path(uri_path);
     let (script, path_info) = resolve_script(&docroot, app, &uri_path)?;
     if !script.is_file() {
         return Ok(PhpOutcome::NotFound);
     }
 
     let script_abs = canonicalize_display(&script);
-    let script_name = script_name_from_uri(&uri_path, &path_info);
+    let script_name = script_name_for(&docroot, app, &uri_path, &script, &path_info);
 
     let fcgi = FcgiRequest {
         method,
@@ -741,11 +734,11 @@ async fn start_cgi(key: &str, app: &AppRouteConfig, state_dir: &Path) -> Result<
             use std::os::unix::fs::PermissionsExt;
             let _ = fs::set_permissions(&sock_path, fs::Permissions::from_mode(0o600));
         }
-        return Ok(PhpRuntime {
+        Ok(PhpRuntime {
             addr,
             child: Some(child),
             kind: PhpKind::Cgi,
-        });
+        })
     }
 
     #[cfg(not(unix))]
@@ -798,7 +791,7 @@ async fn wait_ready(addr: &FcgiAddr, timeout: Duration) -> Result<()> {
 /// `-b <sock>`）；`pid_path` = 本 runtime 的 pidfile（fpm 自己写的）。只杀同时满足：
 ///   * 存活、pid>1、**不是本进程的直系子进程**（自己的子进程归 PHP_RUNTIME 管）；
 ///   * 命令行可读，程序名是 php-fpm/php-cgi，且含上述绝对路径之一。
-/// 这样 deploy 环境里别人起的同名 php-fpm（conf 在别的目录）不会被误杀。
+///     这样 deploy 环境里别人起的同名 php-fpm（conf 在别的目录）不会被误杀。
 #[cfg(unix)]
 fn kill_stale_php(needles: &[&Path], pid_path: Option<&Path>, sock_path: &Path) {
     use crate::server::apps::child_registry;
@@ -1039,6 +1032,49 @@ fn resolve_script(
     Ok((script, String::new()))
 }
 
+/// `SCRIPT_NAME` 的 CGI 语义实现：**实际执行的脚本**在 URL 空间里的路径。
+///
+/// 为什么不能只拿 `SCRIPT_NAME = 请求 URI - PATH_INFO`：
+///   * 目录索引请求 `/php/`（`app.index = index.php`）会执行 `docroot/index.php`，
+///     但「URI 去掉 PATH_INFO」仍是 `/php/` —— nginx/Apache 都报 `/php/index.php`；
+///   * 编码字符（`%20`/中文）解码后与实际文件名对应，URI 前缀则可能是编码形态。
+///     以「docroot 相对脚本路径 + 命中的应用前缀」构造，才与 CGI/1.1 §4.1.13 一致。
+///     docroot 与脚本不在同一词法前缀下（符号链接等）时退回旧的 URI 推导。
+fn script_name_for(
+    docroot: &Path,
+    app: &AppRouteConfig,
+    uri_path: &str,
+    script: &Path,
+    path_info: &str,
+) -> String {
+    let prefix = matched_app_prefix(app, uri_path);
+    if let Ok(rel) = script.strip_prefix(docroot) {
+        let rel = rel.to_string_lossy();
+        if !rel.is_empty() {
+            let rel = rel.replace('\\', "/");
+            let rel = rel.trim_start_matches('/');
+            return format!("{prefix}/{rel}");
+        }
+    }
+    script_name_from_uri(uri_path, path_info)
+}
+
+/// 命中的应用前缀（`paths` 里最长匹配、尾斜杠已归一化）；catch-all 时为空串。
+fn matched_app_prefix<'a>(app: &'a AppRouteConfig, path: &str) -> &'a str {
+    let mut best: Option<&str> = None;
+    for p in &app.paths {
+        let p = p.trim_end_matches('/');
+        if p.is_empty() {
+            continue;
+        }
+        if (path == p || path.starts_with(&format!("{p}/")))
+            && best.is_none_or(|b| p.len() > b.len()) {
+                best = Some(p);
+            }
+    }
+    best.unwrap_or("")
+}
+
 /// `SCRIPT_NAME` = 请求 URI 去掉 PATH_INFO 之后的部分（path_info 为空时就是整个 URI）。
 fn script_name_from_uri(uri_path: &str, path_info: &str) -> String {
     if !path_info.is_empty() && uri_path.ends_with(path_info) {
@@ -1184,5 +1220,82 @@ mod resolve_script_tests {
         assert_eq!(s4, PathBuf::from(dir.join("phplint/x.php")));
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod script_name_tests {
+    use super::*;
+
+    fn app(paths: &[&str], index: &str) -> AppRouteConfig {
+        AppRouteConfig {
+            paths: paths.iter().map(|s| s.to_string()).collect(),
+            enabled: true,
+            engine: "php".into(),
+            socket: None,
+            extensions: vec!["php".into()],
+            index: Some(index.into()),
+            php_bin: None,
+            workers: 1,
+            source_dir: None,
+            out_dir: None,
+            entry: vec![],
+            watch: false,
+            docroot: None,
+            lib: None,
+            deps_dir: None,
+            init_timeout_secs: None,
+            libc: None,
+        }
+    }
+
+    /// 目录索引必须报**实际脚本**的 URI 路径（nginx/Apache 语义），PATH_INFO 情形下
+    /// 仍是脚本路径（不含尾部 PATH_INFO）。旧实现按「URI - PATH_INFO」推导，`/php/`
+    /// 会报 `/php/`（真机）。
+    #[test]
+    fn script_name_uses_resolved_script() {
+        let root = std::env::temp_dir().join(format!(
+            "crucible-php-name-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("index.php"), b"<?php echo 1;").unwrap();
+        let a = app(&["/php"], "index.php");
+        // 目录索引
+        assert_eq!(
+            script_name_for(&root, &a, "/php/", &root.join("index.php"), ""),
+            "/php/index.php"
+        );
+        // 直接请求 + PATH_INFO
+        assert_eq!(
+            script_name_for(&root, &a, "/php/index.php", &root.join("index.php"), ""),
+            "/php/index.php"
+        );
+        assert_eq!(
+            script_name_for(
+                &root,
+                &a,
+                "/php/index.php/foo/bar",
+                &root.join("index.php"),
+                "/foo/bar"
+            ),
+            "/php/index.php"
+        );
+        // 子目录脚本
+        std::fs::create_dir_all(root.join("sub")).unwrap();
+        std::fs::write(root.join("sub/app.php"), b"<?php").unwrap();
+        assert_eq!(
+            script_name_for(&root, &a, "/php/sub/app.php", &root.join("sub/app.php"), ""),
+            "/php/sub/app.php"
+        );
+        // 尾斜杠写法同样成立
+        let a2 = app(&["/php/"], "index.php");
+        assert_eq!(
+            script_name_for(&root, &a2, "/php/", &root.join("index.php"), ""),
+            "/php/index.php"
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

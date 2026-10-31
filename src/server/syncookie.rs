@@ -1,7 +1,7 @@
 //! Linux `/proc/sys/net/ipv4/tcp_syncookies` read/write + evaluate loop (feature-gated).
 
 use crate::server::live_config::LiveConfig;
-use anyhow::{Context, Result};
+use anyhow::Result;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;

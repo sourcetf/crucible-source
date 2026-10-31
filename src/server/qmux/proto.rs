@@ -297,7 +297,7 @@ pub enum Frame {
 impl Frame {
     pub fn encode(&self, out: &mut Vec<u8>) {
         match self {
-            Frame::Padding(n) => out.extend(std::iter::repeat(0u8).take(*n)),
+            Frame::Padding(n) => out.extend(std::iter::repeat_n(0u8, *n)),
             Frame::ResetStream {
                 stream_id,
                 error_code,

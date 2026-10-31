@@ -1,0 +1,8 @@
+GET / HTTP/1.1
+Connection:
+t: GET T
+Ho: _
+Connection:
+t:!GE\ ß
+Connection:
+t: _

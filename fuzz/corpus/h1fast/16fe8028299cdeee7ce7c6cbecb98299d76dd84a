@@ -1,0 +1,4 @@
+GET /inde|.html HTTP/1.1
+H.:81
+Range: by-
+

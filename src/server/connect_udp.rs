@@ -514,6 +514,46 @@ pub enum Framing {
     Datagram,
 }
 
+/// G-16：依 listener 策略 + 客户端能力协商结果选出本隧道的封装形态。
+///
+/// * `datagram_ok`：双方都声明 `SETTINGS_H3_DATAGRAM` **且** QUIC 传输协商出
+///   `max_datagram_frame_size`（调用方用 `h3_shared.settings().enable_datagram()`
+///   + `quinn::Connection::max_datagram_size().is_some()` 求得）；
+/// * `wants_capsules`：客户端带了 `Capsule-Protocol: ?1`（RFC 9297 §3）。
+///
+/// `auto` = 与引入本字段前的协商逐字节一致；`datagram` 在协商不成立时返回 `Err`
+/// （调用方应据此 501 拒绝，而不是静默降级 —— 见 `config::ConnectUdpFraming`）。
+pub fn select_framing(
+    pref: crate::config::ConnectUdpFraming,
+    datagram_ok: bool,
+    wants_capsules: bool,
+) -> Result<Framing, String> {
+    use crate::config::ConnectUdpFraming as P;
+    match pref {
+        P::Auto => Ok(if datagram_ok {
+            Framing::Datagram
+        } else if wants_capsules {
+            Framing::Capsules
+        } else {
+            Framing::LengthPrefixed
+        }),
+        P::Capsule => Ok(Framing::Capsules),
+        P::Length => Ok(Framing::LengthPrefixed),
+        P::Datagram => {
+            if datagram_ok {
+                Ok(Framing::Datagram)
+            } else {
+                Err(
+                    "listener connect_udp_framing=\"datagram\" but peer did not negotiate \
+                     H3 DATAGRAM (needs both SETTINGS_H3_DATAGRAM=1 and a QUIC \
+                     max_datagram_frame_size)"
+                        .into(),
+                )
+            }
+        }
+    }
+}
+
 /// 从隧道字节流里解析出来的事件。
 #[derive(Debug, PartialEq, Eq)]
 pub enum TunnelEvent {
@@ -1042,5 +1082,47 @@ mod tests {
         let mut asm = DatagramAssembler::new(Framing::Capsules);
         asm.push(&buf);
         assert!(asm.next_event().is_err());
+    }
+
+    /// G-16：`connect_udp_framing` 的策略 × 协商结果 → 形态。
+    ///
+    /// `auto` 必须与引入本字段前的协商逐字节一致（datagram 优先、capsule 次之、
+    /// 最后裸长度前缀）；`datagram` 在协商不成立时**必须报错**（调用方 501），
+    /// 不能静默降级；`capsule`/`length` 则无视协商强制固定。
+    #[test]
+    fn select_framing_policy_and_negotiation() {
+        use crate::config::ConnectUdpFraming as P;
+
+        // auto：datagram > capsule > length，且 datagram 只在能力成立时才选。
+        assert_eq!(
+            select_framing(P::Auto, true, false).unwrap(),
+            Framing::Datagram
+        );
+        assert_eq!(
+            select_framing(P::Auto, true, true).unwrap(),
+            Framing::Datagram,
+            "datagram 能力成立时优先于 capsule"
+        );
+        assert_eq!(
+            select_framing(P::Auto, false, true).unwrap(),
+            Framing::Capsules
+        );
+        assert_eq!(
+            select_framing(P::Auto, false, false).unwrap(),
+            Framing::LengthPrefixed
+        );
+
+        // 强制 capsule / length：即使 peer 支持 datagram 也不用。
+        assert_eq!(select_framing(P::Capsule, true, false).unwrap(), Framing::Capsules);
+        assert_eq!(select_framing(P::Capsule, false, true).unwrap(), Framing::Capsules);
+        assert_eq!(
+            select_framing(P::Length, true, true).unwrap(),
+            Framing::LengthPrefixed
+        );
+
+        // 强制 datagram：协商成立才可用，否则明确报错（不降级）。
+        assert_eq!(select_framing(P::Datagram, true, false).unwrap(), Framing::Datagram);
+        assert!(select_framing(P::Datagram, false, true).is_err());
+        assert!(select_framing(P::Datagram, false, false).is_err());
     }
 }

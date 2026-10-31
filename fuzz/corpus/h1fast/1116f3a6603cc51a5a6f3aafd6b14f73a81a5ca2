@@ -1,0 +1,5 @@
+GET / HTTP/1.1
+Hos3:3
+Host:TTP/0.1
+Host: h
+Conta

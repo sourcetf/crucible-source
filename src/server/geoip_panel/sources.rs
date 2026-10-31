@@ -34,7 +34,7 @@ pub fn load_sources_json(path: &Path) -> Result<String> {
             path.display()
         );
     }
-    Ok(std::fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?)
+    std::fs::read_to_string(path).with_context(|| format!("read {}", path.display()))
 }
 
 pub fn list_sources(conn: &Connection) -> Result<Vec<SourceRow>> {

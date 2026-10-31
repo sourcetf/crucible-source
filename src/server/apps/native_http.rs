@@ -567,16 +567,19 @@ async fn proxy_unix(
     target: Option<http::Uri>,
     extra_headers: &[(String, String)],
 ) -> Result<Response<BoxBody>> {
-    use hyper::client::conn::http1;
+    
 
     let (parts, body) = req.into_parts();
     let is_head = parts.method == http::Method::HEAD;
-    // 任务 6（OOM 防护）：sidecar 请求体上限 32MiB；Limited 错误已装箱 → map_err。
-    let collected = http_body_util::Limited::new(body, crate::server::h1::APP_BODY_CAP)
-        .collect()
+    // 任务 6（OOM 防护）+ slowloris：sidecar 请求体上限 32MiB，帧间空闲 60s ⇒
+    // 413/408/400（与 h1 的 proxy/static 收口同口径；旧实现只有 Limited，慢 body
+    // 让请求任务与 32MiB 缓冲无限期挂着）。
+    let bytes = match crate::server::apps::collect_app_body(body, crate::server::h1::APP_BODY_CAP)
         .await
-        .map_err(|e| anyhow::anyhow!("collect body: {e}"))?;
-    let bytes = collected.to_bytes();
+    {
+        Ok(b) => b,
+        Err(e) => return Ok(e.into_response()),
+    };
     let peer_ip = peer.ip().to_string();
 
     let target = target.unwrap_or_else(|| parts.uri.clone());

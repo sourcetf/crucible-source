@@ -1,0 +1,37 @@
+GET / HTTP/1.1
+Hout:1/
+Hout:/ 1.1
+Hout: a
+Hopt:(GET / H∞TP/1.1
+Hout: /1/
+Hout: /1.1
+Hout: a
+Hopt:(jTP/1.1
+Hout: /1/
+Ho#': /1.1
+Hout: a
+Hopt:(P/1.T / HTTP/1.1
+Hout:1/
+Hout:/ 1.1
+Hout: a
+Hopt:(GET / H∞TP/1.1
+Hout: /ó/
+Hout: /1.1
+Hout: a
+Hopt:(jTP/1.1
+Hout: /1/
+Ho#': /1.1
+Hout: a
+Hopt:(P/1.1
+Hot: /1/
+Ho#': /1.1
+Hout: a
+Hopt:(P/1. / HTTP/1.1
+Hout:1/
+Hout:/ 1.1
+Hout: a
+Hopt:(TP/1.1
+Hopt:(j
+
+,ÍHout
+~

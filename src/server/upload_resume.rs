@@ -327,7 +327,7 @@ fn oldest_idle(
             continue;
         }
         let t = *s.touched.lock();
-        if best.as_ref().map_or(true, |(_, _, bt)| t < *bt) {
+        if best.as_ref().is_none_or(|(_, _, bt)| t < *bt) {
             best = Some((k.clone(), Arc::clone(s), t));
         }
     }
@@ -494,7 +494,7 @@ pub fn session_for(
     // 只增不减 —— 攻击者先占满本 IP 的 16 个会话（或声明一个超大 total 把在飞预算顶满），
     // 之后每次带不同文件名的 PUT 都会各留一份这种垃圾文件，可无限制造。
     {
-        let mut b = BUDGET.lock();
+        let b = BUDGET.lock();
         if b.inflight
             .saturating_add(b.reserved)
             .saturating_add(reserve)

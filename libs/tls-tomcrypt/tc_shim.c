@@ -33,7 +33,10 @@
 #include "../tls-common/peek_io.h"
 #include "../tls-common/pem_util.h"
 
+#include <errno.h>
+#include <fcntl.h>
 #include <limits.h>
+#include <poll.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -105,6 +108,22 @@ typedef struct crucible_tomcrypt_conn {
     uint8_t pending[SSL2_MAX_RECORD];
     size_t pending_len;
     size_t pending_off;
+    /* ---- post-handshake non-blocking transport (G-04) ----
+     * After the handshake the relay fd is switched to O_NONBLOCK and a
+     * self-pipe is created so a single Rust poll thread can drive both
+     * directions (read + write) instead of the previous reader+writer pair.
+     * `inbuf` stages a partly-received record; `out` queues encrypted records
+     * whose socket write only partially completed (would-block). */
+    int nonblocking;                          /* fd is O_NONBLOCK, wake pipe live */
+    int wake_rd;                              /* self-pipe read end (polled) */
+    int wake_wr;                              /* self-pipe write end (signalled) */
+    uint8_t inbuf[3 + SSL2_MAX_RECORD_2BYTE]; /* raw record staging */
+    size_t in_len;                            /* bytes staged so far */
+    size_t in_hdr;                            /* header length once known (0 = unknown) */
+    size_t in_need;                           /* header + payload total (0 = unknown) */
+    uint8_t *out;                             /* encrypted output queue */
+    size_t out_len;                           /* valid bytes in `out` */
+    size_t out_off;                           /* already-written prefix of `out` */
 #endif
 } crucible_tomcrypt_conn;
 
@@ -135,6 +154,43 @@ static int read_exact(struct peek_io *io, uint8_t *buf, size_t len) {
 }
 
 #ifdef CRUCIBLE_HAVE_TOMCRYPT
+/* Set O_NONBLOCK on an fd. */
+static int set_nonblocking(int fd) {
+    int fl = fcntl(fd, F_GETFL, 0);
+    if (fl < 0) {
+        return -1;
+    }
+    return fcntl(fd, F_SETFL, fl | O_NONBLOCK);
+}
+
+/* Append bytes to the encrypted output queue, compacting the already-written
+ * prefix first. Returns 0 on success, -1 on allocation failure. */
+static int tc_out_append(crucible_tomcrypt_conn *c, const uint8_t *data, size_t len) {
+    if (len == 0) {
+        return 0;
+    }
+    if (c->out_off > 0) {
+        if (c->out_off >= c->out_len) {
+            free(c->out);
+            c->out = NULL;
+            c->out_len = 0;
+            c->out_off = 0;
+        } else {
+            memmove(c->out, c->out + c->out_off, c->out_len - c->out_off);
+            c->out_len -= c->out_off;
+            c->out_off = 0;
+        }
+    }
+    uint8_t *n = (uint8_t *)realloc(c->out, c->out_len + len);
+    if (!n) {
+        return -1;
+    }
+    c->out = n;
+    memcpy(c->out + c->out_len, data, len);
+    c->out_len += len;
+    return 0;
+}
+
 /* /dev/urandom is available on both Linux and OpenBSD. The values are session
  * and connection identifiers, not long-term secrets, but they must not repeat
  * between connections. */
@@ -276,18 +332,27 @@ static int ssl2_send_record(crucible_tomcrypt_conn *c, const uint8_t *body, size
     }
     uint8_t hdr[2] = {(uint8_t)(0x80 | ((payload_len >> 8) & 0x7f)),
                       (uint8_t)(payload_len & 0xff)};
-    int ok = send_all(c->fd, hdr, 2) == 0 && send_all(c->fd, payload, payload_len) == 0;
+    int rc;
+    if (c->nonblocking) {
+        /* Established connection (G-04): encrypt/queue, let the single poll
+         * thread drain the socket via crucible_tomcrypt_flush(). The record is
+         * committed to the wire order here, so the sequence advances now. */
+        rc = (tc_out_append(c, hdr, 2) == 0 && tc_out_append(c, payload, payload_len) == 0) ? 0
+                                                                                            : -1;
+    } else {
+        rc = (send_all(c->fd, hdr, 2) == 0 && send_all(c->fd, payload, payload_len) == 0) ? 0 : -1;
+    }
     if (encrypted) {
         free(payload);
     }
-    if (ok) {
+    if (rc == 0) {
         /* OpenSSL increments the sequence for **every** record it writes,
          * including the plaintext SERVER-HELLO. A client that counts only
          * encrypted records computes a different MAC for SERVER-VERIFY (the
          * first encrypted server record uses seq 1, not 0). */
         c->write_seq++;
     }
-    return ok ? 0 : -1;
+    return rc;
 }
 
 /* Read one SSLv2 record (2- or 3-byte header). Once keys are installed every
@@ -360,6 +425,104 @@ static int ssl2_recv_record(crucible_tomcrypt_conn *c, uint8_t **out, size_t *ou
     }
     *out = buf;
     return 0;
+}
+
+/* ---- non-blocking record intake (G-04, post-handshake) ----
+ *
+ * Same wire rules as ssl2_recv_record(), but never blocks: bytes are staged in
+ * c->inbuf until a whole record is present. Returns:
+ *   2 = a full record is staged (call tc_process_record),
+ *   1 = would block (caller retries later),
+ *   0 = orderly EOF,
+ *  -1 = protocol/transport error.
+ * Sequence numbers and MAC verification only happen once the record is whole,
+ * so a partial record never advances state. */
+static int tc_stage_fill(crucible_tomcrypt_conn *c) {
+    for (;;) {
+        if (c->in_hdr == 0 && c->in_len >= 1) {
+            size_t hdr = (c->inbuf[0] & 0x80) ? 2 : 3;
+            if (c->in_len >= hdr) {
+                size_t rec_len;
+                if (hdr == 2) {
+                    rec_len = ((size_t)(c->inbuf[0] & 0x7f) << 8) | (size_t)c->inbuf[1];
+                } else {
+                    rec_len = ((size_t)(c->inbuf[0] & 0x3f) << 8) | (size_t)c->inbuf[1];
+                }
+                size_t max_len = (hdr == 2) ? SSL2_MAX_RECORD_2BYTE : SSL2_MAX_RECORD_3BYTE;
+                if (rec_len == 0 || rec_len > max_len) {
+                    return -1;
+                }
+                c->in_hdr = hdr;
+                c->in_need = hdr + rec_len;
+            }
+        }
+        if (c->in_need != 0 && c->in_len >= c->in_need) {
+            return 2;
+        }
+        /* Never read past the record boundary (which would drop the next
+         * record's bytes); until the header is known, read at most 3 bytes. */
+        size_t cap = c->in_need != 0 ? c->in_need : 3;
+        ssize_t n = read(c->fd, c->inbuf + c->in_len, cap - c->in_len);
+        if (n > 0) {
+            c->in_len += (size_t)n;
+            continue;
+        }
+        if (n == 0) {
+            return 0;
+        }
+        if (errno == EINTR) {
+            continue;
+        }
+        if (errno == EAGAIN || errno == EWOULDBLOCK) {
+            return 1;
+        }
+        return -1;
+    }
+}
+
+/* Decrypt/verify a staged record and expose its application payload through
+ * c->pending. Requires a record staged by tc_stage_fill() (returns 2). */
+static int tc_process_record(crucible_tomcrypt_conn *c) {
+    if (c->in_need == 0 || c->in_len < c->in_need) {
+        return -1;
+    }
+    size_t hdr = c->in_hdr;
+    size_t rec_len = c->in_need - hdr;
+    size_t padding = (hdr == 3) ? c->inbuf[2] : 0;
+    uint8_t *payload = c->inbuf + hdr;
+    size_t data_len = 0;
+    int err = 0;
+    if (c->rc4_ready) {
+        if (rec_len < SSL2_MAC_MD5_SIZE + padding) {
+            err = 1;
+        } else if (rc4_stream_crypt(&c->rc4_read, payload, rec_len, payload) != CRYPT_OK) {
+            err = 1;
+        } else {
+            data_len = rec_len - SSL2_MAC_MD5_SIZE - padding;
+            uint8_t mac[SSL2_MAC_MD5_SIZE];
+            if (ssl2_record_mac(c->client_write_key, payload + SSL2_MAC_MD5_SIZE,
+                                data_len + padding, c->read_seq, mac) != 0) {
+                err = 1;
+            } else if (memcmp(mac, payload, SSL2_MAC_MD5_SIZE) != 0) {
+                err = 1;
+            } else {
+                c->read_seq++;
+                memmove(c->pending, payload + SSL2_MAC_MD5_SIZE, data_len);
+                c->pending_len = data_len;
+                c->pending_off = 0;
+            }
+        }
+    } else {
+        data_len = rec_len;
+        memmove(c->pending, payload, data_len);
+        c->pending_len = data_len;
+        c->pending_off = 0;
+        c->read_seq++;
+    }
+    c->in_len = 0;
+    c->in_hdr = 0;
+    c->in_need = 0;
+    return err ? -1 : 0;
 }
 
 static int sslv2_send_server_hello(crucible_tomcrypt_conn *c, const uint8_t *cert_der,
@@ -535,6 +698,8 @@ crucible_tomcrypt_conn *crucible_tomcrypt_accept(int relay_fd, const uint8_t *pe
         return NULL;
     }
     c->fd = relay_fd;
+    c->wake_rd = -1;
+    c->wake_wr = -1;
     /* ClientHello is parsed from `peek` only. Do NOT put it in peek_io — otherwise
      * CMK reads re-consume the hello and can feed garbage into RSA (LTC_ARGCHK abort). */
     if (peek_io_init(&c->io, relay_fd, NULL, 0) != 0) {
@@ -624,6 +789,28 @@ crucible_tomcrypt_conn *crucible_tomcrypt_accept(int relay_fd, const uint8_t *pe
         return NULL;
     }
     c->handshake_done = 1;
+
+    /* Handshake complete: the relay fd may be switched to O_NONBLOCK and given
+     * a self-pipe so a **single** Rust poll thread can multiplex both
+     * directions (G-04: 1 OS thread per established connection, down from the
+     * reader+writer pair). Fail-closed: without a wake pipe the async writer
+     * could not wake the poll thread, so refuse the connection rather than hang. */
+    {
+        int pfd[2];
+        if (set_nonblocking(c->fd) != 0 || pipe(pfd) != 0) {
+            crucible_tomcrypt_free(c);
+            return NULL;
+        }
+        if (set_nonblocking(pfd[0]) != 0 || set_nonblocking(pfd[1]) != 0) {
+            close(pfd[0]);
+            close(pfd[1]);
+            crucible_tomcrypt_free(c);
+            return NULL;
+        }
+        c->wake_rd = pfd[0];
+        c->wake_wr = pfd[1];
+        c->nonblocking = 1;
+    }
     return c;
 #else
     (void)cert_pem;
@@ -646,41 +833,200 @@ ssize_t crucible_tomcrypt_read(crucible_tomcrypt_conn *c, void *buf, size_t len)
     if (len == 0) {
         return 0;
     }
-    /* Serve leftover bytes from a previous (larger) record first. */
-    if (c->pending_off < c->pending_len) {
-        size_t n = c->pending_len - c->pending_off;
-        if (n > len) {
-            n = len;
+    if (!c->nonblocking) {
+        /* Defensive blocking path (post-handshake connections are always
+         * non-blocking; see crucible_tomcrypt_accept). */
+        if (c->pending_off < c->pending_len) {
+            size_t n = c->pending_len - c->pending_off;
+            if (n > len) {
+                n = len;
+            }
+            memcpy(buf, c->pending + c->pending_off, n);
+            c->pending_off += n;
+            if (c->pending_off >= c->pending_len) {
+                c->pending_off = 0;
+                c->pending_len = 0;
+            }
+            return (ssize_t)n;
         }
-        memcpy(buf, c->pending + c->pending_off, n);
-        c->pending_off += n;
-        if (c->pending_off >= c->pending_len) {
-            c->pending_off = 0;
-            c->pending_len = 0;
-        }
-        return (ssize_t)n;
-    }
-    uint8_t *rec = NULL;
-    size_t rec_len = 0;
-    if (ssl2_recv_record(c, &rec, &rec_len) != 0) {
-        return -1;
-    }
-    size_t n = rec_len < len ? rec_len : len;
-    memcpy(buf, rec, n);
-    if (rec_len > n) {
-        size_t rest = rec_len - n;
-        if (rest > sizeof(c->pending)) {
-            free(rec);
+        uint8_t *rec = NULL;
+        size_t rec_len = 0;
+        if (ssl2_recv_record(c, &rec, &rec_len) != 0) {
             return -1;
         }
-        memcpy(c->pending, rec + n, rest);
-        c->pending_len = rest;
-        c->pending_off = 0;
+        size_t n = rec_len < len ? rec_len : len;
+        memcpy(buf, rec, n);
+        if (rec_len > n) {
+            size_t rest = rec_len - n;
+            if (rest > sizeof(c->pending)) {
+                free(rec);
+                return -1;
+            }
+            memcpy(c->pending, rec + n, rest);
+            c->pending_len = rest;
+            c->pending_off = 0;
+        }
+        free(rec);
+        return (ssize_t)n;
     }
-    free(rec);
-    return (ssize_t)n;
+    /* Non-blocking (G-04): stage a whole record, then serve its plaintext.
+     * Returns -2 when no complete record is available yet. */
+    for (;;) {
+        if (c->pending_off < c->pending_len) {
+            size_t n = c->pending_len - c->pending_off;
+            if (n > len) {
+                n = len;
+            }
+            memcpy(buf, c->pending + c->pending_off, n);
+            c->pending_off += n;
+            if (c->pending_off >= c->pending_len) {
+                c->pending_off = 0;
+                c->pending_len = 0;
+            }
+            return (ssize_t)n;
+        }
+        int st = tc_stage_fill(c);
+        if (st == 1) {
+            return -2;
+        }
+        if (st == 0) {
+            return 0;
+        }
+        if (st == -1) {
+            return -1;
+        }
+        if (tc_process_record(c) != 0) {
+            return -1;
+        }
+    }
 #else
     return c->io.read_fn(c->io.ctx, buf, len);
+#endif
+}
+
+/* Post-handshake non-blocking flush of queued encrypted records.
+ * Returns 0 = fully drained, -2 = would block (partial), -1 = error. */
+ssize_t crucible_tomcrypt_flush(crucible_tomcrypt_conn *c) {
+    if (!c) {
+        return -1;
+    }
+#ifdef CRUCIBLE_HAVE_TOMCRYPT
+    if (!c->nonblocking) {
+        return 0;
+    }
+    while (c->out_off < c->out_len) {
+        ssize_t n = write(c->fd, c->out + c->out_off, c->out_len - c->out_off);
+        if (n > 0) {
+            c->out_off += (size_t)n;
+            continue;
+        }
+        if (n < 0 && errno == EINTR) {
+            continue;
+        }
+        if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+            return -2;
+        }
+        return -1;
+    }
+    if (c->out) {
+        free(c->out);
+        c->out = NULL;
+    }
+    c->out_len = 0;
+    c->out_off = 0;
+    return 0;
+#else
+    return 0;
+#endif
+}
+
+/* Bytes still queued for the socket (0 = nothing pending). */
+ssize_t crucible_tomcrypt_out_pending(crucible_tomcrypt_conn *c) {
+    if (!c) {
+        return 0;
+    }
+#ifdef CRUCIBLE_HAVE_TOMCRYPT
+    return (ssize_t)(c->out_len - c->out_off);
+#else
+    return 0;
+#endif
+}
+
+/* Wake a poll thread blocked in crucible_tomcrypt_poll (coalesced via self-pipe). */
+int crucible_tomcrypt_wakeup(crucible_tomcrypt_conn *c) {
+    if (!c) {
+        return -1;
+    }
+#ifdef CRUCIBLE_HAVE_TOMCRYPT
+    if (c->wake_wr < 0) {
+        return -1;
+    }
+    uint8_t b = 1;
+    ssize_t n = write(c->wake_wr, &b, 1);
+    if (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
+        return -1;
+    }
+    return 0;
+#else
+    return -1;
+#endif
+}
+
+/* Poll {relay fd, wake event}. Returns a bitmask: 1=readable, 2=writable,
+ * 4=wakeup, 0=timeout, -1=error. */
+int crucible_tomcrypt_poll(crucible_tomcrypt_conn *c, int want_read, int want_write,
+                           int timeout_ms) {
+    if (!c) {
+        return -1;
+    }
+#ifdef CRUCIBLE_HAVE_TOMCRYPT
+    struct pollfd fds[2];
+    int nfds = 0;
+    int fd_idx;
+    int wake_idx = -1;
+    fds[nfds].fd = c->fd;
+    fds[nfds].events = (short)((want_read ? POLLIN : 0) | (want_write ? POLLOUT : 0));
+    fds[nfds].revents = 0;
+    fd_idx = nfds++;
+    if (c->wake_rd >= 0) {
+        fds[nfds].fd = c->wake_rd;
+        fds[nfds].events = POLLIN;
+        fds[nfds].revents = 0;
+        wake_idx = nfds++;
+    }
+    int r;
+    do {
+        r = poll(fds, (nfds_t)nfds, timeout_ms);
+    } while (r < 0 && errno == EINTR);
+    if (r < 0) {
+        return -1;
+    }
+    if (r == 0) {
+        return 0;
+    }
+    if (fds[fd_idx].revents & POLLNVAL) {
+        return -1;
+    }
+    int mask = 0;
+    if (fds[fd_idx].revents & (POLLIN | POLLHUP | POLLERR)) {
+        mask |= 1;
+    }
+    if (fds[fd_idx].revents & (POLLOUT | POLLHUP | POLLERR)) {
+        mask |= 2;
+    }
+    if (wake_idx >= 0 && (fds[wake_idx].revents & POLLIN)) {
+        uint8_t tmp[64];
+        while (read(c->wake_rd, tmp, sizeof(tmp)) > 0) {
+            /* drain coalesced wakeups */
+        }
+        mask |= 4;
+    }
+    return mask;
+#else
+    (void)want_read;
+    (void)want_write;
+    (void)timeout_ms;
+    return -1;
 #endif
 }
 
@@ -727,6 +1073,18 @@ void crucible_tomcrypt_free(crucible_tomcrypt_conn *c) {
     if (c->rc4_ready) {
         rc4_stream_done(&c->rc4_read);
         rc4_stream_done(&c->rc4_write);
+    }
+    if (c->out) {
+        free(c->out);
+        c->out = NULL;
+    }
+    if (c->wake_rd >= 0) {
+        close(c->wake_rd);
+        c->wake_rd = -1;
+    }
+    if (c->wake_wr >= 0) {
+        close(c->wake_wr);
+        c->wake_wr = -1;
     }
 #endif
     if (c->fd >= 0) {

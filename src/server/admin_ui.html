@@ -1514,6 +1514,10 @@ function pxRow(r){
     +'<td><input type="checkbox" class="x-pool"'+(r.connection_pool?' checked':'')+'/></td>'
     +'<td><input type="checkbox" class="x-via-tor"'+(r.via_tor?' checked':'')+'/></td>'
     +'<td><input class="x-tor-socks" value="'+esc(r.tor_socks||'')+'" placeholder="unix:/path 或 127.0.0.1:9050（空=内置链）"/></td>'
+    +'<td><input class="x-uca" value="'+esc(r.upstream_ca||'')+'" placeholder="CA PEM 路径/正文（仅 trust_self_signed）"/></td>'
+    +'<td><input class="x-ucafp" value="'+esc(r.upstream_ca_sha256||'')+'" placeholder="64 位 SHA-256 指纹（可空）"/></td>'
+    +'<td><input class="x-ccert" value="'+esc(r.client_cert||'')+'" placeholder="回源 mTLS 客户端证书"/></td>'
+    +'<td><input class="x-ckey" value="'+esc(r.client_key||'')+'" placeholder="回源 mTLS 客户端私钥"/></td>'
     +'<td><textarea class="x-reqh" style="min-height:44px">'+esc(headersText(r.modify_request_headers))+'</textarea></td>'
     +'<td><textarea class="x-resph" style="min-height:44px">'+esc(headersText(r.modify_response_headers))+'</textarea></td>'
     +'<td class="actions"><button class="act mini danger">删</button></td>';
@@ -1525,7 +1529,7 @@ function renderPx(){
   const wrap=$('pxOut');
   if(!l){wrap.innerHTML='<p class="hint">无站点。</p>';return;}
   const table=document.createElement('table');table.className='data';
-  table.innerHTML='<thead><tr><th>路径</th><th>上游</th><th>ssl_mode</th><th>回源TLS版本</th><th>回源HTTP</th><th>池</th><th>via_tor</th><th>tor_socks</th><th>请求头注入（Name: value）</th><th>响应头注入</th><th></th></tr></thead>';
+  table.innerHTML='<thead><tr><th>路径</th><th>上游</th><th>ssl_mode</th><th>回源TLS版本</th><th>回源HTTP</th><th>池</th><th>via_tor</th><th>tor_socks</th><th>upstream_ca</th><th>CA指纹</th><th>client_cert</th><th>client_key</th><th>请求头注入（Name: value）</th><th>响应头注入</th><th></th></tr></thead>';
   const tb=document.createElement('tbody');
   (l.proxy_rules||[]).forEach(r=>tb.appendChild(pxRow(r)));
   table.appendChild(tb);
@@ -1543,6 +1547,10 @@ function renderPx(){
         connection_pool:tr.querySelector('.x-pool').checked,
         via_tor:tr.querySelector('.x-via-tor').checked,
         tor_socks:tr.querySelector('.x-tor-socks').value.trim()||null,
+        upstream_ca:tr.querySelector('.x-uca').value.trim()||null,
+        upstream_ca_sha256:tr.querySelector('.x-ucafp').value.trim()||null,
+        client_cert:tr.querySelector('.x-ccert').value.trim()||null,
+        client_key:tr.querySelector('.x-ckey').value.trim()||null,
         modify_request_headers:parseHeaders(tr.querySelector('.x-reqh').value),
         modify_response_headers:parseHeaders(tr.querySelector('.x-resph').value)
       });

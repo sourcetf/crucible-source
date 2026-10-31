@@ -23,7 +23,8 @@ import time
 import urllib.request
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-LAYERS = os.path.join(ROOT, "data", "geoip", "current")
+# 层缓存根目录可覆盖（staging / 测试）；生产默认行为不变。
+LAYERS = os.environ.get("CRUCIBLE_GEOIP_LAYERS") or os.path.join(ROOT, "data", "geoip", "current")
 UA = {"User-Agent": "crucible-geoip-sync/1.0 (+https://localhost)"}
 TIMEOUT = 120
 
@@ -187,6 +188,12 @@ def do_rezmoss() -> int:
     rows: list = []
     seen = 0
     root = json.loads(fetch(api_base))
+    if isinstance(root, dict):
+        # GitHub API 限流/错误时返回 {"message": ...} 而不是目录数组。直接迭代会
+        # 在 `e.get` 上抛 AttributeError，报错信息完全看不出根因。
+        raise RuntimeError(
+            f"GitHub contents API 不可用（限流？）: {str(root.get('message', root))[:200]}"
+        )
     dirs = [e["name"] for e in root if e.get("type") == "dir"]
     for pid in (want or dirs):
         if pid not in dirs:
@@ -195,6 +202,13 @@ def do_rezmoss() -> int:
             sub = json.loads(fetch(api_base + pid))
         except Exception as exc:
             print(f"warn: rezmoss {pid}: {exc}", file=sys.stderr)
+            continue
+        if isinstance(sub, dict):
+            print(
+                f"warn: rezmoss {pid}: listing error "
+                f"{str(sub.get('message', sub))[:160]}",
+                file=sys.stderr,
+            )
             continue
         doc = None
         for entry in sub:
@@ -445,16 +459,35 @@ RIR_DELEGATED = {
     "afrinic": "https://ftp.afrinic.net/pub/stats/afrinic/delegated-afrinic-extended-latest",
 }
 
+# APNIC 的 ftp 主机在部分网络长期超时（实测 2026-10 连续 3 次 120s 超时）；
+# RIPE 官方镜像同一份 NRO delegated 统计，格式一致。主站失败时回落镜像。
+RIR_MIRRORS = {
+    "apnic": [
+        "https://ftp.ripe.net/pub/stats/apnic/delegated-apnic-extended-latest",
+        "https://ftp.ripe.net/pub/stats/apnic/delegated-apnic-latest",
+    ],
+}
+
 
 def do_rir(registry: str, url: str) -> int:
-    text = fetch(url).decode("utf-8", errors="replace")
-    return write_layer("30-rir", f"delegated-{registry}.jsonl",
-                       parse_delegated(text, registry))
+    """下载一个 RIR 的 delegated 统计（主站失败→镜像），返回写入行数。"""
+    last: Exception | None = None
+    for candidate in [url, *RIR_MIRRORS.get(registry, [])]:
+        try:
+            text = fetch(candidate).decode("utf-8", errors="replace")
+            return write_layer(
+                "30-rir", f"delegated-{registry}.jsonl", parse_delegated(text, registry)
+            )
+        except Exception as exc:  # noqa: BLE001
+            last = exc
+            print(f"warn: rir {registry} {candidate}: {exc}", file=sys.stderr)
+    raise RuntimeError(f"all mirrors failed for {registry}: {last}")
 
 
 def main() -> int:
     started = time.time()
     results: list[tuple[str, object]] = []
+    timings: dict[str, float] = {}
 
     for name, fn in (
         ("01-cloud/rezmoss", do_rezmoss),
@@ -467,22 +500,26 @@ def main() -> int:
         ("05-hosting/ipapi", do_ipapi_hosting),
         ("10-isp-cn/china-operator", do_china_operator),
     ):
+        t0 = time.time()
         try:
             n = fn()
             results.append((name, n))
         except Exception as exc:
             results.append((name, f"FAIL: {exc}"))
+        timings[name] = time.time() - t0
 
     for registry, url in RIR_DELEGATED.items():
+        t0 = time.time()
         try:
             n = do_rir(registry, url)
             results.append((f"30-rir/{registry}", n))
         except Exception as exc:
             results.append((f"30-rir/{registry}", f"FAIL: {exc}"))
+        timings[f"30-rir/{registry}"] = time.time() - t0
 
     ok = sum(1 for _, r in results if isinstance(r, int))
     for name, r in results:
-        print(f"geoip_fetch_layers: {name} -> {r}")
+        print(f"geoip_fetch_layers: {name} -> {r} ({timings.get(name, 0):.1f}s)")
     print(f"geoip_fetch_layers: {ok}/{len(results)} sources ok "
           f"in {time.time() - started:.1f}s")
     return 0 if ok else 1

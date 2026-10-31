@@ -1,0 +1,4 @@
+GET /idml HTTP/1.1
+H:30081
+If-None-Match: "abc"
+

@@ -137,12 +137,12 @@ pub(crate) fn enabled() -> bool {
 /// 鉴权/限流/上传），那些语义由 hyper + 应用层处理，快车道**不试图理解**。
 pub(crate) fn conn_eligible(lc: &ListenerConfig) -> bool {
     lc.apps.is_empty()
-        && !crate::server::page_rules::has_rules(&lc)
+        && !crate::server::page_rules::has_rules(lc)
         && lc.proxy_rules.is_empty()
         && lc.file_open.is_empty()
         && lc.basic_auth.is_none()
         && !lc.port_reuse
-        && lc.rate_limit.as_ref().map_or(true, |r| !r.enabled)
+        && lc.rate_limit.as_ref().is_none_or(|r| !r.enabled)
 }
 
 // ---------------------------------------------------------------------------
@@ -276,20 +276,20 @@ fn stat_fd(file: &fs::File) -> Option<libc::stat> {
 #[cfg(unix)]
 fn fdid_from_stat(st: &libc::stat) -> FdId {
     FdId {
-        dev: st.st_dev as u64,
-        ino: st.st_ino as u64,
+        dev: st.st_dev,
+        ino: st.st_ino,
         len: st.st_size as u64,
         mtime_s: st.st_mtime as u64,
         mtime_ns: st.st_mtime_nsec as u32,
         ctime_s: st.st_ctime as u64,
         ctime_ns: st.st_ctime_nsec as u32,
-        nlink: st.st_nlink as u64,
+        nlink: st.st_nlink,
     }
 }
 
 #[cfg(unix)]
 fn id_from_stat(st: &libc::stat) -> Id {
-    Id { len: st.st_size as u64, ino: st.st_ino as u64,
+    Id { len: st.st_size as u64, ino: st.st_ino,
          secs: st.st_mtime as u64, nanos: st.st_mtime_nsec as u32 }
 }
 
@@ -530,6 +530,94 @@ fn scan_head(buf: &[u8], from: usize) -> HeadScan {
     HeadScan::NeedMore
 }
 
+/// 已缓冲的前缀是否**无论后续再收到什么字节**都不可能是合法请求头。
+///
+/// 为什么需要：hyper/httparse 对「请求行/头名语法错误」是**看到就报错**的，即使
+/// 请求头还没收尾（`GET\x00 …`、`HTTP/2.0`、`Bad Name: v`、以及服务完一个请求后
+/// 残留的 `X: v\r\n` 垃圾）。快车道此前只认 `\r\n\r\n`，于是同样这些字节要等到
+/// 30s 头读超时才关连接、一个字节都不发；对照 hyper 路径（或 `CRUCIBLE_H1_FASTPATH=0`）
+/// 是立刻 400。A/B 对拍里表现为「快车道静默、慢车道 400」。
+///
+/// 这里只判**确定性非法**：
+///   * 请求行尚未收全时，方法 token 前缀出现非 token 字节（含开头的 SP/HTAB）；
+///   * 请求行已收全但空格切分不是恰好 3 段、方法非 token、版本不是 HTTP/1.0/1.1；
+///   * 请求行之后、空行之前，某条已收全的头行没有冒号、名字非 token、或出现 obs-fold。
+///
+/// 值里的控制字符/obs-text **不**在这里判：hyper 对它们同样会等结束符（fastsec-wave10
+/// 的实测表），提前回退只会白丢快车道。命中即把**已读字节原样**交回 hyper —— hyper
+/// 看到的是同一个前缀，于是报错时机/状态码与慢车道一致。
+fn head_prefix_invalid(buf: &[u8]) -> bool {
+    // RFC 9112 §2.2 / hyper `consume_leading_lines`：请求行之前的空行（任意 `\r`/`\n`
+    // 序列）会被忽略。它们单独出现时既不是非法请求，也不能据此回退 —— hyper 在
+    // keep-alive 上会继续等下一个请求（快车道若把它们判成「确定性非法」并自己回 400，
+    // 就与慢车道不一致）。
+    let mut start = 0;
+    while start < buf.len() && (buf[start] == b'\r' || buf[start] == b'\n') {
+        start += 1;
+    }
+    let buf = &buf[start..];
+    if buf.is_empty() {
+        return false;
+    }
+    let Some(eol) = find_crlf(buf) else {
+        // 请求行还没收全：只看方法 token 前缀。
+        if buf.is_empty() {
+            return false;
+        }
+        let mut i = 0;
+        while i < buf.len() {
+            let b = buf[i];
+            if b == b' ' {
+                // 方法在第一个 SP 处结束；空方法（行首就是 SP）非法。
+                return i == 0;
+            }
+            if b == b'\t' {
+                // HTAB 不是请求行的分隔符（httparse 只认 SP），确定性非法。
+                return true;
+            }
+            if b == b'\r' || b == b'\n' || !is_token(b) {
+                return true;
+            }
+            i += 1;
+        }
+        return false;
+    };
+    let line = &buf[..eol];
+    let mut parts = line.split(|&b| b == b' ');
+    let method = parts.next().unwrap_or(b"");
+    let (Some(target), Some(version)) = (parts.next(), parts.next()) else {
+        return true;
+    };
+    if method.is_empty()
+        || !method.iter().all(|&b| is_token(b))
+        || target.is_empty()
+        || parts.next().is_some()
+        || (version != b"HTTP/1.1" && version != b"HTTP/1.0")
+    {
+        return true;
+    }
+    // 请求行之后、空行之前的完整头行：确定性语法错误。
+    let mut rest = &buf[eol + 2..];
+    while let Some(i) = find_crlf(rest) {
+        let field = &rest[..i];
+        rest = &rest[i + 2..];
+        if field.is_empty() {
+            break; // 头已收尾（此时 scan_head 已经返回 Complete）
+        }
+        if field[0] == b' ' || field[0] == b'\t' {
+            return true; // obs-fold：hyper 拒
+        }
+        let Some(colon) = field.iter().position(|&b| b == b':') else {
+            return true; // 没有冒号的头行：hyper 拒
+        };
+        if colon == 0 || !field[..colon].iter().all(|&b| is_token(b)) {
+            return true;
+        }
+        // 值不判（见函数文档）。
+    }
+    false
+}
+
 /// 解析一个完整请求头（`head` 以 CRLFCRLF 结束）。返回 `None` = 回退 hyper。
 fn parse_request(head: &[u8]) -> Option<ParsedReq<'_>> {
     // ── 请求行：`METHOD SP TARGET SP VERSION`（严格；多余空白/异形一律回退）──
@@ -687,7 +775,7 @@ fn is_admin_path_fast(admin_path: &str, path: &str) -> bool {
         return true;
     }
     let base = admin_path.trim_end_matches('/');
-    path.len() >= base.len() + 1 && path.as_bytes()[base.len()] == b'/' && path.starts_with(base)
+    path.len() > base.len() && path.as_bytes()[base.len()] == b'/' && path.starts_with(base)
 }
 
 /// 把原始头区段重建为 `HeaderMap`（仅填充路径使用，见 [`fill_entry`]）。
@@ -896,7 +984,26 @@ async fn fill_entry(
 
 thread_local! {
     static DATE_CACHE: std::cell::RefCell<(u64, [u8; 48], usize)> =
-        std::cell::RefCell::new((u64::MAX, [0u8; 48], 0));
+        const { std::cell::RefCell::new((u64::MAX, [0u8; 48], 0)) };
+}
+
+/// 与 hyper 解析错误同版本/同头序的 400（见 `serve` 里 `last_http_10` 的说明）。
+async fn write_parse_error<IO: AsyncWrite + Unpin>(
+    io: &mut IO,
+    http_10: bool,
+    out: &mut Vec<u8>,
+) {
+    out.clear();
+    out.extend_from_slice(if http_10 {
+        b"HTTP/1.0 400 Bad Request\r\ncontent-length: 0\r\n"
+    } else {
+        b"HTTP/1.1 400 Bad Request\r\nconnection: close\r\ncontent-length: 0\r\n"
+    });
+    append_date(out);
+    out.extend_from_slice(b"\r\n");
+    let _ = io.write_all(out).await;
+    let _ = io.flush().await;
+    let _ = io.shutdown().await;
 }
 
 /// 追加 `date: <http-date>\r\n`（每个线程每秒最多格式化一次）。
@@ -956,6 +1063,11 @@ async fn read_head<IO: AsyncRead + Unpin>(
         HeadScan::NotUnderstood => return HeadRead::Fallback,
         HeadScan::NeedMore => {}
     }
+    // 已经能确定「无论后面再来什么字节都不是合法请求头」⇒ 立刻回退，让 hyper 按
+    // 它自己的时机报错（否则这些字节要挂到 30s 头读预算，而慢车道立刻 400）。
+    if head_prefix_invalid(buf) {
+        return HeadRead::Fallback;
+    }
     // 本次等待的预算从**现在**起算（与 `timeout_at(now + 30s, ...)` 同一时刻）。
     sleep
         .as_mut()
@@ -978,6 +1090,9 @@ async fn read_head<IO: AsyncRead + Unpin>(
                         HeadScan::Complete(n) => return HeadRead::Complete(n),
                         HeadScan::NotUnderstood => return HeadRead::Fallback,
                         HeadScan::NeedMore => {}
+                    }
+                    if head_prefix_invalid(buf) {
+                        return HeadRead::Fallback;
                     }
                 }
                 Err(_) => return HeadRead::Closed,
@@ -1083,6 +1198,14 @@ where
     // 不再每请求白做一次静态解析（否则 404 类请求要付「fill + hyper 完整服务」两份成本）。
     // 只影响提速与否，不影响任何响应字节（回退路径逐字节不变）。
     let mut miss_memo: Option<String> = None;
+    // 本连接最近一次**由快车道成功应答**的请求版本（`Some(true)` = HTTP/1.0）。
+    // 用途：pipe 在已服务请求之后残留「确定性非法」字节时，hyper 的错误响应版本取自
+    // 它**上一次解析到的请求**（`conn.rs: self.state.version = msg.head.version` 在解析
+    // 成功后才更新，400 由 `enforce_version` 复用该版本）。快车道把残留字节 replay 给
+    // 一条**全新**的 hyper 连接，state.version 回到默认 1.1 ⇒ 1.0 客户端会看到
+    // `HTTP/1.1 400`（慢车道是 `HTTP/1.0 400`）。这里自己按同一格式回 400，保持两态
+    // 逐字节一致（见 reports/httpcore2-wave22.md）。
+    let mut last_http_10: Option<bool> = None;
     let hsts = lc.ssl.is_some();
     let access_override = lc.access_log.clone();
     // 连接级访问日志前缀（`h1 {peer} `）：peer 的 Display + `core::fmt` 从每请求一次
@@ -1095,6 +1218,14 @@ where
             HeadRead::Complete(n) => n,
             HeadRead::Fallback => {
                 FB_PARSE.fetch_add(1, Ordering::Relaxed);
+                // 已服务过至少一个请求、且残留字节**确定性非法**：自己回与 hyper
+                // 同版本/同头序的 400（见 `last_http_10` 的说明）。其余回退照旧 replay。
+                if let Some(http_10) = last_http_10 {
+                    if head_prefix_invalid(&buf) {
+                        write_parse_error(&mut io, http_10, &mut scratch).await;
+                        return None;
+                    }
+                }
                 return Some(ReplayIo::new(io, buf));
             }
             HeadRead::Closed => return None,
@@ -1103,6 +1234,15 @@ where
             Some(r) => r,
             None => {
                 FB_PARSE.fetch_add(1, Ordering::Relaxed);
+                // 完整请求头的语法就是错的（非法版本/头名等）且本连接此前已服务过请求：
+                // hyper 若在**同一条**连接上会沿用上一个请求的响应版本；replay 到新连接
+                // 会变成 1.1。自己回同版本 400（同 `last_http_10` 的说明）。
+                if let Some(http_10) = last_http_10 {
+                    if head_prefix_invalid(&buf) {
+                        write_parse_error(&mut io, http_10, &mut scratch).await;
+                        return None;
+                    }
+                }
                 return Some(ReplayIo::new(io, buf));
             }
         };
@@ -1254,6 +1394,7 @@ where
             access_override.as_ref(),
         );
         SERVED.fetch_add(1, Ordering::Relaxed);
+        last_http_10 = Some(http_10);
         if close_after {
             let _ = io.shutdown().await;
             return None;
@@ -1564,6 +1705,56 @@ mod tests {
         ));
     }
 
+    /// 未收尾前缀里的**确定性非法**必须立刻回退 hyper（否则快车道挂到 30s，
+    /// 慢车道已经 400 —— A/B 对拍差异，见 reports/httpcore2-wave22.md）。
+    #[test]
+    fn head_prefix_invalid_detects_early_errors_only() {
+        for bad in [
+            &b"GET\x00 / HTTP/1.1\r\n"[..],
+            &b"G\x01T / HTTP/1.1\r\n"[..],
+            &b"GET\t/ HTTP/1.1\r\n"[..],
+            &b" / HTTP/1.1\r\n"[..],
+            &b"GET  / HTTP/1.1\r\n"[..],
+            &b"GET /a b HTTP/1.1\r\n"[..],
+            &b"GET / HTTP/1.1 \r\n"[..],
+            &b"GET / HTTP/2.0\r\n"[..],
+            &b"GET / HTTP/1.2\r\n"[..],
+            &b"GET / HTTP/1\r\n"[..],
+            &b"GET /\r\n"[..],                       // HTTP/0.9 式：hyper 立刻 400
+            &b"Bad Name: v\r\n"[..],                 // 没有合法三段
+            &b"GET / HTTP/1.1\r\nBad Name: v\r\n"[..],
+            &b"GET / HTTP/1.1\r\nX\r\n"[..],
+            &b"GET / HTTP/1.1\r\n Host: h\r\n"[..],
+            &b"GET / HTTP/1.1\r\nX@Y: v\r\n"[..],
+            &b"X: v\r\n"[..],
+            &b"\x00"[..],
+        ] {
+            assert!(head_prefix_invalid(bad), "必须判定为非法前缀: {bad:?}");
+        }
+        for ok in [
+            &b""[..],
+            // 前导空行（hyper consume_leading_lines 会忽略）：不能判非法，否则
+            // keep-alive 上残留一个空行时快车道会自己回 400，而慢车道继续等待。
+            &b"\r\n"[..],
+            &b"\r\n\r\n"[..],
+            &b"\n\n"[..],
+            &b"\r\nGET / HTTP/1.1\r\n"[..],
+            &b"G"[..],
+            &b"GET"[..],
+            &b"GET "[..],
+            &b"GET /"[..],
+            &b"GET / HT"[..],
+            &b"GET / HTTP/1.1\r\n"[..],
+            &b"GET / HTTP/1.1\r\nHost: h"[..],
+            &b"GET / HTTP/1.1\r\nHost: h\r\n"[..],
+            // 值里的控制字符 / obs-text：hyper 也等结束符，不在前缀阶段判。
+            &b"GET / HTTP/1.1\r\nX: a\x01b\r\n"[..],
+            &b"GET / HTTP/1.1\r\nX: \xff\r\n"[..],
+        ] {
+            assert!(!head_prefix_invalid(ok), "不能误判合法/未定前缀: {ok:?}");
+        }
+    }
+
     /// 裸 LF（`\n` 前不是 `\r`）必须被识别为「不理解的形状」，立刻回退 ——
     /// 否则 LF-only 请求（hyper 正常 200）在快车道上会挂到 30s 且一个字节都不发。
     #[test]
@@ -1826,6 +2017,31 @@ mod tests {
         let a = s.find("plain").unwrap();
         let b = s.find("hello-fastpath").unwrap();
         assert!(a < b, "响应必须按请求顺序: {s}");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn garbage_after_served_request_uses_same_error_version() {
+        // HTTP/1.0 keep-alive + 确定性非法残留：hyper 的 400 复用「上一次已解析请求」的
+        // 版本（state.version）⇒ 慢车道是 HTTP/1.0 400 且无 connection 头。快车道把残留
+        // replay 给新连接会让版本回到 1.1，因此必须自己按同格式回 400。
+        let fx = Fixture::new("garbage10");
+        let (live, lc) = fx.live();
+        let out = run(&lc, &live, &["GET / HTTP/1.0\nConnection: keep-alive\n\n::::"]).await;
+        let s = String::from_utf8_lossy(&out);
+        assert!(s.starts_with("HTTP/1.0 200 OK"), "{s}");
+        assert!(s.contains("HTTP/1.0 400 Bad Request\r\ncontent-length: 0\r\n"), "{s}");
+        assert!(!s.contains("connection: close"), "1.0 错误响应不带 connection: {s}");
+        assert_eq!(s.matches("HTTP/1.0 400").count(), 1, "{s}");
+
+        let fx = Fixture::new("garbage11");
+        let (live, lc) = fx.live();
+        let out = run(&lc, &live, &["GET / HTTP/1.1\nHost: h\n\n::::"]).await;
+        let s = String::from_utf8_lossy(&out);
+        assert!(s.starts_with("HTTP/1.1 200 OK"), "{s}");
+        assert!(
+            s.contains("HTTP/1.1 400 Bad Request\r\nconnection: close\r\ncontent-length: 0\r\n"),
+            "{s}"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

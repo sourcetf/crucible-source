@@ -1,0 +1,7 @@
+GET /a HTTP/1.1
+Ho:301,8
+If-None-M`tae: "ab ÿÿÿÿÿ301 P/1.1
+H:,8
+If-None-M`tae: "ab  "ab ÿÿ8
+If-None-M`tae:o, c!GET /a HTTP/1.1
+Host: h,

@@ -1,20 +1,41 @@
 #!/usr/bin/env bash
 # §6 GeoIP 更新总链：fetch 层 → merge（§5 权重）→ enrich 全套 → finish（黑名单清洗+校验）。
 # 用法：
-#   geoip_update.sh                # 全链
-#   geoip_update.sh --only merge   # 只重跑 merge
-#   --only fetch|enrich|finish|blacklist
+#   geoip_update.sh                # 全链（staging 构建 + 原子换库）
+#   geoip_update.sh --only merge   # 只重建库（同样 staging + 原子换库）
+#   --only fetch|enrich|blacklist|finish
+#
+# U-17/原子性：`all`/`merge` 不再原地重写 geoip.sqlite，而是先建
+# `geoip.sqlite.next`，enrich/finish 全在 .next 上跑，最后 `integrity_check` +
+# 原子 `mv` 覆盖旧库。任何一步失败都**不换库**，线上继续读旧库（旧库原样保留）。
+#
+# 路径覆盖：`CRUCIBLE_GEOIP_DATA_ROOT` 可把整条链指到 staging/测试目录
+# （默认 `<repo>/data/geoip`）；`CRUCIBLE_GEOIP_DB` 可单独覆盖库路径。
+# 生产默认行为与旧版一致（只多了 staging + 原子切换）。
 set -uo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-DB="${ROOT}/data/geoip/current/geoip.sqlite"
-LOG="${ROOT}/data/geoip/logs/update.log"
-mkdir -p "${ROOT}/data/geoip/current" "${ROOT}/data/geoip/logs"
-ONLY="${2:-all}"
+DATA="${CRUCIBLE_GEOIP_DATA_ROOT:-${ROOT}/data/geoip}"
+DB="${CRUCIBLE_GEOIP_DB:-${DATA}/current/geoip.sqlite}"
+LOG="${CRUCIBLE_GEOIP_LOG:-${DATA}/logs/update.log}"
+STAGE="${DB}.next"
+mkdir -p "$(dirname "$DB")" "$(dirname "$LOG")" "${DATA}/sources"
+
+# `--only X` / `--only=X` 都接受；旧实现只认 `$2`，`--only=merge` 会退化成 all。
+ONLY=all
+ARGS=("$@")
+for ((i = 0; i < ${#ARGS[@]}; i++)); do
+  a="${ARGS[$i]}"
+  if [ "$a" = "--only" ]; then
+    ONLY="${ARGS[$((i + 1))]:-all}"
+  elif [[ "$a" == --only=* ]]; then
+    ONLY="${a#--only=}"
+  fi
+done
 
 # 单实例锁：面板按钮、cron、手工命令都可能同时触发。merge/enrich 不是为并发写的
 # （两个进程同时改同一个 SQLite），实测一次误操作就拉起了 4 个并发更新。
 # mkdir 是原子的：拿不到就是有人在跑。锁里记 pid，进程没了就清陈旧锁，避免永久卡死。
-LOCK="${ROOT}/data/geoip/logs/update.lock"
+LOCK="${DATA}/logs/update.lock"
 if ! mkdir "$LOCK" 2>/dev/null; then
   OLDPID="$(cat "$LOCK/pid" 2>/dev/null || echo 0)"
   # 必须确认那个 pid 的命令行仍是本脚本：pid 会被复用，只看 kill -0 会让锁永远清不掉。
@@ -32,16 +53,104 @@ fi
 echo $$ >"$LOCK/pid"
 trap 'rm -rf "$LOCK" 2>/dev/null' EXIT INT TERM
 
+# 导出给所有 Python 步骤：同一份数据根 / 库 / 面板 / 层目录（脚本内相对路径
+# `data/geoip` 的硬编码也用 CRUCIBLE_GEOIP_DATA_ROOT 兜住）。
+export CRUCIBLE_GEOIP_DATA_ROOT="$DATA"
+export CRUCIBLE_GEOIP_DB="$DB"
+export CRUCIBLE_GEOIP_SOURCES="${DATA}/current/SOURCES.json"
+export CRUCIBLE_GEOIP_PANEL_DB="${DATA}/panel.sqlite"
+export CRUCIBLE_GEOIP_PANEL="${DATA}/panel.toml"
+export CRUCIBLE_GEOIP_LAYERS="${DATA}/current"
+export CRUCIBLE_GEOIP_SOURCES_DIR="${DATA}/sources"
+
 have_network() {
   command -v curl >/dev/null 2>&1 && curl -fsS --connect-timeout 3 -o /dev/null https://example.com 2>/dev/null
 }
 
+now_ms() { date +%s%N; }
+file_size() { [ -f "$1" ] && stat -c %s "$1" 2>/dev/null || echo 0; }
+
+# 一步一计时：输出 `<step> rc=… elapsed=…ms`，主会话/报告直接引用。
+run_step() {
+  local name="$1"
+  local usedb="$2"
+  shift 2
+  local t0 rc
+  t0="$(now_ms)"
+  if [ -n "$usedb" ]; then
+    CRUCIBLE_GEOIP_DB="$usedb" "$@"
+  else
+    "$@"
+  fi
+  rc=$?
+  echo "[$(date '+%F %T')] step ${name} rc=${rc} elapsed=$(( ($(now_ms) - t0) / 1000000 ))ms"
+  return "$rc"
+}
+
+db_stats() {
+  python3 - "$1" <<'PY'
+import sqlite3, sys
+p = sys.argv[1]
+try:
+    c = sqlite3.connect(p)
+    q = lambda s: c.execute(s).fetchone()[0]
+    print(
+        "db_stats",
+        f"geoip={q('SELECT COUNT(*) FROM geoip')}",
+        f"ipv4={q('SELECT COUNT(*) FROM ipv4')}",
+        f"ipv6={q('SELECT COUNT(*) FROM ipv6')}",
+        f"anycast={q('SELECT COUNT(*) FROM anycast')}",
+        f"file={p}",
+    )
+    c.close()
+except Exception as e:  # noqa: BLE001
+    print(f"db_stats failed: {e}", file=sys.stderr)
+    sys.exit(1)
+PY
+}
+
+# staging 完整性门禁：库可读、integrity_check=ok、主表非空。不过关绝不换库。
+validate_stage() {
+  python3 - "$1" <<'PY'
+import sqlite3, sys
+p = sys.argv[1]
+try:
+    c = sqlite3.connect(p)
+    ok = c.execute("PRAGMA integrity_check").fetchone()[0]
+    n = c.execute("SELECT COUNT(*) FROM geoip").fetchone()[0]
+    c.close()
+except Exception as e:  # noqa: BLE001
+    print(f"stage invalid: {e}")
+    sys.exit(1)
+print(f"stage integrity={ok} geoip_rows={n} bytes={__import__('os').path.getsize(p)}")
+sys.exit(0 if ok == "ok" and n > 0 else 1)
+PY
+}
+
+ENRICH_SCRIPTS=(
+  geoip_enrich_iana_special.py
+  geoip_enrich_geocn.py
+  geoip_enrich_qqwry.py
+  geoip_enrich_cernet.py
+  geoip_enrich_cloud_geo.py
+  geoip_enrich_places.py
+  geoip_resolve_asn_bgp.py
+  geoip_enrich_netorg.py
+  geoip_enrich_rir_geofeed.py
+  geoip_enrich_ripe_anycast_extract.py
+  geoip_enrich_ixp.py
+  geoip_enrich_google_rdns.py
+  geoip_enrich_cn_extra.py
+)
+
 {
-  echo "[$(date '+%F %T')] geoip_update start (only=${ONLY})"
+  echo "[$(date '+%F %T')] geoip_update start (only=${ONLY} data=${DATA} db=${DB})"
 
   if [ "${ONLY}" = "all" ] || [ "${ONLY}" = "fetch" ]; then
-    if have_network; then
-      python3 "${ROOT}/scripts/geoip_fetch_layers.py" || echo "warn: fetch_layers failed"
+    if [ "${GEOIP_SKIP_FETCH:-0}" = "1" ]; then
+      echo "skip fetch (GEOIP_SKIP_FETCH=1)，复用 ${DATA}/current 下已有层文件"
+    elif have_network; then
+      run_step fetch "" python3 "${ROOT}/scripts/geoip_fetch_layers.py" || echo "warn: fetch_layers failed"
     else
       echo "warn: no network; skip fetch"
     fi
@@ -51,8 +160,8 @@ have_network() {
   # scripts/geoip-mmdb2jsonl 从同目录 GeoCN.mmdb 生成 —— 更新链不会自动生成它（本机也没装 Go）。
   # 缺了它 enrich 只会打一行 "run mmdb2jsonl first"，然后静默丢掉最大的源，
   # 所以在开工前就把话说重一点，并明确「不要为了腾空间删它」。
-  if [ ! -s "${ROOT}/data/geoip/sources/GeoCn.jsonl" ]; then
-    if [ -s "${ROOT}/data/geoip/sources/GeoCn.mmdb" ]; then
+  if [ ! -s "${DATA}/sources/GeoCn.jsonl" ]; then
+    if [ -s "${DATA}/sources/GeoCn.mmdb" ]; then
       echo "warn: 缺少 sources/GeoCn.jsonl（GeoCN.mmdb 在，但需要 Go 工具生成）——"
       echo "warn: 本次会跳过国内主力源（约 220 万行）。生成命令：cd ${ROOT} && go run scripts/geoip-mmdb2jsonl . > data/geoip/sources/GeoCn.jsonl"
     else
@@ -60,57 +169,111 @@ have_network() {
     fi
   fi
 
-  # 磁盘预检：merge 是就地重写 geoip.sqlite（导入各层 + 建索引），需要相当于库大小
-  # 量级的临时空间（回滚日志/临时 B 树）。实测一次磁盘写满的后果：merge 默默死在
-  # 半路（dmesg 里刷 "file system full"），面板只看到「更新没了」，而库里还是旧数据。
-  # 空间不够就**跳过 merge 并说清楚**，保留上一份完整数据，比写坏库好得多。
+  TARGET_DB="$DB"
+  STAGED=0
+  CRITICAL_FAIL=0
+  ENRICH_FAILS=0
+  ENRICH_TOTAL=0
+
+  # ---------- merge：构建 staging（不碰线上库） ----------
   if [ "${ONLY}" = "all" ] || [ "${ONLY}" = "merge" ]; then
-    DBSZ=$( [ -f "$DB" ] && du -k "$DB" 2>/dev/null | awk '{print $1}' || echo 0 )
-    FREEK=$(df -k "$DB" 2>/dev/null | awk 'NR==2{print $4}')
-    NEEDK=$(( DBSZ + 262144 ))   # 库大小 + 256MiB 余量
+    # file_size 返回**字节**，df -k 是 1KiB 块：先换算，否则 257MB 的库会被当成
+    # 257GB（实测把一次正常更新误判成「磁盘不足」直接跳过 merge）。
+    DBSZ_K=$(( $(file_size "$DB") / 1024 ))
+    FREEK=$(df -k "$(dirname "$DB")" 2>/dev/null | awk 'NR==2{print $4}')
+    NEEDK=$(( DBSZ_K + 262144 ))   # 库大小 + 256MiB 余量
     if [ -n "$FREEK" ] && [ "$FREEK" -lt "$NEEDK" ]; then
       echo "warn: 磁盘空间不足，跳过 merge（需 ≥$((NEEDK/1024))MiB 空闲，实际 $((FREEK/1024))MiB）。"
-      echo "warn: 建议先清理 ${ROOT}/data/geoip/sources 下的旧层文件（raw 抓取缓存），再重跑 --only merge。"
+      echo "warn: 保留旧库不变；建议先清理 ${DATA}/sources 下的旧层文件（raw 抓取缓存）。"
+      CRITICAL_FAIL=1
     else
-      python3 "${ROOT}/scripts/geoip_merge.py" --db "$DB" --init-schema --import-layers \
-        || echo "warn: merge failed"
+      rm -f "$STAGE"
+      if run_step merge "$STAGE" python3 "${ROOT}/scripts/geoip_merge.py" \
+           --db "$STAGE" --init-schema --import-layers --layers "${DATA}/current"; then
+        echo "[$(date '+%F %T')] merge staged ${STAGE} size=$(file_size "$STAGE")B"
+        TARGET_DB="$STAGE"
+        STAGED=1
+      else
+        echo "warn: merge failed —— 丢弃 staging，旧库保持不变"
+        rm -f "$STAGE"
+        CRITICAL_FAIL=1
+      fi
     fi
   fi
 
-  if [ "${ONLY}" = "all" ] || [ "${ONLY}" = "enrich" ]; then
-    for script in \
-      geoip_enrich_iana_special.py \
-      geoip_enrich_geocn.py \
-      geoip_enrich_qqwry.py \
-      geoip_enrich_cernet.py \
-      geoip_enrich_cloud_geo.py \
-      geoip_enrich_places.py \
-      geoip_resolve_asn_bgp.py \
-      geoip_enrich_netorg.py \
-      geoip_enrich_rir_geofeed.py \
-      geoip_enrich_ripe_anycast_extract.py \
-      geoip_enrich_ixp.py \
-      geoip_enrich_google_rdns.py \
-      geoip_enrich_cn_extra.py; do
-      python3 "${ROOT}/scripts/${script}" || echo "warn: ${script} failed"
+  # ---------- enrich：在 staging 上跑（只有 merge 成功才做） ----------
+  if { [ "${ONLY}" = "all" ] || [ "${ONLY}" = "enrich" ]; } && [ "$CRITICAL_FAIL" -eq 0 ]; then
+    ENRICH_TARGET="$TARGET_DB"
+    ENRICH_TIMEOUT="${GEOIP_ENRICH_TIMEOUT:-1800}"
+    for script in "${ENRICH_SCRIPTS[@]}"; do
+      ENRICH_TOTAL=$((ENRICH_TOTAL + 1))
+      # 每个 enrich 单独限时：某个源挂住（慢 RIR dump / RDAP / rdns）不应让整条
+      # 更新链永远卡在 staging 上。默认 1800s/步，可用 GEOIP_ENRICH_TIMEOUT 覆盖。
+      if ! run_step "enrich/${script}" "$ENRICH_TARGET" \
+           timeout "$ENRICH_TIMEOUT" python3 "${ROOT}/scripts/${script}"; then
+        ENRICH_FAILS=$((ENRICH_FAILS + 1))
+        echo "warn: ${script} failed (timeout=${ENRICH_TIMEOUT}s)"
+      fi
     done
+    if [ "$ENRICH_TOTAL" -gt 0 ] && [ "$ENRICH_FAILS" -ge "$ENRICH_TOTAL" ]; then
+      echo "warn: 所有 enrich 步骤都失败 —— 视为更新失败，回滚（不换库）"
+      CRITICAL_FAIL=1
+    elif [ "${GEOIP_REQUIRE_ALL_ENRICH:-0}" = "1" ] && [ "$ENRICH_FAILS" -gt 0 ]; then
+      echo "warn: GEOIP_REQUIRE_ALL_ENRICH=1 且 ${ENRICH_FAILS}/${ENRICH_TOTAL} enrich 失败 —— 回滚（不换库）"
+      CRITICAL_FAIL=1
+    fi
   fi
 
-  if [ "${ONLY}" = "all" ] || [ "${ONLY}" = "blacklist" ] || [ "${ONLY}" = "finish" ]; then
-    python3 "${ROOT}/scripts/geoip_purge_blacklisted.py" --root "${ROOT}/data/geoip/current" || true
+  # ---------- blacklist / finish：同样作用于 staging ----------
+  if { [ "${ONLY}" = "all" ] || [ "${ONLY}" = "blacklist" ] || [ "${ONLY}" = "finish" ]; } && [ "$CRITICAL_FAIL" -eq 0 ]; then
+    if ! run_step blacklist "$TARGET_DB" python3 "${ROOT}/scripts/geoip_purge_blacklisted.py" \
+         --db "$TARGET_DB" --root "${DATA}/current" --blacklist "${DATA}/blacklist.json"; then
+      echo "warn: blacklist purge failed —— 回滚（不换库）"
+      CRITICAL_FAIL=1
+    fi
   fi
 
-  if [ "${ONLY}" = "all" ] || [ "${ONLY}" = "finish" ]; then
-    bash "${ROOT}/scripts/geoip_finish.sh" || true
+  if { [ "${ONLY}" = "all" ] || [ "${ONLY}" = "finish" ]; } && [ "$CRITICAL_FAIL" -eq 0 ]; then
+    # 原 geoip_finish.sh 的最后一步是「样本 lookup 必须可查」；这里直接在目标库上做，
+    # 避免它内部写死的生产路径把 staging 测试又指回 data/geoip/current。
+    if ! run_step finish-lookup "$TARGET_DB" python3 "${ROOT}/scripts/geoip_lookup.py" \
+         1.2.4.8 --db "$TARGET_DB" --json; then
+      echo "warn: 样本 lookup 失败 —— 回滚（不换库）"
+      CRITICAL_FAIL=1
+    fi
   fi
 
-  # 最终保证：库必须在且可查。
+  # ---------- 原子换库 ----------
+  if [ "$STAGED" -eq 1 ]; then
+    if [ "$CRITICAL_FAIL" -eq 0 ] && validate_stage "$STAGE"; then
+      # 同一文件系统内 rename 是原子的：并发查询要么读到旧文件、要么读到新文件，
+      # 不会看到半个库。旧库在 rename 前始终保持完整（失败回滚自然成立）。
+      if mv -f "$STAGE" "$DB"; then
+        echo "[$(date '+%F %T')] swapped staged db -> ${DB} size=$(file_size "$DB")B"
+        db_stats "$DB" || true
+      else
+        echo "warn: mv staging -> db 失败，旧库保持不变"
+        rm -f "$STAGE"
+        CRITICAL_FAIL=1
+      fi
+    else
+      echo "warn: staging 校验失败，丢弃 ${STAGE}，旧库保持不变"
+      rm -f "$STAGE"
+      CRITICAL_FAIL=1
+    fi
+  fi
+
+  # 最终保证：库必须在且可查（只有完全没有库时才 seed；有旧库就不动）。
   if [ ! -f "$DB" ]; then
-    python3 "${ROOT}/scripts/geoip_seed_demo.py" --db "$DB" --force
+    run_step seed "" python3 "${ROOT}/scripts/geoip_seed_demo.py" --db "$DB" --force || true
   fi
   # tor 池是自我守护化的进程，采完必须显式收掉（否则会一直残留）。
   if [ -d /tmp/geoip-tor-pool ]; then
     python3 "${ROOT}/scripts/geoip_tor_pool.py" stop || echo "warn: tor pool stop failed"
   fi
-  echo "[$(date '+%F %T')] geoip_update done"
+  if [ "$CRITICAL_FAIL" -ne 0 ]; then
+    echo "[$(date '+%F %T')] geoip_update done (FAILED: 旧库保持不变 / rolled back)"
+  else
+    echo "[$(date '+%F %T')] geoip_update done (ok)"
+  fi
 } | tee -a "$LOG"

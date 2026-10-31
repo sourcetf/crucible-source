@@ -1,0 +1,3 @@
+GET /报告.pdf HTTP/1.1
+Host: h
+

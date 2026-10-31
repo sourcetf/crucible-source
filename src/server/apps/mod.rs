@@ -51,6 +51,7 @@ use crate::config::{AppRouteConfig, FileOpenMode, ListenerConfig};
 use crate::server::h1::{full, BoxBody};
 use crate::server::live_config::LiveConfig;
 use bytes::Bytes;
+use http::header::{CONTENT_LENGTH, TRANSFER_ENCODING};
 use http::{Request, Response, StatusCode};
 use http_body_util::BodyExt;
 use hyper::body::Incoming;
@@ -137,6 +138,9 @@ pub async fn try_handle(
     lc: &ListenerConfig,
     peer: SocketAddr,
 ) -> Option<Response<BoxBody>> {
+    // HEAD 必须在 `dispatch` 消费 req 之前记下：引擎仍会产出完整 body（长度就是
+    // HEAD 应报的 Content-Length），最终在出口统一清空 body（见 `finalize_app_response`）。
+    let is_head = req.method() == http::Method::HEAD;
     // 热路径只借不克隆：旧实现把 path/ext 各 to_string()（2 次分配），再
     // `app.clone()` 深拷贝整份 AppRouteConfig（≥8 次分配/请求）。
     let path = req.uri().path();
@@ -167,7 +171,8 @@ pub async fn try_handle(
     };
     let mut req = req;
     req.extensions_mut().insert(deps_env);
-    Some(dispatch(req, live, lc, app, app_idx, peer).await)
+    let resp = dispatch(req, live, lc, app, app_idx, peer).await;
+    Some(finalize_app_response(resp, is_head).await)
 }
 
 /// Path/ext only — does not consume the request body.
@@ -194,6 +199,7 @@ pub async fn try_handle_simple(
     lc: &ListenerConfig,
     peer: SocketAddr,
 ) -> Option<Response<Bytes>> {
+    let is_head = req.method() == http::Method::HEAD;
     let path = req.uri().path();
     let ext = Path::new(path)
         .extension()
@@ -218,7 +224,8 @@ pub async fn try_handle_simple(
     // 引擎执行失败**不能**变成 None。路由已经匹配上（match_app 成功）、引擎却报错时，
     // 返回 None 会被 h2/h3 当成「没有 app 命中」，于是一路落到 proxy/static ——
     // `.php` 文件被当静态文件原样回给客户端，**源码泄露**。与 h1 的 dispatch 一致：回 502。
-    Some(dispatch_simple(req, lc, app, app_idx, peer, &deps_env).await)
+    let resp = dispatch_simple(req, lc, app, app_idx, peer, &deps_env).await;
+    Some(finalize_app_response_simple(resp, is_head))
 }
 
 /// [`try_handle_simple`] 的 h1 等价分发（按 `app.engine` 分支）。
@@ -306,7 +313,13 @@ async fn dispatch_simple(
             Ok(r) => r,
             Err(e) => simple_engine_error("tsx", &e),
         },
-        "lua" | "jsp" | "do" | "asp" | "aspnet" | "aspx" | "python" | "ruby" | "perl" => {
+        "lua" | "jsp" | "do" | "asp" | "aspnet" | "aspx" | "python" | "perl" => {
+            simple_sidecar_dispatch(req, lc, app, app_idx, peer, deps_env, &engine).await
+        }
+        // ruby 单独一支：嵌入不可用时显式记一条「回落 sidecar」的日志（只一次），
+        // 避免运维只看到 200 却不知道实际形态（x-crucible-engine 头可区分）。
+        "ruby" => {
+            log_ruby_sidecar_fallback(app);
             simple_sidecar_dispatch(req, lc, app, app_idx, peer, deps_env, &engine).await
         }
         "cgi" | "wsgi" | "asgi" | "psgi" | "uwsgi" => {
@@ -316,6 +329,7 @@ async fn dispatch_simple(
         // 存在时走常驻 sidecar；否则维持 FFI（诚实 502）。见 `rack_embed_usable`。
         "rack" => {
             if sidecar_engine::rack_sidecar_preferred(app, lc) {
+                log_rack_sidecar_fallback(app);
                 simple_sidecar_dispatch(req, lc, app, app_idx, peer, deps_env, "rack").await
             } else {
                 simple_ffi(req, lc, app, peer, deps_env, "rack").await
@@ -393,8 +407,10 @@ async fn cgi_script_simple(
             }
             Err(e) => return Err(e),
         };
+    let docroot = app.docroot.clone().unwrap_or_else(|| lc.root.clone());
     let resp = cgi_script::execute_binary(
         &script,
+        &docroot,
         req.method(),
         req.uri(),
         req.headers(),
@@ -477,13 +493,165 @@ fn simple_unavailable(engine: &str, msg: String) -> Response<Bytes> {
         .unwrap()
 }
 
-/// G-15：`/c` 的两种形态标签。
+/// 应用引擎请求体的**帧间空闲**上限（slowloris）。
 ///
+/// 与 `h1::BODY_IDLE_TIMEOUT`（60s）**同值同语义**：h1 的 proxy/静态/上传路径早已在
+/// 收口处按「两次 body 帧之间」计时回 408，而应用引擎（php/app_ffi/cgi_script/
+/// native_http）各自 `Limited::collect()` 时**完全没有超时** —— 匿名客户端发一个合法
+/// 请求头 + 声明大 Content-Length 后不再发 body，就能让请求任务、32MiB 缓冲与 fd
+/// 无限期挂着。这里把同一条口径补到引擎路径（跨协议/跨路径一致）。
+pub(crate) const APP_BODY_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// 应用引擎请求体读取失败（决定回哪个状态码，与 h1 `body_read_response` 同口径）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AppBodyError {
+    /// 超过该路径的缓冲上限（`APP_BODY_CAP`）⇒ 413。
+    TooLarge,
+    /// 帧间空闲超过 [`APP_BODY_IDLE_TIMEOUT`] ⇒ 408。
+    Timeout,
+    /// 底层读取错误（连接中断 / chunked 解析失败）⇒ 400。
+    Failed,
+}
+
+impl AppBodyError {
+    pub(crate) fn status(self) -> StatusCode {
+        match self {
+            AppBodyError::TooLarge => StatusCode::PAYLOAD_TOO_LARGE,
+            AppBodyError::Timeout => StatusCode::REQUEST_TIMEOUT,
+            AppBodyError::Failed => StatusCode::BAD_REQUEST,
+        }
+    }
+
+    pub(crate) fn message(self) -> &'static str {
+        match self {
+            AppBodyError::TooLarge => "request body too large",
+            AppBodyError::Timeout => "request body read timeout",
+            AppBodyError::Failed => "request body read failed",
+        }
+    }
+
+    pub(crate) fn into_response(self) -> Response<BoxBody> {
+        Response::builder()
+            .status(self.status())
+            .body(full(self.message()))
+            .unwrap()
+    }
+}
+
+/// 收齐应用引擎请求体（≤ `cap`），带帧间空闲超时（见 [`APP_BODY_IDLE_TIMEOUT`]）。
+pub(crate) async fn collect_app_body<B>(mut body: B, cap: usize) -> Result<Bytes, AppBodyError>
+where
+    B: BodyExt<Data = Bytes> + Unpin,
+{
+    let mut buf: Vec<u8> = Vec::new();
+    loop {
+        match tokio::time::timeout(APP_BODY_IDLE_TIMEOUT, body.frame()).await {
+            Ok(Some(Ok(frame))) => {
+                if let Some(d) = frame.data_ref() {
+                    if buf.len() + d.len() > cap {
+                        return Err(AppBodyError::TooLarge);
+                    }
+                    buf.extend_from_slice(d);
+                }
+            }
+            Ok(Some(Err(_))) => return Err(AppBodyError::Failed),
+            Ok(None) => return Ok(Bytes::from(buf)),
+            Err(_) => return Err(AppBodyError::Timeout),
+        }
+    }
+}
+
+/// 204/304 **没有实体**：响应体必须为空，且不得带 `Content-Length`/`Transfer-Encoding`。
+fn is_no_entity_status(status: StatusCode) -> bool {
+    status == StatusCode::NO_CONTENT || status == StatusCode::NOT_MODIFIED
+}
+
+/// HEAD/204/304 的统一响应规范化（h1，`Response<BoxBody>`）。
+///
+/// 为什么必须在这里做（而不是指望 hyper）：
+///   * **HEAD**：h1 的 hyper 会丢弃 body，但**不会**为 HEAD 合成 `Content-Length`
+///     （`can_have_implicit_zero_content_length` 明确排除 HEAD）⇒ php/tsx 等引擎
+///     的 HEAD 响应没有 CL（GET 有）—— 规格要求 HEAD「无 body 但有 Content-Length」。
+///   * **h2/h3**：字节路径把引擎返回的 body 原样交给协议层，HEAD 会真的发出 DATA 帧
+///     （对端判 0 长度 body 违规，curl 直接 PROTOCOL_ERROR）。所以 body 必须在分发出口
+///     就地清空；CL 用**原始 body 长度**补齐（引擎自己给了 CL 时保留引擎值）。
+///   * **204/304**：任何方法都不得有 body/CL（引擎若给了也在此剥掉）。
+async fn finalize_app_response(resp: Response<BoxBody>, is_head: bool) -> Response<BoxBody> {
+    let status = resp.status();
+    if !is_head && !is_no_entity_status(status) {
+        return resp;
+    }
+    let no_entity = is_no_entity_status(status);
+    let (mut parts, body) = resp.into_parts();
+    if no_entity {
+        parts.headers.remove(CONTENT_LENGTH);
+        parts.headers.remove(TRANSFER_ENCODING);
+    } else if !parts.headers.contains_key(CONTENT_LENGTH) {
+        // 引擎响应体都是内存态（Full/Bytes），收齐只为拿到长度 —— HEAD 的
+        // Content-Length 必须等于对应 GET 的实体长度。
+        if let Ok(c) = body.collect().await {
+            let n = c.to_bytes().len();
+            if let Ok(v) = http::HeaderValue::from_str(&n.to_string()) {
+                parts.headers.insert(CONTENT_LENGTH, v);
+            }
+        }
+        return Response::from_parts(parts, crate::server::h1::empty());
+    }
+    Response::from_parts(parts, crate::server::h1::empty())
+}
+
+/// [`finalize_app_response`] 的字节版（h2/h3）。
+fn finalize_app_response_simple(resp: Response<Bytes>, is_head: bool) -> Response<Bytes> {
+    let status = resp.status();
+    if !is_head && !is_no_entity_status(status) {
+        return resp;
+    }
+    let len = resp.body().len();
+    let (mut parts, _body) = resp.into_parts();
+    if is_no_entity_status(status) {
+        parts.headers.remove(CONTENT_LENGTH);
+        parts.headers.remove(TRANSFER_ENCODING);
+    } else if !parts.headers.contains_key(CONTENT_LENGTH) {
+        if let Ok(v) = http::HeaderValue::from_str(&len.to_string()) {
+            parts.headers.insert(CONTENT_LENGTH, v);
+        }
+    }
+    Response::from_parts(parts, Bytes::new())
+}
+
+/// 扩展名是否命中应用配置。
+///
+/// 归一化三件事（此前都是字面比较，运维按规格示例写 `[".php"]` 或 `["PHP"]` 时**静默
+/// 不命中**，请求落到静态层回 404 —— 配置合法但应用永远不生效）：
+///   * 前导点：配置项 `.php` 与请求扩展名 `php` 等价（规格 §3.4 示例就是带点的写法）；
+///   * 大小写：`PHP`/`php` 等价（HTTP 扩展名不是大小写敏感的东西，Windows 迁移常见）；
+///   * `*` 仍然是通配。
+///     空扩展名（目录请求 / 无扩展名）**总是命中**：规格 §16.3「目录请求 / 无扩展名 →
+///     用 index 或引擎默认 index」—— 引擎随后把它解析成 `app.index`。旧行为要求配置里显式
+///     写 `""` 才生效，漏写时 `/php/` 整个不路由。
+pub(crate) fn extension_matches(app: &AppRouteConfig, ext: &str) -> bool {
+    // `extensions` 为空 = 该前缀下全部（既有语义）。
+    //
+    // **不要**把「请求无扩展名」也当成恒命中：那会让声明了扩展名的应用抢走
+    // 无扩展名的路径（例如 `extensions=["c"]` 的 `/cga` 抢走 `PUT /cga/deps/bin/index`），
+    // 从而绕过上传闸门（实测：deps/bin/index 被 200 覆盖）。要允许无扩展名请求，
+    // 配置里显式加空串（`extensions = ["c", ""]`，与既有配置样例一致）。
+    if app.extensions.is_empty() {
+        return true;
+    }
+    let want = ext.trim().trim_start_matches('.');
+    app.extensions.iter().any(|e| {
+        let e = e.trim();
+        e == "*" || e.trim_start_matches('.').eq_ignore_ascii_case(want)
+    })
+}
+
+/// G-15：`/c` 的两种形态标签。
 /// `lib_available` 与 `sidecar_engine` fallback 链用的是**同一个判据**
 /// （`app_ffi::resolve_lib` → `is_file`），所以标签与真实路径一致：
 ///   * `.so` 在 → in-process FFI（`c-ffi`）；
 ///   * `.so` 不在 → `deps/bin/index` 的 pthread-per-connection sidecar（`c-sidecar`）。
-/// 只加一个响应头，不改状态码/正文；h1 与 h2/h3 用同一口径。
+///     只加一个响应头，不改状态码/正文；h1 与 h2/h3 用同一口径。
 fn c_engine_mode(app: &AppRouteConfig) -> &'static str {
     if native_http::lib_available(app, "c") {
         "c-ffi"
@@ -577,11 +745,7 @@ fn match_app_indexed<'a>(
         if !path_ok {
             return false;
         }
-        if a.extensions.is_empty() {
-            true
-        } else {
-            a.extensions.iter().any(|e| e == ext || e == "*")
-        }
+        extension_matches(a, ext)
     })
 }
 
@@ -622,11 +786,7 @@ pub fn route_owns_path(lc: &ListenerConfig, path: &str) -> bool {
         if !path_ok {
             return false;
         }
-        if a.extensions.is_empty() {
-            true
-        } else {
-            a.extensions.iter().any(|e| e == ext || e == "*")
-        }
+        extension_matches(a, ext)
     })
 }
 
@@ -742,6 +902,9 @@ async fn dispatch(
                     Err(e) => engine_error(&format!("{engine} ffi"), &e),
                 }
             } else {
+                if engine == "ruby" {
+                    log_ruby_sidecar_fallback(app);
+                }
                 match script_ffi::handle(req, lc, app, peer, app_idx).await {
                     Ok(r) => r,
                     Err(e) => engine_error("script_ffi", &e),
@@ -760,6 +923,7 @@ async fn dispatch(
         // 原来的 app_ffi 执行（stub 给出明确的 502 日志）。
         "rack" => {
             if sidecar_engine::rack_sidecar_preferred(app, lc) {
+                log_rack_sidecar_fallback(app);
                 match sidecar_engine::handle_with_fallback(
                     req, lc, app, peer, app_idx, "rack", "rack",
                 )
@@ -784,6 +948,39 @@ async fn dispatch(
             .body(full(format!("engine `{other}` not implemented")))
             .unwrap(),
     }
+}
+
+/// `/ruby/` 的进程内嵌入不可用时，记一条（每进程一次）明示回落 sidecar 的日志。
+///
+/// 为什么需要：两种形态都是 200，只有 `x-crucible-engine`（ruby / ruby-sidecar）能
+/// 区分；构建日志在部署机未必可见。这里让运行期也留下一条可检索的证据，且用
+/// `Once` 保证不是每请求一条（避免日志洪泛）。
+fn log_ruby_sidecar_fallback(app: &AppRouteConfig) {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    if native_http::lib_available(app, "ruby") {
+        return;
+    }
+    ONCE.call_once(|| {
+        log::info!(
+            "apps: ruby 的 libapp_ruby.so 不可用（构建缺 libruby / 链接失败 / \
+             显式 CRUCIBLE_ENABLE_RUBY_EMBED=0 / 跨 .so 选举失败）→ /ruby/ 使用常驻 \
+             ruby sidecar（deps/bin/index；一次拉起、长期驻留，不是 per-request spawn）"
+        );
+    });
+}
+
+/// `/rack/` 类似：嵌入不可用（stub/未构建/显式关闭）时明示走 rack sidecar。
+fn log_rack_sidecar_fallback(app: &AppRouteConfig) {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    if sidecar_engine::rack_embed_usable(app) {
+        return;
+    }
+    ONCE.call_once(|| {
+        log::info!(
+            "apps: rack 的 libapp_rack.so 不可用（stub/未构建/显式 CRUCIBLE_ENABLE_RACK_EMBED=0）\
+             → /rack/ 使用常驻 rack sidecar（deps/bin/index；不是 per-request spawn）"
+        );
+    });
 }
 
 pub fn reconcile_apps_runtime(live: &LiveConfig) {
@@ -1042,6 +1239,119 @@ mod script_rel_tests {
                 p.starts_with(&canon_root) || p.starts_with(root),
                 "escaped docroot: {p:?}"
             );
+        }
+    }
+}
+
+#[cfg(test)]
+mod response_rules_tests {
+    use super::*;
+
+    fn app_with_exts(exts: &[&str]) -> AppRouteConfig {
+        AppRouteConfig {
+            paths: vec!["/php".into()],
+            enabled: true,
+            engine: "php".into(),
+            socket: None,
+            extensions: exts.iter().map(|s| s.to_string()).collect(),
+            index: Some("index.php".into()),
+            php_bin: None,
+            workers: 1,
+            source_dir: None,
+            out_dir: None,
+            entry: vec![],
+            watch: false,
+            docroot: None,
+            lib: None,
+            deps_dir: None,
+            init_timeout_secs: None,
+            libc: None,
+        }
+    }
+
+    /// 扩展名归一化：前导点（规格示例 `[".php"]`）、大小写、`*`、空扩展名（目录/index）。
+    /// 旧实现字面比较 ⇒ `[".php"]`/`["PHP"]` 永不命中，应用静默不生效（真机 /extupper、
+    /// /extdot 恒 404）。
+    #[test]
+    fn extension_matching_normalizes_dot_and_case() {
+        let dotted = app_with_exts(&[".php"]);
+        assert!(extension_matches(&dotted, "php"));
+        assert!(!extension_matches(&dotted, "txt"));
+        let upper = app_with_exts(&["PHP"]);
+        assert!(extension_matches(&upper, "php"));
+        assert!(extension_matches(&upper, "Php"));
+        let multi = app_with_exts(&["php", "phtml"]);
+        assert!(extension_matches(&multi, "phtml"));
+        let star = app_with_exts(&["*"]);
+        assert!(extension_matches(&star, "anything"));
+        // 无扩展名**不**恒命中：只有显式声明空串的应用才接无扩展名请求（防抢路由/绕闸门）。
+        assert!(!extension_matches(&dotted, ""));
+        assert!(extension_matches(&app_with_exts(&["", "php"]), ""));
+        assert!(extension_matches(&app_with_exts(&["php", ""]), ""));
+        // extensions 为空 = 该前缀下全部（既有语义不变）。
+        let all = app_with_exts(&[]);
+        assert!(extension_matches(&all, "any"));
+        assert!(extension_matches(&all, ""));
+    }
+
+    /// URL percent-decode：编码文件名/中文可解析；非法转义原样保留。
+    #[test]
+    fn decode_path_handles_unicode_and_bad_escapes() {
+        assert_eq!(super::app_ffi::decode_path("/a%20b.cgi"), "/a b.cgi");
+        assert_eq!(super::app_ffi::decode_path("/%E4%B8%AD%E6%96%87"), "/中文");
+        assert_eq!(super::app_ffi::decode_path("/%zz"), "/%zz");
+        assert_eq!(super::app_ffi::decode_path("/plain"), "/plain");
+    }
+
+    /// HEAD：body 必须为空、Content-Length 来自原始 body 长度；204/304 无 CL/TE。
+    /// 旧行为：h1 的 hyper 不为 HEAD 合成 CL（php/tsx HEAD 无 CL），h2/h3 直接把
+    /// 引擎 body 发成 DATA 帧（对端 PROTOCOL_ERROR）。
+    #[test]
+    fn head_gets_content_length_and_no_body() {
+        let resp = Response::builder()
+            .status(StatusCode::OK)
+            .header(http::header::CONTENT_TYPE, "text/plain")
+            .body(Bytes::from_static(b"hello world"))
+            .unwrap();
+        let h = finalize_app_response_simple(resp, true);
+        assert_eq!(h.status(), StatusCode::OK);
+        assert_eq!(h.body().len(), 0);
+        assert_eq!(
+            h.headers().get(CONTENT_LENGTH).unwrap(),
+            http::HeaderValue::from_static("11")
+        );
+        // GET 不受影响
+        let resp = Response::builder()
+            .status(StatusCode::OK)
+            .body(Bytes::from_static(b"hello"))
+            .unwrap();
+        let g = finalize_app_response_simple(resp, false);
+        assert_eq!(g.body(), &Bytes::from_static(b"hello"));
+        assert!(g.headers().get(CONTENT_LENGTH).is_none());
+        // 引擎已给 CL（例如 sidecar）→ 保留引擎值
+        let resp = Response::builder()
+            .status(StatusCode::OK)
+            .header(CONTENT_LENGTH, "168")
+            .body(Bytes::from_static(b""))
+            .unwrap();
+        let h = finalize_app_response_simple(resp, true);
+        assert_eq!(h.headers().get(CONTENT_LENGTH).unwrap(), "168");
+        assert!(h.body().is_empty());
+    }
+
+    #[test]
+    fn no_entity_status_drops_body_and_length() {
+        for status in [StatusCode::NO_CONTENT, StatusCode::NOT_MODIFIED] {
+            let resp = Response::builder()
+                .status(status)
+                .header(CONTENT_LENGTH, "5")
+                .header(TRANSFER_ENCODING, "chunked")
+                .body(Bytes::from_static(b"hello"))
+                .unwrap();
+            let r = finalize_app_response_simple(resp, false);
+            assert!(r.body().is_empty());
+            assert!(r.headers().get(CONTENT_LENGTH).is_none());
+            assert!(r.headers().get(TRANSFER_ENCODING).is_none());
         }
     }
 }

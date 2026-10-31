@@ -21,7 +21,7 @@
 //! 「先 stream.core 后 conn.conn_sent」，全文件一致**，避免 AB-BA。
 
 use super::proto::{
-    self, err, parse_frames, put_varint, varint_len, Frame, ProtoError, RecordReader,
+    err, parse_frames, put_varint, varint_len, Frame, ProtoError, RecordReader,
     TransportParams, DEFAULT_MAX_RECORD_SIZE,
 };
 use anyhow::Result;
@@ -156,7 +156,7 @@ impl Conn {
     }
 
     /// 把帧按对端 `max_record_size` 装箱入队（帧不跨记录）。返回**没能入队**的帧。
-    fn push_frames(&self, mut frames: Vec<Frame>) -> Vec<Frame> {
+    fn push_frames(&self, frames: Vec<Frame>) -> Vec<Frame> {
         let max = self.peer_max_record.load(Ordering::Relaxed).max(1) as usize;
         let mut body: Vec<u8> = Vec::new();
         let mut in_body = 0usize;
@@ -1008,7 +1008,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::server::qmux::proto::{err, put_varint, QX_TP_TYPE};
+    use crate::server::qmux::proto::{self, err, put_varint, QX_TP_TYPE};
 
     /// 测试用客户端：手写帧，直接对 `proto` 编解码。
     struct Client {

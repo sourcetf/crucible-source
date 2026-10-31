@@ -16,7 +16,7 @@ import json
 import sqlite3
 from pathlib import Path
 
-from geoip_common import DEFAULT_DB, init_schema, set_meta_flag
+from geoip_common import DEFAULT_DB, current_dir, data_root, init_schema, set_meta_flag
 from geoip_blacklist import SOURCE_BLACKLIST
 
 GEO_FIELDS = [
@@ -87,8 +87,8 @@ def in_blacklist(ip_start: str, ip_end: str, entries: list[str]) -> bool:
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--db", default=DEFAULT_DB)
-    ap.add_argument("--root", default="data/geoip/current")
-    ap.add_argument("--blacklist", default="data/geoip/blacklist.json")
+    ap.add_argument("--root", default=str(current_dir()))
+    ap.add_argument("--blacklist", default=str(data_root() / "blacklist.json"))
     ap.add_argument("--skip-source-purge", action="store_true",
                     help="只清 CIDR 黑名单（源库 purge 幂等但耗时）")
     args = ap.parse_args()
@@ -96,14 +96,14 @@ def main() -> int:
     entries: list[str] = []
     if bl_path.is_file():
         entries = json.loads(bl_path.read_text(encoding="utf-8")).get("entries", [])
-    current_dir = Path(args.root)
+    current_path = Path(args.root)
     conn = sqlite3.connect(args.db)
     removed = 0
     try:
         init_schema(conn)
         # 1) 源库黑名单（Ip2Region / DB-IP）
         if not args.skip_source_purge:
-            stats = purge_source_blacklist(conn, current_dir)
+            stats = purge_source_blacklist(conn, current_path)
             for k, v in stats.items():
                 print(f"geoip_purge_blacklisted: {k} purged/cleared {v}")
         # 2) 手工 CIDR 黑名单整行删除

@@ -1,9 +1,14 @@
 #!/bin/sh
 # Rack app engine — 常驻 sidecar（deps/bin/index）。
 #
-# 为什么不是 libapp_rack.so 嵌入 MRI：OpenBSD 上把 MRI 嵌进多线程宿主会在 boot/
-# 请求期崩掉整个 webserver（见 libs/app-engines/rack/rack_engine.c 与
-# scripts/build_script_ffi.sh 的说明），该平台默认只产出「诚实失败」stub。
+# 定位（wave22 起）：**回落路径**，不是默认。Linux 默认产出 libapp_rack.so
+# （进程内 MRI 嵌入；若同构建也有 libapp_ruby.so，rack 会把请求投递到它的共享
+# MRI 宿主线程，见 rack_engine.c）。/rack/ 只看 deps/ 的条件与 /ruby/ 相同：
+# 构建缺 ruby.h/libruby、显式 CRUCIBLE_ENABLE_RACK_EMBED=0，或
+# `rack_embed_usable()` 判定 .so 只是「诚实失败 stub」。
+# OpenBSD 上把 MRI 嵌进多线程宿主会在 boot/请求期崩掉整个 webserver（见
+# libs/app-engines/rack/rack_engine.c 与 scripts/build_script_ffi.sh 的说明），
+# 该平台默认只产出「诚实失败」stub，由这里兜底。
 # 这里生成 deps/bin/index，让 native_http 拉起**一次、长期驻留**的 sidecar.rb：
 # 不是 per-request spawn（不是 CGI），崩溃也不会带走 webserver。
 #

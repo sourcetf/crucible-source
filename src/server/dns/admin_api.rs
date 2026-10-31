@@ -49,10 +49,17 @@ async fn handle_inner(
             }
             p if p.ends_with("/api/dns/records") => {
                 let q = req.uri().query().unwrap_or("");
-                let zone = q
+                let zone_in = q
                     .split('&')
                     .find_map(|kv| kv.strip_prefix("zone="))
                     .unwrap_or("");
+                // 尾点/大小写归一：面板下拉给的是存储名，手工 curl 可能给
+                // `Example.com.`；不归一会静默返回空表。
+                let zone_owned = super::resolve_zone_name(zone_in)
+                    .ok()
+                    .flatten()
+                    .unwrap_or_else(|| zone_in.to_string());
+                let zone = zone_owned.as_str();
                 // 从区的记录不在 DB 里：named 传输后写进自己的 zone 文件。面板要显示就得读盘
                 // 上那份（readonly 告知前端不要给编辑/删除）。文件还没生成（传输未完成）时
                 // 返回空表 + note，而不是 500 —— 那只是「还没同步过来」。
@@ -113,10 +120,7 @@ async fn handle_inner(
                     };
                 }
                 if let Some(x) = v.get("ns_glue") {
-                    dc.ns_glue = match x.as_str() {
-                        Some(s) => Some(s.trim().to_string()),
-                        None => None,
-                    };
+                    dc.ns_glue = x.as_str().map(|s| s.trim().to_string());
                 }
                 persist_and_reconcile(&dc).await?;
                 Ok(json!({"ok": true, "modes": dc.modes}))
@@ -150,8 +154,35 @@ async fn handle_inner(
                         let name = v["name"].as_str().ok_or("name?")?.to_string();
                         let text = v["text"].as_str().ok_or("text?")?;
                         let mode = v["mode"].as_str().unwrap_or("merge").to_string();
-                        if !valid_name(&name) {
+                        if !super::valid_zone_name(&name) {
                             return Err(format!("bad zone name {name:?}"));
+                        }
+                        // 导入必须落到**已存在的 master 分区**：旧实现只查 valid_name，
+                        // 分区不存在时记录照写库 —— 面板回 ok、`dig` 永远查不到（write_all
+                        // 只为 zones 表里的分区生成文件），从区导入也会被下一次 AXFR 覆盖。
+                        // 大小写/尾点按 DNS 语义归一后再找，避免 `Example.com.` 造出第二份
+                        // 记录（DB 的 zones.name 是唯一键而 records.zone 不唯一）。
+                        let zones = list_zones().map_err(|e| e.to_string())?;
+                        let canon = super::canonical_zone_name(&name);
+                        let zrow = zones
+                            .iter()
+                            .find(|z| super::canonical_zone_name(&z.name) == canon)
+                            .ok_or_else(|| {
+                                format!(
+                                    "分区 {name:?} 不存在：导入前请先建区（面板「DNS 分区」），\
+                                     否则记录入库后不会被任何 view 加载"
+                                )
+                            })?
+                            .clone();
+                        if zrow.kind != "master" {
+                            return Err(format!(
+                                "分区 {:?} 是从区（{}）：记录由 named 的 AXFR/IXFR 维护，不能导入",
+                                zrow.name, zrow.kind
+                            ));
+                        }
+                        let name = zrow.name;
+                        if mode != "merge" && mode != "replace" {
+                            return Err(format!("bad import mode {mode:?}（merge|replace）"));
                         }
                         let parsed = parse_zone_text(text, &name)?;
                         // SOA 一律丢弃：它由 gen_zone_file_monotonic_ext 统一生成并保证
@@ -159,9 +190,17 @@ async fn handle_inner(
                         // 文件里的旧值（面板改动写进文件、BIND 判定未变不重载），
                         // 再来一条还会双 SOA 让 named 拒载整个区。
                         let (recs, dropped_soa) = drop_soa_records(parsed);
-                        // 落库前把 add_record 的守卫（rdata 单行/长度上限）在**解析阶段**
-                        // 全量跑一遍：mode=replace 会先清空本分区，若写到一半才失败，
-                        // 旧记录已经没了、新记录只落一半 —— 与「不落半截数据」的承诺相悖。
+                        // 只有 SOA 的输入在 merge 下是空操作、在 replace 下会**清空整个
+                        // 分区** —— 两者都不是用户想要的，明确拒绝（不落半截数据）。
+                        if recs.is_empty() {
+                            return Err(format!(
+                                "没有可导入的记录（丢弃了 {dropped_soa} 条自动生成的 SOA 后为空）"
+                            ));
+                        }
+                        // 落库前把 add_record 的守卫（rdata 单行/长度上限/TTL 上限）在
+                        // **解析阶段**全量跑一遍：mode=replace 会先清空本分区，若写到一半
+                        // 才失败，旧记录已经没了、新记录只落一半 —— 与「不落半截数据」的
+                        // 承诺相悖。
                         for r in &recs {
                             if r.rdata.is_empty()
                                 || r.rdata.len() > 4096
@@ -169,6 +208,13 @@ async fn handle_inner(
                                 || r.rdata.contains('\r')
                             {
                                 return Err(format!("记录 {} {} 的值不合法（单行且 ≤4096 字节）", r.name, r.rtype));
+                            }
+                            // TTL 是 31 位（RFC 2181）：>2^31-1 会让 named 拒载整个分区。
+                            if u64::from(r.ttl) > super::MAX_TTL {
+                                return Err(format!(
+                                    "记录 {} {} 的 TTL {} 超过 2147483647（named 会拒载整个分区）",
+                                    r.name, r.rtype, r.ttl
+                                ));
                             }
                             // 按类型语义校验（A/AAAA 必须是 IP 字面量、CNAME/NS/PTR 目标
                             // 必须是域名）：与 add_record 同一判据。replace 会先清空本分区，
@@ -202,18 +248,21 @@ async fn handle_inner(
                             .collect();
                         super::check_zone_snippet(&name, &rows)
                             .map_err(|e| format!("{e:#}"))?;
-                        if mode == "replace" {
-                            del_zone_records(&name).map_err(|e| e.to_string())?;
-                        }
-                        let mut n = 0usize;
-                        for r in &recs {
-                            // 批量已验过整份 zone，逐条不再 fork named-checkzone。
-                            super::add_record_unchecked(
-                                &name, "", &r.name, &r.rtype, r.ttl, &r.rdata,
-                            )
-                            .map_err(|e| e.to_string())?;
-                            n += 1;
-                        }
+                        // 整批在同一把锁内「先删后写」：旧实现逐条加锁，两个并发导入
+                        // 会交错成「A 删完、A/B 各写一半」的混合分区。
+                        let rows: Vec<(String, String, u32, String)> = recs
+                            .iter()
+                            .map(|r| {
+                                (
+                                    r.name.clone(),
+                                    r.rtype.to_ascii_uppercase(),
+                                    r.ttl,
+                                    r.rdata.clone(),
+                                )
+                            })
+                            .collect();
+                        let n = super::import_zone_records(&name, mode == "replace", &rows)
+                            .map_err(|e| format!("{e:#}"))?;
                         // 本 match 各分支统一返回 ()（函数尾部回 {"ok":true}），
                         // 条数记日志；前端刷新记录表即可看到「共 N 条」。
                         log::info!(
@@ -240,7 +289,7 @@ async fn handle_inner(
                             .map_err(|e| e.to_string())?;
                     }
                 }
-                reconcile_current(&live).await?;
+                reconcile_current(live).await?;
                 Ok(json!({"ok": true}))
             }
             p if p.ends_with("/api/dns/records") => {
@@ -254,23 +303,35 @@ async fn handle_inner(
                         let zone = v["zone"].as_str().ok_or("zone?")?;
                         let name = v["name"].as_str().unwrap_or("@");
                         let rtype = v["rtype"].as_str().ok_or("rtype?")?;
-                        let ttl = v["ttl"].as_u64().unwrap_or(3600) as u32;
+                        // 不能 `as u64 as u32`：4294967296 会被静默截断成 0（面板显示
+                        // 4294967296、服务里 TTL 0）；>2^31-1 还会让 named 拒载整个分区。
+                        let ttl = super::validate_ttl(v["ttl"].as_u64().unwrap_or(3600))
+                            .map_err(|e| format!("{e:#}"))?;
                         let rdata = v["rdata"].as_str().ok_or("rdata?")?;
                         let line = v["line"].as_str().unwrap_or("");
                         // 线路名的记录只会落进 `line == 线路名` 的那个 view 的 zone 文件
                         // （write_all 按 line 过滤）。线路名写错/线路被删/geo 关掉时，
                         // 记录照样入库、面板照样显示「成功」，但没有任何 view 加载它
                         // —— 与从区只读守卫同一类假成功，这里直接拒绝。
-                        if !line.is_empty() && !dc.geo.lines.iter().any(|l| l.name == line) {
-                            return Err(format!(
-                                "线路 {line:?} 不存在（geo.lines），该记录不会被任何 view 加载"
-                            ));
+                        // geo.enabled=false 时即使 lines 还残留在配置里也不会生成 view，
+                        // 所以必须同时要求 geo 开启。
+                        if !line.is_empty() {
+                            if !dc.geo.enabled {
+                                return Err(format!(
+                                    "线路 {line:?} 不可用：[dns.geo] enabled=false，记录不会被任何 view 加载"
+                                ));
+                            }
+                            if !dc.geo.lines.iter().any(|l| l.name == line) {
+                                return Err(format!(
+                                    "线路 {line:?} 不存在（geo.lines），该记录不会被任何 view 加载"
+                                ));
+                            }
                         }
                         add_record(zone, line, name, rtype, ttl, rdata)
                             .map_err(|e| e.to_string())?;
                     }
                 }
-                reconcile_current(&live).await?;
+                reconcile_current(live).await?;
                 Ok(json!({"ok": true}))
             }
             // DNSSEC（需求 3/4/5）：策略保存 / 一键生成 / 私钥上传
@@ -322,7 +383,7 @@ async fn handle_inner(
                         let also = zone_also_notify(name);
                         add_zone("slave", name, &primaries, &axfr, refresh, &also)
                             .map_err(|e| e.to_string())?;
-                        reconcile_current(&live).await?;
+                        reconcile_current(live).await?;
                         Ok(json!({"ok": true}))
                     }
                 }
@@ -510,7 +571,7 @@ async fn handle_inner(
                 Ok(json!({ "lines": lines, "mmdb": mmdb_info }))
             }
             p if p.ends_with("/api/dns/reload") => {
-                reconcile_current(&live).await?;
+                reconcile_current(live).await?;
                 Ok(json!({"ok": true}))
             }
             // JSP 编译按钮（§7.5/§8）：sidecar jar precompile 优先，输出原样回显
@@ -604,7 +665,18 @@ where
     serde_json::from_value(base).map_err(|e| e.to_string())
 }
 
+/// 面板配置保存的串行化。
+///
+/// `persist_and_reconcile` 是「校验 → 写 panel.toml → reconcile」三步；两个并发保存
+/// （双击、两个标签页、客户端超时重试）会交错：A 校验通过 → B 校验并写入 → A 写入
+/// → 两次 reconcile 各用自己那份 `dc` 生成 named.conf。最终 panel.toml 与 named.conf
+/// 可能来自不同请求，而 `effective()` 之后读 panel.toml 又与运行中的 named 不一致。
+/// 用 tokio Mutex（跨 await 持有；std MutexGuard 不是 Send，不能跨 await）。
+static PANEL_WRITE_LOCK: once_cell::sync::Lazy<tokio::sync::Mutex<()>> =
+    once_cell::sync::Lazy::new(|| tokio::sync::Mutex::new(()));
+
 async fn persist_and_reconcile(dc: &DnsConfig) -> Result<(), String> {
+    let _guard = PANEL_WRITE_LOCK.lock().await;
     // **先校验再写 panel.toml**：panel.toml 是 `effective()` 的权威来源，非法值
     // （listen_addr 关键字/v6、geo 线路名带点、rpz 值不是 IP……）一旦先落进那份文件，
     // 之后每一次 reconcile —— 包括**启动时**的那次 —— 都在 write_all 里失败：

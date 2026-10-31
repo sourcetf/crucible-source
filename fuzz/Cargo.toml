@@ -3,15 +3,36 @@ name = "crucible-fuzz"
 version = "0.0.0"
 edition = "2021"
 publish = false
+build = "build.rs"
 
 [package.metadata]
 cargo-fuzz = true
 
+[lib]
+name = "crucible_fuzz"
+path = "src/lib.rs"
+# 生产源码用 include! 编进来，文件的 `#[cfg(test)] mod tests` 会跟着进来；
+# 那些测试引用完整 crate 的 config 类型，在 fuzz crate 里没有对应桩。
+# 本 crate 不做单测（fuzz target 本身就是驱动），关掉 lib test/doctest。
+test = false
+doctest = false
+
 [dependencies]
 libfuzzer-sys = "0.4"
-httparse = "1"
 anyhow = "1"
+bytes = "1"
 http = "1"
+http-body-util = "0.1"
+httpdate = "1"
+httparse = "1"
+hyper = "1"
+libc = "0.2"
+log = "0.4"
+once_cell = "1"
+parking_lot = "0.12"
+percent-encoding = "2"
+serde = { version = "1", features = ["derive"] }
+tokio = { version = "1", features = ["full"] }
 
 [[bin]]
 name = "h1fast"
@@ -21,8 +42,8 @@ doc = false
 bench = false
 
 [[bin]]
-name = "hostval"
-path = "fuzz_targets/hostval.rs"
+name = "qmux_proto"
+path = "fuzz_targets/qmux_proto.rs"
 test = false
 doc = false
 bench = false
@@ -35,29 +56,8 @@ doc = false
 bench = false
 
 [[bin]]
-name = "rdata"
-path = "fuzz_targets/rdata.rs"
-test = false
-doc = false
-bench = false
-
-[[bin]]
-name = "iputil"
-path = "fuzz_targets/iputil.rs"
-test = false
-doc = false
-bench = false
-
-[[bin]]
-name = "page_rules"
-path = "fuzz_targets/page_rules.rs"
-test = false
-doc = false
-bench = false
-
-[[bin]]
-name = "tlsprobe"
-path = "fuzz_targets/tlsprobe.rs"
+name = "upload_path"
+path = "fuzz_targets/upload_path.rs"
 test = false
 doc = false
 bench = false

@@ -10,9 +10,9 @@ import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
-from geoip_common import DEFAULT_DB, init_schema, upsert_anycast  # noqa: E402
+from geoip_common import DEFAULT_DB, init_schema, sources_dir, upsert_anycast  # noqa: E402
 
-DUMP = Path("data/geoip/sources/ripe.db")
+DUMP = sources_dir() / "ripe.db"
 ANYCAST_RE = re.compile(r"anycast", re.I)
 RANGE_RE = re.compile(r"^(\d+\.\d+\.\d+\.\d+)\s*-\s*(\d+\.\d+\.\d+\.\d+)$")
 

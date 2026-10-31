@@ -21,16 +21,25 @@
 //! 互斥，于是在 A（带 .env）在飞时并发的 B（无 .env）会读到 A 的私密值（跨应用秘密泄漏）。
 //! 空组跨引擎同身份，所以「无 .env」请求彼此仍并发（§13.8 的 sleep-CGI DoS 不回归）。
 //!
-//! # 「慢空请求挡住带 .env 的同族请求」的剩余面
+//! # 「慢空请求挡住带 .env 的同族请求」的剩余面（R-03 能力矩阵）
 //!
-//! 进程 env 只有一个：**仍靠它承载 `.env`** 的引擎（wsgi/asgi/uwsgi/lua/php/…）
-//! 之间，「不同内容组」本来就必须串行 —— 这是正确性约束，不是锁实现问题。
-//! 真正可消除的是**读路径引擎**的排队：cgi/cgi_script 早已按子进程 envp 传 `.env`
-//!（`appengine_env_isolation` 自报，见 `app_ffi::EngineLib::env_free`），本波把
-//! **python 脚本引擎**也改成自报隔离（TLS 覆盖表 + 启动期基底对齐，见
-//! `libs/script-ffi/script_engine.c` 的 `appengine_env_isolation`）—— 慢的空请求
-//! 不再挡住 python 的带 `.env` 请求。其余引擎若要同样收益，需逐个改成按请求传 env
-//!（属引擎级大改，未在宿主锁里硬拆：拆了就等于允许它们读到别人的秘密）。
+//! 进程 env 只有一个：**仍靠它承载 `.env`** 的引擎之间，「不同内容组」本来就必须
+//! 串行 —— 这是正确性约束，不是锁实现问题。宿主**不再**按引擎名硬编码名单：
+//! 每个 `.so` 通过 `appengine_env_isolation()` **自报**它是否按请求/子进程传 env
+//!（判据见 `app_ffi::EngineLib::env_free`），自报者跳过本锁。
+//!
+//! 当前已解耦（慢空请求不会挡住带 `.env` 请求）：
+//! * `cgi`/`cgi_script`：子进程 envp = 启动期基底 + 本请求 `.env`；
+//! * `python`（script-ffi）：`_CrucibleEnv` 线程本地覆盖 + 启动期基底；
+//! * `wsgi`/`asgi`/`uwsgi`：`_CrucibleReqEnv` 线程感知 `os.environ` 代理
+//!   （`crucible_pyembed.h` 的 env 窗口），`extra` JSON 每请求下发；
+//! * `lua`：每请求 `lua_State` 的 `os.getenv` 闭包覆盖表；
+//! * `php`/`fastcgi`：`.env` 作为 FastCGI 请求参数逐请求传递（本模块不参与）。
+//!
+//! 仍留在锁内（能力矩阵的诚实边界）：`rack`/`psgi`/`perl`/`ruby`（解释器 ENV
+//! 全局）、`asp`/`aspnet`/`tsx` 以及 `c`/`go`/`rust`（`appengine_apply_extra`
+//! 就是 `setenv`；这些 .so 不自报隔离）。它们之间的慢空请求仍会挡住同族带 `.env`
+//! 请求；要消掉需把这些引擎逐个改成按请求传 env（引擎级改动）。
 
 use once_cell::sync::Lazy;
 use parking_lot::{Condvar, Mutex};

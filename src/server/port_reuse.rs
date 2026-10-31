@@ -1,7 +1,5 @@
 //! port_reuse TLS 路由 — peek ClientHello → parse_sni → 目标 ssl listener 直通.
 //! 实际在 accept 热路径调用 peek_sni()；TCP forward 由 proxy_to_ssl_listener() 完成.
-use std::net::SocketAddr;
-use std::path::Path;
 
 pub fn peek_sni(buf: &[u8]) -> Option<String> {
     if let Some(s) = crate::server::tls::client_hello::parse_sni(buf) { return Some(s); }
@@ -14,8 +12,8 @@ pub fn peek_sni(buf: &[u8]) -> Option<String> {
 //
 // 教训：同一段逻辑有第二份实现时，先改的那份会被当成「已修」，实际生效的却是另一份。
 
+#[derive(Default)]
 pub struct SniRouter { routes: parking_lot::RwLock<std::collections::HashMap<String, usize>> }
-impl Default for SniRouter { fn default() -> Self { Self { routes: Default::default() } } }
 impl SniRouter {
     pub fn new() -> std::sync::Arc<Self> { std::sync::Arc::new(Self::default()) }
     pub fn register(&self, sni: &str, idx: usize) { self.routes.write().insert(sni.to_lowercase(), idx); }

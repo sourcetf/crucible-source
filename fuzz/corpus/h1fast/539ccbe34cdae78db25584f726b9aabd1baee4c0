@@ -1,0 +1,8 @@
+GET / HTTP/1.1
+Host: ..
+Connection: closET / HTTP/1.1
+Hqst: ..
+Connection: close
+
+e
+

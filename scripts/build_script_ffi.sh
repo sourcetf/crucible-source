@@ -84,29 +84,24 @@ RB_CFLAGS=""; RB_LIBS=""
 # 记录「有头无库/链接失败」的降级项，结束时汇总（避免在几百行编译输出里被淹没）。
 DEGRADED=()
 
-# ---- 嵌入式 Ruby 引擎互斥（fail fast，先于任何编译） ----
+# ---- 嵌入式 Ruby 引擎的默认值与互斥说明 ----
 # MRI 的 VM/GVL 是**进程全局且线程亲和**的：一个进程只能有一次成功的 ruby_init。
-# libapp_ruby.so（script 引擎，专用 MRI 线程）与 libapp_rack.so（app_ffi 池线程）
-# 各自 boot 会二次 ruby_init → `ruby_init_loadpath` 内 SIGSEGV（wave19 core 已证）。
-#   * 默认（ruby embed 关）→ rack embed 按平台默认（Linux 开），/ruby/ 走 sidecar；
-#   * ruby embed=1 且未显式指定 rack → rack 自动转诚实失败版（运行时两 .so 另有
-#     flock 选举兜底：先 boot 者赢，后来者显式 502，不崩进程）；
-#   * 两个都显式=1 → 构建直接失败（这个组合必然把 webserver 打崩，不给机会）。
-RUBY_EMBED_AUTO_OFF_RACK=0
-if [[ "${CRUCIBLE_ENABLE_RUBY_EMBED:-0}" == "1" ]]; then
-  if [[ "${CRUCIBLE_ENABLE_RACK_EMBED:-}" == "1" ]]; then
-    echo "FATAL: CRUCIBLE_ENABLE_RUBY_EMBED=1 与 CRUCIBLE_ENABLE_RACK_EMBED=1 不能同时设置。" >&2
-    echo "       原因：MRI 的 VM/GVL 是进程全局且线程亲和的；libapp_ruby 与 libapp_rack" >&2
-    echo "       各自 ruby_init 会二次初始化 VM → SIGSEGV 整个 webserver（实测 core 496MB）。" >&2
-    echo "       二选一：ruby 嵌入（rack 诚实失败）或 rack 嵌入（ruby 走常驻 sidecar，默认）。" >&2
-    exit 1
-  fi
-  if [[ -z "${CRUCIBLE_ENABLE_RACK_EMBED:-}" ]]; then
-    RUBY_EMBED_AUTO_OFF_RACK=1
-    echo "    NOTE: CRUCIBLE_ENABLE_RUBY_EMBED=1 → rack embed 自动关闭（MRI VM 单一宿主；" \
-         "libapp_rack.so 构建为诚实失败版）"
-  fi
-fi
+# 旧实现里 libapp_ruby.so（script 引擎，专用 MRI 线程）与 libapp_rack.so（app_ffi
+# 池线程）各自 boot 会二次 ruby_init → `ruby_init_loadpath` 内 SIGSEGV（wave19 core
+# 已证）。wave22 起 libapp_ruby **导出共享 MRI 宿主 ABI**（crucible_ruby_host_*），
+# libapp_rack 发现宿主后把整个 Rack 调用作为作业投递到同一条 MRI 线程 —— 两个引擎
+# 可以同时静态嵌入、共用同一个 VM，没有 spawn，也不会二次 ruby_init。
+#
+# 默认值（Linux）：ruby embed=1、rack embed=1。任一引擎缺少头文件/链接失败时，
+# 对应 .so 不产出（/ruby/ 或 /rack/ 自动回落到常驻 sidecar，构建日志明示）。
+# OpenBSD 仍默认关（Ruby 3.4 的 boot 期崩溃无本机复测证据，保持安全默认）。
+# 可用 CRUCIBLE_ENABLE_RUBY_EMBED=0 / CRUCIBLE_ENABLE_RACK_EMBED=0 显式关闭。
+RUBY_EMBED_DEFAULT=0
+case "$(uname -s)" in
+  Linux) RUBY_EMBED_DEFAULT=1 ;;
+esac
+RUBY_EMBED="${CRUCIBLE_ENABLE_RUBY_EMBED:-${RUBY_EMBED_DEFAULT}}"
+RUBY_EMBED_OK=0
 
 detect_python() {
   if pkg-config --exists python3-embed 2>/dev/null; then
@@ -142,13 +137,12 @@ detect_python() {
 
 detect_ruby() {
   # 始终**探测**（rack 的 MRI 嵌入由独立的 CRUCIBLE_ENABLE_RACK_EMBED 控制；
-  # 脚本引擎 ruby 用不用 RB_* 由下面的 CRUCIBLE_ENABLE_RUBY_EMBED 决定）。
-  # 历史：嵌入式 MRI 在 OpenBSD + Ruby 3.4 上启动阶段就 rb_bug → SIGSEGV 整个
-  # webserver 进程（script_engine.c 里的专用 MRI 线程 + RUBY_INIT_STACK + 最小
-  # prelude 都试过，core 栈一致：sigsegv → rb_bug_for_fatal_signal →
-  # ruby_default_signal）。稳定的 /ruby/ 路径是常驻 Ruby sidecar。
-  if [[ "${CRUCIBLE_ENABLE_RUBY_EMBED:-0}" != "1" ]]; then
-    echo "    Ruby script-engine embed disabled by default (CRUCIBLE_ENABLE_RUBY_EMBED=1 to opt in); 仍探测 RB_* 供 rack 使用"
+  # 脚本引擎 ruby 用不用 RB_* 由 RUBY_EMBED 决定）。
+  # 历史：OpenBSD + Ruby 3.4 的嵌入式 MRI 在启动阶段就 rb_bug → SIGSEGV 整个
+  # webserver；Linux + Ruby 3.3.8 在 wave19 修掉 ENV 堆损坏后 1000 请求稳定，
+  # wave22 又加了引擎级超时中断（死循环不再触发宿主 quarantine）与共享宿主 ABI。
+  if [[ "${RUBY_EMBED:-0}" != "1" ]]; then
+    echo "    Ruby script-engine embed disabled (CRUCIBLE_ENABLE_RUBY_EMBED=0); 仍探测 RB_* 供 rack 使用"
   fi
   # OpenBSD 的 ruby 端口装的是**版本化**二进制（ruby34/ruby33…），没有 `ruby` 这个名字；
   # Debian/Ubuntu 用户级解包也只有 ruby3.3 + update-alternatives 符号链接（install_app_runtimes.sh
@@ -312,13 +306,16 @@ echo "==> building libscriptffi.so"
 # 「任一解释器链接失败」连共享锁一起拖挂（本机实测：-lperl 找不到 → 整只降级）。
 ${CC} ${CFLAGS} ${LDFLAGS} -o "${OUT}/libscriptffi.so" "${SRC}/scriptffi.c"
 
+LAST_BUILD_EMBED_OK=0
 build_script_engine() {
   local lang="$1" lflags="$2" llibs="$3"
   local src="${SRC}/script_engine.c"
+  LAST_BUILD_EMBED_OK=0
   echo "==> building libapp_${lang}.so (script_engine; flags=${lflags:-(embed-missing)})"
   if [[ -n "${lflags}" ]]; then
     if ${CC} ${CFLAGS} ${lflags} -DCRUCIBLE_SCRIPT_LANG='"'"${lang}"'"' ${LDFLAGS} \
       -o "${OUT}/libapp_${lang}.so" "${src}" "${COMMON}/appengine_common.c" ${llibs}; then
+      LAST_BUILD_EMBED_OK=1
       return 0
     fi
     echo "WARN: in-process link failed for ${lang}; rebuilding without embeds (fail-closed)" >&2
@@ -330,22 +327,33 @@ build_script_engine() {
 
 # 每只 .so 只拿**自己语言**的 flag（见文件头注释：混用会让一个语言的链接失败拖挂全部）。
 build_script_engine python "${PY_CFLAGS}" "${PY_LIBS}"
-if [[ "${CRUCIBLE_ENABLE_RUBY_EMBED:-0}" == "1" ]]; then
+# Ruby（Linux 默认嵌入）：失败/缺头文件时**不产出** .so，让分派自动回落到常驻
+# sidecar（www-apps/ruby/deps/bin/index）。为什么删而不是留 stub：
+# `native_http::lib_available()` 判的是「文件是否存在」，留一个「每次请求都报
+# embed-missing」的 .so 会让 /ruby/ 恒 502，并抢在持久 sidecar 之前把请求吃掉。
+if [[ "${RUBY_EMBED}" == "1" && -n "${RB_CFLAGS}" ]]; then
   build_script_engine ruby "${RB_CFLAGS}" "${RB_LIBS}"
+  RUBY_EMBED_OK=${LAST_BUILD_EMBED_OK}
+  if [[ "${RUBY_EMBED_OK}" != "1" ]]; then
+    echo "WARN: CRUCIBLE_ENABLE_RUBY_EMBED=1 但 libapp_ruby.so 构建失败 → 删除该 .so，" \
+         "/ruby/ 自动回落到常驻 sidecar（日志见上）" >&2
+  fi
 else
-  # 脚本引擎默认不嵌入 MRI（见 detect_ruby 注释）；RB_* 仍供 rack 使用。
   build_script_engine ruby "" ""
+  if [[ "${RUBY_EMBED}" == "1" ]]; then
+    echo "WARN: ruby embed 已请求（默认 Linux 开启）但未探测到 ruby.h/libruby → " \
+         "/ruby/ 自动回落到常驻 sidecar（CRUCIBLE_ENABLE_RUBY_EMBED=0 可显式关闭）" >&2
+  fi
 fi
 build_script_engine perl   "${PL_CFLAGS}" "${PL_LIBS}"
 
-# Ruby embed 关闭时：**删掉**可能残留的 libapp_ruby.so。
-# 为什么删而不是留 stub：`native_http::lib_available()` 判的是「文件是否存在」，
-# 留一个「每次请求都报 embed-missing」的 .so 会让 /ruby/ 恒 502，并抢在持久 sidecar
-# （www-apps/ruby/deps/bin/index → sidecar.rb）之前把请求吃掉。删掉之后分派自动落到
-# sidecar：不崩、能用（sidecar 崩了也只是重启它，不影响 webserver 主进程）。
-if [[ "${CRUCIBLE_ENABLE_RUBY_EMBED:-0}" != "1" && -f "${OUT}/libapp_ruby.so" ]]; then
+if [[ "${RUBY_EMBED_OK}" != "1" && -f "${OUT}/libapp_ruby.so" ]]; then
   rm -f "${OUT}/libapp_ruby.so"
-  echo "removed ${OUT}/libapp_ruby.so (ruby embed disabled → persistent sidecar path)"
+  if [[ "${RUBY_EMBED}" == "1" ]]; then
+    echo "removed ${OUT}/libapp_ruby.so (ruby embed requested but unavailable → persistent sidecar path)"
+  else
+    echo "removed ${OUT}/libapp_ruby.so (ruby embed disabled → persistent sidecar path)"
+  fi
 fi
 
 # ---- psgi / rack：与 python/ruby/perl 同一套嵌入，只是引擎源文件不同 ----
@@ -387,36 +395,18 @@ build_extra_engine_stub() {
 
 build_extra_engine psgi "${ROOT}/libs/app-engines/psgi/psgi_engine.c" "${PL_CFLAGS}" "${PL_LIBS}" "Perl"
 
-# rack（嵌入式 MRI）：**默认不启用**，构建诚实失败版。
+# rack（嵌入式 MRI）：Linux 默认启用；OpenBSD 默认关（诚实失败 + 历史崩溃证据）。
 #
-# 为什么：MRI 嵌入在本项目里会**周期性 SIGSEGV 整个进程**。实测（OpenBSD 7.9，
-# ruby 3.4.9）：`GET /rack/` 返回 200 之后数秒到数十秒内进程崩溃（core 456MB，
-# gdb: 信号 11，栈顶在 libruby34.so 的 sigsegv 处理器），**所有监听口一起下线**。
-# 已排除的假设：dlclose（RTLD_NODELETE 常驻映射后仍崩）、shutdown 销毁 VM
-# （appengine_shutdown 是 no-op）。剩下的高置信度原因：MRI 的定时器线程/信号处理
-# 与「从任意原生线程（tokio worker）调用 Ruby API」的组合 —— MRI 要求调用线程先
-# 注册到 VM（rb_thread_call_with_gvl / ruby_thread_init 一族），而 app_ffi 的线程池
-# 不保证「初始化 VM 的线程 == 执行请求的线程」。
-#
-# 启用条件（谁修谁验）：把引擎改成「所有 Ruby 调用都经过一个专用的 Ruby 线程」
-# （或每次调用用 rb_thread_call_with_gvl 包裹），并跑通
-# `curl /rack/` 之后至少 5 分钟不崩 + 连续 1000 次请求。
-#
-# 2026-10-23（runtimes-wave14）：装了 ruby 3.3.8 + ruby-dev 后做了 A/B：
-#   Linux / Ubuntu 26.04（Ruby 3.3.8，libruby-3.3.so.3.3，rack 3.2.4）：
-#     1000 次顺序 + 400 次 32 并发（/rack/）全部 200，进程存活、无 crash；
-#   生产 OpenBSD + Ruby 3.4 历史上是「返回 200 后数秒~数十秒 SIGSEGV 整个进程」。
-# 因此默认策略按**平台**：Linux 默认开（否则 /rack/ 只有 502，规格 §7.3 不可用），
-# OpenBSD 默认关（保持诚实失败 + 已知崩溃证据）；始终可用 CRUCIBLE_ENABLE_RACK_EMBED
-# 显式覆盖（0/1）。
+# 历史：OpenBSD 7.9 + Ruby 3.4.9 在 `GET /rack/` 返回 200 后数秒~数十秒 SIGSEGV
+# 整个进程（core 456MB，栈顶在 libruby34.so 的 sigsegv 处理器）。Linux + Ruby 3.3.8
+# 的 A/B（runtimes-wave14）1000 顺序 + 400×32 并发全部 200。wave22 起，如果同一构建
+# 里也有 libapp_ruby.so，rack 会把所有 Ruby 调用投递到它的共享 MRI 宿主线程
+# （crucible_ruby_host_*），不再由 app_ffi 池线程直接碰 VM；没有宿主时保持 wave19 的
+# 「自建 VM + flock/env 选举」路径。始终可用 CRUCIBLE_ENABLE_RACK_EMBED 显式覆盖。
 RACK_EMBED_DEFAULT=0
 case "$(uname -s)" in
   Linux) RACK_EMBED_DEFAULT=1 ;;
 esac
-# ruby embed 打开时 rack 自动转诚实失败版（互斥检查已在文件前部 fail-fast）。
-if [[ "${RUBY_EMBED_AUTO_OFF_RACK:-0}" == "1" ]]; then
-  RACK_EMBED_DEFAULT=0
-fi
 RACK_EMBED="${CRUCIBLE_ENABLE_RACK_EMBED:-${RACK_EMBED_DEFAULT}}"
 if [[ "${RACK_EMBED}" == "1" && -n "${RB_CFLAGS}" ]]; then
   build_extra_engine rack "${ROOT}/libs/app-engines/rack/rack_engine.c" "${RB_CFLAGS}" "${RB_LIBS}" "Ruby"
@@ -434,8 +424,9 @@ echo "built ${OUT}/libscriptffi.so libapp_{python,ruby,perl,psgi,rack}.so"
 #   解释器却因链接问题降级」排障时很容易看漏，所以汇总。）
 INPROCESS_OK=()
 [[ -n "${PY_CFLAGS}" ]] && INPROCESS_OK+=("python")
-# ruby 只在脚本引擎开关打开时才算「可用」（RB_* 探测成功也可能只供 rack 用）。
-[[ -n "${RB_CFLAGS}" && "${CRUCIBLE_ENABLE_RUBY_EMBED:-0}" == "1" ]] && INPROCESS_OK+=("ruby")
+# ruby 只有「开关打开且嵌入构建成功」才算可用（RB_* 探测成功也可能只供 rack 用；
+# 链接失败时 .so 已删除，实际走 sidecar）。
+[[ -n "${RB_CFLAGS}" && "${RUBY_EMBED}" == "1" && "${RUBY_EMBED_OK}" == "1" ]] && INPROCESS_OK+=("ruby")
 [[ -n "${PL_CFLAGS}" ]] && INPROCESS_OK+=("perl")
 [[ -n "${RB_CFLAGS}" && "${RACK_EMBED:-0}" == "1" ]] && INPROCESS_OK+=("rack")
 if [[ ${#DEGRADED[@]} -gt 0 ]]; then

@@ -893,6 +893,8 @@ mod imp {
         }
     }
 
+    // 参数由调用面决定，拆结构体会改变调用签名（本波只清 warning，不重构）。
+    #[allow(clippy::too_many_arguments)]
     async fn handle_resolver(
         resolver: ::h3::server::RequestResolver<::h3_quinn::Connection, Bytes>,
         live: Arc<LiveConfig>,
@@ -1191,6 +1193,7 @@ mod imp {
                 &live,
                 peer,
                 lc.access_log.as_ref(),
+                lc.connect_udp_framing,
                 &quinn_conn,
                 &h3_shared,
                 datagrams.as_ref(),
@@ -1378,6 +1381,8 @@ use chunked uploads (Content-Range) or HTTP/1.1 for larger bodies\n",
     ///
     /// 早退只记日志、不改状态码：响应头可能已经发出去了。参数里带 `method`/`path`/`t0`
     /// 是为了完成侧那条全字段访问日志。
+    // 参数由调用面决定，拆结构体会改变调用签名（本波只清 warning，不重构）。
+    #[allow(clippy::too_many_arguments)]
     async fn h3_send_response<S>(
         send: &mut ::h3::server::RequestStream<S, Bytes>,
         peer: SocketAddr,
@@ -1569,8 +1574,8 @@ use chunked uploads (Content-Range) or HTTP/1.1 for larger bodies",
     /// * **不需要手工归还流控**：h3-quinn 在 `recv_data()` 消费时自己归还，手工再调会 double-release；
     /// * h3 的 `RecvStream` 只有 async API（没有 poll 版），所以用后台任务 + 通道，
     ///   而不是像 h2 那样直接实现 `poll_data`。
-    /// 任务结束（EOF/出错/超时/接收端丢弃）会 drop recv 半边 ⇒ quinn 发 STOP_SENDING，
-    /// 不会把流吊住。
+    ///   任务结束（EOF/出错/超时/接收端丢弃）会 drop recv 半边 ⇒ quinn 发 STOP_SENDING，
+    ///   不会把流吊住。
     fn h3_body_from_recv<R>(mut recv: ::h3::server::RequestStream<R, Bytes>) -> H3Body
     where
         // `Send + 'static` 是 tokio::spawn 的要求（泵任务要能在别的线程上跑、且不借用外部）：
@@ -2071,12 +2076,16 @@ use chunked uploads (Content-Range) or HTTP/1.1 for larger bodies",
     ///
     /// 失败一律回真实状态码，不回 200：目标解析失败 400、地址不允许 403、
     /// UDP 建不起来 502、非 CONNECT-UDP 或 capsule 形态 501。
+    // 参数由调用面决定，拆结构体会改变调用签名（本波只清 warning，不重构）。
+    #[allow(clippy::too_many_arguments)]
     async fn proxy_connect_udp(
         req: &Request<()>,
         mut stream: ::h3::server::RequestStream<::h3_quinn::BidiStream<Bytes>, Bytes>,
         live: &Arc<LiveConfig>,
         peer: SocketAddr,
         per: Option<&crate::config::ListenerAccessLogConfig>,
+        // G-16：listener 的 CONNECT-UDP 封装策略（`connect_udp_framing`，默认 auto）。
+        framing_pref: crate::config::ConnectUdpFraming,
         quinn_conn: &quinn::Connection,
         h3_shared: &::h3::SharedState,
         datagrams: Option<&Arc<DatagramRouter>>,
@@ -2137,18 +2146,37 @@ use chunked uploads (Content-Range) or HTTP/1.1 for larger bodies",
         let quic_datagram = quinn_conn.max_datagram_size().is_some();
         let quarter_stream_id = stream.id().index();
         let datagram_ok = peer_datagram && quic_datagram && stream.id().is_request();
-        let framing = if datagram_ok {
-            connect_udp::Framing::Datagram
-        } else if connect_udp::wants_capsule_protocol(capsule) {
-            connect_udp::Framing::Capsules
-        } else {
-            connect_udp::Framing::LengthPrefixed
+        // G-16：listener 策略（`connect_udp_framing`）叠加客户端能力协商。
+        // 默认 `auto` 与引入本字段前的协商逐字节一致；策略强制 `datagram` 但能力
+        // 不成立时 select_framing 返回 Err —— 这里明确 501 拒绝，**不静默降级**
+        // （运维显式要求 datagram 时降级等于没落实该要求）。
+        let framing = match connect_udp::select_framing(
+            framing_pref,
+            datagram_ok,
+            connect_udp::wants_capsule_protocol(capsule),
+        ) {
+            Ok(f) => f,
+            Err(e) => {
+                connect_reject(
+                    &mut stream,
+                    live,
+                    peer,
+                    per,
+                    &path,
+                    StatusCode::NOT_IMPLEMENTED,
+                    t0,
+                    &e,
+                )
+                .await;
+                return Ok(());
+            }
         };
         log::info!(
-            "h3 CONNECT-UDP peer={peer} path={path}: framing={:?} \
+            "h3 CONNECT-UDP peer={peer} path={path}: framing={:?} pref={} \
              (peer_h3_datagram={peer_datagram} quic_datagram={quic_datagram} \
              quarter_stream_id={quarter_stream_id})",
-            framing
+            framing,
+            framing_pref.as_str()
         );
 
         // 3. 目标解析 + 准入。
@@ -2323,6 +2351,8 @@ use chunked uploads (Content-Range) or HTTP/1.1 for larger bodies",
     /// 结构上刻意让每个 `select!` 分支的处理器都**不碰**其它分支 future 借用的变量：
     /// 下行收包封在 [`recv_downlink`] 里（它自己借 `buf`，只交出已分帧的 `Bytes`
     /// 或已发送的 DATAGRAM），处理器因此不需要再读 `buf`，借用关系一眼可读。
+    // 参数由调用面决定，拆结构体会改变调用签名（本波只清 warning，不重构）。
+    #[allow(clippy::too_many_arguments)]
     async fn run_udp_tunnel(
         send: &mut ::h3::server::RequestStream<::h3_quinn::SendStream<Bytes>, Bytes>,
         recv: &mut ::h3::server::RequestStream<::h3_quinn::RecvStream, Bytes>,
@@ -2468,11 +2498,20 @@ use chunked uploads (Content-Range) or HTTP/1.1 for larger bodies",
                     Ok(()) => Ok(Downlink::Datagram),
                     Err(quinn::SendDatagramError::TooLarge) => {
                         // QUIC DATAGRAM 必须装进单个 QUIC 包。大于 path MTU 的 UDP
-                        // 报文在 DATAGRAM 模式下无法转发（RFC 9298 不要求代理分片）；
-                        // 丢这一帧并记录 —— 不能退回流内封装（客户端按 DATAGRAM 解析）。
+                        // 报文在 DATAGRAM 模式下无法转发。RFC 9298 §6.1 明文：
+                        // *"the proxy SHOULD NOT send the UDP payload in a DATAGRAM
+                        // capsule"* —— 明确**禁止**退回流内 capsule（客户端按
+                        // DATAGRAM 解析，流内帧会被当成垃圾）。RFC 9298 §3.1 又规定
+                        // 代理 "MUST NOT introduce fragmentation at the IP layer"、
+                        // "overly large datagrams are silently dropped"。
+                        // 故此处按 RFC 丢弃该帧并记一条明确告警（不静默：带字节数），
+                        // 隧道继续存活，后续报文不受影响。（RFC 建议的 ICMP
+                        // Packet Too Big 需要 raw socket/CAP_NET_RAW，普通部署不可用，
+                        // 不做。）
                         log::warn!(
                             "h3 CONNECT-UDP DATAGRAM too large for peer path \
-                             ({n} byte UDP payload), dropped"
+                             ({n} byte UDP payload > QUIC max_datagram_size), \
+                             dropped per RFC 9298 section 6.1; tunnel stays up"
                         );
                         Ok(Downlink::Datagram)
                     }
@@ -2486,6 +2525,8 @@ use chunked uploads (Content-Range) or HTTP/1.1 for larger bodies",
     ///
     /// 访问日志是刻意的：否则隧道（成功的和失败的）在 access log 里完全不可见，
     /// 只能靠 warn 级日志猜。
+    // 参数由调用面决定，拆结构体会改变调用签名（本波只清 warning，不重构）。
+    #[allow(clippy::too_many_arguments)]
     async fn connect_reject(
         stream: &mut ::h3::server::RequestStream<::h3_quinn::BidiStream<Bytes>, Bytes>,
         live: &Arc<LiveConfig>,

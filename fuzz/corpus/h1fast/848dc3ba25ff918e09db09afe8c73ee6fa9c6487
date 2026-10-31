@@ -1,0 +1,99 @@
+GET / HTTP/1.1
+Ht:				öö			GET / HTTP/1.0
+Hgzst: TP.1
+Hgst: TP/1.1
+Hqst: ..
+Connst: .ion: clConnection: closET / HTTP/1.1
+Hqst: ..osETGET / HTTP/1.0
+Hgzst: TP.1
+Hgst: TP/1.1
+Hqst:.osETGET / HTTP/1.0
+Hgzst: TP.1
+Hgst: TP/1.1
+Hqst: ..
+Connst: ..
+Connection: clConnection: closET / HTTP/1.1
+Hqst: ..osEnst: ..
+Connection: clConnection: cl1.0
+Hgzst: TP.1
+Hgst: TP/1.1
+Hqst: ..
+Connst: ..
+Connection: clConnection: closET / HTTP/0.1
+Hqst: ..osET / HTTP/1 / HTTP/1.1.
+Connection: clConT / HTTP/1 / HTTP/1.1.
+Connection: clCon.
+Connection: clConnection: closET  / HTTP/1.1
+Hqst: ..osETGET / HTTP/1.0
+Hgzst: TP.1
+Hgst: TP/1.0
+Hqst: ..
+Connst: ..
+Connection: clConnection: closET / HTTP/1.1
+Hqst: ..osEnst: ..
+Connection: clConnection: cl1.0
+Hgzst: TP.2
+Hgst: TP/1.1
+Hqst: ..
+Connst: ..
+Connection: clConnection: closET / HTTP/1.1
+Hqst: ..
+Connst: ..
+Connection: clConnection: closET / HTTP/1.1
+Hqst: ..osEnst: ..
+Connection: clConnection: cl1.0
+Hgzst: TP.1
+Hgst: ..
+Connection: clConnection: closET / 
+Connection: clConnection: cl1.0
+Hgzst: TP.1
+Hgst: TP/1.1
+Hqst: ..
+Connst: ..
+Connection: clConnection: closET / HTTP/1.1
+Hqst: ..
+Connst: ..
+Connection: clConnection: closET / HTTP/1.1
+Hqst: ..osEnst: ..
+Connection: clConnection: cl1.0
+Hgzst: TP.1
+Hgst: TP/1.1
+Hqst: ..
+Connst: ..
+Connection: clConnection: clo / HTTP/1.1
+Hqst: ..osEnst: ..
+Connection: clConnection: cl1.0
+Hgzst: TP.1
+Hgion: closET / HTTP/0.1
+Hqst: ..osEnst: ..
+Connection: clConnection: cl1.0
+Hgzst: TP.1
+Hgst: TP/1.1
+Hqst: ..
+Connst: ..
+Connection: clConnection: closET / HTTP/1.1
+Hqst: ..
+Connst: ..
+Connection: clConnection: closET / HTTP/1.1
+Hqst: ..osEnst: ..
+Connection: clConnection: cl1.0
+Hgzst: sET / HTTP/1.1
+Hqst: ..osET / HTTP/1 / HT–“““.1.
+Connection: clConT / HTTP/1 / HTTP/1.1.
+Connection: clCon.
+Connection: clConn1
+Hgst: TP/1.1
+Hqst: ..
+Connst: ..
+Connection: clConnection: closET / HTTP/1osET / HTTP/1 / HTTP/1.1.
+Connection: clConT / HTTP/1 / HTTP/0.1.
+Connection: clCon.
+Connection: clConnection: closET  / HTTP/1.1
+Hqst: ..osETGET / HTTP/1.0
+Hgzst:$TP.1
+Hgst:TTP/1.1
+Hqst: ..osET / HTTP/1 / HTTP/1.1.
+Connection: clConT / HTTP/1 / HTTP/1.1.
+Connection: clCon.
+Connection: GET / HTT/P1.1
+HoclConnec

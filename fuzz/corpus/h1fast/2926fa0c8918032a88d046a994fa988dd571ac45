@@ -1,0 +1,5 @@
+GET /lcod HTTP/1.1
+If-Ratct:31
+If-Ratc$: c"
+If-Ratch: "abc"
+:

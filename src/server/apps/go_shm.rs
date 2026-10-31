@@ -94,23 +94,17 @@ pub async fn execute(
     let key = format!("{}-{}-go", lc.port, app_idx);
     let method = req.method().as_str().to_string();
     let path = req.uri().path().to_string();
-    // 与其它引擎口径一致：先把请求体卡在 APP_BODY_CAP 再收。本引擎是唯一漏掉这层的
-    //（php / app_ffi / cgi_script / native_http 都用了 `Limited`），而 GO_SHM_BODY_MAX
-    // (64 KiB) 的检查发生在**整个 body 已在内存里**之后 ⇒ chunked 超大请求能在那之前
-    // 就把进程内存吃光。
-    // 注意 `Limited` 的错误类型不实现 `std::error::Error`，所以只能 match，不能 `?`
-    //（php.rs 同样处理：超限直接 413，不再把 body 收进内存）。
-    let body = match http_body_util::Limited::new(req.into_body(), crate::server::h1::APP_BODY_CAP)
-        .collect()
-        .await
+    // 与其它引擎口径一致：先把请求体卡在 APP_BODY_CAP 再收，并带帧间空闲超时
+    //（GO_SHM_BODY_MAX = 64 KiB 的检查发生在**整个 body 已在内存里**之后，所以这层
+    // 上限必须存在；slowloris 也在这里挡成 408）。
+    let body = match crate::server::apps::collect_app_body(
+        req.into_body(),
+        crate::server::h1::APP_BODY_CAP,
+    )
+    .await
     {
-        Ok(c) => c.to_bytes(),
-        Err(_) => {
-            return Ok(Response::builder()
-                .status(StatusCode::PAYLOAD_TOO_LARGE)
-                .body(full("request body too large"))
-                .unwrap())
-        }
+        Ok(b) => b,
+        Err(e) => return Ok(e.into_response()),
     };
 
     let (status, resp_body) = execute_common(key, method, path, body, peer, lc.port).await?;

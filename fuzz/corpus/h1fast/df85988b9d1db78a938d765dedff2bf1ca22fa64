@@ -1,0 +1,36 @@
+GET / HTTP/1.1
+H.............st: ..
+Connectio.: zclosôET /o, c!,es, GET / HTTP/0.1
+H.......H.............st: ..
+Connectio.:!,es, GET / HTTP/1HTTP/1.1
+H......$.......st: ..
+Connectio.: zclosôET /onectio.: zcLosôET /o, c!,...........st: ..
+Connectio.: cET /o,  / HTTP/1.1
+H.............st: ..
+Connectio.: zclosôET /o, c!,es, GET st: ..
+Connectio.:!,es, GET / HTTP/1HTTP/1.1
+H.............st: ..
+Connectio.: zclosôET /onect,es, çGET / HTTP/1.1
+H.............st: ..
+Connectio.: cET /!,es, bar1
+H.............st: ..
+Connectio.: clo/o, c!,es, bar1
+H......................st: ..
+Connectio.: cET /o, c!,es, bar1
+H.............st: ..
+Connectio.: clo/o, c!,es, bar1
+H.............st: ..
+Connectio.: cloc!,es, bar1
+H.............st: ..
+Connectio.: clo/o, c!,es, bar1
+H......................st: ..
+Connectio.: cET /o, c!,es, bar1
+H.............st: ..
+Connectio.: clo/o, c!,es, bar1
+H.............st: ..
+Connectio.: closôET /o, c!
+~
+
+bar
+~
+

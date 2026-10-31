@@ -1,0 +1,8 @@
+PUT /chunked-trailer.txt HTTP/1.1
+Host: 127.0.0.1:30094
+Transfer-Encoding: chunked
+Trailer: X-Sum
+
+0
+X-Sum: 0
+

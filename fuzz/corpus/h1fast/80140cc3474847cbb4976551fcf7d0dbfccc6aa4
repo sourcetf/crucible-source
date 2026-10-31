@@ -1,0 +1,4 @@
+GET /a HTTP/1.1
+Hos: th
+Transfer-Encodinn: c /a HTTP/1.th
+Transfer-Encodinn: ch

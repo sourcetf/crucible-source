@@ -3,11 +3,15 @@
 #
 # Crucible Rack app engine — 常驻 sidecar（Unix domain socket 上的 HTTP/1.1）。
 #
-# 为什么不是「进程内嵌入 MRI」：OpenBSD 上把 MRI 嵌入多线程宿主进程会在 boot/请求期
-# 崩掉整个 webserver（见 libs/app-engines/rack/rack_engine.c 与
-# scripts/build_script_ffi.sh 的说明），因此该平台默认关闭嵌入，只产出「诚实失败」
-# stub .so。旧的 `/ruby/` 已用常驻 sidecar 解决同一问题；本文件把同一方案给 `/rack/`：
-# **一次拉起、长期驻留**（不是 per-request spawn，不是 CGI），崩溃只影响这个子进程，
+# 定位（wave22 起）：**回落路径**。Linux 默认是 libapp_rack.so 的进程内 MRI 嵌入；
+# 若同一构建也有 libapp_ruby.so，rack 会经 crucible_ruby_host_* 把请求投递到它的
+# 唯一 MRI 宿主线程（仍是无 spawn 的静态嵌入）。/rack/ 走这里的条件是：构建缺
+# ruby.h/libruby（只产出「诚实失败」stub .so）、显式 CRUCIBLE_ENABLE_RACK_EMBED=0，
+# 或 `rack_embed_usable()` 判定 .so 不可用。OpenBSD 上把 MRI 嵌入多线程宿主进程会在
+# boot/请求期崩掉整个 webserver（见 libs/app-engines/rack/rack_engine.c 与
+# scripts/build_script_ffi.sh 的说明），该平台默认只产出「诚实失败」stub。
+# 本文件是 **一次拉起、长期驻留**（不是 per-request spawn，不是 CGI），崩溃只影响
+# 这个子进程，
 # webserver 会在下一次请求时重新拉起。
 #
 # 与 `www-apps/ruby/sidecar.rb` 的协议保持一致：

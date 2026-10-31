@@ -1,0 +1,3 @@
+GET /s HTTP/1.1
+H:303
+Upgra0e:ZQ

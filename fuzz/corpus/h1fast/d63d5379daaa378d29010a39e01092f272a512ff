@@ -1,0 +1,5 @@
+GET /inde HTTP/1.1
+Host:
+If-None-!atch: "
+If-None-!!tch: "a			
+˜˜˜˜˜X-2

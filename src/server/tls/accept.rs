@@ -97,8 +97,13 @@ async fn accept_connection_inner(
     // G-08：开了 `[dns.dot] reuse_tls_port` 时，DoT 客户端用**自己的 SNI**（如
     // dot.example）连同一个站点 TLS 口；sni_only 是针对站点名的过滤，不能把这条
     // 分流连接先杀掉。判据与 boring 侧完全一致（ALPN dot + dot.sni 白名单）。
-    // 只在 sni_only 真的开着时才做这次判定：默认配置下热路径零额外开销。
-    if ssl_cfg.sni_only && dot_reuse_config(&live, &peek).is_none() {
+    //
+    // **只在 DoT 分流真的可用的栈上才跳过 sni_only**：ALPN dot 的分流实现只在
+    // BoringSSL 路径（boring_path::accept_dot_reuse）。若这条 ClientHello 会被路由
+    // 到 NSS/TomCrypt/rustls，放它过 sni_only 只会得到一个「错误 SNI 仍被服务」的
+    // HTTP 连接（legacy 构建上 = 真实的 sni_only 绕过）。因此额外要求 wire=Boring
+    // 且本二进制编译了 tls_boring。
+    if ssl_cfg.sni_only && !dot_split_available(&live, &peek) {
         let want = ssl_cfg
             .sni_name
             .as_deref()
@@ -277,32 +282,98 @@ pub(crate) fn record_need(buf: &[u8]) -> Option<usize> {
     }
 }
 
+/// G-08：把 peek 里**连续的 TLS handshake record**（content type 0x16）重组成一条
+/// handshake 消息，返回从 handshake 头开始的完整字节（含 4 字节 type+length）。
+///
+/// RFC 8446 §5.1：握手消息可以跨多个 TLS record 分片，record 边界与消息边界无关。
+/// 只使用 peek 中已经收到的**完整** record；遇到不完整 record 就停止（调用方
+/// fail-open 到 HTTP，不会等待/阻塞）。非 ClientHello 或畸形输入返回 `None`。
+///
+/// 这是纯函数，输入来自匿名对端：所有长度都做上界/溢出检查（越界读 = 可远程触发
+/// 的 panic）。
+fn reassemble_client_hello(peek: &[u8]) -> Option<Vec<u8>> {
+    if peek.len() < 5 || peek[0] != 0x16 {
+        return None;
+    }
+    let mut out: Vec<u8> = Vec::new();
+    let mut p = 0usize;
+    while p + 5 <= peek.len() {
+        // 每个分片 record 都是 handshake content type；遇到别的类型说明不是
+        // ClientHello 的连续分片（如已进入 ChangeCipherSpec），停止。
+        if peek[p] != 0x16 {
+            break;
+        }
+        let len = u16::from_be_bytes([peek[p + 3], peek[p + 4]]) as usize;
+        let start = p + 5;
+        let Some(end) = start.checked_add(len) else {
+            break;
+        };
+        if end > peek.len() {
+            // 该 record 尚未收全：只用已经完整的前缀。
+            break;
+        }
+        out.extend_from_slice(&peek[start..end]);
+        p = end;
+        if out.len() >= 4 {
+            if out[0] != 0x01 {
+                return None;
+            }
+            let hl = ((out[1] as usize) << 16) | ((out[2] as usize) << 8) | out[3] as usize;
+            if out.len() >= 4 + hl {
+                out.truncate(4 + hl);
+                return Some(out);
+            }
+        }
+        // 握手消息上限 2^24；peek 本身有上限，这里显式兜底防无界累积。
+        if out.len() > 16 * 1024 * 1024 {
+            return None;
+        }
+    }
+    if out.len() >= 4 {
+        Some(out)
+    } else {
+        None
+    }
+}
+
+/// G-08：从（可能跨 record 分片的）ClientHello 里取 SNI。
+///
+/// `client_hello::parse_sni` 只解析「单 record、record 起始」的缓冲。这里把重组后的
+/// handshake 消息再包成一个合成 record 交给它，从而让 SNI 与 ALPN 使用同一份
+/// 分片重组结果（否则 ALPN 在第二个 record、SNI 在第一个 record 时两者判断会分叉）。
+fn client_sni(peek: &[u8]) -> Option<String> {
+    let hs = reassemble_client_hello(peek)?;
+    // 合成 record 的 length 字段是 u16；正常 ClientHello 远小于 64KB，超限按畸形丢弃。
+    let len = u16::try_from(hs.len()).ok()?;
+    let mut rec = Vec::with_capacity(5 + hs.len());
+    rec.extend_from_slice(&[0x16, 0x03, 0x01]);
+    rec.extend_from_slice(&len.to_be_bytes());
+    rec.extend_from_slice(&hs);
+    client_hello::parse_sni(&rec)
+}
+
 /// G-08：ClientHello 的 ALPN 扩展里是否声明了协议 `want`（通常是 `b"dot"`）。
 ///
-/// 输入是 TLS record 起始的 peek 缓冲（与 [`client_hello::parse_sni`] 同一前提）。
+/// 输入是 TLS record 起始的 peek 缓冲（与 [`client_hello::parse_sni`] 同一前提），
+/// 允许握手消息跨 record 分片（见 [`reassemble_client_hello`]）。
 /// 所有长度都做上界检查：peek 来自匿名对端，任何越界读都是可远程触发的 panic。
 /// 返回 `false` 表示「没声明」或「报文不完整/畸形」—— 调用方据此走普通 HTTP，
 /// 因此截断/畸形输入是 fail-open 到 HTTP（而不是误入 DNS handler）。
 pub(crate) fn client_offers_alpn(peek: &[u8], want: &[u8]) -> bool {
-    // TLS record: type(1)=0x16 version(2) length(2)
-    if peek.len() < 5 || peek[0] != 0x16 {
+    // G-08：RFC 8446 §5.1 允许一条握手消息**跨多个 TLS record** 分片。旧实现只看
+    // 第一个 record：ALPN 扩展落在第二个 record 时会被误判成「没声明 dot」⇒ 该连接
+    // 按站点 HTTP 处理，DoT 客户端在复用端口上握手成功却永远拿不到 DNS 应答
+    //（真机用 MemoryBIO 把一个完整 ClientHello 拆成两个 record 复现：ALPN=null）。
+    // 这里先把 peek 里连续的 0x16 record 拼回一条 handshake 消息；后续 record 尚未
+    // 到达/被 PEEK_CAP 截断时按截断处理 —— fail-open 到 HTTP，绝不误入 DNS handler。
+    let Some(hs) = reassemble_client_hello(peek) else {
         return false;
-    }
-    let rec_len = u16::from_be_bytes([peek[3], peek[4]]) as usize;
-    let rec_end = match 5usize.checked_add(rec_len) {
-        Some(e) if e <= peek.len() => e,
-        _ => return false,
     };
-    let hs = &peek[5..rec_end];
-    // Handshake: type(1)=ClientHello(0x01) length(3)
+    // Handshake: type(1)=ClientHello(0x01) length(3)（reassemble 已校验并按长度截断）
     if hs.len() < 4 || hs[0] != 0x01 {
         return false;
     }
-    let hl = ((hs[1] as usize) << 16) | ((hs[2] as usize) << 8) | hs[3] as usize;
-    if hl > hs.len().saturating_sub(4) {
-        return false;
-    }
-    let body = &hs[4..4 + hl];
+    let body = &hs[4..];
     // legacy_version(2) random(32) session_id_len(1) ...
     if body.len() < 35 {
         return false;
@@ -339,7 +410,7 @@ pub(crate) fn client_offers_alpn(peek: &[u8], want: &[u8]) -> bool {
             let list_len = u16::from_be_bytes([body[s], body[s + 1]]) as usize;
             let list_end = (s + 2).saturating_add(list_len).min(e);
             let mut q = s + 2;
-            while q + 1 <= list_end {
+            while q < list_end {
                 let l = body[q] as usize;
                 let name_end = match q.checked_add(1 + l) {
                     Some(n) if n <= list_end => n,
@@ -377,13 +448,27 @@ pub(crate) fn dot_reuse_config(
         return None;
     }
     if !dc.dot.sni.is_empty() {
-        let sni = client_hello::parse_sni(peek)?;
+        // G-08：与 ALPN 一样按重组后的握手消息取 SNI（支持跨 record 分片的
+        // ClientHello，避免「ALPN 命中但 SNI 被误判为缺失」）。
+        let sni = client_sni(peek)?;
         if !dc.dot.sni.iter().any(|n| sni_host_eq(n, &sni)) {
             log::debug!("dot reuse: ALPN=dot 但 SNI={sni:?} 不在 [dns.dot].sni 白名单，按站点流量处理");
             return None;
         }
     }
     Some(dc)
+}
+
+/// G-08：sni_only 豁免的唯一判据 —— 这条连接**真的**会走 DoT 分流。
+///
+/// DoT 分流只在 BoringSSL 路径实现（`boring_path::accept_dot_reuse`）；NSS/TomCrypt/
+/// rustls 路径不知道 ALPN dot。若只看 `dot_reuse_config` 就跳过 sni_only，这些栈上
+/// 的错误 SNI 连接会被当成普通 HTTP 服务（sni_only 被绕过）。这里把「栈可用」与
+/// 「ALPN/SNI 匹配」合并成一个判据；非 boring 构建恒为 false（sni_only 行为不变）。
+fn dot_split_available(live: &LiveConfig, peek: &[u8]) -> bool {
+    cfg!(feature = "tls_boring")
+        && client_hello::route(peek) == HelloRoute::Boring
+        && dot_reuse_config(live, peek).is_some()
 }
 
 /// SNI 主机名比较：大小写不敏感，且忽略末尾的点
@@ -491,6 +576,43 @@ mod tests {
         // 前缀相同但不同的名字不能误判。
         let sneaky = hello_with(Some("x"), &[b"dotx"]);
         assert!(!client_offers_alpn(&sneaky, b"dot"));
+    }
+
+    /// 把单 record 的 ClientHello 拆成两条握手 record（RFC 8446 §5.1 允许的分片）。
+    fn split_records(full: &[u8], at: usize) -> Vec<u8> {
+        assert_eq!(full[0], 0x16);
+        let hs = &full[5..];
+        let at = at.min(hs.len());
+        let (a, b) = hs.split_at(at);
+        let mut out = Vec::with_capacity(full.len() + 5);
+        out.extend_from_slice(&[0x16, 0x03, 0x01]);
+        out.extend_from_slice(&(a.len() as u16).to_be_bytes());
+        out.extend_from_slice(a);
+        out.extend_from_slice(&[0x16, 0x03, 0x01]);
+        out.extend_from_slice(&(b.len() as u16).to_be_bytes());
+        out.extend_from_slice(b);
+        out
+    }
+
+    /// G-08：ALPN / SNI 在跨 record 分片的 ClientHello 里也必须被找到。
+    ///
+    /// 旧实现只看第一个 record：ALPN 扩展（位于 ClientHello 尾部）几乎总在第二个
+    /// record ⇒ 所有分片客户端都被判成「没有 dot」，在复用端口上握手成功却拿不到
+    /// DNS 应答。这里对多个切分点验证（ALPN 在前/后半段都要命中）。
+    #[test]
+    fn alpn_and_sni_detected_across_record_fragments() {
+        let full = hello_with(Some("dot.example"), &[b"h2", b"dot"]);
+        for at in [1usize, 20, 40, 80, 120, 200] {
+            let frag = split_records(&full, at);
+            assert!(
+                client_offers_alpn(&frag, b"dot"),
+                "split at {at}: ALPN dot lost across records"
+            );
+            assert_eq!(client_sni(&frag).as_deref(), Some("dot.example"), "split at {at}");
+        }
+        // 第二个 record 缺失（只发第一个分片）⇒ 不能误判为 dot（fail-open 到 HTTP）。
+        let first_only = &split_records(&full, 20)[..25 + 20];
+        assert!(!client_offers_alpn(first_only, b"dot"));
     }
 
     /// 不完整/畸形输入只能返回 false（不能 panic/越界）。

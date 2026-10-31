@@ -1,0 +1,6 @@
+PUT /expect100.txt HTTP/1.1
+Host: 127.0.0.1:30094
+Content-Length: 5
+Expect: 100-continue
+
+hello

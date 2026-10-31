@@ -1,0 +1,4 @@
+GET /indehtml HTTP/1.1
+Host:70081
+If-Mauhc: "ab
+

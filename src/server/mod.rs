@@ -895,11 +895,11 @@ fn ech_selfcheck_problems(
         if !ssl.ech || ssl.ech_cover_cert.is_none() {
             continue;
         }
-        let inner_ec = ssl.cert_ec.as_deref().map_or(false, |s| !s.trim().is_empty());
+        let inner_ec = ssl.cert_ec.as_deref().is_some_and(|s| !s.trim().is_empty());
         let cover_ec = ssl
             .ech_cover_cert_ec
             .as_deref()
-            .map_or(false, |s| !s.trim().is_empty());
+            .is_some_and(|s| !s.trim().is_empty());
         if inner_ec && !cover_ec {
             out.push(format!(
                 "ECH: listener {}:{} 配了 ssl.cert_ec（内层 EC）但没有 ssl.ech_cover_cert_ec —— BoringSSL 按客户端 sigalgs 在 RSA/EC 里选且优先 ECDSA，外层只有 RSA 时**非 ECH 客户端与主动探测者都会拿到内层真实证书**，cover 形同虚设。补上 ech_cover_cert_ec/ech_cover_key_ec（可用 `webserver --gen-cert <public_name> --ec` 生成）",

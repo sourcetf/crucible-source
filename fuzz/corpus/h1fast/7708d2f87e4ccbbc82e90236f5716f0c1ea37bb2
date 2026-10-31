@@ -1,0 +1,21 @@
+GET / HTTP/1.1
+H.............st: ..
+Connectio.: zclos™ET /o, c!T / HTTP/0.1
+H.......H.............st: ..
+Connectio.:!,es, GET / HTTP/1HTTP/1.1
+H.............st: ..
+Connectio.: zclos
+H.............st: ..
+Connectio.: cET /o,!c!.es, bar1
+H.............st: ..
+Connectio.: clo/v :5o, c!,es, bar1
+H......................st: ..
+Connectio.: cET /o,es, bar1
+H.............st: ..
+Connectio.: alo/o, c!,es, bar1
+H.............st: ..
+Connectio.: clos™ET /
+
+bar
+~
+

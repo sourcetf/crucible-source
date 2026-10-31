@@ -740,6 +740,29 @@ fn push_u128<S: ByteSink>(out: &mut S, v: u128) {
     out.push_slice(&buf[i..]);
 }
 
+/// 引号字段的转义判据：`"` / `\` / 所有控制字符（C0、DEL、C1）/ U+2028 / U+2029。
+///
+/// 热路径（[`write_line`]）与 fmt 参照实现（[`format_line`]）共用同一判据，
+/// 保证两条路径逐字节一致；`char::is_control` 覆盖 C0(0x00–0x1F)、DEL(0x7f)
+/// 与 C1(U+0080–U+009F)。
+#[inline]
+fn escape_char(c: char) -> bool {
+    c == '"' || c == '\\' || c.is_control() || c == '\u{2028}' || c == '\u{2029}'
+}
+
+/// 把字符串转义后追加到 [`ByteSink`]（引号字段）。
+#[inline]
+fn push_escaped<S: ByteSink>(out: &mut S, s: &str) {
+    for c in s.chars() {
+        if escape_char(c) {
+            out.push_slice("\u{fffd}".as_bytes());
+        } else {
+            let mut tmp = [0u8; 4];
+            out.push_slice(c.encode_utf8(&mut tmp).as_bytes());
+        }
+    }
+}
+
 /// 单条访问日志行的格式化（热路径：直接进 `Vec<u8>`）。
 ///
 /// 与 [`format_line`]（realtime 路径的 fmt 实现）**逐字节等价**：同一段前缀、
@@ -774,18 +797,19 @@ fn write_line<S: ByteSink, P: LinePrefix>(
     out.push_byte(b' ');
     prefix.write_bytes(out);
     out.push_byte(b'"');
-    out.push_slice(method.as_bytes());
-    out.push_byte(b' ');
     // `path` 是请求目标，**不能原样进引号字段**：含 `"` 的请求能提前结束引号、
     // 把后面的字段伪造成任意内容（日志是审计证据，伪造一行等于污染审计）。
-    for c in path.chars() {
-        if c == '"' || c == '\\' || (c as u32) < 0x20 {
-            out.push_slice("\u{fffd}".as_bytes());
-        } else {
-            let mut tmp = [0u8; 4];
-            out.push_slice(c.encode_utf8(&mut tmp).as_bytes());
-        }
-    }
+    //
+    // 除 `"` / `\` / C0 控制字符外，还必须挡：
+    //   * DEL(0x7f) 与 C1 控制字符（U+0080–U+009F，`char::is_control` 全部覆盖）——
+    //     U+009B 等会被部分终端当 CSI 解释，U+0085(NEL) 会被部分工具当换行；
+    //   * U+2028/U+2029（Unicode 行/段分隔符）—— Python `splitlines()`、部分日志
+    //     收集器把它们当**真实换行**，等于客户端的 URI 能伪造一条新日志行。
+    // 这些字节经 h1 的合法 URI 面可达（http::Uri 接受 0x80–0xFF 的合法 UTF-8），
+    // 已用裸 socket 实测：`GET /<U+0085>` 404 后日志原样写入 C1。
+    push_escaped(out, method);
+    out.push_byte(b' ');
+    push_escaped(out, path);
     out.push_byte(b'"');
     out.push_byte(b' ');
     push_u64(out, status as u64);
@@ -818,14 +842,12 @@ fn format_line<P: LinePrefix>(
     let _ = write!(out, "{}.{:03} ", now_ms / 1000, now_ms % 1000);
     let _ = prefix.write_fmt(out);
     let _ = out.write_char('"');
-    let _ = out.write_str(method);
+    for c in method.chars() {
+        let _ = out.write_char(if escape_char(c) { '\u{fffd}' } else { c });
+    }
     let _ = out.write_char(' ');
     for c in path.chars() {
-        if c == '"' || c == '\\' || (c as u32) < 0x20 {
-            let _ = out.write_char('\u{fffd}');
-        } else {
-            let _ = out.write_char(c);
-        }
+        let _ = out.write_char(if escape_char(c) { '\u{fffd}' } else { c });
     }
     let _ = out.write_char('"');
     let _ = write!(out, " {status} ");

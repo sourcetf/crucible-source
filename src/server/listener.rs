@@ -231,12 +231,12 @@ async fn dispatch_plain(
                 // 按 server_name / sni_name 找匹配的 TLS listener
                 let target = cfg.listeners.iter().find(|l| {
                     l.ssl.is_some() && (
-                        l.server_name.as_deref().map_or(false, |sn| {
-                            sni.eq_ignore_ascii_case(&*sn)
+                        l.server_name.as_deref().is_some_and(|sn| {
+                            sni.eq_ignore_ascii_case(sn)
                                 || sni.ends_with(&format!(".{}", sn.to_lowercase()))
                         }) ||
-                        l.ssl.as_ref().map_or(false, |s| {
-                            s.sni_name.as_deref().map_or(false, |n| sni.eq_ignore_ascii_case(n))
+                        l.ssl.as_ref().is_some_and(|s| {
+                            s.sni_name.as_deref().is_some_and(|n| sni.eq_ignore_ascii_case(n))
                         })
                     )
                 });

@@ -31,7 +31,7 @@ pub fn resolve_isp_alias(name: &str) -> String {
     for (key, alias) in ISP_ALIASES {
         if upper.contains(key) {
             // 等长键保留先声明者（`>` 而非 `>=`），保证确定性。
-            if best.map_or(true, |(_, len)| key.len() > len) {
+            if best.is_none_or(|(_, len)| key.len() > len) {
                 best = Some((alias, key.len()));
             }
         }

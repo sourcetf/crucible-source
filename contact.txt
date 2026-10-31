@@ -5533,3 +5533,806 @@ G-16（aioquic 未装、生产 1vCPU/磁盘）；G-16 UDP 目标在私有无特�
 证据 `~/scratch-samples/logs/{matrix-*-final2,g15-final3,g15-timeout-final2,g16-run-final2,
 h3-g16-final,h3-flow-final,accept-full-final,openbsd-g15}.log`；
 脚本 `~/scratch-samples/{matrix19.py,g15_check.py,g15_timeout.py,g16_check.py,g16_run.sh,h3_flow.py}`。
+
+---
+
+# 【agent-u13admin / 工号 1009 · Wave-22】U-13 Admin 会话 TTL 可配置并真机验证过期（2026-10-30 19:30–21:10 +0800）
+
+**范围**：`src/config.rs`（`[admin]` 段）、`src/server/admin.rs`（登录/会话接线）、
+`src/server/basic_auth.rs`（仅 §16.13 会话/认证段）。未 commit/push/checkout/reset/stash/clean；
+未改 `admin_ui.html`；未回退他人 WIP。HEAD `25987f8`；集成二进制 md5 `b422cf6b…`。
+
+**实现**：新增 `[admin] session_ttl_secs`（u64，默认 **28800 = 8h 不变**，上限 2592000 = 30d）。
+`0`/负数/`>30d` 配置期拒绝（`--check-config` rc=1，报错点名字段；1 与 2592000 合法）。
+会话表 value 改为**绝对到期时刻** `Instant::now()+ttl`：任何请求都不续期（不滑动），
+`Instant` 单调时钟 ⇒ 系统时间回拨不延长。`Set-Cookie` 追加
+`Max-Age=<ttl>; Expires=<now+ttl>`，与服务端同一份 TTL；`__Host-`/Secure/HttpOnly/
+SameSite=Strict/无 Domain 不变，登出仍 `Max-Age=0`。
+
+**单测**：隔离快照 **609 passed / 0 failed / 1 ignored**；集成共享树 **616/0/1**
+（基线 602 + 本波 7：配置边界、cookie Max-Age/Expires、0.9×/1.1× TTL、绝对不续期、
+create 清理、8×32 并发、过期会话过不了鉴权门）。
+
+**真机（端口 26800–26803，TTL=3s，集成二进制）**：
+- TTL=3 时间线 **27/27**：登录 `Max-Age=3`/`Expires=now+2.29s`；t+0 200、t+2.02s 200、
+  t+4.02s API 401、`/__admin/` 页面 401；过期+同源 POST 401、+跨站 Origin 401
+  （鉴权门先拒）、+`Sec-Fetch-Site: cross-site` 403；有效 cookie 跨站仍 403。
+- 活动不续期：每 0.25s 请求，last200=2.78s / first401=3.03s。
+- 多会话 A(4s)/B(2s)：A 401、B 200；B 到 4s 后 401。伪造/截断/空 token 全 401。
+- curl cookie jar：过期后 jar 中 0 条会话 cookie，GET 401（Max-Age 客户端删除）。
+- 登录失败限速：`[401×8, 429, 429]`，封禁期正确口令 429，其他来源 200，Basic 同表 429。
+- 热重载 TTL 3→5 **8/8**：旧会话仍 3s 到期（3.5s 时 401），新会话 5s（5.5s 时 401）。
+- h2（3s）与 h3（30s，规避 aioquic 子进程启动 >3s）过期 **6/6**。
+- 回归 44 项套件副本 **45/45**；默认 8h `Max-Age=28800`、`Expires=now+28799s`；
+  4416 并发登录后恰好 4096 令牌有效，RSS 有界（34,368→56,128 KiB 首次填满；已满后不增长）。
+
+**未闭/边界**：无 CSRF token（现有为 Origin/Referer/Sec-Fetch-Site/JSON CT 判定，
+与会话不绑定）；真机系统时钟回拨未做（无 CAP_SYS_TIME/faketime，证据为 Instant 设计+单测）；
+会话 map 无在线 introspection，过期清理由单测证明；过期页面是 401+Basic challenge（无 302）。
+
+报告 `.agents/1009/reports/u13admin-wave22.md`；修复 `.agents/1009/fixes/u13admin-wave22.md`；
+证据 `~/scratch-u13admin/{logs,logs-w16}`，脚本 `u13_ttl3_timeline.py`/`u13_reload.py`/
+`u13_h3_expiry.py`/`w16_admin_session_u13.py`。
+
+# 【agent-g04nss / 工号 1009 · Wave-22】G-04 关闭：NSS 已建立连接 4→2→1 条 OS 线程（2026-10-30 19:35–21:10 +0800）
+
+**改动**（只动 scope 内两文件；`legacy_io.rs` 未改，无 git 写操作）：
+`src/server/tls/tls_nss.rs`、`libs/tls-nss/nss_shim.c`。
+握手不变（`spawn_blocking` 1 槽/在飞握手、128 上限、10s 绝对 deadline 含排队、
+超时 `shutdown(relay)` 打断阻塞 read）。握手成功后把 NSS SSL fd 切非阻塞，
+用**唯一一条 poll 线程**（`PR_Read/PR_Write` + `PR_Poll{SSL fd, pollable event}`）
+取代 Wave-18 的 reader+writer 两条线程。依据 NSS 3.120 源码契约：
+`ssl3_SendApplicationData` 在 `pendingBuf` 非空时返回 `totalSent-1` 并设
+`appDataBuffered`（ssl3con.c:2821-2921），调用方严格按返回值重试剩余字节即可
+驱动密文缓冲清空（sslsecur.c:479 `ssl_SendSavedWriteData`），所以单线程写不会
+丢/重字节（已用 8MiB 慢读逐字节 sha256 验证）。新增 C API：
+`crucible_nss_poll`（位图 1读/2写/4wakeup）、`crucible_nss_wakeup`
+（`PR_SetPollableEvent`，非阻塞合并）；read/write 的 would-block 返回 -2。
+写侧 60s 零进展强制 `relay.interrupt()`（旧实现写线程可永久阻塞在 write(2)）。
+
+**实测**（NSS 3.120，端口 26443/26444/26445）：
+- 已建立连接：**200 条 = 基线 4 + 200×1.00 = 204 线程**（旧实现 2/conn；
+  Wave-14 是 4/conn）；fd 1210（6/conn，pollable event 占 2 fd）；RSS +37.6MB。
+  关闭后 4 线程 / 10 fd。`ps -L -o comm` 可见每条连接恰好 1 条 `cruc-nss-io`。
+- **200 慢连接（100 一条不发 + 100 只发 4 字节半包，均不进 NSS 握手槽）+
+  200 正常 SSLv3 并发：200/200 OK**，p99 94.7/92.9ms vs 同时段 baseline
+  99.0/106.7ms（v2compat 混合 101.2ms，baseline 中位 102.1ms）→ 无 >10% 回归；
+  混合期峰值线程 49–63（400 连接）、fd 321–385、RSS 61MB。
+- 100 个进入 NSS 的截断 hello（慢握手）+100 正常：正常 100/100；慢的 10s
+  deadline 全部释放，线程 131→103（blocking pool keep-alive）→20s 回 3；
+  RSS 68–69MB 有界。
+- 边界（如实）：200 个 **routeable** 慢 hello > 128 上限时，正常握手会在
+  10s（含排队）deadline 失败（实测 3/200）——保留 128 上限 + 10s 含排队的必然
+  结果；任务场景的「不发/半包」不占槽，200/200 成功。若验收要求两者都成功，
+  需放开上限或把排队排除出 deadline（待主会话拍板）。
+- SSLv3 / v2compat 完整握手 + HTTP 200（finished verified）；SSLv2/TomCrypt 与
+  TLS1.2/1.3 不回归；`test_tls_stacks.sh` **PASS=7 FAIL=0**（复用实例 + 自起
+  实例各一次）；空闲 5 连接 30s 回收；keep-alive 同连接 3 请求全 200。
+- 构建：四 feature rc=0（21,570,224B，md5 12c1a93d…）；默认 `tls,tls_boring` rc=0 且 ldd 无
+  nss/nspr。单测：**617 passed / 0 failed / 1 ignored**（过滤了工作树中其他
+  agent 未完成的 2 条 `server::dns::ecs::tests::malformed_detects_*`；全量跑
+  617 passed / 2 failed，HEAD 中这两个测试名出现 0 次，非本 scope）。19 引擎
+  未跑（改动仅 tls_nss 遗留路径，无交集）。
+
+**未闭/风险**：fd/连接 4→6（pollable event 2 fd；进程上限 1M 无压力）；
+TomCrypt 仍 2 线程/连接（不在 G-04 目标内）；响应内存与旧实现同阶（≤16MiB/conn，
+60s 零进展强制关断）。报告 `.agents/1009/reports/g04nss-wave22.md`；修复
+`.agents/1009/fixes/g04nss-wave22.md`；脚本/证据 `~/scratch-g04nss/{nss_client.py,
+stress_g04.py,logs/}`。
+
+# 【agent-fuzzwave · fuzz/** + scripts/run_fuzz.sh + src/server/dns/ecs.rs】Wave-22（2026-10-30 21:05）
+接手上一任中断的 fuzz 在途工作并交付：
+1) **fuzz crate 可构建可跑**：`[lib] test=false`（生产 `include!` 带进来的 `#[cfg(test)]` 模块需要
+   完整 config，fuzz crate 没有桩）、修 `h1fast.rs:34` 类型错误、crate 级 `allow(unused_mut)`。
+   稳定工具链 `cd fuzz && cargo check --offline` rc=0（**`--all-targets` 仍会编 lib-test，不绿；
+   验收命令用 `cargo check` / `--lib --bins`**）。nightly-2026-08-21 + cargo-fuzz 0.13.2 四 target 全可跑。
+2) **长跑（各 390s，0 生产崩溃/超时/OOM）**：h1fast 5,940,648 exec；qmux_proto 544,710；
+   dns_wire 21,573,510（修后）；upload_path 5,008,234。语料：`fuzz/gen_corpus.py` 生成 237 个确定性
+   种子（accept-verify*.py 的真实请求字节 + 边界：16KiB 头/裸 LF/非法 UTF-8/深 qmux/畸形 ECS…），
+   长跑又自动积累 3,206 个 unit。日志 `~/scratch-fuzzwave/logs/`。
+3) **首轮 5 个 abort 全是 harness 断言错误**（非生产 bug）：h1fast 的 1.0 keep-alive 期望、
+   qmux 的 TP 规范形/记录超限、dns 的 FORMERR 前缀断言、upload 的闸门顺序。均已修
+   `fuzz/fuzz_targets/*.rs`，报告 §5 有最小输入与生产语义依据。
+4) **修 1 个真实生产缺陷（P2，@dns scope 知会）**：`src/server/dns/ecs.rs` 的 `malformed_ecs`
+   漏判「多条 OPT RR」（RFC 6891 §6.1.1 MUST FORMERR）与「OPT RR RDLEN 越过报文末尾」，
+   导致 DoH/DoT 把畸形查询原样转发、`inject_ecs` 再追加一条 OPT。新增 `scan_opts` 统计/截断判定；
+   `malformed_ecs` 判畸形、`inject_ecs` fail-closed 返回 None。新增 2 条单测
+   （修前实测 FAIL，修后 `dns::ecs::tests::` 20/20 PASS）。**建议 dns 的黑盒套件
+   `dns_unbound_verify.sh` 补 `two_opt` / `opt_rdlen_trunc` 两种 wire 用例**（现有只有 family|dupe|olen）。
+5) **新增 `scripts/run_fuzz.sh`**：`--target/--round/--total/--min-exec/--timeout/--rss-mb/--max-len/
+   --log-dir/--check`；摘要 + `summary.tsv`；退出码 0/1/2；`--check` 走稳定工具链。
+6) **回归（最终源码态）**：`$CARGO test --release --bin webserver --offline --features tls,tls_boring`
+   = **616 passed / 0 failed / 1 ignored**；`cargo build --release --bin webserver --offline
+   --features tls,tls_boring` **rc=0**（首次 rc=2 是别人在 `src/server/apps/mod.rs` 的在途编辑
+   `log_ruby_sidecar_fallback` 未定义，按 60s 重试后成功）。
+7) **未闭/交接**：`upload_resume.rs` 与 static-audit3 共享，**本 agent 未改**（只被编进 fuzz lib 满足
+   依赖，未 fuzz）；`h1_fast::is_valid_host_value` 在 fuzz crate 里是桩；`ecs.rs` 的
+   `splice_opt` 在 ARCOUNT=0xFFFF 且无 OPT 时会 wrapping 回绕（P3，未改，报告 §9.4）。
+   报告 `.agents/1009/reports/fuzzwave-wave22.md`；修复 `.agents/1009/fixes/fuzzwave-wave22.md`。
+
+# 【agent-g08dot443 / 工号 1009 · Wave-22】G-08 关闭 + U-14 关闭（2026-10-30 19:30–21:30 +0800）
+
+**结论**：G-08 **28/0/0**（一条命令 `scripts/dns_dot443_verify.sh`）；U-14 **21/0/0**
+（`scripts/dns_unbound_signed_verify.sh`）。回归：单测 **616 passed / 0 failed / 1 ignored**；
+`dns_verify.sh --real both` **bind 72/0 + unbound 59/0**；`dns_gap_verify.sh` **75/0**。
+
+**改了什么**（只动 scope；无 git 写操作）：
+- `src/server/tls/accept.rs`：① [P1] `client_offers_alpn` 只看第一个 TLS record ⇒ 跨 record
+  分片的合法 ClientHello（ALPN 在第二片）握手成功但拿不到 DoT 应答；新增
+  `reassemble_client_hello`（`:294`）/`client_sni`（`:344`），ALPN 与 SNI 都按重组后的
+  handshake 解析，单测覆盖 6 个切分点 + 端到端 splits 20/120/400。② [P2] ALPN=dot 让 sni_only
+  在非 BoringSSL 栈上被绕过（NSS/TomCrypt/rustls 不实现 DoT 分流却跳过 SNI 过滤）；新增
+  `dot_split_available`（`:468`），只有 Boring 路由 + tls_boring 构建才豁免 sni_only。
+- `scripts/dns_dot443_verify.sh`（16→28 项）：sni_only 实例、热载 true→false（新连接回落
+  HTTP / 旧长连接下一帧收尾）→true、无 dot ALPN 不能进 DNS handler、分片 ClientHello、
+  310 次畸形 ALPN/长度变异不 panic、证书选择（dot vs 站点）、无 dot 证书实例。
+- `scripts/dns_unbound_signed_verify.sh`（12→21 项）：Unbound validator（真实根锚
+  auto-trust-anchor-file + qname-minimisation + TCP 迭代）。旧脚本 bogus 判据不可区分
+  （named 无私有链锚，good 也 SERVFAIL）⇒ 现在把本地 KSK 以 static-key 注入**生成的**
+  named.conf（测试现场），good 端到端 NOERROR+ad+RRSIG、bogus/expired SERVFAIL 可归因；
+  expired 区真正签成过期（`dnssec-signzone -P -s 2019 -e 2020`，旧命令根本没生成 .signed）；
+  named 日志 `RRSIG has expired`、unbound `signature expired ... trust anchor` 均取证。
+
+**未闭/边界**：`peek_first_record` 只补齐首 record（PEEK_CAP 4096，不在允许改的 dot 段）
+——分片后片若在 peek 预算外晚到仍 fail-open 到 HTTP；DoT 分流只在 BoringSSL 路径；
+已建立连接不重查热载后的 `dot.sni` 白名单（enabled/reuse/ACL/限速逐帧查）；U-14 的 named
+锚是测试注入，产品无私有根锚配置；环境无 CAP_NET_RAW/tcpdump，抓包为应用层 wire hexdump。
+
+报告 `.agents/1009/reports/g08dot443-wave22.md`；修复 `.agents/1009/fixes/g08dot443-wave22.md`；
+证据 `~/scratch-g08dot/{logs,dot443-final,u14-final}`（日志、wire hex、named/unbound 验证日志）。
+
+---
+
+# 【agent-tlsmatrix / 工号 1009 · Wave-22】U-07 四矩阵 × h2o 2.2.5 收口（2026-10-30 19:40–21:55 +0800）
+
+**范围**：`bench/tls_matrix_h2o.py`（唯一改动；`h2_tls_gate.py`/`matrix_http_tls.py` 未改）；
+**产品代码零改动**。未 commit/push/checkout/reset/stash/clean。共享树 HEAD `25987f8`（dirty，
+其他 agent 在途改动与本报告无关）。固定二进制
+`~/scratch-tlsmatrix/target/release/webserver` md5 `64d90c46a7e694f1b5cc0148abf4439b`
+（与 u07-clean 的 scratch-tls 二进制 md5 相同）。h2o 2.2.5/OpenSSL 3.5.5 md5 `151800be…`；
+wrk 4.1.0 / h2load nghttp2 1.68.0。端口块 26200–26299；日志 `~/scratch-tlsmatrix/logs/`。
+
+**脚本收口**（详见 `fixes/tlsmatrix-wave22.md`）：修 wrk p50/p99 误把 Avg/Stdev/Max 当分位；
+修 h2load `status codes:` 非 2xx 解析；逐线程 CPU/ctx-switch 求和；端口预检+进程组清理；
+h2 主 m10、附 m1；h2 p50/p99 用单独 3s trace（正式轮不带 log-file）；ours access log 默认 ON；
+TLS 版本用客户端 `OPENSSL_CONF` 钉住（h2o 2.2.5 的 `maximum-version` 对 TLS1.3 无效，
+已用 s_client 实证）；h2o TLS1.2 密码套件对齐 AES128；ALPN/握手/新建连探针；
+strace/perf 用 attach-as-parent（`strace -f` 会在 h2o fork 非 dumpable helper 时卡死）。
+
+**四矩阵判定（W3 干净窗口：load 2.2→5.0，5 轮 ABBA 中位，ours 日志 ON；W5 复测两个 TLS h1）**：
+
+| case | ours rps | h2o rps | thr h2o/ours | lat ours/h2o | 判定 |
+|---|---:|---:|---:|---:|---|
+| plain-h1 | 225,395 | 237,605 | 1.076 | 1.022 | **PASS** |
+| tls12-h1 | 166,404 | 188,913 | 1.138 | **1.339**（W5 1.346） | **FAIL（仅延迟）** |
+| tls13-h1 | 171,516 | 188,005 | 1.093 | **1.277**（W5 1.230） | **FAIL（仅延迟）** |
+| tls13-h2 m10 | 160,645 | 989,721 | **6.244** | **8.988** | **FAIL** |
+| tls13-h2 m1（附） | 101,413 | 142,437 | 1.406 | 1.819 | FAIL（info） |
+
+**噪声 vs 真实差距（5 个窗口 W1–W5）**：
+- **h2 m10 6.2–6.7× 是真实差距**：3 窗口全部逐轮 ≥5.26×；CPU/req 12.4µs vs 1.97µs；
+  strace m10 **3.15 syscall/req vs 1.30**（ours recvfrom 1.384+statx 1.003+sendto 0.734；
+  h2o pread64 1.003+read 0.101+writev 0.101）；perf cycles/req（m1）55k vs 17k、user% 49 vs 34。
+- **TLS h1 吞吐全过（1.09–1.14），延迟贴线/越线**。相邻 A/B：ours 日志 **OFF→ON**
+  使 tls13 延迟比 0.986→1.230、tls12 1.201→1.346；关日志时 tls13 PASS、tls12 卡在 1.201。
+  h1 延迟差不是 TLS1.2/1.3 差异（稳态差 ≤3%，见报告 §6.4），而是 BoringSSL 每请求 record
+  成本 + 任务要求的访问日志；wrk mean 受 h2o 完成分布放大（Little 定律：1.34 的延迟比大于
+  1.12 的服务时间比）。
+- **plain-h1 三窗口稳定 PASS**（干净配对 thr 0.97–1.08 / lat 0.99–1.07）。
+- **h2o 2.2.5 自身 64 连接分发双峰**（偶发 1 轮全落一个 worker，cores=0.99、吞吐减半）
+  会抖动 5 轮中位；报告用“干净配对（双方 cores≥1.75）+ h2o 最优轮下界”交叉验证，
+  h2o 最优轮下界 tls12 1.146、tls13 1.108，仍 <1.2。
+
+**握手/ALPN**：全握手 ours 707–792/s、800–853µs CPU/次 vs h2o 762–840/s、449–536µs（1.6–1.9×）；
+全新建连 1661–1662 vs 1475–1746 conn/s（ours 717–767µs/conn vs h2o 400µs）。
+ALPN 分流正确：ours h1 口拒绝 h2（`none`）、h2 口只选 h2（offer http/1.1 → `none`）；
+h2o 每个 TLS 口同时支持 h2/http1.1（设计如此）。双方 TLS1.3 默认组都是 X25519MLKEM768
+（s_client -trace 实证），所以握手 CPU 差是 BoringSSL 实现，不是 PQ 组选择；另发现
+`pqc=false && groups=[]` 时 `apply_groups` 直接返回（`boring_path.rs:894-900`），
+**并不会关掉 BoringSSL 默认 PQ 组**，配置语义建议产品澄清。
+
+**给主会话的 h2 可优化点（未改产品代码）**：① 打开 h2 写合并
+（`libs/h2/src/framed_write.rs:17` `COALESCE_WRITES_DEFAULT=false`、`src/server/h2.rs:74` 写死；
+h2o 已是 0.1 writev/req）；② 连接驱动一次 read 解多帧（ours m10 1.38 recvfrom/req vs h2o 0.10）；
+③ h2 静态路径去掉每请求 statx（`static_files.rs:1396-1397`，复用 h1 的 fd/fstat 复核）；
+④ 每流用户态成本（m10 user% 49 vs 34）需函数级 profile；⑤ 握手 CPU 若 PQC 非必须可用
+`ssl.groups=["X25519","P-256"]`（新建连场景 1.5–2×，keep-alive 门禁无感）；⑥ 访问日志写线程
+优化可回收 TLS h1 的延迟余量（任务要求门禁时 ON）。
+
+**未闭项**：TLS h1 延迟的精确余量受共享机外部负载影响（`sechat_client-a` 常驻 9–16 核），
+已在 5 个窗口+干净配对中给出范围；h2 p50/p99 为 3s trace 采样；WSL perf 的
+`context-switches:u` 恒 0（改用 /proc 逐线程计数）；未在 OpenBSD 1 vCPU 复测。
+
+报告 `.agents/1009/reports/tlsmatrix-wave22.md`；修复 `.agents/1009/fixes/tlsmatrix-wave22.md`。
+证据 `~/scratch-tlsmatrix/{w1,w2,w3,w4-logoff,w5-logon}/tls-matrix.json`、
+`~/scratch-tlsmatrix/logs/{w1,w2,w3,w4-logoff,w5-logon,m10}/`。
+
+# 【agent-u18lua / 工号 1009 · Wave-22】U-18 Lua 引擎高并发/状态隔离（2026-10-30 21:40–22:55 +0800）
+
+**scope**：`libs/app-engines/lua/lua_engine.c`、`src/server/apps/mod.rs`（仅审计，未改）、
+`www-apps/lua/**`。未做任何 git 写操作。最终引擎 .so md5 `5c6ede77bdb61b94dd2712895967dd42`；
+集成 webserver md5 `de3c04cee34f3f9a8a077813a6d16807`（HEAD 25987f8 + 他人在途改动）。
+
+**结论**：① 隔离——每请求 `lua_State` 设计本就正确：200 条唯一请求头回读 0 串、
+`/lua`+`/lua2` 两应用并发 `.env` 0 串、`_G.leak`/`package.loaded` 下一请求 nil、
+10k 请求（池宽 4/32）0 错；另封堵两条进程级逃逸：`os.exit`（基线一次请求打死整个
+webserver）与 `os.setlocale`（进程级 locale）。② 超时——基线只能靠宿主 6s 看门狗
+（502+永久隔离+100% 烧核线程）；修复为每请求 count hook 5s（`CRUCIBLE_LUA_TIMEOUT_MS`），
+纯循环/协程/`coroutine.wrap` 均 500@5.00s 干净返回，worker 不放弃、引擎不隔离；
+8 并发死循环全 500、进程存活。③ 内存——基线无上限（64MiB `string.rep` 200）；
+修复为每请求 Lua 堆 32MiB（`CRUCIBLE_LUA_MAX_MEM_MB`）+ 响应体 64MiB；4MiB 200 /
+64MiB 500；1000×1MiB POST 全字节级一致且 RSS 平台 33,212kB；10k RSS +0.0–2.4%；
+wrk 30s 865,114 请求 / 28,742 rps / 全 200 / RSS +4.2% / 0 隔离。
+
+**附带修复**：未捕获错误改 500 固定文本（旧：先 `ngx.say` 再 `error()` = 200 半截 body）；
+`ngx.exit(404)` 无 body 保留 404（旧 500）；新增 `ngx.req.read_body/get_body_data`
+（1MiB POST 回读）；`package.path` 前置 docroot；初始化整体 pcall 防 OOM abort。
+
+**回归**：单测 **636 passed / 0 failed / 1 ignored**；19 引擎 × h1+h2c **38/38**；
+侧车清理 0 残留。交付脚本 `www-apps/lua/selftest.py`（23–24 项，含 `--stress/--pid`
+RSS 门禁）+ `www-apps/lua/tests/*.lua`。
+
+**未闭**：纯 C 调用不可中断（`os.execute`/`io`/C 模块/正则回溯仍靠宿主 60s 看门狗）；
+`pcall`/`debug.sethook` 可绕过 hook（应用受信边界）；单字符串有效上限约堆上限一半；
+百分号编码 Unicode 在路由层仍 404（非 lua 分支）；h3 未单测（h1/h2c 一致）。
+报告 `.agents/1009/reports/u18lua-wave22.md`；修复 `.agents/1009/fixes/u18lua-wave22.md`；
+证据 `~/scratch-u18lua/logs/`。
+
+# 【agent-security-audit / 工号 1009 · Wave-22】安全审计（鉴权/SSRF/注入/穿越/泄漏）（2026-10-30 21:40–23:30 +0800）
+
+**scope**：`src/server/proxy.rs`、`src/server/admin_files.rs`、`src/server/rate_limit.rs`（`redirect.rs` 不存在）。
+未做任何 git 写操作。共享树收尾时被他人 WIP 阻塞（`src/server/access_log.rs` 调用未定义的
+`push_escaped`，`cargo check --features tls,tls_boring` → E0425×2）；我的回滚/改动与它无关。
+
+**计数：P0=0，P1=0，P2=3（2 修复 + 1 跨 scope），P3=9（全部跨 scope）。**
+
+**已修（file:line）**
+1. **P2** `src/server/proxy.rs:546`（`is_client_forwarded_header`，单测 `:2619`）：旧实现只剥
+   `Forwarded`/`X-Forwarded-*`/`X-Real-IP`，实测 `CF-Connecting-IP`/`True-Client-IP`/
+   `X-Client-IP`/`X-Originating-IP`/`X-Remote-IP`/`X-Remote-Addr`/`Client-IP`/
+   `X-Cluster-Client-IP`/`Fastly-Client-IP`/`X-Original-URL`/`X-Rewrite-URL` 原样进上游 →
+   上游 IP ACL/限流/审计/路径鉴权可按伪造值决策。修复后真机（新二进制 27760 → 27750 回显）
+   这 10 个头 0 到达，只剩权威 XFF/XFP/Forwarded；`X-HTTP-Method-Override` 有意保留（本服务
+   自身不认，实测管理面 GET+override 不写）。
+2. **P2** `src/server/admin_files.rs:216-256` + `:272`（单测 `:624`）：原子写临时名
+   `.name.crucible-write.<pid>.<seq>` 可预测，旧 `fs::write`（O_CREAT|O_TRUNC）**跟随符号链接**
+   ⇒ docroot 内可写应用预置链接可把 admin 保存重定向到 root 外。改为
+   `create_new(O_EXCL)` + 已存在换 seq 重试（≤8）；真机 `/api/files` PUT 200 落盘，单测
+   `temp_file_creation_never_follows_preexisting_symlink` 证明链接目标不被改写。
+
+**跨 scope 移交（精确位置见报告 §7）**
+- **G1 P2**：admin 缺 XFO/CSP(frame-ancestors)/nosniff/COOP（`admin.rs:224` 收口只加 no-store；
+  `headers_mod.rs:61 append_security_headers` 是死代码）。Basic 档可被点击劫持（iframe 内
+  同源请求通过全部 CSRF 检查）；无 CSP 兜底。建议 admin 收口统一加四头（三协议共用）。
+- G2 P3：页规则 `header` 只作用于 dispatch_tail；`block`/`redirect`/`pass` 分支（`h1.rs:925-995`）
+  响应无该头（h1/h2 一致，实测）。
+- G3 P3：admin 文件管理未套 upload 的 app-docroot 禁写（`admin.rs:1411` vs
+  `upload_api.rs:282-302/474-498`）；实测可写 `php/init.sh`/`php/.env`（200 saved，已清理）。
+- G4 P3：admin 文件/规则 API 只按端口选 listener（`admin.rs:3065` 等）；同端口多地址
+  （127.0.0.1+127.0.0.2:27702）只操作配置顺序第一个 root。
+- G5 P3：`config.rs:2205` 不校验 proxy upstream scheme；`file://`/`gopher://` 通过
+  `--check-config`（exit 0），运行期才 502。建议与 `admin::check_upstream` 同一判据。
+- G6 P3：rootzone 刷新 `curl -fsSL -L` 拉面板可配 URL（`dns/mod.rs:5508+`）：
+  `http://169.254.169.254/...` 可出网、302 可跳 file://；建议逐跳 https 白名单。
+- G7 P3：GeoIP 更新按 cwd 解析 `scripts/geoip_update.sh`（`geoip_panel/ops.rs:337-360`）；
+  cwd 可写 + admin 点击 = 任意脚本执行。建议按配置目录/可执行文件目录解析并校验权限。
+- G8 P3：WS 上游非 101 回 502 而非透传状态（`proxy.rs:1085-1096`）；无安全绕过。
+- G9 P3：`X-HTTP-Method-Override` 转发上游（`proxy.rs:906`），上游框架可能改方法语义。
+- G10 P3：upload 的 Sec-Fetch-Site 检查只覆盖 POST（`upload_api.rs:339`）；浏览器无法跨站
+  PUT（无 CORS 预检），属纵深防御。
+
+**回归**
+- 45 项 admin 会话/CSRF 套件（u13 版隔离副本，27780/27781，h1+h2+h3）：**45/45 PASS**
+  （cookie 属性/绝对过期/logout/伪造 token/4416 并发登录/4096 上限/RSS 有界）。
+- 代理+WS+页规则矩阵（h1+h2，53 项）：**53/53 PASS**；穿越矩阵 52/52；鉴权矩阵 381/381。
+- 单测（scratch 拷贝，我的两文件逐字）：proxy 22 passed、admin_files 15 passed（含新增）。
+- **未闭**：共享树全量单测被 `access_log.rs` WIP（未定义 `push_escaped`）阻塞，修复后需重跑
+  `cargo test --release --bin webserver --features tls,tls_boring`（基线 636/0）。
+- rate_limit.rs：实测旧淘汰已按批量摊销（填满 10 万键后新键中位 0.1ms，每 ~1562 键一次
+  ~45ms），**不存在每请求 CPU 放大**，故本轮恢复原样（净 diff 0）。
+
+报告 `.agents/1009/reports/secaudit-wave22.md`；修复 `.agents/1009/fixes/secaudit-wave22.md`；
+证据 `~/scratch-secaudit/{admin_matrix,traversal_matrix,proxy_matrix,proxy_regress,w16}*`。
+补充（同上 agent）：scratch 拷贝全量单测 **641 passed / 1 failed / 1 ignored**；唯一失败
+`access_log::tests::fast_line_matches_fmt_line`（`"GET GET /"`）来自他人 `access_log.rs` WIP
+（我仅在拷贝里补 `push_escaped` 编译桩），与本 agent 的 `proxy.rs`/`admin_files.rs` 改动无关。
+`server::admin::tests::*`、`server::proxy::*`、`server::admin_files::*` 全绿。共享树修复
+`push_escaped` 后请重跑全量单测。
+
+# 【agent-geoipdata · 2026-10-30 · Wave-22 GeoIP 真实数据/U-09/U-17】
+**scope**：`scripts/geoip_*.py`、`scripts/geoip_update.sh`、`src/server/geoip_panel/**`（除 admin_geoip.rs）。
+HEAD `25987f8`；仅改 scope；数据/日志/库全在 `~/scratch-geoipdata/`，生产 `data/geoip/` 未写。
+
+**做了**
+1. 真实公开源完整流水线（RIR delegated + china-operator + 云官方段 + origin-asn/iptoasn/geolite2-asn）：
+   fetch 547.6s（12/14 源；APNIC 主站超时→RIPE 镜像 61,795 行；AWS/05-hosting 失败）→ merge 395,270 行/12.2s
+   → ASN enrich staged 1,673,341 / inserted 754,369 / ranges 751,785 / conflicts 2,522 / 120s
+   → 最终库 281,210,880B：geoip 956,825 + ipv6 192,921（ASN v4 561,448 / v6 192,921）。
+2. Rust 运行期加载真实库：8.8.8.8 US/AS15169、1.48.0.1 CN、v6 ASN、`::ffff:8.8.8.8` US；
+   页规则 country=CN 命中（403）；Python/Rust 字段对照 12/12。
+3. golden 126 例（36 场景 × gain 0/10/50），Python/Rust 全一致；`geoip_panel` 51 passed（基线 48+3）。
+4. ASN/BGP 冲突套件 29/29：三源同前缀 BGP 850 胜、MOAS、/24 胜 /8、v6 双栈、anycast、重跑幂等。
+5. U-17：mapped peer 403；5000 IP pass1 p50 1.038ms / pass2 0.316ms（2.4×）；20000 IP RSS 12.5MB 有界；
+   热 IP p50 0.258ms；60s TTL 原地更新有效。
+6. 原子性：staging + integrity 门禁 + 原子 mv；16 线程并发换库 1,517 次 0 错误；空层/坏 JSON 回滚旧库 SHA 不变。
+7. 面板 family/prefix + panel.toml 热载 17/17。
+
+**修的 bug**（详见 fixes/geoipdata-wave22.md）
+- `geoip_resolve_asn_bgp.py` 缺 `import json` → 永远 0 行假成功；重写三源双栈+确定性冲突。
+- `geoip_common.py` anycast UPSERT 缺唯一索引（anycast 表永远为空）；v6 被写进 v4 主表（Rust 永远查不到）；
+  `int(v6)` OverflowError；list 字段杀死 merge；Python/Rust 分流与 epoch 口径分叉；重复函数。
+- `geoip_update.sh` 无原子换库/无回滚；磁盘检查字节当 KiB；`--only=X` 解析；enrich 无超时。
+- `geoip_purge_blacklisted.py` 变量遮蔽导致 UnboundLocalError。
+- `geoip_fetch_layers.py` APNIC 无镜像；Rust anycast 全表扫描改数值预过滤。
+
+**未闭/跨 scope**
+- `page_rules.rs:380-388/435` CountryCache 持旧 inode：原子 rename 换库后 60s TTL 仍返回旧国家
+  （U-17 实测 61.5s 后仍 403）。建议缓存 (dev,ino,mtime) 或热载清缓存。
+- netorg/ripe anycast 真实数据未完成（RIR dump 150s 限时内未下完，anycast 表 0 行；默认 1800s 可重跑）。
+- AWS 官方段 / 05-hosting 源失败；AWS 由 01-cloud 覆盖。
+- 共享树 release 构建被其他 agent 的 WIP（apps/mod.rs、access_log.rs）阻塞；本轮 Rust 用测试快照验证
+  （51 + 全量 633 passed）。
+
+报告 `.agents/1009/reports/geoipdata-wave22.md`；修复 `.agents/1009/fixes/geoipdata-wave22.md`。
+
+# 【agent-tls-audit2 / 工号 1009 · Wave-22】TLS 主路径（BoringSSL）深度审计与修复（2026-10-30 13:30–23:40 +0800）
+scope 只改 `src/server/tls/boring_path.rs`、`client_hello.rs`、`ocsp_fetcher.rs`；`ssl_material.rs`/`tls/mod.rs` 审计无需改；未动 accept.rs/NSS/TomCrypt。无任何 git 写操作。
+修复 12 个真实缺陷（P1×3、P2×6、P3×3），3 文件 +1035/−117：
+1. P1 非法 ciphers/PSK 材料 → 整口每条连接 soft-fail（tls-core P1-21 回归；groups 在 HEAD 已逐名过滤）：预检 strict 报错，热路径剔除/禁用并告警，端口继续服务（坏 PSK 实测 check-config rc=1、运行时 TLS1.2 verify 0）。
+2. P1 OCSP unknown/revoked/过期响应被装订：解析 SingleResponse certStatus，仅“匹配序列号且 good / 全 good”才装订；缓存/槽/静态统一。
+3. P1 >64KiB staple 触发 BoringSSL `cbb.cc:274 overflow`，该口每条 TLS1.3 握手失败：`MAX_STAPLE_BYTES=16KiB`，5 个入口拒绝。
+4. P2 静态 `ocsp_der_path` 绕过校验 → 两条静态路径统一 validate；unknown/oversize 不装订。
+5. P2 跨 record ClientHello 误解析（prefer_tls13 误降级/SNI 漏检/TLS1.3 检测错位）：按握手长度重组，不完整回 Default。
+6. P2 root-first fullchain 把根当叶 → 整口 soft-fail：按私钥反查叶并自动重排 + warn。
+7. P2 EC 备用证书丢中间链 / cover EC 切换残留 RSA 链 / ECH 真实 EC 无链：带链 + clear_chain + add_chain_cert。
+8. P2 自动 OCSP 用第一张 PEM 当叶（root-first 失效）、cover 叶错、网络失败静默：按私钥取叶 + 失败 warn。
+9. P2 acceptor 指纹漏 early_data/ECH 行为字段/sni_name → 热更不重建。
+10-12. P3 证书过期/未生效静默、私钥不匹配报错含混、OCSP 获取失败无日志：均已修复/留痕。
+验证：主矩阵 79/79 PASS（版本/套件/组/证书/会话/ALPN/PSK/OCSP/ECH/健壮性/预检）；补充 23/23 PASS；单测 HEAD 基线 602/0、本波快照 611/0（+9 新测试）；accept-verify 六段 302 PASS/0 FAIL；4-feature cargo check rc=0。OCSP 请求 DER 与 openssl 87B 逐字节一致、装订字节 1326B 与 responder 一致；ECH 真机 bssl 接受/cover/拒绝/多 key/热载全通过；并发 100 握手、fd/RSS 有界、半开 2.4s、慢握手 30s 回收。
+未闭/跨 scope（只报告）：
+- 服务端 mTLS 未实现（SslConfig 无 client CA/verify 字段；s_client “No client certificate CA names sent”），需 config.rs+admin+accept.rs。
+- accept.rs PEEK_CAP=4096：>4KiB 且 SNI 在 4096 之后的 sni_only 连接会被当无 SNI 丢弃；建议 sni_only 读满 16KiB。
+- legacy tls1.0/1.1：config 只校验拼写，不要求 enable_nss；BoringSSL 口回落 1.2–1.3（有 warn，不整口死），建议 config.validate 启动失败。
+- 0-RTT 无反重放/限速（默认关闭；开启仅 warn）；OCSP 响应签名未验证、chunked 响应不支持；OCSP 单续期线程；TLS1.3 ticket 首个应用写后才发；ECH+双证书受单 credential 槽限制。
+- 共享树 `access_log.rs:789` `push_escaped` 未定义（其他 agent WIP）导致全树暂不可编译；本轮以 `git archive HEAD` 快照 + 3 个 scoped 文件验证。
+报告 `.agents/1009/reports/tlsaudit2-wave22.md`；修复 `.agents/1009/fixes/tlsaudit2-wave22.md`。
+
+# 【agent-soak / 工号 1009 · Wave-22】60 分钟混合负载长稳 + 泄漏判定（2026-10-30 21:35–23:55 +0800）
+
+**scope**：只新增 `scripts/soak_wave22.py`；**未改任何产品代码**，未做 git 写操作。
+被测：HEAD `25987f8` + 在途改动，二进制 md5 `de3c04cee34f3f9a8a077813a6d16807`（21,066,256 B）。
+端口 27800–27899、DNS 状态根 `~/scratch-soak/state-dns`、19 引擎运行时。
+
+**总量**：60 min 协议 = run1 2805 s（被 wsl-mem-watchdog KILL）+ run1b 795 s 续跑；
+另 20 min fastpath=0 对比窗口（run2）。合计 80 min / **117,564,148 请求** / 非 2xx 324,121
+（0.276%，其中 222,305 是预期 tsx 405+探测 404）；真实服务端故障 **12,306 = 0.0105%**。
+fd 斜率 −0.03/+1.60/−0.06 个/min（净 +4/−1/−1，峰值 142 后回落）、线程 0.003/0.002/0.074
+（净 0，中位 39）⇒ **fd/线程零泄漏**。优雅 SIGTERM 后 0 孤儿/0 `.part`/0 `.sock`；
+SIGKILL 窗口 20 个 sidecar reparent 到 PID 806（预期，已清理）。
+
+**P1-1（新）Perl 进程内引擎每请求泄漏 ~78 KB**：`libs/script-ffi/script_engine.c:1851`
+（`perl_parse`）与 `:1883`（`perl_run`）在**每个请求**对同一解释器重复调用。soak 里每个
+`/perl/` 60 s 窗口 RSS +4.05 GB / +1.85 GB / 部分 +1.2 GB（run1）、+4.98 GB（run1b）、
++5.07 GB（run2）。定点两趟 probe：第 2 趟 **79.68 KB/req**（对照 `/python/` 0.0）。
+证据 `~/scratch-soak/{perlprobe.json,logs/perlprobe.log}`、`run*/samples.jsonl`。
+
+**P1-2（新）PSGI 引擎每请求泄漏 ~6.7 KB**：`libs/app-engines/psgi/psgi_engine.c:326`
+每请求 `eval_pv(psgi_driver)` 重新编译 1.5 KB 驱动。60 s `/psgi/` 窗口 RSS +0.49 GB（run1）
+/+0.84 GB（run2）；定点第 2 趟 **6.72 KB/req**。
+
+**后果**：run1 t=2805 s 被系统护栏 `wsl-mem-watchdog` KILL（日志：rss=6063MB swap=2178MB
+total=8241MB > 8192MB）；死前 t≈2760–2805 已出现 **12,252×ECONNREFUSED**（RSS 7.3 GB 压力）。
+**不是产品 panic**；本机 8 GB 护栏下带 `/perl/` 的 19 引擎混合负载无法连续跑满 60 min。
+
+**P1-3（新，admin/config）全量配置保存 round-trip 丢上传能力**：
+`src/config.rs:402-427` 的 `Serialize for AutoindexConfig` 在 `paths==["/"]` 时只输出
+`autoindex = true`，丢 `enable_upload`/`upload_threads`；`GET /api/config` 走
+`to_toml_string`（`config.rs:2293`），面板源码编辑器保存一次 → 上传 405。
+最小复现：独立实例 :27897，PUT before=201 → GET config（只有 bool）→ POST 保存 200 →
+PUT after=**405**。证据 `~/scratch-soak/logs/autoindex-roundtrip-bug.json` +
+`repro-cfg-{before,after}-save.toml`。修复建议：`paths==["/"] && !enable_upload &&
+upload_threads==4` 才输出 bool，并补 GET→POST→GET 单测。
+
+**P2（h1/apps-tsx）**：`src/server/apps/tsx.rs:1261-1268` 的 405 不排空 body、不发
+`Connection: close`；4 线程并发 64 KiB POST 8 s：10,411×405 + **9,160×BrokenPipe**；
+单连接顺序混合 GET/POST 正常。soak 共 89,510 次 tsx 客户端 reset（不计 5xx）。
+**P2（apps/jsp 可疑）**：run1 t≈1740 s（RSS 6.5 GB）`/do/` 51×502，run1b/run2 未复现；
+建议先修 Perl/PSGI 泄漏后再在 6.5 GB+ 条件复跑。
+
+**通过面**：上传/续传 41/41 周期（10 片 202+末片 201+全量 PUT+Range 读回 md5 一致）；
+DNS 权威 7,182 查询 / DoH 958 请求全 200；Admin 41/41 周期登录+读+保存全 200；
+78/78 次 SIGHUP 重载成功且访问日志 marker **0 丢失**；h3 3,229 请求全 200；
+访问日志无 reopen/rotate API（SIGHUP 不重开文件，inode 恒 5111323）。
+fastpath ABBA（纯净静态、3 轮）：ON 194,931 rps/p50 0.120 ms vs OFF 126,459 rps/0.217 ms
+（OFF/ON=0.649、p50 1.81×）⇒ fastpath 承载真实流量。
+
+报告 `.agents/1009/reports/soak-wave22.md`；修复文件 `.agents/1009/fixes/soak-wave22.md`；
+原始采样 `~/scratch-soak/{run1,run1b,run2}/` 与 `~/scratch-soak/logs/`。
+
+# 【agent-geoipgap / 工号 1009 · Wave-21】G-10/G-17/G-18/G-19/G-20 + U-17（2026-10-31）
+**scope**：`src/server/geoip_panel/**`、`scripts/geoip_common.py`、`src/config.rs`（页面规则 validate）、
+`src/server/page_rules.rs`；HEAD `25987f8`。共享树本波源码改动仅 `page_rules.rs`（U-17）；
+其余 5 条实现已在 HEAD，本轮逐条真机复核。未做任何 git 写操作。
+
+**结果**：G-10 评分统一/126 golden/Rust-Python 真机 26/26；G-17 gain 配置+面板+校验
+（22/22，0/10/50 选择按预期翻转）；G-18 panel.toml 持久化 + 优先级 + 旧 sqlite 兼容
+（34/34，面板改/手改→重启均生效，sqlite sha/mtime 未被写）；G-19 目标死代码 0 warning；
+G-20 页面规则 15 类非法配置 `--check-config` rc=1 全部指名（16/16）。
+**U-17 修复**：`page_rules.rs` CountryCache 增加 `(dev,ino,mtime,mtime_nsec)` 身份失效——
+原子 rename 换库后旧连接指向已删除 inode、61.5s 后仍返回旧国家的问题已修（现立即生效）；
+`::ffff:127.0.0.1` → 403；5000 不同源 IP 全 403（pass1 p50 0.701ms / pass2 0.280ms），
+20000 IP 后 RSS 13,824→15,104 KiB 持平；缓存硬上限 4096（单测锁定）；新增 3 条单测。
+
+**回归**：隔离快照单测 **608 passed / 0 failed / 1 ignored**；`geoip_panel` 51 passed；
+页面规则主矩阵 **186/186** + 边界 **74/74**；黑盒 accept **302 PASS / 0 FAIL / 0 SKIP**。
+**共享树在途改动（跨 scope，只报告）**：开局全量单测 652/1/1，唯一失败
+`access_log::tests::fast_line_matches_fmt_line`（`"GET GET /"`，他人 `access_log.rs` WIP
+把 method 写两次）；随后 `qmux/conn.rs:1034` 他人 WIP（未导入 `proto::encode_record`）使全树
+暂不可编译。本波回归在 `git archive HEAD` + scoped 文件的隔离快照 `~/scratch-geoipgap/verify-tree/`
+完成，未回退任何人改动；请主会话合并时一并处理这两处。
+
+报告 `.agents/1009/reports/geoipgap-wave21.md`；修复 `.agents/1009/fixes/geoipgap-wave21.md`；
+证据 `~/scratch-geoipgap/{v-w21-*.log,logs-w21/,w21-u17/,verify-tree/}`。
+
+# 【agent-samples / 工号 1009 · Wave-21b】G-15/G-16 在当前工作树复核（2026-10-31 08:00–09:30 +0800）
+
+**结论**：G-15/G-16 的实现在 HEAD `25987f8`（Wave-21）里已经存在，本波没有重复改写；
+在含 Wave-22 并行改动的当前工作树上重新构建并重跑真机，两个缺口均再次关闭。
+webserver md5 `c0ecbdbb739c8dabbbda684bfa885a45`（21,213,440 B）；
+C sidecar `deps/bin/index` md5 `1c78d01137cc83cabde3ea1c48fbc114`（39,520 B，当前
+`main.c` 经 `init.sh` 重编）。未做任何 git 写操作。
+
+**G-15（实测）**：`/c/` 移动 `libapp_c.sample.so` 前后分别为 `c-ffi` / `c-sidecar`（后者带
+`x-crucible-mode: pthread-per-connection`）；h2c 同样 200 + `c-sidecar`；`?dump=1` 的
+`GATEWAY_INTERFACE=CGI/1.1`/`HTTP_HOST`/`APP_HELLO` 齐全；keep-alive 同连接 2 请求计数 1/2；
+400/431/413/405；5MiB echo 逐字节一致 `18a42ab71ef74ce8`；100 并发=100 个不同 pthread
+（0.88s）；空闲 30.1s 关闭、半截请求 60.0s→408。日志 `~/scratch-samples/logs/g15-wave21b.log`、
+`g15-timeout-wave21b.log`。
+
+**G-16（实测）**：aioquic 1.3.0 + 私有无特权 netns（`8.8.8.8:19099` on `lo`）：
+server SETTINGS `H3_DATAGRAM=1`，CONNECT 200，QUIC DATAGRAM 双向 echo
+`quic-datagram-echo-1`；同连接两隧道按 qsid 0/1 分流；2000B 下行超 MTU 丢弃且隧道存活；
+transport-only（无 H3 SETTINGS）回落 Capsules；Capsules / LengthPrefixed 均 echo 通过。
+服务端日志逐请求 `framing=Datagram|Capsules|LengthPrefixed`。证据
+`~/scratch-samples/logs/g16-wave21b.log`、`logs/h3-g16-final.log`。
+
+**回归**：19 引擎 × h1/h2c **38/38（FFI）** + **38/38（sidecar）**
+（`logs/matrix-{ffi,sidecar}-wave21b.log`）。单测本轮**未取得计数**：共享树
+`src/server/qmux/conn.rs:1034` 因另一 agent WIP（外层 `use super::proto::{...}` 删掉 `self`）
+导致测试编译 E0433；已做一行测试模块导入修复（`use crate::server::qmux::proto::{self,...}`），
+修复后 Bash 执行器在会话后段不可用，未及重跑全量；h3 流控脚本与黑盒 302/0/0 同因未重跑
+（G-16 的 h3 真机与 19 引擎矩阵已覆盖主要回归面）。
+
+报告 `.agents/1009/reports/samples-wave21.md`；修复 `.agents/1009/fixes/samples-wave21.md`；
+证据 `~/scratch-samples/logs/`（`g15-wave21b.log`、`g15-timeout-wave21b.log`、
+`g16-wave21b.log`、`matrix-{ffi,sidecar}-wave21b.log`、`test-build.log`）。
+
+# 【agent-dot443 · G-08 DoT 443 SNI/ALPN 端口复用】wave21 复核（2026-10-31）
+
+**结论**：G-08（`[dns.dot] reuse_tls_port` + `sni` 在站点 TLS 口按 ALPN `dot`/SNI 分流）
+**已在 HEAD `25987f8`（Wave-21）实现并入库**，Wave-22 又追加了跨 record 分片 ClientHello
+的修复（工作树未提交）。本波**未改任何产品源码**，只做真机复验（任务书「未实现」的前提与
+当前工作树不符；缺口曾登记于 `reports/dnsbind2-wave15.md:428`）。未做任何 git 写操作。
+
+**G-08 实测（`~/scratch-dot443/dot443-wave21.log`，base 27600）**：`PASS=28 FAIL=0 SKIP=0`。
+- `openssl s_client -alpn dot` → `ALPN protocol: dot`（TLS1.3）+ 手写 DNS wire 应答 `rcode=0 an=1` A=192.0.2.44；
+- 同端口 `curl --http2/-http1.1/--tls-max 1.2` 全 200（站点证书）；无 ALPN → `HTTP/1.1 200 OK`；
+- DoT（ALPN dot + SNI dot.example）出示 **DoT 证书 SAN=dot.example**；ALPN dot + 站点 SNI →
+  站点证书且无 DNS；独立 :27653 仍工作；dot/h2 混合 10/10；跨 record 分片 20/120/400 均命中；
+- `sni_only` 站点 4 项 PASS；热载 true→false 新连接回落、旧连接收尾，false→true 恢复；
+- `reuse_tls_port=false` 零变化；未配 dot 证书时沿用站点证书。
+
+**回归**：DNS 真机 `scripts/dns_verify.sh --real both` → **bind 72/0 + unbound 59/0（rc=0）**；
+gap **75/0**（合并跑 55 PASS + G-07 因另一 agent 占用默认 base 35500 的 :35700（pebble
+`bind: address already in use`）1 FAIL，隔离 base 37500 单跑 G-07 **20/0**，故合计 75/0）；
+单测 **660 passed / 1 failed / 1 ignored**，唯一失败在 `server::apps::app_ffi`（**他人 WIP**，
+非本 scope；本 scope 定向测试 128/0）。首跑 `cargo test` 曾被他人 WIP `legacy_io.rs:199`
+（`use std::io::Write` 改 `as _` 中间态）编译失败，其落定后恢复。
+
+**未跑**：全量黑盒 302 项（`scripts/accept-verify.sh` 硬编码 30xxx 端口，复核时 30099/30100
+被他人 python3、30553 被他人 named 占用；按纪律不 kill 他人进程/不抢端口）；TLS 性能矩阵
+（`bench/tls_matrix_h2o.py` 属性能门禁、与并发 agent 争 CPU）。
+
+构建 md5 `2d2ba61bc1d77edd03c69b09317806d7`。报告 `.agents/1009/reports/dot443-wave21.md`；
+修复 `.agents/1009/fixes/dot443-wave21.md`；证据 `~/scratch-dot443/`。
+
+# 【agent-reuseport / 工号 1009 · Wave-21】G-13 `SO_REUSEPORT` 多 accept loop（2026-10-31）
+**scope**：`src/server/listener.rs`、`src/server/mod.rs`、`src/main.rs`、`src/config.rs`（仅 listener 字段）；
+HEAD `25987f8`。**本会话无新增源码改动**（G-13 实现已在 HEAD wave21 落地，本轮逐条真机复核）。
+未做任何 git 写操作。
+
+**结果**：`reuse_port = true`（默认关）→ 同 `address:port` 建 N 个 `SO_REUSEPORT` socket
+（默认 `nproc`、可配 `reuse_port_workers`、钳 1..=32），**真机 `ss -lntp` 见同端口 4/8 个 LISTEN socket**，
+`RUST_LOG=accept_loop=debug` 见 4 个 slot 各收 ~100/400 连接（内核哈希分摊）；`reuse_port=false` 单 socket、
+`bind_key` 无后缀、逐字回到现状。**ABBA 6 对：吞吐比 on/off 1.003、延迟比 0.957（不退化）**；
+`reuse_port=true` 下官方 h1 门禁 `bench/h2_fair_gate.py` **PASS exit 0**（off 0.902/0.658，on 1.037/1.101）；
+h2c/h2-over-TLS 20000 请求 **0 失败**；TLS1.3 握手正常；**1000 连接 ×3 keep-alive = 3000 响应全 200、0 错**；
+access log 源 IP（127.0.0.1 / 127.0.0.2）归属正确；SIGHUP 热切换 `reuse_port` 1↔8 socket 正常。
+
+**回归**：单测 **660 passed / 1 failed / 1 ignored**（G-13 相关全绿：bind_tcp/bind_key/reuse_port 系列）；
+唯一失败 `server::apps::app_ffi::status_and_rel_tests::unload_switch_defaults_off_and_scopes_whitelist`
+（`app_ffi.rs:3156`，**跨 scope**——该文件本波他人 739 行 WIP，与 listener 无关，请主会话合并时处理）。
+黑盒：自建 12 项 on/off 逐项一致 12/12；官方 `accept-verify.sh`（302 套件）因 **300xx 端口被并发 agent 占用**未跑。
+
+**未验**：OpenBSD 真机 REUSEPORT 分发语义（本机 Linux）。
+报告 `.agents/1009/reports/reuseport-wave21.md`；修复 `.agents/1009/fixes/reuseport-wave21.md`；
+证据 `~/scratch-reuseport/`（binary md5 `bd3ff9d5847cd10a3f3d6ef399429626`；端口 62081/62082/62443）。
+
+# 【agent-csample / 工号 1009 · Wave-21】G-15：C 样例 pthread-per-conn 常驻 sidecar（2026-10-31 11:00–11:40 +0800）
+
+**结论**：G-15 的实现已在 HEAD `25987f8`（Wave-21）里存在，本波未重复重写；只对任务书的
+两处**字面行为**做了**最小**修正，并在本机真机（端 27095，h1+h2c）复核 FFI / 无-`.so` 两形态。
+
+**改动**（仅 `www-apps/c/main.c`，md5 由 `296279a9…` → `e0532bedc1e70575d38014727c124d95`）：
+1. 新增 `path_is_echo()`：`POST /echo`（宿主剥 `/c` 前缀后 sidecar 见到 `/echo`）回显 body
+   （`main.c:532-547`、`:998`），`?echo=1` 保留；
+2. `GET /` 正文改为字面 `hello from c sidecar`（`.env` 有 `APP_HELLO` 时优先它）(`main.c:1030-1041`)。
+`init.sh` / `mod.rs` / `config-test.toml` 未改（降级链 `c_engine_mode` + `x-crucible-engine: c-ffi|c-sidecar`
+已在 HEAD 就位）。sidecar 重编 `deps/bin/index` md5 `0cca61ecc100a7e95e2ccd72de74ce07`（39,520 B）；
+webserver md5 `315834bcb42cd5e82f37d7f345e5e6d2`。
+
+**真机实测**：FFI 时 `/c/` h1/h2c 均 200 + `c-ffi`（body `hello from c engine path=/c/`）；
+移走 `.so` 后同一路由 `c-sidecar` + `x-crucible-mode: pthread-per-connection`，body
+`hello from c sidecar`；`POST /c/echo` 逐字节回显；DELETE 405+Allow、40MiB→413、超长头→431；
+直连 UDS：keep-alive 同连接 2 请求计数 1/2、5MiB echo sha256 `18a42ab71ef74ce8`、
+100 并发 = **100 个不同 pthread**（`peak_Threads=101`）、空闲 30.1s 关闭、半截请求 60.0s→408、
+40 次中途断开后线程回落基线；webserver SIGTERM → child_registry SIGTERM sidecar →
+`shut down cleanly` + socket 清理（无孤儿）。
+
+**回归**：单测 **660 passed / 1 failed**（失败 `app_ffi::…unload_switch_defaults_off_and_scopes_whitelist`
+`app_ffi.rs:3156`，他人 in-flight，非本 scope）；19 引擎矩阵 /c 在 {h1,h2c}×{FFI,sidecar} **4/4**，
+其余 php/jsp/do/tsx 8 项 502 系**缺外部运行时**（php-cgi/node/Jetty socket），非本改动。
+**黑盒 302/0/0 未跑**：共享验收档 `~/scratch-verify8`（30000 端口块）当前被另一 agent 实例占用，
+未并发跑以免互相破坏；请主会话在其空闲后复跑。本改动只在独立 C 程序，不入 Rust 二进制。
+
+报告 `.agents/1009/reports/csample-wave21.md`；修复 `.agents/1009/fixes/csample-wave21.md`；
+证据 `~/scratch-csample/`（`logs/{host-final,direct-wave21,g15-timeout-csample,matrix-ffi-csample,unit-csample,server-final}.log`）。
+未做任何 git 写操作（无 commit/push/checkout/reset/stash/clean）。
+
+# 【agent-envqueue / 工号 1009 · Wave-21】R-03 env_lock 同族排队（能力分流）复核（2026-10-31 11:15–11:35 +0800）
+
+**scope**：`src/server/apps/{env_lock.rs,deps.rs}`、`libs/script-ffi/script_engine.c`、
+`libs/app-engines/common/crucible_pyembed.h`、`libs/app-engines/{cgi,lua}/**`、
+`libs/app-engines/common/appengine_common.{c,h}`、`libs/app-engines/include/appengine.h`；
+HEAD `25987f8`（含并行 WIP）。**未改任何 product 源码，未做任何 git 写操作。**
+
+**结论**：R-03 的实现已在工作树内（宿主按 .so 自报 `appengine_env_isolation()` 分流，自报者跳过 env 锁；
+`app_ffi.rs:1668-1701/885/1042`），本波为真机验证，无需新增 ABI 符号。
+
+**实测（当前源码构建，md5 `315834bcb42cd5e82f37d7f345e5e6d2`，端口 27580）**：
+慢空 cgi（`sleep 2`、无 .env）在飞 → 带 .env 的 wsgi/asgi/uwsgi/lua/php 时延 **0.8–2.0ms**
+（要求 <100ms；旧 ~2.6s），h1 与 h2c 均通过；慢请求自身 2.009s 完成。边界：锁引擎 perl 慢空请求仍串行
+3.698s，免锁 cgi 不挡 perl（1.3ms）——分流按能力非全局旁路。`.env` 隔离矩阵 wsgi/cgi/lua/php ×
+`{1,8,16,32}` 并发 × A/B 100 次 = **16/16 全绿**。
+
+**回归**：单测 **660 passed / 1 failed / 1 ignored**（唯一失败 `app_ffi::status_and_rel_tests::unload_switch_defaults_off_and_scopes_whitelist`
+是并行 WIP 新增、HEAD 无，`unload_enabled_with` 对 `" ON "` 大小写敏感 —— **跨 scope**；`env_lock::` 11 条、`deps::` 3 条全绿）；
+19 引擎 h1+h2c **38/38**；延迟门禁 rust 57.8k rps（≥11k）/ c 55.6k / go 44.7k，non2xx=0；
+黑盒 `accept-verify.sh` **PASS1 149/0/0**、GOAWAY 7/0/0、EXT **109/4**（多 agent 并发同跑共享套件 30xxx 互相 EADDRINUSE）。
+
+**跨 scope（未改，交主会话）**：`src/server/apps/mod.rs::extension_matches()`（并行 WIP 新增、HEAD 无）对空扩展名
+恒 true，使无扩展名写请求被 app 分发接管、绕过上传 RCE 闸门（`PUT /cga/deps/bin/index` 403→200，并触发 deps ensure
+重 wipe）。A/B：旧二进制 403 / 当前树二进制 200。详见报告 §6。
+
+报告 `.agents/1009/reports/envqueue-wave21.md`；修复 `.agents/1009/fixes/envqueue-wave21.md`；
+证据 `~/scratch-envqueue/logs/{engines-build,unit,matrix-19,accept-envq,r03-latency}.log`、`latgate.json`。
+
+# 【agent-geoip2 / 工号 1009 · Wave-21】G-10/G-17/G-18/G-19 + U-17（2026-10-31 11:00–11:45 +0800）
+
+**scope**：`src/server/geoip_panel/**`、`scripts/geoip_*.py`、`src/server/admin_geoip.rs`；
+HEAD `25987f8` + 共享树并行 WIP。**未做任何 git 写操作**（无 commit/push/checkout/reset/stash/clean）。
+
+**结论**：G-17/G-18/G-19 主体实现位于 HEAD，本波逐条独立复核 + 真机复验**全 PASS**。
+G-10 评分公式双端一致（golden 126/126），但**真机「同数据两端字段一致」在冲突档不成立**，
+本波修复离线侧补齐。
+
+**本波唯一源码改动**：`scripts/geoip_common.py`（G-10 离线口径对齐）—— 新增
+`_ANYCAST_SEED_V4`/`detect_country_conflict(:811)`/`anycast_hit(:842)`，改写 `lookup_merged(:900)`
+镜像 Rust `covering::merge_pipeline`：国家票胜者覆盖 country + `conflict||anycast` 清空
+province/city/district（`merge_covering` 未动，golden 仍锁）。修复前真机 Rust vs Python **12/24**，
+修复后 **24/24**。机理：离线原只做 merge、缺 §23.5.6 抑制层。
+
+**实测（当前源码二进制，隔离端口 231xx）**：
+- G-10 真机 `verify_g10.py`：共 24 例（20 组 /8+/16+/24 交替胜负 + /8 共享 + v4-mapped）
+  字段/prefix/bits/weight/commit/prefixes_merged **24/24 全等**。
+- G-17 `verify_g17.py` **14/14**：gain 10→0→50 热载选择按预期翻转，重启/手改 panel.toml 生效，
+  `panel.toml > config.toml`，gain=1001 → 400，`--check-config` 对 config/panel 越界 rc≠0。
+- G-18 `verify_g18.py` **13/13**：面板 POST 写 panel.toml 且 **sqlite sha/mtime 不变**；重启保持；
+  手改生效；旧 sqlite（panel_sources demo=33/disabled、panel_edits→city=LegacyEdit）可读可应用。
+- G-19：`filter_agg.rs` 已删；6 个目标符号在构建日志 **0 命中**；`geoip_panel/admin_geoip` **0 warning**。
+- U-17 `scripts/geoip_u17_test.py`：`::ffff:127.0.0.1`→**403**；5000/20000 不同源 IP 全 403；
+  RSS **13,312→14,592 KiB**（+1.25 MiB）后持平；pass1 p50 0.777ms → pass2 0.262ms（缓存命中）。
+
+**回归**：单测 **660 passed / 1 failed / 1 ignored**（唯一失败 = 同波 envqueue 报告的
+`app_ffi::status_and_rel_tests::unload_switch_defaults_off_and_scopes_whitelist`，apps scope WIP）；
+`geoip_panel` **51/0**；`page_rules/geoip/iputil/anycast/conflict/toml_store` 全绿；Python golden 126/126、
+asn_conflict OK。黑盒 accept（自建隔离档端口 34xxx）：PASS1 **148/1**、EXT **109/4**、
+GOAWAY 7/0、H3/DNS 24/0、DNS/ECS(on) 6/0；5 个 FAIL 全跨 scope（见下），与 geoip 无关。
+
+**跨 scope（未改，交主会话）**：
+1. **上传 RCE 闸门被绕过**（P0）：`PUT /cga/deps/bin/index` 应 403 却 200。根因同波
+   **agent-envqueue 已定位**：共享树 WIP `src/server/apps/mod.rs::extension_matches()` 对空扩展名
+   恒 true → 无扩展名写请求被 app 分发接管 → 绕闸门。**apps/static scope**（已有 envqueue 报告，此处仅佐证）。
+2. 双栈 `[::]` 绑定告警（`listener[7] ... 0.0.0.0:34556 Address already in use, V6ONLY 未设`）：
+   仅本 agent 34xxx 档出现；envqueue 30xxx 档 PASS1 149/0，未确认为 product 回归。core/listener scope。
+
+报告 `.agents/1009/reports/geoip2-wave21.md`；修复 `.agents/1009/fixes/geoip2-wave21.md`；
+证据 `~/scratch-geoip2/{verify_g10,verify_g17,verify_g18}.py`、`u17/u17-results.json`、
+`build1.log`、`unit.log`、`accept.log`。
+
+# 【agent-nss-threads / 工号 1009 · Wave-21】G-04 遗留 NSS/TomCrypt 每连接线程收敛（2026-10-31）
+
+**scope**：`src/server/tls/{tls_tomcrypt.rs,legacy_io.rs}`、`libs/tls-tomcrypt/**`。
+HEAD `25987f8` + 在途改动；无任何 git 写操作。
+**结论**：两种遗留栈「每条已建立连接」OS 线程均 **1 条**（旧 2，更早 4）。NSS 侧已在
+Wave-22 由 agent-g04nss 收敛到 1（本轮复核未改）；**TomCrypt 本轮由 2 收敛到 1**
+（新唯一 poll 线程 `cruc-tc-io`，非阻塞 read + 加密队列 flush + 自管道 `poll`）。
+保留：10s 绝对握手 deadline（含排队）、128 并发上限、慢握手 10s 释放、`Connection: close` FIN。
+
+**实测**（四 feature 二进制 md5 `ea00cd03e14c311aa98eb28a42590051`）：50 条已建立连接
+NSS=`50×cruc-nss-io`、TomCrypt=`50×cruc-tc-io`（均 1.00/conn）；100 慢(route)+100 正常
+两栈各 100/100，线程/fd/RSS 有界、10s 回收；TomCrypt 混合 p99 172.9ms（改前 213.5ms，不回归，
+peak 线程 176 vs 210）；8 MiB 背压传输 SHA-256 全等；OpenSSL 1.0.2u `-ssl2`/`-ssl3` 均 200；
+`test_tls_stacks.sh` PASS=7；现代 TLS1.2/1.3 正常。
+
+**回归/跨 scope（只报告，未改别人的文件）**：
+- 四 feature 单测 **664 passed / 1 failed / 1 ignored**；唯一失败
+  `apps::app_ffi::status_and_rel_tests::unload_switch_defaults_off_and_scopes_whitelist`
+  （`app_ffi.rs:3180`，该文件有 763 行在途改动）。
+- 黑盒 accept-verify（`ACCEPT_BIN`=本二进制）**298 PASS / 4 FAIL / 0 SKIP**；4 个 FAIL 全为
+  上传运行时文件闸门 `PUT /cga/deps/bin/index → 200`（`static_files.rs`/`upload_api.rs`/
+  `upload_resume.rs` 在途改动），非 TLS。
+
+报告 `.agents/1009/reports/nssthreads-wave21.md`；修复 `.agents/1009/fixes/nssthreads-wave21.md`；
+证据 `~/scratch-nssthreads/logs/`。自起实例（25443/25446/25447）与 accept 实例已全部停止。
+
+# 【agent-h3dgram / 工号 1009 · Wave-21】G-16 HTTP/3 QUIC DATAGRAM「可配」缺口（2026-10-31）
+**scope**：`src/config.rs`（仅 CONNECT-UDP 开关）、`src/server/h3.rs`、`src/server/connect_udp.rs`；
+HEAD `25987f8`；只改自己 scope，未做任何 git 写操作（无 commit/push/checkout/reset/stash/clean）。
+
+**结论**：G-16 的「H3 用 QUIC DATAGRAM 帧」**已在 HEAD `25987f8` 落地**（`enable_http_datagram`
+`h3.rs:152/599`、`DatagramRouter`、三 framing + auto 协商）；任务书「全树未调用」是旧快照。
+本波补其**「可配」缺口**（规格 §16.17 字面要求）：新增 `connect_udp_framing =
+"auto"|"capsule"|"length"|"datagram"`（默认 auto，与引入前逐字节一致），并把超 QUIC datagram
+上限的回程报文语义按 RFC 9298 §6.1 固化为「丢弃 + 明确告警」（明确禁止回流内 capsule）。
+
+**真机**（aioquic 1.3.0，私有无特权 netns `unshare -rn`，`8.8.8.8/32` on lo 作公网单播目标）：
+封装矩阵 **26/26 PASS**（auto↔datagram / transport-only→capsule 回落 / capsule / length /
+强制 capsule·length·datagram / 非 datagram 客户端→501 / 超 MTU(2000B) 丢弃且隧道存活 /
+同连接双隧道按 qsid 分流）；h3 功能矩阵 ALL PASS（准入 200/403/400/501、TE 等连接专有头 RST、
+4MiB 流控全量）；单测 **660 passed / 1 failed**（唯一失败 `app_ffi` = apps scope 他人 WIP，非本波）；
+黑盒 accept（隔离副本 27xxx，避开 verify8 在跑的 30081）**298 PASS / 4 FAIL / 0 SKIP**，4 个 FAIL
+全是 contact.txt:6153 已记的 `apps/static` 上传 RCE 闸门 P0（非本波）；h3 三档 PASS1.6 GOAWAY
+7/0/0、PASS2 H3/DNS 24/0/0 全绿。
+
+报告 `.agents/1009/reports/h3dgram-wave21.md`；修复 `.agents/1009/fixes/h3dgram-wave21.md`；
+证据 `~/scratch-h3dgram/logs/{matrix,h3-matrix,server,unit,accept}-wave21.log`。
+共享树在途改动（只报告）：`app_ffi.rs` 单测失败、`PUT /cga/deps/bin/index` 闸门 200 —— 均他人 scope。
+
+# 【agent-engine-exec / 工号 1009 · Wave-21】G-03 / R-04 / G-14（引擎池宽度 · 卡死 worker · 真卸载）
+
+**scope**：`src/server/apps/app_ffi.rs`（+ `src/server/telemetry.rs` 2 行接指标，改前无他人 WIP）。HEAD `25987f8`；
+本波二进制 md5 `f5de54184ee56e4054c0bdd5e133e120`。未做任何 git 写操作；实例端口 24695/24xxx、配置在 `~/scratch-engineexec/`。
+
+**G-03（池宽度 clamp(2,4)+覆盖）**：实现已在 HEAD，本波真机复核通过。32 核→4、`taskset -c 0`（1 核）→2、
+`CRUCIBLE_APP_POOL_WIDTH=8`→8（`ps -L` 见 8 条 worker）。**1 核不饿死**：宽度 2 + 8 并发慢引擎在飞时静态
+p50 0.41ms/p99 0.57ms ⇒ **无需**队列深度动态扩缩。延迟门禁 rust/static = 0.912(32 核)/0.772(1 核)/0.933(1 核宽度 8)，均 <1.1。
+
+**R-04（卡死 worker）**：有界(≤32)+补位已在 HEAD；本波**补计数指标** `crucible_app_abandoned_workers_total` 等
+（`app_ffi.rs:1376 engine_metrics_lines()` + `telemetry.rs` 接入 `/__metrics`），并加 `spawned_replacements`（真 spawn 数≤32）
+与单测 `abandoned_worker_replacements_are_capped`。真机：3 个不同 .so 死循环 → 502@2s、线程 4→7、计数=3、健康引擎 200。
+**沙箱**（`CRUCIBLE_APP_SANDBOX=1`，默认关，已有实现）：死循环跑 fork 子进程，父进程 top 100%→**0%**、
+超时 SIGKILL 后**自动重建**、无需隔离、正常引擎全 200；`=0` 逐字回到现状（父 100%、引擎被隔离）。
+
+**G-14（RTLD_NODELETE→可选真卸载）**：在途 WIP 原本把真卸载做成默认；按任务要求**改为默认关**，新增
+`CRUCIBLE_APP_UNLOAD=1`：关闭=现状（全引擎 NODELETE，不检测热换、映射维持、旧代码继续服务）；打开=仅解释器引擎
+（python/… 白名单）保留映射，其余真 `dlclose`。真机 50× `mv` 热换（引擎 `c`）：开启 maps 恒 5 份 + `libs_unloaded_total=51`，
+把非法 ELF 换入 → **maps 5→0**、502（真卸载）；默认关闭则 maps 恒 5、0 次卸载、同一替换仍 200（维持现状）。
+Python（whitelist）50× 热换 + 非法替换均 200、不崩、0 次卸载。
+
+**回归**：单测 **662/0/1**（默认）、**665/0/1**（四 feature）；19 引擎 **38/38**；延迟门禁 PASS；
+黑盒 accept（共享 30xxx 被占，复制到 `~/scratch-engineexec/accept` 平移 24xxx）**302 检查：298 PASS / 4 FAIL / 0 SKIP**。
+
+**跨 scope 未修（只报告）**：4 条 FAIL 全为**上传 RCE 闸门** —— `PUT /cga/deps/bin/index` 应 403 实 200 且文件被改写
+（`accept-verify-ext.py`）。闸门 `src/server/upload_api.rs::inside_any_app_docroot` **未被改动**，根因是共享树他人未提交
+WIP（`static_files.rs`/`upload_resume.rs`/`config.rs`/`apps/mod.rs` 均 M）；app_ffi/telemetry 不触及上传路径。
+`geoipgap-wave21` 在 `git archive HEAD` 隔离快照上复现过 302/0/0。**请主会话优先核实**。
+
+报告 `.agents/1009/reports/engineexec-wave21.md`；修复 `.agents/1009/fixes/engineexec-wave21.md`；
+证据 `~/scratch-engineexec/{logs/,conf/config-engineexec.toml,starve_test.py,r04_measure.sh,sandbox_test.sh,g14_test.sh,accept/}`。
+
+# 【agent-pagerule2 / 工号 1009 · Wave-21】G-20 页面规则配置期校验收口（面板/配置单一口径，2026-10-31）
+
+**scope**：`src/config.rs`（仅 page_rules 校验）、`src/server/admin.rs`（仅页面规则面板校验复用）；
+`page_rules.rs` 未改（其 133 行在途改动属他人）。HEAD `25987f8` + 在途；无 git 写操作。
+**结论**：把面板校验与手写 config 校验合并为**唯一** `config.rs:2375 pub(crate) fn validate_page_rule`
+（`validate_page_rule_list` 逐条调用；面板 `admin.rs:2433 check_page_rule` 构造 `PageRuleConfig` 后调用同一函数）。
+补掉开工前真实缺口：action 精确小写（旧 `to_ascii_lowercase()` 放行 `"Redirect"`→静默失效）、
+`priority` 范围 `±1_000_000`、`match_url` 收紧为必须 `/` 开头（旧额外放行 `http` = 死规则）；
+删除面板 4 个平行校验器。面板同步收紧：header 动作定界头、非 ISO2 国家码、priority 越界。
+
+**实测**：24 类非法规则 `--check-config` **rc=1 且指名 `page_rules（全局）[0].<字段>`**（每站报
+`listener …: page_rules[0]`）；合法全维度 rc=0 且 redirect/block/rewrite/header/cache/pass/priority/维度
+运行期逐条生效；面板 HTTP save 非法→400（消息与手写**字面一致**）、合法→200 + 落盘 + 热载 +
+`GET /api/pagerules` 回显一致（:25703）。
+**回归**：单测 **660 passed / 1 failed**(`apps::app_ffi::unload_switch_defaults_off_and_scopes_whitelist`，
+他人未提交改动，非本 scope)；页面规则四协议矩阵 **186/186**；黑盒 accept-verify
+**297 PASS / 4 FAIL / 2 SKIP**（39xxx 端口平移私有副本，未碰别人；4 FAIL 全为在途 WIP 的
+`PUT /cga/deps/bin/index → 200`，apps/static scope；2 SKIP 为 named 未起）。`config-test/features/prof.toml`
+`--check-config` rc=0（零回归）。
+
+报告 `.agents/1009/reports/pagerule2-wave21.md`；修复 `.agents/1009/fixes/pagerule2-wave21.md`；
+证据 `~/scratch-pagerule2/{invalid,valid.toml,admin.toml,invalid_evidence.txt,accept/run4.log}`。
+本 agent 实例（25701/25703/25799、27710/27711/27743、39xxx）已全部停止。
+
+# 【agent-tlsmatrix / 工号 1009 · Wave-21】U-07 四矩阵 × h2o + U-14 真实签名上游（独立复核，2026-10-31 11:03–12:3x +0800）
+**scope**：`bench/**`、`scripts/dns_*.sh`（新增 `scripts/dns_unbound_mode_check.sh`）；产品代码零改动，
+未做任何 git 写操作。共享树 HEAD `25987f8`（dirty）。二进制 `~/scratch-tlsmatrix/bin/tm21-wsrv`
+md5 `2d2ba61bc1d77edd03c69b09317806d7`（HEAD+在途 WIP，11:19 构建）。单次 uptime，无重启。
+
+**U-07（5 轮 ABBA，loadavg 15–27，ours 日志 ON，双方 2 线程，c64 wrk / c50 h2load）：**
+plain-h1 **PASS 1.060/1.065**、tls12-h1 **PASS 1.061/1.065**、tls13-h1 **PASS 1.104/1.176**、
+tls13-h2(m10) **FAIL 5.325×/7.342×**、m1 FAIL(1.244/1.628)。**唯一真实超线=h2 多路复用**
+（逐轮 4.39–5.55×；CPU/req 14.7µs vs 2.76µs）。**注意**：本窗口 load 15–27 双侧同被节流，
+TLS-h1 延迟比被压缩到 ≤1.2；**干净窗口（wave22，load 2–5）为 tls12 1.34 / tls13 1.23–1.35 FAIL**
+（吞吐稳过 1.09–1.14）——TLS-h1 延迟是否达标取决于门禁期是否开 access log，需产品拍板。
+握手：s_time ours 731/709/709 conn/s（CPU/握手 836–846µs）vs h2o 723–778（488–569µs）。
+
+**U-14：** `scripts/dns_unbound_signed_verify.sh`（named→外置**验证型** Unbound：
+auto-trust-anchor-file 真根锚 + qname-minimisation + harden-dnssec-stripped + TCP 迭代）**21/0/0**；
+经本服务器 `dig example.com +dnssec` → **ad + RRSIG**（真实链）、本地私有链 good.u14 → ad；
+**伪造签名→SERVFAIL**、**过期 RRSIG→SERVFAIL**（named/unbound 日志逐字取证）；
+ACL 127.0.0.2 REFUSED、`modes.recursive` 热切换不回退、DoT/DoH 亦 ad。新增
+`scripts/dns_unbound_mode_check.sh`（产品自管 `[dns] recursor="unbound"`）**13/0/0**。
+
+**回归**：单测 **662 passed / 0 failed / 1 ignored**；`dns_verify.sh --real both` **bind 72/0 + unbound 59/0**；
+`dns_gap_verify.sh` **75/0**；**黑盒 accept = 298 PASS / 4 FAIL / 0 SKIP（非 302/0/0）**。
+
+**跨 scope 发现（只报告，未改）：**
+1. **[P2] 产品 `recursor="unbound"` 不做 DNSSEC 验证**：`src/server/dns/mod.rs::unbound_modules()`
+   生成的 `module-config` **从不含 `validator`**（只 `iterator`/`subnetcache iterator`/`respip …`），
+   也不写 auto-trust-anchor-file ⇒ 该模式经主端口拿不到 `ad`（实测 ad=0）。修法：加 `validator`
+   模块 + 写根锚。**dns scope**。
+2. **[回归] accept 4 条 FAIL 全是应用 docroot 上传闸门漏 `deps/bin/index`**：`PUT /cga/deps/bin/index`
+   → 200 且改写 sidecar 二进制（应 403）；`%2F` 编码变体 → 200（应 400/403）；`init.sh`/`.env` 仍 403。
+   兜底闸门 `upload_api.rs:474 inside_any_app_docroot` 未命中。**非 HEAD 行为**：隔离 HEAD+scoped
+   快照（geoipgap，08:31 同日）为 **EXT 113/0/0**；本波用私有 scratch+37xxx 端口隔离复跑本波二进制
+   仍 **109/4/0**，排除端口/scratch 争用 ⇒ 在途 WIP（`src/server/apps/mod.rs` +332 行为首疑）
+   造成的应用/上传路由回退。**apps/upload/static scope owner 合并前定位修复**。
+
+报告 `.agents/1009/reports/tlsmatrix-wave21.md`；修复 `.agents/1009/fixes/tlsmatrix-wave21.md`；
+证据 `~/scratch-tlsmatrix/{w21b,w21b.log,logs/}`（四矩阵 JSON/日志、u14-wave21.log、u14-mode5.log、
+dns-verify-w21.log、dns-gap-w21.log、unit-w21.log、accept-w21.log、accept-iso-w21.log、accept/）。
+
+# 【agent-h2perf / 工号 1009 · Wave-21】R-01 h2 多路复用：基线复现 + 瓶颈分解 + crate 扫参（2026-10-31 12:30–13:35 +0800）
+
+**scope**：`src/server/h2.rs`（`libs/h2/**`、`bench/**` 未改）。未 commit/push/checkout/reset/stash/clean。
+冻结树 `~/scratch-h2perf/tree`（= crucible-git 12:34 快照），端口 23xxx。证据 `~/scratch-h2perf/logs/`。
+
+**基线复现（h2load -n0 -c50 -t2 -D10，ours 2 worker vs h2o 2.2.5 num-threads:2，127B 静态，同窗口 ABBA 中位）**：
+- h2c：**m1 ours/h2o = 0.893**（122.8k vs 137.5k）、**m10 = 0.368**（170.1k vs 462.6k）；c64：m1 **0.986**、m10 **0.343**。
+- TLS1.3：m1 **0.953**、m10 **0.379**。两条协议面 m10 同形 ⇒ **不是 TLS 的锅**。
+- ours 两侧均打满 2.0 核（CPU-bound）；h2o m10 只用 1.44 核。verify8 的 0.662/0.124 是 load 10–21 满核窗口 +
+  未含前序 inline/本地 FUT 优化的旧二进制；本窗口同口径已到 0.986/0.343。
+
+**瓶颈分解（同窗口 3 路 ABBA + perf 指令级）**：
+- c50 m10：`ours 175.0k(0.359) / 裸 crates.io h2 0.4.19 floor 293.5k(0.601) / h2o 488k(1.0)`；m1：`128k/139.6k/144k`。
+- **每请求指令数（load 无关）m10：ours 25,977 / floor 20,444 / h2o 5,232** ⇒ **crate 自身就是 h2o 的 3.9×**，
+  本项目应用层再付 1.27×（IPC 放大成 ~1.68× 吞吐差）。**R-01 的墙在 h2 crate，不在本项目**。
+- 前序优化实测生效：inline 静态快车道 **+30%**、本地 FuturesUnordered **+7.6%**（env 开关对拍）；访问日志 off +2.6%。
+
+**h2 crate 参数网格扫描（m10，运行期 knob，3 轮中位）**：INITIAL_WINDOW(64K/256K/4M)、MAX_SEND_BUFFER(64K/512K)、
+MAX_CONCURRENT_STREAMS(16/64/1024)、COALESCE(0/1)、MAX_INFLIGHT(64/1024/4096) —— **全部 ≤±2.5%（噪声），无一有实质收益**；
+**最优组合 = 现状默认**。全局在飞闸门 256→4096 无益 ⇒ 排除限流假设。TLS：`SSL_write 0.49%`+加密 1.3%+ERR_clear_error 1.2%，
+**TLS 写/加密合计 2–3%，无需 SSL_write 合并**。
+
+**本轮改动（`fixes/h2perf-wave21.md`）**：① 6 个 `CRUCIBLE_H2_*` 运行期 knob（默认=原常量，行为零变化；为扫参）；
+② 连接级单条目静态读缓存（跳过全局锁+双重 FNV 查表，**每请求仍 fstat 复核**）：**ins/req m10 −3.06%、m1 −2.64%**，
+原地改写/rename/unlink 均立即失效。`src/server/h2.rs` md5 `bff57284…`→`f358e1ba…`；最终二进制 md5 `89ac30cd…`。
+
+**回归**：单测 **662/0/1**；h2 模块 14/14；h2 功能矩阵 **16/16**（伪头/TE:trailers/TE:gzip 拒/连接头 RST/CONNECT→RST/Range206/
+2MiB 流控 sha 一致/请求 trailers/TLS HSTS）；h1+h2+TLS 黑盒 smoke **15/15**。**302 项全量套件未跑**（30xxx 被另一 agent 实况占用，不抢占）。
+
+**交主会话**：m10 追平 h2o 属**架构项** —— 保留 crates.io h2 0.4 不可达（裸 crate 自己就 0.60×）。
+应用层微调上限 ~0.36→0.45；要 1.0 需替换/分叉 crate（方案 D 低风险 2–4 人日 / C 分叉 5–8 人日 / A nghttp2 FFI 1–2 周 / B 自研 3–5 周，
+见 `reports/h2perf-wave21.md` §6）。报告 `.agents/1009/reports/h2perf-wave21.md`、修复 `.agents/1009/fixes/h2perf-wave21.md`。

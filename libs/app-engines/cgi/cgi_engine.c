@@ -95,7 +95,7 @@ static const char *resolve_script(const char *script, const char *docroot, char 
 /* 会被我们覆盖的键：继承 environ 时跳过（避免重复键）。 */
 static const char *const cgi_own_keys[] = {
     "GATEWAY_INTERFACE", "REQUEST_METHOD", "PATH_INFO", "QUERY_STRING",
-    "SCRIPT_FILENAME", "SCRIPT_NAME", "REMOTE_ADDR", "SERVER_NAME",
+    "SCRIPT_FILENAME", "SCRIPT_NAME", "DOCUMENT_ROOT", "REMOTE_ADDR", "SERVER_NAME",
     "SERVER_PORT", "SERVER_PROTOCOL", "CONTENT_TYPE", "CONTENT_LENGTH", NULL
 };
 
@@ -633,6 +633,16 @@ static void cgi_script_uri(const char *path, const char *docroot, const char *sc
         memcpy(name_out, path, nlen);
         name_out[nlen] = '\0';
         snprintf(info_out, info_sz, "%s", hit + srel_len);
+    } else if (path[strlen(path) - 1] == '/' && srel_len > 0) {
+        /* 目录索引请求（`/cgi2/` → docroot/index.cgi）：srel 不一定以字面形态出现在
+         * URL 里，但 SCRIPT_NAME 必须是**实际脚本**的 URI 路径（CGI/1.1 §4.1.13，
+         * nginx/Apache 同口径：`/cgi2/index.cgi`）。旧实现在这里回整条 URL
+         *（`/cgi2/`），与 cgi_script 引擎的 SCRIPT_NAME 不一致。 */
+        const char *base = strrchr(srel, '/');
+        base = (base != NULL) ? base + 1 : srel;
+        snprintf(name_out, name_sz, "%s%s", path, base);
+        if (info_sz > 0)
+            info_out[0] = '\0';
     } else {
         snprintf(name_out, name_sz, "%s", path);
         if (info_sz > 0)
@@ -647,7 +657,7 @@ static int cgi_execute(const char *script, const char *docroot, const char *meth
                        const char *extra, AppEngineResult *out)
 {
     crucible_buf raw, errbuf;
-    char *own[12];
+    char *own[16];
     size_t own_n = 0, nenv = 0, i;
     struct cgi_hdr_list hdrs;
     struct cgi_kv_list extra_env;
@@ -695,6 +705,7 @@ static int cgi_execute(const char *script, const char *docroot, const char *meth
     own[own_n++] = cgi_kv("PATH_INFO", path_info_uri);
     own[own_n++] = cgi_kv("QUERY_STRING", query != NULL ? query : "");
     own[own_n++] = cgi_kv("SCRIPT_FILENAME", script);
+    own[own_n++] = cgi_kv("DOCUMENT_ROOT", docroot != NULL ? docroot : "");
     own[own_n++] = cgi_kv("SCRIPT_NAME", script_name_uri);
     own[own_n++] = cgi_kv("REMOTE_ADDR", remote != NULL ? remote : "");
     own[own_n++] = cgi_kv("SERVER_NAME", server_name != NULL && server_name[0] != '\0'

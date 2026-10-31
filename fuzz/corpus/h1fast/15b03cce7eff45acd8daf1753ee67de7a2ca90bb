@@ -1,0 +1,7 @@
+GET /ws HTTP/1.1
+Ho1:30093
+Upgrade: websockœ‹
+Connction: Upgrde
+Sec-WebSocket-K-y: dGhlIHNhbXBsZSBub25jZQ==
+Sec-WebSocket-Version: 13
+
