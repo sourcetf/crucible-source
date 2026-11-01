@@ -129,18 +129,32 @@ pub(crate) fn sidecar_binary_mtime(app: &AppRouteConfig, lc: &ListenerConfig) ->
     sidecar_binary(app, lc).map(|p| mtime_nanos(&p)).unwrap_or(0)
 }
 
-/// 一条受管 sidecar 的**完整身份**：跨注册表/跨协议复用前必须四项全等。
+/// sidecar 二进制（自动探测 `deps/bin/index`）的字节长度（文件缺失 = 0）。
 ///
-/// 四项缺一不可（R-06）：
+/// 与 mtime 合成二元组使用：只记 mtime 会漏掉「mtime 未变、内容已换」的重建
+/// （构建系统原地覆盖同名文件、运维把二进制回滚成旧的、或文件系统只在写入时才更
+/// mtime 而尺寸变化发生在精度之外）。尺寸与 mtime 一起进身份，重启判据更严。
+pub(crate) fn sidecar_binary_size(app: &AppRouteConfig, lc: &ListenerConfig) -> u64 {
+    sidecar_binary(app, lc)
+        .and_then(|p| fs::metadata(&p).ok())
+        .map(|m| m.len())
+        .unwrap_or(0)
+}
+
+/// 一条受管 sidecar 的**完整身份**：跨注册表/跨协议复用前必须五项全等。
+///
+/// 五项缺一不可（R-06）：
 ///   * `env_fp`：spawn 时注入进程 env 的 `.env`（含启动期基底之外本 app 的键）摘要；
 ///   * `docroot_fp`：进程 `cwd` / `DOCUMENT_ROOT`（配置改 docroot 后旧进程必须重启）；
 ///   * `bin_mtime`：`deps/bin/index` 的 mtime（二进制重建后旧映像必须重启）；
+///   * `bin_size`：`deps/bin/index` 的字节长度（与 mtime 合成二元组，防「mtime 未变、内容已换」）；
 ///   * `engine`：引擎名（防御性；sock 路径本身已含引擎，仍显式核验）。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct SidecarIdentity {
     pub env_fp: u64,
     pub docroot_fp: u64,
     pub bin_mtime: u64,
+    pub bin_size: u64,
     pub engine: String,
 }
 
@@ -156,6 +170,7 @@ impl SidecarIdentity {
             env_fp: env_fingerprint(env_vars),
             docroot_fp: path_fingerprint(docroot),
             bin_mtime: sidecar_binary_mtime(app, lc),
+            bin_size: sidecar_binary_size(app, lc),
             engine: sanitize_engine(&app.engine),
         }
     }
@@ -166,8 +181,8 @@ impl SidecarIdentity {
 // 为什么需要（P2/R-06）：h1 与 h2/h3 各有一张 sidecar 注册表，却服务**同一个** UDS 路径。
 // 「sock 活着就复用」让后到的协议无法核验先到协议那次 spawn 用的环境 —— 长驻进程的
 // 进程 env / cwd / 可执行映像都只在 spawn 时定型。现在 spawner 在 sock 旁写
-// `app.sock.envfp`（内容 = `.env` 摘要 + docroot + 引擎 + 二进制 mtime + pid），
-// **跨注册表/跨协议复用前一律核验全部四项**；任一项不一致就杀掉所有者并重建
+// `app.sock.envfp`（内容 = `.env` 摘要 + docroot + 引擎 + 二进制 mtime + 二进制 size + pid），
+// **跨注册表/跨协议复用前一律核验全部五项**；任一项不一致就杀掉所有者并重建
 //（见 [`evict_sidecar_for_env_change`]）。全等 → 不重启（来回切协议不会抖动）。
 
 /// 与 UDS 相邻的指纹文件路径（`.../app.sock` → `.../app.sock.envfp`）。
@@ -177,9 +192,11 @@ pub(crate) fn sidecar_env_fp_path(sock: &Path) -> PathBuf {
     PathBuf::from(os)
 }
 
-/// 指纹文件内容（v2）：`v2 <env_fp> <docroot_fp> <bin_mtime> <engine> [spawner pid]`
-/// （前三个为 16 位十六进制）。v1（`v1 <env_fp> [pid]`，只有 `.env` 摘要）仍可解析，
-/// 但缺 docroot/引擎/二进制 mtime ⇒ 永不与新期望相等（当作不一致，重启一次）。
+/// 指纹文件内容（v3）：`v3 <env_fp> <docroot_fp> <bin_mtime> <bin_size> <engine> [spawner pid]`
+/// （前四个为 16 位十六进制）。v2（`v2 <env_fp> <docroot_fp> <bin_mtime> <engine> [pid]`，
+/// 无二进制 size）与 v1（`v1 <env_fp> [pid]`，只有 `.env` 摘要）仍可解析出 pid 供回收，
+/// 但它们的身份缺少新字段（size=0 / docroot=0 / 引擎为空）⇒ 永不与新期望相等
+/// （当作不一致，重启一次）。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct SidecarEnvFp {
     pub identity: SidecarIdentity,
@@ -190,6 +207,24 @@ pub(crate) fn read_sidecar_env_fp(sock: &Path) -> Option<SidecarEnvFp> {
     let text = fs::read_to_string(sidecar_env_fp_path(sock)).ok()?;
     let t: Vec<&str> = text.split_whitespace().collect();
     match t.first().copied()? {
+        "v3" => {
+            let env_fp = u64::from_str_radix(t.get(1)?, 16).ok()?;
+            let docroot_fp = u64::from_str_radix(t.get(2)?, 16).ok()?;
+            let bin_mtime = u64::from_str_radix(t.get(3)?, 16).ok()?;
+            let bin_size = u64::from_str_radix(t.get(4)?, 16).ok()?;
+            let engine = (*t.get(5)?).to_string();
+            let pid = t.get(6).and_then(|s| s.parse::<i32>().ok());
+            Some(SidecarEnvFp {
+                identity: SidecarIdentity {
+                    env_fp,
+                    docroot_fp,
+                    bin_mtime,
+                    bin_size,
+                    engine,
+                },
+                pid,
+            })
+        }
         "v2" => {
             let env_fp = u64::from_str_radix(t.get(1)?, 16).ok()?;
             let docroot_fp = u64::from_str_radix(t.get(2)?, 16).ok()?;
@@ -201,6 +236,8 @@ pub(crate) fn read_sidecar_env_fp(sock: &Path) -> Option<SidecarEnvFp> {
                     env_fp,
                     docroot_fp,
                     bin_mtime,
+                    // v2 没有二进制 size：填 0 ⇒ 与真实期望（非零 size）永不相等，重启一次。
+                    bin_size: 0,
                     engine,
                 },
                 pid,
@@ -214,6 +251,7 @@ pub(crate) fn read_sidecar_env_fp(sock: &Path) -> Option<SidecarEnvFp> {
                     env_fp,
                     docroot_fp: 0,
                     bin_mtime: 0,
+                    bin_size: 0,
                     engine: String::new(),
                 },
                 pid,
@@ -284,8 +322,13 @@ pub(crate) fn write_sidecar_env_fp(sock: &Path, identity: &SidecarIdentity, pid:
     let p = sidecar_env_fp_path(sock);
     let tmp = p.with_extension("envfp.tmp");
     let body = format!(
-        "v2 {:016x} {:016x} {:016x} {} {}\n",
-        identity.env_fp, identity.docroot_fp, identity.bin_mtime, identity.engine, pid
+        "v3 {:016x} {:016x} {:016x} {:016x} {} {}\n",
+        identity.env_fp,
+        identity.docroot_fp,
+        identity.bin_mtime,
+        identity.bin_size,
+        identity.engine,
+        pid
     );
     let res = fs::write(&tmp, body.as_bytes()).and_then(|_| fs::rename(&tmp, &p));
     if let Err(e) = res {
@@ -924,7 +967,7 @@ mod sidecar_env_fp_tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     /// 指纹文件：落盘/读取/比较/覆盖（跨注册表复用判据的存储面）。
-    /// v2 身份含 `.env`/docroot/二进制 mtime/引擎四项；任一项不同即不一致。
+    /// v3 身份含 `.env`/docroot/二进制 mtime/二进制 size/引擎五项；任一项不同即不一致。
     #[test]
     fn env_fp_file_roundtrip_and_mismatch() {
         let dir = std::env::temp_dir().join(format!(
@@ -942,6 +985,7 @@ mod sidecar_env_fp_tests {
             env_fp: 7,
             docroot_fp: 0xabc,
             bin_mtime: 0x123,
+            bin_size: 0x456,
             engine: "go".to_string(),
         };
         assert!(!sidecar_fp_matches(&sock, &id));
@@ -954,11 +998,12 @@ mod sidecar_env_fp_tests {
             })
         );
         assert!(sidecar_fp_matches(&sock, &id));
-        // 四项各自不同都必须判不一致（R-06：跨注册表复用不只看 .env）。
+        // 五项各自不同都必须判不一致（R-06：跨注册表复用不只看 .env）。
         for mutated in [
             SidecarIdentity { env_fp: 8, ..id.clone() },
             SidecarIdentity { docroot_fp: 0xdead, ..id.clone() },
             SidecarIdentity { bin_mtime: 0x999, ..id.clone() },
+            SidecarIdentity { bin_size: 0xaaa, ..id.clone() },
             SidecarIdentity { engine: "rust".to_string(), ..id.clone() },
         ] {
             assert!(
@@ -971,12 +1016,54 @@ mod sidecar_env_fp_tests {
             env_fp: 0xdead_beef,
             docroot_fp: 1,
             bin_mtime: 2,
+            bin_size: 3,
             engine: "c".to_string(),
         };
         write_sidecar_env_fp(&sock, &id2, 4243);
         let read = read_sidecar_env_fp(&sock).unwrap();
         assert_eq!(read.identity, id2);
         assert_eq!(read.pid, Some(4243));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// v2 旧指纹文件（有 docroot/引擎/mtime，但**无**二进制 size）仍能解析出 pid 供回收，
+    /// 但绝不被判为与新身份一致（size=0 ≠ 真实非零 size）⇒ 跨注册表复用重启一次。
+    #[test]
+    fn legacy_v2_fingerprint_parses_but_never_matches() {
+        let dir = std::env::temp_dir().join(format!(
+            "crucible-fp-v2-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let sock = dir.join("app.sock");
+        fs::write(
+            sidecar_env_fp_path(&sock),
+            "v2 0000000000000007 0000000000000123 0000000000000099 go 555\n",
+        )
+        .unwrap();
+        let got = read_sidecar_env_fp(&sock).expect("v2 必须可解析");
+        assert_eq!(got.pid, Some(555));
+        assert_eq!(got.identity.env_fp, 7);
+        assert_eq!(got.identity.docroot_fp, 0x123);
+        assert_eq!(got.identity.bin_mtime, 0x99);
+        assert_eq!(got.identity.bin_size, 0);
+        assert!(
+            !sidecar_fp_matches(
+                &sock,
+                &SidecarIdentity {
+                    env_fp: 7,
+                    docroot_fp: 0x123,
+                    bin_mtime: 0x99,
+                    bin_size: 0x99,
+                    engine: "go".to_string(),
+                },
+            ),
+            "v2 缺二进制 size（=0），永不与真实完整身份相等"
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -997,8 +1084,8 @@ mod sidecar_env_fp_tests {
         let got = read_sidecar_env_fp(&sock).expect("v1 必须可解析");
         assert_eq!(got.pid, Some(555));
         assert_eq!(got.identity.env_fp, 7);
-        // v1 里没有 docroot/引擎/二进制 mtime：真实期望身份（docroot_fp 是路径哈希、
-        // engine 非空、mtime 非零）永不与之相等 ⇒ 跨注册表复用会判「无法核验」并重启一次。
+        // v1 里没有 docroot/引擎/二进制 mtime/size：真实期望身份永不与之相等 ⇒
+        // 跨注册表复用会判「无法核验」并重启一次。
         assert!(
             !sidecar_fp_matches(
                 &sock,
@@ -1006,10 +1093,11 @@ mod sidecar_env_fp_tests {
                     env_fp: 7,
                     docroot_fp: 0x1234,
                     bin_mtime: 0x99,
+                    bin_size: 0x42,
                     engine: "go".to_string(),
                 },
             ),
-            "v1 缺 docroot/引擎/二进制 mtime，永不与真实完整身份相等"
+            "v1 缺 docroot/引擎/二进制 mtime/size，永不与真实完整身份相等"
         );
         let _ = fs::remove_dir_all(&dir);
     }

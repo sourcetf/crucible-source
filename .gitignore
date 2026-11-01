@@ -117,3 +117,7 @@ www-apps/*/deps/
 
 # 我的临时备份目录（agent 快照补丁，不属于项目）
 .agents-backups-*/
+
+# dnssec-dsfromkey 会在当前目录写 dsset-<zone>（验证脚本应在 $WORK 下跑；这里兜底）
+dsset-*
+*.dsset
