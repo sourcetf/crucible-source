@@ -12,6 +12,26 @@
 #   scripts/bench_h2_local.sh <label> [rounds]
 #   URL=https://127.0.0.1:19443/ CONC=50 DUR=5 scripts/bench_h2_local.sh before 3
 #
+# 起一个最小 h2 目标（自签证书 + 两个 docroot，避免「不同站点 root 相同」被配置校验拦下）：
+#   D=$(mktemp -d); mkdir -p $D/{wwwroot,wwwroot2}
+#   openssl req -x509 -newkey rsa:2048 -nodes -keyout $D/key.pem -out $D/cert.pem \
+#       -days 3650 -subj /CN=localhost
+#   head -c 1386 /dev/urandom | base64 > $D/wwwroot/index.html; cp $D/wwwroot/index.html $D/wwwroot2/
+#   cat > $D/bench.toml <<'EOF'
+#   [[listeners]]
+#   address = "127.0.0.1"
+#   port = 19443
+#   root = "<$D>/wwwroot"
+#   server_name = "localhost"
+#   http_versions = ["h1", "h2"]
+#   [listeners.ssl]
+#   cert = "<$D>/cert.pem"
+#   key = "<$D>/key.pem"
+#   EOF
+#   target/release/webserver --config $D/bench.toml &     # 再跑本脚本
+# h2c（明文 prior-knowledge）另加一个 listener：同 root 会**被校验拒绝**，用第二个 docroot，
+# http_versions = ["h1","h2"]（注意 token 是 `h2`，写 `h2c` 会被判成「h2 被禁用」）。
+#
 # 起点（2026-11-03，32 核 WSL2 Linux，1.3KB 静态文件，TLS+h2）：
 #   coalesce=off: m1 39,750  m10 101,650 req/s
 #   coalesce=on : m1 44,411  m10 134,886 req/s   ← 默认值（+11.7% / +32.7%）
