@@ -6396,3 +6396,41 @@ GeoIP merge_pipeline DDL、h2 m10、过夜 iter28 历史快照。
 **以后一律不要把构建目录、工具链、缓存放进 `~/scratch-*` / `/tmp`**（会随清理消失）。
 用户级运行时在 `~/local`（NSS/BIND/JDK/PHP/Ruby/Node/.NET，用
 `/home/dev123/bin/aptlocal.sh` 装）；一次性实验放 `~/scratch-<波次>` 并在收尾时删除。
+
+---
+
+# 【工号 1009 · P0】perl/psgi 引擎在 OpenBSD 上并发崩溃（堆损坏）—— 已修（commit 6a75c3f / d08bc0f）
+
+## 症状与定位（全部真机证据）
+1. 生产机混合压测（`/perl/ /psgi/ /python/` 各 6 并发）后进程消失，core 25 MB：
+   栈为 `Perl_rpp_free_2_ ← Perl_runops_standard ← Perl_call_sv ← appengine_execute(libapp_psgi.so)`。
+2. 修掉这一处（`SPAGAIN/PUTBACK` 被误放进 `if (count>0)` ⇒ Perl 栈不平衡）后**仍然崩**：
+   core 变成 signal 5（SIGTRAP），栈在 libc `memset`/`malloc_lock` —— OpenBSD malloc 的
+   **堆损坏**报警。
+3. 逐引擎隔离：`/perl/` 6 并发 **2 轮内必崩**；`/psgi/`、`/python/` 单独跑不崩。
+4. 对照实验（关键）：用**改动前**的 perl 引擎源码（`git show 3b90cf4~1:...script_engine.c`）
+   在远程重建 → **同样崩** ⇒ 与 wave-23 的 perl/psgi 内存泄漏修复无关，是**既有**缺陷。
+5. 定位实验：`CRUCIBLE_APP_POOL_WIDTH=1`（引擎池固定单线程）→ 6 并发 50 s **存活**。
+
+## 根因
+**解释器线程亲和性**。通用引擎池有 2..4 个 worker；ithreads 构建的 Perl 里
+`PERL_SET_CONTEXT(my_perl)` 只把**当前线程**的 `PL_curinterp` 指过去，解释器内部仍有
+按线程缓存的栈/arena。于是「线程 A 创建解释器、线程 B 使用它」——**即便有全局
+`PERL_LOCK` 串行**——也会踩坏堆。单线程池恰好让「创建者 = 使用者」，所以不崩。
+
+## 修复
+`src/server/apps/app_ffi.rs::serial_engine()` 增加 `"perl"`（`psgi` 原本已在其中）：
+这两个引擎在**串行单线程池**上运行，解释器只被一个线程创建与使用。
+`lua` 有自己的互斥且无 TLS 亲和问题、`python` 走 GIL/专用线程，均保持原状。
+
+## 验证
+- 本地：16 线程混合 8000 请求 0 失败；`/perl/` 单独 2000 请求 2167 rps 0 失败；进程存活。
+- 远程：重建后需复跑混合压测（本文件后续小节或 `reports/*-wave2*.md` 记录）。
+- 单测：670 passed / 0 failed / 1 ignored。
+
+## 教训（写给后续 agent）
+- **不要**把本机（Linux/glibc）编译的 `.so` 拷到 OpenBSD —— `dlopen` 会报
+  "Cannot load specified object"。引擎必须在**目标机**上用 `scripts/build_app_engines.sh` 重建。
+- 引擎并发问题必须用**真并发**压测（单线程 curl 循环测不出来）。
+- 解释器类引擎（perl/psgi/rack/ruby）都应在**单线程**上执行；新增引擎时先问
+  「它的解释器有没有线程亲和性/全局状态」。
