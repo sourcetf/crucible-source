@@ -6467,3 +6467,76 @@ OpenBSD 上编过**（远程一直跑的是更早的二进制）。修法：统�
   **串行单线程池**（`psgi` 原本就在）。另修 `psgi` 的 Perl 栈不平衡（`SPAGAIN/PUTBACK`
   必须无条件执行，否则 `Perl_rpp_free_2_` 里段错误）。
   新增回归用例 `scripts/accept-verify-engines-concurrent.py`（单线程 curl 循环测不出这类问题）。
+
+---
+
+# 【工号 1009 · 追加】P0：perl 与 psgi **双解释器**互踩（2026-11-03）
+
+## 现象
+生产机（OpenBSD）混合并发 soak：`/perl/`、`/psgi/` **单跑**各自都稳（各几千请求 0 失败），
+**一起跑**（或 soak 里带 `/php/`）则 2~7 秒必崩，整个进程死掉。core 落点每次相同：
+
+```
+#0 Perl_rpp_free_2_   #1 Perl_runops_standard   #2 Perl_call_sv
+#3 appengine_execute  (libapp_psgi.so)          #4 app_ffi::call_exec
+```
+
+## 根因（一条命令就能看出来）
+```
+$ perl -V:useithreads -V:usemultiplicity
+useithreads='undef'; usemultiplicity='undef';
+```
+OpenBSD base perl 是**非线程、非多解释器**构建：`PL_curinterp` 等全是**进程全局**变量，
+`PERL_SET_CONTEXT` 不是 TLS。`libapp_perl.so` 与 `libapp_psgi.so` 各 `perl_alloc()` 一个
+解释器、又各跑在**自己的**串行池线程上 ⇒ 两条线程交替把全局「当前解释器」切到自己那个，
+于是**对方正在执行**的调用落到错误解释器上 → libperl 释放临时栈时踩坏堆。
+
+（开发机 glibc + ithreads perl 上不暴露：那里 `PL_curinterp` 是 TLS，两个解释器互不干扰
+——这就是「本地好好的、真机才崩」的原因。判据永远是**目标机**的 `perl -V`。）
+
+## 修法（两道缺一不可）
+1. **进程唯一解释器**：新增 `libs/app-engines/common/crucible_perl_shared.h`。两个 `.so` 都
+   提供同名、默认可见性的 `crucible_perl_shared_get()`；宿主用 `RTLD_GLOBAL` 装载引擎 `.so`
+   （`app_ffi` 已是），后加载者的引用被动态链接器绑到先加载者的定义 ⇒ 共用同一份静态实例。
+   `PERL_SYS_INIT3 + perl_alloc/construct/parse(-e 0)` 只在共享头里做**一次**；两个引擎都不再
+   自行 parse（对同一解释器重复 parse 同样是 UB）。
+2. **同一条线程**：`app_ffi::pool_family()` 让 `perl` 与 `psgi` 共用**同一个**串行池键
+   （`"perl"`）。非多解释器 perl 同时只允许一个调用在跑 —— 即使只有一份解释器，跨线程并发
+   也会撕裂全局状态。`rack`（MRI）不属本家族，保持独立线程。
+
+> 教训：**嵌入解释器前先看目标机 `perl -V` / `ruby -v` 的线程与多实例构建标志**；
+> 非线程/非多解释器 = 进程内**只能有一个实例、只能串行**。
+> 同族引擎（perl+psgi、ruby+rack 这类共用同一运行时的）必须**共享实例 + 共享线程**。
+
+## 验收结果（2026-11-03，生产机 OpenBSD 真机，逐条可复现）
+
+**决定性门禁** `scripts/accept-verify-perl-shared.sh`（两个 .so 各自调探针
+`crucible_perl_probe_interp()`，比较返回的 `PerlInterpreter*`）：
+
+```
+== 顺序 A：perl 先装载 ==   first=libapp_perl.so -> interp=0xe6e43aed550
+                            second=libapp_psgi.so -> interp=0xe6e43aed550
+== 顺序 B：psgi 先装载 ==   first=libapp_psgi.so -> interp=0xeaeba68dd60
+                            second=libapp_perl.so -> interp=0xeaeba68dd60
+ok: 两种装载顺序下 perl 与 psgi 都用同一个解释器
+```
+
+**并发/混合负载**（生产机 9095，混合 `/perl/ /psgi/ /php/ /ruby/ /python/`）：
+
+| 负载 | 结果 |
+|------|------|
+| `/perl/` 6 并发 20s | ok=11070 bad=0 |
+| `/psgi/` 6 并发 20s | ok=12504 bad=0 |
+| perl+psgi **混合** 6 并发 20s | ok=9930 bad=0 |
+| 5 引擎混合 6 并发 × 40s × **6 块** | 合计 **90276 请求，0 失败，进程全程存活** |
+| 本地 16 线程持续压（WAN） | 3 块 × 90s，0 失败 |
+
+修复前同型负载（perl+psgi 混合）**2~7 秒必崩**；修复后 90k 请求无一次失败，
+RSS 54,996KB → 57,224KB（+2.2MB/90k 请求，无泄漏），**无新 core**，`/jsp/`、`/do/` 均 200。
+
+> 踩坑记录（验收方法学）：那台生产机上**长跑的压测脚本会被环境掐掉**（python 数十秒后
+> 消失、`sh -s` 随后挂住、块缓冲输出随之丢失），而 webserver 本身没事 —— 于是「服务器
+> 是否崩」这个唯一判据会被压测进程的生死掩盖。可靠做法：**把压测切成 <60s 的短块**，
+> 每块一个**新**进程、`python3 -u` 无缓冲，块间探活；或**从本地**经公网打 9095（那里
+> 的公网口开着，实测 `HTTP/1.0 200`）。另注：负载饱和时 WAN 上单发 `GET /` 可能 >5s，
+> **5 秒探活超时会把「排队」误判成「进程已死」**（实测 11.5s/次），探活超时要放宽到 15~20s。
