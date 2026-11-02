@@ -6375,3 +6375,24 @@ GeoIP merge_pipeline DDL、h2 m10、过夜 iter28 历史快照。
 
 报告 `.agents/1009/reports/matrix3-wave22.md`；修复 `.agents/1009/fixes/matrix3-wave22.md`；
 矩阵 `.agents/1009/reports/spec-matrix.md`；附注 `.agents/1009/reports/spec-matrix-notes.md`。
+
+---
+
+# 【工号 1009 · 追加】构建环境路径已改到稳定位置（2026-11-01，磁盘清理后）
+
+本机（WSL2）磁盘由多 agent 共享，`~/scratch-*` 会被当作一次性产物清理。**2026-11-01 的清理
+误删了 `~/scratch-tls`（内含 bindgen 需要的 libclang + Go + BoringSSL 构建缓存），导致
+`cargo build` 全线报 "Unable to find libclang"**。已修正为稳定路径，并写进
+`.agents/1009/BRIEF-WAVE2.md` 第 5 节：
+
+```
+. /home/dev123/bin/buildenv.sh
+#   TMPDIR=/home/dev123/tmp
+#   CARGO_TARGET_DIR=/home/dev123/build-target
+#   LIBCLANG_PATH=/usr/lib/x86_64-linux-gnu     ← 系统 libclang-21.so.1
+#   BORING_BSSL_PATH/INCLUDE → 仓库 target/tls-libs/boringssl（已构建好，无需 Go）
+```
+
+**以后一律不要把构建目录、工具链、缓存放进 `~/scratch-*` / `/tmp`**（会随清理消失）。
+用户级运行时在 `~/local`（NSS/BIND/JDK/PHP/Ruby/Node/.NET，用
+`/home/dev123/bin/aptlocal.sh` 装）；一次性实验放 `~/scratch-<波次>` 并在收尾时删除。
