@@ -276,14 +276,17 @@ fn stat_fd(file: &fs::File) -> Option<libc::stat> {
 #[cfg(unix)]
 fn fdid_from_stat(st: &libc::stat) -> FdId {
     FdId {
-        dev: st.st_dev,
-        ino: st.st_ino,
+        // **平台类型差异**：`st_dev`/`st_nlink` 在 Linux 是 u64/u64，在 OpenBSD 是
+        // i32/u32（`libc::stat` 字段类型随平台变）。统一 `as u64` —— 它们只用于
+        // 「同一文件是否还是同一个 inode」的比较，不参与运算，转换无损。
+        dev: st.st_dev as u64,
+        ino: st.st_ino as u64,
         len: st.st_size as u64,
         mtime_s: st.st_mtime as u64,
         mtime_ns: st.st_mtime_nsec as u32,
         ctime_s: st.st_ctime as u64,
         ctime_ns: st.st_ctime_nsec as u32,
-        nlink: st.st_nlink,
+        nlink: st.st_nlink as u64,
     }
 }
 
