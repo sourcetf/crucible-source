@@ -68,12 +68,48 @@ def hammer(port: int, path: str, threads: int, secs: float):
     return ok, bad, died_at
 
 
+def hammer_mixed(port: int, routes, threads: int, secs: float):
+    """**混合**压测：`threads` 个线程同时随机打若干路由（默认：全部引擎）。
+
+    为什么单列（真机 P0，2026-11-03）：perl 与 psgi 各自单独压都是 0 失败，但
+    **一起压** 2~7 秒就崩 —— 因为两个 `.so` 各建一个 Perl 解释器，而目标机 perl 是
+    `useithreads=undef/usemultiplicity=undef` 构建（`PL_curinterp` 是**进程全局**），
+    两条线程互把「当前解释器」切错 ⇒ libperl 在 `Perl_call_sv`/`Perl_rpp_free_2_` 崩。
+    只按路由**顺序**逐个压（上面的 `hammer`）永远测不出这种**跨引擎**交互，所以这里
+    再用同一个线程池把所有路由**混在一起**打一遍。
+    """
+    ok = bad = 0
+    t0 = time.time()
+    died_at = None
+    with cf.ThreadPoolExecutor(max_workers=threads) as ex:
+        futs = {}
+        i = 0
+        while time.time() - t0 < secs:
+            for _ in range(threads):
+                path = routes[i % len(routes)]
+                i += 1
+                futs[ex.submit(one, port, path)] = path
+            for f in cf.as_completed(list(futs)):
+                st = f.result()
+                if st == 200:
+                    ok += 1
+                else:
+                    bad += 1
+            futs.clear()
+            if not alive(port):
+                died_at = time.time() - t0
+                break
+    return ok, bad, died_at
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--port", type=int, default=9095)
     ap.add_argument("--threads", type=int, default=8)
     ap.add_argument("--secs", type=float, default=15.0)
     ap.add_argument("--only", default="", help="只测这些路由（逗号分隔），默认全部")
+    ap.add_argument("--no-mix", action="store_true",
+                    help="跳过最后的「全路由混合并发」压测（默认做 —— 跨引擎交互只有它能测出）")
     args = ap.parse_args()
 
     routes = [r.strip() for r in args.only.split(",") if r.strip()] or ENGINES
@@ -92,6 +128,18 @@ def main():
         print(f"{flag} {path:10s} {args.threads} 并发 {args.secs:.0f}s：ok={ok} bad={bad}")
         if bad:
             fails.append(path)
+    if not args.no_mix and not fails:
+        ok, bad, died_at = hammer_mixed(args.port, routes, args.threads, args.secs)
+        if died_at is not None:
+            print(f"FAIL mixed     进程在 {died_at:.1f}s 死掉（ok={ok} bad={bad}；"
+                  f"路由循环={routes}）")
+            fails.append("mixed")
+        else:
+            flag = "ok  " if bad == 0 else "BAD "
+            print(f"{flag} mixed     全部 {len(routes)} 路由混合 {args.threads} 并发 "
+                  f"{args.secs:.0f}s：ok={ok} bad={bad}")
+            if bad:
+                fails.append("mixed")
     print(f"== summary: fails={len(fails)} {fails} ==")
     sys.exit(1 if fails else 0)
 

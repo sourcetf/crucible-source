@@ -1752,6 +1752,8 @@ int crucible_ruby_host_submit(int (*fn)(void *), void *ctx)
 #include <EXTERN.h>
 #include <perl.h>
 
+#include "crucible_perl_shared.h"
+
 static PerlInterpreter *my_perl;
 
 #ifndef _WIN32
@@ -1822,23 +1824,26 @@ static int run_perl_inprocess(const char *script, const char *method, const char
                               size_t body_len, const char *remote, const char *headers,
                               char **out_body, size_t *out_len)
 {
-    static char *embedding[] = {"", (char *)"crucible"};
-    int argc = 2;
-    char **argv = embedding;
-    char **env = NULL;
     char lenbuf[32];
     SV *out_sv;
     STRLEN n;
     char *s;
     int rc = -1;
-    /* 解释器只 parse/run 一次（见下方说明）。 */
-    static int perl_parsed;
+    char initerr[256];
 
     PERL_LOCK();
     if (!my_perl) {
-        PERL_SYS_INIT3(&argc, &argv, &env);
-        my_perl = perl_alloc();
-        perl_construct(my_perl);
+        /* **进程唯一**解释器（与 libapp_psgi.so 共用同一个实例，初始化只做一次）。
+         * 成因见 common/crucible_perl_shared.h：OpenBSD base perl 是 useithreads=undef /
+         * usemultiplicity=undef 的构建，PL_curinterp 是**进程全局**变量 —— perl 与 psgi
+         * 各建一个解释器并在两条线程上跑，会互相把「当前解释器」切错，几秒内崩在
+         * Perl_call_sv/Perl_rpp_free_2_（OpenBSD 真机 core 已确认）。 */
+        my_perl = crucible_perl_shared_interp("libapp_perl.so", initerr, sizeof(initerr));
+        if (my_perl == NULL) {
+            fprintf(stderr, "scriptffi: 嵌入式 Perl 初始化失败: %s\n", initerr);
+            PERL_UNLOCK();
+            return -1;
+        }
     }
     /* Debian/Ubuntu 的 perl 是 **ithreads** 构建：解释器指针/PL_* 是**每线程**的
      * TLS（`PL_curinterp`）。app_ffi 的通用池有 4..8 个线程，第一次请求在哪个
@@ -1848,23 +1853,11 @@ static int run_perl_inprocess(const char *script, const char *method, const char
      * `segfault at 0x40 in libperl.so.5.40`，整个 webserver 被打死）。
      * 每次进入锁后都显式 set：线程无关、幂等（非 ithreads 构建上是 no-op）。 */
     PERL_SET_CONTEXT(my_perl);
-    /* **只在初始化时 parse/run 一次**：
-     * Perl API 规定 `perl_parse` 对同一解释器只能调用一次；每请求重复 parse 会不断
-     * 新建 op 树/符号表且永不释放 —— soak-wave22 实测 `/perl/` 每请求泄漏 **~78 KB**
-     * （60 s 窗口 +4.05 GB / +1.85 GB，长稳 46 分钟被系统 OOM 护栏杀掉），
-     * 而 `perl_run` 只用于执行 BEGIN 块，同样不需要每请求调用。
+    /* **perl_parse/perl_run 只在共享头里做一次**（对同一解释器只能 parse 一次；
+     * 每请求重复 parse 会不断新建 op 树/符号表且永不释放 —— soak-wave22 实测
+     * `/perl/` 每请求泄漏 ~78 KB，长稳 46 分钟被系统 OOM 护栏杀掉）。而且解释器现在
+     * 是**跨 .so 共享**的：本引擎再 parse 一次就会把 psgi 正在用的解释器重复解析。
      * 请求期只做 ENV/body 注入 + eval 脚本（脚本内容每请求可不同，故仍按请求执行）。 */
-    if (!perl_parsed) {
-        /* `-e 0`：argv[1] 会被 perl_parse 当成**脚本文件**去打开（传普通名字会直接
-         * 失败：Can't open perl script "…"），所以既不给它脚本文件、也不让它跑任何
-         * 用户代码 —— 只把解释器初始化好；脚本在请求期由 eval 执行（rack 引擎同款）。 */
-        /* static：perl_parse 会保留 argv 指针（PL_origargv），指向栈上的数组会在
-         * 之后被 GC/错误路径解引用 —— 真机实测段错误。 */
-        static char *args[] = {(char *)"crucible-perl", (char *)"-e", (char *)"0"};
-        perl_parse(my_perl, NULL, 3, args, NULL);
-        perl_run(my_perl);
-        perl_parsed = 1;
-    }
     /* ENV（含 CONTENT_LENGTH/CONTENT_TYPE；P2 body 丢失修复）。 */
     {
         HV *envhv = get_hv("ENV", GV_ADD);

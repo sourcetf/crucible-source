@@ -947,8 +947,9 @@ async fn exec_dispatch(
         }
     };
     let pool: Arc<EnginePool> = if serial {
-        // rack/psgi：串行单线程池（解释器非线程安全）。
-        serial_pool(&engine_for_pool)
+        // 解释器都非线程安全 → 串行单线程池。**按家族取池**（见 pool_family）：
+        // perl 与 psgi 共用**同一条**线程，rack 自己一条。
+        serial_pool(pool_family(&engine_for_pool))
     } else if let Some(n) = dedicated_pool_threads(&engine_for_pool) {
         // cgi：独立窄池（见 dedicated_pool_threads），不占通用池、也不被通用池拖累。
         named_pool(&engine_for_pool, n)
@@ -1477,6 +1478,29 @@ fn serial_engine(engine: &str) -> bool {
     // 用 `CRUCIBLE_APP_POOL_WIDTH=1` 固定到单线程后 50s 压测存活 ⇒ 证实是亲和性而非并发本身。
     // 串行池是**单线程**：解释器在它上面创建、也只在它上面使用。psgi 同理（各有私有解释器）。
     matches!(engine, "rack" | "psgi" | "perl")
+}
+
+/// 串行池的**家族键**：同键的引擎共用同一条池线程。
+///
+/// 为什么 perl 与 psgi 必须同线程（真机 P0，2026-11-03）：目标机 OpenBSD 的 base perl
+/// 是 `useithreads=undef` / `usemultiplicity=undef` 构建 —— `PL_curinterp` 等是**进程
+/// 全局**的，`PERL_SET_CONTEXT` 不是 TLS。两条线程各自 `PERL_SET_CONTEXT` 到自己的
+/// 解释器时，会把**对方正在执行**的调用切错解释器：core 反复落在
+/// `Perl_rpp_free_2_ ← Perl_runops_standard ← Perl_call_sv ← appengine_execute(libapp_psgi.so)`。
+/// 单跑 /perl/ 或单跑 /psgi/ 都稳（各自只有一个解释器），混合并发几秒即崩 —— 典型指纹。
+///
+/// 两道修复缺一不可：
+///   1. 两个引擎共用一个解释器（`libs/app-engines/common/crucible_perl_shared.h`
+///      经 RTLD_GLOBAL 符号介入把两个 `.so` 的引用绑到同一实例）；
+///   2. 本函数把两个引擎钉在**同一条**线程上 —— 非多解释器 perl 同时只允许一个
+///      调用在跑，跨线程并发即使只有一份解释器也依然会撕裂全局状态。
+///
+/// rack 是 MRI（独立的运行时与 GVL 线程），不属本家族，保持自己一条线程。
+fn pool_family(engine: &str) -> &str {
+    match engine {
+        "perl" | "psgi" => "perl",
+        other => other,
+    }
 }
 
 /// c/go/rust 是否在请求线程内联执行（§22.4.2 native_inline）。

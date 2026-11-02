@@ -97,6 +97,8 @@ static const char *resolve_script(const char *script, const char *docroot, char 
 #include <EXTERN.h>
 #include <perl.h>
 
+#include "crucible_perl_shared.h"
+
 /* perl.h 的嵌入 API 宏（aTHX 等）要求解释器变量就叫 my_perl。 */
 static PerlInterpreter *my_perl;
 
@@ -186,31 +188,19 @@ static const char *psgi_driver =
     "    $buf;\n"
     "}";
 
-/* 一次 Perl 初始化：PERL_SYS_INIT3 + perl_alloc + perl_construct + perl_parse。
- * "-e 0"：不作为脚本运行——PSGI 应用由驱动片段的 do $script 加载。 */
+/* 取**进程唯一**的嵌入式 Perl 解释器 —— 与 libapp_perl.so 共用同一个实例。
+ *
+ * 成因见 common/crucible_perl_shared.h：OpenBSD base perl 是 useithreads=undef /
+ * usemultiplicity=undef 的构建，PL_curinterp 等是**进程全局**变量；两个 .so 各建一个
+ * 解释器并在两条线程上跑，就会互相把「当前解释器」切错，几秒内崩在
+ * Perl_call_sv/Perl_rpp_free_2_（真机 core 已确认）。初始化（PERL_SYS_INIT3 +
+ * perl_alloc/construct/parse `-e 0`）在共享头里**每进程只做一次**。 */
 static int perl_ensure_locked(char *err, size_t errsz)
 {
-    static char *embedding[] = {"", "-e", "0"};
-    int argc = 3;
-    char **argv = embedding;
-    char **env = NULL;
-
     if (my_perl != NULL)
         return 0;
-    PERL_SYS_INIT3(&argc, &argv, &env);
-    my_perl = perl_alloc();
-    if (my_perl == NULL) {
-        snprintf(err, errsz, "perl_alloc 失败");
-        return -1;
-    }
-    perl_construct(my_perl);
-    if (perl_parse(my_perl, NULL, 3, embedding, NULL) != 0) {
-        snprintf(err, errsz, "perl_parse(-e 0) 失败");
-        my_perl = NULL;
-        return -1;
-    }
-    (void)perl_run(my_perl);
-    return 0;
+    my_perl = crucible_perl_shared_interp("libapp_psgi.so", err, errsz);
+    return my_perl != NULL ? 0 : -1;
 }
 
 static void psgi_hv_put(HV *hv, const char *key, const char *val)
