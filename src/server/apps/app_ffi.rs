@@ -1469,7 +1469,14 @@ fn generic_pool_threads_with(
 }
 
 fn serial_engine(engine: &str) -> bool {
-    matches!(engine, "rack" | "psgi")
+    // **解释器有「线程亲和性」**：通用池有 2..4 个 worker，而 Perl 的 ithreads 构建里
+    // `PERL_SET_CONTEXT` 只把*当前线程*的 `PL_curinterp` 指过去，解释器内部仍有按线程
+    // 缓存的栈/arena —— 从**非创建线程**调用（哪怕有全局锁串行）会踩坏堆。
+    // 真实症状（OpenBSD 生产，6 并发 /perl/）：2 轮内进程 SIGTRAP/SIGSEGV，
+    // core 栈在 `memset`/`malloc_lock`（OpenBSD malloc 检测到堆损坏）；
+    // 用 `CRUCIBLE_APP_POOL_WIDTH=1` 固定到单线程后 50s 压测存活 ⇒ 证实是亲和性而非并发本身。
+    // 串行池是**单线程**：解释器在它上面创建、也只在它上面使用。psgi 同理（各有私有解释器）。
+    matches!(engine, "rack" | "psgi" | "perl")
 }
 
 /// c/go/rust 是否在请求线程内联执行（§22.4.2 native_inline）。
