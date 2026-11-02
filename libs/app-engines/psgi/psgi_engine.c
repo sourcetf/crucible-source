@@ -363,16 +363,23 @@ static int psgi_request(const char *script, const char *method, const char *path
         driver_ret = NULL;
         if (cv != NULL && SvOK(cv)) {
             dSP;
+            int count;
 
             ENTER;
             SAVETMPS;
             PUSHMARK(SP);
-            if (call_sv(cv, G_SCALAR | G_EVAL) > 0) {
-                SPAGAIN;
+            count = (int)call_sv(cv, G_SCALAR | G_EVAL);
+            /* **SPAGAIN/PUTBACK 必须无条件执行**：只在 count>0 时才做，会把 Perl 栈留在
+             * 不平衡状态（call_sv 已经把结果压栈/移栈），下一次调用从坏栈继续，
+             * 表现为 libperl 里 `Perl_rpp_free_2_`/`Perl_runops_standard` 段错误 ——
+             * OpenBSD 真机 2026-11-03 在混合引擎压测中就是这么崩的（core 可查）。
+             * 规范写法见 perlguts「Calling a Perl subroutine from C」。 */
+            SPAGAIN;
+            if (count > 0) {
                 /* 复制一份自有引用：LEAVE 之后栈上的值即失效。 */
                 driver_ret = newSVsv(POPs);
-                PUTBACK;
             }
+            PUTBACK;
             FREETMPS;
             LEAVE;
         }

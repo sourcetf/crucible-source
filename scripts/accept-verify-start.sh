@@ -1,11 +1,11 @@
 #!/bin/sh
 # accept-verify-start.sh — 启动一个隔离的 Crucible 验收实例（工号 1009 / agent-verify5）。
-# 端口块 22+（低于 Linux 临时端口范围，避开 24/26/28/29/31/32/33/36/38/40xxx），
+# 端口块 25000+（低于 Linux 临时端口范围，避开 24/26/28/29/31/32/33/36/38/40xxx），
 # DNS 状态根独立。cwd 必须是仓库根（docroot 是相对路径）。
 # 用法: sh scripts/accept-verify-start.sh
 set -e
 REPO=/home/dev123/crucible-git
-SCRATCH=/home/dev123/scratch-vf2
+SCRATCH=/home/dev123/scratch-vf3
 CFG=${ACCEPT_CFG:-$SCRATCH/conf/config-verify.toml}
 BIN=${ACCEPT_BIN:-$SCRATCH/bin/webserver}
 LOG=$SCRATCH/logs/webserver.log
@@ -35,11 +35,12 @@ nohup bash -c '. "$1/scripts/runtime_env.sh" 2>/dev/null || true; exec "$2" --co
 WPID=$!
 echo "$WPID" >"$PIDF"
 echo "started pid=$WPID cfg=$CFG log=$LOG"
-# 等待端口就绪
+# 等待端口就绪（verifyfinal3：DNS 状态根为空时首次启动要现起 BIND named + 19 listener，
+# 实测 ~14s；旧 10s 窗口会假失败并让套件在 PASS1 前退出。放宽到 40s。）
 i=0
-while [ $i -lt 40 ]; do
-  if curl -s -o /dev/null --max-time 1 http://127.0.0.1:22/ 2>/dev/null; then echo "ready after ${i}00ms"; exit 0; fi
+while [ $i -lt 160 ]; do
+  if curl -s -o /dev/null --max-time 1 http://127.0.0.1:25081/ 2>/dev/null; then echo "ready after ${i}00ms"; exit 0; fi
   i=$((i+1)); sleep 0.25
 done
-echo "WARN: not ready in 10s; last log:"; tail -20 "$LOG"
+echo "WARN: not ready in 40s; last log:"; tail -20 "$LOG"
 exit 1
