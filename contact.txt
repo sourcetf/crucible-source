@@ -6434,3 +6434,36 @@ GeoIP merge_pipeline DDL、h2 m10、过夜 iter28 历史快照。
 - 引擎并发问题必须用**真并发**压测（单线程 curl 循环测不出来）。
 - 解释器类引擎（perl/psgi/rack/ruby）都应在**单线程**上执行；新增引擎时先问
   「它的解释器有没有线程亲和性/全局状态」。
+
+---
+
+# 【工号 1009 · 追加】OpenBSD 移植性 + 远程构建方法学（2026-11-03）
+
+## 1. OpenBSD 编译阻塞：`libc::stat` 字段类型差异（已修，commit be6944e）
+`src/server/h1_fast.rs::fdid_from_stat` 直接把 `st.st_dev` / `st.st_nlink` 塞进
+`FdId { dev: u64, nlink: u64 }`：Linux 上它们是 u64、**OpenBSD 上是 i32/u32** ⇒
+远程 `cargo build` 报 `error[E0308] expected u64, found i32`，**h1 快车道那段代码从未在
+OpenBSD 上编过**（远程一直跑的是更早的二进制）。修法：统一 `as u64`（只用于 inode 比较，
+不参与运算，无损）。
+
+> 教训：**任何直接读 `libc::stat` 字段的代码都要写平台无关的转换**；本地 Linux 编译通过
+> 不代表 OpenBSD 能过。判断依据是远程 `cargo build` 的输出，不是本地。
+
+## 2. 远程构建的可靠姿势（踩过的坑）
+- **不要**把本机（Linux/glibc）编译的 `.so` 拷到 OpenBSD：`dlopen` 报
+  `Cannot load specified object`。引擎必须在**目标机**上用 `scripts/build_app_engines.sh` 重建。
+- **`nohup ... &` 的后台构建可能随 SSH 会话一起被回收**（实测：编译 10 分钟后进程消失、
+  日志无 `RC=` 行、产物未更新）。可靠做法：让 SSH 会话**持续到构建结束**，即
+  `REM_TIMEOUT=2400 /home/dev123/bin/rem.sh <脚本>` 并把这条命令放在本地后台跑，然后轮询。
+- 1 vCPU + 2 GB RAM 上，5 feature（`tls,tls_boring,go_shm_ipc,tls_nss,tls_tomcrypt`）+
+  `lto=thin` 的**链接阶段**是最慢的一段（数分钟到十几分钟），别误判为卡死。
+- 构建脚本里 `cp target/release/webserver bin/webserver` 前**必须判 RC**：否则失败时会
+  把旧二进制再拷一遍并重启，"看起来部署成功"其实是没更新。
+
+## 3. 本轮的两个 P0（都在生产真机上复现过）
+- **perl/psgi 内存泄漏**（wave-23 修）：`/perl/` 78 KB/req、`/psgi/` 6.7 KB/req。
+- **perl 引擎并发崩溃**（wave-24 修）：ithreads Perl 解释器有**线程亲和性**，通用池从非创建
+  线程调用（即便有全局锁）会踩坏堆 → OpenBSD malloc 报 SIGTRAP/SIGSEGV。修法：`perl` 加入
+  **串行单线程池**（`psgi` 原本就在）。另修 `psgi` 的 Perl 栈不平衡（`SPAGAIN/PUTBACK`
+  必须无条件执行，否则 `Perl_rpp_free_2_` 里段错误）。
+  新增回归用例 `scripts/accept-verify-engines-concurrent.py`（单线程 curl 循环测不出这类问题）。
