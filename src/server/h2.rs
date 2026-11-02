@@ -52,9 +52,11 @@ fn h2_env_usize(name: &str, default: usize, lo: usize, hi: usize) -> usize {
         .unwrap_or(default)
 }
 
-/// `CRUCIBLE_H2_COALESCE`：覆盖 [`H2_COALESCE_WRITES`]。默认仍为 `false`
-/// （coalesce 会把响应帧推迟到 cap/16KiB 再落 socket，纯静态公平口径实测无收益，
-/// 见 `reports/h2perf-wave21.md`；保留开关供 TLS 记录合并等场景验证）。
+/// `CRUCIBLE_H2_COALESCE`：覆盖 [`H2_COALESCE_WRITES`]。**默认开** ——
+/// `libs/h2/src/framed_write.rs` 的 `COALESCE_WRITES_DEFAULT` 里记了实测表：
+/// 本地核多机器上 m10 +32.7%、m1 +11.7%，延迟不退化（m10 mean 4.78ms vs 4.82ms）。
+/// 旧注释「实测无收益」来自 1 vCPU 目标机的量测，那里 syscall 不是瓶颈 —— 两边数字
+/// 都已记录，别用单机结论翻默认值。`=0` 保留为同二进制对照开关。
 fn h2_coalesce_enabled() -> bool {
     match crate::server::apps::env_lock::read_static_env("CRUCIBLE_H2_COALESCE").as_deref() {
         Some("0") => false,

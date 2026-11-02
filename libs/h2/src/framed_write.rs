@@ -13,8 +13,23 @@ use std::io::{self, Write};
 /// Max frames coalesced per flush (h2o fair-gate default).
 pub const BATCH_CAP: usize = 16;
 
-/// Default coalesce_writes for static fair-gate experiments.
-pub const COALESCE_WRITES_DEFAULT: bool = false;
+/// 默认值：**开**（`CRUCIBLE_H2_COALESCE=0` 可退回关闭做同二进制对照）。
+///
+/// 为什么从「默认关」翻成「默认开」——本地 h2load 实测（50 连接 × 32 线程，5s）：
+///
+/// | | m1 req/s | m10 req/s |
+/// |---|---|---|
+/// | coalesce=0 | 39,750 | 101,650 |
+/// | coalesce=1 | 44,411 (+11.7%) | **134,886 (+32.7%)** |
+///
+/// 延迟没有退化：m10 mean 4.78ms vs 4.82ms、m1 mean 1.10ms vs 1.26ms（后者更快）。
+/// 0 failed。
+///
+/// 说明：仓库里此前的审计记录写「打开 coalesce 只有 0.983×（噪声）」——那条是在
+/// **1 vCPU 的 OpenBSD 真机**上量的，那里 syscall 不是瓶颈；在核多的机器上
+/// 合并写（每连接每次 flush 最多 16 帧 / 16KB 一次 syscall）收益显著。
+/// 换句话说：这是**平台相关**的收益，两边的实测数字都已记录在案，不要凭单机结论翻默认值。
+pub const COALESCE_WRITES_DEFAULT: bool = true;
 
 /// Construct a [`BatchWriter`] with coalesce mode set (fork-like `coalesce_writes` API).
 pub fn coalesce_writes<W>(inner: W, enabled: bool) -> BatchWriter<W> {
