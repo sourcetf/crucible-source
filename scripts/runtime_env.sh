@@ -78,14 +78,34 @@ crucible_runtime_apply() {
   export PKG_CONFIG_PATH="${multi}/pkgconfig:${root}/usr/share/pkgconfig:${root}/usr/lib/pkgconfig${PKG_CONFIG_PATH:+:${PKG_CONFIG_PATH}}"
 
   # JAVA_HOME：显式值优先（但必须真有 javac，否则退回探测）。
+  #
+  # 探测路径要覆盖各发行版的真实布局（真机踩过）：Debian/Ubuntu 在
+  # `/usr/lib/jvm/<vendor>-<ver>`；**OpenBSD 的 `pkg_add jdk` 装到
+  # `/usr/local/jdk-17`**（不在 jvm/ 子目录下）—— 只探 jvm/* 会让 JAVA_HOME 为空、
+  # javac 不在 PATH，`build_jsp_sidecar.sh` 直接 FAIL（"找到 mvn 但没有 javac"），
+  # 表现成「/jsp/ 侧车构建失败 → 502」，很容易误判成 Java 代码问题。
   if [ -z "${JAVA_HOME:-}" ] || [ ! -x "${JAVA_HOME:-}/bin/javac" ]; then
     local cand
-    for cand in "${root}"/usr/lib/jvm/* /usr/lib/jvm/*; do
+    for cand in "${root}"/usr/lib/jvm/* /usr/lib/jvm/* \
+                "${root}"/usr/local/jdk* /usr/local/jdk* \
+                "${root}"/usr/local/openjdk* /usr/local/openjdk* \
+                "${root}"/usr/local/jvm/* /usr/local/jvm/* \
+                /usr/jdk* "${root}"/opt/jdk* /opt/jdk* \
+                /opt/java* "${root}"/opt/java*; do
       if [ -x "${cand}/bin/javac" ]; then
         JAVA_HOME="${cand}"
       fi
     done
     [ -n "${JAVA_HOME:-}" ] && export JAVA_HOME
+  fi
+  # 兜底：PATH 里已经有 javac 时，用它的上一级目录当 JAVA_HOME（mvn 会读它）。
+  if [ -z "${JAVA_HOME:-}" ]; then
+    local jc
+    jc="$(command -v javac 2>/dev/null || true)"
+    if [ -n "$jc" ]; then
+      JAVA_HOME="$(cd "$(dirname "$jc")/.." && pwd)"
+      export JAVA_HOME
+    fi
   fi
   if [ -n "${JAVA_HOME:-}" ] && [ -d "${JAVA_HOME}/bin" ]; then
     case ":${PATH:-}:" in
