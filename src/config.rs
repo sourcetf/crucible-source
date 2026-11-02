@@ -2053,6 +2053,35 @@ ECH 既无法装载（无密钥）也无法自动生成（缺 public-name），�
                     );
                 }
             }
+            // ④ 名字合法 ≠ 当前栈能服务：BoringSSL 主路径装的是 `mozilla_modern` 预设
+            //（`NO_TLSV1 | NO_TLSV1_1`，且密码套件表只有 AEAD），**服务不了** TLS1.0/1.1。
+            // 运行期 `apply_versions` 会把这些条目静默丢弃、只留 1.2–1.3（`boring_path.rs`
+            // 的 legacy 分支），于是「我把端口锁到 TLS1.0」实际跑的是 TLS1.2/1.3 ——
+            // 配置被静默改写，且 `--check-config` 放行。这里改成预检期诚实失败；
+            // 确实要服务老客户端，就走遗留栈（`enable_nss` / `enable_tomcrypt` 分流）。
+            if !ssl.enable_nss && !ssl.enable_tomcrypt {
+                let legacy: Vec<&str> = ssl
+                    .versions
+                    .iter()
+                    .map(|v| v.trim())
+                    .filter(|v| {
+                        matches!(
+                            v.to_ascii_lowercase().as_str(),
+                            "tls1" | "tls1.0" | "tls1.1" | "tlsv1" | "tlsv1.0" | "tlsv1.1"
+                        )
+                    })
+                    .collect();
+                if !legacy.is_empty() {
+                    anyhow::bail!(
+                        "listener {}:{} 的 ssl.versions 含 BoringSSL 主路径无法服务的版本 {legacy:?}\
+（mozilla_modern 预设禁用 TLS1.0/1.1），且没开 enable_nss/enable_tomcrypt —— \
+运行期只会静默降级到 TLS1.2–1.3，配置不会生效。请改成 tls1.2/tls1.3，\
+或开遗留栈（enable_nss / enable_tomcrypt）由 NSS/TomCrypt 分流这些老客户端",
+                        l.address,
+                        l.port
+                    );
+                }
+            }
         }
 
         // deps_dir 必须位于该应用 docroot 之内。
@@ -2426,6 +2455,22 @@ ECH 既无法装载（无密钥）也无法自动生成（缺 public-name），�
                     anyhow::bail!(
                         "listener {}:{}: proxy 规则 path={pth} 的 client_cert 与 client_key 必须成对配置",
                         l.address, l.port
+                    );
+                }
+                // `upstream_ca` / `upstream_ca_sha256` 只有 `trust_self_signed` 档位会读
+                //（`verify` 走系统根、`no_verify` 不校验、`off` 不建 TLS）。其它档位下写了
+                // 它们等于**静默忽略**：运维以为「已固定上游 CA」，实际还在信任系统根 —— 
+                // 这是安全语义上的静默降级。这里诚实失败，把选择交回运维。
+                if mode != crate::server::onion_ca::OnionSslMode::TrustSelfSigned
+                    && (non_empty(&r.upstream_ca) || non_empty(&r.upstream_ca_sha256))
+                {
+                    anyhow::bail!(
+                        "listener {}:{}: proxy 规则 path={pth} 配了 upstream_ca/upstream_ca_sha256，\
+但 ssl_mode={:?} 不会读取它们（只有 trust_self_signed 拿它们当信任锚）—— \
+要么改成 ssl_mode=trust_self_signed（只信任该 CA），要么删掉这两个字段（verify 档位用系统根）",
+                        l.address,
+                        l.port,
+                        r.ssl_mode
                     );
                 }
                 if let Some(pin) = r
@@ -3564,6 +3609,97 @@ versions = ["tls9.9"]
         let cfg: Config = toml::from_str(toml).expect("parse");
         let err = cfg.validate().expect_err("非法 TLS 版本必须报错");
         assert!(format!("{err}").contains("TLS 版本"), "错误信息应提到版本: {err}");
+    }
+
+    /// **名字合法但当前栈服务不了**：`versions` 写 tls1.0/1.1 时，BoringSSL 主路径
+    /// （`mozilla_modern` 预设禁了 TLS1.0/1.1）运行期只会**静默降级**到 1.2–1.3，
+    /// 而 `--check-config` 还放行 —— 配置看着生效、实际被改写。必须预检期诚实失败；
+    /// 开了遗留栈（NSS/TomCrypt 负责分流老客户端）时则放行。
+    #[test]
+    fn legacy_tls_version_without_legacy_stack_is_rejected() {
+        let base = r#"
+[[listeners]]
+address = "127.0.0.1"
+port = 14443
+root = "/tmp/x4"
+[listeners.ssl]
+cert = "cert.pem"
+key = "key.pem"
+"#;
+        // ① 只配 legacy 版本、没开遗留栈 → 拒。
+        let cfg: Config = toml::from_str(&format!("{base}versions = [\"tls1.0\"]\n")).expect("parse");
+        let err = cfg.validate().expect_err("legacy-only 版本必须报错");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("无法服务") && msg.contains("tls1.0"),
+            "错误信息应说明服务不了并列出该版本: {msg}"
+        );
+
+        // ② 现代版本 + legacy 混写：legacy 条目同样会被静默丢弃，也要拒。
+        let cfg: Config =
+            toml::from_str(&format!("{base}versions = [\"tls1.3\", \"TLSv1.1\"]\n")).expect("parse");
+        assert!(
+            cfg.validate().is_err(),
+            "混写里的 legacy 条目会被静默忽略，必须报错"
+        );
+
+        // ③ 开了遗留栈（NSS/TomCrypt 负责这些老客户端）→ 放行。
+        let cfg: Config = toml::from_str(&format!(
+            "{base}versions = [\"tls1.0\", \"tls1.2\"]\nenable_nss = true\n"
+        ))
+        .expect("parse");
+        assert!(
+            cfg.validate().is_ok(),
+            "开了 enable_nss 时老版本由 NSS 分流，不该拦"
+        );
+
+        // ④ 现代版本不受影响。
+        let cfg: Config = toml::from_str(&format!("{base}versions = [\"tls1.2\", \"tls1.3\"]\n"))
+            .expect("parse");
+        assert!(cfg.validate().is_ok(), "tls1.2/1.3 不该被拦");
+    }
+
+    /// `upstream_ca*` 只有 `trust_self_signed` 会读：其它档位下配了等于静默忽略
+    /// （运维以为固定了上游 CA，实际仍在信任系统根）。必须预检期拒。
+    #[test]
+    fn upstream_ca_outside_trust_self_signed_is_rejected() {
+        let base = r#"
+[[listeners]]
+address = "127.0.0.1"
+port = 14443
+root = "/tmp/x5"
+[[listeners.proxy_rules]]
+path = "/up"
+upstream = "https://127.0.0.1:9443"
+"#;
+        // ① ssl_mode 缺省（verify）+ upstream_ca → 静默忽略，拒。
+        let cfg: Config =
+            toml::from_str(&format!("{base}upstream_ca = \"/tmp/ca.pem\"\n")).expect("parse");
+        let err = cfg.validate().expect_err("verify 档位配 upstream_ca 必须报错");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("upstream_ca") && msg.contains("trust_self_signed"),
+            "错误信息应说明只有 trust_self_signed 会读: {msg}"
+        );
+
+        // ② trust_self_signed + upstream_ca → 正是该档位的用法，放行。
+        let cfg: Config = toml::from_str(&format!(
+            "{base}ssl_mode = \"trust_self_signed\"\nupstream_ca = \"/tmp/ca.pem\"\n"
+        ))
+        .expect("parse");
+        assert!(cfg.validate().is_ok(), "trust_self_signed 带 CA 是正确用法");
+
+        // ③ no_verify + 指纹 → 同样不会读，拒。
+        let pin = "aa".repeat(32);
+        let cfg: Config = toml::from_str(&format!(
+            "{base}ssl_mode = \"no_verify\"\nupstream_ca_sha256 = \"{pin}\"\n"
+        ))
+        .expect("parse");
+        assert!(cfg.validate().is_err(), "no_verify 档位配指纹必须报错");
+
+        // ④ 不配这两个字段的普通 verify 规则不受影响。
+        let cfg: Config = toml::from_str(base).expect("parse");
+        assert!(cfg.validate().is_ok(), "普通 verify 规则不该被拦");
     }
 
     #[test]
