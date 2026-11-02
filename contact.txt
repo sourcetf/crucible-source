@@ -6540,3 +6540,54 @@ RSS 54,996KB → 57,224KB（+2.2MB/90k 请求，无泄漏），**无新 core**�
 > 每块一个**新**进程、`python3 -u` 无缓冲，块间探活；或**从本地**经公网打 9095（那里
 > 的公网口开着，实测 `HTTP/1.0 200`）。另注：负载饱和时 WAN 上单发 `GET /` 可能 >5s，
 > **5 秒探活超时会把「排队」误判成「进程已死」**（实测 11.5s/次），探活超时要放宽到 15~20s。
+
+---
+
+# 【工号 1009 · 追加】h2 写合并（coalesce）默认值翻转：**收益是平台相关的**（2026-11-03）
+
+## 结论
+`CRUCIBLE_H2_COALESCE`（socket 级写合并：每连接每轮 flush 最多攒 16 帧 / 16KiB 再落
+socket）**默认从关改成开**。本地 h2load 实测（32 核 WSL2 Linux，1.3KB 静态文件，
+TLS+h2，50 连接 × 32 线程，5s × 3 轮）：
+
+| | m1 req/s | m10 req/s |
+|---|---|---|
+| coalesce=off | 39,750 | 101,650 |
+| coalesce=on  | 44,411（**+11.7%**） | **134,886（+32.7%）** |
+
+延迟不退化：m10 mean 4.78ms vs 4.82ms、max 11.01ms vs 10.06ms；m1 mean 1.10ms vs 1.26ms。
+0 failed。功能侧另验：**h2 与 h2c（明文 prior-knowledge）各下 5MB 文件 sha256 逐字节一致**，
+h2c 的 m10 = 152,312 req/s / 0 failed；全量 672 用例通过。
+
+## 为什么要「至少两个平台都量一遍」
+仓库里此前的审计结论是「打开 coalesce 只有 0.983×（噪声）」—— 那条是在 **1 vCPU 的
+OpenBSD 真机**上量的，那里 syscall 不是瓶颈。同一份代码在核多的机器上是 **+33%**。
+**教训：h2/网络侧的收益必须标平台**；否则后人会拿单机结论把默认值再翻回去。
+两边数字已写进 `libs/h2/src/framed_write.rs::COALESCE_WRITES_DEFAULT` 的注释与
+`scripts/bench_h2_local.sh` 头部（附复现命令）。
+
+## 顺手留下的可复现量法
+`scripts/bench_h2_local.sh <label> [rounds]`（依赖 h2load：`bin/aptlocal.sh install
+nghttp2-client` + `LD_LIBRARY_PATH` 指向用户级 libev）。目标机 OpenBSD 上只有 nghttp2
+**库**（`pkg_add nghttp2` 不装 h2load），所以本轮的平台 A/B 只能在本机做 —— 这一点如实记录，
+不要写成「目标机已验证」。
+
+## 与本次 P0 的关系（同族引擎共享运行时）
+CPython 那一族（`libapp_{python,wsgi,asgi,uwsgi}.so`）早先已经用了**更干净的协调点**模式：
+初始化收敛到 `libscriptffi.so` 导出的 `crucible_py_ensure_init()`，各引擎用绝对路径 dlopen
+同一个文件 ⇒ 进程内只有一份初始化锁与解释器（见 `crucible_pyinit.h` 文件头）。
+本次 perl/psgi 用的是「同名符号 + `dlsym(RTLD_DEFAULT)` 所有者解析」，功能等价且已在目标机
+双顺序验证；**若将来再加第三个基于 libperl 的引擎，优先按 scriptffi 协调点模式重构**，
+少依赖动态链接器的符号可见性。
+
+## 仍未闭合的大缺口：h2 crate 发送路径（路线 C）
+量化（既有审计，m10 每请求指令数）：**ours 25,977 / 裸 crates.io h2 0.4.19 下限 20,444 /
+h2o 5,232**。`libs/h2` 目前只是 `pub use h2_crate::*` 薄包装（`libs/h2/src/lib.rs:19`），
+BATCH_CAP/coalesce 都作用在 socket 层，crate 内部仍是「按帧 poll、按流 flush」。
+要真闭合必须 **vendor h2 0.4.19 源码进 `libs/h2/src` 并改
+`proto/streams/prioritize.rs` + `codec/framed_write.rs` 的 flush 调度**（让一次
+`buffer_pending` 排空所有就绪流后只落一次写）—— 22k 行、审计估 5~8 人日、需要 h2 单测
+与流量回放守住流控/优先级语义。本会话**未做**：本机无 profiler（perf/valgrind 都缺），
+盲目改 crate 调度属于赌博，且当前 spec 门禁口径（m1 吞吐/延迟比）已通过（审计实测
+m1 ours/h2o 0.89~0.99）。已把精确改动点、验证命令（`bench/h2_tls_gate.py`、h2load m1/m10、
+`perf stat` 指令归一）记在此处，供后续按量化推进。
