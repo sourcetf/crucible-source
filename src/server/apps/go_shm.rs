@@ -107,7 +107,10 @@ pub async fn execute(
         Err(e) => return Ok(e.into_response()),
     };
 
-    let (status, resp_body) = execute_common(key, method, path, body, peer, lc.global_sandbox.clone()).await?;
+    let (status, resp_body) = execute_common(
+        key, method, path, body, peer, lc.port, lc.global_sandbox.clone(),
+    )
+    .await?;
     Ok(Response::builder()
         .status(StatusCode::from_u16(status).unwrap_or(StatusCode::OK))
         .header(http::header::CONTENT_TYPE, "text/plain; charset=utf-8")
@@ -130,7 +133,10 @@ pub async fn execute_simple(
     let method = req.method().as_str().to_string();
     let path = req.uri().path().to_string();
     let body = req.body().clone();
-    let (status, resp_body) = execute_common(key, method, path, body, peer, lc.global_sandbox.clone()).await?;
+    let (status, resp_body) = execute_common(
+        key, method, path, body, peer, lc.port, lc.global_sandbox.clone(),
+    )
+    .await?;
     Ok(Response::builder()
         .status(StatusCode::from_u16(status).unwrap_or(StatusCode::OK))
         .header(http::header::CONTENT_TYPE, "text/plain; charset=utf-8")
@@ -146,6 +152,7 @@ async fn execute_common(
     path: String,
     body: Bytes,
     peer: SocketAddr,
+    port: u16,
     sandbox_cfg: crate::server::apps::sandbox::SandboxConfig,
 ) -> Result<(u16, Bytes)> {
     // P2-11：ensure（spawn 子进程 + 5s 等待）放 spawn_blocking。
