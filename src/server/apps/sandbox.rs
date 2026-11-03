@@ -272,7 +272,11 @@ pub type GlobalSandboxConfig = SandboxConfig;
 /// 引擎会 `SIGABRT`（pledge 违规），给宽了等于没做。这里只放「通用 web 应用需要、
 /// 且与逃逸无关」的项，并**默认不含 `exec`**（`allow_exec` 才加）：
 ///
-/// * `stdio/rpath/wpath/cpath/dpath/tmppath` —— 读写文件与建目录（含 tempnam 类）
+/// * `stdio/rpath/wpath/cpath/dpath` —— 读写文件与建目录（`dpath`=读目录）。
+///   **刻意不含 `tmppath`**：本机 OpenBSD 的 pledge 不认该 token（逐 token 实测
+///   `tmppath`→INVALID），混进承诺串会让**整条 `pledge()` 返回 EINVAL**、
+///   子进程 `_exit(127)`、引擎全挂。临时文件用每应用自建、已被 reveal 的
+///   `state/php/tmp/<key>`，不需 `/tmp` 权限。
 /// * `inet/unix/dns` —— FastCGI 走 UDS（`unix`）、出网请求（`inet`+`dns`）
 /// * `flock/fattr` —— 文件锁与属性（PHP 的 `flock`/`stat`）
 /// * `getpw/proc` —— FPM 以 nobody 跑时的 `getpwnam`/`getgrnam`、进程信息
@@ -287,10 +291,14 @@ fn engine_pledge(engine: &str, allow_exec: bool) -> Option<&'static str> {
         // 通用解释器型：覆盖 php / php-fpm / php-cgi / cgi / 各脚本型 sidecar。
         "php" | "fastcgi" | "cgi" | "perl" | "psgi" | "python" | "wsgi" | "asgi" | "uwsgi"
         | "ruby" | "rack" | "lua" | "asp" | "aspnet" | "do" | "tsx" => {
-            "stdio rpath wpath cpath dpath tmppath inet unix dns flock fattr getpw proc prot_exec"
+            // **不要 `tmppath`**：本机 OpenBSD 的 pledge 不认这个 token，混进承诺串会让
+            // **整条 pledge() 返回 EINVAL**（子进程 _exit(127)，sidecar 全挂、502）。
+            // 临时目录用每应用自建的 `state/php/tmp/<key>`（已 reveal），不需要 /tmp 权限：
+            // `rpath/wpath/cpath/dpath` 足以覆盖在已 reveal 路径上的读写建目录。
+            "stdio rpath wpath cpath dpath inet unix dns flock fattr getpw proc prot_exec"
         }
         // 原生编译产物（c/rust/go）：同样按 web 应用口径，但不需要解释器的额外项。
-        "c" | "rust" | "go" => "stdio rpath wpath cpath dpath tmppath inet unix dns flock fattr",
+        "c" | "rust" | "go" => "stdio rpath wpath cpath dpath inet unix dns flock fattr",
         // 没见过的引擎名：**不给** pledge（只 unveil）。宁可少一层，也不要因为
         // 猜错承诺集把引擎打成起不来。
         _ => return None,
