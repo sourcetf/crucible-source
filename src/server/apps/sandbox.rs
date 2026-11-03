@@ -527,7 +527,15 @@ pub fn build_spec(
         // 默认：孩子不能再 exec（`pledge_exec` 为空串）。这是「RCE 拿不到 shell」
         // 的关键一半 —— 即使引擎自己需要 exec（allow_exec），孩子也不再继承。
         pledge_exec: cfg.pledge_exec.clone().unwrap_or_default(),
-        chroot: cfg.chroot.clone().map(PathBuf::from),
+        // `chroot = "docroot"` 是哨兵：解析成**真实** docroot 路径再交给 pre_exec
+        // （直接 chroot("docroot") 是相对路径，必然失败 → _exit(127) → 引擎起不来）。
+        // PHP-FPM 不走这条：它用池级 `chroot =` 指令只关 **worker**（master 需要读
+        // conf/pid/log，不能被 chroot），php.rs 传下来的 cfg 已把 chroot 清空。
+        chroot: match cfg.chroot.as_deref().map(str::trim) {
+            Some("docroot") | Some("app") => docroot.map(|d| d.to_path_buf()),
+            Some("") | None | Some("none") | Some("off") => None,
+            Some(other) => Some(PathBuf::from(other)),
+        },
         chdir: None,
     }
 }

@@ -712,6 +712,10 @@ pm.max_requests = 10000
         .stderr(Stdio::null());
     // **进程级沙箱**（OpenBSD unveil/pledge；其它平台 no-op）。放在 spawn 前：
     // 钩子会在 fork 之后、exec 之前于子进程里施加（见 apps::sandbox 的文件头）。
+    // chroot 交给 FPM 的池级 `chroot =`（只关 worker）；**不能**在 pre_exec 里 chroot
+    // —— 那会连 master 一起关进去，master 就读不到 conf/pid/log/sock（都在 docroot 外）。
+    let mut spec_cfg = cfg.clone();
+    spec_cfg.chroot = None;
     let spec = sandbox::build_spec(
         "php",
         Some(&docroot),
@@ -719,7 +723,7 @@ pm.max_requests = 10000
         Some(&tmp_dir),
         &sandbox::php_interp_roots(Path::new(&fpm_bin)),
         Some(Path::new(&fpm_bin)),
-        &cfg,
+        &spec_cfg,
     );
     log::info!("php-fpm {key}: sandbox {}", spec.summary());
     spec.apply(&mut cmd).context("apply sandbox to php-fpm")?;
