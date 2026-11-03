@@ -6604,3 +6604,62 @@ BATCH_CAP/coalesce 都作用在 socket 层，crate 内部仍是「按帧 poll、
 盲目改 crate 调度属于赌博，且当前 spec 门禁口径（m1 吞吐/延迟比）已通过（审计实测
 m1 ours/h2o 0.89~0.99）。已把精确改动点、验证命令（`bench/h2_tls_gate.py`、h2load m1/m10、
 `perf stat` 指令归一）记在此处，供后续按量化推进。
+
+---
+
+# 【工号 1009 · 追加】PHP 升级 + 应用引擎沙箱（unveil/pledge/chroot，2026-11-04）
+
+## 背景
+PHP 核心 **CVE-2026-109619 / CVE-2026-109618**（CVSS 9.2，2026-10-21，请求内存 UAF 类 → 可 RCE）
+命中本机在跑的 `php-8.4.27`；php-fpm 另有 **CVE-2026-91768**（`listen.allowed_clients` 的 IPv6 只比前
+12 字节）。目标机已装 **php-8.5.12p0**（php.net 分支 8 最新，含修复）。本机升级 + 代码侧围堵一起做。
+
+## 一、PHP 版本选择：**不要用「候选表 + PATH 顺序」**
+`resolve_php_bin` 原候选表里 `php-fpm`（无版本名）排在 `php-fpm-8.5` **前面**。机器上只要有一个指向
+旧版本的无版本符号链接，就会**静默选中旧版** —— 对「按版本发安全修复」的 PHP，这就是「以为升过级」的
+事故形态。改成：先扫 `/usr/local/sbin`、`/usr/local/bin`、`/usr/sbin`、`/usr/bin`、`PATH`，按
+`(major, minor)` 取**版本最高**的 `php-fpm-<v>` / `php-cgi-<v>`（`php-fpm85` 无点写法也认），再退回候选表。
+
+## 二、沙箱：`unveil` + `pledge`，在 `pre_exec`（fork 后、exec 前）施加
+* 实现 `src/server/apps/sandbox.rs`；**fail-closed**：unveil/pledge 任一失败 ⇒ 子进程 `_exit(127)`，
+  引擎起不来（对外 502），不会静默无沙箱运行。
+* 默认 docroot **只给 `rx`**（连 `c` 都不给）：`rxc` 仍允许往 docroot **新建**文件 —— RCE 丢一个
+  `pwn.php` 就完成了持久化。需要写上传/缓存的应用显式 `docroot_rw = true`。
+* pledge **默认不含 `exec`**（RCE 拿不到 shell）；`pledge_exec` 默认空串（它的子进程也不能 exec）。
+  判 `exec` 是否已在串里要**按整词**比对 —— `prot_exec` 含 `exec` 子串，用 `contains("exec")`
+  会误判成「已给 exec」而少给一个承诺（本模块单测抓到的真实 bug）。
+* 未知引擎名**不猜**承诺集（只 unveil）。
+* 非 OpenBSD：整套 no-op，日志写 `active_here=false`，**不假装**做了隔离。
+
+## 三、三个真机踩出来的坑（每个都能让整条路由 502）
+1. **`tmppath` 不是合法的 pledge token**（本机 OpenBSD 实测 EINVAL）。
+   逐 token 实测：`stdio/rpath/wpath/cpath/dpath/inet/unix/dns/flock/fattr/getpw/proc/prot_exec`
+   全 OK，**只有 `tmppath` INVALID**。承诺串里混进它 ⇒ **整条 `pledge()` 返回 EINVAL** ⇒
+   子进程 `_exit(127)` ⇒ ruby/rack/do/go/php-cgi 全挂（现象是 5 条路由 502，日志一句
+   `pledge(...) 失败: Invalid argument (os error 22)`）。临时文件用**每应用自建**且已被 reveal 的
+   `state/php/tmp/<key>`（`rpath/wpath/cpath/dpath` 足够），不需要 `/tmp` 权限。
+2. **reveal 少了 `/bin`、`/usr/bin`、`/sbin`、`/usr/sbin`**：sidecar 的 `deps/bin/index` 与
+   `www-apps/<app>/init.sh` 生成的包装脚本都是 `#!/bin/sh`。unveil 里没有 `/bin` ⇒ `execve` EACCES ⇒
+   起不来。同理 CGI 脚本。
+3. **reveal 少了 `/etc/passwd`、`/etc/group`**：php-fpm master 以 root 起、再 `setuid(nobody)`；
+   读不到就 `cannot get gid for group 'nobody'`、直接退出。（`/etc/master.passwd` 是真实密码文件，
+   **不**揭示；`/etc/passwd` 里没有秘密。）
+   另外 JSP/DO 要 `java -jar libs/jsp-sidecar/target/*.jar`、go 要 `target/app-engines/`，
+   这些「引擎自带运行时资产」也要揭示（见 `engine_artifact_roots`）。
+
+## 四、验收方法学：**先用最小 C 探针复刻策略，再等 Rust 构建**
+1 vCPU + `lto=thin` + 5 feature 的 Rust 链接要 15–25 分钟；而 `unveil/pledge` 的行为完全可以用一个
+几十行的 C 程序复刻（unveil 每条 → `unveil(NULL,NULL)` 锁定 → pledge → `execl(php-fpm)`）。
+真机上用这个探针 5 秒就能确认「策略集够不够 fpm 起来」，把「改代码→等 25 分钟→发现还是 502」的
+迭代从小时级压到分钟级。**逐 token / 整串的 pledge 合法性也用同样办法一秒钟测完**（见上面坑 1）。
+
+## 五、顺带修掉的进程级隐患：嵌入式 CPython 的 stdlib 预检
+真机事故：机器上 Python 从 3.13 升到 3.14 并删掉 `python3.13` stdlib，而 `libapp_python.so` 仍链
+`libpython3.13`（引擎没跟着重建）⇒ 第一个 `/python/` 请求走 `Py_FatalError` → `abort()` ⇒
+**整个 webserver 死掉**（21 条路由全 000，连静态页都停）。
+现在 `run_python_inprocess` 在初始化前用**编译期** `PY_MAJOR_VERSION.PY_MINOR_VERSION` 拼 stdlib 路径
+（优先 `PYTHONHOME`），检查 `encodings/__init__.py` 可读；不在就返回 -1（502）并打印
+`sh scripts/build_app_engines.sh` 的修法。**一个引擎配置坏了 ⇒ 单路由失败，不再进程级 abort。**
+
+> 教训：解释器类引擎的 `.so` **必须**在目标机、按**当前**解释器重建；升级/降级解释器后
+> 第一件事就是重跑 `scripts/build_app_engines.sh`。
