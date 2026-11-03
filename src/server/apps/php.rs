@@ -670,7 +670,7 @@ pid = {pid}
 listen.backlog = 4096
 pm = static
 pm.max_children = {workers}
-{chroot_line}chdir = /tmp
+{chroot_line}chdir = {tmp}
 catch_workers_output = yes
 ; 每应用独立的临时目录（`state/php/tmp/<key>`）：会话/上传临时文件彼此不可见，
 ; 也让 unveil 不必揭示整个 /tmp。chroot 打开时这里的路径要按 chroot 内的视角给。
@@ -693,9 +693,9 @@ pm.max_requests = 10000
         listen = listen,
         pool_owner = pool_owner,
         listen_owner = listen_owner,
+        tmp = if chroot.is_some() { "/tmp".to_string() } else { tmp_dir.display().to_string() },
         chroot_line = chroot_line,
         workers = app.workers.max(1),
-        tmp = if chroot.is_some() { "/tmp".to_string() } else { tmp_dir.display().to_string() },
     );
     fs::write(&conf_path, conf).context("write php-fpm conf")?;
 

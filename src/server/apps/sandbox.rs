@@ -200,9 +200,10 @@ pub fn apply_for_app(
     tmp_dir: Option<&Path>,
     bin: Option<&Path>,
 ) -> SandboxSpec {
-    let interp = bin
+    let mut interp = bin
         .map(|b| interp_roots_for(engine, b))
         .unwrap_or_default();
+    interp.extend(engine_artifact_roots(engine, true));
     let spec = build_spec(engine, docroot, state_dir, tmp_dir, &interp, bin, app_cfg);
     log::info!("sandbox[{engine}]: {}", spec.summary());
     if let Err(e) = spec.apply(cmd) {
@@ -318,6 +319,30 @@ const BASE_REVEALS: &[(&str, &str)] = &[
     ("/etc/ssl/certs", "r"),
     ("/dev/null", "rw"),
     ("/dev/urandom", "r"),
+];
+
+/// 所有 spawn 出来的进程都要、但**不属于**「公共只读」一档的两组路径。
+///
+/// * `/bin`,`/sbin`,`/usr/bin`,`/usr/sbin`（`rx`）：sidecar 的 `deps/bin/index` 与
+///   `www-apps/<app>/init.sh` 生成的**包装脚本**都是 `#!/bin/sh`；CGI 脚本同理。
+///   unveil 里没有 `/bin` 时 `execve` 返回 EACCES —— 引擎起不来。真机 2026-11-04：
+///   5 条路由 502，而日志里 sandbox 明明 `active_here=true`，reveals 里就是缺 `/bin`。
+///   代价是这些进程能 exec 系统命令；缓解在于 `pledge` 默认**不放** `exec`
+///   （`pledge_exec` 为空 ⇒ 它的子进程也不能 exec），需要更严可给应用开
+///   `pledge = "..."` 覆盖或把本表在配置里关掉。
+/// * `/etc/passwd`,`/etc/group`,`/etc/nsswitch.conf`,`/etc/login.conf`（`r`）：
+///   解释器启动时 drop privileges（php-fpm 从 root 切到 nobody、ruby/python 的
+///   `getpwnam`）。读不到就 `cannot get gid for group 'nobody'`，master 直接退出。
+///   **只给读**：这些文件里没有可泄露的密钥（真实密码在 `/etc/master.passwd`）。
+pub const BASE_UNIVERSE_REVEALS: &[(&str, &str)] = &[
+    ("/bin", "rx"),
+    ("/sbin", "rx"),
+    ("/usr/bin", "rx"),
+    ("/usr/sbin", "rx"),
+    ("/etc/passwd", "r"),
+    ("/etc/group", "r"),
+    ("/etc/nsswitch.conf", "r"),
+    ("/etc/login.conf", "r"),
 ];
 
 /// PHP 解释器自身的只读目录（按二进制名推导版本）。
@@ -463,7 +488,7 @@ pub fn build_spec(
     if cfg.enabled {
         // ① 公共只读路径（时区/解析/TLS 根证书/设备）—— 不存在就跳过（不报错，
         //    否则裁剪过的系统上整个引擎都起不来）。
-        for (p, m) in BASE_REVEALS {
+        for (p, m) in BASE_REVEALS.iter().chain(BASE_UNIVERSE_REVEALS.iter()) {
             let path = Path::new(p);
             if path.exists() {
                 push_reveal(&mut reveals, path, m);
@@ -712,6 +737,7 @@ mod tests {
     fn BASE_reveals_existing() -> Vec<PathBuf> {
         BASE_REVEALS
             .iter()
+            .chain(BASE_UNIVERSE_REVEALS.iter())
             .map(|(p, _)| PathBuf::from(p))
             .filter(|p| p.exists())
             .collect()
@@ -745,4 +771,33 @@ mod tests {
         assert!(roots.iter().any(|p| p == Path::new("/usr/local/sbin")));
         assert!(roots.iter().any(|p| p == Path::new("/usr/lib")));
     }
+}
+
+/// 引擎带着跑的**运行时资产**目录（不是解释器本身，而是它启动时会去读/执行的文件）。
+///
+/// 这些是解释器进程**启动期**就要打开的东西 —— unveil 挡住 ⇒ 引擎起不来，而日志面上
+/// 通常只看到「sidecar 未就绪」，很难从现象反推到「jar 不可见」。按引擎族补：
+/// * `jsp`/`do`：`java -jar .../libs/jsp-sidecar/target/jsp-sidecar.jar`
+/// * `go`：`go-shm-server` 位于 `target/app-engines/`
+///
+/// 不存在的路径自动跳过（揭示不存在的路径本身不会失败，但漏掉真实存在的就会 fail-closed）。
+pub fn engine_artifact_roots(engine: &str, _cwd_is_crucible: bool) -> Vec<PathBuf> {
+    let mut roots: Vec<PathBuf> = Vec::new();
+    let mut push = |r: &str| {
+        let p = PathBuf::from(r);
+        if p.exists() {
+            roots.push(p);
+        }
+    };
+    match engine {
+        "jsp" | "do" => {
+            push("/crucible/libs/jsp-sidecar/target");
+            push("/crucible/libs/jsp-sidecar");
+        }
+        "go" => {
+            push("/crucible/target/app-engines");
+        }
+        _ => {}
+    }
+    roots
 }
