@@ -771,6 +771,21 @@ async fn ensure_sidecar_simple(
     // 烤进 sidecar 环境。启动期基底 + **本 app 的 .env**（本 app 的键对 JSP/Jetty、
     // ruby sidecar 等可见；别人的请求期临时值一律不继承）。
     crate::server::apps::env_lock::apply_clean_env(&mut cmd, env_vars);
+    // 进程级沙箱：把 sidecar 的文件系统视图收缩到「本应用 docroot + 状态目录 +
+    // 解释器库」。引擎名取路由声明的 engine（ruby/rack/jsp/do/node…），
+    // 决定揭示哪一族运行时目录（见 sandbox::interp_roots_for）。
+    {
+        let engine = app.engine.to_string();
+        crate::server::apps::sandbox::apply_for_app(
+            &mut cmd,
+            &engine,
+            &app.sandbox_effective(&lc.global_sandbox),
+            Some(&docroot),
+            Some(&state),
+            None,
+            Some(&deps_bin),
+        );
+    }
     cmd.current_dir(&docroot)
         .env("WEBSERVER_LISTEN_UNIX", sock.display().to_string())
         // 与 h1 `native_http::ensure_sidecar` 同一套 env：sidecar（ruby 等）据此
@@ -996,6 +1011,7 @@ mod tests {
             deps_dir: None,
             init_timeout_secs: None,
             libc: None,
+            sandbox: None,
         }
     }
 

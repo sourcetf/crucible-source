@@ -43,6 +43,7 @@ pub mod jsp;
 pub mod lua;
 pub mod native_http;
 pub mod php;
+pub mod sandbox;
 pub mod script_ffi;
 pub mod sidecar_engine;
 pub mod tsx;
@@ -1078,6 +1079,7 @@ mod script_rel_tests {
                 deps_dir: None,
                 init_timeout_secs: None,
                 libc: None,
+                sandbox: None,
             }],
             basic_auth: None,
             proxy_rules: vec![],
@@ -1266,6 +1268,7 @@ mod response_rules_tests {
             deps_dir: None,
             init_timeout_secs: None,
             libc: None,
+            sandbox: None,
         }
     }
 

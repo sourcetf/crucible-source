@@ -203,6 +203,8 @@ pub async fn execute_binary(
     let headers = headers.clone();
     let authority = uri.authority().map(|a| a.to_string());
     let env_vars: Vec<(String, String)> = env_vars.to_vec();
+    // 沙箱策略要搬进 `spawn_blocking`（要求 'static），克隆一份很小的配置结构。
+    let sandbox_cfg = lc.global_sandbox.clone();
 
     let raw = task::spawn_blocking(move || -> Result<Vec<u8>> {
         let mut cmd = Command::new(&bin);
@@ -212,6 +214,18 @@ pub async fn execute_binary(
         // 一个慢的空请求也就不会挡住随后带 `.env` 的请求（见 env_lock 的说明）。
         // 旧实现直接继承 `environ`（Command 默认），会把别的请求的 `.env` 一起带走。
         crate::server::apps::env_lock::apply_clean_env(&mut cmd, &env_vars);
+        // 进程级沙箱：CGI 是「每个请求 spawn 一个脚本」的经典 RCE 面 —— 脚本自己
+        // 就是攻击载荷时，unveil 把它能看到的文件系统收缩到本应用 docroot+库目录。
+        // 这里没有 app 上下文（execute_binary 的签名只带 docroot），用**全局**策略。
+        crate::server::apps::sandbox::apply_for_app(
+            &mut cmd,
+            "cgi",
+            &sandbox_cfg,
+            Some(&docroot),
+            None,
+            None,
+            Some(&bin),
+        );
         cmd.stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
@@ -580,6 +594,7 @@ mod tests {
             deps_dir: None,
             init_timeout_secs: None,
             libc: None,
+            sandbox: None,
         }
     }
 

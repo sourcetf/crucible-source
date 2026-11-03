@@ -2366,6 +2366,7 @@ mod tests {
             deps_dir: None,
             init_timeout_secs: None,
             libc: None,
+            sandbox: None,
         });
         assert!(!h2_fast_eligible(&req(get.clone(), "/", HeaderMap::new()), &lc2));
     }

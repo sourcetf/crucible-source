@@ -1470,6 +1470,7 @@ mod tests {
             deps_dir: None,
             init_timeout_secs: None,
             libc: None,
+            sandbox: None,
         }
     }
 

@@ -3,6 +3,29 @@ enable = true
 level = "info"
 realtime = false
 
+# 应用引擎的进程级沙箱（OpenBSD `unveil`/`pledge`/`chroot`）。
+#
+# 这里是**全局默认**（不写也生效）；每个 `[[listeners.apps]]` 可加自己的
+# `[listeners.apps.sandbox]` 覆盖。默认行为：把引擎子进程的文件系统视图收缩到
+# 「本应用 docroot（只读 `rx`）+ 本应用状态目录 + 本应用临时目录 + 解释器库」，
+# 并把系统调用集合收缩到 web 应用口径（默认**不含 `exec`**：RCE 拿不到 shell）。
+#
+# 真机实测（`/php/sandbox-probe.php`）：读 `/etc/passwd`、读 `/etc/ssl/private`、
+# 往 docroot 外写、**往 docroot 内新建 php 文件**、覆盖已有文件、`shell_exec`
+# 全部被挡；只有「自己目录内读写」与出网仍可用（出网是 web 应用刚需，走 `inet`）。
+#
+# 非 OpenBSD 平台没有这两个系统调用，整套机制是 no-op（日志写 `active_here=false`）。
+[sandbox]
+enabled = true
+# 上传/缓存类应用要写自己的 docroot（默认连 create 都不给 —— 那是 RCE 丢 webshell
+# 做持久化的路径）：给该应用开 `docroot_rw = true`，或只放开某个目录：
+# extra_unveil = ["/var/uploads:rwxc"]
+# 覆盖承诺集（填 "none" = 只 unveil 不 pledge）；需要 shell out 的应用才加 exec：
+# pledge = "..."
+# allow_exec = false
+# 把 worker 关进 docroot（FPM 原生 chroot，需应用自包含、不引用 docroot 外路径）：
+# chroot = "docroot"
+
 [admin]
 path = "/__admin"
 realm = "WebServer Admin"

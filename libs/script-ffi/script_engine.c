@@ -677,6 +677,45 @@ static int run_python_inprocess(const char *script, const char *method, const ch
     const char *dir;
     int rc = -1, shim_active = 0;
 
+    /* **预检：嵌入式解释器的 stdlib 必须真的在**，否则 `Py_Initialize` 会走
+     * `Py_FatalError` → `abort()`，把**整个 webserver** 打死（不是这一个请求 502）。
+     *
+     * 真机事故（2026-11-03，OpenBSD）：机器上的 Python 从 3.13 升到 3.14，删掉了
+     * `/usr/local/lib/python3.13`；而 `libapp_python.so` 仍链接 `libpython3.13`（引擎
+     * 没跟着重建），于是它算出的 prefix 下没有 `encodings` —— 第一个 `/python/`
+     * 请求就让进程 abort、21 条路由全 000（连静态页都停）。
+     *
+     * 判据用**编译期**的 `PY_MAJOR_VERSION.PY_MINOR_VERSION`（与所链接 libpython 同源）
+     * 拼出标准库路径，再看 `encodings` 在不在；不在就返回 -1（调用方回 502 并打印
+     * 怎么修：按目标机当前解释器重建引擎）。`PYTHONHOME` 会覆盖 prefix，故优先尊重它。 */
+    {
+        const char *home = getenv("PYTHONHOME");
+        char stdlib[1024];
+        char probe[1200];
+        if (home != NULL && home[0] != '\0') {
+            snprintf(stdlib, sizeof(stdlib), "%s/lib/python%d.%d", home,
+                     PY_MAJOR_VERSION, PY_MINOR_VERSION);
+        } else {
+            snprintf(stdlib, sizeof(stdlib), "/usr/local/lib/python%d.%d",
+                     PY_MAJOR_VERSION, PY_MINOR_VERSION);
+        }
+        snprintf(probe, sizeof(probe), "%s/encodings/__init__.py", stdlib);
+        if (access(probe, R_OK) != 0) {
+            fprintf(stderr,
+                    "scriptffi: 嵌入式 CPython %d.%d 的标准库不在 %s（缺 %s）—— "
+                    "拒绝初始化（否则 Py_Initialize 会 abort 整个进程）。"
+                    "多半是机器上 Python 被升级、而引擎没跟着重建："
+                    "在目标机跑 `sh scripts/build_app_engines.sh`。\n",
+                    PY_MAJOR_VERSION, PY_MINOR_VERSION, stdlib, probe);
+            /* errbuf 只有 256B：路径只打在 stderr 那一行，这里给可执行的修法。 */
+            snprintf(errbuf, sizeof(errbuf),
+                     "嵌入式 CPython %d.%d 的标准库缺失（stdlib=%.100s）："
+                     "按目标机当前解释器重建引擎（sh scripts/build_app_engines.sh）",
+                     PY_MAJOR_VERSION, PY_MINOR_VERSION, stdlib);
+            return -1;
+        }
+    }
+
     /* 跨 .so 共享初始化锁：并发冷启动只有一个线程真正 Py_Initialize。
      * PyEval_SaveThread 的返回类型是 PyThreadState*，共享 ABI 用 void*（宽度一致）；
      * 新 GCC（15）把「函数指针类型不兼容」从告警升级为错误，故显式转换。 */

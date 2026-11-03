@@ -35,6 +35,15 @@ pub struct Config {
     /// （运行期只读快照，不参与 config.toml 序列化）。
     #[serde(default)]
     pub page_rules: Vec<PageRuleConfig>,
+    /// 应用引擎的**进程级沙箱**默认（OpenBSD `unveil`/`pledge`/`chroot`）。
+    ///
+    /// 顶层这份是「所有应用」的默认；每个 `[[listeners.apps]]` 可以用自己的
+    /// `[listeners.apps.sandbox]` 覆盖（见 `AppRouteConfig::sandbox_effective`）。
+    /// 默认**开**：`unveil` 把引擎子进程的文件系统视图收缩到「它自己的 docroot +
+    /// 状态目录 + 临时目录 + 解释器库」，`pledge` 把系统调用集合收缩到 web 应用口径；
+    /// 非 OpenBSD 平台上这两者不存在，整个机制是 no-op（日志如实标注 `active_here=false`）。
+    #[serde(default)]
+    pub sandbox: crate::server::apps::sandbox::SandboxConfig,
     #[serde(default)]
     pub tor_hs: TorHsConfig,
     #[serde(default)]
@@ -721,6 +730,10 @@ pub struct ListenerConfig {
     /// 只有规则声明了 country 时才会被读取。
     #[serde(skip)]
     pub geoip_db: Option<PathBuf>,
+    /// 顶层 `[sandbox]` 的运行期副本（`Config::load` 注入；`#[serde(skip)]` 故不会
+    /// 在每站回显一份）。每应用的最终策略 = `app.sandbox_effective(&l.global_sandbox)`。
+    #[serde(skip)]
+    pub global_sandbox: crate::server::apps::sandbox::SandboxConfig,
     #[serde(default)]
     pub server_name: Option<String>,
     #[serde(default)]
@@ -846,6 +859,7 @@ impl Default for ListenerConfig {
             page_rules: Vec::new(),
             global_page_rules: Vec::new(),
             geoip_db: None,
+            global_sandbox: crate::server::apps::sandbox::SandboxConfig::default(),
             server_name: None,
             status_path: None,
             address_v6: None,
@@ -1317,6 +1331,45 @@ pub struct AppRouteConfig {
     pub init_timeout_secs: Option<u64>,
     #[serde(default = "default_libc_opt")]
     pub libc: Option<String>,
+    /// 进程级沙箱（OpenBSD `unveil`/`pledge`/`chroot`；其它平台 no-op）。
+    ///
+    /// 不写 = 用顶层 `[sandbox]` 默认（若顶层也没写 = 默认**开**）。显式写整块可以
+    /// 覆盖默认：`[listeners.apps.sandbox] enabled = false` 可给单个应用关掉。
+    #[serde(default)]
+    pub sandbox: Option<crate::server::apps::sandbox::SandboxConfig>,
+}
+
+impl AppRouteConfig {
+    /// 本应用生效的沙箱配置：应用级覆盖（若写了）优先，否则用顶层全局默认。
+    pub fn sandbox_effective(
+        &self,
+        global: &crate::server::apps::sandbox::SandboxConfig,
+    ) -> crate::server::apps::sandbox::SandboxConfig {
+        match &self.sandbox {
+            Some(app) => {
+                // 应用级只覆盖它**显式写了**的字段：`Option` 字段为 None 时继承全局，
+                // 这样「全局开 allow_exec、某个应用关掉」这类组合可用。
+                let mut merged = global.clone();
+                merged.enabled = app.enabled && global.enabled;
+                merged.docroot_rw = app.docroot_rw || global.docroot_rw;
+                merged.allow_exec = app.allow_exec || global.allow_exec;
+                if !app.extra_unveil.is_empty() {
+                    merged.extra_unveil.extend(app.extra_unveil.clone());
+                }
+                if app.pledge.is_some() {
+                    merged.pledge = app.pledge.clone();
+                }
+                if app.pledge_exec.is_some() {
+                    merged.pledge_exec = app.pledge_exec.clone();
+                }
+                if app.chroot.is_some() {
+                    merged.chroot = app.chroot.clone();
+                }
+                merged
+            }
+            None => global.clone(),
+        }
+    }
 }
 
 fn default_workers() -> usize {
@@ -1541,6 +1594,8 @@ struct ConfigRaw {
     #[serde(default)]
     page_rules: Vec<PageRuleConfig>,
     #[serde(default)]
+    sandbox: crate::server::apps::sandbox::SandboxConfig,
+    #[serde(default)]
     tor_hs: TorHsConfig,
     #[serde(default)]
     telemetry: TelemetryConfig,
@@ -1636,6 +1691,7 @@ impl Config {
             syncookie: raw_cfg.syncookie,
             geoip: raw_cfg.geoip,
             page_rules: raw_cfg.page_rules,
+            sandbox: raw_cfg.sandbox,
             tor_hs: raw_cfg.tor_hs,
             telemetry: raw_cfg.telemetry,
             dns: raw_cfg.dns,
@@ -1703,6 +1759,7 @@ impl Config {
     /// 否则「关掉 GeoIP」后页面规则的 country 维度仍会查库并拦流量，开关等于失效。
     pub fn inject_shared_listener_config(&mut self) {
         let global = self.page_rules.clone();
+        let sandbox = self.sandbox.clone();
         let db = if self.geoip.enabled {
             self.geoip.db_path.clone()
         } else {
@@ -1710,6 +1767,7 @@ impl Config {
         };
         for l in &mut self.listeners {
             l.global_page_rules = global.clone();
+            l.global_sandbox = sandbox.clone();
             l.geoip_db = db.clone();
         }
     }

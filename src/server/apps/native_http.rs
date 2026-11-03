@@ -556,6 +556,18 @@ async fn ensure_sidecar(
     // 一律不继承，而本 app 自己的键（JSP 的 `System.getenv`、ruby sidecar 的 `ENV`）
     // 可见 —— 这正是 §7.9 要求的「.env 注入引擎执行环境」。
     crate::server::apps::env_lock::apply_clean_env(&mut cmd, env_vars);
+    {
+        let engine = app.engine.to_string();
+        crate::server::apps::sandbox::apply_for_app(
+            &mut cmd,
+            &engine,
+            &app.sandbox_effective(&lc.global_sandbox),
+            Some(&docroot),
+            Some(&state),
+            None,
+            Some(&deps_bin),
+        );
+    }
     cmd.current_dir(&docroot)
         .env("WEBSERVER_LISTEN_UNIX", sock.display().to_string())
         // 路由前缀：sidecar 自行决定是否剥离（JSP/Jetty 据此把 /jsp/x.jsp 映射到 docroot/x.jsp）。

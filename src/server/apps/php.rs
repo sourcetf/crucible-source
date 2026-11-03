@@ -2,6 +2,7 @@
 //! 禁止把 CLI `php` 当 FastCGI（自动 remap 到 php-cgi）。
 
 use super::fastcgi::{self, FcgiAddr, FcgiRequest};
+use super::sandbox;
 use crate::config::{AppRouteConfig, ListenerConfig};
 use crate::server::h1::{full, BoxBody};
 use anyhow::{bail, Context, Result};
@@ -52,6 +53,11 @@ struct PhpRuntime {
     child: Option<Child>,
     #[allow(dead_code)]
     kind: PhpKind,
+    /// 该池被 chroot 到哪个目录（`sandbox.chroot = "docroot"` 时）。请求期据此把
+    /// `SCRIPT_FILENAME`/`DOCUMENT_ROOT` 换成**chroot 内**的路径 —— 否则 FPM 在
+    /// jail 里看到的是 `/crucible/www-apps/php/index.php` 这种宿主绝对路径，
+    /// 会解析成 `<docroot>/crucible/...` 而 404。
+    chroot: Option<PathBuf>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -225,11 +231,12 @@ async fn php_exchange(
     let key = runtime_key(lc.port, app_idx);
     ensure_runtime(&key, lc, app, app_idx).await?;
 
-    let addr = {
+    let (addr, pool_chroot) = {
         let map = PHP_RUNTIME.lock();
-        map.get(&key)
-            .map(|r| r.addr.clone())
-            .context("php runtime missing after ensure")?
+        let rt = map
+            .get(&key)
+            .context("php runtime missing after ensure")?;
+        (rt.addr.clone(), rt.chroot.clone())
     };
 
     let docroot = resolve_docroot(lc, app);
@@ -255,10 +262,26 @@ async fn php_exchange(
     let script_abs = canonicalize_display(&script);
     let script_name = script_name_for(&docroot, app, &uri_path, &script, &path_info);
 
+    // 池被 chroot（`sandbox.chroot = "docroot"`）时，FPM 的**文件系统视图**以 docroot
+    // 为根：必须把 SCRIPT_FILENAME 换成 chroot 内的路径，否则它按宿主绝对路径去找
+    // 文件（`<docroot>/crucible/www-apps/php/x.php`）而 404。DOCUMENT_ROOT 相应为 `/`。
+    // 相对关系由构造保证（chroot == 本应用 docroot），这里做前缀剥离。
+    let (document_root, script_filename) = match &pool_chroot {
+        Some(root) => {
+            let root_s = canonicalize_display(root);
+            let rel = script_abs
+                .strip_prefix(root_s.trim_end_matches('/'))
+                .map(|r| format!("/{}", r.trim_start_matches('/')))
+                .unwrap_or_else(|| script_abs.clone());
+            ("/".to_string(), rel)
+        }
+        None => (docroot_abs.clone(), script_abs.clone()),
+    };
+
     let fcgi = FcgiRequest {
         method,
-        script_filename: script_abs,
-        document_root: docroot_abs,
+        script_filename,
+        document_root,
         request_uri,
         query_string: query,
         content_type,
@@ -555,6 +578,7 @@ async fn ensure_runtime(
                     addr,
                     child: None,
                     kind: PhpKind::Fpm,
+                    chroot: None,
                 },
             );
             return Ok(());
@@ -570,7 +594,7 @@ async fn ensure_runtime(
         Err(e) => log::warn!("php-fpm start failed ({e:#}); falling back to php-cgi"),
     }
 
-    let rt = start_cgi(key, app, &state_dir).await?;
+    let rt = start_cgi(key, lc, app, &state_dir).await?;
     PHP_RUNTIME.lock().insert(key.to_string(), rt);
     Ok(())
 }
@@ -578,7 +602,7 @@ async fn ensure_runtime(
 #[cfg(unix)]
 async fn start_fpm(
     key: &str,
-    _lc: &ListenerConfig,
+    lc: &ListenerConfig,
     app: &AppRouteConfig,
     _app_idx: usize,
     state_dir: &Path,
@@ -614,6 +638,26 @@ async fn start_fpm(
     } else {
         ("", "")
     };
+    let docroot = resolve_docroot(lc, app);
+    let tmp_dir = prepare_app_tmp(key)?;
+    let cfg = app.sandbox_effective(&lc.global_sandbox);
+    // `chroot = "docroot"`：把 worker 关进 docroot（FPM 原生 `chroot` 指令，**worker**
+    // 生效；master 读 conf/pid/log 在 chroot 之前，不受影响）。需要配合请求期的
+    // SCRIPT_FILENAME 改写（见 `PhpRuntime::chroot`）。
+    // 沙箱关闭时连 chroot 一起忽略（`enabled = false` = 完全不做隔离）。
+    let chroot: Option<PathBuf> = if !cfg.enabled {
+        None
+    } else {
+        match cfg.chroot.as_deref().map(str::trim) {
+            Some("docroot") | Some("app") => Some(docroot.clone()),
+            Some("") | None | Some("none") | Some("off") => None,
+            Some(other) => Some(PathBuf::from(other)),
+        }
+    };
+    let chroot_line = chroot
+        .as_ref()
+        .map(|d| format!("chroot = {}\nchdir = /\n", d.display()))
+        .unwrap_or_default();
     let conf = format!(
         r#"[global]
 error_log = {err}
@@ -626,8 +670,13 @@ pid = {pid}
 listen.backlog = 4096
 pm = static
 pm.max_children = {workers}
-chdir = /tmp
+{chroot_line}chdir = /tmp
 catch_workers_output = yes
+; 每应用独立的临时目录（`state/php/tmp/<key>`）：会话/上传临时文件彼此不可见，
+; 也让 unveil 不必揭示整个 /tmp。chroot 打开时这里的路径要按 chroot 内的视角给。
+php_admin_value[sys_temp_dir] = {tmp}
+php_admin_value[upload_tmp_dir] = {tmp}
+php_admin_value[session.save_path] = {tmp}
 ; 只允许 .php 被当作 PHP 解析：路由的 extensions 含 ""（目录/无扩展名兜底），
 ; 若不过滤，docroot 里任意无扩展名文件（deps/bin/index 等）会被当 PHP 脚本执行/回显
 ; 源码，绕过静态层「应用 docroot 私密文件 → 404」的策略。
@@ -644,7 +693,9 @@ pm.max_requests = 10000
         listen = listen,
         pool_owner = pool_owner,
         listen_owner = listen_owner,
+        chroot_line = chroot_line,
         workers = app.workers.max(1),
+        tmp = if chroot.is_some() { "/tmp".to_string() } else { tmp_dir.display().to_string() },
     );
     fs::write(&conf_path, conf).context("write php-fpm conf")?;
 
@@ -659,6 +710,19 @@ pm.max_requests = 10000
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
+    // **进程级沙箱**（OpenBSD unveil/pledge；其它平台 no-op）。放在 spawn 前：
+    // 钩子会在 fork 之后、exec 之前于子进程里施加（见 apps::sandbox 的文件头）。
+    let spec = sandbox::build_spec(
+        "php",
+        Some(&docroot),
+        Some(&state_dir),
+        Some(&tmp_dir),
+        &sandbox::php_interp_roots(Path::new(&fpm_bin)),
+        Some(Path::new(&fpm_bin)),
+        &cfg,
+    );
+    log::info!("php-fpm {key}: sandbox {}", spec.summary());
+    spec.apply(&mut cmd).context("apply sandbox to php-fpm")?;
     let mut child = crate::server::apps::child_registry::spawn_tracked(
         &mut cmd,
         &format!("php-fpm {key}"),
@@ -677,6 +741,7 @@ pm.max_requests = 10000
         addr,
         child: Some(child),
         kind: PhpKind::Fpm,
+        chroot,
     })
 }
 
@@ -689,11 +754,19 @@ async fn start_fpm(
     state_dir: &Path,
 ) -> Result<PhpRuntime> {
     // 非 Unix：无法 UDS fpm，直接走 cgi TCP 回退。
-    start_cgi(key, app, state_dir).await
+    start_cgi(key, _lc, app, state_dir).await
 }
 
-async fn start_cgi(key: &str, app: &AppRouteConfig, state_dir: &Path) -> Result<PhpRuntime> {
+async fn start_cgi(
+    key: &str,
+    lc: &ListenerConfig,
+    app: &AppRouteConfig,
+    state_dir: &Path,
+) -> Result<PhpRuntime> {
     let cgi_bin = resolve_php_bin(app, false)?;
+    let docroot = resolve_docroot(lc, app);
+    let tmp_dir = prepare_app_tmp(key)?;
+    let cfg = app.sandbox_effective(&lc.global_sandbox);
     let workers = app.workers.max(1).to_string();
 
     #[cfg(unix)]
@@ -709,11 +782,29 @@ async fn start_cgi(key: &str, app: &AppRouteConfig, state_dir: &Path) -> Result<
         crate::server::apps::env_lock::apply_clean_env(&mut cmd, &[]);
         cmd.arg("-b")
             .arg(format!("{}", abs_sock.display()))
+            // 临时目录也指到每应用独立目录（与 fpm 池的 php_admin_value 同口径）。
+            .arg("-d")
+            .arg(format!("sys_temp_dir={}", tmp_dir.display()))
+            .arg("-d")
+            .arg(format!("upload_tmp_dir={}", tmp_dir.display()))
+            .arg("-d")
+            .arg(format!("session.save_path={}", tmp_dir.display()))
             .env("PHP_FCGI_CHILDREN", &workers)
             .env("PHP_FCGI_MAX_REQUESTS", "0")
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
+        let spec = sandbox::build_spec(
+            "php",
+            Some(&docroot),
+            Some(&state_dir),
+            Some(&tmp_dir),
+            &sandbox::php_interp_roots(Path::new(&cgi_bin)),
+            Some(Path::new(&cgi_bin)),
+            &cfg,
+        );
+        log::info!("php-cgi {key}: sandbox {}", spec.summary());
+        spec.apply(&mut cmd).context("apply sandbox to php-cgi")?;
         let mut child = crate::server::apps::child_registry::spawn_tracked(
             &mut cmd,
             &format!("php-cgi {key}"),
@@ -738,6 +829,7 @@ async fn start_cgi(key: &str, app: &AppRouteConfig, state_dir: &Path) -> Result<
             addr,
             child: Some(child),
             kind: PhpKind::Cgi,
+            chroot: None,
         })
     }
 
@@ -770,6 +862,7 @@ async fn start_cgi(key: &str, app: &AppRouteConfig, state_dir: &Path) -> Result<
             addr,
             child: Some(child),
             kind: PhpKind::Cgi,
+            chroot: None,
         })
     }
 }
@@ -852,6 +945,16 @@ fn resolve_php_bin(app: &AppRouteConfig, want_fpm: bool) -> Result<String> {
     if let Some(bin) = &app.php_bin {
         return Ok(remap_cli_php(bin, want_fpm));
     }
+    // ① **先按目录扫版本，取最高的那个**。
+    //
+    //    为什么放在显式候选表之前：候选表里无版本的 `php-fpm` 排在 `php-fpm-8.5`
+    //    前面，机器上只要存在一个指向旧版本的无版本链接，就会**静默选中旧版本**。
+    //    PHP 的安全修复是按版本发的（例如 2026-10 的 CVE-2026-109618/109619「请求
+    //    内存 UAF → 可 RCE」只存在于有修复的版本之外），静默降级选旧版是典型的
+    //    「以为升过级」事故。
+    if let Some(p) = scan_highest_versioned(want_fpm) {
+        return Ok(p);
+    }
     if want_fpm {
         for cand in [
             "php-fpm",
@@ -907,6 +1010,81 @@ fn resolve_php_bin(app: &AppRouteConfig, want_fpm: bool) -> Result<String> {
         }
     }
     bail!("php-cgi not found in PATH");
+}
+
+/// 扫目录找**版本最高**的 `php-fpm-<major>.<minor>` / `php-cgi-<major>.<minor>`
+/// （也认 `php-fpm85` 这种无点写法），返回绝对路径。
+///
+/// 只扫 `/usr/local/sbin`（OpenBSD 的 fpm 在这里）、`/usr/local/bin`、`/usr/sbin`、
+/// `/usr/bin` 与 `PATH`。**版本优先于 PATH 顺序** —— 目的就是不让旧版本因为排在
+/// 前面而被静默选中。
+fn scan_highest_versioned(want_fpm: bool) -> Option<String> {
+    let prog = if want_fpm { "php-fpm" } else { "php-cgi" };
+    let mut dirs: Vec<PathBuf> = vec![
+        PathBuf::from("/usr/local/sbin"),
+        PathBuf::from("/usr/local/bin"),
+        PathBuf::from("/usr/sbin"),
+        PathBuf::from("/usr/bin"),
+    ];
+    if let Ok(path) = std::env::var("PATH") {
+        for d in path.split(':').filter(|s| !s.is_empty()) {
+            dirs.push(PathBuf::from(d));
+        }
+    }
+    let mut best: Option<((u32, u32), String)> = None;
+    for d in dirs {
+        let rd = match fs::read_dir(&d) {
+            Ok(r) => r,
+            Err(_) => continue,
+        };
+        for e in rd.flatten() {
+            let name = match e.file_name().into_string() {
+                Ok(s) => s,
+                Err(_) => continue,
+            };
+            let rest = match name.strip_prefix(prog) {
+                Some(r) => r,
+                // `php-fpm` 本身（无版本）走候选表，交给 PATH 语义。
+                None => continue,
+            };
+            let ver = match parse_php_version(rest) {
+                Some(v) => v,
+                None => continue,
+            };
+            let path = e.path();
+            if !path.is_file() {
+                continue;
+            }
+            if best.as_ref().map(|(bv, _)| ver > *bv).unwrap_or(true) {
+                best = Some((ver, path.display().to_string()));
+            }
+        }
+    }
+    best.map(|(_, p)| p)
+}
+
+/// 解析 `-8.5` / `8.5` / `85` / `8.5.12` 这类版本片段为 `(major, minor)`；
+/// 解析不出来返回 `None`（说明不是 PHP 版本化二进制，例如 `php-fpm-wrapper`）。
+fn parse_php_version(s: &str) -> Option<(u32, u32)> {
+    let s = s.trim_start_matches(['.', '-', '_']);
+    if s.is_empty() {
+        return None;
+    }
+    if let Some((maj, rest)) = s.split_once('.') {
+        let maj: u32 = maj.parse().ok()?;
+        let min: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+        let min: u32 = min.parse().ok()?;
+        return Some((maj, min));
+    }
+    let digits: String = s.chars().take_while(|c| c.is_ascii_digit()).collect();
+    // 后面必须跟着 `-pN` 之外的东西不允许（`php-fpm-8.5p1` 也可接受，digits 已截断）
+    match digits.len() {
+        0 => None,
+        1 => Some((digits.parse().ok()?, 0)),
+        2 => Some((digits[0..1].parse().ok()?, digits[1..2].parse().ok()?)),
+        3 => Some((digits[0..1].parse().ok()?, digits[1..3].parse().ok()?)),
+        _ => Some((digits[0..1].parse().ok()?, digits[1..3].parse().ok()?)),
+    }
 }
 
 /// 把 CLI `php` 名字映射到同目录的 `php-fpm` / `php-cgi` 候选（§7.4：禁止把 CLI php
@@ -1109,6 +1287,17 @@ fn abs_state_php() -> PathBuf {
     abs_path(&p)
 }
 
+/// 每个应用独立的临时目录（会话/上传临时文件）：`state/php/tmp/<key>`。
+///
+/// 为什么要独立：unveil 只揭示这个目录就够 PHP 用（否则得把整个 `/tmp` 交出去，
+/// 那里有别的进程/别的应用的临时文件）；同时 PHP 的 `sys_temp_dir` /
+/// `session.save_path` / `upload_tmp_dir` 都指向它，应用之间互相看不到会话。
+fn prepare_app_tmp(key: &str) -> Result<PathBuf> {
+    let dir = sandbox::app_tmp_dir(&abs_state_php(), key);
+    fs::create_dir_all(&dir).with_context(|| format!("mkdir app tmp {}", dir.display()))?;
+    Ok(dir)
+}
+
 fn abs_path(p: &Path) -> PathBuf {
     if p.is_absolute() {
         return p.to_path_buf();
@@ -1186,6 +1375,7 @@ mod resolve_script_tests {
             deps_dir: None,
             init_timeout_secs: None,
             libc: None,
+            sandbox: None,
         }
     }
 
@@ -1246,6 +1436,7 @@ mod script_name_tests {
             deps_dir: None,
             init_timeout_secs: None,
             libc: None,
+            sandbox: None,
         }
     }
 

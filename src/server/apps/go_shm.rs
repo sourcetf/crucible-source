@@ -107,7 +107,7 @@ pub async fn execute(
         Err(e) => return Ok(e.into_response()),
     };
 
-    let (status, resp_body) = execute_common(key, method, path, body, peer, lc.port).await?;
+    let (status, resp_body) = execute_common(key, method, path, body, peer, lc.global_sandbox.clone()).await?;
     Ok(Response::builder()
         .status(StatusCode::from_u16(status).unwrap_or(StatusCode::OK))
         .header(http::header::CONTENT_TYPE, "text/plain; charset=utf-8")
@@ -130,7 +130,7 @@ pub async fn execute_simple(
     let method = req.method().as_str().to_string();
     let path = req.uri().path().to_string();
     let body = req.body().clone();
-    let (status, resp_body) = execute_common(key, method, path, body, peer, lc.port).await?;
+    let (status, resp_body) = execute_common(key, method, path, body, peer, lc.global_sandbox.clone()).await?;
     Ok(Response::builder()
         .status(StatusCode::from_u16(status).unwrap_or(StatusCode::OK))
         .header(http::header::CONTENT_TYPE, "text/plain; charset=utf-8")
@@ -146,11 +146,11 @@ async fn execute_common(
     path: String,
     body: Bytes,
     peer: SocketAddr,
-    port: u16,
+    sandbox_cfg: crate::server::apps::sandbox::SandboxConfig,
 ) -> Result<(u16, Bytes)> {
     // P2-11：ensure（spawn 子进程 + 5s 等待）放 spawn_blocking。
     let key_for_ensure = key.clone();
-    tokio::task::spawn_blocking(move || ensure_runtime(&key_for_ensure))
+    tokio::task::spawn_blocking(move || ensure_runtime(&key_for_ensure, &sandbox_cfg))
         .await
         .map_err(|e| anyhow::anyhow!("go shm ensure join: {e}"))??;
 
@@ -245,7 +245,10 @@ fn notify_and_wait(rt: &Runtime, slot_id: u32) -> Result<()> {
     Ok(())
 }
 
-fn ensure_runtime(key: &str) -> Result<()> {
+fn ensure_runtime(
+    key: &str,
+    sandbox_cfg: &crate::server::apps::sandbox::SandboxConfig,
+) -> Result<()> {
     {
         let mut map = RUNTIMES.lock();
         if let Some(rt) = map.get_mut(key) {
@@ -288,6 +291,15 @@ fn ensure_runtime(key: &str) -> Result<()> {
     // 干净环境：go-shm-server 是长驻进程，spawn 时刻可能落在别的应用的请求期 `.env`
     // 窗口内；默认继承 environ 会把别人的密钥永久烤进它的环境。
     crate::server::apps::env_lock::apply_clean_env(&mut cmd, &[]);
+    crate::server::apps::sandbox::apply_for_app(
+        &mut cmd,
+        "go",
+        sandbox_cfg,
+        None,
+        Some(&state_dir),
+        None,
+        Some(&bin),
+    );
     cmd.env("GO_SHM_FILE", &shm_path)
         .env("GO_SHM_NOTIFY_SOCKET", &notify_path)
         .stdin(Stdio::null())

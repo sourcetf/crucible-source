@@ -1133,6 +1133,7 @@ root = "/tmp/site-b"
             deps_dir: None,
             init_timeout_secs: None,
             libc: None,
+            sandbox: None,
         };
         let lc = ListenerConfig {
             address: "127.0.0.1".into(),
