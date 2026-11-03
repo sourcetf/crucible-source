@@ -41,7 +41,11 @@ pub struct SandboxSpec {
     pub reveals: Vec<Reveal>,
     /// `None` = 不调用 `pledge`（例如 JIT/线程模型复杂的 sidecar：unveil 仍生效）。
     pub pledge: Option<String>,
-    /// 孩子进程 `exec` 时继承的 promise 集；默认空串 = **孩子不能再 exec**。
+    /// `exec` 之后进程拿到的 promise 集。
+    ///
+    /// **绝不要传空串**：`pledge(cur, "")` 会让 exec 后的进程无 promise，首个
+    /// syscall 就 SIGABRT（实测 2026-11-04：sidecar 全 502、日志为空 —— 现象像
+    /// "起不来"）。[`build_spec`] 的默认逻辑保证这里非空（引擎承诺集去掉 `exec`）。
     pub pledge_exec: String,
     /// 可选：chroot 到该目录（要求 root；FPM 走自己的 pool 指令，不在这里设）。
     pub chroot: Option<PathBuf>,
@@ -112,7 +116,10 @@ impl SandboxSpec {
                 .pledge
                 .as_ref()
                 .and_then(|p| std::ffi::CString::new(p.as_str()).ok());
-            let pledge_exec = std::ffi::CString::new(self.pledge_exec.as_str()).ok();
+            let pledge_exec = Some(
+                std::ffi::CString::new(self.pledge_exec.as_str())
+                    .map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidInput))?,
+            );
             let chroot = self
                 .chroot
                 .as_ref()
@@ -232,9 +239,14 @@ pub struct SandboxConfig {
     /// 覆盖 promise 集（空 = 用引擎默认）。传 `"none"` 表示**只 unveil 不 pledge**。
     #[serde(default)]
     pub pledge: Option<String>,
-    /// 覆盖孩子进程继承的 promise 集（默认空串 = 孩子不能再 exec）。
-    #[serde(default)]
-    pub pledge_exec: Option<String>,
+    /// 覆盖 `exec` **之后**进程拿到的 promise 集。
+    ///
+    /// **传空串是危险的**：OpenBSD 的 `pledge(cur, "")` 会让 `exec` 后的进程
+    /// **没有任何 promise**，于是解释器一启动就因首个 syscall 违规被杀
+    /// （实测 SIGABRT，`sidecar.log`/fpm 的 error_log 都是空的 —— 现象像"起不来"）
+    /// 真正的锚：`execpromises` 非空且至少含解释器运行所需的项。
+    /// `None`（默认）= 用 [`engine_pledge`] 的基础集（**含 `exec`**，因为 sidecar
+    /// 的 `deps/bin/index` 是 `#!/bin/sh` 包装脚本，启动时要 exec 解释器）。
     /// 允许引擎 `exec`（把 `exec`/`prot_exec` 加进 promise 集）。默认 `false`：
     /// PHP/CGI 的 RCE 拿不到 shell 更值钱；确有需要（app 会 shell out）才打开。
     #[serde(default)]
@@ -252,7 +264,6 @@ impl Default for SandboxConfig {
             docroot_rw: false,
             extra_unveil: Vec::new(),
             pledge: None,
-            pledge_exec: None,
             allow_exec: false,
             chroot: None,
         }
@@ -531,35 +542,52 @@ pub fn build_spec(
         }
     }
 
-    // pledge：`pledge = "none"` 明确表示「只 unveil 不 pledge」；沙箱关闭时一律不给。
-    let pledge = if !cfg.enabled {
+    // 承诺集的构造（pre_exec 里 `pledge(current, execpromises)` 调用）：
+    //
+    // * `current`（第 1 个参数）必须含 **`exec`** —— 紧随 pledge 的启动 `execve()`
+    //   需要它；不含 `exec` 时那个 execve 被拒（EPERM），引擎起不来（真机实测：
+    //   ruby/rack/do/go/php-fpm 的子进程全部 SIGABRT 且无输出、日志为空）。
+    // * `execpromises`（第 2 个参数）是 **exec 之后进程**的权能。空串或 NULL 会让
+    //   解释器一启动就崩（动态加载器无权限）；所以必须给一个**能真正运行**的集合。
+    //   这里是「引擎承诺集（去掉 `exec`）」，即解释器自己做 syscall 都够 —— 有
+    //   `allow_exec=true` 时再给回 `exec`（解释器自身也 shell out）。
+    //
+    // 安全取向：默认 `allow_exec=false` ⇒ 被解释器再 exec 出来的子进程**拿不到 `exec`**
+    // （`pledge_exec` 为空 ⇒ 子进程的 `execpromises` 无 `exec` → 它不能再 exec 任何东西，
+    // 也就拿不到 `/bin/sh`）。fpm/ruby/jvm 自身不 spawn shell 容器，不受影响。
+    let base_promises = engine_pledge(engine, cfg.allow_exec);
+    let build_pledge = if !cfg.enabled {
         None
     } else {
         match cfg.pledge.as_deref().map(str::trim) {
             Some("none") | Some("off") | Some("-") => None,
             Some(other) if !other.is_empty() => Some(other.to_string()),
-            _ => engine_pledge(engine, cfg.allow_exec).map(|s| {
-                // **按整词**判断是否已有 `exec`：`prot_exec` 里含 `exec` 子串，
-                // 用 `contains("exec")` 会误判成「已给 exec」而**少给一个承诺**
-                //（本文件单测 `exec_and_pledge_overrides` 抓到的真实 bug）。
-                let has_exec = s.split_whitespace().any(|tok| tok == "exec");
-                if cfg.allow_exec && !has_exec {
-                    format!("{s} exec")
-                } else {
-                    s.to_string()
-                }
+            _ => base_promises.map(|s| {
+                let has_exec = s.split_whitespace().any(|t| t == "exec");
+                if has_exec { s.to_string() } else { format!("{s} exec") }
             }),
         }
     };
-
+    // `execpromises`（默认）：引擎承诺集去掉 `exec`（子进程不能 exec）；
+    // `allow_exec=true` 时再加回 `exec`。**绝不给空串**（那会冻死解释器）。
+    let execpromises = match build_pledge.as_deref() {
+        None => String::new(),
+        Some(cur) => {
+            let toks: Vec<&str> = cur.split_whitespace().filter(|t| *t != "exec").collect();
+            if cfg.allow_exec {
+                format!("{} exec", toks.join(" "))
+            } else {
+                toks.join(" ")
+            }
+        }
+    };
     SandboxSpec {
         enabled: cfg.enabled,
         engine_hint: engine.to_string(),
         reveals,
-        pledge,
-        // 默认：孩子不能再 exec（`pledge_exec` 为空串）。这是「RCE 拿不到 shell」
-        // 的关键一半 —— 即使引擎自己需要 exec（allow_exec），孩子也不再继承。
-        pledge_exec: cfg.pledge_exec.clone().unwrap_or_default(),
+        pledge: build_pledge,
+        // 默认子进程不能 exec；`allow_exec=true` 时保留 exec（见上）。
+        pledge_exec: execpromises,
         // `chroot = "docroot"` 是哨兵：解析成**真实** docroot 路径再交给 pre_exec
         // （直接 chroot("docroot") 是相对路径，必然失败 → _exit(127) → 引擎起不来）。
         // PHP-FPM 不走这条：它用池级 `chroot =` 指令只关 **worker**（master 需要读
@@ -647,9 +675,15 @@ mod tests {
 
         let p = spec.pledge.as_deref().expect("php 默认应给 pledge");
         assert!(p.contains("rpath") && p.contains("unix") && p.contains("inet"));
-        assert!(!p.split(' ').any(|x| x == "exec"), "默认不许引擎自己 exec: {p}");
+        // current（pledge）**必须含 `exec`**：紧随的启动 execve 需要它，缺了引擎起不来。
+        assert!(p.split(' ').any(|x| x == "exec"), "current 集须含 exec 才能启动: {p}");
+        // child（execpromises）**不含 exec**：默认"解释器 exec 出来的进程不能再 exec"
+        // ⇒ RCE 拿不到 /bin/sh（要放行用 allow_exec）。
+        assert!(!spec.pledge_exec.split(' ').any(|x| x == "exec"),
+                "默认子进程不能 exec: {}", spec.pledge_exec);
+        assert!(spec.pledge_exec.split(' ').any(|x| x == "stdio"),
+                "child 集不能是空串（否则冻死解释器）");
         assert!(!p.contains("chown"), "不该给改属主的能力: {p}");
-        assert_eq!(spec.pledge_exec, "", "孩子进程默认不能再 exec");
     }
 
     /// `docroot_rw = true` 才给 `w`（上传类应用需要）。

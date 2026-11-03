@@ -1359,9 +1359,10 @@ impl AppRouteConfig {
                 if app.pledge.is_some() {
                     merged.pledge = app.pledge.clone();
                 }
-                if app.pledge_exec.is_some() {
-                    merged.pledge_exec = app.pledge_exec.clone();
-                }
+                // `pledge_exec`（execpromises）**不暴露给配置**：它必须由 `build_spec`
+                // 用引擎承诺集安全派生。让配置能写空串/NULL 会冻死解释器（首个 syscall
+                // SIGABRT → 该应用 502，且这种"配置写错"比"给宽权限"危险得多）。
+                // 想收紧子进程的 exec 就用 `allow_exec`（见 sandbox.rs）。
                 if app.chroot.is_some() {
                     merged.chroot = app.chroot.clone();
                 }
