@@ -6816,3 +6816,49 @@ sh scripts/accept-verify-engine-containment.sh    # 围堵门禁（默认盯着 
    目的地址，属运维策略。
 7. **管理面（`/__admin`）在 9095 上也可达**，引擎（localhost）可对它爆破管理员口令。已有 argon2 哈希
    与会话 cookie 保护，但建议把管理面限制到特定 listener（`[admin] listeners_allow`）。
+
+---
+
+# 【工号 1009 · 追加】chroot 的真实边界 + 应用间隔离（2026-11-06 续）
+
+## chroot：一条**硬约束**，不是取舍口味
+真机实测 php-fpm 自己会打印：
+```
+[pool X] 'chroot' directive is ignored when FPM is not running as root
+```
+根因：**池级 `chroot` 由 master 执行**，master 必须先以 root `chroot(2)` 才能把 worker 关进去。
+而我们的沙箱正是把整个 fpm 降权到非特权用户 ⇒ **PHP 上「chroot」与「降权」互斥**，
+只能二选一：
+* 要降权（推荐：威胁模型是"引擎必被攻破"）⇒ 不配 `chroot`；
+* 要 FPM 原生 chroot ⇒ master 必须保持 root（等于放弃第一道防线）。
+
+**处置**：配置期**直接报错**（`[sandbox] chroot` + `user != none` 的组合），不再静默忽略 ——
+"以为开了其实没开"正是本项目一路在猎杀的形态。
+
+**非 PHP 引擎不受此限**：chroot 由**我们**在 fork 后、setuid 前亲自执行（那一刻子进程仍是
+root），顺序完全由我们掌控（`unveil → 锁 → chroot → 降权 → pledge`）。
+
+## chroot 的两个正确性问题（都已修）
+1. **unveil 与 chroot 的顺序语义**：`pre_exec` 是 unveil → 锁 → chroot，而 unveil 的条目在
+   **查找时**按当时的 root 解释。chroot 之后再去看那些宿主绝对路径（`/usr/lib`），会变成
+   「jail 里的 /usr/lib」⇒ 白名单全部失配。启用 chroot 时必须换口径：只揭示 chroot 内的
+   最小集（jail 根 `/` + `extra_unveil` 里写的 chroot 相对路径），文件系统边界交给 chroot。
+2. **chroot 下 tmp 必须是 chroot 内路径**：宿主侧真实位置是 `<docroot>/tmp`（要建出来并
+   chown 给引擎用户），conf 与 `-d opcache.lockfile_path` 里写 `/tmp`。
+
+## 应用间隔离（补上我先前引入的缺口）
+* **`state/php/<key>/`，0700**：降权后 spawn 前要 chown「本应用状态目录」给引擎用户；
+  此前所有 PHP 应用共用 `state/php/`，一次 chown 就把**别的** PHP 应用的 socket/error.log
+  也交了出去。现在每 key 一个目录，chown 作用域天然是本应用。
+* **每应用独立用户**：默认共用 `www` 时，攻破一个引擎能读其它引擎的 socket/日志/上传目录。
+  配置已支持 `[listeners.apps.sandbox] user = "_c_php"`；新增
+  `scripts/create-engine-users.sh` 按名单创建（幂等）。
+  真机机制验证：php-fpm 以独立用户运行、socket 属主为该用户，且 `www` **读不到**该 0700 目录。
+* 目标机有个 2026-09-07 遗留的 `/etc/ptmp`（useradd/vipw 的陈旧锁，0 字节、当前无进程在改
+  密码库）会挡住 `useradd`。**我没有擅自动 `/etc`**，留给运维处理。
+
+## 仍未闭合
+* chroot 只在**非 PHP**引擎上可用（且默认关闭，需运维显式配 + 确认应用自包含）；
+  PHP 侧因上述硬约束只能靠 unveil + 降权。
+* 每应用独立用户需要运维执行 `create-engine-users.sh` 并在各应用配置里指认，尚未在样例中启用。
+* webserver 主进程仍是 root；引擎运行时自身漏洞未解决；引擎可出网；管理面在全部 listener 可达。
