@@ -630,7 +630,18 @@ async fn start_fpm(
     //   ERROR: FPM initialization failed
     // ⇒ php-fpm 起不来、/php/ 恒 502（本机 2026-10-23 真机复现）。
     // 非 root 时直接省略这四行：FPM 行为等价（本来就不 chown），且不再解析不存在的组。
-    let (pool_owner, listen_owner) = if unsafe { libc::geteuid() } == 0 {
+    // 还有第三种情况：**我们要把整个 fpm 降权到非特权用户**（sandbox 沙箱）。那时
+    // master 一上来就不是 root，`user`/`group` 会被忽略，而 `listen.owner/group`
+    // 会真正去 `chown()` 到 nobody —— 非 root 做不到，FPM 报错退出。所以只要本次
+    // 会降权（或本来就不是 root），就一律省略这四行。
+    let will_drop = {
+        let cfg = app.sandbox_effective(&lc.global_sandbox);
+        matches!(
+            crate::server::apps::sandbox::resolve_ids(cfg.user.as_deref(), cfg.group.as_deref()),
+            Ok(Some(_))
+        ) && cfg.enabled
+    };
+    let (pool_owner, listen_owner) = if unsafe { libc::geteuid() } == 0 && !will_drop {
         (
             "user = nobody\ngroup = nobody\n",
             "listen.owner = nobody\nlisten.group = nobody\n",

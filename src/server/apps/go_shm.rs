@@ -307,7 +307,12 @@ fn ensure_runtime(
         None,
         Some(&bin),
     );
-    cmd.env("GO_SHM_FILE", &shm_path)
+    // **运行时硬化**：Go 1.24+ 在 Linux 上**默认**为监听 socket 启用 MPTCP，而
+    // CVE-2026-98432（Linux IPv4 TCP 握手 UAF）在 MPTCP 路径上有公开 PoC —— 默认
+    // 开 MPTCP 等于替攻击者满足前置条件。显式关掉：Go 侧 `multipathtcp=0`
+    //（目标机是 OpenBSD 时该设置无副作用；换 Linux 部署时它是必需的）。
+    cmd.env("GODEBUG", "multipathtcp=0")
+        .env("GO_SHM_FILE", &shm_path)
         .env("GO_SHM_NOTIFY_SOCKET", &notify_path)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
