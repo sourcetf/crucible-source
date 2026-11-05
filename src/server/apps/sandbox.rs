@@ -51,6 +51,16 @@ pub struct SandboxSpec {
     pub chroot: Option<PathBuf>,
     /// chroot 后的工作目录（默认 `/`）。
     pub chdir: Option<PathBuf>,
+    /// **降权目标**：子进程 `exec` 前 `setgroups`/`setgid`/`setuid` 到这里。
+    ///
+    /// 这是「攻破也不威胁主机」的**第一道**、也是最关键的一道：引擎子进程不再以
+    /// root 运行 ⇒ 拿到 RCE 也改不了系统文件、读不到 `/etc/master.passwd`、杀不掉
+    /// 别人的进程、绑不了特权端口。`unveil`（文件视图）与 `pledge`（系统调用面）
+    /// 都要在**降权之后**才真正成立 —— root 有绕过它们的手段，非特权用户没有。
+    ///
+    /// `None` = 不降权（保持旧行为；仅用于本地非 root 开发）。
+    pub uid: Option<libc::uid_t>,
+    pub gid: Option<libc::gid_t>,
 }
 
 impl SandboxSpec {
@@ -69,10 +79,12 @@ impl SandboxSpec {
             .collect();
         paths.sort();
         format!(
-            "engine={} enabled={} active_here={} reveals=[{}] pledge={:?} pledge_exec={:?} chroot={:?}",
+            "engine={} enabled={} active_here={} uid={:?} gid={:?} reveals=[{}] pledge={:?} pledge_exec={:?} chroot={:?}",
             self.engine_hint,
             self.enabled,
             self.is_active(),
+            self.uid,
+            self.gid,
             paths.join(" "),
             self.pledge.as_deref().unwrap_or("<none>"),
             self.pledge_exec,
@@ -130,6 +142,8 @@ impl SandboxSpec {
                 .and_then(|d| std::ffi::CString::new(d.as_os_str().as_encoded_bytes()).ok());
 
             let engine = self.engine_hint.clone();
+            let uid = self.uid;
+            let gid = self.gid;
             unsafe {
                 use std::os::unix::process::CommandExt;
                 cmd.pre_exec(move || {
@@ -167,7 +181,40 @@ impl SandboxSpec {
                             libc::_exit(127);
                         }
                     }
-                    // ④ pledge（最后一步：它之后连 unveil 都不能再调）。
+                    // ④ **降权**：setgroups → setgid → setuid（顺序不可颠倒）。
+                    //
+                    // 落在 chroot 之后、pledge 之前：chroot 需要 root，pledge 之后
+                    // 连 setuid 都调不动。降权掉了才让 unveil/pledge 真正成立 ——
+                    // root 进程可以重新 unveil 自己、可以被 ptrace，非特权用户不行。
+                    if let Some(gid) = gid {
+                        if libc::setgroups(0, std::ptr::null()) == -1 {
+                            let e = std::io::Error::last_os_error();
+                            eprintln!("crucible-sandbox[{engine}]: setgroups 失败: {e}");
+                            libc::_exit(127);
+                        }
+                        if libc::setgid(gid) == -1 {
+                            let e = std::io::Error::last_os_error();
+                            eprintln!("crucible-sandbox[{engine}]: setgid({gid}) 失败: {e}");
+                            libc::_exit(127);
+                        }
+                    }
+                    if let Some(uid) = uid {
+                        if libc::setuid(uid) == -1 {
+                            let e = std::io::Error::last_os_error();
+                            eprintln!("crucible-sandbox[{engine}]: setuid({uid}) 失败: {e}");
+                            libc::_exit(127);
+                        }
+                        // 复核：setuid 后必须**真的**拿不回 root（Linux 上无 CAP_SETUID
+                        // 时 setuid(0) 会 EPERM；OpenBSD 同理）。这条是「降权没生效」
+                        // 这类静默失败的最后一道断言。
+                        if libc::setuid(0) == 0 {
+                            eprintln!(
+                                "crucible-sandbox[{engine}]: 降权后仍能 setuid(0) —— 降权未生效，拒绝启动"
+                            );
+                            libc::_exit(127);
+                        }
+                    }
+                    // ⑤ pledge（最后一步：它之后连 unveil 都不能再调）。
                     if let Some(p) = &pledge {
                         let ep = pledge_exec
                             .as_ref()
@@ -211,7 +258,37 @@ pub fn apply_for_app(
         .map(|b| interp_roots_for(engine, b))
         .unwrap_or_default();
     interp.extend(engine_artifact_roots(engine, true));
-    let spec = build_spec(engine, docroot, state_dir, tmp_dir, &interp, bin, app_cfg);
+    // 降权目标：配置里的 user/group（默认 `www`）。解析失败 ⇒ 报错路径见下，
+    // **不静默以 root 跑**（那正是本机制要消灭的状态）。
+    let (uid, gid) = match resolve_ids(app_cfg.user.as_deref(), app_cfg.group.as_deref()) {
+        Ok(Some((u, g))) => (Some(u), Some(g)),
+        Ok(None) => (None, None),
+        Err(e) => {
+            log::error!("sandbox[{engine}]: 降权用户解析失败（本次将以当前身份运行）: {e}");
+            (None, None)
+        }
+    };
+    let mut spec = build_spec(engine, docroot, state_dir, tmp_dir, &interp, bin, app_cfg);
+    spec.uid = uid;
+    spec.gid = gid;
+    // 降权后引擎要能写自己的状态目录（socket/pid/log）与临时目录：在 spawn 之前
+    // （父进程仍是 root）把**本应用自己的**那两棵子树交给目标用户。只动这两棵，
+    // 不碰 docroot（只读即可）与 `/crucible` 其余部分。
+    if let (Some(u), Some(g)) = (uid, gid) {
+        for d in [state_dir, tmp_dir].into_iter().flatten() {
+            if let Err(e) = chown_tree(d, u, g) {
+                log::warn!("sandbox[{engine}]: chown {} 失败: {e}（引擎可能写不了 socket）", d.display());
+            }
+        }
+        // `docroot_rw` 的应用要写自己的文档根（上传/缓存）：也交给目标用户。
+        if app_cfg.docroot_rw {
+            if let Some(d) = docroot {
+                if let Err(e) = chown_tree(d, u, g) {
+                    log::warn!("sandbox[{engine}]: chown docroot {} 失败: {e}", d.display());
+                }
+            }
+        }
+    }
     log::info!("sandbox[{engine}]: {}", spec.summary());
     if let Err(e) = spec.apply(cmd) {
         log::warn!("sandbox[{engine}]: 挂钩失败（子进程将无隔离）: {e}");
@@ -255,6 +332,15 @@ pub struct SandboxConfig {
     /// 由 `php.rs` 直接写进池配置，不走这里）。
     #[serde(default)]
     pub chroot: Option<String>,
+    /// 降权到的**用户名**（OpenBSD/Linux 都从 `/etc/passwd` 解析；也接受纯数字 uid）。
+    ///
+    /// `None` = 用全局默认（见 [`default_drop_user`]）。传 `"none"`/`"root"`/`"-"` =
+    /// **明确不降权**（仅用于本地非 root 开发；生产上等于放弃第一道防线）。
+    #[serde(default)]
+    pub user: Option<String>,
+    /// 降权到的**组名**；`None` = 用该用户的登录组（`getpwnam` 的 `pw_gid`）。
+    #[serde(default)]
+    pub group: Option<String>,
 }
 
 impl Default for SandboxConfig {
@@ -266,8 +352,112 @@ impl Default for SandboxConfig {
             pledge: None,
             allow_exec: false,
             chroot: None,
+            user: None,
+            group: None,
         }
     }
+}
+
+/// 默认降权用户：优先 `www`（OpenBSD 自带、专为 HTTP 服务）、其次 `nobody`。
+///
+/// 为什么是"每引擎一个非特权用户"而非共用 root：RCE 的爆炸半径直接取决于
+/// `setuid` 落到谁身上。共用 `www` 已能挡住"改系统/读 shadow/杀别人进程"；若要
+/// 引擎之间互不可见，给不同应用配不同的 `user`（配合 unveil 的 docroot 隔离）。
+pub fn default_drop_user() -> &'static str {
+    "www"
+}
+
+/// 解析用户/组名为 `(uid, gid)`。
+///
+/// * `name` 为 `None` ⇒ 用 [`default_drop_user`]；
+/// * `"none"`/`"root"`/`"-"`/空串 ⇒ **不降权**（`None`）；
+/// * 纯数字 ⇒ 当 uid/gid 用（组未给时用同一数字）；
+/// * 否则 `getpwnam`/`getgrnam` 解析；解析不到 ⇒ **报错**（fail-closed：
+///   宁可引擎起不来，也不要静默以 root 运行）。
+pub fn resolve_ids(
+    user: Option<&str>,
+    group: Option<&str>,
+) -> std::io::Result<Option<(libc::uid_t, libc::gid_t)>> {
+    let uname = match user.map(str::trim) {
+        Some("none") | Some("root") | Some("-") | Some("") => return Ok(None),
+        Some(u) => u.to_string(),
+        None => default_drop_user().to_string(),
+    };
+    if let Ok(n) = uname.parse::<libc::uid_t>() {
+        let gid = match group.map(str::trim) {
+            Some(g) if !g.is_empty() => g
+                .parse::<libc::gid_t>()
+                .map_err(|_| bad(format!("group `{g}` 不是合法 gid")))?,
+            _ => n,
+        };
+        return Ok(Some((n, gid)));
+    }
+    let cu = std::ffi::CString::new(uname.clone())
+        .map_err(|_| bad(format!("用户名含 NUL: {uname}")))?;
+    let pw = unsafe { libc::getpwnam(cu.as_ptr()) };
+    if pw.is_null() {
+        return Err(bad(format!(
+            "用户 `{uname}` 不存在（改 [sandbox] user，或 `useradd -m {uname}`）"
+        )));
+    }
+    let (uid, mut gid) = unsafe { ((*pw).pw_uid, (*pw).pw_gid) };
+    if let Some(g) = group.map(str::trim).filter(|g| !g.is_empty()) {
+        let cg = std::ffi::CString::new(g).map_err(|_| bad("组名含 NUL".to_string()))?;
+        let gr = unsafe { libc::getgrnam(cg.as_ptr()) };
+        if gr.is_null() {
+            return Err(bad(format!("组 `{g}` 不存在")));
+        }
+        gid = unsafe { (*gr).gr_gid };
+    }
+    Ok(Some((uid, gid)))
+}
+
+fn bad(msg: String) -> std::io::Error {
+    std::io::Error::new(std::io::ErrorKind::InvalidInput, msg)
+}
+
+/// 把 `path`（递归）的属主改成 `(uid, gid)`，供降权后的引擎写入。
+///
+/// 为什么必须做：引擎降权到非特权用户后，它的 socket / pid / log 都要写进
+/// `state/...`，而那些目录当前是 root 所有 ⇒ 降权后写不进去，引擎起不来（502）。
+/// 这里在 **spawn 之前**（父进程仍是 root）把「该应用自己的状态目录与临时目录」
+/// 交给目标用户 —— 只 chown **应用自己的**那两棵子树，不碰 `/crucible` 其它部分。
+///
+/// 非 root 运行（本地开发）时 chown 会 EPERM：这里**只记日志不报错**，因为本地
+/// 本来就不降权（`uid/gid` 为 `None` 时根本不该调本函数）。
+pub fn chown_tree(path: &Path, uid: libc::uid_t, gid: libc::gid_t) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        let c = std::ffi::CString::new(path.as_os_str().as_bytes())
+            .map_err(|_| bad(format!("路径含 NUL: {path:?}")))?;
+        // 先改这一层。
+        let rc = unsafe { libc::chown(c.as_ptr(), uid, gid) };
+        if rc == -1 {
+            let e = std::io::Error::last_os_error();
+            // 目录不存在（还没建）不算错误：调用方通常会先 create_dir_all。
+            if e.kind() != std::io::ErrorKind::NotFound {
+                return Err(e);
+            }
+        }
+        // 再递归子项（socket/pid/log 都是文件，也要一起改）。
+        let rd = match std::fs::read_dir(path) {
+            Ok(r) => r,
+            Err(_) => return Ok(()), // 不存在/无权限读 ⇒ 跳过
+        };
+        for ent in rd.flatten() {
+            let p = ent.path();
+            let c = match std::ffi::CString::new(p.as_os_str().as_bytes()) {
+                Ok(c) => c,
+                Err(_) => continue,
+            };
+            let _ = unsafe { libc::chown(c.as_ptr(), uid, gid) };
+            if ent.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                let _ = chown_tree(&p, uid, gid);
+            }
+        }
+    }
+    Ok(())
 }
 
 fn default_sandbox_on() -> bool {
@@ -300,16 +490,32 @@ pub type GlobalSandboxConfig = SandboxConfig;
 fn engine_pledge(engine: &str, allow_exec: bool) -> Option<&'static str> {
     let base = match engine {
         // 通用解释器型：覆盖 php / php-fpm / php-cgi / cgi / 各脚本型 sidecar。
+        // **ruby/rack 不由我们 pledge**：OpenBSD 的 ruby 端口让解释器在启动时
+        // **自己** pledge（一套为 ruby 调好的承诺集）。我们在它之前 pledge 会让它的
+        // pledge() 因「不能扩大权限」返回 EPERM，解释器直接 `exit 1`
+        //（真机实测：`pledge: Operation not permitted`）。unveil + 降权 对它仍然生效，
+        // 且它自己的 pledge 是在「已 unveil、已降权」之后施加的 —— 比我们代劳更准。
+        "ruby" | "rack" => return None,
         "php" | "fastcgi" | "cgi" | "perl" | "psgi" | "python" | "wsgi" | "asgi" | "uwsgi"
-        | "ruby" | "rack" | "lua" | "asp" | "aspnet" | "do" | "tsx" => {
+        | "lua" | "asp" | "aspnet" | "do" | "tsx" => {
             // **不要 `tmppath`**：本机 OpenBSD 的 pledge 不认这个 token，混进承诺串会让
             // **整条 pledge() 返回 EINVAL**（子进程 _exit(127)，sidecar 全挂、502）。
             // 临时目录用每应用自建的 `state/php/tmp/<key>`（已 reveal），不需要 /tmp 权限：
             // `rpath/wpath/cpath/dpath` 足以覆盖在已 reveal 路径上的读写建目录。
-            "stdio rpath wpath cpath dpath inet unix dns flock fattr getpw proc prot_exec"
+            //
+            // 带 `chown`：php-fpm 启动时要 `chown()` 它自己建的 socket 给
+            // `listen.owner`（真机实测：缺 `chown` ⇒ `failed to chown() the socket`
+            // ⇒ master 退出 ⇒ /php/ 502）。这是降权到非 root 后 fpm 的正常启动路径。
+            "stdio rpath wpath cpath dpath inet unix dns flock fattr chown getpw proc prot_exec"
         }
-        // 原生编译产物（c/rust/go）：同样按 web 应用口径，但不需要解释器的额外项。
-        "c" | "rust" | "go" => "stdio rpath wpath cpath dpath inet unix dns flock fattr",
+        // 原生编译产物（c/rust/go）。**Go runtime 特殊**（真机逐 token 二分实测）：
+        //   * 需要 `cpath`（建锁/临时文件）与 `unix`（内部 socket）；
+        //   * 需要 **`id`**（Go runtime 启动时 `setrlimit` —— core 崩点就在它；
+        //     `proc` 也能通过但更宽：额外给出 fork/kill，故取 `id`）；
+        //   * 需要 execpromises 保留 `exec`（见下面的 engine_needs_exec_always）。
+        //   缺任一 ⇒ 立刻 SIGABRT。
+        "go" => "stdio rpath wpath cpath dpath inet unix dns flock fattr id",
+        "c" | "rust" => "stdio rpath wpath cpath dpath inet unix dns flock fattr",
         // 没见过的引擎名：**不给** pledge（只 unveil）。宁可少一层，也不要因为
         // 猜错承诺集把引擎打成起不来。
         _ => return None,
@@ -570,11 +776,15 @@ pub fn build_spec(
     };
     // `execpromises`（默认）：引擎承诺集去掉 `exec`（子进程不能 exec）；
     // `allow_exec=true` 时再加回 `exec`。**绝不给空串**（那会冻死解释器）。
+    // Go runtime 与 `#!/bin/sh` 包装脚本在**启动期**就要 exec（Go 会 fork/exec 探测
+    // 环境、wrapper 脚本要 exec 真正的解释器），所以这几个引擎的 execpromises 必须
+    // 保留 `exec`；否则真机实测 SIGABRT / `exit 1`。其余引擎默认去掉 `exec`。
+    let engine_needs_exec_always = matches!(engine, "go" | "jsp" | "do");
     let execpromises = match build_pledge.as_deref() {
         None => String::new(),
         Some(cur) => {
             let toks: Vec<&str> = cur.split_whitespace().filter(|t| *t != "exec").collect();
-            if cfg.allow_exec {
+            if cfg.allow_exec || engine_needs_exec_always {
                 format!("{} exec", toks.join(" "))
             } else {
                 toks.join(" ")
@@ -588,6 +798,9 @@ pub fn build_spec(
         pledge: build_pledge,
         // 默认子进程不能 exec；`allow_exec=true` 时保留 exec（见上）。
         pledge_exec: execpromises,
+        // 降权由 apply_for_app 填充（需要 app 配置里的 user/group）。
+        uid: None,
+        gid: None,
         // `chroot = "docroot"` 是哨兵：解析成**真实** docroot 路径再交给 pre_exec
         // （直接 chroot("docroot") 是相对路径，必然失败 → _exit(127) → 引擎起不来）。
         // PHP-FPM 不走这条：它用池级 `chroot =` 指令只关 **worker**（master 需要读
@@ -683,7 +896,9 @@ mod tests {
                 "默认子进程不能 exec: {}", spec.pledge_exec);
         assert!(spec.pledge_exec.split(' ').any(|x| x == "stdio"),
                 "child 集不能是空串（否则冻死解释器）");
-        assert!(!p.contains("chown"), "不该给改属主的能力: {p}");
+        // `chown` **必须有**：php-fpm 启动时要 chown 自己建的 socket 给 listen.owner
+        // （真机实测缺了即 `failed to chown() the socket` → master 退出 → 502）。
+        assert!(p.split_whitespace().any(|t| t == "chown"), "php 需要 chown: {p}");
     }
 
     /// `docroot_rw = true` 才给 `w`（上传类应用需要）。
@@ -813,6 +1028,89 @@ mod tests {
         assert!(roots.iter().any(|p| p == Path::new("/usr/local/sbin")));
         assert!(roots.iter().any(|p| p == Path::new("/usr/lib")));
     }
+    /// 降权用户解析：默认 `www`、显式 none/root 关闭、解析失败 fail-closed。
+    #[test]
+    fn resolve_ids_semantics() {
+        // 显式关闭：none/root/-/空 ⇒ 不降权
+        for off in ["none", "root", "-", ""] {
+            assert_eq!(resolve_ids(Some(off), None).unwrap(), None, "`{off}` 应关闭降权");
+        }
+        // 纯数字 uid ⇒ 直接用（组缺省时同数字）
+        assert_eq!(resolve_ids(Some("1234"), None).unwrap(), Some((1234, 1234)));
+        assert_eq!(resolve_ids(Some("1234"), Some("4321")).unwrap(), Some((1234, 4321)));
+        // 数字格式错误 ⇒ 报错
+        assert!(resolve_ids(Some("12x"), None).is_err());
+        // 不存在的用户 ⇒ **报错**（fail-closed，绝不静默以 root 跑）
+        let e = resolve_ids(Some("__no_such_user_zzz"), None).expect_err("必须报错");
+        assert!(format!("{e}").contains("不存在"), "{e}");
+    }
+
+    /// 降权是「攻破也不威胁主机」的第一道：spec 必须带上 uid/gid，且
+    /// `apply_for_app` 解析默认用户后填入（这里只测纯数据部分）。
+    #[test]
+    fn drop_ids_recorded_in_spec() {
+        let spec = build_spec("php", None, None, None, &[], None, &cfg());
+        assert!(spec.uid.is_none() && spec.gid.is_none(), "build_spec 默认不带降权（由 apply_for_app 填）");
+        let mut spec = spec;
+        spec.uid = Some(67);
+        spec.gid = Some(67);
+        assert!(spec.summary().contains("uid=Some(67)"), "{}", spec.summary());
+    }
+
+    /// Go 与 shell-wrapper 引擎的 execpromises **必须保留 exec**（实测结论钉住）。
+    #[test]
+    fn go_and_wrapper_engines_keep_exec_in_execpromises() {
+        // Go：由我们 pledge，且 execpromises 必须保留 `exec`（实测缺了即 SIGABRT）。
+        let spec = build_spec("go", None, None, None, &[], None, &cfg());
+        assert!(
+            spec.pledge_exec.split_whitespace().any(|t| t == "exec"),
+            "go 的 execpromises 必须含 exec: {}",
+            spec.pledge_exec
+        );
+        // `id` 也必须在（Go runtime 启动期 setrlimit；实测缺了即 SIGABRT）。
+        assert!(
+            spec.pledge.as_deref().unwrap().split_whitespace().any(|t| t == "id"),
+            "go 需要 id: {:?}",
+            spec.pledge
+        );
+        // ruby/rack：**不由我们 pledge**（解释器自己 pledge，我们代劳会让它 EPERM 退出）。
+        for eng in ["ruby", "rack"] {
+            let spec = build_spec(eng, None, None, None, &[], None, &cfg());
+            assert!(spec.pledge.is_none(), "{eng} 应只 unveil（解释器自 pledge）: {:?}", spec.pledge);
+        }
+        // `jsp` 不在承诺表里（Java 的线程/JIT 模型与 pledge 冲突）⇒ 只 unveil，
+        // 此时 execpromises 为空是**正确的**（不调用 pledge）。
+        let spec = build_spec("jsp", None, None, None, &[], None, &cfg());
+        assert!(spec.pledge.is_none(), "jsp 应只 unveil 不 pledge");
+        assert_eq!(spec.pledge_exec, "");
+        // 非 wrapper 引擎（如 c/rust）默认仍去掉 exec（更严）
+        let spec = build_spec("rust", None, None, None, &[], None, &cfg());
+        assert!(
+            !spec.pledge_exec.split_whitespace().any(|t| t == "exec"),
+            "rust 默认不该给 exec: {}",
+            spec.pledge_exec
+        );
+    }
+
+    /// php 的承诺集必须含 `chown`（fpm 启动要 chown socket 给 listen.owner）。
+    #[test]
+    fn php_pledge_has_chown() {
+        let spec = build_spec("php", None, None, None, &[], None, &cfg());
+        let p = spec.pledge.as_deref().unwrap();
+        assert!(p.split_whitespace().any(|t| t == "chown"), "php 需要 chown: {p}");
+    }
+
+    /// `user = "none"` 的配置 ⇒ 解析为不降权（本地开发路径）。
+    #[test]
+    fn config_user_none_disables_drop() {
+        let c = SandboxConfig {
+            user: Some("none".into()),
+            ..cfg()
+        };
+        let spec = build_spec("php", None, None, None, &[], None, &c);
+        assert!(spec.uid.is_none());
+    }
+
 }
 
 /// 引擎带着跑的**运行时资产**目录（不是解释器本身，而是它启动时会去读/执行的文件）。
