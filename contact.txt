@@ -6758,3 +6758,61 @@ pledge 恰恰是限制"攻破后能调哪些系统调用"的那一层，不能�
 4. **webserver 主进程仍是 root**（绑 80/443/53 与管 DNS 需要）；已改为引擎侧不 root。
    主进程自身被 RCE 的风险仍高于引擎 —— 后续可考虑"绑完端口即降权 + 保留必要能力"。
 5. 引擎侧漏洞本身（Java/Node/PHP/Go 的运行时洞）没解决，只做了"打穿后不威胁主机"。
+
+## 七、真机验收结果（2026-11-06，目标机 OpenBSD 8.0）
+```
+===== 1) 引擎进程身份（必须非 root）=====
+进程 php-fpm (pid 20559) 身份=www          ok
+进程 ruby34 (pid 12815) 身份=www           ok
+进程 java -jar (pid 17124) 身份=www        ok
+进程 deps/bin/index (pid 74804) 身份=www   ok
+===== 2) 以引擎用户身份试读宿主秘密（必须全被拒）=====
+读系统密码库 /etc/master.passwd          ok
+读管理员哈希（config.toml）            ok
+读服务器私钥 key.pem                     ok
+读 ECH 私钥 cover.key.pem                ok
+读 /root 目录                            ok
+写 /etc                                  ok
+读其它应用的 docroot（jsp 的 jar 目录写权限） ok
+向 pid 1 发信号                          ok
+绑特权端口 80                            ok
+===== 3) 沙箱日志：13 条 uid=Some(...) =====  ok
+== CONTAINMENT OK：攻破任一引擎也拿不到主机 ==
+```
+**全 19 条路由 200**（含 `/php/`、`/do/`）。沙箱策略逐引擎可见（`/var/log/crucible-restart.log` 的
+`sandbox[...]` 行把 reveals / pledge / pledge_exec / uid/gid 全打出来了，便于事后审计）。
+
+复跑方式：
+```
+sh scripts/harden-secret-perms.sh                 # 收紧宿主机密钥（幂等）
+sh scripts/accept-verify-engine-containment.sh    # 围堵门禁（默认盯着 www）
+```
+
+## 八、`/php/` 与 `/do/` 的最后一跳（各是一个"反直觉"的坑）
+* **`ld.so: can't load library 'libsodium.so.11.1'`** —— OpenBSD 的 `ld.so` 在**运行期**靠
+  **`/var/run/ld.so.hints`** 把「库名」解析成路径。unveil 白名单缺的是这个**索引文件**（不是库
+  本身，库在 `/usr/local/lib` 已揭示）。现象是引擎起不来但报错看着像"缺库"。已加入 `BASE_REVEALS`。
+* **`Unable to create opcache lock file in /tmp`** —— opcache 锁文件默认落 `/tmp`，而我们**故意**
+  不揭示 `/tmp`（跨应用串味入口）。该指令在 **master 启动期**读取，池级
+  `php_admin_value[...]` 来不及生效 ⇒ 必须用**命令行 `-d`** 指到每应用 `state/php/tmp/<key>`。
+* **`/do/`** 与 `/jsp/` 是同一个 Java jar；`jsp` 因不在承诺表里一直正常，`do` 被套 pledge 就挂
+  （`pledge: Operation not permitted`）。两者改为只 unveil。
+
+## 九、本轮小结与仍未闭合（诚实清单）
+**已完成**：降权（引擎全部非 root、默认 `www`）→ unveil（文件视图）→ 按引擎校准的 pledge
+（能 pledge 的都 pledge，与解释器自身冲突的如实放弃并记录原因）→ 宿主机密钥收紧 →
+可复跑的围堵门禁。**"攻破任一引擎拿不到主机"这一条已在真机验证通过。**
+
+**未闭合**（按优先级）：
+1. **chroot 未全面启用**：只有 `sandbox.chroot` 可选路径 + FPM 池级 chroot，默认空。
+   解释器型引擎做实 chroot 需要在 jail 内放整套运行时（代价大）；当前以 unveil + 降权承担。
+2. **仍共用单一非特权用户 `www`**：应用之间可互读 state/docroot。要隔离需给不同应用配不同
+   `[sandbox] user`（配置已支持，未在样例里启用）。
+3. **PHP 的 `state/php` 是共享目录**：`chown_tree` 会把整棵交给 www；多 PHP 应用时应改成每 key 子目录。
+4. **webserver 主进程仍是 root**（绑 80/443/53 与管 named 需要）。主进程被 RCE 的风险仍高于引擎；
+   后续可考虑"绑完端口即降权并只保留必要能力"。
+5. **引擎运行时自身的漏洞**（Java/Node/PHP/Go 的 CVE 流）没解决 —— 本轮只做到"打穿后不威胁主机"。
+6. **引擎可出网**：`inet` 承诺给着（web 应用刚需）。被攻破后可用于外传数据；要收紧需配防火墙/限制
+   目的地址，属运维策略。
+7. **管理面（`/__admin`）在 9095 上也可达**，引擎（localhost）可对它爆破管理员口令。已有 argon2 哈希
+   与会话 cookie 保护，但建议把管理面限制到特定 listener（`[admin] listeners_allow`）。
