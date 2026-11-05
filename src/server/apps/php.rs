@@ -727,17 +727,18 @@ pm.max_requests = 10000
     // —— 那会连 master 一起关进去，master 就读不到 conf/pid/log/sock（都在 docroot 外）。
     let mut spec_cfg = cfg.clone();
     spec_cfg.chroot = None;
-    let spec = sandbox::build_spec(
+    // **必须走 apply_for_app**（而不是 build_spec + apply）：降权（uid/gid）与
+    // 「把本应用的状态/临时目录交给目标用户」都在它里面 —— 只调 build_spec 的
+    // 话 fpm 会以 root 起来，等于这一整层防护对 PHP 失效（本文件此前就是这样）。
+    sandbox::apply_for_app(
+        &mut cmd,
         "php",
+        &spec_cfg,
         Some(&docroot),
         Some(&state_dir),
         Some(&tmp_dir),
-        &sandbox::php_interp_roots(Path::new(&fpm_bin)),
         Some(Path::new(&fpm_bin)),
-        &spec_cfg,
     );
-    log::info!("php-fpm {key}: sandbox {}", spec.summary());
-    spec.apply(&mut cmd).context("apply sandbox to php-fpm")?;
     let mut child = crate::server::apps::child_registry::spawn_tracked(
         &mut cmd,
         &format!("php-fpm {key}"),
@@ -809,17 +810,15 @@ async fn start_cgi(
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
-        let spec = sandbox::build_spec(
+        sandbox::apply_for_app(
+            &mut cmd,
             "php",
+            &cfg,
             Some(&docroot),
             Some(&state_dir),
             Some(&tmp_dir),
-            &sandbox::php_interp_roots(Path::new(&cgi_bin)),
             Some(Path::new(&cgi_bin)),
-            &cfg,
         );
-        log::info!("php-cgi {key}: sandbox {}", spec.summary());
-        spec.apply(&mut cmd).context("apply sandbox to php-cgi")?;
         let mut child = crate::server::apps::child_registry::spawn_tracked(
             &mut cmd,
             &format!("php-cgi {key}"),
