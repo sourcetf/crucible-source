@@ -6663,3 +6663,98 @@ PHP 核心 **CVE-2026-109619 / CVE-2026-109618**（CVSS 9.2，2026-10-21，请�
 
 > 教训：解释器类引擎的 `.so` **必须**在目标机、按**当前**解释器重建；升级/降级解释器后
 > 第一件事就是重跑 `scripts/build_app_engines.sh`。
+
+---
+
+# 【工号 1009 · 追加】威胁模型升级：**假定引擎必被攻破**，围堵主机（2026-11-06）
+
+## 口径变化（由用户提供，此前我判断错了）
+原口径是"PHP 有个 CVSS 9.2 的 RCE，升级 + 加沙箱"。用户纠正：**没有一个应用引擎是安全的**
+—— PHP 核心 CVE-2026-109619/109618、php-fpm CVE-2026-91768、Linux 内核 CVE-2026-98432
+（IPv4 TCP 握手 UAF；Go 1.24+ 在 Linux 默认开 MPTCP 监听，等于替攻击者满足 PoC 前置条件），
+Java/Node 也相继出洞。所以安全目标不是"引擎别被打穿"（做不到），而是
+**打穿之后也拿不下主机**。
+
+我此前的"把 pledge 默认关掉、只留 unveil"是**方向性错误**：在"引擎必被攻破"的前提下，
+pledge 恰恰是限制"攻破后能调哪些系统调用"的那一层，不能关。
+
+## 目标机事实（先核实，避免按错前提设计）
+* 目标机是 **OpenBSD 8.0**，`net.mptcp.*` 不存在 ⇒ CVE-2026-98432 不作用于它的内核。
+  但 `go-shm-server` 是 **go1.26.2** 构建的（远超 1.24 分界），同一份引擎代码在 Linux
+  （本机开发环境 go1.26.8）就会走到 MPTCP 路径 ⇒ 已在 spawn 时注入
+  `GODEBUG=multipathtcp=0`（OpenBSD 上无害，Linux 上是必需）。
+* **致命前提错误：所有引擎都以 root 运行**。`ps` 显示 webserver 与 `java -jar`
+  sidecar 全是 `root wheel`。root 的进程能重新 unveil 自己、能被 ptrace、能改系统文件
+  —— 在这种情况下 unveil/pledge 形同虚设。**降权才是第一道防线**。
+
+## 一、降权（本轮主线）
+`SandboxSpec` 增 `uid`/`gid`；`pre_exec` 顺序改为：
+`unveil → 锁 → (chroot) → setgroups/setgid/setuid → pledge`。
+* 降权放 chroot 后（chroot 要 root）、pledge 前（pledge 之后连 setuid 都调不动）；
+* `setuid` 后**复查 `setuid(0)` 必须失败**，否则拒绝启动 —— 防"以为降了其实没降"；
+* `resolve_ids()`：默认 `www`；`none`/`root`/`-` 关闭（本地开发）；纯数字当 uid；
+  用户不存在**报错**（fail-closed，绝不静默以 root 跑）；
+* `chown_tree()`：spawn 前（父进程仍 root）把**本应用自己的** state/tmp（`docroot_rw`
+  时连 docroot）交给目标用户 —— 否则降权后引擎写不了 socket/pid/log；
+* 配置 `[sandbox] user`/`group`，每应用可覆盖。
+
+真机 C 探针实测：降权后子进程 `uid=67 euid=67 gid=67`（www），socket 属主变 `www`。
+
+**踩到的坑（会导致 PHP 完全没降权）**：`php.rs` 原先直接 `build_spec + spec.apply`，
+绕过了 `apply_for_app`（uid/gid 填充与 chown 都在那里）⇒ fpm/cgi 仍以 root 起。
+现已改走统一入口，并 grep 确认再无其他绕过点。
+
+## 二、按引擎校准 pledge（全部真机逐个 token 二分得出，不是猜的）
+| 引擎 | 承诺集 | 依据 |
+|---|---|---|
+| `go` | `... cpath unix id` + execpromises 保留 `exec` | 缺 `cpath`/`unix`/`exec` 任一即 SIGABRT；**`id` 必需**（Go runtime 启动期 `setrlimit` —— core 崩点就是它；`proc` 也能过但更宽，多给 fork/kill，故取 `id`） |
+| `ruby`/`rack` | **不由我们 pledge**（只 unveil + 降权） | OpenBSD 的 ruby 端口让解释器启动时**自己** pledge；我们先 pledge 会让它的 `pledge()` 因"不能扩大权限"EPERM ⇒ `pledge: Operation not permitted` → `exit 1`。它的自 pledge 施加在"已 unveil、已降权"之后，比我们代劳更准 |
+| `php` | `... chown ...` | fpm 启动要 `chown()` 自建 socket 给 `listen.owner`；缺了即 `failed to chown() the socket` → master 退出 → 502 |
+| `jsp`/`do`（Java） | 只 unveil（`pledge` 返回 `None`） | JIT/线程模型与 pledge 冲突 |
+| 未知引擎 | 只 unveil | 不猜承诺集（猜错=起不来） |
+
+**另外两个坑**（早前记录，此处并入）：
+* `tmppath` 不是本机 OpenBSD 的合法 pledge token，混进承诺串会让**整条 pledge 返回
+  EINVAL** → 子进程 `_exit(127)` → 5 条路由 502。逐 token 实测只有它 INVALID。
+* `pledge(cur, "")`（空 execpromises）会让 exec 后的进程**没有任何 promise**、首个 syscall
+  就 SIGABRT —— 必须给非空集合。
+
+## 三、宿主机密钥权限（实测出的真实缺口）
+澄清：以下都在目标机上**实测**过，不是推测。
+```
+/crucible/config.toml    -rw-r--r--  含 admin 的 argon2 password_hash   ← www 可读
+/crucible/key.pem        -rw-r--r--  服务器 TLS 私钥                     ← www 可读
+/crucible/key_ec.pem     -rw-r--r--  同上（ECC 副证）                    ← www 可读
+```
+即**任何一个被 RCE 的引擎**都能读走管理员密码哈希与服务器私钥。unveil 在 OpenBSD 上能挡
+路径（这些路径未揭示），但**文件模式是跨平台、且在 unveil 失效时仍生效的那一层**。
+新增 `scripts/harden-secret-perms.sh`：收到 `640 root:wheel` 并以引擎用户身份复核读不到。
+
+## 四、验收门禁（按新口径）
+`scripts/accept-verify-engine-containment.sh`：不看"引擎有没有洞"，只看**攻破后能做什么**：
+1. 引擎进程必须非 root；
+2. 以该用户身份**必须读不到**：`/etc/master.passwd`、`config.toml`、`key.pem`、
+   ECH 私钥、`/root`；**必须写不了** `/etc`；**必须杀不掉** pid 1；**必须绑不了** 80；
+3. 沙箱日志里必须有 `uid=Some(...)` 的记录（否则就是"以为降了其实没降"）。
+
+## 五、方法学（这一轮的效率来源）
+* **C 探针复刻 `pre_exec` 全序列**（unveil → 锁 → 降权 → pledge → exec 真实二进制）：
+  1 vCPU 上 Rust 链接要 15–25 分钟，而这个探针 `cc` 一下 5 秒就能判定"策略集够不够"。
+  本轮所有 pledge/降权结论都是它 + `ktrace` + 逐 token 二分得出来的。
+* `ktrace -f out -i` 能跟到 `execve` 之后的子进程；但**OpenBSD 的 `find` 没有 `-newermt`**、
+  `head` 没有 `-c`、pledge 违规记录不一定进 `dmesg`/`messages`（dmesg 会轮转）。
+* 部署脚本**必须**用 `scripts/deploy/deploy_release.sh`（它自带构建 RC 检查 +
+  `--check-config` 预检）。我自己写的临时部署脚本没判 RC，构建失败后仍继续"停服→换交"，
+  把服务搞停过一次 —— 教训记此。
+
+## 六、尚未闭合（诚实列出）
+1. **chroot 未全面启用**：只有 `sandbox.chroot` 可选路径与 FPM 池级 chroot 支持，
+   默认空。对解释器型引擎，chroot 需要 jail 内有完整运行时，代价大；当前以
+   **unveil（文件视图）+ 降权（身份）** 承担主要隔离。
+2. **仍共用一个非特权用户（www）**：应用之间可以互读 state/docroot。要隔离需给不同应用
+   配不同 `user`（配置已支持）。
+3. **PHP 的 state/php 是共享目录**：`chown_tree` 会把整个 `state/php` 交给 www，
+   多个 PHP 应用时应改为每 key 一个子目录。
+4. **webserver 主进程仍是 root**（绑 80/443/53 与管 DNS 需要）；已改为引擎侧不 root。
+   主进程自身被 RCE 的风险仍高于引擎 —— 后续可考虑"绑完端口即降权 + 保留必要能力"。
+5. 引擎侧漏洞本身（Java/Node/PHP/Go 的运行时洞）没解决，只做了"打穿后不威胁主机"。
