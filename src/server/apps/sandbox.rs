@@ -718,7 +718,29 @@ pub fn build_spec(
     // 需要写 docroot 的应用（上传/缓存）显式开 `docroot_rw`（⇒ `rwxc`）。
     let doc_perms = if cfg.docroot_rw { "rwxc" } else { "rx" };
 
-    if cfg.enabled {
+    // **chroot 与 unveil 的先后语义**：`pre_exec` 的顺序是 unveil → 锁 → chroot，
+    // 而 unveil 的条目是在**查找时**按当时的 root 解释的 —— chroot 之后，之前那些
+    // 宿主绝对路径（`/usr/lib`）会变成「jail 里的 /usr/lib」，白名单就全错了。
+    // 所以**启用 chroot 时**不用宿主路径的揭示集，改成一个 chroot 内的最小集：
+    // jail 根本身（`/`）加上运维在 `extra_unveil` 里写的 **chroot 相对**路径。
+    // 此时文件系统边界由 chroot 承担（内核保证），unveil 只做最小放行。
+    let chroot_enabled = cfg.enabled
+        && match cfg.chroot.as_deref().map(str::trim) {
+            Some("docroot") | Some("app") => true,
+            Some("") | Some("none") | Some("off") | None => false,
+            Some(_other) => true, // 显式绝对路径
+        };
+    if chroot_enabled {
+        push_reveal(&mut reveals, Path::new("/"), "rwxc");
+        for raw in &cfg.extra_unveil {
+            if let Some((p, m)) = raw.split_once(':') {
+                let (p, m) = (p.trim(), m.trim());
+                if !p.is_empty() && !m.is_empty() {
+                    push_reveal(&mut reveals, Path::new(p), m);
+                }
+            }
+        }
+    } else if cfg.enabled {
         // ① 公共只读路径（时区/解析/TLS 根证书/设备）—— 不存在就跳过（不报错，
         //    否则裁剪过的系统上整个引擎都起不来）。
         for (p, m) in BASE_REVEALS.iter().chain(BASE_UNIVERSE_REVEALS.iter()) {

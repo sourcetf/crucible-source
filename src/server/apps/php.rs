@@ -664,10 +664,34 @@ async fn start_fpm(
             Some(other) => Some(PathBuf::from(other)),
         }
     };
+    // **PHP 上「chroot」与「降权」互斥**（真机实测的硬约束，不是取舍口味）：
+    // php-fpm 的池级 `chroot` 由 **master** 执行，而 master 必须先以 root 身份
+    // `chroot(2)` 才能把 worker 关进去 —— fpm 自己就会打印
+    //   `'chroot' directive is ignored when FPM is not running as root`
+    // 并**静默放弃** chroot。而我们的沙箱正是把整个 fpm 降权到非特权用户。
+    // 两条路只能选一条：
+    //   * 要降权（推荐，威胁模型是"引擎必被攻破"）⇒ 不要配 `chroot`；
+    //   * 要 FPM 原生 chroot ⇒ 必须让 master 保持 root（等于放弃第一道防线）。
+    // 这里**明确报错**而不是静默忽略 —— "以为开了其实没开"正是本项目一直在猎杀的形态。
+    if chroot.is_some() && will_drop {
+        bail!(
+            "php app `{key}`: [sandbox] chroot 与降权（user 非 none）不能同时用 ——              php-fpm 的池级 chroot 需要 master 以 root 运行，降权后它会被 fpm **静默忽略**。请二选一：去掉 chroot（保留降权，推荐），或把 [sandbox] user 设为 none/root（放弃降权）。"
+        );
+    }
     let chroot_line = chroot
         .as_ref()
         .map(|d| format!("chroot = {}\nchdir = /\n", d.display()))
         .unwrap_or_default();
+    // **chroot 下的 tmp 必须是 chroot 内的路径**：宿主侧实际位置是 `<docroot>/tmp`
+    //（要建出来并 chown 给引擎用户，否则 worker 写不了），而 conf/`-d` 里写 `/tmp`。
+    let host_tmp: PathBuf = match &chroot {
+        Some(d) => {
+            let t = d.join("tmp");
+            fs::create_dir_all(&t).with_context(|| format!("mkdir jail tmp {}", t.display()))?;
+            t
+        }
+        None => tmp_dir.clone(),
+    };
     let conf = format!(
         r#"[global]
 error_log = {err}
@@ -703,7 +727,7 @@ pm.max_requests = 10000
         listen = listen,
         pool_owner = pool_owner,
         listen_owner = listen_owner,
-        tmp = if chroot.is_some() { "/tmp".to_string() } else { tmp_dir.display().to_string() },
+        tmp = if chroot.is_some() { "/tmp".to_string() } else { host_tmp.display().to_string() },
         chroot_line = chroot_line,
         workers = app.workers.max(1),
     );
@@ -721,7 +745,10 @@ pm.max_requests = 10000
     cmd.arg("-y")
         .arg(abs_path(&conf_path))
         .arg("-d")
-        .arg(format!("opcache.lockfile_path={}", tmp_dir.display()))
+        .arg(format!(
+            "opcache.lockfile_path={}",
+            if chroot.is_some() { "/tmp".to_string() } else { host_tmp.display().to_string() }
+        ))
         .arg("-F") // foreground; we manage as child
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -741,7 +768,7 @@ pm.max_requests = 10000
         &spec_cfg,
         Some(&docroot),
         Some(&state_dir),
-        Some(&tmp_dir),
+        Some(&host_tmp),
         Some(Path::new(&fpm_bin)),
     );
     let mut child = crate::server::apps::child_registry::spawn_tracked(
