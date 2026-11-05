@@ -496,8 +496,12 @@ fn engine_pledge(engine: &str, allow_exec: bool) -> Option<&'static str> {
         //（真机实测：`pledge: Operation not permitted`）。unveil + 降权 对它仍然生效，
         // 且它自己的 pledge 是在「已 unveil、已降权」之后施加的 —— 比我们代劳更准。
         "ruby" | "rack" => return None,
+        // `do` 也是 Java（与 `jsp` 同一个 jar / 同一个 JVM）⇒ **同样不 pledge**：
+        // 真机实测 `do` 的 sidecar 日志是 `pledge: Operation not permitted`（JVM 启动期
+        // 要调用承诺集之外的 syscall），而 `jsp` 因为不在承诺表里一直正常。
+        "do" | "jsp" => return None,
         "php" | "fastcgi" | "cgi" | "perl" | "psgi" | "python" | "wsgi" | "asgi" | "uwsgi"
-        | "lua" | "asp" | "aspnet" | "do" | "tsx" => {
+        | "lua" | "asp" | "aspnet" | "tsx" => {
             // **不要 `tmppath`**：本机 OpenBSD 的 pledge 不认这个 token，混进承诺串会让
             // **整条 pledge() 返回 EINVAL**（子进程 _exit(127)，sidecar 全挂、502）。
             // 临时目录用每应用自建的 `state/php/tmp/<key>`（已 reveal），不需要 /tmp 权限：
@@ -542,6 +546,10 @@ const BASE_REVEALS: &[(&str, &str)] = &[
     ("/etc/protocols", "r"),
     ("/etc/ssl/cert.pem", "r"),
     ("/etc/ssl/certs", "r"),
+    // OpenBSD 的 `ld.so` 用它在**运行期**把库名（`libsodium.so.11.1`）解析成路径；
+    // 不揭示它，动态链接的引擎会在启动时报 `can't load library`（真机实测：php-fpm
+    // 起不来，而这条与 unveil 的"路径白名单"直觉相反 —— 缺的是**索引文件**不是库）。
+    ("/var/run/ld.so.hints", "r"),
     ("/dev/null", "rw"),
     ("/dev/urandom", "r"),
 ];

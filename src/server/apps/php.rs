@@ -715,8 +715,14 @@ pm.max_requests = 10000
     // fpm 池默认 clear_env=yes（worker 环境会被清），但 master 自己会永久留下别人的密钥。
     // 统一用「启动期基底」spawn（与 cgi_script / sidecar 同一判据）。
     crate::server::apps::env_lock::apply_clean_env(&mut cmd, &[]);
+    // `opcache.lockfile_path` 必须在**命令行**给：它在 master 启动期就被读取，
+    // 池里的 `php_admin_value[...]` 来不及生效（真机实测：加了池级指令仍报
+    // `Unable to create opcache lock file in /tmp`）。默认值是 `/tmp`，而我们的
+    // unveil **故意不揭示 `/tmp`**（那是跨应用串味的入口）⇒ 指向每应用自建 tmp。
     cmd.arg("-y")
         .arg(abs_path(&conf_path))
+        .arg("-d")
+        .arg(format!("opcache.lockfile_path={}", tmp_dir.display()))
         .arg("-F") // foreground; we manage as child
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -805,6 +811,8 @@ async fn start_cgi(
             .arg(format!("upload_tmp_dir={}", tmp_dir.display()))
             .arg("-d")
             .arg(format!("session.save_path={}", tmp_dir.display()))
+            .arg("-d")
+            .arg(format!("opcache.lockfile_path={}", tmp_dir.display()))
             .env("PHP_FCGI_CHILDREN", &workers)
             .env("PHP_FCGI_MAX_REQUESTS", "0")
             .stdin(Stdio::null())
