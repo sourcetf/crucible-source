@@ -565,8 +565,7 @@ async fn ensure_runtime(
         }
     }
 
-    let state_dir = abs_state_php();
-    fs::create_dir_all(&state_dir).context("mkdir state/php")?;
+    let state_dir = state_dir_for_key(key);
 
     // Prefer configured socket, else UDS under state/php.
     if let Some(sock) = &app.socket {
@@ -1309,13 +1308,32 @@ fn abs_state_php() -> PathBuf {
     abs_path(&p)
 }
 
+/// **每应用一个状态子目录**：`state/php/<key>/`。
+///
+/// 为什么不能共用 `state/php/`：降权后 spawn 前要把「本应用的状态目录」`chown` 给引擎
+/// 用户（否则它写不了 socket/pid/log）。若所有 PHP 应用共用同一个目录，一次 chown
+/// 就把**别的 PHP 应用**的 socket/error.log 也交给了本应用的用户 —— 应用之间可互读。
+/// 每 key 一个目录后，chown 的作用域天然就是本应用。
+fn state_dir_for_key(key: &str) -> PathBuf {
+    let dir = abs_state_php().join(key);
+    let _ = fs::create_dir_all(&dir);
+    // 0700：即使哪天又退化成共用用户，同用户之外的进程也读不到。
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = fs::set_permissions(&dir, fs::Permissions::from_mode(0o700));
+    }
+    dir
+}
+
 /// 每个应用独立的临时目录（会话/上传临时文件）：`state/php/tmp/<key>`。
 ///
 /// 为什么要独立：unveil 只揭示这个目录就够 PHP 用（否则得把整个 `/tmp` 交出去，
 /// 那里有别的进程/别的应用的临时文件）；同时 PHP 的 `sys_temp_dir` /
 /// `session.save_path` / `upload_tmp_dir` 都指向它，应用之间互相看不到会话。
 fn prepare_app_tmp(key: &str) -> Result<PathBuf> {
-    let dir = sandbox::app_tmp_dir(&abs_state_php(), key);
+    // 状态目录已经是每 key 一个，tmp 直接挂在它下面即可（再套一层 <key> 是冗余）。
+    let dir = state_dir_for_key(key).join("tmp");
     fs::create_dir_all(&dir).with_context(|| format!("mkdir app tmp {}", dir.display()))?;
     Ok(dir)
 }
