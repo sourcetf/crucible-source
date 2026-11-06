@@ -1,37 +1,42 @@
 #!/bin/sh
-# 按**引擎用户**收敛出网（OpenBSD pf）：给"会被攻破的"引擎进程只留它干活必需的出口。
+# 【可选工具，默认**不**部署】按**引擎用户**收敛出网的 pf 规则生成器。
 #
-# 为什么需要（现状实测 2026-11-06）：`/etc/pf.conf` 只有一条裸 `pass` —— 全出站放开，
-# 仅限制了 `_pbuild`。以引擎用户 `www` 身份实测可达：外部 DNS 53、外部 443、
-# **本机 SSH 22**（拿别的服务当跳板）。用户也指出 **上游 53 是放开的** —— 也就是说
-# 被 RCE 的引擎可以直接把数据编码进 DNS 查询发到任意解析器，或直接连本机服务。
+# ⚠️ 重要：本脚本是一个**运维可选**的收紧手段，**当前生产部署并未启用**
+#    （2026-11-06 实测 `/etc/pf.conf` 里没有本脚本的规则块）。
 #
-# 本脚本给引擎用户（默认 `www` + config.toml 里各应用 `[sandbox] user` 指定的用户）
+# 背景（含一次真实误读，留作教训）：本项目 spec 要求 53 端口的 DNS 能力
+# （root/递归/权威、DoT/DoH、ECS 等），**上游 53 是放开的、是可用能力，不是一个"洞"**。
+# 曾把「上游 53 放开」误当漏洞而封掉引擎的 53，等于砍功能 —— 已回滚。
+# 因此：**除非运维明确要求收紧，不要运行本脚本**；要收紧也必须把应用真正需要的
+# 端口（**含 53**）显式写进放行列表。
+#
+# 它做什么：给引擎用户（默认 `www` + config.toml 里各应用 `[sandbox] user` 指定的用户）
 # 装上三条 quick 规则，插在裸 `pass` **之前**：
-#   1. 允许 80/443（web 应用调用外部 API 的刚需）
-#   2. 允许 53（解析走本机递归解析器；回环已被 `set skip on lo` 跳过，这条只管非回环）
-#   3. 其余出站一律 `block return out log quick`（DNS 隧道、SMTP、任意端口外联、内网横向）
+#   1. 允许放行端口（默认 80/443/**53**）
+#   2. （可选，`--use-local-resolver`）把解析改走本机递归解析器，从而可以不放行 53
+#   3. 其余出站 `block return out log quick`（DNS 隧道、任意端口外联、内网横向）
 #
-# 关键性质：规则**按用户**匹配 ⇒ 不影响 root、_bind、_stalwart 等其它服务。
+# 关键性质：规则**按用户**匹配 ⇒ 不影响 root、`_bind`（named 自身递归）、`_stalwart` 等。
 # 幂等：重复运行会先删掉上次插入的块再插一遍。改动前备份，且**先 `pfctl -nf` 干跑解析**，
 # 解析不过就不加载（宁可不改也不要把规则集弄坏）。
 #
+# ⚠️ 换了引擎降权用户（`[listeners.apps.sandbox] user`）后**必须重跑**本脚本，
+#    否则新 uid 不在规则里会落回裸 `pass`（= 全出网，等于没装）。
+#
 # 用法（目标机 root）：
-#   sh scripts/harden-egress-pf.sh                 # 装上/刷新规则
-#   sh scripts/harden-egress-pf.sh --ports 80,443,8080   # 自定义放行端口
+#   sh scripts/harden-egress-pf.sh                 # 装上/刷新规则（默认放行 80,443,53）
+#   sh scripts/harden-egress-pf.sh --ports 80,443,53,587
 #   sh scripts/harden-egress-pf.sh --remove        # 卸载（回到原状）
 #   sh scripts/harden-egress-pf.sh --use-local-resolver
-#       把 /etc/resolv.conf 指向本机递归解析器（127.0.0.1），随后引擎的 53 出网可**完全封掉**
-#       ——本机 named 已经 `recursion yes` 且 `allow-recursion { 127.0.0.1; }`，回环又不受 pf
-#       过滤，所以解析照常、而"引擎直连外部 53 做 DNS 隧道"这条通道被堵死。
-#       不切换时脚本只放行到**已在 resolv.conf 里配置的解析器**（保证解析不坏），
-#       并提示：对该解析器仍可做 DNS 隧道（数据编进查询名即可），要彻底堵需切本机解析器。
+#       把 /etc/resolv.conf 指向本机递归解析器（127.0.0.1）——本机 named 已 `recursion yes`
+#       且 `allow-recursion { 127.0.0.1; }`，回环又不受 pf 过滤，所以解析照常，
+#       而"引擎直连外部 53"可被完全封掉。**仅在运维明确要封引擎 53 时才用**。
 set -u
 ROOT="${CRUCIBLE_ROOT:-/crucible}"
 PF=/etc/pf.conf
 MARK_BEGIN="# BEGIN crucible engine egress"
 MARK_END="# END crucible engine egress"
-PORTS="80, 443"
+PORTS="80, 443, 53"
 
 USE_LOCAL_RESOLVER=0
 case "${1:-}" in
@@ -104,8 +109,8 @@ else
 	# 未切本机解析器：放行到「已配置的解析器」的 53，保证解析不坏。
 	ns_set=$(echo "$ns_list" | sed 's/,/, /g')
 	DNS_RULE="pass out quick proto { tcp udp } to { $ns_set } port 53 user $ulist"
-	echo "  注意：仍放行到解析器 [$ns_list] 的 53 —— 对该解析器做 DNS 隧道在理论上仍可行"
-	echo "        （数据编进查询名即可）。要彻底堵：加 --use-local-resolver 切到本机解析器。"
+	echo "  放行到解析器 [$ns_list] 的 53（DNS 是应用功能，默认保留）。"
+	echo "        仅当运维明确要求封掉引擎直连 53 时，才加 --use-local-resolver。"
 fi
 
 cp -p "$PF" "$PF.bak-$(date +%Y%m%d-%H%M%S)"
