@@ -185,6 +185,9 @@ pub async fn execute_binary(
     body: Bytes,
     env_vars: &[(String, String)],
     lc: &ListenerConfig,
+    // 本应用**生效的**沙箱配置（`app.sandbox_effective(lc)`）。此前这里只用
+    // `lc.global_sandbox`，于是 per-app 的 `user`/`chroot`/`pledge` 对 CGI 无效。
+    sandbox: &crate::server::apps::sandbox::SandboxConfig,
     peer: SocketAddr,
     script_name: String,
     path_info: String,
@@ -204,7 +207,7 @@ pub async fn execute_binary(
     let authority = uri.authority().map(|a| a.to_string());
     let env_vars: Vec<(String, String)> = env_vars.to_vec();
     // 沙箱策略要搬进 `spawn_blocking`（要求 'static），克隆一份很小的配置结构。
-    let sandbox_cfg = lc.global_sandbox.clone();
+    let sandbox_cfg = sandbox.clone();
 
     let raw = task::spawn_blocking(move || -> Result<Vec<u8>> {
         let mut cmd = Command::new(&bin);
@@ -416,6 +419,7 @@ pub async fn handle(
         body_bytes,
         &env_vars,
         lc,
+        &app.sandbox_effective(&lc.global_sandbox),
         peer,
         script_name,
         path_info,

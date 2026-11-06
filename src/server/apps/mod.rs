@@ -418,6 +418,7 @@ async fn cgi_script_simple(
         req.body().clone(),
         &deps_env.vars,
         lc,
+        &app.sandbox_effective(&lc.global_sandbox),
         peer,
         script_name,
         path_info,

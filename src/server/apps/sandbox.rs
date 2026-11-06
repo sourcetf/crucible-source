@@ -147,6 +147,16 @@ impl SandboxSpec {
             unsafe {
                 use std::os::unix::process::CommandExt;
                 cmd.pre_exec(move || {
+                    // ⓪ umask(0077)：引擎后续创建的一切（socket / 日志 / 缓存 / 上传）
+                    // 默认仅属主可访问。webserver 主进程以 root 连接与读取，不受 DAC
+                    // 约束，所以收紧 umask 不损失功能。
+                    //
+                    // 实测教训：`rack`/`ruby` 的 sidecar 会 `File.chmod(0666, sock)`
+                    // —— 0666 的 socket 落在 0755 的父目录里，同机任何进程（含被攻破的
+                    // 其它引擎，它们同为 `www`）都能**绕过 webserver** 直连该应用。
+                    // 那两处已改成 0600；umask 是防同类问题再出现的兜底（新引擎若只是
+                    // 依赖默认权限，就会天然是 0700/0600 而不是 0777&~022）。
+                    libc::umask(0o077);
                     // ① 揭示路径（顺序无关，但必须在锁之前）。
                     for (p, m) in &reveals {
                         if libc::unveil(p.as_ptr(), m.as_ptr()) == -1 {

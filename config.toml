@@ -29,6 +29,11 @@ enabled = true
 [admin]
 path = "/__admin"
 realm = "WebServer Admin"
+# 管理面只在 TLS 口（8443）暴露。为空（旧行为）时 `listeners_allow` 覆盖**所有** listener：
+# 9095 是明文口且地址 0.0.0.0，等于把管理员口令摊在明文上明文传输，被 RCE 的引擎也能
+# 直接在回环上打到它。白名单外的端口上 admin 路径回 **404**（不是 401 —— 401 会弹出
+# 浏览器 Basic 口令框，把界面变成一个凭据输入面）。h1/h2/h3 三协议同语义。
+listeners_allow = [8443]
 
 [[admin.users]]
 password_hash = ""  # 生产值不入库（本仓库是公开的）。设置方式：面板 POST /__admin/api/password，或见 OPERATOR-TODO.md B 项
@@ -118,6 +123,9 @@ index = "index.php"
 paths = ["/php"]
 workers = 16
 
+[listeners.apps.sandbox]
+user = "_c_php"
+
 [[listeners.apps]]
 docroot = "www-apps/rust"
 enabled = true
@@ -129,12 +137,18 @@ extensions = [
 lib = "target/app-engines/libapp_rust.so"
 paths = ["/rust"]
 
+[listeners.apps.sandbox]
+user = "_c_rust"
+
 [[listeners.apps]]
 docroot = "www-apps/c"
 enabled = true
 engine = "c"
 lib = "target/app-engines/libapp_c.so"
 paths = ["/c"]
+
+[listeners.apps.sandbox]
+user = "_c_c"
 
 [[listeners.apps]]
 docroot = "www-apps/go"
@@ -143,12 +157,18 @@ engine = "go"
 lib = "target/app-engines/libapp_go.so"
 paths = ["/go"]
 
+[listeners.apps.sandbox]
+user = "_c_go"
+
 [[listeners.apps]]
 docroot = "www-apps/lua"
 enabled = true
 engine = "lua"
 lib = "target/app-engines/libapp_lua.so"
 paths = ["/lua"]
+
+[listeners.apps.sandbox]
+user = "_c_lua"
 
 [[listeners.apps]]
 docroot = "www-apps/asp"
@@ -162,6 +182,9 @@ index = "index.asp"
 lib = "target/app-engines/libapp_asp.so"
 paths = ["/asp"]
 
+[listeners.apps.sandbox]
+user = "_c_asp"
+
 [[listeners.apps]]
 docroot = "www-apps/python"
 enabled = true
@@ -174,6 +197,9 @@ index = "index.py"
 lib = "target/app-engines/libapp_python.so"
 paths = ["/python"]
 
+[listeners.apps.sandbox]
+user = "_c_python"
+
 [[listeners.apps]]
 docroot = "www-apps/jsp"
 enabled = true
@@ -185,6 +211,9 @@ extensions = [
 index = "index.jsp"
 paths = ["/jsp"]
 socket = "state/jsp/jsp.sock"
+
+[listeners.apps.sandbox]
+user = "_c_jsp"
 
 [[listeners.apps]]
 docroot = "www-apps/jsp"
@@ -199,6 +228,9 @@ index = "index.jsp"
 paths = ["/do"]
 socket = "state/jsp/jsp.sock"
 
+[listeners.apps.sandbox]
+user = "_c_do"
+
 [[listeners.apps]]
 docroot = "www-apps/ruby"
 enabled = true
@@ -210,6 +242,9 @@ extensions = [
 index = "index.rb"
 lib = "target/app-engines/libapp_ruby.so"
 paths = ["/ruby"]
+
+[listeners.apps.sandbox]
+user = "_c_ruby"
 
 [[listeners.apps]]
 docroot = "www-apps/perl"
@@ -223,6 +258,9 @@ index = "index.pl"
 lib = "target/app-engines/libapp_perl.so"
 paths = ["/perl"]
 
+[listeners.apps.sandbox]
+user = "_c_perl"
+
 [[listeners.apps]]
 docroot = "www-apps/wsgi"
 enabled = true
@@ -230,6 +268,9 @@ engine = "wsgi"
 index = "index.py"
 lib = "target/app-engines/libapp_wsgi.so"
 paths = ["/wsgi"]
+
+[listeners.apps.sandbox]
+user = "_c_wsgi"
 
 [[listeners.apps]]
 docroot = "www-apps/asgi"
@@ -239,6 +280,9 @@ index = "index.py"
 lib = "target/app-engines/libapp_asgi.so"
 paths = ["/asgi"]
 
+[listeners.apps.sandbox]
+user = "_c_asgi"
+
 [[listeners.apps]]
 docroot = "www-apps/psgi"
 enabled = true
@@ -246,6 +290,9 @@ engine = "psgi"
 index = "index.psgi"
 lib = "target/app-engines/libapp_psgi.so"
 paths = ["/psgi"]
+
+[listeners.apps.sandbox]
+user = "_c_psgi"
 
 [[listeners.apps]]
 docroot = "www-apps/rack"
@@ -255,6 +302,9 @@ index = "index.ru"
 lib = "target/app-engines/libapp_rack.so"
 paths = ["/rack"]
 
+[listeners.apps.sandbox]
+user = "_c_rack"
+
 [[listeners.apps]]
 docroot = "www-apps/cgi"
 enabled = true
@@ -262,6 +312,9 @@ engine = "cgi"
 index = "index.cgi"
 lib = "target/app-engines/libapp_cgi.so"
 paths = ["/cgi"]
+
+[listeners.apps.sandbox]
+user = "_c_cgi"
 
 [[listeners.apps]]
 docroot = "www-apps/tsx"
@@ -276,6 +329,9 @@ index = "index.tsx"
 lib = "target/app-engines/libapp_tsx.so"
 paths = ["/tsx"]
 
+[listeners.apps.sandbox]
+user = "_c_tsx"
+
 [[listeners.apps]]
 docroot = "www-apps/aspnet"
 enabled = true
@@ -283,6 +339,9 @@ engine = "aspnet"
 index = "index.aspx"
 lib = "target/app-engines/libapp_aspnet.so"
 paths = ["/aspnet"]
+
+[listeners.apps.sandbox]
+user = "_c_aspnet"
 
 [[listeners]]
 address = "0.0.0.0"

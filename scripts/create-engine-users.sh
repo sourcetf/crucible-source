@@ -23,9 +23,11 @@ OS=$(uname -s)
 users=""
 if [ "${1:-}" = "--from-config" ]; then
 	# 扫描配置里显式写了的 user（排除 www/none/root）
-	users=$(grep -E '^\s*user\s*=' "$ROOT/config.toml" 2>/dev/null |
-		sed 's/.*=\s*//; s/"//g; s/#.*//' |
-		grep -vE '^(www|nobody|none|root|-)$' | sort -u)
+	# BSD grep 不认 `\s`（GNU 扩展），且 ERE 里不能有空分支（`(a|b|)$` 会报
+	# "empty (sub)expression"）—— 用 [[:space:]] 并把「空」单独过滤。
+	users=$(grep -E '^[[:space:]]*user[[:space:]]*=' "$ROOT/config.toml" 2>/dev/null |
+		sed 's/.*=[[:space:]]*//; s/"//g; s/#.*//; s/[[:space:]]//g' |
+		grep -vE '^(www|nobody|none|root|-)$' | grep -v '^$' | sort -u)
 else
 	users="$*"
 fi

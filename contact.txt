@@ -6862,3 +6862,92 @@ root），顺序完全由我们掌控（`unveil → 锁 → chroot → 降权 �
   PHP 侧因上述硬约束只能靠 unveil + 降权。
 * 每应用独立用户需要运维执行 `create-engine-users.sh` 并在各应用配置里指认，尚未在样例中启用。
 * webserver 主进程仍是 root；引擎运行时自身漏洞未解决；引擎可出网；管理面在全部 listener 可达。
+
+# 【agent-1009 · Wave-23】「攻破也不威胁主机」收口（第 2 轮）：出口收敛 + admin 暴露面 + per-app 用户 + 产物权限（2026-11-06）
+
+**scope**：本地 `crucible-git` ⇄ 目标机 `openbsd.dns.google`（83.229.125.81）。
+改动文件：`src/config.rs`、`src/server/apps/{sandbox,go_shm,cgi_script,mod}.rs`、
+`www-apps/{rack,ruby}/sidecar.rb`、`config.toml`、`scripts/{harden-egress-pf,create-engine-users}.sh`、
+`contact.txt`。**未**碰他人 WIP（已逐文件哈希比对确认工作树与本地一致）。
+
+## 一、用户点出的问题：上游 53 是放开的
+
+**实测（以引擎用户身份）**：外部 443 通、**外部 DNS 53 通**、外部 853 通、本机服务端口通
+⇒ 被 RCE 的引擎可把数据编码进 DNS 查询直发任意解析器（DNS 隧道），也能拿同机服务当跳板。
+
+**修法**（`scripts/harden-egress-pf.sh`，幂等 / 先 `pfctl -nf` 干跑 / `--remove` 可卸）：
+按**引擎用户**插三条 `quick` 规则在裸 `pass` 之前 —— 只放行 `{tcp,udp} 80,443`，其余 `block return out log`。
+配套：`/etc/resolv.conf` 主解析器改为 `127.0.0.1`（本机 named 已 `recursion yes` 且
+`allow-recursion { 127.0.0.1; }`，而**回环被 `set skip on lo` 跳过 pf**），于是引擎照常解析、
+而"直连外部 53"这条隧道被堵死。另加 `nameserver 8.8.8.8` 回退 —— 本机 named 是 webserver 的
+**子进程**，重启 webserver 期间它不在；回退只服务**主机自身**（sshd 反查/邮件/包管理），
+引擎的 53 仍被 pf 挡死，所以不构成引擎隧道。
+
+**实测**（以 `_c_asgi`）：外部 443 通 / 外部 853 不通 / 外部 53 不通 / 域名解析正常；
+公网 53 查询正常。规则按 uid 匹配 ⇒ 不影响 root、`_bind`（named 自身递归）。**注意**：
+引擎切换降权用户后必须**立刻重跑**本脚本，否则新 uid 不在规则里 ⇒ 会落回裸 `pass`（全出网）。
+
+## 二、真 bug 1：`sandbox_effective` 漏合并 `user`/`group` ⇒「每应用独立用户」静默无效
+
+`AppRouteConfig::sandbox_effective()` 合并了 `enabled/docroot_rw/allow_exec/extra_unveil/pledge/chroot`，
+**独独漏了 `user`/`group`**。后果：配置里写 `[listeners.apps.sandbox] user = "_c_php"` 完全不生效，
+引擎仍以全局默认 `www` 跑 —— 文档承诺的应用间隔离（socket/进程维度）实际为零。
+`unveil` 只管**文件视图**，同 uid 之间的 socket 连接、`kill`、IPC 谁也拦不住。
+（真机症状：22 个引擎进程全是 `www`，php 的 FastCGI socket `srw-rw----` 落在 0700 目录里，
+被攻破的 rack 引擎照样连得上。）已修；顺带修 `cgi_script.rs`（只取 `lc.global_sandbox`，
+per-app 的 user/chroot/pledge 全部无效）与 `go_shm.rs`（两个入口同问题）。
+
+## 三、真 bug 2：sidecar 把 socket chmod 成 0666 ⇒ 绕过 webserver 直连
+
+`www-apps/rack/sidecar.rb:909` 与 `www-apps/ruby/sidecar.rb:207` 都显式 `File.chmod(0o666, SOCK)`，
+socket 落在 `0755` 的父目录 ⇒ **同机任何进程**（包括被攻破的其它引擎）都能绕过 webserver
+把未鉴权请求直接打进该应用。已改 `0o600`（webserver 以 root 连接，不受 DAC 限制，不损功能）。
+兜底：沙箱 `pre_exec` 加 `umask(0o077)`，让引擎后续创建的一切（socket/日志/缓存/上传）
+默认仅属主可访问。实测：jsp/do/go 的 socket 由 `srwxr-xr-x` → `srwx------`，rack/ruby 由
+`srw-rw-rw-` → `srw-------`。
+
+## 四、admin 暴露面（P2-21 收口）
+
+`[admin] listeners_allow = [8443]`。此前为空 ⇒ 管理面在**所有** listener 上可达，其中 9095
+是**明文**口且绑 `0.0.0.0` ⇒ 管理员口令在明文上传输；被 RCE 的引擎也能在回环上直接打面板。
+实测：`9095 /__admin` → **404**（白名单外回 404 而非 401 —— 401 会弹出浏览器 Basic 口令框，
+把界面变成凭据输入面），`8443 /__admin` → 401（可达、需鉴权）。h1/h2/h3 三协议同语义
+（`listener_allowed` 在 h1.rs:685、h2.rs:736/1779、h3.rs:1245/1875 都有执行）。
+
+## 五、per-app 用户（落地）
+
+创建 `_c_<engine>` ×18（uid 1001–1018，各自独立组，`/sbin/nologin`），配置逐应用
+`[listeners.apps.sandbox] user = "_c_<engine>"`。`apply_for_app` 会把本应用 `state`/`tmp` 两棵子树
+`chown` 给该用户（错误路径会**大声失败**，不会静默以 root 跑）。
+
+**实测（真机，换交后）**：
+- 19/19 业务路由 200（含此前 502 的 `/php/`、`/do/`）；
+- 引擎进程身份 = `_c_php`(17×fpm) / `_c_ruby` / `_c_rack` / `_c_jsp` / `_c_do` / `_c_go`；
+- **跨应用 socket 连接全部 `PermissionError`**（以 `_c_asgi` 试连 php/jsp/do/go/ruby/rack）；
+- **跨应用 `kill`：`Operation not permitted`**；
+- 每应用出口仍受第「一」节的规则约束；
+- 围堵门禁 `CONTAINMENT OK`（43 条 `uid=Some(...)` 策略行）。
+
+## 六、其它
+
+- **僵尸 `/etc/ptmp`**（Sep 7、0 字节、无持有者）阻塞 `useradd` —— 移存 `/root/ptmp.stale-20260907`
+  （不删，可回滚），用户管理解锁。
+- **引擎运行时已是各系列最新**：`php-fpm-8.5`（8.5.12，非默认 8.3）、`jdk-17.0.21.0.3.1.1v0`、
+  `ruby-3.4.12`、`node-24.22.1`、`python-3.14.9`。ports 里还有 `jdk-21/25`、`ruby-4.0.9`
+  （大版本跳跃 + 磁盘仅剩 1.2G，属可选项，非缺陷）。
+- 清理死端口残留（`state/native/19095-*`、`state/php/{19095,21095,22095}-0.*`、`probe-*`、
+  `state/{jsp,l4test,l4auto,dns-test}`），释放 ~15.6MB。
+- `scripts/create-engine-users.sh` 修 BSD grep 兼容（`\s` 不认；ERE 空分支会报
+  `empty (sub)expression` —— 这正是出口脚本第一次跑时「没找到引擎用户」的原因）。
+
+## 七、仍未闭合（诚实清单）
+
+1. **主 webserver 进程仍是 root**。它必须 root：绑 53/80/443、管理 named（`*` 非 rcctl 服务，
+   是它的子进程）、以及为引擎子进程做 `setgroups/setgid/setuid`。OpenBSD 无 capability 模型，
+   全有或全无。**但**：被攻破的引擎（非 root）**够不到它** —— 不同 uid，`kill`/`ptrace` 都需特权；
+   `to pid 1 发信号` 在门禁里已实测被拒。真正的残余面是「root 主进程解析来自网络的 HTTP/后端响应」，
+   属**输入解析**风险（Rust 内存安全，主要是逻辑 bug），要用 privsep（特权小助手 spawn 引擎、
+   主进程降权）才能根治，工作量以天计。
+2. 引擎运行时 CVE 本身未解 —— 沙箱/降权/出口是**纵深**，不是补丁替代。
+3. chroot 默认关（PHP 上 chroot 与降权互斥，见上一节）。
+4. `h2` 多路复用 m10 仍是 crate 级架构限制（见 Wave-21/22 节）。

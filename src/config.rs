@@ -1366,6 +1366,15 @@ impl AppRouteConfig {
                 if app.chroot.is_some() {
                     merged.chroot = app.chroot.clone();
                 }
+                // `user`/`group` 曾经**漏在这里**：配置里写 `[listeners.apps.sandbox] user = "..."`
+                // 会静默无效（引擎仍以全局默认 `www` 跑）。「每应用独立用户」是应用间
+                // 隔离的唯一手段（unveil 只管文件视图；socket/进程隔离看 uid）。
+                if app.user.is_some() {
+                    merged.user = app.user.clone();
+                }
+                if app.group.is_some() {
+                    merged.group = app.group.clone();
+                }
                 merged
             }
             None => global.clone(),

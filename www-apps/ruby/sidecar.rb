@@ -204,7 +204,11 @@ end
 Dir.mkdir(File.dirname(SOCK)) rescue nil
 File.unlink(SOCK) rescue nil
 server = UNIXServer.new(SOCK)
-File.chmod(0o666, SOCK) rescue nil
+# 0600：只有属主（引擎用户）和 root（webserver 主进程）能连。此前是 0o666，配合
+# 0755 的父目录 ⇒ **同机任何进程**（包括被攻破的其它引擎，它们同为 www）都能绕过
+# webserver 直连本应用 socket，把未鉴权的请求直接打进来。webserver 以 root 连接，
+# 不受 DAC 限制，所以收紧到 0600 不损失功能。
+File.chmod(0o600, SOCK) rescue nil
 log("listening on #{SOCK} docroot=#{DOCROOT} prefixes=#{PREFIXES.inspect}")
 
 loop do

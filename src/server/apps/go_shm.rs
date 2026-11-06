@@ -87,7 +87,7 @@ pub fn available() -> bool {
 pub async fn execute(
     req: Request<Incoming>,
     lc: &ListenerConfig,
-    _app: &AppRouteConfig,
+    app: &AppRouteConfig,
     app_idx: usize,
     peer: SocketAddr,
 ) -> Result<Response<BoxBody>> {
@@ -107,8 +107,9 @@ pub async fn execute(
         Err(e) => return Ok(e.into_response()),
     };
 
+    let sandbox = app.sandbox_effective(&lc.global_sandbox);
     let (status, resp_body) = execute_common(
-        key, method, path, body, peer, lc.port, lc.global_sandbox.clone(),
+        key, method, path, body, peer, lc.port, sandbox,
     )
     .await?;
     Ok(Response::builder()
@@ -125,7 +126,7 @@ pub async fn execute(
 pub async fn execute_simple(
     req: &Request<Bytes>,
     lc: &ListenerConfig,
-    _app: &AppRouteConfig,
+    app: &AppRouteConfig,
     app_idx: usize,
     peer: SocketAddr,
 ) -> Result<Response<Bytes>> {
@@ -133,8 +134,9 @@ pub async fn execute_simple(
     let method = req.method().as_str().to_string();
     let path = req.uri().path().to_string();
     let body = req.body().clone();
+    let sandbox = app.sandbox_effective(&lc.global_sandbox);
     let (status, resp_body) = execute_common(
-        key, method, path, body, peer, lc.port, lc.global_sandbox.clone(),
+        key, method, path, body, peer, lc.port, sandbox,
     )
     .await?;
     Ok(Response::builder()

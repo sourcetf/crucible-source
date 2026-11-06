@@ -126,8 +126,15 @@ ssl = { cert="real.pem", key="real.key.pem", cert_ec="cert_ec.pem", key_ec="key_
 
 ### B. admin 口令与暴露面
 
-- 生产口令已轮换（2026-10-02）；`[admin].listeners_allow` **仍未配置** ⇒ 管理面在所有 listener 可达（含明文口）。
-  建议：`[admin] listeners_allow=[8443]`（管理面只在 TLS 口）。
+- ✅ **已配置**（2026-11-06）：`[admin] listeners_allow = [8443]` ⇒ 管理面只在 TLS 口可达（此前为空 =
+  所有 listener 可达，其中 9095 是明文口且绑 0.0.0.0）。白名单外端口上 `/__admin` 回 **404**
+  （不是 401 —— 401 会诱出浏览器 Basic 口令框）。实测：`9095 /__admin`→404、`8443 /__admin`→401。
+- 引擎出网已收敛（2026-11-06）：`scripts/harden-egress-pf.sh` 按**引擎用户**只放行 `{tcp,udp} 80,443`，
+  其余 `block return out log`（堵掉 DNS 隧道与内网横向）；`/etc/resolv.conf` 主解析器指向本机 named
+  （回环被 `set skip on lo` 跳过 pf）以保证解析，并留 8.8.8.8 回退（只服务主机自身）。
+  ⚠️ **换过引擎降权用户后必须重跑本脚本**，否则新 uid 不在规则里会落回裸 `pass`（全出网）。
+- 引擎已按应用分用户（`_c_<engine>` ×18）：跨应用 socket 连接与 `kill` 真机实测均被拒。
+  创建/维护见 `scripts/create-engine-users.sh`，配置见各应用 `[listeners.apps.sandbox] user`。
 - **建议尽快轮换生产 SSH root 口令**（历史明文口令曾散落本地副本）；推荐改密钥登录并关口令登录（先确认密钥能登再关）。
 
 ### C. `[dns]` 的唯一真相来源
