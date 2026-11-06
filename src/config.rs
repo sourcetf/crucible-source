@@ -2113,9 +2113,12 @@ ECH 既无法装载（无密钥）也无法自动生成（缺 public-name），�
                     n.as_str(),
                     "tls1" | "tls1.0" | "tls1.1" | "tls1.2" | "tls1.3"
                         | "tlsv1" | "tlsv1.0" | "tlsv1.1" | "tlsv1.2" | "tlsv1.3"
+                        // SSLv3 由 NSS 遗留栈承载（`tls_version_index` 早认它，见该函数）：
+                        // 规格要求保留这条兼容能力，白名单漏了它 ⇒ 显式声明会被 --check-config 拒。
+                        | "sslv3" | "sslv3.0" | "ssl3"
                 ) {
                     anyhow::bail!(
-                        "listener {}:{} 的 TLS 版本 {v:?} 无法识别（支持 tls1.0/tls1.1/tls1.2/tls1.3）",
+                        "listener {}:{} 的 TLS 版本 {v:?} 无法识别（支持 sslv3/tls1.0/tls1.1/tls1.2/tls1.3）",
                         l.address,
                         l.port
                     );

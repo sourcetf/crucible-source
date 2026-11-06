@@ -1622,6 +1622,49 @@ async fn handle_h2(
             "acl",
         );
     }
+    // 端口复用口（`port_reuse` 且非 TLS）上的明文 HTTP：统一 HSTS + 301 到 https。
+    // h1 早有这段（`h1.rs` 的 port_reuse 分支），h2 的注释写着"与 h1 一致"但**从未实现** ——
+    // 于是同一站点走 h2c prior-knowledge 就绕过 301，不支持 HSTS 的客户端会被钉在明文上。
+    // 与 h1 同一套开放重定向防护：优先 `server_name`，否则仅当 Host 看起来是合法主机名才用。
+    if lc.port_reuse && lc.ssl.is_none() {
+        let raw_host = req
+            .headers()
+            .get(http::header::HOST)
+            .and_then(|v| v.to_str().ok())
+            .map(crate::server::h1::host_without_port)
+            .unwrap_or("")
+            .to_string();
+        let host = match lc.server_name.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+            Some(sn) => Some(sn.to_string()),
+            None => {
+                if crate::server::h1::is_plausible_hostname(&raw_host) {
+                    Some(raw_host)
+                } else {
+                    None
+                }
+            }
+        };
+        let pq = req
+            .uri()
+            .path_and_query()
+            .map(|p| crate::server::h1::normalize_redirect_path(p.as_str()))
+            .unwrap_or_else(|| "/".to_string());
+        let target = match host {
+            Some(h) => format!("https://{h}{pq}"),
+            None => pq,
+        };
+        let mut b = Response::builder()
+            .status(StatusCode::MOVED_PERMANENTLY)
+            .header(
+                http::header::STRICT_TRANSPORT_SECURITY,
+                crate::server::h1::hsts_header(),
+            );
+        // 与 h1 同：Location 非法时降级为"不带 Location 的 301"，绝不在 service future 里 panic。
+        if let Ok(loc) = http::HeaderValue::from_str(&target) {
+            b = b.header(http::header::LOCATION, loc);
+        }
+        return tag(b.body(Bytes::from_static(b"moved to https")).unwrap(), "hsts");
+    }
 
     if let Some(rl) = &lc.rate_limit {
         if rl.enabled {

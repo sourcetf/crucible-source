@@ -1665,6 +1665,19 @@ fn save_apps(live: &Arc<LiveConfig>, v: &Json) -> Response<BoxBody> {
 }
 
 /// body: {"port": 9446, "ssl": {...} | null}；null 表示去掉该站点的 TLS。
+/// 取当前生效的 `SslConfig` 里被掩码字段的真实值（供 `***` 未改动哨兵还原）。
+fn ssl_masked_field(s: &crate::config::SslConfig, k: &str) -> Option<String> {
+    match k {
+        "key" => s.key.clone(),
+        "key_ec" => s.key_ec.clone(),
+        "ech_keys" => s.ech_keys.clone(),
+        "ech_cover_key" => s.ech_cover_key.clone(),
+        "ech_cover_key_ec" => s.ech_cover_key_ec.clone(),
+        "psk_key" => s.psk_key.clone(),
+        _ => None,
+    }
+}
+
 fn save_ssl(live: &Arc<LiveConfig>, v: &Json) -> Response<BoxBody> {
     let port = match json_port(v, "port") {
         Ok(p) => p,
@@ -1704,6 +1717,44 @@ fn save_ssl(live: &Arc<LiveConfig>, v: &Json) -> Response<BoxBody> {
             })
         }
     };
+    // **"***" 未改动哨兵**：`mask_secrets` 把**内联**凭据材料（内联 PEM / PSK）下发成
+    // `"***"`，而本端点用同一份 JSON 回填面板表单 —— 管理员不动那些框、只改版本或套件
+    // 再保存，就会把 `key = "***"` 写回 config.toml，**TLS 静默损坏**（Wave-25 功能审查
+    // 发现的 P0，源于 Wave-24 的掩码加固）。这里把 `"***"` 还原成当前生效值；
+    // 当前也没有值就删键（宁缺勿毒，绝不留 `***` 进配置）。
+    let ssl_val = match ssl_val {
+        Some(toml::Value::Table(mut t)) => {
+            const MASKED: &[&str] = &[
+                "key",
+                "key_ec",
+                "ech_keys",
+                "ech_cover_key",
+                "ech_cover_key_ec",
+                "psk_key",
+            ];
+            let cur = live.snapshot();
+            let cur_ssl = cur
+                .listeners
+                .iter()
+                .find(|l| l.port == port)
+                .and_then(|l| l.ssl.clone());
+            for k in MASKED {
+                if t.get(*k).and_then(|x| x.as_str()) == Some("***") {
+                    match cur_ssl.as_ref().and_then(|s| ssl_masked_field(s, k)) {
+                        Some(real) => {
+                            t.insert((*k).to_string(), toml::Value::String(real));
+                        }
+                        None => {
+                            t.remove(*k);
+                        }
+                    }
+                }
+            }
+            Some(toml::Value::Table(t))
+        }
+        other => other,
+    };
+
     // 字段级合并（不是整表替换）：面板表单里没有的 ssl 键（ECH cover 证书族、
     // OCSP 路径等）必须保留，否则「保存 TLS」会把它们静默删掉。
     //

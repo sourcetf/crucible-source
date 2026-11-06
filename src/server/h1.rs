@@ -35,7 +35,7 @@ pub fn hsts_header() -> &'static str {
 /// 只需挡住明显不像主机名的输入（含空格、斜杠、`@`、`?`、`#`、控制字符），
 /// 避免把客户端可控的 Host 原样拼进 Location 造成开放重定向。
 /// 允许字母/数字/`.`/`-`/`_`，以及 IPv6 字面量的 `[` `]` `:`。
-fn is_plausible_hostname(h: &str) -> bool {
+pub(crate) fn is_plausible_hostname(h: &str) -> bool {
     if h.is_empty() || h.len() > 253 {
         return false;
     }
@@ -51,7 +51,7 @@ fn is_plausible_hostname(h: &str) -> bool {
 ///
 /// 此前用 `split(':').next()`：IPv6 字面量 `[::1]:8080` 会被截成 `[`（非法主机名）
 /// ⇒ 301 退化成相对路径跳转。这里对 `[...]` 形式取到配对的 `]` 为止。
-fn host_without_port(h: &str) -> &str {
+pub(crate) fn host_without_port(h: &str) -> &str {
     let h = h.trim();
     if let Some(rest) = h.strip_prefix('[') {
         return match rest.find(']') {
@@ -75,7 +75,7 @@ fn host_without_port(h: &str) -> &str {
 /// 保留尾斜杠与 query；**不做 percent-decode**（Location 里必须是合法 URI，
 /// 解码后再拼会把 `%20` 变成裸空格）。归一化后路径必以单个 `/` 开头，不可能再是
 /// 协议相对 URL。
-fn normalize_redirect_path(path_and_query: &str) -> String {
+pub(crate) fn normalize_redirect_path(path_and_query: &str) -> String {
     let (path, query) = match path_and_query.split_once('?') {
         Some((p, q)) => (p, Some(q)),
         None => (path_and_query, None),

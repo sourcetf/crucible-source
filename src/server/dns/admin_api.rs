@@ -600,14 +600,42 @@ async fn handle_inner(
                 if !std::path::Path::new(jar).is_file() {
                     return Err(format!("jsp sidecar missing: {jar}"));
                 }
-                let out = tokio::process::Command::new(java)
+                // **必须有硬超时**：`jsp-sidecar.jar` 只认 `--socket/--docroot`，未知参数被
+                // 忽略后直接 `server.start()+join()` 永不退出 ⇒ `.output()` 会永久挂住一个
+                // tokio 任务，还可能在**默认 socket** 上起第二个 Jetty 跟在跑的那个抢。
+                // 这里给 120s 硬超时 + 一个独立 socket 路径（绝不碰产线那个），超时如实报错。
+                let sock = format!("state/jsp/precompile-{}.sock", std::process::id());
+                let child = tokio::process::Command::new(java)
                     .arg("-jar")
                     .arg(jar)
                     .arg("precompile")
                     .arg(&docroot)
-                    .output()
-                    .await
+                    .arg("--socket")
+                    .arg(&sock)
+                    .stdout(std::process::Stdio::piped())
+                    .stderr(std::process::Stdio::piped())
+                    .kill_on_drop(true)
+                    .spawn()
                     .map_err(|e| e.to_string())?;
+                let out = match tokio::time::timeout(
+                    std::time::Duration::from_secs(120),
+                    child.wait_with_output(),
+                )
+                .await
+                {
+                    Ok(Ok(o)) => o,
+                    Ok(Err(e)) => return Err(format!("jsp precompile: {e}")),
+                    Err(_) => {
+                        let _ = std::fs::remove_file(&sock);
+                        return Err(
+                            "jsp precompile 超时（120s）：当前 sidecar jar 未实现 precompile 子命令\
+（未知参数会被忽略，进程转而启动 Jetty 且不退出）。请重建 jar（见 scripts/build_jsp_sidecar.sh）\
+或改用运行时编译；已终止该子进程。"
+                                .into(),
+                        );
+                    }
+                };
+                let _ = std::fs::remove_file(&sock);
                 let mut output = String::from_utf8_lossy(&out.stdout).to_string();
                 if !out.stderr.is_empty() {
                     output.push_str(&String::from_utf8_lossy(&out.stderr));

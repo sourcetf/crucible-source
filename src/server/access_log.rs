@@ -648,6 +648,13 @@ fn log_line<P: LinePrefix>(
     if !eff.enable {
         return;
     }
+    // `level` 此前只被解析进 `eff` 却**从不被消费** —— 配置、回显、下拉都在，但改它对
+    // 输出毫无影响（Wave-25 功能审查判定的伪实现）。按状态码下限过滤：
+    // `error` ⇒ 仅 5xx；`warn` ⇒ 4xx+5xx；`info`/`debug`/`trace`（及未知值）⇒ 全部请求行。
+    // 未知值不过滤（不能因为写错等级就把访问日志静默清空 —— 那是审计证据）。
+    if !level_allows(&eff.level, status) {
+        return;
+    }
     // 无 chrono 依赖：unix 秒.毫秒，足够 Admin tail 按序展示。
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -689,6 +696,18 @@ fn log_line<P: LinePrefix>(
 /// `fmt::Write` 适配器：把 fmt 输出接进任意 [`ByteSink`]。
 /// 仅用于前缀段的**每连接/每请求一次**的 fmt 格式化（[`ConnPrefix::new`]、
 /// [`ProtoPeer`]）；行主体的热路径见 [`write_line`]。
+/// `[access_log].level` 的行级过滤判据（见 `log_response` 调用点）。
+///
+/// 语义：等级 = **最低关注度**。`error` 只留 5xx，`warn` 留 4xx/5xx，其余（含未知值）
+/// 全部保留。未知值不过滤 —— 写错等级不应把访问日志清空。
+fn level_allows(level: &str, status: u16) -> bool {
+    match level.trim().to_ascii_lowercase().as_str() {
+        "error" | "err" => status >= 500,
+        "warn" | "warning" => status >= 400,
+        _ => true,
+    }
+}
+
 struct FmtW<'a, S: ByteSink>(&'a mut S);
 impl<S: ByteSink> std::fmt::Write for FmtW<'_, S> {
     #[inline]

@@ -7160,3 +7160,33 @@ init_timeout/libc/sandbox 字段；GeoIP 冲突未分 IP/ASN 两栏、筛选无�
 `.cursor/rules/perf-h2o-and-ultra-servers.mdc` 缺失；样例 apps 挂 8443 而非 §3.4 的 9095（Wave-23c 按用户指示主动迁移）。
 
 **注**：P0-1 是我上一轮安全加固引入的，建议优先修；P0-2 是真挂死。两条我都可以立刻修。
+
+# 【agent-1009 · Wave-25b】按功能审查修 bug（第一批，2026-11-07）
+
+**P0-1（我 Wave-24 引入的回归）已修**：`save_ssl` 把 `"***"` 当**未改动哨兵** —— 内联 PEM/PSK 被
+`mask_secrets` 下发成 `***` 后，面板只看不动再保存会把它写回 config.toml（TLS 静默损坏）；
+现在遇到 `***` 会还原成当前生效值，当前无值则删键（绝不留 `***` 进配置）。新增 `ssl_masked_field()`。
+
+**P0-2 已修**：JSP 编译按钮原来 `java -jar jsp-sidecar.jar precompile` 后 `.output().await` **无超时**
+⇒ 永久挂住一个 tokio 任务、还可能在默认 socket 上起第二个 Jetty。现在：120s 硬超时 + `kill_on_drop`
++ 独立 socket 路径（`state/jsp/precompile-<pid>.sock`，绝不碰产线那个），超时**如实报错**并说明原因。
+
+**P1-2 已修并真机验证**：访问日志 `level` 此前是伪实现（能配/能回显/从不消费）。现按状态码下限过滤
+（error⇒5xx、warn⇒4xx+5xx、info/debug/trace 及未知值⇒全部）。实测：把 `[access_log].level` 置 `warn` 后，
+`GET /`（200）**不入**日志、`GET /__nope`（404）入日志；随后已还原。
+
+**P1-7 已修并真机验证**：`versions = ["sslv3", …]` 此前被配置校验白名单拒（与 `tls_version_index` 口径不一致）。
+现白名单接受 `sslv3/sslv3.0/ssl3`。实测：正向 `config OK (… tls acceptors built=3)`；
+负向对照 `versions=["tls9"]` 被拒且报错点名 "支持 sslv3/tls1.0/…/tls1.3"。**SSLv3 能力本身没动**，只是现在能显式声明。
+
+**P2-5 已修（代码级）**：h2 的 `port_reuse` 明文口此前只有一句"与 h1 一致"的注释、**没有实现 301**
+⇒ 同站点走 h2c prior-knowledge 能绕过 301。现补齐（复用 h1 的 `host_without_port/is_plausible_hostname/
+normalize_redirect_path`，已提升为 `pub(crate)`；同样带开放重定向防护与"Location 非法则降级"。产线
+`config.toml` 当前 `port_reuse` 计数为 0，故该分支在本部署不可达，属代码级修复）。
+
+**回归**：19/19 路由 200、`CONTAINMENT OK`。新二进制 22155832（03:31）。
+
+**待办（下一批）**：GeoIP 源权重伪实现、GeoIP cron 伪实现、`upload_on_exists`、TSX 面板接线、
+选项目录独立 tab、P1-3/4 之外的 P1（H3 PSK、城市骨架层、libaxonasp/mruby 链）。
+P0-1/P0-2 的**端到端**验证需要一个管理员口令（产线 `password_hash` 为空、管理面 fail-closed），
+故这两条本轮为**代码级**修复 + 逻辑复核。
