@@ -325,11 +325,14 @@ fn fetch_edition(license: &str, edition: &str, dst: &Path) -> Result<()> {
             .with_context(|| format!("mkdir {}", parent.display()))?;
     }
     let resp = http_get_allowlisted(&url, 5).with_context(|| format!("maxmind {edition}"))?;
-    let mut data = Vec::with_capacity(
-        resp.header("Content-Length")
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(2_000_000),
-    );
+    // 预分配容量**必须夹上限**：`Content-Length` 来自响应对端（MaxMind 或链路中间人），
+    // 直通 `with_capacity` 时一个巨大值就会让进程在分配失败处 abort（Rust 分配失败即 abort）。
+    // 实际读取另有 200MB 的 `.take()` 上限。安全审查 2026-11-06 的 P3。
+    let cl_hint: usize = resp
+        .header("Content-Length")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(2_000_000);
+    let mut data = Vec::with_capacity(cl_hint.min(64 * 1024 * 1024));
     resp.into_reader().take(200_000_000).read_to_end(&mut data)?;
     let gz = GzDecoder::new(Cursor::new(data));
     let mut tar = Archive::new(gz);

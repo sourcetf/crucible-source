@@ -1259,9 +1259,13 @@ pub async fn handle(
 
     // 2) 编译管线产出静态产物：只服务 GET/HEAD。
     if req.method() != Method::GET && req.method() != Method::HEAD {
+        // 与 static 层 405 同口径：**宣告 `Connection: close`**。此前只回 `Allow` 而不关闭、
+        // 也不排空请求体 ⇒ 并发大 POST 下客户端看到 BrokenPipe/ECONNRESET（soak 89,510 次/80min）。
+        // 安全审查 2026-11-06 的 CG-07。
         return Ok(Response::builder()
             .status(StatusCode::METHOD_NOT_ALLOWED)
             .header(header::ALLOW, "GET, HEAD")
+            .header(header::CONNECTION, "close")
             .header(header::CONTENT_TYPE, "text/plain; charset=utf-8")
             .body(full("405 Method Not Allowed\n"))
             .unwrap());

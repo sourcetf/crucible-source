@@ -231,6 +231,9 @@ pub async fn handle(
     let mut resp = handle_inner(req, live, tls, peer).await;
     resp.headers_mut()
         .insert(header::CACHE_CONTROL, http::HeaderValue::from_static("no-store"));
+    // 安全响应头收口（CG-06）：此前 `append_security_headers` 是 0 调用点的死代码，
+    // 面板可被跨站 iframe 点击劫持（同源请求能过全部 CSRF 检查）。
+    crate::server::headers_mod::append_security_headers(resp.headers_mut());
     resp
 }
 

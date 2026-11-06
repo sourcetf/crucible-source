@@ -177,10 +177,12 @@ fn check_user_pass_headers(headers: &HeaderMap, username: &str, password_hash: &
     let Some((user, pass)) = text.split_once(':') else {
         return false;
     };
-    if !ct_eq_str(user, username) {
-        return false;
-    }
-    password::verify_password(pass, password_hash).unwrap_or(false)
+    // **用户名不匹配也要付出一次哈希代价**：否则"响应时间"就能区分用户名是否存在
+    // （Basic 路径此前按名字短路；登录路径早已是"对每个配置用户都跑一次 verify"的口径）。
+    // 安全审查 2026-11-06 的 P3-2。
+    let user_ok = ct_eq_str(user, username);
+    let pass_ok = password::verify_password(pass, password_hash).unwrap_or(false);
+    user_ok && pass_ok
 }
 
 /// 用户名常量时间比较（P2，§16.13）：密码本身已由 argon2id/yescrypt 恒时验证，

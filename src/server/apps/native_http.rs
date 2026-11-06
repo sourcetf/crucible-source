@@ -545,7 +545,19 @@ async fn ensure_sidecar(
 
     let _ = fs::remove_file(&sock);
     let log_path = state.join("sidecar.log");
-    let log_file = fs::File::create(&log_path).context("sidecar.log")?;
+    // 0600：这个文件由**父进程**（root）创建，随后才 chown 给引擎用户 —— 期间若按
+    // 默认 umask（022）就是世界可读的 0644，引擎 stderr 里的敏感内容会外泄到本机其它用户。
+    // 安全审查 2026-11-06 的 P3。
+    let log_file = {
+        use std::os::unix::fs::OpenOptionsExt;
+        fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&log_path)
+            .context("sidecar.log")?
+    };
 
     let mut cmd = Command::new(&deps_bin);
     // **干净环境**：sidecar 是**长驻**进程，spawn 只发生在「缓存里没有 / 上一个死了」时，

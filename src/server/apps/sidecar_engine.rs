@@ -763,7 +763,17 @@ async fn ensure_sidecar_simple(
     let docroot = docroot_desired;
     let _ = std::fs::remove_file(&sock);
     let log_path = state.join("sidecar.log");
-    let log_file = std::fs::File::create(&log_path).context("sidecar.log")?;
+    // 0600（同 h1 的 native_http）：父进程创建、随后才 chown 给引擎用户。
+    let log_file = {
+        use std::os::unix::fs::OpenOptionsExt;
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&log_path)
+            .context("sidecar.log")?
+    };
 
     let mut cmd = Command::new(&deps_bin);
     // 干净环境（与 h1 `native_http::ensure_sidecar` 同一判据）：sidecar 是长驻进程，spawn

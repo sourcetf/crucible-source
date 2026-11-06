@@ -58,10 +58,23 @@ pub fn set_header(map: &mut HeaderMap, name: &str, value: &str) {
     }
 }
 
+/// 管理面/敏感响应统一安全头。
+///
+/// **此前是死代码（0 调用点）**，于是管理面板缺 XFO/CSP/COOP/nosniff：Basic 凭据档下
+/// 可被跨站 iframe 点击劫持（同源请求能过全部 CSRF 检查）。安全审查 2026-11-06 的 CG-06：
+/// 在 `admin::handle` 收口调用本函数，并补齐 CSP(`frame-ancestors`) 与 COOP。
 pub fn append_security_headers(map: &mut HeaderMap) {
     set_header(map, "X-Content-Type-Options", "nosniff");
     set_header(map, "X-Frame-Options", "SAMEORIGIN");
     set_header(map, "Referrer-Policy", "no-referrer-when-downgrade");
+    // 面板是纯静态 HTML + 少量内联脚本/样式（`admin_ui.html`），用 `frame-ancestors 'none'`
+    // 与 COOP 兜住点击劫持/跨窗口引用；不设 `default-src`，避免打断内联脚本。
+    set_header(
+        map,
+        "Content-Security-Policy",
+        "frame-ancestors 'none'; base-uri 'none'; form-action 'self'",
+    );
+    set_header(map, "Cross-Origin-Opener-Policy", "same-origin");
 }
 
 /// page_rules cache/header 注入:按顺序写入响应头。

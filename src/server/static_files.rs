@@ -1584,6 +1584,14 @@ pub(crate) enum MultiRange {
 ///
 /// 内存护栏不变：合并后的每个区间与区间总长都受 [`MAX_RANGE_BYTES`] 约束（见
 /// [`clamp_slice`] 与 `MAX_TOTAL_RANGE_BYTES`），绝不会因为多段而放大内存。
+/// 请求侧 `Range` **段数**上限（合并前的原始段数）。
+///
+/// 此前只在**合并后**用 `MAX_RANGE_PARTS`（16）收敛，而解析期的 `specs` 中间量不受限：
+/// 一条 `Range: bytes=0-0,0-0,0-0,...` 能塞进成千上万段（受 hyper 读缓冲 408KB 限，
+/// 约 2×10⁵ 段），造成数 MB 分配 + 排序（并发下可放大）。超限即按 §14.2 整条忽略。
+/// 安全审查 2026-11-06 的 P3。
+const MAX_RANGE_INPUT_PARTS: usize = 64;
+
 pub(crate) fn parse_ranges(range: &str, len: u64) -> MultiRange {
     let range = range.trim();
     let Some((unit, rest)) = range.split_once('=') else {
@@ -1605,7 +1613,12 @@ pub(crate) fn parse_ranges(range: &str, len: u64) -> MultiRange {
     }
     // 多段：任一 spec 语法不成立 → 整条忽略（§14.2「invalid ranges-specifier」）。
     let mut specs: Vec<ByteRange> = Vec::with_capacity(4);
+    let mut parts_seen = 0usize;
     for part in rest.split(',') {
+        parts_seen += 1;
+        if parts_seen > MAX_RANGE_INPUT_PARTS {
+            return MultiRange::Ignore;
+        }
         let part = part.trim();
         if part.is_empty() {
             // `bytes=0-9,` / `bytes=0-9,,20-29`：尾部/中间空元素属语法不成立

@@ -294,7 +294,16 @@ fn ensure_runtime(
     let _ = fs::remove_file(&notify_path);
     let layout = init_shm_file(&shm_path)?;
     let log_path = state_dir.join("server.log");
-    let log_file = fs::File::create(&log_path)?;
+    // 0600（父进程创建、随后才 chown 给引擎用户；见 native_http 的同处说明）。
+    let log_file = {
+        use std::os::unix::fs::OpenOptionsExt;
+        fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&log_path)?
+    };
 
     let mut cmd = Command::new(&bin);
     // 干净环境：go-shm-server 是长驻进程，spawn 时刻可能落在别的应用的请求期 `.env`

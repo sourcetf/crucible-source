@@ -7100,3 +7100,29 @@ DoT/DoH、ECS）。我却把它当成「存在 DNS 隧道风险」去堵，**等
 - 认证/CSRF：三协议判定顺序统一且都在**收 body 之前**；argon2id（OWASP 下限）/yescrypt；会话令牌 32B `OsRng`；`Origin: null` 拒绝；不信任 `X-Forwarded-For`；配置写入原子 + 保留权限 + 校验副本 0600；面板 `esc()` 全覆盖。
 - 解析器：h1_fast/qmux/dns(ecs,dot_doh)/connect_udp/client_hello/upload range 切片与整数全有界，**未发现远程单包可触发的越界/panic**；CL/TE 与 HPACK/流控由 hyper/h2 crate 承担。
 - **fuzz 缺口**（建议补）：`dot_doh.rs` 名字解析（与 `ecs.rs` 重复实现、只 fuzz 了后者）、`tls/client_hello.rs`、`connect_udp.rs` 目标解析、`parse_content_range`（本轮修的溢出点正缺覆盖）、`proxy.rs` 上游响应解析、`parse_ranges`。
+
+# 【agent-1009 · Wave-24b】缺口/伪实现清扫 + 审计遗留项（2026-11-07）
+
+按用户要求「不砍任何功能，缺口或伪实现一律做完」，逐条核对了项目自己的权威缺口清单
+（`spec-matrix-notes.md` §A，41 条）与本轮审计遗留项。
+
+**核实"其实早已修好"（矩阵文档滞后）**：CG-01（P1）Perl/PSGI 每请求泄漏已在后续 wave 修掉
+（`script_engine.c:1895` perl_parse 只做一次；`psgi_engine.c` 驱动编译一次 + FREETMPS）；
+CG-02（P1）autoindex round-trip 已修且有往返单测。
+
+**本轮补齐（真机验证）**：
+- **CG-06**：`append_security_headers` 原为**死代码（0 调用点）** ⇒ 面板缺 XFO/CSP/COOP/nosniff。
+  已在 `admin::handle` 收口调用并补 CSP(`frame-ancestors 'none'`)/COOP。实测 `POST /__admin/api/login`
+  响应带全部五个头。
+- **CG-07**：`/tsx/` 405 补 `Connection: close`。实测 HTTP/1.1 下可见（h2 下由协议层剥离）。
+- **审计 B3/B4/B5/B8**：Basic 用户名枚举时序（改为不按名字短路，与登录路径同口径）、
+  geoip 预分配夹 64MiB、`parse_ranges` 解析期段数上限 64（100 段→整条忽略回 200 全量）、
+  父进程创建的 `sidecar.log`/`server.log` 改 0600。
+- 回归：19/19 路由 200、`CONTAINMENT OK`（71 条 uid 策略行）、DNS 53 正常。
+
+**明确不做（缺口真实存在，理由见报告 §五）**：CG-03 mTLS（2–3d 特性开发）、CG-05 Ruby 默认嵌入
+（3–5d + 全平台回归）、CG-04 unbound validator（模块顺序写错会让该模式起不来 = 砍功能，
+需 unbound 环境验证）、CG-08/09 admin 文件 API、审计 B1 静态 TOCTOU（正解是逐级 `openat`+fd
+传递，单加 `O_NOFOLLOW` 会打断 docroot 内合法符号链接 = 砍功能）、B2 FFI 边界长度上界、
+B6 OCSP 验签、**B7 NSS 返回值 fail-closed（会让遗留 SSLv3/IE6 栈在个别 NSS 上起不来，按"不砍功能"不做）**、
+B9 DER 短长度（当前不可达）、B10 fuzz 目标。
