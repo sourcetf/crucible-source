@@ -77,7 +77,7 @@ bash scripts/build_jsp_sidecar.sh              # 真 Jetty+Jasper Fat JAR（需 
 # 或：scripts/build_release.sh --restart（/etc/rc.local 拉起，日志 /tmp/webserver-restart.log）
 ```
 - 配置热重载：`SIGHUP` 或面板保存（`live_config`；Admin HTML 例外，改 UI 必须重链）。
-- 端口约定（样例 `config.toml`）：`9081/9095` 明文 h1+h2c、`9445` 仅 TLS1.2、`9446` 仅 TLS1.3、
+- 端口约定（样例 `config.toml`）：`9081` 明文 h1+h2c、**`8443` TLS（18 个应用引擎 + 静态站）**、`9445` 仅 TLS1.2、`9446` 仅 TLS1.3、
   `8443` TLS1.2+1.3+h2+h3、`853` DoT、`53` named、`8443/udp` h3。
 - `[admin].listeners_allow` 可把管理面收到 TLS 口；明文登录只在 TLS 签发 cookie。
 
@@ -93,7 +93,7 @@ cargo test --release --bin webserver --offline --features tls,tls_boring
 sh scripts/accept-verify.sh --no-build
 
 # 19 引擎 × h1+h2c → 38/38
-python3 scripts/verify_app_engines.py --port 9095
+python3 scripts/verify_app_engines.py                   # 默认 TLS 8443
 
 # 遗留 TLS（需四 feature 二进制）→ PASS=7
 CRUCIBLE_BIN=target/release/webserver CRUCIBLE_TLS_TEST_PORT=19543 sh scripts/test_tls_stacks.sh
@@ -114,7 +114,7 @@ bash scripts/dns_dot443_verify.sh       # DoT 443 SNI/ALPN 复用 28/0
 
 ```sh
 python3 bench/h2_fair_gate.py                      # 官方双门禁（wrk 分支；exit 0 = PASS）
-python3 bench/app_engine_overhead.py --port 9095   # 引擎 RPS/延迟（rust/c/go vs static）
+python3 bench/app_engine_overhead.py --port 8443   # 引擎 RPS/延迟（rust/c/go vs static）
 python3 bench/tls_matrix_h2o.py --ours <bin> --h2o <h2o> \
   --rounds 5 --duration 10 --cpu-ours 8-13 --cpu-h2o 14-19 --cpu-client 20-29 --handshake
 ```

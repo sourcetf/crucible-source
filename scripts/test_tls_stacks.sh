@@ -39,7 +39,7 @@ if [ -z "$BIN" ]; then
   fi
 fi
 
-for p in 8443 9445 9446 9081 9095; do
+for p in 8443 9445 9446 9081; do  # 9095 已于 2026-11-06 移除（应用改走 8443 TLS）
   if [ "$PORT" = "$p" ]; then
     echo "FAIL: refused production port $p; use e.g. 19543 / 27543" >&2
     exit 2

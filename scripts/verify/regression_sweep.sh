@@ -2,7 +2,9 @@
 # 四轮改动后的**只读**回归扫（生产端口，全部是 GET/HEAD/OPTIONS，不改任何状态、不写盘）。
 # 目的：4 轮共 62 处改动全部落盘部署后，逐协议/逐特性确认没有横向回归。
 set -u
-PLAIN=http://127.0.0.1:9095
+# 应用自 2026-11-06 起只在 TLS 口（8443）提供（原明文 9095 已移除），故需 -k。
+APPS=https://127.0.0.1:8443
+K=-k
 FAIR=http://127.0.0.1:9081
 T12=https://127.0.0.1:9445
 T13=https://127.0.0.1:9446
@@ -14,13 +16,13 @@ p() { # label url [curl args...]
   printf '  %-30s %s\n' "$_l" "${_c:-ERR}"
 }
 
-echo "=== A. h1 明文（:9095，root=www-apps，18 个引擎）==="
+echo "=== A. TLS（:8443，18 个引擎 + 静态站）==="
 for e in rust go c lua python php asp jsp do ruby perl wsgi asgi psgi rack cgi tsx aspnet; do
-  p "/$e/" "$PLAIN/$e/"
+  p "/$e/" "$APPS/$e/" $K
 done
 
 echo "=== B. 静态面 ==="
-p "9095 /" "$PLAIN/"
+p "8443 /" "$APPS/" $K
 p "9081 / (fair-plain)" "$FAIR/"
 p "9445 / (tls1.2)" "$T12" -k
 p "9446 / (tls1.3)" "$T13" -k
@@ -31,18 +33,18 @@ p "8443 h2" "$H3/" -k --http2
 p "8443 h3" "$H3/" -k --http3-only
 
 echo "=== D. 管理面 / 指标（未认证必须 401，绝不能 200）==="
-p "/__admin (9095)" "$PLAIN/__admin"
+p "/__admin (8443)" "$APPS/__admin" $K
 p "/__admin/ (8443)" "$H3/__admin/" -k
 p "/__admin/api/config (8443)" "$H3/__admin/api/config" -k
 p "/__metrics (8443)" "$H3/__metrics" -k
 
 echo "=== E. 穿越 / 方法（不得出现 200）==="
-p "/../../etc/passwd" "$PLAIN/../../etc/passwd"
-p "/%2e%2e/%2e%2e/etc/passwd" "$PLAIN/%2e%2e/%2e%2e/etc/passwd"
-p "/..%2f..%2fetc/passwd" "$PLAIN/..%2f..%2fetc/passwd"
-p "/__admin/../config.toml" "$PLAIN/__admin/../config.toml"
-echo -n "  HEAD /  9095: "; curl -s -o /dev/null -w '%{http_code}\n' --max-time 10 -I "$PLAIN/"
-echo -n "  OPTIONS /  9095: "; curl -s -o /dev/null -w '%{http_code}\n' --max-time 10 -X OPTIONS "$PLAIN/"
+p "/../../etc/passwd" "$APPS/../../etc/passwd" $K
+p "/%2e%2e/%2e%2e/etc/passwd" "$APPS/%2e%2e/%2e%2e/etc/passwd" $K
+p "/..%2f..%2fetc/passwd" "$APPS/..%2f..%2fetc/passwd" $K
+p "/__admin/../config.toml" "$APPS/__admin/../config.toml" $K
+echo -n "  HEAD /  8443: "; curl -s -k -o /dev/null -w '%{http_code}\n' --max-time 10 -I "$APPS/"
+echo -n "  OPTIONS /  8443: "; curl -s -k -o /dev/null -w '%{http_code}\n' --max-time 10 -X OPTIONS "$APPS/"
 
 echo "=== F. Range / 条件请求 ==="
 echo -n "  Range bytes=0-9 (静态): "

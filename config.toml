@@ -29,10 +29,12 @@ enabled = true
 [admin]
 path = "/__admin"
 realm = "WebServer Admin"
-# 管理面只在 TLS 口（8443）暴露。为空（旧行为）时 `listeners_allow` 覆盖**所有** listener：
-# 9095 是明文口且地址 0.0.0.0，等于把管理员口令摊在明文上明文传输，被 RCE 的引擎也能
-# 直接在回环上打到它。白名单外的端口上 admin 路径回 **404**（不是 401 —— 401 会弹出
-# 浏览器 Basic 口令框，把界面变成一个凭据输入面）。h1/h2/h3 三协议同语义。
+# 管理面只在 TLS 口（8443）暴露。为空（旧行为）时 `listeners_allow` 覆盖**所有** listener，
+# 其中曾包含明文的应用口 9095（地址 0.0.0.0）—— 等于把管理员口令摊在明文上传输。
+# 该明文口已于 2026-11-06 移除（18 条应用路由一并迁到 8443 TLS），所以现在白名单只剩
+# 8443；保留 `listeners_allow` 是为了**将来新增 listener 时管理面不会自动暴露**。
+# 白名单外的端口上 admin 路径回 **404**（不是 401 —— 401 会弹出浏览器 Basic 口令框，
+# 把界面变成一个凭据输入面）。h1/h2/h3 三协议同语义。
 listeners_allow = [8443]
 
 [[admin.users]]
@@ -97,6 +99,50 @@ deny = []
 [[listeners]]
 address = "0.0.0.0"
 autoindex = true
+http_versions = [
+    "h1",
+    "h2",
+]
+port = 9081
+root = "www-static-fair"
+server_name = "fair-plain.crucible.local"
+
+[[listeners]]
+address = "0.0.0.0"
+autoindex = true
+http_versions = [
+    "h1",
+    "h2",
+]
+port = 9445
+root = "www-static-fair-tls12"
+server_name = "fair-tls12.crucible.local"
+
+[listeners.ssl]
+cert = "cert.pem"
+key = "key.pem"
+prefer_tls13 = false
+versions = ["TLSv1.2"]
+
+[[listeners]]
+address = "0.0.0.0"
+autoindex = true
+http_versions = [
+    "h1",
+    "h2",
+]
+port = 9446
+root = "www-static-fair-tls13"
+server_name = "fair-tls13.crucible.local"
+
+[listeners.ssl]
+cert = "cert.pem"
+key = "key.pem"
+prefer_tls13 = true
+versions = ["TLSv1.3"]
+
+[[listeners]]
+address = "0.0.0.0"
 file_open = [
     "/php/demo.php=preview",
     "pdf=preview",
@@ -106,10 +152,32 @@ file_open = [
 http_versions = [
     "h1",
     "h2",
+    "h3",
 ]
-port = 9095
-root = "www-apps"
-server_name = "apps.crucible.local"
+port = 8443
+root = "www"
+server_name = "prod.crucible.local"
+
+[listeners.autoindex]
+enabled = true
+paths = []
+
+[listeners.ssl]
+cert = "state/ech/real.pem"
+cert_ec = "state/ech/real_ec.pem"
+ech = true
+ech_cover_cert = "state/ech/cover.pem"
+ech_cover_cert_ec = "state/ech/cover_ec.pem"
+ech_cover_key = "state/ech/cover.key.pem"
+ech_cover_key_ec = "state/ech/cover_ec.key.pem"
+ech_keys = "state/ech/ech_keys.pem"
+ech_public_name = "crucible.local"
+enable_nss = true
+enable_tomcrypt = true
+key = "state/ech/real.key.pem"
+key_ec = "state/ech/real_ec.key.pem"
+pqc = true
+prefer_tls13 = true
 
 [[listeners.apps]]
 docroot = "www-apps/php"
@@ -343,82 +411,6 @@ paths = ["/aspnet"]
 [listeners.apps.sandbox]
 user = "_c_aspnet"
 
-[[listeners]]
-address = "0.0.0.0"
-autoindex = true
-http_versions = [
-    "h1",
-    "h2",
-]
-port = 9081
-root = "www-static-fair"
-server_name = "fair-plain.crucible.local"
-
-[[listeners]]
-address = "0.0.0.0"
-autoindex = true
-http_versions = [
-    "h1",
-    "h2",
-]
-port = 9445
-root = "www-static-fair-tls12"
-server_name = "fair-tls12.crucible.local"
-
-[listeners.ssl]
-cert = "cert.pem"
-key = "key.pem"
-prefer_tls13 = false
-versions = ["TLSv1.2"]
-
-[[listeners]]
-address = "0.0.0.0"
-autoindex = true
-http_versions = [
-    "h1",
-    "h2",
-]
-port = 9446
-root = "www-static-fair-tls13"
-server_name = "fair-tls13.crucible.local"
-
-[listeners.ssl]
-cert = "cert.pem"
-key = "key.pem"
-prefer_tls13 = true
-versions = ["TLSv1.3"]
-
-[[listeners]]
-address = "0.0.0.0"
-http_versions = [
-    "h1",
-    "h2",
-    "h3",
-]
-port = 8443
-root = "www"
-server_name = "prod.crucible.local"
-
-[listeners.autoindex]
-enabled = true
-paths = []
-
-[listeners.ssl]
-cert = "state/ech/real.pem"
-cert_ec = "state/ech/real_ec.pem"
-ech = true
-ech_cover_cert = "state/ech/cover.pem"
-ech_cover_cert_ec = "state/ech/cover_ec.pem"
-ech_cover_key = "state/ech/cover.key.pem"
-ech_cover_key_ec = "state/ech/cover_ec.key.pem"
-ech_keys = "state/ech/ech_keys.pem"
-ech_public_name = "crucible.local"
-enable_nss = true
-enable_tomcrypt = true
-key = "state/ech/real.key.pem"
-key_ec = "state/ech/real_ec.key.pem"
-pqc = true
-prefer_tls13 = true
 
 [telemetry]
 enabled = true

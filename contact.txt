@@ -7001,3 +7001,63 @@ DoT/DoH、ECS）。我却把它当成「存在 DNS 隧道风险」去堵，**等
 **教训（写进方法学）**：用户的「事实陈述」（某端口/资源是放开的）不等于「行动请求」
 （去封它）。把前者读成后者，代价是砍掉 spec 要求的功能。今后遇到这类陈述，
 先确认是「可用能力」还是「待修缺陷」，再动手。
+
+# 【agent-1009 · Wave-23c】去掉明文应用口：18 条应用路由迁到 TLS 8443，9095 已移除（2026-11-06）
+
+**用户决定**：「可以删掉 9095」→ 澄清为「**删掉明文 9095，应用迁到 TLS 口**」。
+
+## 改了什么（`config.toml`）
+
+- 删除 `[[listeners]] port = 9095`（`root = "www-apps"`、`server_name = "apps.crucible.local"`、
+  `autoindex = true`、`file_open = [...]`）**整条**；
+- 18 个 `[[listeners.apps]]` 块（含各自的 `[listeners.apps.sandbox] user`）**原样迁到 8443**
+  （即 `prod.crucible.local` 那条 TLS listener，`ssl` 保留 ECH/PQC/HSTS 不变）；
+- 原 9095 的 `file_open`（`/php/demo.php=preview`、`pdf=preview`、`zip=download`、`php=execute`）
+  随迁到 8443；
+- autoindex 等价：9095 是 `autoindex = true`（默认 `paths=["/"]` = 整站），8443 原本就是
+  `[listeners.autoindex] enabled = true, paths = []`（`paths` 为空**也**判为整站，见
+  `AutoindexConfig::allows`）⇒ 行为一致，无需改动；
+- 注意 `server_name` 参与 TLS **SNI 选择**与 `Location` 生成（`listener.rs:231`、`h1.rs:763`）：
+  应用现在跟着 8443 的 `prod.crucible.local`；Host 不参与路由，所以用 `127.0.0.1` 直连照常。
+
+## 真机验证
+
+- **9095 不再监听**（`curl` 连接被拒，`netstat` 里无 9095）；
+- **8443 上 19/19 路由 200**（18 条引擎路由 + `/`）；`h2`/`h3` 正常；
+- 9081/9445/9446 三个 fair 监听器不受影响；`8443 /__admin` → 401、`/__metrics` → 401；
+- 公网 DNS 53 正常；围堵门禁 `CONTAINMENT OK`（引擎身份 `_c_php`/`_c_go`/…，49 条 uid 策略行）。
+
+## 同步更新了受影响的工具（我改了生产配置，工具必须跟上）
+
+| 文件 | 改动 |
+| --- | --- |
+| `scripts/verify/regression_sweep.sh` | 应用段 `PLAIN(http://:9095)` → `APPS(https://:8443)` + `-k` |
+| `scripts/accept-verify-engine-containment.sh` | `CRUCIBLE_PORT` 默认 9095 → 8443（该变量实际不参与判据，仅注释同步） |
+| `scripts/test_tls_stacks.sh` | 端口列表去掉 9095 |
+| `scripts/verify_app_engines.py` | 默认 `--port 8443` + 默认 TLS；新增 `--plain` 供测试端口（19095 等） |
+| `scripts/accept-verify-engines-concurrent.py` | 同上（新增 `HTTPSConnection` 分支 + `TLS` 全局开关） |
+| `OPERATOR-TODO.md` / `README.md` / `config.toml` 注释 | 端口约定同步为「8443 TLS 承载 18 个引擎」 |
+
+工具本身跑通即为验证：回归扫全 200、围堵门禁 OK、`verify_app_engines.py` 38 项中 6 项
+为**样例应用/工具期望值历史不匹配**（`/uwsgi` 本就未配置路由 ⇒ 404；`/c`、`/rust` 正文与
+期望字符串不同），与本次迁移无关。
+
+## 顺带发现并（部分）处理的缺陷：配置重载不回收旧引擎
+
+**现象**：把应用从 9095 迁到 8443 后，旧 `9095-0` 的 php-fpm master **连同 16 个 pool worker**、
+以及 go/jsp/do/ruby/rack 各一个 sidecar **全部存活**（共 17 个进程），与新 `8443-*` 一套并存。
+
+**根因**：`reconcile_apps_runtime` 只对**仍在配置里**的 key 探活/重启（`php::reconcile`），
+并按 active 集卸载 **dlopen 的 lib**（`app_ffi::reconcile_unload`），**唯独没有"按 active 集关停进程"**
+这一步 —— 与 lib 的处理不对称。影响：每次改配置（改端口/改名/删应用）都白白泄漏一整组引擎，
+2GB 机器上反复改会吃光内存。
+
+**本轮处置**：新增 `scripts/reap-orphan-engines.sh`（**不改代码即可用**）：按 config.toml 解析出
+生效的 `port-app_idx` key 集，扫 `state/native|php|go-ipc/*`，只杀**能证明**归属该 key 的进程
+（php-fpm 看命令行里的 conf 绝对路径；sidecar 用 `fstat <sock>` 找持有者），默认 dry-run、
+`--yes` 才动手。本轮已清掉 9095 迁移留下的 17 个孤儿 + 一个陈旧 `go-ipc/19095-3-go`。
+
+**代码级修法（未做，留给后续）**：在 `reconcile_apps_runtime` 里算出 active key 集后，调用
+新增的 `php::reconcile_shutdown` / `native_http::reconcile_shutdown` / `sidecar_engine::reconcile_shutdown`，
+与已有的 `app_ffi::reconcile_unload` 对称（用 `child_registry::kill_child` 关停并清 state 目录）。
+需要一次重建+重启，故本轮先用脚本兜底。

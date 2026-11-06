@@ -8,16 +8,16 @@
 
 用法：
   # 明文 h1 + h2c（同一个 listener）
-  python3 scripts/verify_app_engines.py --port 9095
+  python3 scripts/verify_app_engines.py            # 生产：TLS 8443（默认）
 
   # 只测 h1
-  python3 scripts/verify_app_engines.py --port 9095 --no-h2c
+  python3 scripts/verify_app_engines.py --no-h2c
 
   # TLS listener（curl -k；证书自签）
-  python3 scripts/verify_app_engines.py --port 8443 --tls
+  python3 scripts/verify_app_engines.py --port 19095 --tls   # 测试端口 + TLS
 
   # 自定义 host / 路径前缀（部署在反向代理后）
-  python3 scripts/verify_app_engines.py --host 127.0.0.1 --port 9095 --prefix /apps
+  python3 scripts/verify_app_engines.py --host 127.0.0.1 --port 19095 --plain --prefix /apps
 
 依赖：python3 标准库；h2c/TLS 分支需要 PATH 里有 curl（`--http2-prior-knowledge`）。
 退出码：0 全部通过；1 有失败（逐条打印失败原因）。
@@ -103,7 +103,10 @@ def h2c(host: str, port: int, tls: bool, path: str, timeout: float):
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--host", default="127.0.0.1")
-    ap.add_argument("--port", type=int, default=9095)
+    # 应用自 2026-11-06 起只在 TLS 口（8443）提供（原明文 9095 已移除）。
+    ap.add_argument("--port", type=int, default=8443)
+    ap.add_argument("--plain", dest="tls", action="store_false",
+                    help="用明文 HTTP（测试端口 19095 等；生产已无明文应用口）")
     ap.add_argument("--prefix", default="", help="路由前缀（默认空；用于反代后的部署）")
     ap.add_argument("--tls", action="store_true", help="用 https（curl -k）")
     ap.add_argument("--no-h2c", action="store_true", help="只测 h1")

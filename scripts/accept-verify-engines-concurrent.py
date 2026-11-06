@@ -7,7 +7,7 @@
 亲和性（非创建线程调用即踩坏堆），修法是让 perl/psgi 走**串行单线程池**。
 
 用法（对着一个已起好的实例）：
-    python3 scripts/accept-verify-engines-concurrent.py --port 9095 --threads 8 --secs 30
+    python3 scripts/accept-verify-engines-concurrent.py --threads 8 --secs 30   # 默认 TLS 8443
 
 判定：每个引擎在 `--secs` 秒内持续并发请求后，**进程必须仍存活**，且所有响应为 200。
 进程存活按 HTTP 探活判定（跨平台，不依赖 /proc）。
@@ -18,6 +18,10 @@ import http.client
 import sys
 import time
 
+# 应用自 2026-11-06 起只在 TLS 口（8443）提供（原明文 9095 已移除）；
+# `--plain` 切回明文（供 19095 等测试端口）。由 main() 覆盖。
+TLS = True
+
 ENGINES = [
     "/php/", "/c/", "/rust/", "/go/", "/lua/", "/python/", "/ruby/", "/perl/",
     "/wsgi/", "/asgi/", "/psgi/", "/rack/", "/cgi/", "/uwsgi/", "/tsx/",
@@ -27,7 +31,14 @@ ENGINES = [
 
 def one(port: int, path: str, timeout: float = 20.0):
     try:
-        c = http.client.HTTPConnection("127.0.0.1", port, timeout=timeout)
+        if TLS:
+            import ssl
+            ctx = ssl.create_default_context()
+            ctx.check_hostname = False
+            ctx.verify_mode = ssl.CERT_NONE
+            c = http.client.HTTPSConnection("127.0.0.1", port, timeout=timeout, context=ctx)
+        else:
+            c = http.client.HTTPConnection("127.0.0.1", port, timeout=timeout)
         c.request("GET", path)
         r = c.getresponse()
         r.read()
@@ -104,13 +115,18 @@ def hammer_mixed(port: int, routes, threads: int, secs: float):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--port", type=int, default=9095)
+    # 应用自 2026-11-06 起只在 TLS 口（8443）提供（原明文 9095 已移除）。
+    ap.add_argument("--port", type=int, default=8443)
+    ap.add_argument("--plain", dest="tls", action="store_false",
+                    help="用明文 HTTP（测试端口；生产已无明文应用口）")
     ap.add_argument("--threads", type=int, default=8)
     ap.add_argument("--secs", type=float, default=15.0)
     ap.add_argument("--only", default="", help="只测这些路由（逗号分隔），默认全部")
     ap.add_argument("--no-mix", action="store_true",
                     help="跳过最后的「全路由混合并发」压测（默认做 —— 跨引擎交互只有它能测出）")
     args = ap.parse_args()
+    global TLS
+    TLS = args.tls
 
     routes = [r.strip() for r in args.only.split(",") if r.strip()] or ENGINES
     fails = []

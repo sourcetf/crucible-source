@@ -15,7 +15,9 @@
 set -u
 USER_="${1:-www}"
 ROOT="${CRUCIBLE_ROOT:-/crucible}"
-PORT="${CRUCIBLE_PORT:-9095}"
+# 应用自 2026-11-06 起只在 TLS 口（8443）提供；本脚本只按 uid/socket 判据工作，
+# 保留该变量仅为可读性（不参与判据）。
+PORT="${CRUCIBLE_PORT:-8443}"
 fails=0
 note() { printf '%-46s %s\n' "$1" "$2"; }
 ok() { note "$1" "ok"; }

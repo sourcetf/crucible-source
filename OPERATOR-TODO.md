@@ -127,8 +127,11 @@ ssl = { cert="real.pem", key="real.key.pem", cert_ec="cert_ec.pem", key_ec="key_
 ### B. admin 口令与暴露面
 
 - ✅ **已配置**（2026-11-06）：`[admin] listeners_allow = [8443]` ⇒ 管理面只在 TLS 口可达（此前为空 =
-  所有 listener 可达，其中 9095 是明文口且绑 0.0.0.0）。白名单外端口上 `/__admin` 回 **404**
-  （不是 401 —— 401 会诱出浏览器 Basic 口令框）。实测：`9095 /__admin`→404、`8443 /__admin`→401。
+  所有 listener 可达）。白名单外端口上 `/__admin` 回 **404**（不是 401 —— 401 会诱出浏览器
+  Basic 口令框）。实测：`8443 /__admin`→401（唯一白名单口）。
+- ✅ **明文应用口 9095 已移除**（2026-11-06）：18 条应用路由（/php /do /go …）迁到 **8443 TLS**，
+  9095 不再监听（实测连接被拒）。原 9095 的 `file_open`/autoindex 策略随迁；`server_name` 由
+  `apps.crucible.local` 变为 8443 的 `prod.crucible.local`（Host 不参与路由，仅影响 Location）。
 - 引擎出网：**未收紧，保持原状**（`/etc/pf.conf` 与上游 53 都放开）。`scripts/harden-egress-pf.sh`
   是**可选**工具、默认**不部署** —— 53 是功能（DNS/DoT/DoH/ECS/应用解析），不是洞；
   2026-11-06 曾误当漏洞封掉引擎 53，已回滚。要收紧时必须把应用真正需要的端口（含 53）显式列入。
@@ -172,9 +175,9 @@ bash scripts/build_app_engines.sh && bash scripts/build_script_ffi.sh
 ./bin/webserver --config config-test.toml --check-config        # rc=0
 cargo test --release --bin webserver --offline --features tls,tls_boring   # wave21b: 662/0/1
 sh scripts/accept-verify.sh --no-build                          # 302 PASS / 0 FAIL / 0 SKIP
-python3 scripts/verify_app_engines.py --port 9095               # 38/38
+python3 scripts/verify_app_engines.py                           # 38/38（默认 TLS 8443）
 python3 bench/h2_fair_gate.py                                   # 官方双门禁 exit 0
-python3 bench/app_engine_overhead.py --port 9095                # rust 延迟/static < 1.1
+python3 bench/app_engine_overhead.py --port 8443                # rust 延迟/static < 1.1
 ```
 （遗留栈 PASS=7、DNS bind 72/0 + unbound 59/0 + gap 75/0 + DoT443 28/0 的命令见 `README.md §4`。）
 
