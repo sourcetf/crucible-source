@@ -7126,3 +7126,37 @@ CG-02（P1）autoindex round-trip 已修且有往返单测。
 传递，单加 `O_NOFOLLOW` 会打断 docroot 内合法符号链接 = 砍功能）、B2 FFI 边界长度上界、
 B6 OCSP 验签、**B7 NSS 返回值 fail-closed（会让遗留 SSLv3/IE6 栈在个别 NSS 上起不来，按"不砍功能"不做）**、
 B9 DER 短长度（当前不可达）、B10 fuzz 目标。
+
+# 【agent-1009 · Wave-25】全库**功能性**审查（规格 ↔ 实现逐条对照，2026-11-07）
+
+**方法**：规格全文 `/mnt/c/Users/admin/Desktop/crucible/webserver-rebuild-prompt-v2.txt`（1368 行 §0–§23）
+按功能面拆 **6 个只读子 agent** 并行对照：①listeners/L4/核心请求路径；②静态/file_open/页面规则/访问日志/反代；
+③应用引擎（§7 + §16.3–16.9，含 18 个引擎逐个产物核对）；④Admin UI 12 选项卡 + 认证/文件管理；
+⑤TLS/遗留协议 + h2/h3/QMux（§6/§16.16/§16.17）；⑥GeoIP（§9 + §23 全篇）。子 agent 未改任何文件。
+完整清单：`.agents/1009/reports/functional-review-wave25.md`。
+
+**总览**：绝大多数条目**符合**（TLS/遗留协议面 20 条符合仅 1 缺失；应用引擎核心 12 条符合；
+Admin 12 tab 中 8 个完全符合；GeoIP 的 schema/合并算法/更新脚本/已知坑全符合）。
+
+**P0（会丢数据/挂死）**
+- **P0-1 TLS 内联 PEM/PSK 掩码往返会写坏配置 —— 这是 Wave-24 安全加固引入的回归**：
+  `mask_secrets` 把内联 `ssl.key` 等替换成 `"***"`，而 `/api/config/json` 是 TLS 表单唯一数据源，
+  回填后不改 key 直接保存 ⇒ `key = "***"` 写回，TLS 静默损坏。保存端需把 `***` 当"未改动"。
+- **P0-2 JSP「编译」按钮永久阻塞**：`dns/admin_api.rs:578-613` 跑 `java -jar jsp-sidecar.jar precompile`
+  且 `.output().await` 无超时，而 jar 只认 `--socket/--docroot` ⇒ 直接 `server.start()+join()` 不退，
+  还会在默认 sock 上起第二个 sidecar。
+
+**P1（缺失/伪实现）**：`upload_on_exists`(rename/skip/overwrite) 缺失；访问日志 **`level` 是伪实现**（配了不影响输出）；
+GeoIP **源权重是伪实现**（面板能改、merge 只用行内 weight）、**cron 是伪实现**（能配、无执行器）；
+「选项目录」不是独立第 12 tab；TSX 面板 API 未接线；`versions=["sslv3"]` 被校验白名单拒（与 `tls_version_index` 不一致）；
+**H3/QUIC 侧 PSK 缺失**；GeoIP 的自定义 geofeed / 字段管理 / 按源更新 / 脚本路径配置 均缺失；城市骨架层无 fetch；
+`libaxonasp.so` 未产出（现由 C 版实现）；mruby 链是空壳（`build_mruby.sh` 只写 stub 头）。
+
+**P2（口径差异）**：无 `server_names`/Host 维度多站点；`port_reuse` 字段语义与规格分叉（能力在，命名不同）；
+L4 只 TCP；`SO_BUSY_POLL` 未进默认 features；h2 明文 port_reuse 口缺 301；小文件缓存模式门控；符号链接策略口径；
+访问日志 realtime 是轮询非 SSE/WS；cgi 每请求 fork；aspnet 无 hostfxr 时 C mini 回 200；dlclose 默认关；
+`extensions` 空=任意扩展名；TSX watch 是轮询；概览对 PHP 恒 `ready:null`；面板不可编辑 §3.3 的 TSX/php_bin/deps_dir/
+init_timeout/libc/sandbox 字段；GeoIP 冲突未分 IP/ASN 两栏、筛选无别名下拉、`filter_agg.rs` 不存在；
+`.cursor/rules/perf-h2o-and-ultra-servers.mdc` 缺失；样例 apps 挂 8443 而非 §3.4 的 9095（Wave-23c 按用户指示主动迁移）。
+
+**注**：P0-1 是我上一轮安全加固引入的，建议优先修；P0-2 是真挂死。两条我都可以立刻修。
