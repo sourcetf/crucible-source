@@ -228,7 +228,7 @@ pub async fn execute_binary(
             None,
             None,
             Some(&bin),
-        );
+        )?;
         cmd.stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())

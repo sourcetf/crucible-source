@@ -210,6 +210,22 @@ static void psgi_hv_put(HV *hv, const char *key, const char *val)
     (void)hv_store(hv, key, (I32)strlen(key), newSVpv(val != NULL ? val : "", 0), 0);
 }
 
+/* 带**显式长度**的版本：请求体是二进制（可含 0x00）且 Rust 侧只保证 `body_len`
+ * 字节有效、**不保证**结尾有 NUL。用 `newSVpv(val, 0)` 会对 body 调 `strlen` ——
+ * 越过 `body_len` 一直读到相邻堆内存的 NUL：把越界字节当请求体交给 Perl 应用
+ * （应用回显即远程堆信息泄露），并使二进制 body 被静默截断而 CONTENT_LENGTH 仍报完整值。
+ * 安全审查 2026-11-06 的 P1-1。 */
+static void psgi_hv_putn(HV *hv, const char *key, const char *val, size_t len)
+{
+    if (hv == NULL || key == NULL)
+        return;
+    if (val == NULL) {
+        val = "";
+        len = 0;
+    }
+    (void)hv_store(hv, key, (I32)strlen(key), newSVpvn(val, len), 0);
+}
+
 /* 请求头块（PSGI 头可为 arrayref [k,v,...] 或 hashref）写入 out。 */
 static void psgi_emit_headers(crucible_buf *out, SV *hsv)
 {
@@ -309,7 +325,8 @@ static int psgi_request(const char *script, const char *method, const char *path
     psgi_hv_put(req, "server_name",
                 server_name != NULL && server_name[0] != '\0' ? server_name : "crucible");
     psgi_hv_put(req, "server_port", portbuf);
-    psgi_hv_put(req, "body", body != NULL ? body : "");
+    /* 请求体走**长度版**：不能对二进制体做 strlen（见 psgi_hv_putn 的说明）。 */
+    psgi_hv_putn(req, "body", body, body != NULL ? body_len : 0);
     /* ABI 请求头块：驱动片段展开为 $env->{HTTP_*} 并同步 %ENV。 */
     psgi_hv_put(req, "headers", headers != NULL ? headers : "");
 

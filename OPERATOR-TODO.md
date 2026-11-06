@@ -190,3 +190,22 @@ python3 bench/app_engine_overhead.py --port 8443                # rust 延迟/st
   `connect_udp_framing` 默认 `auto`（按对端能力协商 DATAGRAM/capsule/长度前缀）。
 - **配置预检**：改动配置后先 `--check-config` 再重启（新校验误拒生产配置两次事故后的固定流程）。
 - **磁盘**：长期 95%，构建脚本末尾回收 dev 产物；已 gzip 压缩 `state/dns/log/` 下废弃的 named.log（**未删除**，`zcat` 可读）。
+
+### G. 实现安全审查（Wave-24，2026-11-06）
+
+已修 15 项（含 4 个 P1）：降权解析失败改 fail-closed、`chown_tree` 不再跟随符号链接、
+`init.sh` 降权执行、psgi 请求体不再当 C 字符串（越界读）、chroot 下 jail 根权限跟随
+`docroot_rw`、自签证书序列号改随机、SSLv2 MAC 常数时间比较、密钥材料释放前清零、
+pyembed 响应体 64MiB 上限、转发剥离客户端 Content-Length、上传区间长度改 checked、
+管理员会话绑定账号并在改密/删号时定向销毁、配置 JSON 脱敏补全（含内联 TLS/PSK）、
+`/api/login` body 上限 32MiB→8KiB、`/__metrics` 尊重 `listeners_allow`。
+完整清单与证据：`.agents/1009/reports/security-audit-wave24.md`。
+
+**待办（已定位、未改，逐条给了做法）**：
+- 静态文件 `canonicalize→open` 的符号链接 TOCTOU（需逐级 `openat(O_NOFOLLOW)` + fd 传递，属重构）。
+- FFI 边界只信 NUL 结尾（把 `len` 当硬上界先拷出再找 NUL）。
+- Basic 认证按用户名短路的时序（对 dummy hash 也跑一次 verify）。
+- `geoip` 的 `with_capacity(Content-Length)` 夹上限；`parse_ranges` 段数上限。
+- OCSP 装订物验 responder 签名；NSS shim 返回值 fail-closed。
+- 引擎日志/状态目录由父进程创建时为 0644（`OpenOptionsExt::mode(0o600)`）。
+- fuzz 缺口：`dot_doh.rs` 名字解析、`tls/client_hello.rs`、`connect_udp.rs`、`parse_content_range`、`proxy.rs` 上游响应解析。

@@ -1652,7 +1652,7 @@ async fn handle_h2(
     // **之前**（listener 口令与「谁能抓指标」是两件事），指标的门在 telemetry 内部按
     // [admin].metrics_public 判定（默认要求管理员凭据）。
     if let Some(resp) =
-        crate::server::telemetry::maybe_handle_simple(&req, &snap.telemetry, &snap.admin, peer.ip())
+        crate::server::telemetry::maybe_handle_simple(&req, &snap.telemetry, &snap.admin, peer.ip(), lc.port)
     {
         return tag(resp, "telemetry");
     }
@@ -1801,8 +1801,14 @@ async fn handle_h2(
     // admin：P1-4——走与 h1 完全一致的 admin::handle（UI + 全部 API + CSRF/Basic 鉴权）。
     // 旧实现对 /__admin/api/* 只回 UI shell，新二进制一旦链接 12 个 tab 的 API 在 h2 全失效。
     if crate::server::access::is_admin_path(&snap.admin.path, &path) {
-        // admin::handle 是 h1 体类型（Bytes）的接口：先收齐（≤8MiB）。
-        let req = match collect_bytes(req, REQUEST_BODY_CAP).await {
+        // admin::handle 是 h1 体类型（Bytes）的接口：先收齐。登录端点只用 8KiB
+        // （免凭据路径 + 未认证客户端 ⇒ 内存放大，安全审查 2026-11-06 的 P2-3）。
+        let cap = if crate::server::basic_auth::is_admin_login_path(&path) {
+            crate::server::basic_auth::ADMIN_LOGIN_BODY_CAP
+        } else {
+            REQUEST_BODY_CAP
+        };
+        let req = match collect_bytes(req, cap).await {
             Ok(r) => r,
             Err(resp) => return tag(resp, "admin"),
         };

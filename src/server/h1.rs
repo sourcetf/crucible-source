@@ -634,7 +634,7 @@ async fn handle_request_inner(
     // 位置与 DoH 对齐——排在 basic_auth **之前**：listener 口令与「谁能抓指标」是两件事，
     // 指标的门在 telemetry 内部按 [admin].metrics_public 判定（默认要求管理员凭据）。
     if let Some(resp) =
-        crate::server::telemetry::maybe_handle(&req, &snap.telemetry, &snap.admin, peer.ip())
+        crate::server::telemetry::maybe_handle(&req, &snap.telemetry, &snap.admin, peer.ip(), lc.port)
     {
         return tag(resp, "telemetry");
     }
@@ -861,14 +861,21 @@ async fn handle_request_inner(
         //
         // 收 body **之前**先按声明的 Content-Length 廉价拒绝：CL 已超上限时直接 413，
         // 既不读 body，也不会回 100 Continue（见 `content_length_too_large`）。
-        if content_length_too_large(req.headers(), ADMIN_BODY_CAP) {
+        // 登录端点的体只有一个 JSON：用 8KiB 的小上限，别按 32MiB 缓冲
+        // （免凭据路径 + 未认证客户端 ⇒ 内存放大，安全审查 2026-11-06 的 P2-3）。
+        let body_cap = if crate::server::basic_auth::is_admin_login_path(&path) {
+            crate::server::basic_auth::ADMIN_LOGIN_BODY_CAP
+        } else {
+            ADMIN_BODY_CAP
+        };
+        if content_length_too_large(req.headers(), body_cap) {
             return tag(
                 body_read_response(BodyReadErr::TooLarge, "admin request body too large"),
                 "acl",
             );
         }
         let (parts, body) = req.into_parts();
-        let bytes = match collect_body_capped(body, ADMIN_BODY_CAP).await {
+        let bytes = match collect_body_capped(body, body_cap).await {
             Ok(b) => b,
             Err(e) => {
                 return tag(

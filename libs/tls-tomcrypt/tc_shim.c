@@ -194,6 +194,30 @@ static int tc_out_append(crucible_tomcrypt_conn *c, const uint8_t *data, size_t 
 /* /dev/urandom is available on both Linux and OpenBSD. The values are session
  * and connection identifiers, not long-term secrets, but they must not repeat
  * between connections. */
+/* 常数时间比较：`memcmp` 在第一个不同字节就返回 —— 攻击者可逐字节翻转密文并测量
+ * "连接被关闭"的时序差来恢复 MAC（SSLv2 用 RC4 流密码，翻转密文即线性翻转解密后的
+ * MAC 字段，非常适合逐字节 oracle）。异或累加再判零与"第几个字节不同"无关。
+ * 协议与算法保持原样（安全审查 2026-11-06 的 P2-1）。 */
+static int ct_mem_equal(const uint8_t *a, const uint8_t *b, size_t n)
+{
+    uint8_t diff = 0;
+    size_t i;
+    for (i = 0; i < n; i++)
+        diff |= (uint8_t)(a[i] ^ b[i]);
+    return diff == 0;
+}
+
+/* 密钥材料安全清零：`volatile` 写防止编译器把"死存储"优化掉（普通 memset 会被删）。
+ * 用完不清零 ⇒ 长期运行 + 堆/栈复用下，前一会话的 master/写密钥留在内存里，
+ * 任何后续泄露原语都能读到（安全审查 2026-11-06 的 P2-2）。 */
+static void secure_zero(void *p, size_t n)
+{
+    volatile uint8_t *v = (volatile uint8_t *)p;
+    while (n--) {
+        *v++ = 0;
+    }
+}
+
 static int random_bytes(uint8_t *buf, size_t len) {
     FILE *f = fopen("/dev/urandom", "rb");
     size_t got = 0;
@@ -411,7 +435,7 @@ static int ssl2_recv_record(crucible_tomcrypt_conn *c, uint8_t **out, size_t *ou
             free(buf);
             return -1;
         }
-        if (memcmp(mac, buf, SSL2_MAC_MD5_SIZE) != 0) {
+        if (!ct_mem_equal(mac, buf, SSL2_MAC_MD5_SIZE)) {
             free(buf);
             return -1;
         }
@@ -503,7 +527,7 @@ static int tc_process_record(crucible_tomcrypt_conn *c) {
             if (ssl2_record_mac(c->client_write_key, payload + SSL2_MAC_MD5_SIZE,
                                 data_len + padding, c->read_seq, mac) != 0) {
                 err = 1;
-            } else if (memcmp(mac, payload, SSL2_MAC_MD5_SIZE) != 0) {
+            } else if (!ct_mem_equal(mac, payload, SSL2_MAC_MD5_SIZE)) {
                 err = 1;
             } else {
                 c->read_seq++;
@@ -629,6 +653,8 @@ static int sslv2_read_client_master_key(crucible_tomcrypt_conn *c) {
         size_t take = dec_len < room ? dec_len : room;
         memcpy(c->master_key + clear_len, decrypted, take);
     }
+    /* 解出的 premaster 立即从栈上抹掉（它参与导出全部会话密钥）。 */
+    secure_zero(decrypted, sizeof(decrypted));
     free(rec);
     return 0;
 }
@@ -1091,5 +1117,8 @@ void crucible_tomcrypt_free(crucible_tomcrypt_conn *c) {
         close(c->fd);
         c->fd = -1;
     }
+    /* 结构里躺着 master_key / server_write_key / client_write_key / RC4 状态：
+     * 释放前整块抹掉，别留给下一次堆分配（安全审查 2026-11-06 的 P2-2）。 */
+    secure_zero(c, sizeof(*c));
     free(c);
 }

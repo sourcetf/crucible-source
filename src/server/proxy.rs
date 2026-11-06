@@ -904,7 +904,17 @@ async fn proxy_once(
     let conn_tokens: Vec<String> = connection_tokens(&parts.headers);
     for (k, v) in parts.headers.iter() {
         let kl = k.as_str().to_ascii_lowercase();
-        if k == HOST || HOP_BY_HOP.contains(&kl.as_str()) || conn_tokens.contains(&kl) {
+        // `content-length` 必须**剥掉**：body 是上面全量收齐的 `bytes`，定界由
+        // `Full<Bytes>` 的 size_hint 决定。转发客户端声明的 CL 时，若它不等于真实
+        // body 长度（h3 侧下 h3 crate 完全不校验 CL 与 DATA 一致，见安全审查
+        // 2026-11-06 的 P2-1），上游按错的长度定界 ⇒ 静默截断；一旦将来换编码器把
+        // 余下字节追加，就是 TE.CL 型请求走私原语。规则注入方向早已禁 CL（见下方
+        // `modify_request_headers` 分支），客户端方向此前漏了，这里补齐，口径一致。
+        if k == HOST
+            || kl == "content-length"
+            || HOP_BY_HOP.contains(&kl.as_str())
+            || conn_tokens.contains(&kl)
+        {
             continue;
         }
         // 整个转发头族（Forwarded / X-Forwarded-* / X-Real-IP）由下面自行计算后注入。

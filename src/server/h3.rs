@@ -1778,6 +1778,7 @@ use chunked uploads (Content-Range) or HTTP/1.1 for larger bodies",
             &snap.telemetry,
             &snap.admin,
             peer.ip(),
+            lc.port,
         ) {
             return tag(resp, "telemetry");
         }
@@ -1897,8 +1898,14 @@ use chunked uploads (Content-Range) or HTTP/1.1 for larger bodies",
     // P1-4：admin 走与 h1/h2 一致的完整 handle（旧实现只回 UI shell）。
         // 注：旧实现把 admin 放在 ip_access 之前，这里一并修正为规格顺序。
         if crate::server::access::is_admin_path(&snap.admin.path, &path) {
-            // admin::handle 是 h1 体类型（Bytes）的接口：先收齐（≤8MiB）。
-            let req = match h3_collect_bytes(req, REQUEST_BODY_CAP).await {
+            // admin::handle 是 h1 体类型（Bytes）的接口：先收齐。登录端点只用 8KiB
+            // （免凭据路径 + 未认证客户端 ⇒ 内存放大，安全审查 2026-11-06 的 P2-3）。
+            let cap = if crate::server::basic_auth::is_admin_login_path(&path) {
+                crate::server::basic_auth::ADMIN_LOGIN_BODY_CAP
+            } else {
+                REQUEST_BODY_CAP
+            };
+            let req = match h3_collect_bytes(req, cap).await {
                 Ok(r) => r,
                 Err(resp) => return tag(resp, "admin"),
             };

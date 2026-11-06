@@ -770,7 +770,7 @@ pm.max_requests = 10000
         Some(&state_dir),
         Some(&host_tmp),
         Some(Path::new(&fpm_bin)),
-    );
+    )?;
     let mut child = crate::server::apps::child_registry::spawn_tracked(
         &mut cmd,
         &format!("php-fpm {key}"),
@@ -852,7 +852,7 @@ async fn start_cgi(
             Some(&state_dir),
             Some(&tmp_dir),
             Some(Path::new(&cgi_bin)),
-        );
+        )?;
         let mut child = crate::server::apps::child_registry::spawn_tracked(
             &mut cmd,
             &format!("php-cgi {key}"),

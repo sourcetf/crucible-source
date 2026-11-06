@@ -339,6 +339,20 @@ fn gen_self_signed(
 
     let mut b = X509Builder::new().context("X509Builder")?;
     b.set_version(2).context("set_version")?;
+    // 序列号：RFC 5280 §4.1.2.2 要求**正整数且每个 CA 唯一**。此前从未 set —— BoringSSL 的
+    // `X509_new()` 把 `serialNumber` 建成空的 `ASN1_INTEGER`，编码时按"零的规范形式"写成
+    // `INTEGER 0x00`，于是**每张自签证书的序列号都是 0**（安全审查 2026-11-06）：
+    // 严格校验器（`openssl verify -x509_strict`）会拒，吊销/去重也失去可辨别性。
+    // 用 BoringSSL 的 CSPRNG 取 16 字节、去高位置正、避开 0。
+    let mut serial_bytes = [0u8; 16];
+    boring::rand::rand_bytes(&mut serial_bytes).context("序列号随机字节")?;
+    serial_bytes[0] &= 0x7f;
+    if serial_bytes[0] == 0 {
+        serial_bytes[0] = 1;
+    }
+    let serial_bn = boring::bn::BigNum::from_slice(&serial_bytes).context("序列号 BigNum")?;
+    let serial = boring::asn1::Asn1Integer::from_bn(&serial_bn).context("序列号 ASN1")?;
+    b.set_serial_number(&serial).context("set_serial_number")?;
     b.set_subject_name(&name).context("set_subject")?;
     b.set_issuer_name(&name).context("set_issuer")?;
     b.set_pubkey(&pkey).context("set_pubkey")?;

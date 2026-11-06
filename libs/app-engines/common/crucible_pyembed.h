@@ -122,6 +122,12 @@ static int g_py_state;            /* 0=未尝试 1=就绪 -1=失败 */
 /* 1 = 正处在「初始化锁内的视图清理回调」上下文（此时 g_py_state 仍是 0，但解释器
  * 已初始化、g_py 表已加载；只允许本线程的 env_view 走通，见该函数）。 */
 static int g_py_init_scrub_ctx;
+/* WSGI/ASGI 响应体上限（与其它引擎同口径：cgi 32MiB / lua 64MiB / rack 32MiB）。
+ * 应用返回超大或**无限**可迭代对象时，C 侧拼接此前无界增长 —— 宿主在 Rust 侧
+ * 检查 `UPSTREAM_BODY_CAP` 之前就已经 OOM（安全审查 2026-11-06 的 P2-1）。
+ * `g_py_body_overflow` 在每请求开始时清零（见 crucible_py_request_env_begin）。 */
+#define CRUCIBLE_PY_BODY_CAP (64u * 1024u * 1024u)
+static int g_py_body_overflow;
 static char g_py_init_err[256];
 static char g_py_version[96];
 static void *g_py_tstate;         /* PyEval_SaveThread 保存的初始化线程状态 */
@@ -446,6 +452,12 @@ static int crucible_py_append_obj(crucible_buf *bb, void *o)
 
     if (bb == NULL || o == NULL || g_py_state != 1)
         return -1;
+    /* 硬上限：超过就**停止拼接并置标志**（调用方据此回 502，而不是发一个截断的 200，
+     * 也不是让宿主进程被无限响应撑爆）。 */
+    if (bb->len >= CRUCIBLE_PY_BODY_CAP) {
+        g_py_body_overflow = 1;
+        return -1;
+    }
     if (g_py.bytes_as_string_and_size(o, &bs, &bn) == 0)
         return crucible_buf_append(bb, bs, (size_t)bn);
     crucible_py_clear_error();
@@ -1210,6 +1222,8 @@ static int crucible_py_reqenv_cb(void *ctx, const char *k, const char *v)
 static int crucible_py_request_env_begin(const char *extra)
 {
     struct crucible_py_reqenv_ctx ctx;
+    /* 每请求复位响应体溢出标志（必须在这几个早退 return 之前）。 */
+    g_py_body_overflow = 0;
     void *args, *res;
 
     if (g_py_reqenv_set == NULL || g_py.dict_new == NULL)
@@ -2073,6 +2087,12 @@ static int crucible_py_wsgi_request(const char *label, const char *script,
     }
     if (hb.len == 0)
         (void)crucible_buf_puts(&hb, "Content-Type: text/plain; charset=utf-8\r\n");
+    /* 响应体超限：**如实报错**（app_ffi 变成 502），不把截断的 body 当 200 发出去。 */
+    if (g_py_body_overflow) {
+        rc = crucible_py_fail(out, "响应体超出上限（%u MiB）",
+                              (unsigned)(CRUCIBLE_PY_BODY_CAP >> 20));
+        goto done;
+    }
     appengine_result_set_headers(out, hb.p != NULL ? hb.p : "");
     appengine_result_set_body(out, bb.p != NULL ? bb.p : "", bb.len);
     rc = 0;
@@ -2353,6 +2373,12 @@ static int crucible_py_asgi_request(const char *label, const char *script,
     }
     if (hb.len == 0)
         (void)crucible_buf_puts(&hb, "Content-Type: text/plain; charset=utf-8\r\n");
+    /* 响应体超限：**如实报错**（app_ffi 变成 502），不把截断的 body 当 200 发出去。 */
+    if (g_py_body_overflow) {
+        rc = crucible_py_fail(out, "响应体超出上限（%u MiB）",
+                              (unsigned)(CRUCIBLE_PY_BODY_CAP >> 20));
+        goto done;
+    }
     appengine_result_set_headers(out, hb.p != NULL ? hb.p : "");
     appengine_result_set_body(out, bb.p != NULL ? bb.p : "", bb.len);
     rc = 0;

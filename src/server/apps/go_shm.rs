@@ -308,7 +308,7 @@ fn ensure_runtime(
         Some(&state_dir),
         None,
         Some(&bin),
-    );
+    )?;
     // **运行时硬化**：Go 1.24+ 在 Linux 上**默认**为监听 socket 启用 MPTCP，而
     // CVE-2026-98432（Linux IPv4 TCP 握手 UAF）在 MPTCP 路径上有公开 PoC —— 默认
     // 开 MPTCP 等于替攻击者满足前置条件。显式关掉：Go 侧 `multipathtcp=0`

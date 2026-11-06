@@ -37,6 +37,8 @@ pub fn metrics_body() -> String {
 
 /// `/__metrics` 的访问判定（三协议共用一个判定，各自拼自己的体类型）。
 enum MetricsAccess {
+    /// 该 listener 不在 `[admin].listeners_allow` 内：当作"这里没有指标端点"（404）。
+    NotFound,
     /// 放行：`metrics_public = true`，或已通过管理员鉴权门。
     Serve,
     /// 拒绝：(状态码, Retry-After 秒数, 文案)。
@@ -55,7 +57,19 @@ enum MetricsAccess {
 ///
 /// 401 与 admin 一致带 `WWW-Authenticate`（否则客户端不知道要发凭据）；退避期回 429
 /// 而不是 401 —— 与 admin 路径同一语义（401 会被反复重试，反而放大请求量）。
-fn metrics_access<T>(req: &Request<T>, admin: &AdminConfig, ip: IpAddr) -> MetricsAccess {
+fn metrics_access<T>(
+    req: &Request<T>,
+    admin: &AdminConfig,
+    ip: IpAddr,
+    port: u16,
+) -> MetricsAccess {
+    // 与 admin 面板同一条暴露面判据（`[admin].listeners_allow`）：白名单外的 listener 上
+    // **根本没有管理面** —— 此前 `/__metrics` 漏了这一步，于是配了白名单时，非白名单
+    // （可能是明文）口上仍会接受/弹出 admin Basic 凭据，与 h1/h2/h3 的 admin 语义不一致。
+    // 安全审查 2026-11-06 的 P3-3。
+    if !admin.listener_allowed(port) {
+        return MetricsAccess::NotFound;
+    }
     // 开关在 `[admin]` 上（metrics_public）—— 与它复用的 admin 口令校验同属一处配置。
     if admin.metrics_public {
         return MetricsAccess::Serve;
@@ -90,6 +104,7 @@ pub fn maybe_handle(
     cfg: &TelemetryConfig,
     admin: &AdminConfig,
     ip: IpAddr,
+    port: u16,
 ) -> Option<Response<BoxBody>> {
     if !cfg.enabled {
         return None;
@@ -106,7 +121,8 @@ pub fn maybe_handle(
                 .unwrap(),
         );
     }
-    match metrics_access(req, admin, ip) {
+    match metrics_access(req, admin, ip, port) {
+        MetricsAccess::NotFound => None,
         MetricsAccess::Serve => Some(metrics_response()),
         MetricsAccess::Reject(status, retry, msg) => Some(
             reject_parts(status, retry, &admin.realm)
@@ -126,6 +142,7 @@ pub fn maybe_handle_simple<T>(
     cfg: &TelemetryConfig,
     admin: &AdminConfig,
     ip: IpAddr,
+    port: u16,
 ) -> Option<Response<Bytes>> {
     if !cfg.enabled || req.uri().path() != cfg.path {
         return None;
@@ -138,7 +155,8 @@ pub fn maybe_handle_simple<T>(
                 .unwrap(),
         );
     }
-    match metrics_access(req, admin, ip) {
+    match metrics_access(req, admin, ip, port) {
+        MetricsAccess::NotFound => None,
         MetricsAccess::Serve => {
             let body = metrics_body();
             Some(

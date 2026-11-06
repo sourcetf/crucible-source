@@ -194,7 +194,8 @@ async fn handle_login(
     // U-13：会话 TTL 来自 `[admin] session_ttl_secs`（默认 8h）。服务端与会话
     // cookie 的 Max-Age/Expires 使用同一份值，客户端与服务端同时到期。
     let ttl = cfg.admin.session_ttl();
-    let token = crate::server::basic_auth::create_admin_session(ttl);
+    // 会话**绑定到账号**：改口令/删账号时据此定向销毁（安全审查 2026-11-06 P2-1）。
+    let token = crate::server::basic_auth::create_admin_session_bound(ttl, Some(body.username.clone()));
     let mut resp = json_ok("{\"ok\":true,\"cookie_set\":true}".to_string());
     match http::HeaderValue::from_str(&crate::server::basic_auth::admin_session_set_cookie(
         &token, ttl,
@@ -1263,9 +1264,17 @@ async fn handle_inner(
                     .unwrap_or_else(|| "admin".into());
                 // 先持久化到 config.toml；失败则至少保留内存态，不让账号锁死。
                 match cfg_edit::persist_admin_password(&live, &username, &h) {
-                    Ok(()) => text_ok("ok"),
+                    Ok(()) => {
+                        // 旧口令签发的会话必须立即失效：否则被窃 cookie 在口令轮换后
+                        // 仍能用满 TTL（安全审查 2026-11-06 P2-1）。
+                        let n = crate::server::basic_auth::destroy_sessions_for_user(&username);
+                        log::info!("admin: 口令已更新（{username}），销毁其 {n} 个旧会话");
+                        text_ok("ok")
+                    }
                     Err(e) => {
                         live.update_admin_hash(h);
+                        let n = crate::server::basic_auth::destroy_sessions_for_user(&username);
+                        log::info!("admin: 口令已更新（仅内存，{username}），销毁其 {n} 个旧会话");
                         text_err(
                             StatusCode::INTERNAL_SERVER_ERROR,
                             format!("已写入内存（重启丢失），磁盘持久化失败: {e:#}"),
@@ -1541,7 +1550,11 @@ fn save_admin_user(live: &Arc<LiveConfig>, v: &Json) -> Response<BoxBody> {
                 return bad_request("不能删除最后一个用户（否则管理面将永久 401 锁死）");
             }
             arr.remove(i);
-            finish_write(live, &tree, &format!("user {username} deleted"))
+            let resp = finish_write(live, &tree, &format!("user {username} deleted"));
+            // 账号已删：其已签发的会话必须同时失效（安全审查 2026-11-06 P2-1）。
+            let n = crate::server::basic_auth::destroy_sessions_for_user(&username);
+            log::info!("admin: 已删除用户 {username}，销毁其 {n} 个会话");
+            resp
         }
         "pass" => {
             let Some(i) = pos else {
@@ -3112,6 +3125,12 @@ fn engine_runtime_status(
 /// - `dns.geo.mmdb.license_key`：MaxMind 许可证密钥；DNS tab 从 /api/dns/status
 ///   单独读取，全量 JSON 里不再扩散。
 fn mask_secrets(v: &mut Json) {
+    // 口径：**凡是凭据材料都不下发给面板**。此前只打了 admin 口令哈希与 geoip license_key，
+    // 而 `/api/config/json` 是 `serde_json::to_value(&cfg)` 全量序列化 ⇒ 下列仍然明文出去：
+    //   * `listeners[].basic_auth.password_hash`（每站 Basic 口令哈希）
+    //   * `listeners[].ssl.key/key_ec/ech_keys/psk_key/ech_cover_key*` —— 这些字段
+    //     **允许内联 PEM/hex**（见 `ssl_material.rs`），内联时下发的就是**私钥本体**。
+    // 面板任何 XSS 或第三方脚本就能直接读走。（安全审查 2026-11-06 的 P2-2）
     if let Some(users) = v.pointer_mut("/admin/users").and_then(|u| u.as_array_mut()) {
         for u in users.iter_mut() {
             if let Some(o) = u.as_object_mut() {
@@ -3124,6 +3143,42 @@ fn mask_secrets(v: &mut Json) {
     if let Some(o) = v.pointer_mut("/dns/geo/mmdb").and_then(|m| m.as_object_mut()) {
         if o.contains_key("license_key") {
             o.insert("license_key".into(), Json::String(String::new()));
+        }
+    }
+    // 每站 Basic 口令哈希。
+    if let Some(ls) = v.pointer_mut("/listeners").and_then(|l| l.as_array_mut()) {
+        for l in ls.iter_mut() {
+            if let Some(o) = l.as_object_mut() {
+                if let Some(ba) = o.get_mut("basic_auth").and_then(|b| b.as_object_mut()) {
+                    if ba.contains_key("password_hash") {
+                        ba.insert("password_hash".into(), Json::String("***".into()));
+                    }
+                }
+                // 内联 TLS/PSK 材料（字段名与 config.toml 的 `[listeners.ssl]` 一致）。
+                if let Some(ssl) = o.get_mut("ssl").and_then(|s| s.as_object_mut()) {
+                    for key in [
+                        "key",
+                        "key_ec",
+                        "ech_keys",
+                        "ech_cover_key",
+                        "ech_cover_key_ec",
+                        "psk_key",
+                        "client_ca",
+                    ] {
+                        if let Some(slot) = ssl.get_mut(key) {
+                            // 只打码**内联内容**：路径形态（不含换行/"BEGIN"）保留，
+                            // 否则面板就看不到自己配的是哪个文件了。
+                            let inline = slot
+                                .as_str()
+                                .map(|t| t.contains("-----BEGIN") || t.contains('\n'))
+                                .unwrap_or(false);
+                            if inline {
+                                *slot = Json::String("***".into());
+                            }
+                        }
+                    }
+                }
+            }
         }
     }
 }

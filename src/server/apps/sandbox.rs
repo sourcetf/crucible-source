@@ -61,6 +61,13 @@ pub struct SandboxSpec {
     /// `None` = 不降权（保持旧行为；仅用于本地非 root 开发）。
     pub uid: Option<libc::uid_t>,
     pub gid: Option<libc::gid_t>,
+    /// **只降权**：跳过 unveil/pledge/chroot，只做 `umask` + `setgroups/setgid/setuid`。
+    ///
+    /// 给「必须宽松文件系统与网络访问」的**构建脚本**用（`init.sh` 里的 pip/npm/make）：
+    /// 它们不能进 unveil（要写 deps、要访问网络、要 fork 一堆工具），但**绝不能以 root 跑**
+    /// —— 应用开了 `docroot_rw` 时能自己改写 `init.sh`，root 执行即主机接管
+    /// （安全审查 2026-11-06 的 P1-3）。
+    pub drop_only: bool,
 }
 
 impl SandboxSpec {
@@ -144,6 +151,7 @@ impl SandboxSpec {
             let engine = self.engine_hint.clone();
             let uid = self.uid;
             let gid = self.gid;
+            let drop_only = self.drop_only;
             unsafe {
                 use std::os::unix::process::CommandExt;
                 cmd.pre_exec(move || {
@@ -156,7 +164,19 @@ impl SandboxSpec {
                     // 其它引擎，它们同为 `www`）都能**绕过 webserver** 直连该应用。
                     // 那两处已改成 0600；umask 是防同类问题再出现的兜底（新引擎若只是
                     // 依赖默认权限，就会天然是 0700/0600 而不是 0777&~022）。
-                    libc::umask(0o077);
+                    if drop_only {
+                        // **构建脚本**（init.sh）产出的是给引擎读的工件（`deps/bin/index` 等），
+                        // 而且常被**同一个 docroot 下的多个应用**共享 ⇒ 必须保持 0755 语义。
+                        // 用 077 会让它创建的 `deps/bin` 变成 0700，共用 docroot 的另一个应用
+                        // 连目录都进不去 —— 真机实测：`/jsp/` 502，因为 `do` 建的
+                        // `www-apps/jsp/deps/bin` 是 `_c_do:0700`（安全审查 2026-11-06 修复回归）。
+                        libc::umask(0o022);
+                    } else {
+                        // 引擎侧相反：它创建的 socket/日志/缓存默认**仅属主**可访问。
+                        libc::umask(0o077);
+                    }
+                    // `drop_only`：只降权，不做文件视图/系统调用面收缩（构建脚本用）。
+                    if !drop_only {
                     // ① 揭示路径（顺序无关，但必须在锁之前）。
                     for (p, m) in &reveals {
                         if libc::unveil(p.as_ptr(), m.as_ptr()) == -1 {
@@ -191,6 +211,7 @@ impl SandboxSpec {
                             libc::_exit(127);
                         }
                     }
+                    } // end if !drop_only（unveil + 锁 + chroot）
                     // ④ **降权**：setgroups → setgid → setuid（顺序不可颠倒）。
                     //
                     // 落在 chroot 之后、pledge 之前：chroot 需要 root，pledge 之后
@@ -224,6 +245,7 @@ impl SandboxSpec {
                             libc::_exit(127);
                         }
                     }
+                    if !drop_only {
                     // ⑤ pledge（最后一步：它之后连 unveil 都不能再调）。
                     if let Some(p) = &pledge {
                         let ep = pledge_exec
@@ -236,6 +258,7 @@ impl SandboxSpec {
                             libc::_exit(127);
                         }
                     }
+                    } // end if !drop_only（pledge）
                     Ok(())
                 });
             }
@@ -247,6 +270,31 @@ impl SandboxSpec {
             Ok(())
         }
     }
+}
+
+/// **只降权**版：给构建脚本（`init.sh`）用。不做 unveil/pledge/chroot。
+///
+/// 返回解析出的 `(uid, gid)`；配置为不降权（`none`/`root`/`-`/空）时返回 `None`。
+/// **fail-closed**：用户名解析失败直接返回错误（调用方应中止 spawn），绝不静默以 root 跑。
+pub fn apply_drop_only(
+    cmd: &mut std::process::Command,
+    user: Option<&str>,
+    group: Option<&str>,
+) -> std::io::Result<Option<(libc::uid_t, libc::gid_t)>> {
+    let (uid, gid) = match resolve_ids(user, group)? {
+        Some(x) => x,
+        None => return Ok(None),
+    };
+    let spec = SandboxSpec {
+        enabled: true,
+        engine_hint: "deps-init".to_string(),
+        uid: Some(uid),
+        gid: Some(gid),
+        drop_only: true,
+        ..Default::default()
+    };
+    spec.apply(cmd)?;
+    Ok(Some((uid, gid)))
 }
 
 /// 各 spawn 入口的统一接线：按应用配置组装规格、打一行可观测日志、挂到 `Command`。
@@ -263,19 +311,26 @@ pub fn apply_for_app(
     state_dir: Option<&Path>,
     tmp_dir: Option<&Path>,
     bin: Option<&Path>,
-) -> SandboxSpec {
+) -> std::io::Result<SandboxSpec> {
     let mut interp = bin
         .map(|b| interp_roots_for(engine, b))
         .unwrap_or_default();
     interp.extend(engine_artifact_roots(engine, true));
-    // 降权目标：配置里的 user/group（默认 `www`）。解析失败 ⇒ 报错路径见下，
-    // **不静默以 root 跑**（那正是本机制要消灭的状态）。
+    // 降权目标：配置里的 user/group（默认 `www`）。
+    //
+    // **fail-closed**：解析失败（用户名拼错、目标机上没有该用户）必须让**引擎起不来**，
+    // 绝不能 `(None, None)` 继续 —— 那是"以 root 跑"，正是本机制要消灭的状态。
+    // 安全审查（2026-11-06）实测此处曾是 `log::error!` + `(None, None)` 的 fail-open，
+    // 与紧邻的文档承诺直接矛盾：配置里把 `user` 打错一个字母，整套降权/沙箱就静默失效
+    // （引擎仍 unveil+pledge，但以 webserver 身份 = root 运行，且 root 可以重新 unveil 自己）。
     let (uid, gid) = match resolve_ids(app_cfg.user.as_deref(), app_cfg.group.as_deref()) {
         Ok(Some((u, g))) => (Some(u), Some(g)),
         Ok(None) => (None, None),
         Err(e) => {
-            log::error!("sandbox[{engine}]: 降权用户解析失败（本次将以当前身份运行）: {e}");
-            (None, None)
+            log::error!(
+                "sandbox[{engine}]: 降权用户解析失败，拒绝启动该引擎（fail-closed）: {e}"
+            );
+            return Err(e);
         }
     };
     let mut spec = build_spec(engine, docroot, state_dir, tmp_dir, &interp, bin, app_cfg);
@@ -300,10 +355,10 @@ pub fn apply_for_app(
         }
     }
     log::info!("sandbox[{engine}]: {}", spec.summary());
-    if let Err(e) = spec.apply(cmd) {
-        log::warn!("sandbox[{engine}]: 挂钩失败（子进程将无隔离）: {e}");
-    }
-    spec
+    // 挂钩失败同样 fail-closed：`apply()` 只在参数非法（路径/权限串含 NUL）时报错，
+    // 继续 spawn 会得到一个**完全无隔离**的子进程，与"绝不静默降级"相悖。
+    spec.apply(cmd)?;
+    Ok(spec)
 }
 
 // ---------------------------------------------------------------- 策略表
@@ -436,38 +491,135 @@ fn bad(msg: String) -> std::io::Error {
 /// 非 root 运行（本地开发）时 chown 会 EPERM：这里**只记日志不报错**，因为本地
 /// 本来就不降权（`uid/gid` 为 `None` 时根本不该调本函数）。
 pub fn chown_tree(path: &Path, uid: libc::uid_t, gid: libc::gid_t) -> std::io::Result<()> {
+    // **安全审查（2026-11-06）修正**：此前这里用 `libc::chown`（**跟随符号链接**）+
+    // `read_dir`/`file_type()` 递归。后果是一名已被攻破的引擎（它合法拥有自己的
+    // `state/<key>` 目录）可以在里面放一个 `x -> /etc/master.passwd`，等下一次
+    // spawn/重启触发 `chown_tree` 时，把**宿主关键文件**的属主改成引擎自己 ⇒ 接管主机。
+    // 同一个仓库里的 `tor_hs.rs` 早就有加固版（`fstatat(AT_SYMLINK_NOFOLLOW)`、
+    // 跳过符号链接与硬链接、`openat(O_NOFOLLOW)` 递归），本函数现在与之对齐。
     #[cfg(unix)]
     {
         use std::os::unix::ffi::OsStrExt;
         let c = std::ffi::CString::new(path.as_os_str().as_bytes())
             .map_err(|_| bad(format!("路径含 NUL: {path:?}")))?;
-        // 先改这一层。
-        let rc = unsafe { libc::chown(c.as_ptr(), uid, gid) };
-        if rc == -1 {
-            let e = std::io::Error::last_os_error();
-            // 目录不存在（还没建）不算错误：调用方通常会先 create_dir_all。
-            if e.kind() != std::io::ErrorKind::NotFound {
-                return Err(e);
-            }
-        }
-        // 再递归子项（socket/pid/log 都是文件，也要一起改）。
-        let rd = match std::fs::read_dir(path) {
-            Ok(r) => r,
-            Err(_) => return Ok(()), // 不存在/无权限读 ⇒ 跳过
+        // O_NOFOLLOW：检查（下面的 fstatat）与打开之间被换成链接时直接失败，绝不跟随。
+        let fd = unsafe {
+            libc::open(
+                c.as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
         };
-        for ent in rd.flatten() {
-            let p = ent.path();
-            let c = match std::ffi::CString::new(p.as_os_str().as_bytes()) {
-                Ok(c) => c,
-                Err(_) => continue,
-            };
-            let _ = unsafe { libc::chown(c.as_ptr(), uid, gid) };
-            if ent.file_type().map(|t| t.is_dir()).unwrap_or(false) {
-                let _ = chown_tree(&p, uid, gid);
+        if fd < 0 {
+            let e = std::io::Error::last_os_error();
+            // 目录还不存在（调用方通常先 create_dir_all）不算错误。
+            if e.kind() == std::io::ErrorKind::NotFound {
+                return Ok(());
             }
+            return Err(e);
         }
+        let dir = unsafe { libc::fdopendir(fd) };
+        if dir.is_null() {
+            let e = std::io::Error::last_os_error();
+            unsafe { libc::close(fd) };
+            return Err(e);
+        }
+        let children = chown_children(dir, fd, uid, gid);
+        // 子项全部改完（或中途失败）才改目录自身；失败时不改，避免「目录先成别人的、下不去」。
+        let self_result = if children.is_ok() {
+            if unsafe { libc::fchown(fd, uid, gid) } == 0 {
+                Ok(())
+            } else {
+                Err(std::io::Error::last_os_error())
+            }
+        } else {
+            Ok(())
+        };
+        unsafe { libc::closedir(dir) };
+        children?;
+        self_result?;
     }
     Ok(())
+}
+
+/// [`chown_tree`] 的子项遍历（不含目录自身）。`dir`/`dirfd` 指向同一目录，
+/// 递归用 `openat(O_NOFOLLOW)` 拿到子目录 fd —— 路径全程不可被换成符号链接。
+#[cfg(unix)]
+fn chown_children(
+    dir: *mut libc::DIR,
+    dirfd: libc::c_int,
+    uid: libc::uid_t,
+    gid: libc::gid_t,
+) -> std::io::Result<()> {
+    loop {
+        // readdir 的 EOF 与错误都返回 NULL；按 EOF 处理（剩下的项下次重试，属"晚一点恢复"）。
+        let ent = unsafe { libc::readdir(dir) };
+        if ent.is_null() {
+            return Ok(());
+        }
+        let name = unsafe { std::ffi::CStr::from_ptr((*ent).d_name.as_ptr()) };
+        if name.to_bytes() == b"." || name.to_bytes() == b".." {
+            continue;
+        }
+        let mut st: libc::stat = unsafe { std::mem::zeroed() };
+        if unsafe { libc::fstatat(dirfd, name.as_ptr(), &mut st, libc::AT_SYMLINK_NOFOLLOW) } != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let ftype = st.st_mode & libc::S_IFMT;
+        if ftype == libc::S_IFLNK {
+            // 符号链接：跳过，连链接自身都不改（更不跟随目标）。
+            log::warn!(
+                "sandbox: chown_tree 跳过符号链接 {}（绝不跟随）",
+                name.to_string_lossy()
+            );
+            continue;
+        }
+        if ftype != libc::S_IFDIR && st.st_nlink > 1 {
+            // 硬链接是同一 inode 的第二个名字：改属主会改到"别处"那个文件
+            // （符号链接保护挡不住）。我们自己的文件链接数恒为 1。
+            log::warn!(
+                "sandbox: chown_tree 跳过硬链接 {}（nlink={}，可能是对宿主文件的链接）",
+                name.to_string_lossy(),
+                st.st_nlink
+            );
+            continue;
+        }
+        if ftype == libc::S_IFDIR {
+            let child_fd = unsafe {
+                libc::openat(
+                    dirfd,
+                    name.as_ptr(),
+                    libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                )
+            };
+            if child_fd < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            let sub = unsafe { libc::fdopendir(child_fd) };
+            if sub.is_null() {
+                let e = std::io::Error::last_os_error();
+                unsafe { libc::close(child_fd) };
+                return Err(e);
+            }
+            let r = chown_children(sub, child_fd, uid, gid);
+            let sr = if r.is_ok() {
+                if unsafe { libc::fchown(child_fd, uid, gid) } == 0 {
+                    Ok(())
+                } else {
+                    Err(std::io::Error::last_os_error())
+                }
+            } else {
+                Ok(())
+            };
+            unsafe { libc::closedir(sub) };
+            r?;
+            sr?;
+        } else if unsafe {
+            libc::fchownat(dirfd, name.as_ptr(), uid, gid, libc::AT_SYMLINK_NOFOLLOW)
+        } != 0
+        {
+            return Err(std::io::Error::last_os_error());
+        }
+    }
 }
 
 fn default_sandbox_on() -> bool {
@@ -741,7 +893,14 @@ pub fn build_spec(
             Some(_other) => true, // 显式绝对路径
         };
     if chroot_enabled {
-        push_reveal(&mut reveals, Path::new("/"), "rwxc");
+        // jail 根（`/`）的写权限要与 `docroot_rw` 一致，否则该开关在 chroot 模式下被
+        // 静默忽略：`unveil("/", "rwxc")` 让引擎对整个 jail 可写 ⇒ 「不给 docroot 写权」
+        // 的意图（防 RCE 丢 webshell 持久化）失效。
+        // 判据：`chroot = "docroot"|"app"` 时 jail 根**就是** docroot ⇒ 用 `doc_perms`；
+        // 显式绝对路径的 jail 里放的是引擎自己的目录 ⇒ 保留 `rwxc`（socket/pid/log 要能建）。
+        let jail_is_docroot = matches!(cfg.chroot.as_deref().map(str::trim), Some("docroot") | Some("app"));
+        let root_perms = if jail_is_docroot { doc_perms } else { "rwxc" };
+        push_reveal(&mut reveals, Path::new("/"), root_perms);
         for raw in &cfg.extra_unveil {
             if let Some((p, m)) = raw.split_once(':') {
                 let (p, m) = (p.trim(), m.trim());
@@ -834,6 +993,7 @@ pub fn build_spec(
     SandboxSpec {
         enabled: cfg.enabled,
         engine_hint: engine.to_string(),
+        drop_only: false,
         reveals,
         pledge: build_pledge,
         // 默认子进程不能 exec；`allow_exec=true` 时保留 exec（见上）。

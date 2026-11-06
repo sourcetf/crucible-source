@@ -566,7 +566,7 @@ async fn ensure_sidecar(
             Some(&state),
             None,
             Some(&deps_bin),
-        );
+        )?;
     }
     cmd.current_dir(&docroot)
         .env("WEBSERVER_LISTEN_UNIX", sock.display().to_string())

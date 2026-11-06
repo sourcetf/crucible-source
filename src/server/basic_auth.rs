@@ -295,6 +295,18 @@ pub enum AdminGate {
     Throttled(Duration),
 }
 
+/// 登录端点（唯一**免凭据**放行的 admin 路径）。
+///
+/// 单独抽出来是因为它还需要一个**小 body 上限**：门放行后调用方才会收 body，而
+/// 登录请求体只有一个 JSON（几百字节）。按 admin 的通用上限（32MiB）缓冲，等于给
+/// 未认证客户端一个免费的内存放大面（安全审查 2026-11-06 的 P2-3）。
+pub fn is_admin_login_path(path: &str) -> bool {
+    path.ends_with("/api/login")
+}
+
+/// 登录端点的 body 上限（8KiB）：足够放下 `{"username":..,"password":..,"totp":..}`。
+pub const ADMIN_LOGIN_BODY_CAP: usize = 8 * 1024;
+
 /// admin 路径在**收请求体之前**的鉴权门（三协议必须一致）。
 ///
 /// 为什么要有它：h1 会先收满 32MiB body 再交给 admin::handle，而 admin::handle 的
@@ -331,7 +343,7 @@ pub fn admin_gate_path(
         return AdminGate::Proceed;
     }
     // 登录端点：没有凭据也要让它进来（口令校验在 handler 内）。
-    if path.ends_with("/api/login") {
+    if is_admin_login_path(path) {
         return AdminGate::Proceed;
     }
     if !has_basic_credentials(headers) {
@@ -381,12 +393,19 @@ const ADMIN_SESSION_CAP: usize = 4096;
 /// listener 的 TLS 状态比对 —— 明文 listener 手工重放 TLS 签发的 cookie 必须被拒
 ///（浏览器受 `Secure` 约束本不会发送）。`listeners_allow` 内的其它 TLS 端口仍可复用
 ///（白名单语义不变：非白名单端口在鉴权前就 404，根本没有管理面）。
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 struct AdminSession {
     /// 绝对过期时刻（单调 `Instant`；创建时固定，不滑动续期）。
     expires_at: Instant,
     /// true = 只能在该会话被签发的那类 listener（TLS）上使用。
     tls_only: bool,
+    /// 该会话属于哪个管理员账号。
+    ///
+    /// 用于「改口令 / 删账号后**定向销毁**其会话」：此前会话表里没有身份，
+    /// 于是管理员改了口令或删掉账号后，先前签发的 cookie 仍然有效到 TTL（默认 8h、
+    /// 上限 30d）—— 被窃 cookie 或离职账号的 cookie 都能继续用（安全审查 2026-11-06 P2-1）。
+    /// `None` = 未绑定（仅单测用旧构造函数时出现），不会被定向销毁匹配到。
+    username: Option<String>,
 }
 
 /// 令牌 → 会话条目。
@@ -399,6 +418,12 @@ static ADMIN_SESSIONS: Lazy<Mutex<HashMap<String, AdminSession>>> =
 /// 1s..=30d）。这里再夹一次并防溢出，保证以编程方式调用（单测/嵌入）也不会
 /// 造出「立即过期」或 panic 的条目。
 pub fn create_admin_session(ttl: Duration) -> String {
+    create_admin_session_bound(ttl, None)
+}
+
+/// 与 [`create_admin_session`] 相同，但把会话**绑定到具体管理员账号**。
+/// 生产路径（`handle_login`）必须用这个 —— 否则改口令/删账号时无法定向销毁其会话。
+pub fn create_admin_session_bound(ttl: Duration, username: Option<String>) -> String {
     use rand_core::{OsRng, RngCore};
     let mut bytes = [0u8; 32];
     OsRng.fill_bytes(&mut bytes);
@@ -418,6 +443,7 @@ pub fn create_admin_session(ttl: Duration) -> String {
         expires_at,
         // 只在 TLS listener 上签发（调用方 `handle_login` 已保证），故一律 TLS 绑定。
         tls_only: true,
+        username,
     };
     let mut map = ADMIN_SESSIONS.lock();
     // 惰性清理过期项；仍超上限时淘汰最早到期的一条（不整表清空 —— 否则全站会话被
@@ -443,7 +469,9 @@ fn lookup_session(token: &str) -> Option<AdminSession> {
     }
     let now = Instant::now();
     let mut map = ADMIN_SESSIONS.lock();
-    match map.get(token).copied() {
+    // `cloned()`（不是 `copied()`）：AdminSession 现在含 `Option<String>`（所属账号），
+    // 已不再是 `Copy`（安全审查 2026-11-06：会话要绑定账号才能定向销毁）。
+    match map.get(token).cloned() {
         Some(e) if e.expires_at > now => Some(e),
         Some(_) => {
             map.remove(token);
@@ -512,6 +540,22 @@ pub fn validate_request_session_bound(headers: &HeaderMap, tls: bool) -> bool {
     }
 }
 
+/// 定向销毁某个管理员账号的**全部**会话（改口令 / 删账号时调用）。
+///
+/// 用户名按 `eq_ignore_ascii_case` 比较：登录时提交的大小写未必与配置里一致。
+/// 返回销毁条数（仅用于测试/日志）。
+pub fn destroy_sessions_for_user(username: &str) -> usize {
+    let mut map = ADMIN_SESSIONS.lock();
+    let before = map.len();
+    map.retain(|_, e| {
+        e.username
+            .as_deref()
+            .map(|u| !u.eq_ignore_ascii_case(username))
+            .unwrap_or(true)
+    });
+    before - map.len()
+}
+
 /// `Set-Cookie` 值：`__Host-` 前缀 + Secure/HttpOnly/SameSite=Strict，
 /// 并用与服务端**同一份** `ttl` 生成 `Max-Age` / `Expires`。
 ///
@@ -546,6 +590,7 @@ pub(crate) fn insert_session_with_deadline_for_test(token: &str, expires_at: Ins
         AdminSession {
             expires_at,
             tls_only: true,
+            username: None,
         },
     );
 }

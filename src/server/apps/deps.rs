@@ -137,11 +137,14 @@ pub async fn try_cached(lc: &ListenerConfig, app: &AppRouteConfig) -> Result<Dep
 
     // 冷路径才解析 .env（读一次文件），解析结果随缓存驻留。
     let env_vars = Arc::new(parse_env_file(&envp));
+    // 生效沙箱配置：`init.sh` 要以**本应用的降权用户**执行（见 ensure_app_deps 的说明）。
+    let sbx = app.sandbox_effective(&lc.global_sandbox);
     let ensure_result = ensure_app_deps(
         &docroot,
         &deps_dir,
         &init,
         app.init_timeout_secs.unwrap_or(120),
+        &sbx,
     )
     .await;
     if let Err(e) = ensure_result {
@@ -306,6 +309,7 @@ async fn ensure_app_deps(
     deps_dir: &Path,
     init: &Path,
     timeout_secs: u64,
+    sbx: &crate::server::apps::sandbox::SandboxConfig,
 ) -> Result<()> {
     // 兜底（Config::validate 已拦一次）：下面会递归删除 deps_dir。
     // 任何不在 docroot 之内的路径都拒绝，避免删掉任意目录树。
@@ -339,6 +343,32 @@ async fn ensure_app_deps(
     // 并发的 wsgi 应用的 WINDOWMARK/SECRET_A，还会被写进 deps/ 产物）。
     // 用「启动期基底」构造 envp：运维环境照旧，请求期临时值一律不继承。
     crate::server::apps::env_lock::apply_clean_env_tokio(&mut cmd, &[]);
+    // **降权**（安全审查 2026-11-06 的 P1-3）：`init.sh` 位于 docroot 内，而应用开了
+    // `docroot_rw` 时**应用自己就能改写它**（unveil 给了它那只目录的写权）。此前这里
+    // 没有任何沙箱/降权 ⇒ 一次改写 + 一次冷请求 = **以 root 执行任意 shell**，整套围堵
+    // 作废。构建脚本不能进 unveil/pledge（要写 deps、要联网、要 fork pip/npm/make），
+    // 所以只降权（`apply_drop_only`）—— 消除「root 执行可被应用改写的脚本」这条路径。
+    // fail-closed：用户名解析失败直接中止，绝不静默以 root 跑。
+    let dropped = crate::server::apps::sandbox::apply_drop_only(
+        cmd.as_std_mut(),
+        sbx.user.as_deref(),
+        sbx.group.as_deref(),
+    )
+    .with_context(|| format!("init.sh 降权挂钩 {}", init.display()))?;
+    if let Some((u, g)) = dropped {
+        // 降权后仍要让构建能写 `deps/`：把这棵子树交给该用户（与引擎 state 目录同法）。
+        if let Err(e) = crate::server::apps::sandbox::chown_tree(deps_dir, u, g) {
+            log::warn!(
+                "deps: chown {} 给 {}:{} 失败: {e}（构建可能写不进去）",
+                deps_dir.display(),
+                u,
+                g
+            );
+        }
+        // 构建工具（pip/npm/cargo）要写 $HOME：给一个**该用户可写**的 HOME，
+        // 否则它们会在 /nonexistent 上失败（降权前是 root/HOME=/root，看不出来）。
+        cmd.env("HOME", deps_dir);
+    }
     cmd.arg(init)
         .current_dir(docroot)
         .env("DEPS_DIR", deps_dir)

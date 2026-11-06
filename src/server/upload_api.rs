@@ -679,7 +679,14 @@ where
             // 「body 比声明的区间长」必须拒：否则多出来的字节被静默追加进目标文件，
             // 最终长度超过 `Content-Range` 声明的 total 也能 commit（§14.4 语义被破坏）。
             if let Some(end) = declared_end {
-                let limit = end - start + 1;
+                // 溢出安全的区间长度：`bytes 0-18446744073709551615/*` 这种声明下
+                // `end - start + 1` 在 release 会回绕成 0（debug 直接 panic），
+                // 于是**任何**非空 body 都被判"超出区间"而 400（合法续传被误拒）。
+                // （安全审查 2026-11-06 的 P2-2）
+                let limit = end
+                    .checked_sub(start)
+                    .and_then(|d| d.checked_add(1))
+                    .unwrap_or(u64::MAX);
                 if rxed > limit {
                     log::warn!(
                         "upload: 请求体超出声明的 Content-Range 区间（{rxed} > {limit}）peer={peer} path={path:?}"

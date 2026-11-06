@@ -7061,3 +7061,42 @@ DoT/DoH、ECS）。我却把它当成「存在 DNS 隧道风险」去堵，**等
 新增的 `php::reconcile_shutdown` / `native_http::reconcile_shutdown` / `sidecar_engine::reconcile_shutdown`，
 与已有的 `app_ffi::reconcile_unload` 对称（用 `child_registry::kill_child` 关停并清 state 目录）。
 需要一次重建+重启，故本轮先用脚本兜底。
+
+# 【agent-1009 · Wave-24】全库**实现安全**审查（6 个并行只读子 agent + 主会话复核修复，2026-11-06）
+
+**用户要求**：全库安全审查，可派子 agent；仓库涉及复杂权限/所有权系统与密码学实现（含**手搓的旧版 SSL/TLS 兼容层**）；
+**注意不是协议安全** —— 不要砍掉 SSLv2 等旧协议，要的是**实现安全或尽可能安全**。
+
+**范围**：Rust 84k 行 / 90 文件；C 45k 行（含 38.5k 行应用引擎、1.1k 行 SSLv2 状态机、0.4k 行 NSS 胶水）。
+**方法**：按风险面拆 6 个**只读**子 agent 并行审计 ——
+① 权限/沙箱边界；② Rust 手搓密码学与遗留 TLS；③ C 遗留 TLS（NSS/TomCrypt/peek/pem）；
+④ C 应用引擎与 C↔Rust FFI；⑤ 认证/管理面/会话/机密；⑥ 协议解析与 DNS wire。
+每条发现都由主会话**读原文复核**后才动手；子 agent 未改任何文件。
+**本轮没有一处"删协议/删功能"的改动**：SSLv2/SSLv3/TLS1.0-1.2/RC4/MD5-SHA1 全部保留。
+
+**结果**：P1×4、P2×14、P3×10+ ⇒ **已修 15 项（含全部 4 个 P1）**，其余逐条给出"暂不改的理由 + 确切做法"。
+完整清单与证据见 `.agents/1009/reports/security-audit-wave24.md`。
+
+## 已修（要点）
+
+**P1（4/4）**
+1. **降权解析失败静默以 root 运行**（`apps/sandbox.rs`）：`resolve_ids` 报错时 `(None,None)` 继续 spawn，与紧邻文档承诺直接矛盾 —— 配置里 `user` 拼错一个字母，整套降权静默失效。改为 `apply_for_app -> Result`，失败**拒绝启动**（6 个调用点全部 `?` 传播）。
+2. **`chown_tree` 跟随符号链接**（`apps/sandbox.rs`）：`libc::chown` + `read_dir` 递归 ⇒ 引擎在自己拥有的 `state/<key>` 里放 `x -> /etc/master.passwd`，下次 spawn chown 即把宿主文件交出去。已移植同仓 `tor_hs.rs` 的加固版（`fstatat(AT_SYMLINK_NOFOLLOW)` 跳过符号链接/硬链接 + `openat(O_NOFOLLOW)` 递归 + 目录自身最后改）。
+3. **`init.sh` 以 root 无沙箱执行**（`apps/deps.rs`）：`docroot_rw` 应用可自改 `init.sh`，一次冷请求 = root 执行任意 shell。新增 `sandbox::apply_drop_only`（只降权不做 unveil/pledge，构建脚本要联网/写 deps/ fork），以本应用降权用户执行 + chown `deps/` + `HOME=deps/`。
+4. **psgi 把请求体当 C 字符串**（`libs/app-engines/psgi/psgi_engine.c`）：`newSVpv(val,0)` 对 `body` 做 `strlen` ⇒ 越过 `body_len` 读相邻堆内存交给 Perl 应用（回显即泄露）+ 二进制体截断。新增 `psgi_hv_putn`（`newSVpvn` 带长度）。**复核**：rack 引擎同类写法是对的（`rb_str_new(c->body,c->body_len)`），故为 psgi 独有。
+
+**P2（已修 10）**：chroot 模式 jail 根权限改为跟随 `docroot_rw`；自签证书序列号改为随机 16 字节正整数（此前**恒为 0**）；SSLv2 MAC 改常数时间比较（RC4/MD5/SSLv2 保留）；密钥材料释放前安全清零（`secure_zero`，含 premaster 栈缓冲）；pyembed 三引擎响应体加 64MiB 上限并**如实报 502**；转发上游剥离客户端 `Content-Length`；上传 `Content-Range` 区间长度改 `checked_*`；管理员会话**绑定账号**且改口令/删账号时定向销毁其会话；`/api/config/json` 脱敏补 `listeners[].basic_auth.password_hash` 与**内联** TLS/PSK 材料；`/api/login` 免凭据路径 body 上限从 32MiB 收到 8KiB（h1/h2/h3 统一）。
+
+**P3（已修 1）**：`/__metrics` 补 `[admin].listeners_allow` 判据（此前白名单外的 listener 上仍会索要 admin 凭据）。
+
+## 明确列出但**本轮不改**（理由 + 做法见报告）
+静态文件 `canonicalize→open` 的符号链接 TOCTOU（单加 `O_NOFOLLOW` 会打断 docroot 内合法链接，正解是逐级 `openat` + fd 传递）、FFI 边界只信 NUL 结尾（要把 `len` 当硬上界先拷出）、默认共用 `www`（部署配置已用 `_c_*` 每应用用户缓解）、Basic 用户名枚举时序、geoip `with_capacity(CL)`、`parse_ranges` 段数无上限、OCSP 装订物不验签名（客户端最终会验）、NSS shim 忽略返回值、父进程创建的引擎日志目录权限 0644、DER 短长度未校验（当前输入不可达）。
+
+## 复核确认"无问题"的重点（覆盖面）
+- 沙箱 pre_exec 顺序与失败处理（`umask` → unveil → 锁 → chroot → chdir → setgroups/setgid/setuid → **`setuid(0)` 复核** → pledge，每步失败 `_exit(127)`）。
+- 手搓 TLS 解析（Rust）：长度先校验后切片、`saturating/checked`、无巨额 `with_capacity`；随机源全 CSPRNG。
+- **C 遗留 TLS：未发现可远程触发的内存安全缺陷**（网络→缓冲的拷贝全先比容量、记录长度有上限与一致性校验、`malloc` 全检查、C↔Rust 的"返回 ≤ len"契约在所有路径成立）。
+- C 引擎 FFI：ABI 版本/布局两侧一致、无 `strcpy/sprintf/alloca/system/popen`、header 名值块两侧有界、出站头禁 CR/LF、cgi 用 `execve` argv。
+- 认证/CSRF：三协议判定顺序统一且都在**收 body 之前**；argon2id（OWASP 下限）/yescrypt；会话令牌 32B `OsRng`；`Origin: null` 拒绝；不信任 `X-Forwarded-For`；配置写入原子 + 保留权限 + 校验副本 0600；面板 `esc()` 全覆盖。
+- 解析器：h1_fast/qmux/dns(ecs,dot_doh)/connect_udp/client_hello/upload range 切片与整数全有界，**未发现远程单包可触发的越界/panic**；CL/TE 与 HPACK/流控由 hyper/h2 crate 承担。
+- **fuzz 缺口**（建议补）：`dot_doh.rs` 名字解析（与 `ecs.rs` 重复实现、只 fuzz 了后者）、`tls/client_hello.rs`、`connect_udp.rs` 目标解析、`parse_content_range`（本轮修的溢出点正缺覆盖）、`proxy.rs` 上游响应解析、`parse_ranges`。
