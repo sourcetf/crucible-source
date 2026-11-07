@@ -21,4 +21,8 @@ for a in "$@"; do
     *) args+=("$a") ;;
   esac
 done
-exec cc -static-pie -Wl,-Bstatic "${args[@]}"
+# **只给 -static-pie，不要再加 -Wl,-Bstatic**：实测两者同时出现时 clang 会报
+# `argument unused during compilation: '-static-pie'`（把它判为未使用）⇒ 链接退回动态。
+# 而 `-static-pie` 本身就让其后所有 `-l`（含 -lm/-lc）按静态解析（独立探针 `cc -static-pie -o x x.c -lm`
+# 的产物 ldd 为空即为证）。所以这里只保留过滤后的参数 + `-static-pie`。
+exec cc -static-pie "${args[@]}"
