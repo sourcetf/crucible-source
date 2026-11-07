@@ -201,37 +201,64 @@ BIN="target/release/webserver"
 if [ "$STATIC" = 1 ]; then
   case "$HOST_OS" in
     Linux)
-      # 仓库已有 musl 静态路径（Linux 上静态 + dlopen 正常）。
-      if [ -f scripts/build_musl_static.sh ]; then
-        run "构建 musl 静态运行时（Linux）" bash scripts/build_musl_static.sh || step_fail "build_musl_static.sh"
+      # ===== 真·全静态（musl）：这是唯一能同时满足「ldd 为空」与「引擎 dlopen 可用」的路 =====
+      MUSL_ARCH="$(uname -m)-unknown-linux-musl"
+      # 1) musl C 链接器（zig 或 musl-gcc；**不允许**静默回落到系统 cc —— 那会产出动态产物还声称静态）
+      . ./scripts/lib_app_musl.sh 2>/dev/null || true
+      # **硬拒绝**：没有 musl 工具链时不回落到系统 cc（那会产出动态产物再声称"静态"）。
+      if [ -z "${CC_MUSL:-}" ] || [ "${CC_MUSL}" = "cc" ] || [ "${CC_MUSL}" = "${CC:-cc}" ]; then
+        echo "  ** 本机没有 musl 工具链（zig / musl-gcc 都没有）⇒ 无法产出「ldd 为空」的静态产物 **"
+        echo "     安装其一：apt/dnf install musl-tools（提供 musl-gcc）  或  下载 zig（ziglang.org/download）"
+        echo "     已拒绝继续：绝不回落到系统 cc 产出动态二进制、再把它当"静态"交付。"
+        if [ "$DRY" = 1 ]; then echo "     （--dry-run：仅警告；真跑会以退出码 2 中止）"; else exit 2; fi
       fi
-      SFLAGS="-C target-feature=+crt-static"
-      run "cargo build --release（musl 静态）" env \
-        CARGO_PROFILE_RELEASE_LTO=thin \
-        RUSTFLAGS="${SFLAGS}" cargo build --release --features "${FEATURES}" \
-        || step_fail "static cargo build（Linux/musl）"
+      LNK="${CC_MUSL:-$(pwd)/scripts/zig-musl-cc.sh}"
+      # 2) 目标三元组必须有 std（rustup 装了才行）
+      if have rustup; then
+        rustup target list --installed 2>/dev/null | grep -qx "$MUSL_ARCH" || \
+          run "rustup target add $MUSL_ARCH" rustup target add "$MUSL_ARCH"
+      fi
+      # 3) 主程序：静态 musl
+      ENVK="CARGO_TARGET_$(echo "$MUSL_ARCH" | tr 'a-z-' 'A-Z_')_LINKER"
+      run "cargo build --release --target $MUSL_ARCH（+crt-static）" env \
+        CARGO_PROFILE_RELEASE_LTO=thin RUSTFLAGS="-C target-feature=+crt-static" \
+        "$ENVK=$LNK" cargo build --release --target "$MUSL_ARCH" --features "${FEATURES}" \
+        || step_fail "静态 musl 主程序构建"
+      # 4) 引擎也要用同一 musl 工具链（否则静态主程序 dlopen 不了 glibc 的 .so）
+      if [ "$DO_ENGINES" = 1 ] && [ -f scripts/build_app_engines.sh ]; then
+        run "用 musl 工具链重建引擎 .so（dlopen 兼容）" env CC="$LNK" \
+          bash scripts/build_app_engines.sh || step_fail "musl 引擎构建"
+      fi
+      # 5) **验收：ldd 为空**（判据用 readelf 的 NEEDED 数，最稳；不同发行版 ldd 文案不一）
+      SBIN="target/$MUSL_ARCH/release/webserver"
+      if [ "$DRY" = 0 ]; then
+        if [ ! -f "$SBIN" ]; then step_fail "静态产物不存在：$SBIN"; else
+          need="$(readelf -d "$SBIN" 2>/dev/null | grep -c NEEDED)"
+          echo "  --- 静态验收 ---"
+          printf '    %-34s %s\n' "file:" "$(file -b "$SBIN" | cut -c1-58)"
+          printf '    %-34s %s（要求 0）\n' "readelf -d NEEDED 条数:" "$need"
+          printf '    %-34s %s\n' "ldd:" "$(ldd "$SBIN" 2>&1 | head -1 | cut -c1-58)"
+          [ "$need" = 0 ] || step_fail "静态验收：仍有 $need 条 DT_NEEDED（不是全静态）"
+          "$SBIN" --check-config --config config.toml >/dev/null 2>&1 \
+            && echo "    能启动（--check-config）: OK" \
+            || step_fail "静态验收：产物跑不起来"
+        fi
+      fi
+      echo "  说明：侧车类引擎（php-fpm/ruby/java/node）依赖目标机解释器，静态主程序不含它们；"
+      echo "        交付时需把 target/$MUSL_ARCH/release/webserver 与 musl 版 target/app-engines/*.so 一起带走。"
       ;;
     OpenBSD)
-      # 见文件头实测结论：真静态会 SIGSEGV 且 dlopen 不可用 ⇒ 构建后**逐项验证**，不过就拒绝。
-      SFLAGS="-C target-feature=+crt-static -C relocation-model=static -C link-arg=-static"
-      run "cargo build --release（OpenBSD 真静态尝试）" env \
-        CARGO_PROFILE_RELEASE_LTO=thin \
-        RUSTFLAGS="${SFLAGS}" cargo build --release --features "${FEATURES}" \
-        || step_fail "static cargo build（OpenBSD）"
-      if [ "$DRY" = 0 ] && [ -x "$BIN" ]; then
-        echo "  --- 静态验证（三项全过才算可用） ---"
-        if ldd "$BIN" 2>&1 | grep -qi "not a dynamic executable"; then echo "    [1/3] 非动态: OK"; else echo "    [1/3] 非动态: ** 仍是动态链接 **"; step_fail "静态验证[1/3] 产物仍是动态链接"; fi
-        if "$BIN" --help >/dev/null 2>&1; then echo "    [2/3] 能启动: OK"; else echo "    [2/3] 能启动: ** 无法执行（静态 hello-world 在本机即 SIGSEGV）**"; step_fail "静态验证[2/3] 产物跑不起来"; fi
-        if [ -e target/app-engines/libapp_lua.so ]; then
-          if "$BIN" --check-config --config config.toml >/dev/null 2>&1; then
-            echo "    [3/3] 能读配置: OK  —— **但注意：OpenBSD 静态二进制 dlopen 不可用，FFI 引擎（libapp_*.so）会全部装不上**"
-            echo "          ⇒ 若要用静态产物，必须只用 sidecar/fpm 类引擎，或改用 Linux/musl 静态构建。"
-          else echo "    [3/3] 能读配置: ** 失败 **"; step_fail "静态验证[3/3] 静态产物读不了配置"; fi
-        fi
-        echo "    （**不自动安装**：因上述 dlopen 限制，静态产物需人工确认引擎形态后再换交。）"
-      fi
+      # 见文件头实测结论：OpenBSD 上「ldd 为空」与「dlopen 可用」互斥（静态二进制里 dlopen 会 SIGSEGV），
+      # 且 rustc 真静态产物启动即崩。**不做假装**：直接失败并把证据与出路说清。
+      echo "  ** OpenBSD 无法同时满足「全静态(ldd 为空)」与「引擎可 dlopen」**（实测证据见脚本头）"
+      echo "     · 静态 C 程序 dlopen 自包含 .so ⇒ Segmentation fault（动态版 OK）"
+      echo "     · rustc +crt-static+relocation-model=static -static ⇒ 链接成功但启动 SIGSEGV(rc=139)"
+      echo "     · rustc 纯 -static ⇒ 链接失败：ld: undefined hidden symbol _libc_mprotect（rcrt0.o）"
+      echo "     出路：① 跨机可移植的全静态产物请在 **Linux** 上跑本脚本 --static（musl）；"
+      echo "           ② 必须留在 OpenBSD 且要单文件，则需把引擎从 dlopen 改为**静态链接进主程序**（架构改动，未做）。"
+      step_fail "--static 在 OpenBSD 上不可行（已有实测证据）"
       ;;
-    *) echo "  未知平台 $HOST_OS ⇒ 按 OpenBSD 同法处理"; step_fail "--static 在 $HOST_OS 上未定义" ;;
+    *) echo "  未知平台 $HOST_OS"; step_fail "--static 在 $HOST_OS 上未定义" ;;
   esac
 else
   if [ ! -f scripts/build_release.sh ]; then step_fail "缺 scripts/build_release.sh"; else
