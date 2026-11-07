@@ -24,17 +24,20 @@
 #       ② **校验本地补丁仍在**（`BATCH_CAP` 常量、quinn-boring 仍挂在工作区），丢了就**报错退出**
 #          —— 静默丢掉 `BATCH_CAP` 会让 h2 多路复用性能回退而没人察觉。
 #
-# ---- 静态编译（`--static`）与"实测结论"，别再走弯路
-# 目标机是 **OpenBSD**。实测（2026-11-07，本仓库在 openbsd.dns.google 上）：
-#   * `rustc -C target-feature=+crt-static` 能编，但产物是 **PIE(ET_DYN)**，不是真静态；
-#   * 要真静态得再加 `-C relocation-model=static -C link-arg=-static`，编出来的 hello-world
-#     **启动即 SIGSEGV**（`ldd` 报 not a dynamic executable）；
-#   * `cc -static` 编出的程序里 **`dlopen` 直接失败**（OpenBSD 静态 libc 没有动态加载器）。
-# 而本项目**所有应用引擎都靠 dlopen 装载 `target/app-engines/libapp_*.so`** ⇒ **全静态会打掉
-# 整套 FFI 引擎**。因此本脚本 `--static` 的行为是：**真去构建、逐项验证、不过就拒绝安装**，
-# 并把实测证据打出来（绝不是一个"看起来静态"却跑不起来的产物）。
-# Linux 上 `--static` 走仓库已有的 musl 静态路径（`scripts/build_musl_static.sh` / zig-musl），
-# 那边静态 + dlopen 是可用的。
+# ---- 静态编译（`--static`）：**OpenBSD 用 static-pie**（实测结论，别再走弯路）
+# 目标机是 **OpenBSD**，且要求「用 OpenBSD 自己的 libc」（比 musl/glibc 加固更好，不引异种 libc）。
+# 实测（2026-11-07，openbsd.dns.google，x86_64）：
+#   * `-static`（完整静态）：`ldd` 为空，但 **`dlopen` 直接失败/崩**（静态 libc 无动态加载器）
+#     ⇒ 本项目所有引擎都靠 dlopen 载入 `libapp_*.so`，**-static 会打掉整套 FFI 引擎**；
+#     `cc -static` 的探针 dlopen 自包含 .so ⇒ Segmentation fault。
+#   * **`-static-pie`：`ldd` 输出为空、能跑、且 `dlopen` 正常**；用真实引擎实测
+#     `dlopen(libapp_lua.so/libapp_c.so)` ⇒ LOADED 且 `appengine_execute/init/abi_version` 都在。
+#     ⇒ **这就是"ldd 为空 + 引擎可用 + OpenBSD libc"的答案**：`RUSTFLAGS="-C link-arg=-static-pie"`。
+#   * `+crt-static` 单独用会编出 PIE(ET_DYN) 且仍动态链接（`ldd` 非空），别拿它当"静态"。
+# **代价（必须知道）**：`tls_nss` 用的 NSS 只有**共享库**（libnss3/libssl3/…），把它链进去
+# `ldd` 就不再为空 ⇒ 本脚本在 `--static` 下会**自动去掉 tls_nss** 并明确告警；
+# 静态产物里遗留栈只剩 BoringSSL + TomCrypt（SSLv2），NSS 那条（SSLv3/IE6 v2-hello）只在
+# 动态产物里有。要两者兼得就保留动态部署，或把 NSS 也静态化（NSS 上游不支持，未做）。
 #
 # ---- 剥离（默认开启，`--no-strip` 关）
 # 编完对 **主程序 + ech_probe + 全部引擎 .so** 去符号表/调试段（`strip`），打印前后体积与
@@ -248,15 +251,55 @@ if [ "$STATIC" = 1 ]; then
       echo "        交付时需把 target/$MUSL_ARCH/release/webserver 与 musl 版 target/app-engines/*.so 一起带走。"
       ;;
     OpenBSD)
-      # 见文件头实测结论：OpenBSD 上「ldd 为空」与「dlopen 可用」互斥（静态二进制里 dlopen 会 SIGSEGV），
-      # 且 rustc 真静态产物启动即崩。**不做假装**：直接失败并把证据与出路说清。
-      echo "  ** OpenBSD 无法同时满足「全静态(ldd 为空)」与「引擎可 dlopen」**（实测证据见脚本头）"
-      echo "     · 静态 C 程序 dlopen 自包含 .so ⇒ Segmentation fault（动态版 OK）"
-      echo "     · rustc +crt-static+relocation-model=static -static ⇒ 链接成功但启动 SIGSEGV(rc=139)"
-      echo "     · rustc 纯 -static ⇒ 链接失败：ld: undefined hidden symbol _libc_mprotect（rcrt0.o）"
-      echo "     出路：① 跨机可移植的全静态产物请在 **Linux** 上跑本脚本 --static（musl）；"
-      echo "           ② 必须留在 OpenBSD 且要单文件，则需把引擎从 dlopen 改为**静态链接进主程序**（架构改动，未做）。"
-      step_fail "--static 在 OpenBSD 上不可行（已有实测证据）"
+      # static-pie：ldd 为空 + dlopen 可用 + 用 OpenBSD 自有 libc（见文件头实测表）。
+      FEAT_STATIC="$(echo "$FEATURES" | tr ',' '\n' | grep -vx 'tls_nss' | paste -sd, -)"
+      if [ "$FEAT_STATIC" != "$FEATURES" ]; then
+        echo "  注意：NSS 只有共享库（libnss3 等），链进去 ldd 就不为空 ⇒ 静态构建**去掉 tls_nss**："
+        echo "        动态产物: $FEATURES"
+        echo "        静态产物: $FEAT_STATIC（遗留栈只剩 BoringSSL + TomCrypt/SSLv2）"
+      fi
+      # **必须换 linker driver，不能只加 link-arg**：实测 `-C link-arg=-static-pie` 会被
+      # rustc 追加到命令行**末尾**，而链接器按位置处理静态/动态选择 —— 前面的 `-l…` 已经把
+      # libc/libm/libpthread/libc++/libc++abi 动态解掉，产物仍留 5 条 DT_NEEDED。
+      # `scripts/openbsd-static-pie-cc.sh` 把 `-static-pie -Wl,-Bstatic` 放**最前**，让其后所有
+      # `-l` 都按静态解析；缺 .a 的库会**链接失败并报错**（不静默退回动态）。
+      run "cargo build --release（static-pie，经 linker 包装）" env \
+        CARGO_PROFILE_RELEASE_LTO=thin \
+        RUSTFLAGS="-C linker=$(pwd)/scripts/openbsd-static-pie-cc.sh" \
+        cargo build --release --features "${FEAT_STATIC}" \
+        || step_fail "static-pie 主程序构建"
+      if [ "$DRY" = 0 ] && [ -x "$BIN" ]; then
+        echo "  --- 静态验收（四项全过才算可用） ---"
+        need="$(readelf -d "$BIN" 2>/dev/null | grep -c NEEDED)"
+        [ "$need" = 0 ] && echo "    [1/4] DT_NEEDED = 0（ldd 为空）: OK" \
+          || step_fail "静态验收[1/4] 仍有 $need 条 DT_NEEDED（ldd 不为空）"
+        lddout="$(ldd "$BIN" 2>&1 | head -3 | tr -d ' \n')"
+        [ -z "$lddout" ] || [ "$lddout" = "$BIN:" ] && echo "    [2/4] ldd 输出为空: OK" \
+          || { echo "    [2/4] ldd 有输出：$lddout"; step_fail "静态验收[2/4] ldd 非空"; }
+        "$BIN" --check-config --config config.toml >/dev/null 2>&1 \
+          && echo "    [3/4] 能启动（--check-config）: OK" || step_fail "静态验收[3/4] 静态产物跑不起来"
+        # [4/4] dlopen 探针：**用真实引擎 .so** 证明 FFI 引擎在这个静态产物里仍可加载。
+        probe="$(mktemp -d)/p.c"; eng="$(ls target/app-engines/libapp_lua.so 2>/dev/null | head -1)"
+        cat > "$probe" <<'EOC'
+#include <dlfcn.h>
+#include <stdio.h>
+int main(int c, char **v){
+  void *h = dlopen(v[1], RTLD_NOW|RTLD_GLOBAL);
+  if (!h) { printf("FAIL %s\n", dlerror()?dlerror():"(null)"); return 1; }
+  if (!dlsym(h,"appengine_execute") || !dlsym(h,"appengine_init")) { printf("FAIL 缺 ABI 符号\n"); return 1; }
+  printf("LOADED\n"); return 0;
+}
+EOC
+        if [ -n "$eng" ] && cc -static-pie -o "${probe%.c}.bin" "$probe" -lm 2>/dev/null; then
+          if [ "$("${probe%.c}.bin" "$eng" 2>&1 | head -1)" = "LOADED" ]; then
+            echo "    [4/4] static-pie 里 dlopen 真实引擎（$eng）: OK"
+          else
+            echo "    [4/4] dlopen 引擎失败 ⇒ 静态产物不能用（引擎装不上）"
+            step_fail "静态验收[4/4] 静态产物无法 dlopen 引擎"
+          fi
+        else echo "    [4/4] 跳过（没有引擎 .so 或 cc -static-pie 不可用）"; fi
+        rm -rf "$(dirname "$probe")"
+      fi
       ;;
     *) echo "  未知平台 $HOST_OS"; step_fail "--static 在 $HOST_OS 上未定义" ;;
   esac
