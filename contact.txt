@@ -7251,3 +7251,46 @@ dup2 后又关掉），并把「CGI 必然是 per-request 进程 + 与 §22.4.2 
 
 **终态验证**：新二进制 22456768（10:02）；19/19 业务路由 200；9081/9445/9446 + h3 全 200；`/tsx/` h1 405 正常；
 DNS 53 正常；`CONTAINMENT OK`；引擎身份 `_c_*`；孤儿自检「没有遗留」。
+
+# 【agent-1009 · Wave-25e】OpenBSD「ldd 为空」静态构建的**定论与实测边界**（2026-11-07）
+
+**需求**：静态编译使 `ldd` 为空、跨机器可移植，且**用 OpenBSD 自有 libc**（不用 musl/glibc）。
+
+**结论：在 OpenBSD 8.0 / x86_64 / 现行 rustc 上，Rust 二进制「NEEDED=0」与「能启动」互斥。**
+即「ldd 为空 + 可运行 + 引擎可 dlopen」**三者不可兼得**；C/C++ 无此问题（`cc -static-pie` 能跑）。
+
+## 最小复现（3 行 `fn main(){println!()}`，与本项目代码/依赖无关）
+
+| 链接方式 | NEEDED | 运行 |
+| --- | --- | --- |
+| 包装器 `cc -static-pie`（过滤 `-pie` 与否都一样） | **0** | **Abort trap (core dumped)** |
+| `+crt-static` + 包装器 | **0** | **Abort trap** |
+| 裸 `-C link-arg=-static-pie`（库已在前面被动态解析） | 3 | ✓ |
+| `+crt-static` + 裸 `-static-pie` | 3 | ✓ |
+| 默认动态 | 3 | ✓ |
+| `+crt-static` + `-static`（真静态） | — | 链接失败 `undefined hidden symbol: _libc_mprotect` |
+| `-nostartfiles` + `/usr/lib/rcrt0.o` + `-lc` | — | 链接失败 `undefined hidden symbol: __csu_do_fini_array` |
+| 仅 `-nostartfiles` | 0 | 产物无有效入口（exec 失败，shell 报 `syntax error: NUL byte unexpected`） |
+| C `cc -static-pie`（不带 -lm） | 0 | ✓ |
+| C++ `c++ -static-pie` | 5 | ✓ |
+
+## 崩溃现场（ktrace + egdb，core=/crucible/webserver.core）
+`_dl_start → _dl_boot → _dl_call_preinit → _libc_preinit → issetugid → errno 78 (ENOSYS) → SIGABRT`
+⇒ OpenBSD 的 static-pie = 「静态 libc + **内嵌一份 ld.so 做启动**」（这正是它能 dlopen 的原因），
+而 Rust 的启动序列在这条 preinit 路径上 `issetugid` 解析失败 ⇒ abort。
+
+## 已落地
+- `scripts/openbsd-static-pie-cc.sh`：把「static-pie 要作为**驱动参数**、必须过滤 rustc 注入的
+  `-Wl,-Bdynamic` 与 `-pie`」这套实测出来的做法固化（它**确实**能产出 NEEDED=0 的产物）。
+- `scripts/update-deps-and-build.sh --static`：平台自适应 + **四项验收**（NEEDED=0 / ldd 空 /
+  `--check-config` 能启动 / static-pie 里 dlopen 真实引擎）。当前在 OpenBSD 上**第 3 项会失败**，
+  这正是上面的定论 —— 不要换交那个产物。
+- 记忆：`openbsd-static-pie-ldd-empty.md`（含全部证据）。
+
+## 可行路线（三选一）
+1. **保持动态部署**（现状：9 条 NEEDED，引擎/NSS 全可用）——推荐。
+2. 要单文件可移植：把引擎从 dlopen 改为**静态链接进主程序**（架构改动）。注意即便如此也到不了
+   NEEDED=0：`libapp_python/perl/ruby.so` 链接的是**共享** `libpython/libperl/libruby`，NSS 也只有
+   共享库 ⇒ 除非连解释器一起静态化（上游未提供静态版）。
+3. 换平台/toolchain（Linux+musl 静态可达成，但**用户明确否决 musl**）；或等上游修 OpenBSD+rustc 的
+   static-pie 启动路径（当前无可用版本可测）。
