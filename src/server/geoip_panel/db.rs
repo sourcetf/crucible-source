@@ -235,6 +235,14 @@ pub fn open_panel(path: &Path) -> Result<Connection> {
             last_run INTEGER DEFAULT 0,
             last_status TEXT
         );
+        CREATE TABLE IF NOT EXISTS panel_geofeed (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            url TEXT NOT NULL UNIQUE,
+            enabled INTEGER DEFAULT 1,
+            last_fetch INTEGER DEFAULT 0,
+            last_status TEXT,
+            created_at TEXT DEFAULT (datetime('now'))
+        );
         CREATE TABLE IF NOT EXISTS panel_audit (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             action TEXT NOT NULL,

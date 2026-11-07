@@ -19,6 +19,13 @@ use std::time::Duration;
 
 static RING: Lazy<Mutex<VecDeque<String>>> = Lazy::new(|| Mutex::new(VecDeque::with_capacity(512)));
 
+/// 环缓冲的单调序号（P2-8）：每 push 一行 +1。
+///
+/// 为什么需要它：`recent_lines` 只能给「最近 N 行」快照，SSE 增量推送无法判断
+/// 「订阅者已经拿到哪一行」，靠内容去重会在相同日志行上误判。序号随 `RING` 同一把
+/// 锁递增，保证 `(序号, 行)` 的一致性；环丢头不影响序号单调。
+static RING_SEQ: AtomicU64 = AtomicU64::new(0);
+
 /// 访问日志的**批量写缓冲**。
 ///
 /// 为什么要有：原来每一行都走 `log::info!` → env_logger **每条记录一次 write + flush**。
@@ -690,6 +697,8 @@ fn log_line<P: LinePrefix>(
             ring.pop_front();
         }
         ring.push_back(line);
+        // 与环同一临界区递增：SSE 订阅者用序号判定增量边界。
+        RING_SEQ.fetch_add(1, Ordering::Relaxed);
     }
 }
 
@@ -885,6 +894,67 @@ fn format_line<P: LinePrefix>(
 pub fn recent_lines(limit: usize) -> Vec<String> {
     let ring = RING.lock();
     ring.iter().rev().take(limit).cloned().collect::<Vec<_>>().into_iter().rev().collect()
+}
+
+/// 增量读取：返回 `(next_cursor, lines)`，其中 `lines` 是**序号 ≥ `cursor`** 的全部行。
+///
+/// 用于 SSE tail（P2-8）：订阅者首次以 `cursor = 0` 订阅拿到当前环内全部行（≤512），
+/// 之后把返回的 `next_cursor` 作为下次调用的 `cursor`，即可只取新增行。环只保留最后
+/// 512 行：若订阅者落后超过 512 行，`cursor` 会被夹到环首（最多漏掉被挤出的旧行，
+/// 不会重复推送已发出的行）。
+pub fn lines_after(cursor: u64) -> (u64, Vec<String>) {
+    let ring = RING.lock();
+    let next = RING_SEQ.load(Ordering::Relaxed);
+    let len = ring.len() as u64;
+    let first = next.saturating_sub(len); // 环首行的序号
+    let start = if cursor <= first {
+        0
+    } else {
+        (cursor - first).min(len) as usize
+    };
+    let out: Vec<String> = ring.iter().skip(start).cloned().collect();
+    (next, out)
+}
+
+/// 响应 `Content-Type` 是否为 SSE（`text/event-stream`）。见 [`SseStreamBody`]。
+pub fn is_event_stream(headers: &http::HeaderMap) -> bool {
+    headers
+        .get(http::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v.trim_start().to_ascii_lowercase().starts_with("text/event-stream"))
+        .unwrap_or(false)
+}
+
+/// Admin SSE 流的**响应扩展**句柄（§16.12 / P2-8）。
+///
+/// h1 直接把 `admin::handle` 的 `BoxBody` 交给 hyper 流式发送；而 h2/h3 的 admin 分支会把
+/// `Response<BoxBody>`「收齐成 `Response<Bytes>`」（见 `h2::collect_to_bytes`）。SSE 是
+/// **无界**流，收齐会永远等不到结尾 ⇒ 请求挂死。为此 h2/h3 的收齐函数遇到
+/// `text/event-stream` 时不再收齐，改把原始 body 装进本扩展、body 置空；连接任务/发送
+/// 出口见到本扩展即按帧 `send_data`（收到客户端断开即止）。
+///
+/// **为什么装 `Arc<Mutex<Option<..>>>`**：`http::Extensions::insert` 要求 `T: Clone`
+/// （`http` crate 的签名如此），而流式 body 本身不可克隆。用 Arc 共享 + Mutex 取走持有权，
+/// 既满足 Clone 又保证"只有一个消费者能取到 body"（取走后为 None，重复消费不会是 UB）。
+#[derive(Clone)]
+pub struct SseStreamBody(pub std::sync::Arc<std::sync::Mutex<Option<crate::server::h1::BoxBody>>>);
+
+impl SseStreamBody {
+    /// 由 `admin::handle` 产出的流式 body 构造句柄。
+    pub fn new(body: crate::server::h1::BoxBody) -> Self {
+        Self(std::sync::Arc::new(std::sync::Mutex::new(Some(body))))
+    }
+
+    /// **取走** body（只能成功一次；已被取走则回 `None`）。
+    pub fn take_body(&self) -> Option<crate::server::h1::BoxBody> {
+        self.0.lock().ok().and_then(|mut g| g.take())
+    }
+}
+
+impl std::fmt::Debug for SseStreamBody {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("SseStreamBody(..)")
+    }
 }
 
 

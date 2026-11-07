@@ -100,6 +100,38 @@ cd /crucible && git reset --hard <old-commit> && cargo build --release ... && \
 - `config.toml` 因缺生产 ECH 资产 `state/ech/real.pem` 会 `--check-config` rc=1（历史同）。
 - 遗留栈需 `tls_nss,tls_tomcrypt` features + 用户级 NSS/libtomcrypt；默认构建完全不加载。
 
+### 3.3.1 ASP / ASP.NET / Go / mruby 的真实形态与阻塞（P1-13 / P1-14 / P2-10）
+
+**结论（本构建机实测，2026-11-07）**：ASP 与 ASP.NET 都**不是**规格字面的后端；下方每条都给了可复现命令与产物证据。
+
+- **P1-13 `libaxonasp.so`（Go）—— 未构建，且“构建出来也不能用”**：
+  * `ls target/app-engines/libaxonasp.so` → **不存在**；`ls target/app-engines/libapp_asp.so` → 存在（30464 B）。
+  * `strings target/app-engines/libapp_asp.so | grep -i axon` → `axonasp_engine.c`、`<!-- axonasp path=%s -->`
+    ⇒ 实际加载的是 **C** 兼容实现（`libs/axonasp-ffi/axonasp_engine.c`），不是 Go c-shared。
+  * `nm -D target/app-engines/libapp_asp.so` → `appengine_execute` 等 ABI 符号齐全（C 引擎）。
+  * **工具链在本机存在**：`command -v go` → `/usr/bin/go`；`go version` → `go1.26.8 linux/amd64`。
+    所以「无 Go 工具链」**不是**本机的阻塞（是否适用于生产机需另行确认）。
+  * **真正的阻塞是 ABI 不匹配**：`libs/axonasp-ffi/main.go` 只导出 `//export axonasp_handle` /
+    `axonasp_free`（见其源码），而宿主 `app_ffi::default_lib_path` 只按
+    `target/app-engines/libapp_<engine>.so` 取库并调用 `appengine_init/execute/shutdown`。
+    `build_axonasp_ffi.sh` 即使产出 `libaxonasp.so`，**也没有任何代码会加载它**。
+  * 要落到字面规格（产品决策，未做）：Go 侧改成导出 appengine ABI，并让引擎映射/默认路径指向它。
+- **P1-14 mruby 链 —— 无源码，脚本只写 stub**：
+  * `ls -ld libs/mruby*` → `No such file or directory`（仓库内无 mruby 源码/目录）。
+  * `scripts/build_mruby.sh`（704 B）只 `mkdir` + 写一个 **占位** `mruby.h`（文件内自述
+    「stub header so configure can probe; real mruby replaces this tree」），**不 clone、不编译**。
+  * 现状：scriptffi 实际走 MRI / python / perl 嵌入或 spawn，mruby 嵌入不存在；不伪造嵌入。
+- **P2-10 ASP.NET hostfxr —— 无运行时，走 mini（已如实标注）**：
+  * `command -v dotnet` → 空（rc=1）；`ls /usr/share/dotnet /usr/lib/dotnet` → 均不存在；
+    `~/.dotnet` 仅有 sentinel（无 `host/`、无 `libhostfxr.so`）；全盘 `find` 未见 `libhostfxr.so`。
+  * `libaspnet_ffi.so`（15568 B）只有 `crucible_aspnet_execute` 一个导出（独立 loader shim，**服务端不加载**）。
+  * 引擎 `libapp_aspnet.so`（`libs/aspnet-ffi/aspnet_engine.c`）在无 hostfxr 时回落 **C mini**
+    并回 200，响应头带 `X-Crucible-Engine: aspnet-mini`（真 hostfxr 时为 `aspnet-hostfxr`）。
+    **所有**降级路径（mini-200 / mini-404）都带该标记；ASP 的 404 分支此前漏 `X-Crucible-Engine: asp`，已补。
+  * 要真过 CoreCLR：装 .NET 运行时（`DOTNET_ROOT` 下有 `host/fxr/*/libhostfxr.so`）并在
+    `docroot/bin/` 放 `CrucibleAspNetSample.dll`+`runtimeconfig.json`；缺任一即 mini（不伪造）。
+
+
 ---
 
 ## 4. 需要你拍板 / 需要你操作的事项

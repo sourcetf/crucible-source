@@ -87,10 +87,14 @@ pub async fn handle_settings(
             };
             json_ok(format!(
                 "{{\"ok\":true,\"enabled\":{},\"db_path\":{},\
-\"path_priority_gain\":{},\"panel_path\":{},\"panel_overrides\":{}}}",
+\"path_priority_gain\":{},\"update_script\":{},\"disabled_fields\":{},\
+\"panel_path\":{},\"panel_overrides\":{}}}",
                 snap.geoip.enabled,
                 json_str(&db_s),
                 snap.geoip.path_priority_gain,
+                json_str(&snap.geoip.update_script_path().display().to_string()),
+                serde_json::to_string(&snap.geoip.disabled_fields)
+                    .unwrap_or_else(|_| "[]".into()),
                 json_str(&panel.display().to_string()),
                 panel_over
             ))
@@ -106,6 +110,10 @@ pub async fn handle_settings(
             let mut enabled: Option<bool> = None;
             let mut db_path: Option<Option<PathBuf>> = None; // Some(None) = 清除覆盖
             let mut gain: Option<i64> = None;
+            // P1-11：更新脚本路径覆盖；Some(None) = 清除（回落 config.toml/默认）。
+            let mut update_script: Option<Option<PathBuf>> = None;
+            // P1-10：停用字段覆盖（None = 不动）。
+            let mut disabled_fields: Option<Vec<String>> = None;
             match serde_json::from_str::<serde_json::Value>(&text) {
                 Ok(v) if v.is_object() => {
                     if let Some(b) = v.get("enabled") {
@@ -133,6 +141,34 @@ pub async fn handle_settings(
                             None => return bad_request("path_priority_gain 必须是整数"),
                         }
                     }
+                    if let Some(p) = v.get("update_script") {
+                        if p.is_null() {
+                            update_script = Some(None);
+                        } else if let Some(s) = p.as_str() {
+                            if s.trim().is_empty() {
+                                update_script = Some(None);
+                            } else {
+                                update_script = Some(Some(PathBuf::from(s.trim())));
+                            }
+                        } else {
+                            return bad_request("update_script 必须是字符串或 null");
+                        }
+                    }
+                    if let Some(d) = v.get("disabled_fields") {
+                        let Some(arr) = d.as_array() else {
+                            return bad_request("disabled_fields 必须是字符串数组");
+                        };
+                        let mut fs = Vec::with_capacity(arr.len());
+                        for x in arr {
+                            match x.as_str() {
+                                Some(s) => fs.push(s.trim().to_string()),
+                                None => {
+                                    return bad_request("disabled_fields 必须是字符串数组")
+                                }
+                            }
+                        }
+                        disabled_fields = Some(fs);
+                    }
                 }
                 Ok(_) => return bad_request("body 必须是 JSON 对象"),
                 Err(_) => {
@@ -152,13 +188,43 @@ pub async fn handle_settings(
                             Err(_) => return bad_request("path_priority_gain 必须是整数"),
                         }
                     }
-                    if enabled.is_none() && db_path.is_none() && gain.is_none() {
-                        return bad_request("没有可保存的设置（enabled/db_path/path_priority_gain）");
+                    if let Some(s) = form_field(&text, "update_script") {
+                        update_script = Some(if s.trim().is_empty() {
+                            None
+                        } else {
+                            Some(PathBuf::from(s.trim()))
+                        });
+                    }
+                    // 表单没有数组语义：`disabled_fields=a,b,c`（空 = 全部启用）。
+                    if let Some(s) = form_field(&text, "disabled_fields") {
+                        disabled_fields = Some(
+                            s.split(',')
+                                .map(|x| x.trim().to_string())
+                                .filter(|x| !x.is_empty())
+                                .collect(),
+                        );
+                    }
+                    if enabled.is_none()
+                        && db_path.is_none()
+                        && gain.is_none()
+                        && update_script.is_none()
+                        && disabled_fields.is_none()
+                    {
+                        return bad_request(
+                            "没有可保存的设置（enabled/db_path/path_priority_gain/update_script/disabled_fields）",
+                        );
                     }
                 }
             }
-            if enabled.is_none() && db_path.is_none() && gain.is_none() {
-                return bad_request("没有可保存的设置（enabled/db_path/path_priority_gain）");
+            if enabled.is_none()
+                && db_path.is_none()
+                && gain.is_none()
+                && update_script.is_none()
+                && disabled_fields.is_none()
+            {
+                return bad_request(
+                    "没有可保存的设置（enabled/db_path/path_priority_gain/update_script/disabled_fields）",
+                );
             }
             let mut panel = match toml_store::load_effective() {
                 Ok(c) => c,
@@ -184,6 +250,12 @@ pub async fn handle_settings(
                     ));
                 }
                 panel.path_priority_gain = Some(g);
+            }
+            if let Some(p) = update_script {
+                panel.update_script = p;
+            }
+            if let Some(f) = disabled_fields {
+                panel.disabled_fields = Some(f);
             }
             // 保存前检查组合合法性：enabled=true 而生效配置没有任何 db_path 时，
             // 运行期开关显示已启用但 country 规则永不命中（stored 后才在 reload
@@ -229,10 +301,13 @@ pub async fn handle_settings(
                 .unwrap_or_default();
             json_ok(format!(
                 "{{\"ok\":true,\"enabled\":{},\"db_path\":{},\
-\"path_priority_gain\":{},\"panel_path\":{}}}",
+\"path_priority_gain\":{},\"update_script\":{},\"disabled_fields\":{},\"panel_path\":{}}}",
                 snap.geoip.enabled,
                 json_str(&db_s),
                 snap.geoip.path_priority_gain,
+                json_str(&snap.geoip.update_script_path().display().to_string()),
+                serde_json::to_string(&snap.geoip.disabled_fields)
+                    .unwrap_or_else(|_| "[]".into()),
                 json_str(&toml_store::panel_path().display().to_string())
             ))
     } else {
@@ -330,6 +405,205 @@ pub async fn handle_filter_with_live(
     }
 }
 
+/// `GET /api/geoip/filter/values?limit=` — P2-17 筛选器下拉取值。
+///
+/// 返回 `{country, province, city, isp}` 四组字符串：
+/// - `country`：国家别名表全部键（`中国`/`CN`/`United States`…）+ 库里出现过的国家码；
+/// - `isp`：ISP 别名显示名（China Telecom/AWS…）+ 库里出现过的运营商；
+/// - `province` / `city`：库里出现过的省市值（无别名表，直接用数据源值）。
+///
+/// 面板把它们塞进 `<datalist>`：输入 `中国`/`CN`/`Cloudflare` 都能得到等价候选。
+pub async fn handle_filter_values(
+    req: &Request<Full<Bytes>>,
+    live: &Arc<LiveConfig>,
+) -> Response<BoxBody> {
+    if req.method() != Method::GET {
+        return method_not_allowed();
+    }
+    let limit = query_param(req.uri().query().unwrap_or(""), "limit")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(200usize);
+    let mut country = aliases::country_alias_keys();
+    let mut isp = aliases::isp_alias_names();
+    let mut province: Vec<String> = Vec::new();
+    let mut city: Vec<String> = Vec::new();
+    if let Some(db_path) = resolve_db_path(live) {
+        if let Ok(conn) = db::open(&db_path) {
+            let mut merge = |dst: &mut Vec<String>, field: &str| {
+                if let Ok(mut v) =
+                    crate::server::geoip_panel::ops::distinct_values(&conn, field, limit)
+                {
+                    dst.append(&mut v);
+                }
+            };
+            merge(&mut country, "country");
+            merge(&mut province, "province");
+            merge(&mut city, "city");
+            merge(&mut isp, "isp");
+        }
+    }
+    let dedup_sort = |mut v: Vec<String>| -> Vec<String> {
+        v.retain(|s| !s.trim().is_empty());
+        v.sort();
+        v.dedup();
+        v.truncate(limit.clamp(1, 1000));
+        v
+    };
+    let country = dedup_sort(country);
+    let province = dedup_sort(province);
+    let city = dedup_sort(city);
+    let isp = dedup_sort(isp);
+    let body = serde_json::json!({
+        "country": country,
+        "province": province,
+        "city": city,
+        "isp": isp,
+    });
+    json_ok(body.to_string())
+}
+
+/// `GET /api/geoip/geofeed` | `POST url=` — P1-9 自定义 geofeed 列表。
+pub async fn handle_geofeed(req: Request<Full<Bytes>>) -> Response<BoxBody> {
+    let panel_path = crate::server::geoip_panel::db::panel_db_path();
+    let panel_path = panel_path.as_path();
+    match *req.method() {
+        Method::GET => {
+            if !panel_path.is_file() {
+                return json_ok("{\"geofeed\":[]}".into());
+            }
+            match db::open_panel(panel_path) {
+                Ok(conn) => match crate::server::geoip_panel::ops::list_geofeed(&conn) {
+                    Ok(rows) => {
+                        let items: Vec<String> = rows
+                            .iter()
+                            .map(|r| {
+                                format!(
+                                    "{{\"id\":{},\"url\":{},\"enabled\":{},\"last_fetch\":{},\"last_status\":{}}}",
+                                    r.id,
+                                    json_str(&r.url),
+                                    r.enabled,
+                                    r.last_fetch,
+                                    json_str(&r.last_status)
+                                )
+                            })
+                            .collect();
+                        json_ok(format!("{{\"geofeed\":[{}]}}", items.join(",")))
+                    }
+                    Err(e) => json_ok(format!("{{\"error\":{}}}", json_str(&format!("{e:#}")))),
+                },
+                Err(e) => json_ok(format!("{{\"error\":{}}}", json_str(&format!("{e:#}")))),
+            }
+        }
+        Method::POST => {
+            let (_parts, body) = req.into_parts();
+            let bytes = body
+                .collect()
+                .await
+                .map(|c| c.to_bytes())
+                .unwrap_or_default();
+            let body = String::from_utf8_lossy(&bytes);
+            let url = form_field(&body, "url").unwrap_or_default();
+            match db::open_panel(panel_path) {
+                Ok(conn) => match crate::server::geoip_panel::ops::add_geofeed(&conn, &url) {
+                    Ok(()) => json_ok("{\"ok\":true}".into()),
+                    Err(e) => json_ok(format!(
+                        "{{\"error\":{}}}",
+                        json_str(&format!("{e:#}"))
+                    )),
+                },
+                Err(e) => json_ok(format!("{{\"error\":{}}}", json_str(&format!("{e:#}")))),
+            }
+        }
+        _ => method_not_allowed(),
+    }
+}
+
+/// `POST /api/geoip/geofeed/delete` body: id=
+pub async fn handle_geofeed_delete(req: Request<Full<Bytes>>) -> Response<BoxBody> {
+    if req.method() != Method::POST {
+        return method_not_allowed();
+    }
+    let (_parts, body) = req.into_parts();
+    let bytes = body
+        .collect()
+        .await
+        .map(|c| c.to_bytes())
+        .unwrap_or_default();
+    let body = String::from_utf8_lossy(&bytes);
+    let Some(id) = form_field(&body, "id").and_then(|s| s.parse::<i64>().ok()) else {
+        return json_ok("{\"error\":\"missing id\"}".into());
+    };
+    let panel_path = crate::server::geoip_panel::db::panel_db_path();
+    match db::open_panel(panel_path.as_path()) {
+        Ok(conn) => match crate::server::geoip_panel::ops::delete_geofeed(&conn, id) {
+            Ok(true) => json_ok("{\"ok\":true}".into()),
+            Ok(false) => json_ok("{\"error\":\"not found\"}".into()),
+            Err(e) => json_ok(format!("{{\"error\":{}}}", json_str(&format!("{e:#}")))),
+        },
+        Err(e) => json_ok(format!("{{\"error\":{}}}", json_str(&format!("{e:#}")))),
+    }
+}
+
+/// `POST /api/geoip/geofeed/refresh` — P1-9 批量刷新。
+///
+/// 把面板库里启用的 geofeed URL 落成供给层 `custom_geofeed.json`，再触发
+/// `geoip_update.sh --only=geofeed`（脚本侧读该文件并导入）。生产路径不调 Python，
+/// Rust 与 Python 之间只有一份声明式数据文件（理由见 `ops::write_geofeed_supply`）。
+pub async fn handle_geofeed_refresh(
+    _req: Request<Full<Bytes>>,
+    live: &Arc<LiveConfig>,
+) -> Response<BoxBody> {
+    let panel_path = crate::server::geoip_panel::db::panel_db_path();
+    let conn = match db::open_panel(panel_path.as_path()) {
+        Ok(c) => c,
+        Err(e) => {
+            return json_ok(format!(
+                "{{\"ok\":false,\"error\":{}}}",
+                json_str(&format!("open panel: {e:#}"))
+            ))
+        }
+    };
+    let urls = match crate::server::geoip_panel::ops::enabled_geofeed_urls(&conn) {
+        Ok(u) => u,
+        Err(e) => {
+            return json_ok(format!(
+                "{{\"ok\":false,\"error\":{}}}",
+                json_str(&format!("{e:#}"))
+            ))
+        }
+    };
+    if urls.is_empty() {
+        return json_ok(
+            "{\"ok\":false,\"error\":\"自定义 geofeed 列表为空（先添加 URL）\"}".into(),
+        );
+    }
+    let supply = crate::server::geoip_panel::ops::custom_geofeed_supply_path();
+    if let Err(e) = crate::server::geoip_panel::ops::write_geofeed_supply(&supply, &urls) {
+        return json_ok(format!(
+            "{{\"ok\":false,\"error\":{}}}",
+            json_str(&format!("写供给层失败: {e:#}"))
+        ));
+    }
+    let script = live.snapshot().geoip.update_script_path();
+    let root = std::path::Path::new(".");
+    match crate::server::geoip_panel::ops::spawn_geoip_update_script(
+        root,
+        Some(script.as_path()),
+        Some("geofeed"),
+    ) {
+        Ok(()) => json_ok(format!(
+            "{{\"ok\":true,\"urls\":{},\"supply\":{},\"spawned\":{}}}",
+            urls.len(),
+            json_str(&supply.display().to_string()),
+            json_str(&script.display().to_string())
+        )),
+        Err(e) => json_ok(format!(
+            "{{\"ok\":false,\"error\":{}}}",
+            json_str(&format!("{e:#}"))
+        )),
+    }
+}
+
 /// `GET /api/geoip/sources` — panel sources + optional SOURCES.json.
 pub async fn handle_sources(_req: &Request<Full<Bytes>>) -> Response<BoxBody> {
     let panel_path = crate::server::geoip_panel::db::panel_db_path();
@@ -409,29 +683,47 @@ pub async fn handle_sources(_req: &Request<Full<Bytes>>) -> Response<BoxBody> {
     ))
 }
 
-/// `GET /api/geoip/conflicts`
+/// `GET /api/geoip/conflicts`（P2-16：按 `field` 分成「IP 冲突」与「ASN 冲突」两栏）。
+///
+/// `field == "asn"`（大小写不敏感）归入 ASN 栏；其余（country/isp/…）归入 IP 栏。
+/// 同时保留扁平 `conflicts` 数组（旧调用点不回退），并给每条附 `kind`。
 pub async fn handle_conflicts(_req: &Request<Full<Bytes>>) -> Response<BoxBody> {
     let panel_path = crate::server::geoip_panel::db::panel_db_path();
     let panel_path = panel_path.as_path();
     if !panel_path.is_file() {
-        return json_ok("{\"conflicts\":[]}".into());
+        return json_ok("{\"conflicts\":[],\"ip_conflicts\":[],\"asn_conflicts\":[]}".into());
     }
     match db::open_panel(panel_path) {
         Ok(conn) => match crate::server::geoip_panel::ops::list_conflicts(&conn) {
             Ok(rows) => {
-                let mut items = String::new();
-                for (i, (id, prefix, field, sources)) in rows.iter().enumerate() {
-                    if i > 0 {
-                        items.push(',');
-                    }
-                    items.push_str(&format!(
-                        "{{\"id\":{id},\"prefix\":{},\"field\":{},\"sources\":{}}}",
+                let mut all = Vec::with_capacity(rows.len());
+                let mut ip = Vec::new();
+                let mut asn = Vec::new();
+                for (id, prefix, field, sources) in rows.iter() {
+                    let kind = if field.trim().eq_ignore_ascii_case("asn") {
+                        "asn"
+                    } else {
+                        "ip"
+                    };
+                    let item = format!(
+                        "{{\"id\":{id},\"prefix\":{},\"field\":{},\"sources\":{},\"kind\":\"{kind}\"}}",
                         json_str(prefix),
                         json_str(field),
                         json_str(sources)
-                    ));
+                    );
+                    if kind == "asn" {
+                        asn.push(item.clone());
+                    } else {
+                        ip.push(item.clone());
+                    }
+                    all.push(item);
                 }
-                json_ok(format!("{{\"conflicts\":[{items}]}}"))
+                json_ok(format!(
+                    "{{\"conflicts\":[{}],\"ip_conflicts\":[{}],\"asn_conflicts\":[{}]}}",
+                    all.join(","),
+                    ip.join(","),
+                    asn.join(",")
+                ))
             }
             Err(e) => json_ok(format!("{{\"error\":{}}}", json_str(&format!("{e:#}")))),
         },
@@ -718,11 +1010,37 @@ pub async fn handle_source_set(req: Request<Full<Bytes>>) -> Response<BoxBody> {
     }
 }
 
-/// `POST /api/geoip/update` — spawn offline merge script.
-pub async fn handle_update_trigger(_req: Request<Full<Bytes>>) -> Response<BoxBody> {
+/// `POST /api/geoip/update?only=<源名>` — spawn offline update script.
+///
+/// P1-11：可选 `only`（源名/阶段，如 `merge`/`enrich`/`geofeed`）转发为
+/// `--only=<源名>`；脚本路径取 `[geoip] update_script`（面板可配，默认历史路径）。
+pub async fn handle_update_trigger(
+    req: Request<Full<Bytes>>,
+    live: &Arc<LiveConfig>,
+) -> Response<BoxBody> {
+    // query 优先；body 表单 `only=` 兜底（面板用 query，运维 curl 两种都行）。
+    let mut only = query_param(req.uri().query().unwrap_or(""), "only");
+    let (_parts, body) = req.into_parts();
+    let bytes = body
+        .collect()
+        .await
+        .map(|c| c.to_bytes())
+        .unwrap_or_default();
+    let text = String::from_utf8_lossy(&bytes).into_owned();
+    if only.as_deref().map(str::trim).unwrap_or("").is_empty() {
+        only = form_field(&text, "only").filter(|s| !s.trim().is_empty());
+    }
+    let script = live.snapshot().geoip.update_script_path();
     let root = std::path::Path::new(".");
-    match crate::server::geoip_panel::ops::spawn_geoip_update(root) {
-        Ok(()) => json_ok("{\"ok\":true,\"spawned\":\"geoip_update.sh\"}".into()),
+    match crate::server::geoip_panel::ops::spawn_geoip_update_script(
+        root,
+        Some(script.as_path()),
+        only.as_deref(),
+    ) {
+        Ok(()) => json_ok(format!(
+            "{{\"ok\":true,\"spawned\":{}}}",
+            json_str(&script.display().to_string())
+        )),
         // 失败也带 `ok:false`：前端按 HTTP 状态判断成功与否，只回 {"error":...} 会被当成
         // 「已触发」并显示成功提示（实际被并发保护挡下了）。
         Err(e) => json_ok(format!(
@@ -911,6 +1229,8 @@ fn lookup_json(ip_s: &str, db_path: Option<&std::path::Path>) -> Response<BoxBod
                         gr.isp = aliases::resolve_isp_alias(&gr.isp);
                         gr.label = lookup::format_label(&gr);
                     }
+                    // P1-10：查询返回前按「停用字段」开关过滤展示字段，并重算 label。
+                    blank_disabled_display(&mut gr);
                     let covering_json: Vec<String> = covering_rows
                         .iter()
                         .map(|p| {
@@ -986,6 +1306,27 @@ fn lookup_json(ip_s: &str, db_path: Option<&std::path::Path>) -> Response<BoxBod
             json_str(&format!("{e:#}"))
         )),
     }
+}
+
+/// P1-10：按面板「停用字段」开关清空查询结果里的展示字段，并重算 label。
+fn blank_disabled_display(r: &mut lookup::GeoResult) {
+    use crate::server::geoip_panel::covering::is_field_disabled;
+    if is_field_disabled("country") { r.country.clear(); }
+    if is_field_disabled("province") { r.province.clear(); }
+    if is_field_disabled("region") { r.region.clear(); }
+    if is_field_disabled("city") { r.city.clear(); }
+    if is_field_disabled("district") { r.district.clear(); }
+    if is_field_disabled("isp") { r.isp.clear(); }
+    if is_field_disabled("dc") { r.dc.clear(); }
+    if is_field_disabled("asn") { r.asn.clear(); }
+    if is_field_disabled("as_org") { r.as_org.clear(); }
+    if is_field_disabled("net_org") { r.net_org.clear(); }
+    if is_field_disabled("cloud_provider") { r.cloud_provider.clear(); }
+    if is_field_disabled("cloud_region") { r.cloud_region.clear(); }
+    if is_field_disabled("cloud_service") { r.cloud_service.clear(); }
+    if is_field_disabled("hosting") { r.hosting.clear(); }
+    if is_field_disabled("division_code") { r.division_code.clear(); }
+    r.label = lookup::format_label(r);
 }
 
 fn query_param(q: &str, key: &str) -> Option<String> {

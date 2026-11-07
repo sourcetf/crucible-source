@@ -185,6 +185,8 @@ mod tests {
             enabled: true,
             db_path: Some(PathBuf::from("/keep.sqlite")),
             path_priority_gain: 10,
+            update_script: None,
+            disabled_fields: Vec::new(),
         };
         cfg.apply_to(&mut geoip);
         assert!(geoip.enabled, "panel.toml 未写 enabled ⇒ 保留 config 值");

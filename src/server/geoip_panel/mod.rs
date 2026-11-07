@@ -6,6 +6,7 @@ pub mod config;
 pub mod conflict;
 pub mod covering;
 pub mod db;
+pub mod filter_agg;
 pub mod iputil;
 pub mod lookup;
 pub mod ops;

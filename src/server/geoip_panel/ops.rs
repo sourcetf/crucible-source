@@ -245,6 +245,337 @@ pub fn upsert_cron(
     Ok(())
 }
 
+/// P1-4：计划任务的 schedule 白名单解析（§23.6「计划任务：执行脚本」）。
+///
+/// **保守**：只认下面这几种写法；任何其它字符串（尤其是 5 段 cron 表达式
+/// `0 3 * * *`）一律返回 `None` ⇒ **绝不执行**，只记一次 warn。面板里写错一个
+/// 表达式绝不能让服务器按错误的频率反复跑重活（下载 + 13 个 enrich）。
+///
+/// 支持：`hourly` / `daily` / `weekly` / `daily HH:MM` / `HH:MM`（=每日该时刻）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CronSchedule {
+    /// 每 3600s（自上次运行起算）。
+    Hourly,
+    /// `None` = 每 86400s；`Some((h,m))` = 每天本地时间 h:m。
+    Daily(Option<(u8, u8)>),
+    /// 每 7*86400s（自上次运行起算）。
+    Weekly,
+}
+
+/// 解析 schedule（见 [`CronSchedule`]）；无法识别返回 `None`。
+pub fn parse_schedule(s: &str) -> Option<CronSchedule> {
+    let t = s.trim().to_ascii_lowercase();
+    match t.as_str() {
+        "" => None,
+        "hourly" | "@hourly" => Some(CronSchedule::Hourly),
+        "daily" | "@daily" | "midnight" => Some(CronSchedule::Daily(None)),
+        "weekly" | "@weekly" => Some(CronSchedule::Weekly),
+        _ => {
+            let hm = t.strip_prefix("daily ").map(str::trim).or_else(|| {
+                // 纯 `HH:MM` 也当作每日（规格白名单里的 `HH:MM`（每日））。
+                if t.contains(':') {
+                    Some(t.as_str())
+                } else {
+                    None
+                }
+            })?;
+            parse_hhmm(hm).map(|hm| CronSchedule::Daily(Some(hm)))
+        }
+    }
+}
+
+/// 解析 `HH:MM`（24 小时制，严格的 5 字符形式），越界/畸形返回 `None`。
+fn parse_hhmm(s: &str) -> Option<(u8, u8)> {
+    let s = s.trim();
+    let (h, m) = s.split_once(':')?;
+    if h.is_empty() || m.is_empty() || m.contains(':') {
+        return None;
+    }
+    // 只接受指定位数（"3:00" 也放过：容忍运维手写；但拒绝 "03:0" 之外的怪值靠范围校验）。
+    let h: u8 = h.parse().ok()?;
+    let m: u8 = m.parse().ok()?;
+    if h > 23 || m > 59 {
+        return None;
+    }
+    Some((h, m))
+}
+
+/// 本地时间下的「今天 HH:MM」的 unix 秒（若晚于 now 则回退到昨天 —— 取**最近一次**已到点）。
+///
+/// 用 libc `localtime_r`（进程已链接 libc；与脚本用 `date` 得到的本地时间一致），避免
+/// 引入时区依赖。失败时（极不可能）回落 UTC 语义（tm 全 0 时会走 `now` 分支）。
+fn last_occurrence_local(now: i64, h: u8, m: u8) -> i64 {
+    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+    let t = now as libc::time_t;
+    let ok = unsafe { !libc::localtime_r(&t, &mut tm).is_null() };
+    if !ok {
+        // 回落：按「距上次整点」的粗粒度判定（不会误执行，只是不精确）。
+        return now - (now.rem_euclid(86400));
+    }
+    let sod = tm.tm_hour as i64 * 3600 + tm.tm_min as i64 * 60 + tm.tm_sec as i64;
+    let today_at = now - sod + h as i64 * 3600 + m as i64 * 60;
+    if today_at > now {
+        today_at - 86400
+    } else {
+        today_at
+    }
+}
+
+/// 该 schedule 在 `now` 时点是否到期（`last_run == 0` = 从未运行 ⇒ 视为到期）。
+///
+/// 间隔型（hourly/weekly/daily 无时刻）按「自上次运行起算」；时刻型（daily HH:MM /
+/// HH:MM）按「最近一次该时刻是否已过且晚于上次运行」。
+pub fn schedule_due(sched: &CronSchedule, last_run: i64, now: i64) -> bool {
+    if last_run <= 0 {
+        return true;
+    }
+    match sched {
+        CronSchedule::Hourly => now - last_run >= 3600,
+        CronSchedule::Daily(None) => now - last_run >= 86400,
+        CronSchedule::Weekly => now - last_run >= 7 * 86400,
+        CronSchedule::Daily(Some((h, m))) => last_occurrence_local(now, *h, *m) > last_run,
+    }
+}
+
+/// 记一次计划任务运行（更新 `last_run` + `last_status` + 审计）。
+pub fn mark_cron_run(panel: &Connection, id: i64, status: &str) -> Result<()> {
+    let now = now_unix();
+    panel.execute(
+        "UPDATE panel_cron SET last_run = ?1, last_status = ?2 WHERE id = ?3",
+        rusqlite::params![now, status, id],
+    )?;
+    panel.execute(
+        "INSERT INTO panel_audit(action, detail) VALUES('cron_run', ?1)",
+        rusqlite::params![format!("#{id} {status}")],
+    )?;
+    Ok(())
+}
+
+fn now_unix() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+/// 无法识别的 schedule 只 warn 一次（同一条字符串），避免每 60s 刷一条日志。
+fn warn_unrecognized_schedule_once(schedule: &str) {
+    static SEEN: std::sync::Mutex<Option<std::collections::HashSet<String>>> =
+        std::sync::Mutex::new(None);
+    let mut g = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+    let set = g.get_or_insert_with(std::collections::HashSet::new);
+    if set.insert(schedule.to_string()) {
+        log::warn!(
+            "geoip cron: 无法识别的 schedule {schedule:?} —— 不会执行该任务。\
+             支持 hourly/daily/weekly/daily HH:MM/HH:MM"
+        );
+    }
+}
+
+/// P1-4：执行器 —— 读 `panel_cron`，判定「到点」并触发离线更新脚本（单飞）。
+///
+/// 由 `server::mod` 的周期任务每 60s 调用一次。到点的任务一律跑
+/// `[geoip] update_script`（P1-11 可配），触发与面板按钮共用 `spawn_geoip_update_script`
+/// 的单实例保护（锁目录 + 进程扫描 + 进程内 Mutex）⇒ **不会并发跑两次**。
+/// 失败只 warn，绝不影响进程存活。返回本次成功触发的任务数。
+pub fn run_due_crons(geoip: &crate::config::GeoIpConfig) -> usize {
+    let root = Path::new(".");
+    let panel_path = crate::server::geoip_panel::db::panel_db_path();
+    if !panel_path.is_file() {
+        return 0;
+    }
+    let conn = match crate::server::geoip_panel::db::open_panel(&panel_path) {
+        Ok(c) => c,
+        Err(e) => {
+            log::warn!("geoip cron: 打开面板库失败: {e:#}");
+            return 0;
+        }
+    };
+    let rows = match list_cron(&conn) {
+        Ok(r) => r,
+        Err(e) => {
+            log::warn!("geoip cron: 读取 panel_cron 失败: {e:#}");
+            return 0;
+        }
+    };
+    let now = now_unix();
+    let mut spawned = 0usize;
+    // 每个 schedule 字符串只 warn 一次（跨调用）。
+    for (_id, _name, schedule, enabled, last_run) in rows {
+        if enabled == 0 {
+            continue;
+        }
+        let Some(sched) = parse_schedule(&schedule) else {
+            warn_unrecognized_schedule_once(&schedule);
+            continue;
+        };
+        if !schedule_due(&sched, last_run, now) {
+            continue;
+        }
+        let script = geoip.update_script_path();
+        match spawn_geoip_update_script(root, Some(script.as_path()), None) {
+            Ok(()) => {
+                // 只有**真正触发**了才推进 last_run：被并发保护挡下（另一轮在跑）时
+                // 不改时间戳，下一 tick 会自然重试。
+                if let Err(e) = mark_cron_run(&conn, _id, "spawned") {
+                    log::warn!("geoip cron: 记 last_run 失败: {e:#}");
+                }
+                spawned += 1;
+                log::info!(
+                    "geoip cron: 任务 {} (schedule={schedule}) 到期，已触发更新脚本",
+                    _name
+                );
+            }
+            Err(e) => {
+                log::warn!("geoip cron: 触发更新脚本失败: {e:#}");
+            }
+        }
+    }
+    spawned
+}
+
+// ------------------------------ P1-9 自定义 geofeed 列表 ------------------------------
+
+/// 一行自定义 geofeed（面板列表展示）。
+#[derive(Clone, Debug, Default)]
+pub struct GeofeedRow {
+    pub id: i64,
+    pub url: String,
+    pub enabled: bool,
+    pub last_fetch: i64,
+    pub last_status: String,
+}
+
+/// 列出面板里的自定义 geofeed URL。
+pub fn list_geofeed(panel: &Connection) -> Result<Vec<GeofeedRow>> {
+    let mut stmt = panel.prepare(
+        "SELECT id, url, COALESCE(enabled, 1), COALESCE(last_fetch, 0), COALESCE(last_status, '')
+         FROM panel_geofeed ORDER BY id ASC",
+    )?;
+    let rows = stmt.query_map([], |row| {
+        Ok(GeofeedRow {
+            id: row.get(0)?,
+            url: row.get(1)?,
+            enabled: row.get::<_, i64>(2)? != 0,
+            last_fetch: row.get(3)?,
+            last_status: row.get(4)?,
+        })
+    })?;
+    let mut out = Vec::new();
+    for r in rows {
+        out.push(r?);
+    }
+    Ok(out)
+}
+
+/// 新增一个自定义 geofeed URL（幂等；只接受 http/https）。
+pub fn add_geofeed(panel: &Connection, url: &str) -> Result<()> {
+    let url = url.trim();
+    if url.is_empty() {
+        anyhow::bail!("geofeed url 不能为空");
+    }
+    let lower = url.to_ascii_lowercase();
+    if !(lower.starts_with("http://") || lower.starts_with("https://")) {
+        anyhow::bail!("geofeed url 必须是 http(s):// 地址");
+    }
+    panel.execute(
+        "INSERT INTO panel_geofeed(url, enabled, last_fetch, last_status)
+         VALUES(?1, 1, 0, '') ON CONFLICT(url) DO NOTHING",
+        rusqlite::params![url],
+    )?;
+    panel.execute(
+        "INSERT INTO panel_audit(action, detail) VALUES('geofeed_add', ?1)",
+        rusqlite::params![url],
+    )?;
+    Ok(())
+}
+
+/// 删除一个自定义 geofeed URL。
+pub fn delete_geofeed(panel: &Connection, id: i64) -> Result<bool> {
+    let n = panel.execute("DELETE FROM panel_geofeed WHERE id = ?1", rusqlite::params![id])?;
+    if n > 0 {
+        panel.execute(
+            "INSERT INTO panel_audit(action, detail) VALUES('geofeed_delete', ?1)",
+            rusqlite::params![format!("geofeed #{id} removed")],
+        )?;
+    }
+    Ok(n > 0)
+}
+
+/// 供离线脚本消费的「供给层」：把启用的 geofeed URL 写成 JSON 文件。
+///
+/// 选这条路径的理由（§23.6「自定义 geofeed 列表：添加 URL；批量刷新」）：生产路径**禁止**
+/// 调 Python，但批量下载 geofeed 属于离线更新工作，只能由 `scripts/geoip_*` 做。于是
+/// Rust 侧只负责把面板库里的 URL 落成一个纯数据文件（`custom_geofeed.json`），
+/// `geoip_update.sh --only=geofeed` 再让 `geoip_enrich_geofeed.py --urls-file` 读它并导入。
+/// 这样 Rust 与 Python 之间只有一份**声明式数据**（不是命令执行桥），符合 §23.1 铁律 2/3。
+pub fn write_geofeed_supply(path: &Path, urls: &[String]) -> Result<()> {
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)
+            .with_context(|| format!("mkdir {}", dir.display()))?;
+    }
+    let body = serde_json::json!({ "urls": urls });
+    // 原子写（同目录 tmp + rename）：与 toml_store 同策，避免半截文件被脚本读到。
+    let mut tmp = path.as_os_str().to_os_string();
+    tmp.push(".tmp");
+    let tmp = std::path::PathBuf::from(tmp);
+    let text = serde_json::to_string_pretty(&body).context("encode custom geofeed json")?;
+    if let Err(e) = std::fs::write(&tmp, text) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e).with_context(|| format!("write {}", tmp.display()));
+    }
+    if let Err(e) = std::fs::rename(&tmp, path) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e).with_context(|| format!("rename {} -> {}", tmp.display(), path.display()));
+    }
+    Ok(())
+}
+
+/// 自定义 geofeed 供给层路径（`CRUCIBLE_GEOIP_CUSTOM_GEOFEED` 覆盖 → 默认）。
+pub fn custom_geofeed_supply_path() -> std::path::PathBuf {
+    crate::server::apps::env_lock::read_static_env("CRUCIBLE_GEOIP_CUSTOM_GEOFEED")
+        .filter(|s| !s.trim().is_empty())
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::path::PathBuf::from("data/geoip/sources/custom_geofeed.json"))
+}
+
+/// 收集启用的 geofeed URL（供批量刷新写供给层）。
+pub fn enabled_geofeed_urls(panel: &Connection) -> Result<Vec<String>> {
+    Ok(list_geofeed(panel)?
+        .into_iter()
+        .filter(|r| r.enabled)
+        .map(|r| r.url)
+        .collect())
+}
+
+// ------------------------------ P2-17 筛选下拉取值 ------------------------------
+
+/// 从三张表（geoip/ipv4/ipv6）取某列的去重值（面板筛选 datalist 用）。
+///
+/// `field` 只接受白名单列名（country/province/city/isp），拼接进 SQL 前先校验 ——
+/// 这是内部调用，但保持「不接受任意列名」的防御性。
+pub fn distinct_values(conn: &Connection, field: &str, limit: usize) -> Result<Vec<String>> {
+    let col = match field {
+        "country" | "province" | "city" | "isp" | "region" => field,
+        _ => anyhow::bail!("invalid distinct field: {field}"),
+    };
+    let lim = limit.min(1000);
+    let sql = format!(
+        "SELECT v FROM (
+             SELECT {col} AS v FROM geoip WHERE {col} IS NOT NULL AND {col} != ''
+             UNION SELECT {col} FROM ipv4 WHERE {col} IS NOT NULL AND {col} != ''
+             UNION SELECT {col} FROM ipv6 WHERE {col} IS NOT NULL AND {col} != ''
+         ) ORDER BY v LIMIT ?1"
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(rusqlite::params![lim as i64], |r| r.get::<_, String>(0))?;
+    let mut out = Vec::new();
+    for r in rows {
+        out.push(r?);
+    }
+    Ok(out)
+}
+
 /// Toggle / set source weight+enabled.
 ///
 /// 校验：既没给 enabled 也没给 weight ⇒ 无事可做（报错，别假成功）；给了值但
@@ -269,6 +600,10 @@ pub fn set_source(
     }
     if let Some(w) = weight {
         affected += panel.execute(
+            // 消费方：**离线合并** `scripts/geoip_merge.py` 的
+            // `PANEL_SOURCE_OVERRIDES`（读 panel.toml / panel.sqlite）——它按源名覆盖
+            // `LAYER_WEIGHTS`，`enabled=false` 的层整层跳过。此前面板写入无任何消费者
+            // （Wave-25 判定为伪实现），现改权重/启用会在**下一次合并**生效。
             "UPDATE panel_sources SET weight = ?1 WHERE name = ?2",
             rusqlite::params![w, name],
         )?;
@@ -324,8 +659,32 @@ pub fn proc_is_geoip_update(pid: i32) -> bool {
 static SPAWN_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// Spawn offline geoip_update.sh (non-blocking).
+///
+/// P1-11：脚本路径与 `--only=<源名>` 都可配 —— 前者来自 `[geoip] update_script`
+/// （默认 `scripts/geoip_update.sh`），后者来自 `/api/geoip/update?only=`。
 pub fn spawn_geoip_update(root: &Path) -> Result<()> {
-    let script = root.join("scripts/geoip_update.sh");
+    spawn_geoip_update_script(root, None, None)
+}
+
+/// Spawn the (configurable) offline update script, optionally with `--only=<name>`.
+///
+/// `script` 为 `None`/空 ⇒ 沿用 `root/scripts/geoip_update.sh`；绝对路径原样使用。
+/// `only` 为 `None`/空 ⇒ 全链更新（不带 `--only`）。
+pub fn spawn_geoip_update_script(
+    root: &Path,
+    script: Option<&Path>,
+    only: Option<&str>,
+) -> Result<()> {
+    let script = match script {
+        Some(p) if !p.as_os_str().is_empty() => {
+            if p.is_absolute() {
+                p.to_path_buf()
+            } else {
+                root.join(p)
+            }
+        }
+        _ => root.join("scripts/geoip_update.sh"),
+    };
     if !script.is_file() {
         anyhow::bail!("missing {}", script.display());
     }
@@ -351,8 +710,13 @@ pub fn spawn_geoip_update(root: &Path) -> Result<()> {
     if any_geoip_update_running() {
         anyhow::bail!("geoip 更新已有进程在运行（锁已过期但进程仍在），等它结束再触发");
     }
-    let child = std::process::Command::new("bash")
-        .arg(&script)
+    let mut cmd = std::process::Command::new("bash");
+    cmd.arg(&script);
+    if let Some(only) = only.map(str::trim).filter(|s| !s.is_empty()) {
+        // 与脚本的解析一致（`--only=X` 形式，避免某些源名以 `-` 开头时被 getopt 误读）。
+        cmd.arg(format!("--only={only}"));
+    }
+    let child = cmd
         .current_dir(root)
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
@@ -368,138 +732,11 @@ pub fn spawn_geoip_update(root: &Path) -> Result<()> {
     Ok(())
 }
 
-/// 一条筛选结果（Admin 面板表格展示用）。
-pub struct FilterRow {
-    pub prefix: String,
-    pub country: String,
-    pub province: String,
-    pub city: String,
-    pub isp: String,
-    pub cloud_provider: String,
-    pub weight: i64,
-}
-
-/// 转义 LIKE 元字符（`%` `_` `\`），避免面板输入的 `%` 被当成通配符。
-/// 配合 SQL 侧的 `ESCAPE '\'` 使用。
-fn like_escape(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for ch in s.chars() {
-        if matches!(ch, '%' | '_' | '\\') {
-            out.push('\\');
-        }
-        out.push(ch);
-    }
-    out
-}
-
-/// Filter geoip rows by country/isp/cloud（Admin 面板筛选；结果携带字段供表格渲染）。
+/// 面板筛选聚合（P2-18 / §23.10 模块职责表）：实现已迁至 [`super::filter_agg`]。
 ///
-/// 三张表都要查：`geoip`（主表）与 §23 双 schema 的 `ipv4`/`ipv6` range 表。
-/// 旧实现只 `FROM geoip` —— 写入 `ipv4`/`ipv6` 表的行（v6 demo/镜像数据）在面板里
-/// 永远筛不到，表现为「库里有数据、筛选结果为空」。列名差异（ip_start/ip_end vs
-/// start/end、缺 dc）在子查询里对齐。
-///
-/// §23.6 追加两个维度（规格「按国家/城市/地区/运营商/**IPv4|v6** 等筛」）：
-/// - `family`：`v4`/`ipv4`/`4` 只留 IPv4，`v6`/`ipv6`/`6` 只留 IPv6，其余（空）不过滤。
-///   判定用**前缀文本**是否含 `:`（IPv6 字面量必含冒号；主表 `geoip` 与 range 表
-///   `ipv4`/`ipv6` 三路 UNION 之后 `prefix` 列口径统一，故在派生表外层过滤即可，
-///   无需按表名区分）。
-/// - `prefix`：对（可能已 COALESCE 的）前缀做**包含**匹配，便于按 `1.2.4.0/24`
-///   或某个网段片段定位。与 country 等一样做 LIKE 元字符转义。
-pub fn filter_prefixes(
-    conn: &Connection,
-    country: Option<&str>,
-    isp: Option<&str>,
-    cloud: Option<&str>,
-    family: Option<&str>,
-    prefix: Option<&str>,
-    limit: usize,
-) -> Result<Vec<FilterRow>> {
-    let lim = limit.min(500);
-    let c = country.unwrap_or("").to_ascii_lowercase();
-    let i = isp.unwrap_or("").to_ascii_lowercase();
-    let cl = cloud.unwrap_or("").to_ascii_lowercase();
-    // 归一化 family：只保留三种语义（v4 / v6 / 空）。其余值（含拼写错误）按空处理，
-    // 不做「静默当 v4」——那是把运维的笔误变成错误结果。
-    let fam = match family.unwrap_or("").trim().to_ascii_lowercase().as_str() {
-        "v4" | "ipv4" | "4" => "v4",
-        "v6" | "ipv6" | "6" => "v6",
-        _ => "",
-    };
-    let pfx = prefix.unwrap_or("").to_ascii_lowercase();
-    // 过滤下推到 SQL。原实现是 `ORDER BY weight DESC LIMIT 5000` 之后再在 Rust 里
-    // 按 country/isp/cloud 过滤 —— 命中的行只要排在权重前 5000 之外就被**静默截断**
-    // （面板显示「没有结果」，其实数据存在）。这里的 LIMIT 作用在过滤后的结果集上。
-    // 大小写：SQLite 的 LIKE 对 ASCII 不区分大小写（等价于原来的 to_ascii_lowercase
-    // 包含匹配）；lower() 只为把意图写死，非 ASCII 与原来一样不做大小写折叠。
-    let where_clause = "WHERE (?1 = ''
-                 OR lower(COALESCE(country, '')) LIKE '%' || ?1 || '%' ESCAPE '\\'
-                 OR lower(COALESCE(province, '')) LIKE '%' || ?1 || '%' ESCAPE '\\'
-                 OR lower(COALESCE(city, '')) LIKE '%' || ?1 || '%' ESCAPE '\\')
-           AND (?2 = '' OR lower(COALESCE(isp, '')) LIKE '%' || ?2 || '%' ESCAPE '\\')
-           AND (?3 = '' OR lower(COALESCE(cloud_provider, '')) LIKE '%' || ?3 || '%' ESCAPE '\\')";
-    let sql = format!(
-        "SELECT prefix, country, province, city, isp, cloud_provider, weight FROM (
-             SELECT COALESCE(prefix, ip_start || '-' || ip_end) AS prefix,
-                    COALESCE(country, '') AS country, COALESCE(province, '') AS province,
-                    COALESCE(city, '') AS city, COALESCE(isp, '') AS isp,
-                    COALESCE(cloud_provider, '') AS cloud_provider,
-                    COALESCE(weight, 0) AS weight
-               FROM geoip {where_clause}
-             UNION ALL
-             SELECT COALESCE(prefix, start || '-' || end), COALESCE(country, ''),
-                    COALESCE(province, ''), COALESCE(city, ''), COALESCE(isp, ''),
-                    COALESCE(cloud_provider, ''), COALESCE(weight, 0)
-               FROM ipv4 {where_clause}
-             UNION ALL
-             SELECT COALESCE(prefix, start || '-' || end), COALESCE(country, ''),
-                    COALESCE(province, ''), COALESCE(city, ''), COALESCE(isp, ''),
-                    COALESCE(cloud_provider, ''), COALESCE(weight, 0)
-               FROM ipv6 {where_clause}
-         )
-         WHERE (?5 = ''
-                OR (?5 = 'v6' AND instr(prefix, ':') > 0)
-                OR (?5 = 'v4' AND instr(prefix, ':') = 0))
-           AND (?6 = '' OR lower(prefix) LIKE '%' || ?6 || '%' ESCAPE '\\')
-         ORDER BY weight DESC LIMIT ?4"
-    );
-    let mut stmt = conn.prepare(&sql)?;
-    let rows = stmt.query_map(
-        rusqlite::params![
-            like_escape(&c),
-            like_escape(&i),
-            like_escape(&cl),
-            lim as i64,
-            fam,
-            like_escape(&pfx)
-        ],
-        |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, String>(2)?,
-                row.get::<_, String>(3)?,
-                row.get::<_, String>(4)?,
-                row.get::<_, String>(5)?,
-                row.get::<_, i64>(6)?,
-            ))
-        },
-    )?;
-    let mut out = Vec::new();
-    for row in rows {
-        let (prefix, country, province, city, isp, cloud_provider, weight) = row?;
-        out.push(FilterRow {
-            prefix,
-            country,
-            province,
-            city,
-            isp,
-            cloud_provider,
-            weight,
-        });
-    }
-    Ok(out)
-}
+/// 这里 `pub use` 重新导出，保持既有调用点（`admin_geoip::handle_filter_with_live`
+/// 与 `ops.rs` 单测里的 `filter_prefixes`）完全不变。
+pub use super::filter_agg::{filter_prefixes, FilterRow};
 
 /// 列出当前手工覆盖（panel_edits，最新在前）。
 pub fn list_edits(panel: &Connection, limit: usize) -> Result<Vec<(i64, String, String, String, i64)>> {
@@ -660,6 +897,37 @@ mod tests {
         let by_prefix_v4 = filter_prefixes(&conn, None, None, None, Some("v4"), Some("8.8.8"), 100).unwrap();
         assert_eq!(by_prefix_v4.len(), 1);
         assert_eq!(by_prefix_v4[0].prefix, "8.8.8.0/24");
+    }
+
+    /// P1-4：schedule 白名单解析必须**保守** —— 只认五种写法，5 段 cron 表达式一律拒绝。
+    #[test]
+    fn cron_schedule_whitelist_parsing() {
+        assert_eq!(parse_schedule(" hourly "), Some(CronSchedule::Hourly));
+        assert_eq!(parse_schedule("daily"), Some(CronSchedule::Daily(None)));
+        assert_eq!(parse_schedule("weekly"), Some(CronSchedule::Weekly));
+        assert_eq!(parse_schedule("03:30"), Some(CronSchedule::Daily(Some((3, 30)))));
+        assert_eq!(
+            parse_schedule("daily 23:59"),
+            Some(CronSchedule::Daily(Some((23, 59))))
+        );
+        // 绝不能因面板里写了奇怪表达式就定时跑重活。
+        assert_eq!(parse_schedule("0 3 * * *"), None);
+        assert_eq!(parse_schedule("every 5 minutes"), None);
+        assert_eq!(parse_schedule("25:00"), None);
+        assert_eq!(parse_schedule(""), None);
+    }
+
+    /// P1-4：间隔型到期判定（确定性，不依赖本地时区）。
+    #[test]
+    fn cron_due_intervals() {
+        let now = 1_000_000_000i64;
+        assert!(schedule_due(&CronSchedule::Hourly, 0, now), "从未运行 ⇒ 到期");
+        assert!(!schedule_due(&CronSchedule::Hourly, now - 10, now));
+        assert!(schedule_due(&CronSchedule::Hourly, now - 3600, now));
+        assert!(!schedule_due(&CronSchedule::Daily(None), now - 100, now));
+        assert!(schedule_due(&CronSchedule::Daily(None), now - 86_400, now));
+        assert!(!schedule_due(&CronSchedule::Weekly, now - 86_400, now));
+        assert!(schedule_due(&CronSchedule::Weekly, now - 7 * 86_400, now));
     }
 
     /// 源管理不得假成功：无字段可改、或源名不存在，都必须报错（旧实现无条件回 ok）。

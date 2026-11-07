@@ -760,10 +760,12 @@ async fn handle_request_inner(
             .to_string();
         // 不做开放重定向：Host 是客户端可控的，直接拼进 Location 就等于
         // 把 https://evil.example 回给用户（钓鱼/凭据窃取面）。
-        // 优先用本 listener 配置的 server_name；否则仅在 Host 看起来是合法主机名时
-        // 才采用，否则退化成纯相对路径跳转。
-        let host = match lc.server_name.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
-            Some(sn) => Some(sn.to_string()),
+        // 优先用本 listener 配置的站点名（`all_server_names()` 取首项，单数
+        // `server_name` 在前 ⇒ 既有单名字配置行为不变）；否则仅在 Host 看起来是
+        // 合法主机名时才采用，否则退化成纯相对路径跳转。
+        let names = lc.all_server_names();
+        let host = match names.first() {
+            Some(sn) => Some(sn.clone()),
             None => {
                 if is_plausible_hostname(&raw_host) {
                     Some(raw_host)

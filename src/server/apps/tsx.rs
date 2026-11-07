@@ -7,8 +7,10 @@
 //!      **绝不经过 shell**）把产物写进 `out_dir`（默认 `<docroot>/dist`）。
 //!      编译结果按「源文件集合 + mtime + 大小 + 工具身份」指纹缓存：
 //!      指纹不变就不重编译 —— 编译器**不在每请求路径上** spawn。
-//!   2. **watch**：`watch = true` 时进程内后台线程每 ≤1.5s 轮询 source_dir 的 mtime，
-//!      变更即重编译（单线程、每应用一次，不是每请求）。
+//!   2. **watch**：`watch = true` 时进程内后台线程监听 `source_dir` 的平台事件
+//!      （Linux inotify / OpenBSD kqueue，P2-13），变更即重编译（单线程、每应用一次，
+//!      不是每请求）；事件后端注册失败时回退 ≤1.5s 轮询，另保留较长周期兜底扫描 ——
+//!      watch 在任何平台都不会失效。
 //!   3. **静态托管**：请求从 `out_dir` 读产物（拒绝 `..`/反斜杠/NUL，再做 canonical
 //!      范围校验防符号链接逃逸）。源码 `.ts/.tsx` 不会被当文件吐出 —— 请求一个
 //!      `.tsx` 路径拿到的是它的同名 `.js` 产物（不是源码字节）。
@@ -48,8 +50,14 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-/// watch 轮询间隔（规格要求 ≤2s）。
+/// watch **兜底轮询**间隔（规格要求 ≤2s）。P2-13 起主路径改为平台事件（Linux inotify /
+/// OpenBSD kqueue），本间隔只用于「事件后端注册失败」时的退化轮询。
 const WATCH_INTERVAL: Duration = Duration::from_millis(1500);
+/// 平台事件后端下的**兜底扫描**间隔：事件本身近实时唤醒；但网络文件系统（NFS 等）
+/// 可能不发本地事件，故保留一个较长周期的全量扫描 —— 「绝不让 watch 失效」。
+const WATCH_SAFETY_INTERVAL: Duration = Duration::from_secs(5);
+/// 单次源监听展开的目录数上限（防 fd/watch 耗尽）。
+const MAX_WATCH_DIRS: usize = 4096;
 /// 相邻两次「按需」源扫描的最小间隔：突发请求不重复 walk 目录；watch 线程与下一次
 /// 检查会兜住窗口内的变更（watch=false 时最坏滞后一个窗口 + 扫描耗时）。
 const MIN_CHECK_INTERVAL: Duration = Duration::from_millis(750);
@@ -279,23 +287,319 @@ fn start_watch_thread() {
     }
     let spawned = std::thread::Builder::new()
         .name("cruc-tsx-watch".into())
-        .spawn(|| loop {
-            std::thread::sleep(WATCH_INTERVAL);
-            let jobs: Vec<WatchJob> = WATCH.lock().values().cloned().collect();
-            for job in jobs {
-                if !job.app.watch {
-                    continue;
-                }
-                // 失败已在 ensure_built 内落日志/状态；watch 继续等下一次变更。
-                let _ = ensure_built(&job.build, &job.app, &job.docroot);
-            }
-        });
+        .spawn(watch_loop);
     if spawned.is_err() {
         // 线程起不来不是致命错误：请求路径仍按需编译（只是没有后台热编译）。
         WATCH_STARTED.store(false, Ordering::SeqCst);
         log::warn!("tsx: watch 线程创建失败，退化为按需编译");
     }
 }
+
+/// watch 主循环：优先平台事件（Linux inotify / OpenBSD kqueue），注册失败即回退轮询。
+///
+/// 事件命中 → 立即重建（`ensure_built` 内有指纹缓存，未变更则几乎零成本）；
+/// 另保留 [`WATCH_SAFETY_INTERVAL`] 周期的兜底扫描，覆盖「事件静默但文件已变」
+/// （NFS/容器卷）的场景。两种模式下 watch 都不会失效。
+fn watch_loop() {
+    match EventWatcher::new() {
+        Ok(mut w) => {
+            log::info!("tsx: watch 使用平台事件后端（{}）", w.kind());
+            loop {
+                // 每轮把监听集同步到当前 watch=true 的 jobs（新增站点立即纳入）。
+                let roots = watch_roots();
+                w.sync(&roots);
+                let _ = w.wait(WATCH_SAFETY_INTERVAL);
+                run_watch_jobs();
+            }
+        }
+        Err(e) => {
+            log::warn!(
+                "tsx: 平台事件后端注册失败（{e}），回退 {WATCH_INTERVAL:?} 轮询"
+            );
+            loop {
+                std::thread::sleep(WATCH_INTERVAL);
+                run_watch_jobs();
+            }
+        }
+    }
+}
+
+/// 对当前所有 `watch = true` 的 job 跑一次「按需编译」（指纹不变则是 no-op）。
+fn run_watch_jobs() {
+    let jobs: Vec<WatchJob> = WATCH.lock().values().cloned().collect();
+    for job in jobs {
+        if !job.app.watch {
+            continue;
+        }
+        // 失败已在 ensure_built 内落日志/状态；watch 继续等下一次变更。
+        let _ = ensure_built(&job.build, &job.app, &job.docroot);
+    }
+}
+
+/// 需要监听的 `(source_dir, out_dir)` 集：跳过 out_dir 子树避免「产物写入又触发重建」
+/// 的自激循环（与 `collect_sources` 跳过 out_dir 同一口径）。
+fn watch_roots() -> Vec<(PathBuf, PathBuf)> {
+    let jobs: Vec<WatchJob> = WATCH.lock().values().cloned().collect();
+    let mut out = Vec::new();
+    for job in jobs {
+        if !job.app.watch {
+            continue;
+        }
+        let src = resolve_dir(job.app.source_dir.as_deref(), job.docroot.clone());
+        let outdir = resolve_dir(job.app.out_dir.as_deref(), job.docroot.join("dist"));
+        out.push((src, outdir));
+    }
+    out
+}
+
+/// 平台事件后端（P2-13）。Linux = inotify，OpenBSD = kqueue，其它平台注册失败 → 轮询。
+mod event_watch {
+    use super::{Path, PathBuf, MAX_WATCH_DIRS};
+    use std::collections::HashSet;
+    use std::time::Duration;
+
+    /// 目录是否应在递归监听时跳过（隐藏目录 / node_modules / deps / 指定 out_dir）。
+    fn skip_dir(name: &str) -> bool {
+        name.starts_with('.') || name == "node_modules" || name == "deps"
+    }
+
+    /// 递归展开一个 (源目录, 产物目录)：对每个子目录调用 `add`，跳过产物目录。
+    fn walk(roots: &[(PathBuf, PathBuf)], mut add: impl FnMut(&Path)) {
+        for (root, outdir) in roots {
+            let mut stack = vec![root.clone()];
+            let mut guard = 0usize;
+            while let Some(dir) = stack.pop() {
+                guard += 1;
+                if guard > MAX_WATCH_DIRS {
+                    break;
+                }
+                if dir == *outdir {
+                    continue; // 产物目录：不监听，避免自激
+                }
+                add(&dir);
+                if let Ok(rd) = std::fs::read_dir(&dir) {
+                    for e in rd.flatten() {
+                        let name = e.file_name();
+                        let n = name.to_string_lossy();
+                        if skip_dir(&n) {
+                            continue;
+                        }
+                        let p = e.path();
+                        if p.is_dir() {
+                            stack.push(p);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // ---------------- Linux: inotify ----------------
+    #[cfg(target_os = "linux")]
+    pub struct EventWatcher {
+        fd: libc::c_int,
+        watched: HashSet<PathBuf>,
+    }
+
+    #[cfg(target_os = "linux")]
+    impl EventWatcher {
+        pub fn new() -> std::io::Result<Self> {
+            let fd = unsafe { libc::inotify_init1(libc::IN_NONBLOCK | libc::IN_CLOEXEC) };
+            if fd < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(Self {
+                fd,
+                watched: HashSet::new(),
+            })
+        }
+
+        pub fn kind(&self) -> &'static str {
+            "inotify"
+        }
+
+        fn add_dir(&mut self, dir: &Path) {
+            if self.watched.contains(dir) {
+                return;
+            }
+            use std::os::unix::ffi::OsStrExt;
+            let c = match std::ffi::CString::new(dir.as_os_str().as_bytes()) {
+                Ok(c) => c,
+                Err(_) => return, // 路径含 NUL：跳过该目录
+            };
+            let mask = libc::IN_MODIFY
+                | libc::IN_CLOSE_WRITE
+                | libc::IN_CREATE
+                | libc::IN_DELETE
+                | libc::IN_MOVED_TO
+                | libc::IN_MOVED_FROM
+                | libc::IN_ATTRIB
+                | libc::IN_DELETE_SELF
+                | libc::IN_MOVE_SELF;
+            let wd = unsafe { libc::inotify_add_watch(self.fd, c.as_ptr(), mask) };
+            if wd >= 0 {
+                self.watched.insert(dir.to_path_buf());
+            }
+        }
+
+        /// 把监听集同步到 `roots`（新增目录才加 watch；已移除的保留，代价可忽略）。
+        pub fn sync(&mut self, roots: &[(PathBuf, PathBuf)]) {
+            walk(roots, |d| self.add_dir(d));
+        }
+
+        /// 等到「有事件」或超时。事件内容不解析：任何事件都触发一次重建。
+        pub fn wait(&mut self, timeout: Duration) -> bool {
+            let mut pfd = libc::pollfd {
+                fd: self.fd,
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            let ms = timeout.as_millis().min(i32::MAX as u128) as libc::c_int;
+            let r = unsafe { libc::poll(&mut pfd, 1, ms) };
+            if r <= 0 {
+                return false; // 超时（也含 EINTR：按超时处理，下一轮兜底扫描）
+            }
+            // 排空内核事件队列。
+            let mut buf = [0u8; 4096];
+            loop {
+                let n = unsafe {
+                    libc::read(self.fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len())
+                };
+                if n <= 0 {
+                    break;
+                }
+            }
+            true
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    impl Drop for EventWatcher {
+        fn drop(&mut self) {
+            unsafe {
+                libc::close(self.fd);
+            }
+        }
+    }
+
+    // ---------------- OpenBSD: kqueue ----------------
+    #[cfg(target_os = "openbsd")]
+    pub struct EventWatcher {
+        kq: libc::c_int,
+        registered: Vec<(PathBuf, libc::c_int)>,
+        watched: HashSet<PathBuf>,
+    }
+
+    #[cfg(target_os = "openbsd")]
+    impl EventWatcher {
+        pub fn new() -> std::io::Result<Self> {
+            let kq = unsafe { libc::kqueue() };
+            if kq < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(Self {
+                kq,
+                registered: Vec::new(),
+                watched: HashSet::new(),
+            })
+        }
+
+        pub fn kind(&self) -> &'static str {
+            "kqueue"
+        }
+
+        fn add_dir(&mut self, dir: &Path) {
+            if self.watched.contains(dir) {
+                return;
+            }
+            use std::os::unix::ffi::OsStrExt;
+            let c = match std::ffi::CString::new(dir.as_os_str().as_bytes()) {
+                Ok(c) => c,
+                Err(_) => return,
+            };
+            let fd = unsafe { libc::open(c.as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC) };
+            if fd < 0 {
+                return;
+            }
+            // NOTE_WRITE = 目录内容（新建/删除/改名）变更；与 inotify 的等价意图一致。
+            // 直接构造 `kevent`（libc crate 不导出 C 的 `EV_SET` 宏；字段类型见
+            // `libc::kevent`：ident/filter/flags/fflags/data/udata）。
+            let ev = libc::kevent {
+                ident: fd as libc::uintptr_t,
+                filter: libc::EVFILT_VNODE,
+                flags: libc::EV_ADD | libc::EV_ENABLE | libc::EV_CLEAR,
+                fflags: libc::NOTE_WRITE
+                    | libc::NOTE_DELETE
+                    | libc::NOTE_RENAME
+                    | libc::NOTE_EXTEND
+                    | libc::NOTE_ATTRIB,
+                data: 0,
+                udata: std::ptr::null_mut(),
+            };
+            let rc = unsafe {
+                libc::kevent(self.kq, &ev, 1, std::ptr::null_mut(), 0, std::ptr::null())
+            };
+            if rc < 0 {
+                unsafe {
+                    libc::close(fd);
+                }
+                return;
+            }
+            self.registered.push((dir.to_path_buf(), fd));
+            self.watched.insert(dir.to_path_buf());
+        }
+
+        pub fn sync(&mut self, roots: &[(PathBuf, PathBuf)]) {
+            walk(roots, |d| self.add_dir(d));
+        }
+
+        pub fn wait(&mut self, timeout: Duration) -> bool {
+            let ts = libc::timespec {
+                tv_sec: timeout.as_secs() as libc::time_t,
+                tv_nsec: timeout.subsec_nanos() as libc::c_long,
+            };
+            let mut ev: libc::kevent = unsafe { std::mem::zeroed() };
+            let n = unsafe { libc::kevent(self.kq, std::ptr::null(), 0, &mut ev, 1, &ts) };
+            n > 0
+        }
+    }
+
+    #[cfg(target_os = "openbsd")]
+    impl Drop for EventWatcher {
+        fn drop(&mut self) {
+            for (_, fd) in &self.registered {
+                unsafe {
+                    libc::close(*fd);
+                }
+            }
+            unsafe {
+                libc::close(self.kq);
+            }
+        }
+    }
+
+    // ---------------- 其它平台：注册失败 → 调用方回退轮询 ----------------
+    #[cfg(not(any(target_os = "linux", target_os = "openbsd")))]
+    pub struct EventWatcher;
+
+    #[cfg(not(any(target_os = "linux", target_os = "openbsd")))]
+    impl EventWatcher {
+        pub fn new() -> std::io::Result<Self> {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "no platform event backend (linux inotify / openbsd kqueue)",
+            ))
+        }
+        pub fn kind(&self) -> &'static str {
+            "none"
+        }
+        pub fn sync(&mut self, _roots: &[(PathBuf, PathBuf)]) {}
+        pub fn wait(&mut self, _timeout: Duration) -> bool {
+            false
+        }
+    }
+}
+use event_watch::EventWatcher;
 
 // ---------------------------------------------------------------------------
 // 路径解析与源扫描

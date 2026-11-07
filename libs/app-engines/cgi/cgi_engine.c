@@ -1,22 +1,43 @@
 /*
  * CGI app-engine —— 真实 argv exec（无 shell 字符串、无命令注入面）。
  *
- * CGI 的本质就是"每请求起一个进程"，这一条对 CGI 是正当的（spec 的禁 spawn 针对
- * 解释器嵌入类引擎：python/ruby/perl/lua/wsgi/asgi/psgi/rack/uwsgi/tsx）。
- * 但旧实现有两个真问题：
- *   1) popen("\"%s\" …") / popen("/bin/sh \"%s\" …")——把**请求派生**的脚本路径插进
- *      shell 字符串。路径里出现 `"`、`$`、反引号或 `\` 就能逃出引号执行任意命令
- *      （docroot/script 只做了目录穿越校验，不校验引号），是命令注入漏洞。
- *   2) 失败即 appengine_fill_hello（假成功），且不发 CONTENT_LENGTH、不喂 stdin
- *      （POST body 永远到不了 CGI）。
+ * ── 为什么 CGI 必然是「每请求一个进程」，以及它与 §22.4.2 的边界 ──────────────
  *
- * 现在：envp 在父进程里按 CGI 规范拼好（不在 fork 后 setenv，避免多线程 fork 后
- * 撞 malloc 锁），fork + execve(script, {script,NULL}, envp)；非可执行/无 shebang
- * 时退回 execve("/bin/sh", {"/bin/sh", script, NULL}, envp)——仍是 argv 数组，
- * 请求数据永远不经过 shell 解析。stdin=请求体、stdout=响应、stderr=诊断（进入错误
- * 文本）。poll 循环同时收发，避免 body 大时管道互锁；带 30s 墙钟超时与 32MiB 响应
- * 上限（超限/超时都 kill+reap 子进程并显式报错）。
- * 输出为空 / 子进程异常退出 → 显式错误（含退出码与 stderr），不再假 hello。
+ * 规格 §7.3 字面写「禁 spawn」，§22.4.2 的 spawn 禁令**只针对 C/Go/Rust**（要求它们
+ * 走 in-process FFI / 持久 sidecar，而不是每请求起进程）。CGI 本身是**协议级**的
+ * per-request 进程模型：它没有可内联的 ABI，也没有持久化的运行时 —— 客户端与脚本之间
+ * 的契约就是「一个进程一次请求一次响应」，脚本的整个生命周期就是这一次 exec。把它改成
+ * 常驻进程会改变脚本可见的语义（全局状态跨请求泄漏、`exit()` 不再结束请求、`atexit`
+ * 不回、stdin EOF 与进程结束的时序全都不一样），那就不是 CGI 了。因此：
+ *
+ *   * 本文件是 §7.3「禁 spawn」的**明确例外**，理由落在 §22.4.2 的对象范围上（该禁令的
+ *     对象是 C/Go/Rust 这些**有 in-process FFI 可用**的引擎，不是 CGI 这个协议）；
+ *   * 但例外只允许在语义上必要的进程，代价必须付清：本节下面列出的每一条。
+ *
+ * 已核对/已加固的 CGI 语义（逐条可对照代码）：
+ *   1) **每请求一个进程**：`cgi_spawn` 里 `fork()` 一次；不存在复用。
+ *   2) **argv 形式 execve、无 shell 串**：`execve(script, {script,NULL}, envp)`；无 shebang
+ *      时退回 `execve("/bin/sh", {"/bin/sh", script, NULL}, envp)` —— 仍是 argv 数组，
+ *      请求派生的路径只是**一个 argv 元素**，永不经 shell 解析（旧版 popen("\"%s\"…")
+ *      是命令注入，见下）。
+ *   3) **无 shell 字符串拼接**：envp 在父进程里按 CGI/1.1 拼好（不在 fork 后 setenv，
+ *      避免多线程 fork 后撞 malloc 锁）。
+ *   4) **fd 全关**：子进程只保留 0/1/2（dup2 到三条管道），其余自建 fd 显式关闭；
+ *      父端保留的三条管道 fd 全部设 **FD_CLOEXEC**（`cgi_set_cloexec`），这样它们不会
+ *      泄漏进**同进程内并发派生的其它 CGI 子进程**（没有这一步时，A 请求的管道写端会
+ *      被 B 请求的 fork 继承，B 读不到 EOF/EOF 传播被拖住）。进程里其它继承 fd 依赖
+ *      宿主（tokio / socket2 创建的 socket 均为 CLOEXEC）不再泄漏。
+ *   5) **`setpgid`**：子进程 `setpgid(0,0)` 自成进程组，父进程再 `setpgid(pid,pid)` 兜底
+ *      （谁先生效都行，无竞态窗口）。
+ *   6) **超时整组 kill + 回收**：`CGI_TIMEOUT_MS` 墙钟超时后 `kill(-pid, SIGKILL)` 杀**整个
+ *      进程组**（脚本起的 `sleep 300 &`、`make`、`sh -c` 等孙进程一并回收），再 `kill(pid)`
+ *      兜底，最后 `waitpid` 回收，绝不留僵尸。
+ *   7) **body 上限**：请求体上限由宿主入口 `h1::APP_BODY_CAP = 32MiB` 保证（本引擎拿到
+ *      的 `body_len` 已被宿主界过）；**响应**累积上限 32MiB（`CGI_OUT_CAP`），超限即
+ *      kill+reap 并显式报错，不无限吃内存。
+ *   8) **stdin=请求体、stdout=响应、stderr=诊断**（进入错误文本）；poll 单线程收发，
+ *      避免 body 大时管道互锁（父端管道均非阻塞）；输出为空 / 子进程异常退出 → 显式错误
+ *      （含退出码与 stderr），不再假 hello。
  *
  * 注：向已关闭的管道写入需要 SIGPIPE 被忽略（Rust 运行时默认 SIG_IGN），EPIPE 会
  * 作为普通写错误处理（写端随即关闭）。
@@ -201,18 +222,40 @@ static void cgi_set_nonblock(int fd)
         (void)fcntl(fd, F_SETFL, fl | O_NONBLOCK);
 }
 
+/* 父端管道 fd 设为 close-on-exec：`pipe()` 默认**不**设 CLOEXEC，于是同一进程内**并发**
+ * 派生另一个 CGI 子进程时，本请求的管道端点会被那个新子进程继承 —— 后果是它的 stdin
+ * 写端永远不会真正关闭（EOF 传不到脚本）、管道的读端在无关进程里多存活一份。给六个
+ * 端点都设 CLOEXEC 后，exec 时它们自动关闭；子进程要用的 0/1/2 是 `dup2` 出来的，
+ * POSIX 规定 `dup2` 会**清掉**新 fd 的 CLOEXEC，所以 stdio 不受影响。 */
+static void cgi_set_cloexec(int fd)
+{
+    int fl;
+
+    if (fd < 0)
+        return;
+    fl = fcntl(fd, F_GETFD, 0);
+    if (fl >= 0)
+        (void)fcntl(fd, F_SETFD, fl | FD_CLOEXEC);
+}
+
 static int cgi_spawn(const char *script, char **envp, cgi_proc *p)
 {
     int inpipe[2], outpipe[2], errpipe[2];
     pid_t pid;
 
+    /* 管道创建后立刻设 CLOEXEC（见 cgi_set_cloexec 的说明）：防止本请求的管道端点
+     * 泄漏进并发派生的其它 CGI 子进程。失败不致命（退化为旧行为），只记一次。 */
     if (pipe(inpipe) != 0)
         return -1;
+    cgi_set_cloexec(inpipe[0]);
+    cgi_set_cloexec(inpipe[1]);
     if (pipe(outpipe) != 0) {
         close(inpipe[0]);
         close(inpipe[1]);
         return -1;
     }
+    cgi_set_cloexec(outpipe[0]);
+    cgi_set_cloexec(outpipe[1]);
     if (pipe(errpipe) != 0) {
         close(inpipe[0]);
         close(inpipe[1]);
@@ -220,6 +263,8 @@ static int cgi_spawn(const char *script, char **envp, cgi_proc *p)
         close(outpipe[1]);
         return -1;
     }
+    cgi_set_cloexec(errpipe[0]);
+    cgi_set_cloexec(errpipe[1]);
     pid = fork();
     if (pid < 0) {
         close(inpipe[0]);
@@ -248,9 +293,14 @@ static int cgi_spawn(const char *script, char **envp, cgi_proc *p)
         if (dup2(inpipe[0], STDIN_FILENO) < 0 || dup2(outpipe[1], STDOUT_FILENO) < 0 ||
             dup2(errpipe[1], STDERR_FILENO) < 0)
             _exit(127);
-        close(inpipe[0]);
-        close(outpipe[1]);
-        close(errpipe[1]);
+        /* 关掉 dup2 的**源** fd —— 但源若恰好就是目标（宿主的 stdio 被关、pipe() 分到了
+         * 0/1/2 里的某个），关它会把刚装好的 stdio 又关掉。只在源 != 目标时关。 */
+        if (inpipe[0] != STDIN_FILENO)
+            close(inpipe[0]);
+        if (outpipe[1] != STDOUT_FILENO)
+            close(outpipe[1]);
+        if (errpipe[1] != STDERR_FILENO)
+            close(errpipe[1]);
 
         argv[0] = (char *)script;
         argv[1] = NULL;

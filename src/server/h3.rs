@@ -1410,6 +1410,10 @@ use chunked uploads (Content-Range) or HTTP/1.1 for larger bodies\n",
             let file_src = parts
                 .extensions
                 .remove::<crate::server::static_files::FileSource>();
+            // P2-8：admin SSE 无界流——由本函数按帧流式发送（见 collect_to_bytes 说明）。
+            let sse = parts
+                .extensions
+                .remove::<crate::server::access_log::SseStreamBody>();
             let engine = parts
                 .extensions
                 .get::<crate::server::access_log::EngineTag>()
@@ -1490,6 +1494,24 @@ use chunked uploads (Content-Range) or HTTP/1.1 for larger bodies\n",
                         src.path.display()
                     ),
                 }
+            } else if let Some(mut sse) = sse.and_then(|h| h.take_body()) {
+                // P2-8：admin SSE 无界流。`send_data` 自带 QUIC 流控背压；客户端断开时
+                // `send_data` 报错即停。
+                use http_body_util::BodyExt as _;
+                while let Some(frame) = sse.frame().await {
+                    let frame = match frame {
+                        Ok(f) => f,
+                        Err(_) => break,
+                    };
+                    let chunk = frame.into_data().unwrap_or_default();
+                    if chunk.is_empty() {
+                        continue;
+                    }
+                    if let Err(e) = send.send_data(chunk).await {
+                        log::debug!("h3 sse send_data peer={peer}: {e:#}");
+                        break;
+                    }
+                }
             } else if !body_out.is_empty() {
                 if let Err(e) = send.send_data(body_out).await {
                     log::debug!("h3 send_data peer={peer}: {e:#}");
@@ -1502,8 +1524,17 @@ use chunked uploads (Content-Range) or HTTP/1.1 for larger bodies\n",
         }
 
     /// admin::handle 返回 `Response<BoxBody>`（h1 体类型）；h3 分支收齐为 `Response<Bytes>`。
+    ///
+    /// 例外：SSE（`text/event-stream`）是无界流，收齐会挂死。故遇到 SSE 时把原始 body
+    /// 装进 `SseStreamBody` 扩展、body 置空，由 `h3_send_response` 按帧流式发送。
     async fn collect_to_bytes(resp: Response<BoxBody>) -> Response<Bytes> {
-        let (parts, body) = resp.into_parts();
+        let (mut parts, body) = resp.into_parts();
+        if crate::server::access_log::is_event_stream(&parts.headers) {
+            parts
+                .extensions
+                .insert(crate::server::access_log::SseStreamBody::new(body));
+            return Response::from_parts(parts, Bytes::new());
+        }
         let data = BodyExt::collect(body)
             .await
             .map(|c| c.to_bytes())

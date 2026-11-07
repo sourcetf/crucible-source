@@ -1,7 +1,9 @@
 //! Prefix covering / merge helpers for GeoIP data (§23.5).
 
 use anyhow::Result;
+use once_cell::sync::Lazy;
 use rusqlite::Connection;
+use std::collections::HashSet;
 
 /// One covering prefix row used during field merge.
 #[derive(Clone, Debug, Default)]
@@ -316,6 +318,9 @@ pub fn merge_covering_fields(rows: &[CoveringPrefix]) -> CoveringPrefix {
 /// `load_covering_prefixes` 的 `ORDER BY commit,weight,bits,rowid` 固定，等价于
 /// 第 4 个确定性 tiebreak 分量 = 行序号）。空值永不覆盖非空。
 pub fn merge_covering_fields_with_gain(rows: &[CoveringPrefix], gain: i64) -> CoveringPrefix {
+    // P1-10：停用字段在**逐字段合并处**直接跳过（等价于把源值当空 —— 空值永不覆盖
+    // 非空，故 `prefer_field` 早退）。默认集合为空 ⇒ 与旧实现逐位一致（golden 不变）。
+    let disabled = disabled_fields_snapshot();
     let mut out = CoveringPrefix::default();
     let mut scores = [FieldScore::default(); 15];
 
@@ -323,7 +328,7 @@ pub fn merge_covering_fields_with_gain(rows: &[CoveringPrefix], gain: i64) -> Co
         prefer_field(
             &mut out.country,
             &mut scores[0],
-            sanitize("country", &row.country, &row.country),
+            field_vis(&disabled, "country", sanitize("country", &row.country, &row.country)),
             row.e_country,
             row.commit_unix,
             row.weight,
@@ -333,7 +338,7 @@ pub fn merge_covering_fields_with_gain(rows: &[CoveringPrefix], gain: i64) -> Co
         prefer_field(
             &mut out.province,
             &mut scores[1],
-            &row.province,
+            field_vis(&disabled, "province", &row.province),
             row.e_province,
             row.commit_unix,
             row.weight,
@@ -343,7 +348,7 @@ pub fn merge_covering_fields_with_gain(rows: &[CoveringPrefix], gain: i64) -> Co
         prefer_field(
             &mut out.region,
             &mut scores[2],
-            &row.region,
+            field_vis(&disabled, "region", &row.region),
             0,
             row.commit_unix,
             row.weight,
@@ -353,7 +358,7 @@ pub fn merge_covering_fields_with_gain(rows: &[CoveringPrefix], gain: i64) -> Co
         prefer_field(
             &mut out.city,
             &mut scores[3],
-            sanitize("city", &row.country, &row.city),
+            field_vis(&disabled, "city", sanitize("city", &row.country, &row.city)),
             row.e_city,
             row.commit_unix,
             row.weight,
@@ -363,7 +368,7 @@ pub fn merge_covering_fields_with_gain(rows: &[CoveringPrefix], gain: i64) -> Co
         prefer_field(
             &mut out.district,
             &mut scores[4],
-            &row.district,
+            field_vis(&disabled, "district", &row.district),
             row.e_district,
             row.commit_unix,
             row.weight,
@@ -373,7 +378,7 @@ pub fn merge_covering_fields_with_gain(rows: &[CoveringPrefix], gain: i64) -> Co
         prefer_field(
             &mut out.isp,
             &mut scores[5],
-            &row.isp,
+            field_vis(&disabled, "isp", &row.isp),
             row.e_isp,
             row.commit_unix,
             row.weight,
@@ -383,7 +388,7 @@ pub fn merge_covering_fields_with_gain(rows: &[CoveringPrefix], gain: i64) -> Co
         prefer_field(
             &mut out.dc,
             &mut scores[6],
-            &row.dc,
+            field_vis(&disabled, "dc", &row.dc),
             0,
             row.commit_unix,
             row.weight,
@@ -393,7 +398,7 @@ pub fn merge_covering_fields_with_gain(rows: &[CoveringPrefix], gain: i64) -> Co
         prefer_field(
             &mut out.asn,
             &mut scores[7],
-            &row.asn,
+            field_vis(&disabled, "asn", &row.asn),
             row.e_asn,
             row.commit_unix,
             row.weight,
@@ -403,7 +408,7 @@ pub fn merge_covering_fields_with_gain(rows: &[CoveringPrefix], gain: i64) -> Co
         prefer_field(
             &mut out.as_org,
             &mut scores[8],
-            &row.as_org,
+            field_vis(&disabled, "as_org", &row.as_org),
             row.e_as_org,
             row.commit_unix,
             row.weight,
@@ -413,7 +418,7 @@ pub fn merge_covering_fields_with_gain(rows: &[CoveringPrefix], gain: i64) -> Co
         prefer_field(
             &mut out.net_org,
             &mut scores[9],
-            &row.net_org,
+            field_vis(&disabled, "net_org", &row.net_org),
             row.e_net_org,
             row.commit_unix,
             row.weight,
@@ -423,7 +428,7 @@ pub fn merge_covering_fields_with_gain(rows: &[CoveringPrefix], gain: i64) -> Co
         prefer_field(
             &mut out.cloud_provider,
             &mut scores[10],
-            &row.cloud_provider,
+            field_vis(&disabled, "cloud_provider", &row.cloud_provider),
             row.e_cloud_provider,
             row.commit_unix,
             row.weight,
@@ -433,7 +438,7 @@ pub fn merge_covering_fields_with_gain(rows: &[CoveringPrefix], gain: i64) -> Co
         prefer_field(
             &mut out.cloud_region,
             &mut scores[11],
-            &row.cloud_region,
+            field_vis(&disabled, "cloud_region", &row.cloud_region),
             row.e_cloud_region,
             row.commit_unix,
             row.weight,
@@ -443,7 +448,7 @@ pub fn merge_covering_fields_with_gain(rows: &[CoveringPrefix], gain: i64) -> Co
         prefer_field(
             &mut out.cloud_service,
             &mut scores[12],
-            &row.cloud_service,
+            field_vis(&disabled, "cloud_service", &row.cloud_service),
             row.e_cloud_service,
             row.commit_unix,
             row.weight,
@@ -453,7 +458,7 @@ pub fn merge_covering_fields_with_gain(rows: &[CoveringPrefix], gain: i64) -> Co
         prefer_field(
             &mut out.hosting,
             &mut scores[13],
-            &row.hosting,
+            field_vis(&disabled, "hosting", &row.hosting),
             row.e_hosting,
             row.commit_unix,
             row.weight,
@@ -463,7 +468,7 @@ pub fn merge_covering_fields_with_gain(rows: &[CoveringPrefix], gain: i64) -> Co
         prefer_field(
             &mut out.division_code,
             &mut scores[14],
-            &row.division_code,
+            field_vis(&disabled, "division_code", &row.division_code),
             0,
             row.commit_unix,
             row.weight,
@@ -478,6 +483,16 @@ pub fn merge_covering_fields_with_gain(rows: &[CoveringPrefix], gain: i64) -> Co
         out.commit_unix = out.commit_unix.max(row.commit_unix);
     }
     out
+}
+
+/// 字段展示开关在**合并输入**上的投影：停用则把值当空（`prefer_field` 空值早退）。
+#[inline]
+fn field_vis<'a>(disabled: &HashSet<String>, field: &str, v: &'a str) -> &'a str {
+    if disabled.contains(field) {
+        ""
+    } else {
+        v
+    }
 }
 
 pub fn merge_covering(rows: &[CoveringPrefix]) -> MergedFields {
@@ -530,6 +545,92 @@ pub fn path_priority_gain() -> i64 {
 /// 设置路径优先级增益（配置加载 / 面板保存 / 热载时调用）。
 pub fn set_path_priority_gain(gain: i64) {
     PATH_PRIORITY_GAIN.store(gain, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// P1-10 / §23.6「数据库字段管理：哪些字段展示/参与合并」：面板可停用的字段白名单。
+///
+/// 与 [`apply_field`] / `CoveringPrefix` 的字段一一对应。`country`…`division_code`。
+/// 拼错字段名在配置/面板入口就被拒（`config::Config::validate` /
+/// `PanelConfig::validate`），这里只负责运行期「合并期跳过 + 查询期置空」。
+pub const KNOWN_FIELDS: &[&str] = &[
+    "country",
+    "province",
+    "region",
+    "city",
+    "district",
+    "isp",
+    "dc",
+    "asn",
+    "as_org",
+    "net_org",
+    "cloud_provider",
+    "cloud_region",
+    "cloud_service",
+    "hosting",
+    "division_code",
+];
+
+/// 当前生效的「停用字段」集合（小写化）。空 = 全部字段参与合并/展示。
+///
+/// 用全局量而不是把集合穿进每个调用点：`merge_covering*` 在查询热路径上被页面规则
+/// 与面板 lookup 调用，签名保持不变才能避免改动 10+ 个跨协议调用方；配置/面板保存是
+/// 低频事件，写侧一次 store 即可（与 `PATH_PRIORITY_GAIN` 同一考量）。
+static DISABLED_FIELDS: Lazy<std::sync::RwLock<HashSet<String>>> =
+    Lazy::new(|| std::sync::RwLock::new(HashSet::new()));
+
+/// 设置停用字段（配置加载 / 面板保存 / 热载时调用）。
+pub fn set_disabled_fields(fields: &[String]) {
+    let mut g = DISABLED_FIELDS.write().unwrap_or_else(|e| e.into_inner());
+    g.clear();
+    for f in fields {
+        let f = f.trim().to_ascii_lowercase();
+        if !f.is_empty() {
+            g.insert(f);
+        }
+    }
+}
+
+/// 停用字段的当前快照（合并前取一次，避免逐字段反复加锁）。
+pub fn disabled_fields_snapshot() -> HashSet<String> {
+    DISABLED_FIELDS
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
+}
+
+/// 某字段当前是否被面板停用（展示/合并均跳过）。
+pub fn is_field_disabled(field: &str) -> bool {
+    DISABLED_FIELDS
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .contains(&field.trim().to_ascii_lowercase())
+}
+
+/// 按停用开关把已合并结果里的相应字段置空（查询返回前的最后一道「展示」过滤）。
+///
+/// 与合并期跳过是同一条开关的两个落点：合并期跳过保证「停用字段不参与合并」；
+/// 这里在 `apply_panel_edits` **之后**再置空，保证手工勘误也无法把停用字段带回来
+///（比如管理员停用 `city` 后，一条历史的 city 覆盖不该让它重新出现在面板里）。
+pub fn apply_field_visibility(m: &mut MergedFields) {
+    let disabled = disabled_fields_snapshot();
+    if disabled.is_empty() {
+        return;
+    }
+    if disabled.contains("country") { m.country.clear(); }
+    if disabled.contains("province") { m.province.clear(); }
+    if disabled.contains("region") { m.region.clear(); }
+    if disabled.contains("city") { m.city.clear(); }
+    if disabled.contains("district") { m.district.clear(); }
+    if disabled.contains("isp") { m.isp.clear(); }
+    if disabled.contains("dc") { m.dc.clear(); }
+    if disabled.contains("asn") { m.asn.clear(); }
+    if disabled.contains("as_org") { m.as_org.clear(); }
+    if disabled.contains("net_org") { m.net_org.clear(); }
+    if disabled.contains("cloud_provider") { m.cloud_provider.clear(); }
+    if disabled.contains("cloud_region") { m.cloud_region.clear(); }
+    if disabled.contains("cloud_service") { m.cloud_service.clear(); }
+    if disabled.contains("hosting") { m.hosting.clear(); }
+    if disabled.contains("division_code") { m.division_code.clear(); }
 }
 
 /// 单个字段的评分：`(weight + bits * gain, epoch, bits)`，同分后行胜。
@@ -617,6 +718,9 @@ fn merge_pipeline(conn: &Connection, ip: &str, rows: &[CoveringPrefix]) -> Merge
         }
         Err(e) => warn_once(&format!("geoip panel db unavailable: {e:#}")),
     }
+    // P1-10：手工勘误之后再按开关置空停用字段 —— 保证「停用」是最终展示口径，
+    // 一条历史覆盖不会把已停用的字段带回面板/查询结果。
+    apply_field_visibility(&mut merged);
     merged
 }
 

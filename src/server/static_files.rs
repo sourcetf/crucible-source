@@ -969,7 +969,13 @@ pub async fn serve_simple<T>(req: &Request<T>, lc: &ListenerConfig) -> Result<Re
         return Ok(resp);
     }
     // 只有小文件才进缓存，否则 256 条 × 16MiB 会把常驻内存撑到数 GiB。
-    let data = if len <= SMALL_FILE_MAX {
+    // §16.2/§22.6 门控：小文件内存缓存**仅在 `file_open` 为 `auto`/`execute` 且无 Range
+    // 时启用**（本处已在 Range 分支之后，故无 Range 恒成立）；`preview`/`download` 直读，
+    // 不进缓存 —— 但缓存只存**字节**，Content-Type/Disposition 一律由响应侧另算，
+    // 所以门控只是省掉这两条路径的缓存填充，响应字节与头部不变。
+    let data = if len <= SMALL_FILE_MAX
+        && matches!(mode, FileOpenMode::Auto | FileOpenMode::Execute)
+    {
         read_cached(&fs_path, &meta)?
     } else {
         // >256KiB 的整读走 spawn_blocking（同 h1 路径）。
@@ -1260,7 +1266,12 @@ async fn serve_file(
         return Ok(resp);
     }
 
-    let data = if len <= SMALL_FILE_MAX {
+    // §16.2/§22.6：小文件内存缓存仅在 `file_open` 为 `auto`/`execute` 且无 Range 时启用
+    // （本处已在 Range/HEAD 分支之后，故无 Range 恒成立）；`preview`/`download` 直读。
+    // 缓存只存字节，Content-Type/Disposition 由响应侧另算 ⇒ 纯门控、行为不变。
+    let data = if len <= SMALL_FILE_MAX
+        && matches!(mode, FileOpenMode::Auto | FileOpenMode::Execute)
+    {
         read_cached(path, meta)?
     } else {
         // >256KiB 的整读走 spawn_blocking：同步 `fs::read` 最大 16MiB，在 2-worker 的

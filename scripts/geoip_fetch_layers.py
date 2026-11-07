@@ -12,6 +12,12 @@
 
 黑名单硬拒绝（§3）：Ip2Region / DB-IP 系 URL 一律不下载不合并（BLACKLIST_URLS）。
 单源失败不影响其余；临时文件写完后原子改名。GEOIP_CLOUD_PROVIDERS 可改厂商清单。
+
+P2-19（§23.1）：原始分层（`01-cloud/…` 等）默认**不保留** —— 本脚本把层写进
+`CRUCIBLE_GEOIP_LAYERS`（默认 `current/`，merge 需要），随后由更新链
+（`geoip_update.sh`）在收尾时清掉 `current/NN-*`。只有 `GEOIP_KEEP_RAW=1` 时才保留原始分层。
+本脚本自己在开跑前也会清掉上一轮的陈旧分层目录（未设 GEOIP_KEEP_RAW 时），
+避免一次中断的更新把 `current/` 越堆越大。
 """
 
 import ipaddress
@@ -25,6 +31,9 @@ import urllib.request
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 # 层缓存根目录可覆盖（staging / 测试）；生产默认行为不变。
 LAYERS = os.environ.get("CRUCIBLE_GEOIP_LAYERS") or os.path.join(ROOT, "data", "geoip", "current")
+# P2-19（§23.1）：未设 GEOIP_KEEP_RAW 时原始分层视为临时物 —— 这里开跑前清掉上一轮的
+# 陈旧分层目录（收尾清理在 geoip_update.sh）。设 `GEOIP_KEEP_RAW=1` 则保留。
+KEEP_RAW = os.environ.get("GEOIP_KEEP_RAW", "").strip().lower() in ("1", "true", "yes", "on")
 UA = {"User-Agent": "crucible-geoip-sync/1.0 (+https://localhost)"}
 TIMEOUT = 120
 
@@ -484,10 +493,41 @@ def do_rir(registry: str, url: str) -> int:
     raise RuntimeError(f"all mirrors failed for {registry}: {last}")
 
 
+def clean_stale_layers() -> int:
+    """未设 GEOIP_KEEP_RAW 时，清掉 LAYERS 下上一轮的原始分层目录（`NN-*`）。
+
+    只删「两位数字前缀」的目录，绝不碰 `geoip.sqlite` / `SOURCES.json` / `blacklist.json`。
+    返回删除的目录数。
+    """
+    if KEEP_RAW or not os.path.isdir(LAYERS):
+        return 0
+    removed = 0
+    for name in os.listdir(LAYERS):
+        if len(name) >= 2 and name[:2].isdigit() and name[2:3] == "-":
+            p = os.path.join(LAYERS, name)
+            if os.path.isdir(p):
+                try:
+                    import shutil
+
+                    shutil.rmtree(p)
+                    removed += 1
+                except OSError as e:  # noqa: BLE001
+                    print(f"warn: clean stale layer {p}: {e}", file=sys.stderr)
+    return removed
+
+
 def main() -> int:
     started = time.time()
     results: list[tuple[str, object]] = []
     timings: dict[str, float] = {}
+
+    if not KEEP_RAW:
+        n_clean = clean_stale_layers()
+        if n_clean:
+            print(
+                f"geoip_fetch_layers: cleaned {n_clean} stale raw layer dirs "
+                f"(GEOIP_KEEP_RAW!=1；设 1 保留原始分层)"
+            )
 
     for name, fn in (
         ("01-cloud/rezmoss", do_rezmoss),

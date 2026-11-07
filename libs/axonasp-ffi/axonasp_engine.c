@@ -1,6 +1,26 @@
 /*
  * AxonASP-compatible Classic ASP engine —
  * Response.Write / <%= %> / Request.QueryString / Request.ServerVariables / HTML.
+ *
+ * ── 实现现状 vs 规格（P2-10，诚实标注）─────────────────────────────────────
+ * 规格 §16.6 / §7.6 写的是「Classic ASP：AxonASP FFI（libs/axonasp-ffi，Go c-shared）」。
+ * 实际被宿主加载的产物是 **本 C 文件**编出的 `libapp_asp.so`（引擎 = `asp`）：
+ *   * Rust 侧只按 `<repo>/target/app-engines/libapp_<engine>.so` 取 .so
+ *     （app_ffi::default_lib_path），"asp" → `libapp_asp.so`，**从不加载 `libaxonasp.so`**；
+ *   * 同目录的 `libs/axonasp-ffi/main.go` 经 `go build -buildmode=c-shared` 产出
+ *     `libaxonasp.so`，但它导出的符号是 `axonasp_handle` / `axonasp_free`，**不是**
+ *     appengine ABI（`appengine_init`/`appengine_execute`/`appengine_shutdown`）——
+ *     即便构建出来也**不能被 app_ffi 加载**。因此本引擎是一个「AxonASP 兼容的 C 实现」，
+ *     而非规格字面的 Go c-shared 后端。不伪造：不改名、不假装它是 libaxonasp。
+ *   * 不切到 Go 的原因（可核对）：① 引擎 ABI 不匹配（见上）；② Go 后端对 `<%= %>` /
+ *     Response.Write 只做正则替换，本 C 版还实现了 Request.ServerVariables、
+ *     目录索引/index.asp 解析、FIFO/非普通文件防护、404 语义（不软 200），功能更全；
+ *     ③ 生产/验收机的 Go 工具链存在与否不一致（见 OPERATOR-TODO §3.3）。
+ * 若日后要落到字面规格：需把 Go 侧改成导出 appengine ABI 并让 default_lib_path /
+ * 引擎映射指向它 —— 那是产品决策，不在本文件范围内。
+ *
+ * 响应头：成功 200 与两条 404 路径**都**带 `X-Crucible-Engine: asp`（此前 404 分支
+ * 漏标，运维无法从响应头区分引擎形态）。
  */
 #include "../app-engines/include/appengine.h"
 #include "../app-engines/common/appengine_common.h"
@@ -421,7 +441,8 @@ int appengine_execute(
             appengine_result_alloc(out);
             out->status = 404;
             appengine_result_set_headers(
-                out, "Content-Type: text/plain; charset=utf-8\r\n");
+                out, "Content-Type: text/plain; charset=utf-8\r\n"
+                     "X-Crucible-Engine: asp\r\n");
             appengine_result_set_body(out, "asp: script not found\n", 22);
             appengine_result_set_error(out, script);
             return 0;
@@ -433,7 +454,8 @@ int appengine_execute(
             appengine_result_alloc(out);
             out->status = 404;
             appengine_result_set_headers(
-                out, "Content-Type: text/plain; charset=utf-8\r\n");
+                out, "Content-Type: text/plain; charset=utf-8\r\n"
+                     "X-Crucible-Engine: asp\r\n");
             appengine_result_set_body(out, "asp: script not found\n", 22);
             appengine_result_set_error(out, script_path);
             return 0;

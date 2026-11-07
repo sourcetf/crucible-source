@@ -25,6 +25,7 @@ use http_body_util::{BodyExt, Full};
 use serde_json::Value as Json;
 use std::net::IpAddr;
 use std::sync::Arc;
+use std::time::Duration;
 
 pub const UI_HTML: &str = include_str!("admin_ui.html");
 /// 视频预览（HLS/mp4）辅助脚本，经 include_str! 编进二进制；改后需重链。
@@ -359,6 +360,13 @@ async fn handle_inner(
         return json_ok(s);
     }
 
+    // P2-8 / §16.12：访问日志**实时 tail** 的 SSE 端点（`text/event-stream`）。
+    // 轮询端点 `/api/logs` 保留不动；面板「实时」优先用本端点，失败再回退轮询。
+    // 复用 `access_log` 的环 + 单调序号做增量推送，带心跳与客户端断开检测。
+    if path.ends_with("/api/logs/stream") && method == Method::GET {
+        return logs_stream_response(req.headers());
+    }
+
     // 页面规则 / 反代规则:GET 读取,POST 增删(写 config.toml + 热重载)
     if path.ends_with("/api/pagerules") && (method == Method::GET || method == Method::POST) {
         return handle_rules_api(req, &live, RulesKind::Page).await;
@@ -428,6 +436,20 @@ async fn handle_inner(
     if path.ends_with("/api/geoip/filter") && method == Method::GET {
         return admin_geoip::handle_filter_with_live(&req, &live).await;
     }
+    // P2-17：筛选器别名/取值下拉（国家别名 + 库里出现过的城市/省市/运营商）。
+    if path.ends_with("/api/geoip/filter/values") && method == Method::GET {
+        return admin_geoip::handle_filter_values(&req, &live).await;
+    }
+    // P1-9：自定义 geofeed 列表（增删查 + 批量刷新）。子路径必须先判定（ends_with 语义）。
+    if path.ends_with("/api/geoip/geofeed/delete") && method == Method::POST {
+        return admin_geoip::handle_geofeed_delete(req).await;
+    }
+    if path.ends_with("/api/geoip/geofeed/refresh") && method == Method::POST {
+        return admin_geoip::handle_geofeed_refresh(req, &live).await;
+    }
+    if path.ends_with("/api/geoip/geofeed") {
+        return admin_geoip::handle_geofeed(req).await;
+    }
     if path.ends_with("/api/geoip/conflicts/resolve") && method == Method::POST {
         return admin_geoip::handle_conflict_resolve(req).await;
     }
@@ -460,7 +482,7 @@ async fn handle_inner(
         return admin_geoip::handle_source_set(req).await;
     }
     if path.ends_with("/api/geoip/update") && method == Method::POST {
-        return admin_geoip::handle_update_trigger(req).await;
+        return admin_geoip::handle_update_trigger(req, &live).await;
     }
 
     // TLS 可配置套件目录：**运行时探测**链接进来的 BoringSSL 得到（见 tls/cipher_catalog），
@@ -2822,6 +2844,20 @@ fn check_listener_json(l: &Json) -> Result<(), String> {
             ));
         }
     }
+    // §16.1 多站点名（P2-1）：数组形态，逐项与单数 server_name 同一口径校验。
+    if let Some(names) = l.get("server_names").and_then(|x| x.as_array()) {
+        check_len("listener.server_names", names.len(), 64)?;
+        for (i, v) in names.iter().enumerate() {
+            let Some(s) = v.as_str() else {
+                return Err(format!("listener.server_names[{i}] 必须是字符串"));
+            };
+            if s.len() > MAX_DNS_NAME_LEN || s.chars().any(|c| c.is_control()) {
+                return Err(format!(
+                    "listener.server_names[{i}] 越界（> {MAX_DNS_NAME_LEN} 字节或含控制字符）"
+                ));
+            }
+        }
+    }
     if let Some(sp) = l.get("status_path").and_then(|x| x.as_str()) {
         if !sp.is_empty() && (!sp.starts_with('/') || sp.len() > MAX_PATH_STR) {
             return Err(format!("listener.status_path 必须以 / 开头且 ≤ {MAX_PATH_STR} 字节: {sp:?}"));
@@ -3041,6 +3077,121 @@ fn json_ok(s: String) -> Response<BoxBody> {
         .header(header::CONTENT_TYPE, "application/json; charset=utf-8")
         .body(full(s))
         .unwrap()
+}
+
+/// §16.12 / P2-8：访问日志实时 tail 的 SSE 响应。
+///
+/// * `text/event-stream` + `Cache-Control: no-cache`（禁中间层缓冲/缓存）；
+/// * 复用 [`crate::server::access_log::lines_after`] 的环 + 单调序号做增量推送：
+///   连接时先发当前环内全部行，之后每 500ms 拉一次新增行；每行带 `id:` = 序号，
+///   断线重连时读 `Last-Event-ID` 续传（避免把已推送的行重发一遍）；
+/// * **心跳**：每 15s 发一条 SSE 注释行（`: ping`），既保活又让被半开的连接尽早发现；
+/// * **客户端断开检测**：body 只 poll 通道，写端 `send` 失败（接收端已 Drop）即结束
+///   后台任务 —— 这是最直接的断开信号，无需额外注册超时；
+/// * h2/h3 的 admin 分支会把响应收齐成 `Bytes`（无界流会挂死），故其收齐函数对
+///   `text/event-stream` 改用 [`crate::server::access_log::SseStreamBody`] 扩展、
+///   由连接任务按帧流式发送。
+fn logs_stream_response(headers: &http::HeaderMap) -> Response<BoxBody> {
+    // 断线续传：EventSource 重连会带 `Last-Event-ID`（我们已发 `id:`）。该值是**已收到**
+    // 的最后序号，故从它 +1 开始；无该头即从头（发全量 backlog）。
+    let start_cursor = headers
+        .get("last-event-id")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .map(|id| id.saturating_add(1))
+        .unwrap_or(0);
+    let (tx, rx) = tokio::sync::mpsc::channel::<Bytes>(16);
+    tokio::spawn(async move {
+        // 首屏：环内现有行（从 start_cursor 起）。
+        let (next, backlog) = crate::server::access_log::lines_after(start_cursor);
+        if !sse_send_lines(&tx, next, backlog).await {
+            return;
+        }
+        let mut cursor = next;
+        let mut tick = tokio::time::interval(Duration::from_millis(500));
+        let mut beat = tokio::time::interval(Duration::from_secs(15));
+        // 首个 tick 立即完成：跳过一次，避免与首屏重复扫描。
+        tick.tick().await;
+        loop {
+            tokio::select! {
+                _ = tick.tick() => {
+                    let (next, lines) = crate::server::access_log::lines_after(cursor);
+                    cursor = next;
+                    if !sse_send_lines(&tx, cursor, lines).await {
+                        return; // 接收端已丢弃：客户端断开
+                    }
+                }
+                _ = beat.tick() => {
+                    if tx.send(Bytes::from_static(b": ping\n\n")).await.is_err() {
+                        return;
+                    }
+                }
+            }
+        }
+    });
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "text/event-stream; charset=utf-8")
+        .header(header::CACHE_CONTROL, "no-cache")
+        // 反代（nginx 等）默认会缓冲 SSE；这一句让支持它的反代关闭缓冲。
+        .header("x-accel-buffering", "no")
+        .body(BoxBody::new(SseBody {
+            rx: parking_lot::Mutex::new(rx),
+        }))
+        .unwrap()
+}
+
+/// 把一批行（含各自的 `id:` = 环序号）写进 SSE 通道；返回 false = 客户端已断开。
+async fn sse_send_lines(
+    tx: &tokio::sync::mpsc::Sender<Bytes>,
+    next: u64,
+    lines: Vec<String>,
+) -> bool {
+    let first = next.saturating_sub(lines.len() as u64);
+    for (i, line) in lines.into_iter().enumerate() {
+        let seq = first + i as u64;
+        if tx.send(sse_frame(seq, &line)).await.is_err() {
+            return false;
+        }
+    }
+    true
+}
+
+/// 一条日志行的 SSE 帧：`id: <seq>\ndata: <line>\n\n`。访问日志行不含换行，故单条 data 即可。
+fn sse_frame(seq: u64, line: &str) -> Bytes {
+    let mut s = String::with_capacity(line.len() + 24);
+    s.push_str("id: ");
+    s.push_str(&seq.to_string());
+    s.push_str("\ndata: ");
+    s.push_str(line);
+    s.push_str("\n\n");
+    Bytes::from(s)
+}
+
+/// SSE body 适配：把通道里的帧当 DATA 帧发出去（与 `h1::FileStreamBody` 同构）。
+/// 接收端放 `Mutex` 是因为 `mpsc::Receiver` 是 `Send` 但非 `Sync`，而 [`BoxBody`]
+/// 是 `Send + Sync` 的 trait object；临界区内不 await。
+struct SseBody {
+    rx: parking_lot::Mutex<tokio::sync::mpsc::Receiver<Bytes>>,
+}
+
+impl hyper::body::Body for SseBody {
+    type Data = Bytes;
+    type Error = std::convert::Infallible;
+
+    fn poll_frame(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Result<hyper::body::Frame<Bytes>, Self::Error>>> {
+        let this = self.get_mut();
+        match this.rx.lock().poll_recv(cx) {
+            std::task::Poll::Ready(Some(b)) => {
+                std::task::Poll::Ready(Some(Ok(hyper::body::Frame::data(b))))
+            }
+            std::task::Poll::Ready(None) => std::task::Poll::Ready(None),
+            std::task::Poll::Pending => std::task::Poll::Pending,
+        }
+    }
 }
 
 fn query_str(q: &str, key: &str) -> Option<String> {

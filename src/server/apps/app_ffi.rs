@@ -173,6 +173,18 @@ fn engine_needs_nodelete(engine: &str) -> bool {
 /// 打开时若某只引擎在**同一个路径**上被反复热换，`reconcile_unload`/慢路径会用
 /// `(dev,ino,size,mtime_ns)` 指纹发现替换并重装（默认关时不做这个检测，进程一直
 /// 用第一次装载的代码，直到重启 —— 这正是「维持现状」）。
+///
+/// **P2-11 评估（为何默认仍关）**：曾评估「引用计数为 0 + 无在途请求 + 引擎声明可卸载」
+/// 时默认打开真 `dlclose`，结论是**不打开**，理由：
+///   1. `.so` 用 `RTLD_NOW | RTLD_GLOBAL` 装载（§16.8，且 perl/psgi 靠全局符号介入
+///      共享同一解释器实例）。`dlclose` 掉一个被别处 GOT/PLT 绑到其全局符号的对象，
+///      会留下悬空绑定 —— 这是确定的 SIGSEGV，且触发点远离卸载处，极难定位。
+///   2. ABI v2 **没有**「引擎声明自身可卸载」的能力位；现在的可卸载性来自
+///      [`DEFAULT_NODELETE_ENGINES`] 这个基于某次 `ldd` 证据的**启发式白名单**，
+///      不等于引擎给出的承诺。白名单外的引擎若持有静态 TLS/后台线程，卸载即崩。
+///   3. 默认打开意味着**每个默认部署**都走热换/指纹重装路径；而该路径的存在价值是
+///      受控实验（报告 `/proc/<pid>/maps` 对比）。稳妥起见保持默认关、由
+///      `CRUCIBLE_APP_UNLOAD=1` 显式开启（功能完整保留，未砍）。
 fn unload_enabled_with(switch: Option<&str>) -> bool {
     matches!(switch.map(str::trim), Some("1" | "true" | "yes" | "on"))
 }

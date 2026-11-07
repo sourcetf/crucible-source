@@ -7220,3 +7220,34 @@ P2 集群（`server_names`/Host 多站点、`port_reuse` 命名、L4 UDP、`SO_B
 小文件缓存门控、符号链接口径、访问日志 SSE/WS、cgi fork、ASP/ASP.NET 后端、dlclose、
 extensions 语义、TSX watch kqueue/inotify、面板可编辑 §3.3 字段）；依赖外部工具链的
 （H3 PSK 需 quinn-boring 改动、GeoIP 城市层需下载源、`libaxonasp.so` 需 Go、mruby 链需源码）。
+
+# 【agent-1009 · Wave-25d】功能审查修复 第三批（GeoIP 集群 + HTTP/面板 P2 + 协议/引擎），2026-11-07
+
+**GeoIP（§23）**：cron **执行器**（此前只写 `panel_cron` 无消费者=伪实现；白名单解析 hourly/daily/weekly/HH:MM，
+无法识别**绝不执行**，60s 巡检、单飞、更新 last_run）；**源权重真生效**（`geoip_merge.py` 读
+`panel.toml [sources]` / `panel.sqlite panel_sources` 覆盖 `LAYER_WEIGHTS`，`enabled=false` 整层跳过 —— 此前
+面板能改但无人消费）；自定义 geofeed（表 + API + UI + 声明式 JSON 供给层 → `--only=geofeed`）；字段管理
+（`disabled_fields` 配置 + 查询过滤 + 合并期跳过）；按源更新（`?only=`）+ **可配脚本路径**（`[geoip] update_script`）；
+冲突栏分 IP/ASN；筛选别名 datalist；`GEOIP_KEEP_RAW` 门控；`filter_agg.rs` 模块落位（ops 里的筛选聚合干净迁出 + re-export）。
+
+**HTTP/面板**：`server_names` + `all_server_names()`（接线 SNI 期望名 / port_reuse 301 Location / port_reuse 选 listener；
+**不引入新 Host 路由语义**）；小文件缓存改为**仅 auto/execute** 走（preview/download 直读）；访问日志 realtime
+新增 **SSE** `GET {admin}/api/logs/stream`（带 `id:` 断点续传、心跳、断开检测；h2/h3 识别 SSE 不再收齐而是按帧
+`send_data`；面板优先 SSE、失败回退旧轮询端点，端点未删）；TSX watch 改 **inotify/kqueue**（事件注册失败回退轮询）；
+面板可编辑 §3.3 扩展字段（TSX source_dir/out_dir/entry/watch、php_bin、deps_dir、init_timeout_secs、libc、
+sandbox.user/group/docroot_rw）；`reuse_port` 加显式别名 + 与 `port_reuse` 的区别写进注释。
+
+**协议/引擎**：L4 加 **UDP relay**（回话地址映射 + 60s 空闲回收 + 8192 fd 上限 + 每包过 ip_access）与**多上游**轮询；
+CGI 修两个**真缺陷**（6 个管道 fd 未设 `FD_CLOEXEC` ⇒ 并发派生时继承管道端点；`close` 未判源≠目标 ⇒ stdio 被
+dup2 后又关掉），并把「CGI 必然是 per-request 进程 + 与 §22.4.2 的边界」写进文件头；ASP.NET/ASP 降级标记补齐；
+**H3/QUIC 侧 PSK 经查证不可干净实现**（该 BoringSSL 已删 OpenSSL 式 TLS1.3 会话 PSK 回调，只剩 TLS1.2 的
+`SSL_CTX_set_psk_server_callback`；TLS1.3 走 `SSL_CREDENTIAL_new_pre_shared_key` 而高层 `boring` crate 未绑定，
+须裸 FFI + 手工引用计数），已把证据写进 `boring_path.rs:apply_psk` 注释与 OPERATOR-TODO；**`libaxonasp.so` 的真实
+阻塞是 ABI 不匹配**（Go 其实在 `/usr/bin/go`；`axonasp-ffi/main.go` 只导出 `axonasp_handle`/`axonasp_free`，而宿主只
+认 `appengine_*`）—— 已写入 OPERATOR-TODO §3.3.1；mruby 链仍是 stub（无源码）。
+
+**编译期修掉**：`SseStreamBody` 改为 `Arc<Mutex<Option<BoxBody>>>` + `#[derive(Clone)]`（`http::Extensions::insert`
+要求 `T: Clone`），消费点改 `take_body()`。
+
+**终态验证**：新二进制 22456768（10:02）；19/19 业务路由 200；9081/9445/9446 + h3 全 200；`/tsx/` h1 405 正常；
+DNS 53 正常；`CONTAINMENT OK`；引擎身份 `_c_*`；孤儿自检「没有遗留」。

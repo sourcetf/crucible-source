@@ -123,6 +123,34 @@ pub async fn run(live: Arc<LiveConfig>) -> Result<()> {
         });
     }
 
+    // P1-4：GeoIP 计划任务执行器（§23.6「计划任务：开启/配置 cron 类更新（配置进 toml；
+    // 执行脚本）」）。此前 `/api/geoip/cron` 只 upsert `panel_cron`，**没有任何执行器读取它**
+    // —— 面板上配置的定时任务永远不会跑（功能审查判为伪实现）。
+    //
+    // 每 60s 检查一次：按 `panel_cron`（name/schedule/enabled/last_run）判定「是否到点」，
+    // 到点则执行 `[geoip] update_script`（P1-11 可配，默认 scripts/geoip_update.sh）。
+    // schedule 解析保守（白名单），无法识别只 warn 一次、绝不执行；触发复用
+    // `spawn_geoip_update_script` 的单实例保护（单飞）；失败只 warn，不影响进程。
+    {
+        let live_cron = Arc::clone(&live);
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(60));
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            tick.tick().await; // 首个 tick 立即就绪，先消费掉（不在启动瞬间抢跑）
+            loop {
+                tick.tick().await;
+                let snap = live_cron.snapshot();
+                if !snap.geoip.enabled {
+                    continue;
+                }
+                let n = crate::server::geoip_panel::ops::run_due_crons(&snap.geoip);
+                if n > 0 {
+                    log::info!("geoip cron: 本次触发 {n} 个到期更新任务");
+                }
+            }
+        });
+    }
+
     let active: Arc<tokio::sync::Mutex<std::collections::HashSet<String>>> =
         Arc::new(tokio::sync::Mutex::new(std::collections::HashSet::new()));
 
@@ -224,6 +252,13 @@ pub async fn run(live: Arc<LiveConfig>) -> Result<()> {
                                     .iter()
                                     .any(|k| !a.contains(k))
                             }) || (lc.allows_h3() && !a.contains(&format!("h3|{key}")))
+                                // §16.18：l4_forward listener 的 UDP 中继也必须存活；
+                                // 任一地址的中继任务退出（bind 失败恢复后/listener 重建）
+                                // 都要能把它拉回来。
+                                || (lc.l4_forward.is_some()
+                                    && addrs.iter().any(|ad| {
+                                        !a.contains(&format!("l4udp|{key}@{ad}"))
+                                    }))
                         }
                         Err(_) => true,
                     };
@@ -581,6 +616,62 @@ async fn spawn_listener_port(
             });
         }
       }
+    }
+
+    // §16.18 L4 UDP 中继：与 TCP 同端口（UDP/TCP 端口空间独立），每个绑定地址一个中继。
+    //
+    // 必须和 h3 一样放在 `first_err` 提前返回**之前**：某个地址的 TCP bind 失败时，
+    // 该 listener 的 UDP 面不该被一起丢掉（失败地址由 reconciler 单独重试）。
+    // 用 `l4udp|<key>@<addr>` 记账，reconciler 据此判断「这个地址的 UDP 中继还在不在」，
+    // 避免每 2s 重复 bind 同一 UDP 端口。
+    if lc.l4_forward.is_some() {
+        for addr in addrs.iter().copied() {
+            let ukey = format!("l4udp|{key}@{addr}");
+            let should_spawn = {
+                let mut a = active.lock().await;
+                if a.contains(&ukey) {
+                    false
+                } else {
+                    a.insert(ukey.clone());
+                    true
+                }
+            };
+            if should_spawn {
+                let live_u = Arc::clone(&live);
+                let active_u = Arc::clone(&active);
+                let key_u = key.clone();
+                let ukey_c = ukey.clone();
+                tokio::spawn(async move {
+                    // 每轮重取配置：改目标/改 ACL 无需重启；listener 被删或不再配
+                    // l4_forward 时 serve_udp_relay 返回 Ok，这里收尾退出。
+                    loop {
+                        let still = live_u.snapshot().listeners.iter().any(|l| {
+                            crate::server::bind_key(l) == key_u && l.l4_forward.is_some()
+                        });
+                        if !still {
+                            log::info!("l4 udp relay {ukey_c} removed; stopping");
+                            break;
+                        }
+                        match crate::server::l4::serve_udp_relay(
+                            Arc::clone(&live_u),
+                            key_u.clone(),
+                            addr,
+                        )
+                        .await
+                        {
+                            Ok(()) => break, // listener 被删/停配（serve 内部已判定）
+                            Err(e) => {
+                                log::warn!(
+                                    "l4 udp relay {addr} (listener {key_u}): {e:#}; retry in 5s"
+                                );
+                                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                            }
+                        }
+                    }
+                    active_u.lock().await.remove(&ukey_c);
+                });
+            }
+        }
     }
 
     // 有地址没绑上：把错误交回调用方（记日志 + 让 reconciler 重试该地址），

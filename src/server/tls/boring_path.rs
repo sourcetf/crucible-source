@@ -1685,7 +1685,24 @@ fn hex_decode(s: &str) -> Option<Vec<u8>> {
 /// TLS-PSK server hook（§16.16）。
 /// P1-10：材料来源优先级 ssl.psk_key（配置：hex / base64 / 文件路径）> env
 /// CRUCIBLE_TLS_PSK（保留兼容）；配置 psk_identity 后严格匹配 identity。
-/// H3/QUIC 侧 PSK 涉及 quinn-boring 内部，另行移交（见 REVIEW-MASTER 移交清单）。
+///
+/// **H3/QUIC 侧 TLS1.3 外部 PSK（P1-8）—— 评估结论：本库不具备干净实现路径，未实现。**
+/// 可核查证据（在 boringssl 头文件 / boring crate 源码里 grep）：
+///   * 任务点名的 `SSL_CTX_set_psk_use_session_callback` / `SSL_CTX_set_psk_find_session_callback`
+///     **在本 vendored BoringSSL 中根本不存在**：
+///     `grep -rn psk_find_session|psk_use_session boring-sys-5.4.0/deps/boringssl/include/` → 空。
+///   * 本 BoringSSL 只保留 TLS1.2 回调（`SSL_CTX_set_psk_server_callback`，
+///     `boringssl/include/openssl/ssl.h:4037`），并在注释里明说 TLS1.3 PSK 改用
+///     `SSL_CREDENTIAL_new_pre_shared_key`（ssl.h:3974，RFC 9258 导入器）。
+///   * 但高层 `boring` crate **没有绑定** 该符号：`grep -rn new_pre_shared_key boring-5.4.0/src/` → 空；
+///     其 `SslCredential` 只提供 RPK 构造器 `new_raw_public_key`（credential.rs:34）。要用它只能绕过
+///     安全的 `boring` 封装，直接调 `boring_sys::SSL_CREDENTIAL_new_pre_shared_key` 裸 FFI 并手工
+///     交接指针/引用计数 —— 属于「需要未暴露的 API」那一类。
+///   * 且 `SslConfig` 没有 RFC 9258 所需的 PSK **导入上下文/哈希**字段（只有 psk/psk_key/psk_identity），
+///     补字段并定死默认 context 是安全/产品决策，不是纯实现。
+/// 因此 TCP（TLS1.2 PSK）保持现状；H3 侧不伪造（不写“看起来支持”的空壳）。若日后要落地：
+/// 用 boring-sys 的 `SSL_CREDENTIAL_new_pre_shared_key` + `SSL_CTX_add1_credential` 构建 PSK 凭证，
+/// 并从 config 增补 context/hash 字段，客户端侧同步——这是一次独立改造。
 fn apply_psk(builder: &mut SslAcceptorBuilder, ssl: &SslConfig, strict: bool) -> Result<()> {
     if !ssl.psk {
         return Ok(());

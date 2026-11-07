@@ -310,11 +310,36 @@ pub struct GeoIpConfig {
     /// 面板设置 `data/geoip/panel.toml` 可覆盖本字段。
     #[serde(default = "default_path_priority_gain")]
     pub path_priority_gain: i64,
+    /// P1-11 / §23.6「源管理 → 配置更新脚本路径」/§23.10：离线更新脚本路径。
+    /// `None` = 沿用历史硬编码 `scripts/geoip_update.sh`（零变化）。面板
+    /// `POST /api/geoip/update?only=<源名>` 与计划任务都走这个脚本。
+    #[serde(default)]
+    pub update_script: Option<PathBuf>,
+    /// P1-10 / §23.6「数据库字段管理：哪些字段展示/参与合并」。空 = 全部字段都
+    /// 展示并参与合并（零变化）。非空时：合并期跳过这些字段，查询结果也置空。
+    /// 字段名见 `geoip_panel::covering::KNOWN_FIELDS`。
+    #[serde(default)]
+    pub disabled_fields: Vec<String>,
 }
 
 /// 路径优先级增益的 serde 默认值（与 `geoip_panel::covering::DEFAULT_PATH_PRIORITY_GAIN` 相同）。
 pub fn default_path_priority_gain() -> i64 {
     crate::server::geoip_panel::covering::DEFAULT_PATH_PRIORITY_GAIN
+}
+
+/// P1-11：离线更新脚本的默认路径（`update_script` 为 `None` 时使用）。
+pub fn default_geoip_update_script() -> PathBuf {
+    PathBuf::from("scripts/geoip_update.sh")
+}
+
+impl GeoIpConfig {
+    /// 生效的离线更新脚本路径（`update_script` 为 `None`/空时回落默认）。
+    pub fn update_script_path(&self) -> PathBuf {
+        match &self.update_script {
+            Some(p) if !p.as_os_str().is_empty() => p.clone(),
+            _ => default_geoip_update_script(),
+        }
+    }
 }
 
 impl Default for GeoIpConfig {
@@ -323,6 +348,8 @@ impl Default for GeoIpConfig {
             db_path: None,
             enabled: false,
             path_priority_gain: default_path_priority_gain(),
+            update_script: None,
+            disabled_fields: Vec::new(),
         }
     }
 }
@@ -774,6 +801,17 @@ pub struct ListenerConfig {
     pub global_sandbox: crate::server::apps::sandbox::SandboxConfig,
     #[serde(default)]
     pub server_name: Option<String>,
+    /// §16.1：**多站点名**（`server_names = ["a.example", "b.example"]`）。
+    ///
+    /// 与单数 `server_name` **并存**（不是替代）：[`ListenerConfig::all_server_names`]
+    /// 把两者合并、去重、保序（单数名在前），供 SNI 期望名（`ssl.sni_only` 但未配
+    /// `ssl.sni_name` 时）与 `port_reuse` 301 的 `Location` 取值使用。只写单数
+    /// `server_name` 的既有配置行为逐字不变。
+    ///
+    /// 本字段**只让「多名字」可声明**，不引入任何新的 Host 路由语义（不改变既有请求
+    /// 分发判定）—— 那会改动现网路由行为，属于砍/改功能。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub server_names: Vec<String>,
     #[serde(default)]
     pub status_path: Option<String>,
     #[serde(default)]
@@ -801,7 +839,13 @@ pub struct ListenerConfig {
     ///
     /// 注意：`SO_REUSEPORT` 也让**同 uid 的其它进程**能绑同一端口（这是该选项的
     /// 固有语义）；只应在受控部署里开。
-    #[serde(default)]
+    ///
+    /// **命名（P2-2）**：规格 §16.1/§22 把这个 SO_REUSEPORT 能力记作 `port_reuse`，
+    /// 而本实现里 `port_reuse`（见上方字段）是**明文口 TLS/SNI 嗅探转发**，SO_REUSEPORT
+    /// 挂在 `reuse_port`。两者语义不同、都保留。为避免运维按规格书写 `port_reuse` 却被
+    /// 当成嗅探开关，本字段额外接受显式别名 `port_reuse_so_reuseport`（写成它同样打开
+    /// SO_REUSEPORT 多 accept loop）。序列化仍写 `reuse_port`，读写往返稳定。
+    #[serde(default, alias = "port_reuse_so_reuseport")]
     pub reuse_port: bool,
     /// `reuse_port = true` 时的 accept loop 数（默认 = `nproc`，钳到 1..=32）。
     ///
@@ -899,6 +943,7 @@ impl Default for ListenerConfig {
             geoip_db: None,
             global_sandbox: crate::server::apps::sandbox::SandboxConfig::default(),
             server_name: None,
+            server_names: Vec::new(),
             status_path: None,
             address_v6: None,
             port_reuse: false,
@@ -917,6 +962,37 @@ impl Default for ListenerConfig {
 }
 
 impl ListenerConfig {
+    /// §16.1：本 listener 的**全部站点名**，合并单数 `server_name` 与复数
+    /// `server_names` 后**去重（大小写不敏感）、保序**（单数名在前），并丢弃空白项。
+    ///
+    /// 消费点（均为既有逻辑，改为读本方法，单名字配置行为不变）：
+    ///   * `tls/accept.rs` 的 `sni_only` 期望名（未配 `ssl.sni_name` 时按本集合逐个匹配）；
+    ///   * `port_reuse` 的 301 `Location` 取值（取首项作为规范主机名）；
+    ///   * `listener.rs` 明文口按 SNI 找目标 TLS listener；
+    ///   * `config.rs` 的 `sni_only` / `port_reuse` 校验。
+    ///
+    /// **不引入新的 Host 路由语义**：只提供一个「多名字」的读取口。
+    pub fn all_server_names(&self) -> Vec<String> {
+        fn push(out: &mut Vec<String>, s: &str) {
+            let s = s.trim();
+            if s.is_empty() {
+                return;
+            }
+            if out.iter().any(|x| x.eq_ignore_ascii_case(s)) {
+                return;
+            }
+            out.push(s.to_string());
+        }
+        let mut out: Vec<String> = Vec::new();
+        if let Some(sn) = self.server_name.as_deref() {
+            push(&mut out, sn);
+        }
+        for sn in &self.server_names {
+            push(&mut out, sn);
+        }
+        out
+    }
+
     pub fn file_open_mode(&self, req_path: &str) -> FileOpenMode {
         self.file_open.mode_for_path(req_path)
     }
@@ -1791,6 +1867,9 @@ impl Config {
         crate::server::geoip_panel::covering::set_path_priority_gain(
             self.geoip.path_priority_gain,
         );
+        // P1-10：把「哪些字段参与合并/展示」发布给 covering（面板 panel.toml 覆盖
+        // 已在 effective_geoip 里并入 self.geoip.disabled_fields）。空 = 全部启用。
+        crate::server::geoip_panel::covering::set_disabled_fields(&self.geoip.disabled_fields);
         Ok(())
     }
 
@@ -2132,15 +2211,15 @@ ECH 既无法装载（无密钥）也无法自动生成（缺 public-name），�
                     l.address, l.port
                 );
             }
-            // ② sni_only 必须在名字可比对：只开 sni_only 而不给 sni_name / server_name 时，
-            //    每个连接都会因「SNI 不匹配」被丢弃（fail-closed，但整个站点不可用），
-            //    运维在日志里只看到一句「无可用 SNI」。
+            // ② sni_only 必须在名字可比对：只开 sni_only 而不给 sni_name / server_name（含
+            //    server_names）时，每个连接都会因「SNI 不匹配」被丢弃（fail-closed，但整个
+            //    站点不可用），运维在日志里只看到一句「无可用 SNI」。
             if ssl.sni_only
                 && ssl.sni_name.as_deref().unwrap_or("").trim().is_empty()
-                && l.server_name.as_deref().unwrap_or("").trim().is_empty()
+                && l.all_server_names().is_empty()
             {
                 anyhow::bail!(
-                    "listener {}:{} 开了 sni_only 但既没有 sni_name 也没有 server_name ——                      这样所有连接都会被丢弃",
+                    "listener {}:{} 开了 sni_only 但既没有 sni_name 也没有 server_name/server_names ——                      这样所有连接都会被丢弃",
                     l.address, l.port
                 );
             }
@@ -2297,6 +2376,27 @@ ECH 既无法装载（无密钥）也无法自动生成（缺 public-name），�
                 self.geoip.path_priority_gain,
                 default_path_priority_gain()
             );
+        }
+        // ①c P1-11：更新脚本路径写空串会让面板/计划任务 spawn 一个不存在的路径
+        //（表现为「点了没反应」）。要回落默认请删掉该键，不要写空。
+        if let Some(p) = &self.geoip.update_script {
+            if p.as_os_str().is_empty() {
+                anyhow::bail!("geoip.update_script 不能为空串（要回落默认请删掉该键）");
+            }
+        }
+        // ①d P1-10：字段开关只接受已知 schema 字段；拼错会让运维以为「已隐藏」，
+        // 实际该字段照常展示/合并（与「假成功」同类）。
+        for f in &self.geoip.disabled_fields {
+            let f = f.trim().to_ascii_lowercase();
+            if f.is_empty() {
+                anyhow::bail!("geoip.disabled_fields 含空字段名");
+            }
+            if !crate::server::geoip_panel::covering::KNOWN_FIELDS.contains(&f.as_str()) {
+                anyhow::bail!(
+                    "geoip.disabled_fields 含未知字段 {f:?}（可用：{}）",
+                    crate::server::geoip_panel::covering::KNOWN_FIELDS.join(", ")
+                );
+            }
         }
 
         // ①c `[dns]` 的「开了但配不全」**不能**在 `validate()` 里当错误拦：
@@ -2490,23 +2590,39 @@ ECH 既无法装载（无密钥）也无法自动生成（缺 public-name），�
                 &l.page_rules,
                 &format!("listener {}:{}: page_rules", l.address, l.port),
             )?;
-            // ⑤d l4_forward：必须能解析成 ip:port。否则每次连接才在 listener 里 parse 失败，
-            //     连接被静默丢弃（配置加载却是成功的）。
+            // ⑤d l4_forward：必须能解析成 ip:port；§16.18 起允许逗号分隔的**多上游**
+            //     （简单轮询）。任何一项非法都拒绝加载 —— 否则该口会静默丢弃流量。
             if let Some(dest) = &l.l4_forward {
-                if dest.parse::<std::net::SocketAddr>().is_err() {
+                let mut any = false;
+                for part in dest.split(',') {
+                    let t = part.trim();
+                    if t.is_empty() {
+                        continue;
+                    }
+                    any = true;
+                    if t.parse::<std::net::SocketAddr>().is_err() {
+                        anyhow::bail!(
+                            "listener {}:{}: l4_forward 中的 {t:?} 不是合法的 `ip:port`（多项用逗号分隔；该口会静默丢弃所有流量）",
+                            l.address, l.port
+                        );
+                    }
+                }
+                if !any {
                     anyhow::bail!(
-                        "listener {}:{}: l4_forward {dest:?} 不是合法的 `ip:port`（该口会静默丢弃所有连接）",
+                        "listener {}:{}: l4_forward {dest:?} 未包含任何上游目标（该口会静默丢弃所有流量）",
                         l.address, l.port
                     );
                 }
             }
-            // port_reuse 的 301 会把 server_name 拼进 Location（`https://<server_name>/…`），
+            // port_reuse 的 301 会把站点名拼进 Location（`https://<name>/…`），
             // 同样必须是安全的 header 值。只在 port_reuse 下检查，避免误伤别的用法。
+            // `all_server_names()` 覆盖单数 server_name 与复数 server_names（首个进
+            // Location，但每一个都必须是合法 header 值，避免后面被取用时才发现）。
             if l.port_reuse {
-                if let Some(sn) = l.server_name.as_deref() {
-                    if !safe_header_value(sn) {
+                for sn in l.all_server_names() {
+                    if !safe_header_value(&sn) {
                         anyhow::bail!(
-                            "listener {}:{}: port_reuse 下 server_name 会进 Location 响应头，但不能作为 header 值（含控制字符/非 ASCII）: {sn:?}",
+                            "listener {}:{}: port_reuse 下 server_name/server_names 会进 Location 响应头，但不能作为 header 值（含控制字符/非 ASCII）: {sn:?}",
                             l.address, l.port
                         );
                     }

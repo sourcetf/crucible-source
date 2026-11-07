@@ -3,7 +3,12 @@
 # 用法：
 #   geoip_update.sh                # 全链（staging 构建 + 原子换库）
 #   geoip_update.sh --only merge   # 只重建库（同样 staging + 原子换库）
-#   --only fetch|enrich|blacklist|finish
+#   --only fetch|enrich|blacklist|finish|geofeed
+#   --only geofeed                 # P1-9：只导入面板自定义 geofeed 列表（读供给层 JSON）
+#
+# P2-19 原始分层保留：fetch 把 `01-cloud/…` 等原始分层写进 `current/`（merge 依赖它）。
+# 默认（未设 `GEOIP_KEEP_RAW=1`）在全链收尾时**清掉**这些原始分层目录，只保留
+# `geoip.sqlite` / `SOURCES.json`（§23.1）；设 `GEOIP_KEEP_RAW=1` 才保留原始分层。
 #
 # U-17/原子性：`all`/`merge` 不再原地重写 geoip.sqlite，而是先建
 # `geoip.sqlite.next`，enrich/finish 全在 .next 上跑，最后 `integrity_check` +
@@ -62,6 +67,8 @@ export CRUCIBLE_GEOIP_PANEL_DB="${DATA}/panel.sqlite"
 export CRUCIBLE_GEOIP_PANEL="${DATA}/panel.toml"
 export CRUCIBLE_GEOIP_LAYERS="${DATA}/current"
 export CRUCIBLE_GEOIP_SOURCES_DIR="${DATA}/sources"
+# P1-9：自定义 geofeed 供给层（面板写入的 URL 列表；--only=geofeed 时被消费）。
+export CRUCIBLE_GEOIP_CUSTOM_GEOFEED="${CRUCIBLE_GEOIP_CUSTOM_GEOFEED:-${DATA}/sources/custom_geofeed.json}"
 
 have_network() {
   command -v curl >/dev/null 2>&1 && curl -fsS --connect-timeout 3 -o /dev/null https://example.com 2>/dev/null
@@ -224,6 +231,19 @@ ENRICH_SCRIPTS=(
     fi
   fi
 
+  # ---------- geofeed（P1-9 自定义列表批量刷新；仅 --only=geofeed） ----------
+  # 面板把启用的 URL 落成供给层 JSON，这里消费它并逐 URL 导入（RFC8805）。
+  # 直接作用于 TARGET_DB（--only=geofeed 时 TARGET_DB == 线上库，因为跳过了 merge）。
+  if [ "${ONLY}" = "geofeed" ] && [ "$CRITICAL_FAIL" -eq 0 ]; then
+    if [ -s "${CRUCIBLE_GEOIP_CUSTOM_GEOFEED}" ]; then
+      run_step geofeed "$TARGET_DB" python3 "${ROOT}/scripts/geoip_enrich_geofeed.py" \
+        --db "$TARGET_DB" --urls-file "${CRUCIBLE_GEOIP_CUSTOM_GEOFEED}" \
+        || echo "warn: custom geofeed import failed"
+    else
+      echo "warn: --only=geofeed 但供给层 ${CRUCIBLE_GEOIP_CUSTOM_GEOFEED} 不存在/为空（先在面板添加 URL 并刷新）"
+    fi
+  fi
+
   # ---------- blacklist / finish：同样作用于 staging ----------
   if { [ "${ONLY}" = "all" ] || [ "${ONLY}" = "blacklist" ] || [ "${ONLY}" = "finish" ]; } && [ "$CRITICAL_FAIL" -eq 0 ]; then
     if ! run_step blacklist "$TARGET_DB" python3 "${ROOT}/scripts/geoip_purge_blacklisted.py" \
@@ -267,6 +287,19 @@ ENRICH_SCRIPTS=(
   if [ ! -f "$DB" ]; then
     run_step seed "" python3 "${ROOT}/scripts/geoip_seed_demo.py" --db "$DB" --force || true
   fi
+  # P2-19：原始分层默认不保留（§23.1）。全链/仅 fetch 跑完后，若未设 GEOIP_KEEP_RAW=1，
+  # 清掉 `current/NN-*` 原始分层目录（保留 geoip.sqlite / SOURCES.json）；设了则原样保留。
+  if { [ "${ONLY}" = "all" ] || [ "${ONLY}" = "fetch" ]; } && [ "${GEOIP_KEEP_RAW:-0}" != "1" ]; then
+    removed=0
+    for d in "${DATA}/current"/[0-9][0-9]-*; do
+      [ -d "$d" ] || continue
+      rm -rf "$d" && removed=$((removed + 1))
+    done
+    if [ "$removed" -gt 0 ]; then
+      echo "[$(date '+%F %T')] raw layers cleaned (${removed} dirs；GEOIP_KEEP_RAW!=1，设 1 可保留)"
+    fi
+  fi
+
   # tor 池是自我守护化的进程，采完必须显式收掉（否则会一直残留）。
   if [ -d /tmp/geoip-tor-pool ]; then
     python3 "${ROOT}/scripts/geoip_tor_pool.py" stop || echo "warn: tor pool stop failed"

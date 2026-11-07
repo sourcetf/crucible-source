@@ -2,7 +2,7 @@
 ROOT := /crucible
 TARGET_OS := openbsd
 GO_ENGINE_MODE := shm
-CARGO_FEATURES := tls,tls_boring,go_shm_ipc,tls_nss,tls_tomcrypt
+CARGO_FEATURES := tls,tls_boring,go_shm_ipc,tls_nss,tls_tomcrypt,linux_busy_poll
 CC := cc
 PREFIX := /usr/local
 WORKER_THREADS := 2

@@ -116,7 +116,8 @@ img.preview{max-width:100%;max-height:420px}
         <div style="flex:1"><label>root（站点目录，全局唯一）</label><input id="leRoot" style="width:100%"/></div>
       </div>
       <div class="row">
-        <div><label>server_name</label><input id="leServerName"/></div>
+        <div><label>server_name（单数）</label><input id="leServerName"/></div>
+        <div style="flex:1"><label>server_names（逗号分隔，多站点名；与单数并存）</label><input id="leServerNames" style="width:100%" placeholder="a.example,b.example"/></div>
         <div><label>status_path（可选）</label><input id="leStatusPath" placeholder="/__status"/></div>
       </div>
       <div class="row">
@@ -354,10 +355,10 @@ img.preview{max-width:100%;max-height:420px}
       <pre id="alSiteOut"></pre>
     </div>
     <div class="card">
-      <h3 class="sub">实时日志（GET /api/logs，内存环形缓冲）</h3>
+      <h3 class="sub">实时日志（SSE /api/logs/stream，回退 GET /api/logs，内存环形缓冲）</h3>
       <div class="row">
         <div><label>行数(limit)</label><input id="logTailLimit" value="200" size="5"/></div>
-        <div><button class="act" id="btnLogTailStart">开始轮询</button></div>
+        <div><button class="act" id="btnLogTailStart">开始实时</button></div>
         <div><button class="act" id="btnLogTailStop">停止</button></div>
       </div>
       <pre id="logTailOut">未启动。</pre>
@@ -372,10 +373,25 @@ img.preview{max-width:100%;max-height:420px}
         <div><label>启用</label><select id="geoEnabled"><option value="true">true</option><option value="false">false</option></select></div>
         <div style="flex:1"><label>db_path</label><input id="geoDbPath" style="width:100%"/></div>
         <div><label title="每多一位前缀长度，等效权重增加的数值（0..=1000）">路径增益</label><input id="geoPathGain" size="6" value="10"/></div>
-        <div><button class="act" id="btnGeoSave">保存开关/路径/增益</button></div>
+      </div>
+      <div class="row">
+        <div style="flex:1"><label title="P1-11 离线更新脚本路径（默认 scripts/geoip_update.sh）">更新脚本路径</label><input id="geoUpdateScript" style="width:100%" placeholder="scripts/geoip_update.sh"/></div>
+        <div style="flex:1"><label title="P1-10 逗号分隔的字段名；这些字段不展示、不参与合并（留空=全部启用）">停用字段</label><input id="geoDisabledFields" style="width:100%" placeholder="如 city,district"/></div>
+        <div><button class="act" id="btnGeoSave">保存开关/路径/增益/字段</button></div>
       </div>
       <pre id="geoStatusOut">加载中…</pre>
       <div style="margin-top:10px">
+        <div><label>更新范围</label>
+          <select id="geoOnly">
+            <option value="">全链</option>
+            <option value="merge">merge（只重建库）</option>
+            <option value="fetch">fetch</option>
+            <option value="enrich">enrich</option>
+            <option value="geofeed">geofeed（自定义列表）</option>
+            <option value="blacklist">blacklist</option>
+            <option value="finish">finish</option>
+          </select>
+        </div>
         <button class="act" id="btnGeoUpdate">触发离线更新</button>
         <span id="geoUpdateState" style="margin-left:8px;color:#666"></span>
       </div>
@@ -394,8 +410,8 @@ img.preview{max-width:100%;max-height:420px}
     <div class="card">
       <h3 class="sub">筛选</h3>
       <div class="row">
-        <div><label>country / 省市</label><input id="geoCountry" size="10"/></div>
-        <div><label>isp</label><input id="geoIsp" size="10"/></div>
+        <div><label>country / 省市</label><input id="geoCountry" size="10" list="geoCountryList"/></div>
+        <div><label>isp</label><input id="geoIsp" size="10" list="geoIspList"/></div>
         <div><label>cloud</label><input id="geoCloud" size="10"/></div>
         <div><label>family</label>
           <select id="geoFamily">
@@ -406,6 +422,9 @@ img.preview{max-width:100%;max-height:420px}
         <div><label>limit</label><input id="geoLimit" size="5" value="50"/></div>
         <div><button class="act" id="btnGeoFilter">筛选</button></div>
       </div>
+      <!-- P2-17：国家别名（中国/CN/中华人民共和国…）+ 库里出现过的省市/运营商做下拉。 -->
+      <datalist id="geoCountryList"></datalist>
+      <datalist id="geoIspList"></datalist>
       <div id="geoFilterOut"></div>
     </div>
 
@@ -443,19 +462,34 @@ img.preview{max-width:100%;max-height:420px}
     </div>
 
     <div class="card">
+      <h3 class="sub">自定义 geofeed 列表</h3>
+      <p class="hint">P1-9：添加 RFC8805 geofeed URL；「批量刷新」把它们落成供给层并触发
+        <code>geoip_update.sh --only=geofeed</code> 导入。</p>
+      <div class="row">
+        <div style="flex:1"><label>geofeed URL</label><input id="geoGeofeedUrl" style="width:100%" placeholder="https://example.com/geofeed.csv"/></div>
+        <div><button class="act" id="btnGeofeedAdd">添加</button></div>
+        <div><button class="act ghost" id="btnGeofeedRefreshList">刷新列表</button></div>
+        <div><button class="act" id="btnGeofeedRefresh">批量刷新（导入）</button></div>
+      </div>
+      <div id="geoGeofeedOut"></div>
+    </div>
+
+    <div class="card">
       <h3 class="sub">定时任务</h3>
       <div class="row">
         <div><label>name</label><input id="cronName" size="12" placeholder="geoip_update"/></div>
-        <div><label>schedule</label><input id="cronSched" size="10" placeholder="daily" list="cronSchedList"/>
+        <div><label>schedule</label><input id="cronSched" size="12" placeholder="daily" list="cronSchedList"/>
           <datalist id="cronSchedList">
-            <option value="daily"></option><option value="hourly"></option>
-            <option value="weekly"></option><option value="monthly"></option>
+            <option value="hourly"></option><option value="daily"></option>
+            <option value="weekly"></option><option value="daily 03:00"></option>
+            <option value="03:00"></option>
           </datalist>
         </div>
         <div><label>enabled</label><select id="cronEnabled"><option value="1">true</option><option value="0">false</option></select></div>
         <div><button class="act" id="btnCronSave">保存任务</button></div>
         <div><button class="act ghost" id="btnCronLoad">刷新</button></div>
       </div>
+      <p class="hint">只认 hourly / daily / weekly / daily HH:MM / HH:MM；其它写法（含 5 段 cron 表达式）不会执行，只记一次告警。</p>
       <div id="geoCronOut"></div>
     </div>
 
@@ -898,7 +932,7 @@ async function renderListeners(){
   let h='<table class="data"><tr><th>端口</th><th>地址</th><th>root</th><th>TLS</th><th>版本</th><th>应用数</th><th>server_name</th><th>操作</th></tr>';
   CFG.listeners.forEach(l=>{
     h+='<tr><td>'+esc(l.port)+'</td><td>'+esc(l.address)+'</td><td>'+esc(l.root)+'</td><td>'+(l.ssl?'<span class="tag">ssl</span>':'—')+'</td>'
-      +'<td>'+esc((l.http_versions||[]).join(','))+'</td><td>'+((l.apps||[]).length)+'</td><td>'+esc(l.server_name||'')+'</td>'
+      +'<td>'+esc((l.http_versions||[]).join(','))+'</td><td>'+((l.apps||[]).length)+'</td><td>'+esc((l.server_name?[l.server_name]:[]).concat(l.server_names||[]).join(','))+'</td>'
       // 端口当前是 u16，仍按外部数据 esc 后再拼进 onclick：内联事件里的值一旦变成字符串，
       // 未转义会直接逃出引号注入 JS。
       +'<td class="actions"><button class="act mini" onclick="editListener('+esc(l.port)+')">编辑</button>'
@@ -913,7 +947,8 @@ window.editListener=function(port){
   $('listenerEditCard').style.display='block';
   $('listenerEditTitle').textContent='编辑站点 :'+port+'（改端口会替换原条目）';
   $('leAddress').value=l.address;$('lePort').value=l.port;$('leRoot').value=l.root;
-  $('leServerName').value=l.server_name||'';$('leStatusPath').value=l.status_path||'';
+  $('leServerName').value=l.server_name||'';$('leServerNames').value=(l.server_names||[]).join(',');
+  $('leStatusPath').value=l.status_path||'';
   const vs=(l.http_versions||[]).map(v=>v.toLowerCase());
   $('leH1').checked=vs.some(v=>v==='h1'||v==='http/1.1');
   $('leH2').checked=vs.some(v=>v==='h2'||v==='http/2');
@@ -933,7 +968,7 @@ $('btnListenerNew').onclick=()=>{
   $('listenerEditCard').style.display='block';
   $('listenerEditTitle').textContent='新增站点';
   $('leAddress').value='0.0.0.0';$('lePort').value='';$('leRoot').value='';
-  $('leServerName').value='';$('leStatusPath').value='';
+  $('leServerName').value='';$('leServerNames').value='';$('leStatusPath').value='';
   $('leH1').checked=true;$('leH2').checked=true;$('leH3').checked=false;
   $('leAutoindex').value='true';$('leAutoindexPaths').value='/';
   $('leAutoindexUpload').value='false';$('leUploadThreads').value='4';$('leUploadOnExists').value='overwrite';
@@ -963,6 +998,7 @@ $('btnListenerSave').onclick=async()=>{
   listener.autoindex={enabled:$('leAutoindex').value==='true',paths:aiPaths.length?aiPaths:['/'],enable_upload:$('leAutoindexUpload').value==='true',upload_threads:parseInt($('leUploadThreads').value,10)||4,upload_on_exists:$('leUploadOnExists').value||'overwrite'};
   listener.http_versions=versions;
   listener.server_name=$('leServerName').value.trim()||null;
+  listener.server_names=$('leServerNames').value.split(',').map(s=>s.trim()).filter(Boolean);
   listener.status_path=$('leStatusPath').value.trim()||null;
   const body={orig_port:EDIT_PORT,listener:listener};
   const r=await api('/api/listener/save',jpost(body));
@@ -1204,6 +1240,21 @@ function appRow(a){
     +'<td><input class="a-socket" value="'+esc(a.socket||'')+'" placeholder="unix:/path"/></td>'
     +'<td><input class="a-lib" value="'+esc(a.lib||'')+'" placeholder="target/app-engines/libapp_x.so"/></td>'
     +'<td><input class="a-docroot" value="'+esc(a.docroot||'')+'"/></td>'
+    // P2-15 / §3.3：补齐此前未渲染、保存时会被后端按 serde 默认重置的字段。
+    // 全部以 `tr._orig` 为底覆盖，未列出的键（enabled/paths/... 之外的）仍原样带回。
+    +'<td class="a-extra"><div style="display:flex;flex-wrap:wrap;gap:4px;max-width:460px">'
+    +'<label title="TSX 源码目录">src<input class="a-source-dir" size="8" value="'+esc(a.source_dir||'')+'"/></label>'
+    +'<label title="TSX 产物目录">out<input class="a-out-dir" size="8" value="'+esc(a.out_dir||'')+'"/></label>'
+    +'<label title="TSX 入口（逗号分隔，默认 src/main.tsx）">entry<input class="a-entry" size="10" value="'+esc((a.entry||[]).join(','))+'"/></label>'
+    +'<label title="TSX watch（inotify/kqueue 热编译）">watch<input type="checkbox" class="a-watch" '+(a.watch?'checked':'')+'/></label>'
+    +'<label title="PHP 可执行文件">php_bin<input class="a-php-bin" size="8" value="'+esc(a.php_bin||'')+'"/></label>'
+    +'<label title="依赖目录">deps_dir<input class="a-deps-dir" size="8" value="'+esc(a.deps_dir||'')+'"/></label>'
+    +'<label title="初始化超时（秒，1..=3600）">init<input class="a-init-timeout" size="4" value="'+(a.init_timeout_secs!=null?a.init_timeout_secs:'')+'"/></label>'
+    +'<label title="libc 选择（auto/glibc/musl…）">libc<input class="a-libc" size="6" value="'+esc(a.libc||'')+'"/></label>'
+    +'<label title="沙箱降权用户">sb.user<input class="a-sb-user" size="6" value="'+esc((a.sandbox||{}).user||'')+'"/></label>'
+    +'<label title="沙箱降权组">sb.group<input class="a-sb-group" size="6" value="'+esc((a.sandbox||{}).group||'')+'"/></label>'
+    +'<label title="沙箱 docroot 可写">sb.rw<input type="checkbox" class="a-sb-docroot-rw" '+(((a.sandbox||{}).docroot_rw)?'checked':'')+'/></label>'
+    +'</div></td>'
     +'<td class="actions"><button class="act mini danger">删</button></td>';
   const sel=tr.querySelector('.a-engine');
   (CATALOG||[]).forEach(e=>{
@@ -1237,7 +1288,7 @@ async function renderApps(){
   // 用 DOM 构建，避免转义复杂度
   const table=document.createElement('table');table.className='data';
   const thead=document.createElement('thead');
-  thead.innerHTML='<tr><th>启用</th><th>paths</th><th>engine</th><th>extensions</th><th>workers</th><th>index</th><th>socket</th><th>lib</th><th>docroot</th><th></th></tr>';
+  thead.innerHTML='<tr><th>启用</th><th>paths</th><th>engine</th><th>extensions</th><th>workers</th><th>index</th><th>socket</th><th>lib</th><th>docroot</th><th>扩展字段（§3.3）</th><th></th></tr>';
   const tbody=document.createElement('tbody');
   (l.apps||[]).forEach(a=>tbody.appendChild(appRow(a)));
   table.appendChild(thead);table.appendChild(tbody);
@@ -1265,6 +1316,29 @@ async function renderApps(){
       o.socket=tr.querySelector('.a-socket').value||null;
       o.lib=tr.querySelector('.a-lib').value||null;
       o.docroot=tr.querySelector('.a-docroot').value||null;
+      // P2-15 / §3.3：新增可编辑字段。空串 → null（回落运行期默认），
+      // 未渲染的其它键仍由上面的 `tr._orig` 原样带回，机制不变。
+      o.source_dir=tr.querySelector('.a-source-dir').value.trim()||null;
+      o.out_dir=tr.querySelector('.a-out-dir').value.trim()||null;
+      o.entry=tr.querySelector('.a-entry').value.split(',').map(s=>s.trim()).filter(Boolean);
+      o.watch=tr.querySelector('.a-watch').checked;
+      o.php_bin=tr.querySelector('.a-php-bin').value.trim()||null;
+      o.deps_dir=tr.querySelector('.a-deps-dir').value.trim()||null;
+      const itRaw=tr.querySelector('.a-init-timeout').value.trim();
+      o.init_timeout_secs=itRaw?parseInt(itRaw,10):null;
+      o.libc=tr.querySelector('.a-libc').value.trim()||null;
+      // 沙箱：仅当「本就有 sandbox」或「本次填了任一沙箱字段」时才写出，
+      // 避免给所有 app 无端 materialize 一个 sandbox 块；内部其余键与原值合并。
+      const sbUser=tr.querySelector('.a-sb-user').value.trim();
+      const sbGroup=tr.querySelector('.a-sb-group').value.trim();
+      const sbRw=tr.querySelector('.a-sb-docroot-rw').checked;
+      if(o.sandbox||sbUser||sbGroup||sbRw){
+        const sb=Object.assign({},o.sandbox||{});
+        if(sbUser)sb.user=sbUser; else delete sb.user;
+        if(sbGroup)sb.group=sbGroup; else delete sb.group;
+        sb.docroot_rw=!!sbRw;
+        o.sandbox=sb;
+      }
       apps.push(o);
     });
     const r=await api('/api/apps/save',jpost({port:parseInt(port,10),apps:apps}));
@@ -1663,10 +1737,26 @@ $('btnAlSiteSave').onclick=async()=>{
   out('alSiteOut',r.text,r.ok);toast(r.text,!r.ok);
   if(r.ok)await loadCfg();
 };
-// 实时 tail：GET /api/logs?limit=N → {"lines":[...]}（access_log 内存环形缓冲）。
+// 实时 tail：优先 SSE（GET {admin}/api/logs/stream，text/event-stream），
+// 不可用/断开时回退到轮询（GET /api/logs?limit=N → {"lines":[...]}，端点保留不动）。
 let logTailTimer=null;
+let logTailES=null;
+let logTailLines=[];
+function logTailLimit(){return Math.max(1,Math.min(500,parseInt($('logTailLimit').value,10)||200));}
+function logTailRender(){
+  const p=$('logTailOut');
+  p.textContent=logTailLines.join('\n');
+  p.className='ok';
+  p.scrollTop=p.scrollHeight;
+}
+function logTailPush(line){
+  logTailLines.push(line);
+  const lim=logTailLimit();
+  if(logTailLines.length>lim)logTailLines.splice(0,logTailLines.length-lim);
+  logTailRender();
+}
 async function logTailOnce(){
-  const limit=Math.max(1,Math.min(500,parseInt($('logTailLimit').value,10)||200));
+  const limit=logTailLimit();
   const r=await apiJson('/api/logs?limit='+limit);
   const p=$('logTailOut');
   if(r.ok&&r.json&&Array.isArray(r.json.lines)){
@@ -1678,13 +1768,40 @@ async function logTailOnce(){
     p.className='err';
   }
 }
+function logTailPollFallback(){
+  if(logTailTimer)return;
+  logTailOnce();
+  logTailTimer=setInterval(logTailOnce,2000);
+}
 function logTailStop(){
   if(logTailTimer){clearInterval(logTailTimer);logTailTimer=null;}
+  if(logTailES){try{logTailES.close();}catch(e){} logTailES=null;}
 }
 function logTailStart(){
   logTailStop();
-  logTailOnce();
-  logTailTimer=setInterval(logTailOnce,2000);
+  logTailLines=[];
+  const p=$('logTailOut');
+  p.textContent='连接中…';p.className='';
+  if(typeof EventSource==='function'){
+    try{
+      const es=new EventSource(base+'/api/logs/stream');
+      es.onopen=()=>{p.textContent='';p.className='ok';};
+      es.onmessage=(ev)=>{if(typeof ev.data==='string'&&ev.data.length)logTailPush(ev.data);};
+      es.onerror=()=>{
+        // 传输层错误：EventSource 默认会**自动重连**（服务端正常关闭 / 短暂网络抖动
+        // 都属此类，readyState=CONNECTING），此时不要打断、也不要回退轮询 ——
+        // 重连会带 Last-Event-ID 从断点续传（服务端按 `id:` 推送）。
+        // 只有「永久失败」（HTTP 非 200 / 非 SSE，readyState=CLOSED）才回退到轮询端点。
+        if(es.readyState===EventSource.CLOSED){
+          if(logTailES===es)logTailES=null;
+          logTailPollFallback();
+        }
+      };
+      logTailES=es;
+      return;
+    }catch(e){/* EventSource 构造失败 → 轮询 */}
+  }
+  logTailPollFallback();
 }
 $('btnLogTailStart').onclick=logTailStart;
 $('btnLogTailStop').onclick=logTailStop;
@@ -1696,7 +1813,10 @@ function initGeoTab(){
   $('geoEnabled').value=String(!!g.enabled);
   $('geoDbPath').value=g.db_path||'';
   $('geoPathGain').value=(g.path_priority_gain!==undefined?g.path_priority_gain:10);
+  if($('geoUpdateScript'))$('geoUpdateScript').value=g.update_script||'scripts/geoip_update.sh';
   refreshGeoStatus();
+  loadGeoFilterValues();
+  loadGeofeed();
   // 面板设置真正生效值（panel.toml > config.toml [geoip] > 默认），
   // 与 CFG 可能不同（手改 panel.toml 后 config 里看不到）。
   apiJson('/api/geoip/settings').then(r=>{
@@ -1706,8 +1826,23 @@ function initGeoTab(){
       if(s.enabled!==undefined)$('geoEnabled').value=String(!!s.enabled);
       if(s.db_path!==undefined)$('geoDbPath').value=s.db_path||'';
       if(s.path_priority_gain!==undefined)$('geoPathGain').value=s.path_priority_gain;
+      if(s.update_script!==undefined&&$('geoUpdateScript'))$('geoUpdateScript').value=s.update_script||'';
+      if(s.disabled_fields!==undefined&&$('geoDisabledFields'))$('geoDisabledFields').value=(s.disabled_fields||[]).join(',');
     }catch(e){}
   });
+}
+// P2-17：拉国家别名 + 库里出现过的省市/运营商，填两个 datalist。
+async function loadGeoFilterValues(){
+  const r=await apiJson('/api/geoip/filter/values');
+  if(!r.json)return;
+  const j=r.json;
+  const fill=(id,vals)=>{
+    const dl=$(id); if(!dl)return;
+    dl.innerHTML=(vals||[]).map(v=>'<option value="'+esc(v)+'">').join('');
+  };
+  // country 框在规格里同时用于「国家/省市」，故把国家别名+国家码+省市值都放进去。
+  fill('geoCountryList',[].concat(j.country||[],j.province||[],j.city||[]));
+  fill('geoIspList',j.isp||[]);
 }
 async function refreshGeoStatus(){
   const r=await apiJson('/api/geoip/status');
@@ -1717,9 +1852,13 @@ $('btnGeoSave').onclick=async()=>{
   // G-18：面板设置持久化到 data/geoip/panel.toml（不再改写 config.toml [geoip]）。
   const gain=parseInt($('geoPathGain').value,10);
   if(isNaN(gain)){toast('路径增益必须是整数',true);return;}
-  const r=await api('/api/geoip/settings',jpost({enabled:$('geoEnabled').value==='true',db_path:$('geoDbPath').value.trim()||null,path_priority_gain:gain}));
+  const fields=($('geoDisabledFields').value||'').split(',').map(s=>s.trim()).filter(Boolean);
+  const payload={enabled:$('geoEnabled').value==='true',db_path:$('geoDbPath').value.trim()||null,
+    path_priority_gain:gain,update_script:($('geoUpdateScript').value||'').trim()||null,
+    disabled_fields:fields};
+  const r=await api('/api/geoip/settings',jpost(payload));
   toast(r.text,!r.ok);
-  if(r.ok){await loadCfg();refreshGeoStatus();}
+  if(r.ok){await loadCfg();refreshGeoStatus();loadGeoFilterValues();}
 };
 $('btnGeoipLookup').onclick=async()=>{
   const ip=$('geoipIp').value.trim();
@@ -1858,6 +1997,40 @@ $('btnCronSave').onclick=async()=>{
   toast(r.text,!r.ok);
   loadCron();
 };
+// P1-9：自定义 geofeed 列表。
+async function loadGeofeed(){
+  const el=$('geoGeofeedOut'); if(!el)return;
+  const r=await apiJson('/api/geoip/geofeed');
+  if(!r.ok||!r.json){el.innerHTML='<pre class="err">'+esc(r.text)+'</pre>';return;}
+  const rows=r.json.geofeed||[];
+  if(!rows.length){el.innerHTML='<p class="hint">暂无自定义 geofeed。</p>';return;}
+  let h='<table class="data"><tr><th>id</th><th>url</th><th>enabled</th><th>last_fetch</th><th>状态</th><th></th></tr>';
+  rows.forEach(x=>{
+    h+='<tr><td>'+esc(x.id)+'</td><td>'+esc(x.url)+'</td><td>'+(x.enabled?'是':'否')+'</td>'
+      +'<td>'+(x.last_fetch?new Date(x.last_fetch*1000).toLocaleString():'—')+'</td><td>'+esc(x.last_status||'')+'</td>'
+      +'<td class="actions"><button class="act mini danger" onclick="delGeofeed('+esc(x.id)+')">删除</button></td></tr>';
+  });
+  h+='</table>';
+  el.innerHTML=h;
+}
+window.delGeofeed=async function(id){
+  const r=await api('/api/geoip/geofeed/delete',fpost({id:String(id)}));
+  toast(r.text,!r.ok);
+  loadGeofeed();
+};
+$('btnGeofeedAdd').onclick=async()=>{
+  const url=$('geoGeofeedUrl').value.trim();
+  if(!url){toast('填写 geofeed URL',true);return;}
+  const r=await api('/api/geoip/geofeed',fpost({url:url}));
+  toast(r.text,!r.ok);
+  if(r.ok){$('geoGeofeedUrl').value='';loadGeofeed();}
+};
+$('btnGeofeedRefreshList').onclick=loadGeofeed;
+$('btnGeofeedRefresh').onclick=async()=>{
+  const r=await api('/api/geoip/geofeed/refresh',{method:'POST'});
+  toast(r.text,!r.ok);
+  loadGeofeed();
+};
 let geoPoll=null;
 $('btnGeoUpdate').onclick=async()=>{
   if(geoPoll){toast('更新已在进行中',true);return;}
@@ -1867,7 +2040,9 @@ $('btnGeoUpdate').onclick=async()=>{
   let since=0;
   const st0=await apiJson('/api/geoip/update/status?since=0');
   if(st0.json&&st0.json.to!==undefined) since=st0.json.to;
-  const r=await api('/api/geoip/update',{method:'POST'});
+  // P1-11：更新范围（转发 --only=）。
+  const only=($('geoOnly')&&$('geoOnly').value||'').trim();
+  const r=await api('/api/geoip/update'+(only?('?only='+encodeURIComponent(only)):''),{method:'POST'});
   // 后端被并发保护挡下时也回 HTTP 200（body 里 ok:false + error）。这种情形下**不中断轮询**：
   // 正在跑的可能是我们自己刚触发的那一轮，继续看进度比弹个错更有用。
   let trigErr='';
@@ -2416,30 +2591,40 @@ document.getElementById('btnGeoConflicts').onclick = async () => {
   const r = await apiJson('/api/geoip/conflicts');
   if (!r.json) { el.innerHTML = '<pre class="err">' + esc(r.text) + '</pre>'; return; }
   const json = r.json;
-  const rows = json.conflicts || [];
-  if (!rows.length) { el.innerHTML = '<p class="hint">无未处理冲突。</p>'; return; }
+  // P2-16：按 field 分成「IP 冲突」与「ASN 冲突」两栏（后端也可能只给扁平的 conflicts）。
+  const ipRows = json.ip_conflicts || (json.conflicts || []).filter(x => String(x.field||'').toLowerCase() !== 'asn');
+  const asnRows = json.asn_conflicts || (json.conflicts || []).filter(x => String(x.field||'').toLowerCase() === 'asn');
+  if (!ipRows.length && !asnRows.length) { el.innerHTML = '<p class="hint">无未处理冲突。</p>'; return; }
 
-  let html = '<table class="data"><tr><th>id</th><th>prefix</th><th>冲突字段</th><th>数据源（点击取值）</th><th>预览值</th><th>操作</th></tr>';
-  rows.forEach(x => {
-    const sources = String(x.sources || '').split('|').filter(Boolean);
-    const srcBtns = sources.map(s =>
-      '<button class="act mini src-pick" data-id="'+esc(x.id)+'" data-prefix="'+esc(x.prefix)+'" data-field="'+esc(x.field)+'" data-src="'+esc(s)+'">'+esc(s)+'</button>'
-    ).join(' ');
-    // id 既是服务端数据，又同时出现在 id= 与内联 onclick= 里：两处都必须转义，
-    // 否则一旦它不再是纯数字，引号就能逃出属性/事件执行。
-    html += '<tr id="row-' + esc(x.id) + '">' +
-      '<td>' + esc(x.id) + '</td>' +
-      '<td><code>' + esc(x.prefix) + '</code></td>' +
-      '<td>' + esc(x.field) + '</td>' +
-      '<td>' + srcBtns + ' <span class="hint" id="val-' + esc(x.id) + '">—</span></td>' +
-      '<td><span id="preview-' + esc(x.id) + '">—</span></td>' +
-      '<td class="actions">' +
-        '<button class="act mini conflict-use" data-id="'+esc(x.id)+'" data-prefix="'+esc(x.prefix)+'" data-field="'+esc(x.field)+'">手动填值</button> ' +
-        '<button class="act mini ghost" onclick="resolveConflict(' + esc(x.id) + ',true)">跳过此冲突</button>' +
-      '</td>' +
-    '</tr>';
-  });
-  html += '</table>';
+  const renderRows = (rows) => {
+    let t = '<table class="data"><tr><th>id</th><th>prefix</th><th>冲突字段</th><th>数据源（点击取值）</th><th>预览值</th><th>操作</th></tr>';
+    rows.forEach(x => {
+      const sources = String(x.sources || '').split('|').filter(Boolean);
+      const srcBtns = sources.map(s =>
+        '<button class="act mini src-pick" data-id="'+esc(x.id)+'" data-prefix="'+esc(x.prefix)+'" data-field="'+esc(x.field)+'" data-src="'+esc(s)+'">'+esc(s)+'</button>'
+      ).join(' ');
+      // id 既是服务端数据，又同时出现在 id= 与内联 onclick= 里：两处都必须转义，
+      // 否则一旦它不再是纯数字，引号就能逃出属性/事件执行。
+      t += '<tr id="row-' + esc(x.id) + '">' +
+        '<td>' + esc(x.id) + '</td>' +
+        '<td><code>' + esc(x.prefix) + '</code></td>' +
+        '<td>' + esc(x.field) + '</td>' +
+        '<td>' + srcBtns + ' <span class="hint" id="val-' + esc(x.id) + '">—</span></td>' +
+        '<td><span id="preview-' + esc(x.id) + '">—</span></td>' +
+        '<td class="actions">' +
+          '<button class="act mini conflict-use" data-id="'+esc(x.id)+'" data-prefix="'+esc(x.prefix)+'" data-field="'+esc(x.field)+'">手动填值</button> ' +
+          '<button class="act mini ghost" onclick="resolveConflict(' + esc(x.id) + ',true)">跳过此冲突</button>' +
+        '</td>' +
+      '</tr>';
+    });
+    t += '</table>';
+    return t;
+  };
+
+  let html = '<h4 class="sub">IP 冲突（' + ipRows.length + '）</h4>';
+  html += ipRows.length ? renderRows(ipRows) : '<p class="hint">无 IP 冲突。</p>';
+  html += '<h4 class="sub" style="margin-top:1rem">ASN 冲突（' + asnRows.length + '）</h4>';
+  html += asnRows.length ? renderRows(asnRows) : '<p class="hint">无 ASN 冲突（MOAS 等）。</p>';
   el.innerHTML = html;
 
   // 每个 src-pick 按钮：获取该源在此前缀的字段值并预览

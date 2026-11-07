@@ -875,6 +875,10 @@ where
             let file_src = parts
                 .extensions
                 .remove::<crate::server::static_files::FileSource>();
+            // P2-8：SSE 无界流——由本任务按帧流式发送（见 collect_to_bytes 的说明）。
+            let sse = parts
+                .extensions
+                .remove::<crate::server::access_log::SseStreamBody>();
             let engine = parts
                 .extensions
                 .get::<crate::server::access_log::EngineTag>()
@@ -893,7 +897,7 @@ where
                 engine,
                 access_override.as_ref(),
             );
-            let end = file_src.is_none() && data.is_empty();
+            let end = file_src.is_none() && sse.is_none() && data.is_empty();
             if let Ok(mut send) = respond.send_response(Response::from_parts(parts, ()), end) {
                 if let Some(src) = file_src {
                     // 大文件：按 64KiB 分块读盘、逐帧发送。
@@ -993,6 +997,42 @@ where
                             src.path.display()
                         ),
                     }
+                } else if let Some(mut sse) = sse.and_then(|h| h.take_body()) {
+                    // P2-8：admin SSE 无界流。按帧拉取、等发送额度后逐帧发；
+                    // 客户端断开时 poll_capacity 返回 None / send_data 报错 → 结束。
+                    use http_body_util::BodyExt as _;
+                    'sse: while let Some(frame) = sse.frame().await {
+                        let frame = match frame {
+                            Ok(f) => f,
+                            Err(_) => break,
+                        };
+                        let chunk = frame.into_data().unwrap_or_default();
+                        if chunk.is_empty() {
+                            continue;
+                        }
+                        let mut off = 0usize;
+                        while off < chunk.len() {
+                            let need = chunk.len() - off;
+                            send.reserve_capacity(need);
+                            let cap =
+                                match std::future::poll_fn(|cx| send.poll_capacity(cx)).await {
+                                    Some(Ok(c)) => c,
+                                    Some(Err(_)) | None => break 'sse,
+                                };
+                            let take = need.min(cap);
+                            if take == 0 {
+                                continue;
+                            }
+                            if send
+                                .send_data(chunk.slice(off..off + take), false)
+                                .is_err()
+                            {
+                                break 'sse;
+                            }
+                            off += take;
+                        }
+                    }
+                    let _ = send.send_data(Bytes::new(), true);
                 } else if !data.is_empty() {
                     // 非文件响应体（≤ REQUEST_BODY_CAP 之类，最大也就 DoH/admin 的几百 KiB）：
                     // 整块交给 h2 的发送缓冲即可，尺寸有界，不需要走额度等待。
@@ -1010,8 +1050,18 @@ where
 }
 
 /// admin::handle 返回 `Response<BoxBody>`（h1 体类型）；h2 分支收齐为 `Response<Bytes>`。
+///
+/// 例外：SSE（`text/event-stream`）是无界流，收齐会永远等不到结尾 ⇒ 请求挂死。故这里
+/// 遇到 SSE 不再收齐，把原始 body 装进 `SseStreamBody` 扩展、body 置空，连接任务见该
+/// 扩展即按帧流式 `send_data`（见 `serve_io` 的发送分支）。
 async fn collect_to_bytes(resp: Response<BoxBody>) -> Response<Bytes> {
-    let (parts, body) = resp.into_parts();
+    let (mut parts, body) = resp.into_parts();
+    if crate::server::access_log::is_event_stream(&parts.headers) {
+        parts
+            .extensions
+            .insert(crate::server::access_log::SseStreamBody::new(body));
+        return Response::from_parts(parts, Bytes::new());
+    }
     let data = BodyExt::collect(body)
         .await
         .map(|c| c.to_bytes())
@@ -1634,8 +1684,11 @@ async fn handle_h2(
             .map(crate::server::h1::host_without_port)
             .unwrap_or("")
             .to_string();
-        let host = match lc.server_name.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
-            Some(sn) => Some(sn.to_string()),
+        // 站点名优先（`all_server_names()` 首项，单数 `server_name` 在前 ⇒ 既有
+        // 单名字配置行为不变），否则仅当 Host 看起来是合法主机名才用。
+        let names = lc.all_server_names();
+        let host = match names.first() {
+            Some(sn) => Some(sn.clone()),
             None => {
                 if crate::server::h1::is_plausible_hostname(&raw_host) {
                     Some(raw_host)

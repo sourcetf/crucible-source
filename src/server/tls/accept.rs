@@ -104,27 +104,33 @@ async fn accept_connection_inner(
     // HTTP 连接（legacy 构建上 = 真实的 sni_only 绕过）。因此额外要求 wire=Boring
     // 且本二进制编译了 tls_boring。
     if ssl_cfg.sni_only && !dot_split_available(&live, &peek) {
-        let want = ssl_cfg
-            .sni_name
-            .as_deref()
-            .map(|s| s.to_string())
-            .or_else(|| lc.server_name.clone());
-        let Some(want) = want else {
+        // 期望名集合：显式 `ssl.sni_name` 优先；否则用本 listener 的**全部**
+        // `server_names`（含单数 `server_name`，见 `ListenerConfig::all_server_names`）。
+        // 单名字配置时集合恰有一个元素，与原来只读 `server_name` 的行为逐字相同；
+        // 多名字时任一命中即放行（SNI 期望名的多站点语义）。
+        let wants: Vec<String> = match ssl_cfg.sni_name.as_deref().map(str::trim) {
+            Some(n) if !n.is_empty() => vec![n.to_string()],
+            _ => lc.all_server_names(),
+        };
+        if wants.is_empty() {
             // 规格：sni_only 开启时**必须**配 sni_name。没配就没有可比对的期望值，
             // 按 fail-closed 全部丢弃（不能退化成「任意 SNI 都放行」），但要如实报警：
             // 否则运维只看到「站点静默不可用」，不知是配置缺项。只报一次，防刷日志。
             if !sni_unconfigured_warned() {
                 log::error!(
-                    "tls listener :{} 开了 ssl.sni_only 但既无 ssl.sni_name 也无 server_name —— \
+                    "tls listener :{} 开了 ssl.sni_only 但既无 ssl.sni_name 也无 server_name/server_names —— \
                      所有连接都会按规格被丢弃；请补 ssl.sni_name",
                     lc.port
                 );
             }
             drop(stream);
             return Ok(());
-        };
+        }
         let got = client_hello::parse_sni(&peek);
-        let ok = got.as_deref().map(|g| sni_host_eq(g, &want)).unwrap_or(false);
+        let ok = got
+            .as_deref()
+            .map(|g| wants.iter().any(|w| sni_host_eq(g, w)))
+            .unwrap_or(false);
         if !ok {
             // 匿名可触发（任何 SNI 不匹配的连接）⇒ debug，避免按连接数刷日志。
             log::debug!("tls sni_only: dropped peer={peer} (missing/mismatched SNI)");

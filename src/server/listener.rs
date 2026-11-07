@@ -106,10 +106,9 @@ pub async fn handle_connection(
             log::debug!("l4: connection from {peer} denied by [ip_access]");
             return Ok(());
         }
-        let addr: SocketAddr = dest
-            .parse()
-            .with_context(|| format!("l4_forward {dest:?} 无效，应为 ip:port"))?;
-        crate::server::l4::proxy_tcp(stream, addr).await?;
+        let upstreams = crate::server::l4::parse_upstreams(dest)
+            .with_context(|| format!("l4_forward {dest:?} 无效"))?;
+        crate::server::l4::proxy_tcp_any(stream, &upstreams).await?;
         return Ok(());
     }
 
@@ -228,10 +227,10 @@ async fn dispatch_plain(
                     }
                 };
                 let cfg = live.snapshot();
-                // 按 server_name / sni_name 找匹配的 TLS listener
+                // 按 listener 的站点名（server_name/server_names）/ sni_name 找匹配的 TLS listener
                 let target = cfg.listeners.iter().find(|l| {
                     l.ssl.is_some() && (
-                        l.server_name.as_deref().is_some_and(|sn| {
+                        l.all_server_names().iter().any(|sn| {
                             sni.eq_ignore_ascii_case(sn)
                                 || sni.ends_with(&format!(".{}", sn.to_lowercase()))
                         }) ||

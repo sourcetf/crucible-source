@@ -35,6 +35,13 @@ pub struct PanelConfig {
     pub db_path: Option<PathBuf>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub path_priority_gain: Option<i64>,
+    /// P1-11：离线更新脚本路径（覆盖 `[geoip] update_script`）。`None` = 不覆盖。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub update_script: Option<PathBuf>,
+    /// P1-10：面板停用/不展示的字段（覆盖 `[geoip] disabled_fields`）。
+    /// `None` = 不覆盖（沿用 config.toml）；`Some([])` = 显式全部启用。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disabled_fields: Option<Vec<String>>,
     /// 源权重 / 启停（按源名）。面板 `POST /api/geoip/sources` 同步写这里，
     /// 读取时覆盖 `panel_sqlite.panel_sources` 的旧值。
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
@@ -57,6 +64,25 @@ impl PanelConfig {
         if let Some(g) = self.path_priority_gain {
             if !(0..=1000).contains(&g) {
                 anyhow::bail!("panel.toml: path_priority_gain = {g} 越界（允许 0..=1000）");
+            }
+        }
+        if let Some(p) = &self.update_script {
+            if p.as_os_str().is_empty() {
+                anyhow::bail!("panel.toml: update_script 不能为空串（要清空请删掉该键）");
+            }
+        }
+        if let Some(fields) = &self.disabled_fields {
+            for f in fields {
+                let f = f.trim().to_ascii_lowercase();
+                if f.is_empty() {
+                    anyhow::bail!("panel.toml: disabled_fields 含空字段名");
+                }
+                if !crate::server::geoip_panel::covering::KNOWN_FIELDS.contains(&f.as_str()) {
+                    anyhow::bail!(
+                        "panel.toml: disabled_fields 含未知字段 {f:?}（可用：{}）",
+                        crate::server::geoip_panel::covering::KNOWN_FIELDS.join(", ")
+                    );
+                }
             }
         }
         for (name, s) in &self.sources {
@@ -82,6 +108,12 @@ impl PanelConfig {
         }
         if let Some(g) = self.path_priority_gain {
             geoip.path_priority_gain = g;
+        }
+        if let Some(p) = &self.update_script {
+            geoip.update_script = Some(p.clone());
+        }
+        if let Some(fields) = &self.disabled_fields {
+            geoip.disabled_fields = fields.clone();
         }
     }
 
@@ -112,6 +144,8 @@ mod tests {
             enabled: false,
             db_path: Some(PathBuf::from("/a.sqlite")),
             path_priority_gain: 10,
+            update_script: None,
+            disabled_fields: Vec::new(),
         };
         let panel = PanelConfig {
             path_priority_gain: Some(50),

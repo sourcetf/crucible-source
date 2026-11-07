@@ -99,6 +99,25 @@ pub fn resolve_country_alias(name: &str) -> String {
     t.to_string()
 }
 
+/// P2-17：国家别名表的全部键（中文名 / 英文全称 / 常见缩写 / ISO2），供筛选下拉。
+///
+/// 返回稳定排序（别名表底层是 HashMap，迭代序随进程变化）—— 面板 datalist 每次刷新
+/// 顺序不能漂移。
+pub fn country_alias_keys() -> Vec<String> {
+    let mut out: Vec<String> = COUNTRY_ALIASES.keys().map(|k| (*k).to_string()).collect();
+    out.sort();
+    out.dedup();
+    out
+}
+
+/// P2-17：ISP 别名表的显示名（China Telecom / AWS / …），供筛选下拉。
+pub fn isp_alias_names() -> Vec<String> {
+    let mut out: Vec<String> = ISP_ALIASES.iter().map(|(_, a)| (*a).to_string()).collect();
+    out.sort();
+    out.dedup();
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
