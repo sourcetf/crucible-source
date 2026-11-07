@@ -7190,3 +7190,33 @@ normalize_redirect_path`，已提升为 `pub(crate)`；同样带开放重定向�
 选项目录独立 tab、P1-3/4 之外的 P1（H3 PSK、城市骨架层、libaxonasp/mruby 链）。
 P0-1/P0-2 的**端到端**验证需要一个管理员口令（产线 `password_hash` 为空、管理面 fail-closed），
 故这两条本轮为**代码级**修复 + 逻辑复核。
+
+# 【agent-1009 · Wave-25c】功能审查修复 第二批（2026-11-07）
+
+- **P1-1 `upload_on_exists`（规格 §16.14，此前完全未实现）**：`AutoindexConfig` 新增字段
+  （`overwrite` 默认 / `skip` ⇒ 409 / `rename` ⇒ 首个空闲 `name (n).ext`）；上传入口在
+  `session_for` 前按策略改写或拒绝目标（`next_free_name()`）；序列化/反序列化/折叠判据全部带上
+  该字段（否则面板往返会丢 —— Wave-25b 刚修过同类问题）；面板 listeners 表单新增「同名文件处理」
+  下拉并参与回填/保存。
+- **P1-6 TSX 面板状态 API 接线**：`tsx::status_json()` 此前是 `#[allow(dead_code)]` 的死数据源，
+  现接到 `GET {admin}/api/apps/tsx/status`（只读、无副作用）。
+- **P2-14 概览的 PHP 就绪度**：此前 php 恒 `ready: null`，运维看不出「端口在跑但 fpm 没起来」。
+  新增 `php::runtime_ready(port, idx)`（只读 `PHP_RUNTIME` 最后已知状态、不连 socket、无副作用），
+  `engine_runtime_status` 增加 `app_idx` 参数并使用它。
+- **P1-5「选项目录」独立第 12 个选项卡**：原为「应用引擎」tab 内一段 `<pre>`，现拆成独立 tab
+  并在原处留指引文案（目录仍由 `options_catalog.rs` / `/api/catalog` 驱动）。
+- **P2-20** 创建规格 §1 要求但缺失的 `.cursor/rules/perf-h2o-and-ultra-servers.mdc`
+  （写入 §22 的性能纪律：公平对拍、测量防自欺、已知的 h2 crate 墙）。
+
+**验证**：新二进制 22173408（08:20）重启即用新代码重新解析 config.toml（证明新字段反序列化正常）；
+19/19 路由 200、`CONTAINMENT OK`；面板源码核对 `data-tab="catalog"` ×1、`leUploadOnExists` ×4。
+**注意**：本批多为面板 API/HTML，端到端验证需要一个管理员口令（产线 `password_hash` 为空、
+管理面 fail-closed），故这类项为**代码级 + 源码核对**；`upload_on_exists` 的运行时验证还需要一个
+开了 `enable_upload` 的 listener（产线未开）。
+
+**仍待修（继续推进中）**：GeoIP 集群（源权重伪实现、cron 伪实现、自定义 geofeed、字段管理、
+按源更新+脚本路径、冲突分 IP/ASN 栏、筛选别名下拉、`filter_agg.rs`、`GEOIP_KEEP_RAW`）；
+P2 集群（`server_names`/Host 多站点、`port_reuse` 命名、L4 UDP、`SO_BUSY_POLL` features、
+小文件缓存门控、符号链接口径、访问日志 SSE/WS、cgi fork、ASP/ASP.NET 后端、dlclose、
+extensions 语义、TSX watch kqueue/inotify、面板可编辑 §3.3 字段）；依赖外部工具链的
+（H3 PSK 需 quinn-boring 改动、GeoIP 城市层需下载源、`libaxonasp.so` 需 Go、mruby 链需源码）。

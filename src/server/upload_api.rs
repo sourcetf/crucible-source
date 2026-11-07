@@ -66,6 +66,37 @@ const EXEC_EXTS: &[&str] = &[
 static UPLOAD_GATES: Lazy<parking_lot::Mutex<std::collections::HashMap<u16, (std::sync::Arc<tokio::sync::Semaphore>, u16)>>> =
     Lazy::new(|| parking_lot::Mutex::new(std::collections::HashMap::new()));
 
+/// `upload_on_exists = "rename"` 用：取首个空闲的 `<stem> (n)<ext>`（n 从 1 起，上限 1000）。
+///
+/// 只改**文件名**，目录与扩展名保持；到上限仍冲突则回退原名（让后续流程按默认语义处理，
+/// 绝不静默丢文件）。文件名过长（>255 字节）时同样回退原名。
+fn next_free_name(target: &std::path::Path) -> std::path::PathBuf {
+    let stem = target
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let ext = target
+        .extension()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let dir = target.parent().unwrap_or_else(|| std::path::Path::new("."));
+    for n in 1..=1000u32 {
+        let name = if ext.is_empty() {
+            format!("{stem} ({n})")
+        } else {
+            format!("{stem} ({n}).{ext}")
+        };
+        if name.len() > 255 {
+            return target.to_path_buf();
+        }
+        let cand = dir.join(name);
+        if !cand.exists() {
+            return cand;
+        }
+    }
+    target.to_path_buf()
+}
+
 fn upload_gate(port: u16, threads: u16) -> std::sync::Arc<tokio::sync::Semaphore> {
     let want = threads.clamp(1, 16);
     let mut m = UPLOAD_GATES.lock();
@@ -564,6 +595,27 @@ where
                 .and_then(|v| v.to_str().ok())
                 .and_then(|s| s.trim().parse::<u64>().ok());
             (0, cl)
+        }
+    };
+    // 目标同名策略（规格 §16.14 `upload_on_exists`，Wave-25 审查判定此前**完全未实现**）：
+    //   `skip`   ⇒ 目标已存在直接 409，绝不动原文件；
+    //   `rename` ⇒ 自动改用首个空闲的 `<stem> (n)<ext>`；
+    //   `overwrite`（默认，`None`/未知值同此）⇒ 保持历史行为，不改既有部署语义。
+    let target = {
+        if target.exists() {
+            match lc.autoindex.upload_on_exists_mode() {
+                "skip" => {
+                    return resp(
+                        StatusCode::CONFLICT,
+                        "目标文件已存在（upload_on_exists = skip）",
+                        None,
+                    )
+                }
+                "rename" => next_free_name(&target),
+                _ => target,
+            }
+        } else {
+            target
         }
     };
     let sess = match upload_resume::session_for(&target, start, total, Some(peer.ip())) {

@@ -1386,10 +1386,11 @@ pub async fn handle_bytes(
     }
 }
 
-/// 面板/运维可见的引擎状态快照（JSON 数组）。admin.rs 目前没有 TSX 状态 API
-/// （见跨文件需求），这里先提供数据源：admin 只需一行接线
-/// `path.ends_with("/api/apps/tsx/status") => json_ok(tsx::status_json())`。
-#[allow(dead_code)]
+/// 面板/运维可见的引擎状态快照（JSON 数组）。
+///
+/// Wave-25 功能审查指出它此前是 **0 调用的死数据源**（`#[allow(dead_code)]`）
+/// —— 面板的「构建日志」拿不到任何东西。现已在 `admin.rs` 接线到
+/// `GET {admin}/api/apps/tsx/status`。
 pub fn status_json() -> String {
     let states: Vec<Arc<AppBuild>> = APPS.lock().values().cloned().collect();
     let mut s = String::from("[");

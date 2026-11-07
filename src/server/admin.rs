@@ -600,6 +600,11 @@ async fn handle_inner(
     if path.ends_with("/api/apps/save") && method == Method::POST {
         return with_json(req, |v| save_apps(&live, &v)).await;
     }
+    // TSX 引擎状态（构建日志）：Wave-25 审查发现 `tsx::status_json()` 此前是死数据源，
+    // 面板拿不到编译状态/最后一次错误。这里接线（只读，无副作用）。
+    if path.ends_with("/api/apps/tsx/status") && method == Method::GET {
+        return json_ok(crate::server::apps::tsx::status_json());
+    }
     if path.ends_with("/api/ssl/save") && method == Method::POST {
         return with_json(req, |v| save_ssl(&live, &v)).await;
     }
@@ -3111,7 +3116,7 @@ fn engines_overview_json(cfg: &Config) -> String {
             if eng == "do" {
                 eng = "jsp".into();
             }
-            let (via, ready) = engine_runtime_status(a, l, &eng);
+            let (via, ready) = engine_runtime_status(a, l, &eng, idx);
             if !first {
                 s.push(',');
             }
@@ -3140,12 +3145,17 @@ fn engine_runtime_status(
     app: &crate::config::AppRouteConfig,
     lc: &ListenerConfig,
     engine: &str,
+    app_idx: usize,
 ) -> (&'static str, Option<bool>) {
     use crate::server::apps::native_http as nh;
     match engine {
-        // php 走 php-fpm（由 php::reconcile 拉起）：本处不 spawn、也不连接其 socket，
-        // 只标注 managed，避免 /api/overview 触发副作用。
-        "php" => ("php-fpm", None),
+        // php 走 php-fpm（由 php::reconcile 拉起）：本处**不 spawn、不连 socket**（避免
+        // /api/overview 触发副作用），但读 `PHP_RUNTIME` 的**最后已知**状态 ——
+        // Wave-25 审查指出此前恒 `null`，运维看不出「端口在跑但 fpm 没起来」。
+        "php" => (
+            "php-fpm",
+            crate::server::apps::php::runtime_ready(lc.port, app_idx),
+        ),
         // jsp 优先 UDS sidecar（显式 socket 或 deps/bin/index 自动分支）。
         "jsp" => {
             if nh::uds_socket_available(app) {

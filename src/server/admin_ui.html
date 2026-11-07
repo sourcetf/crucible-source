@@ -86,6 +86,7 @@ img.preview{max-width:100%;max-height:420px}
   <button data-tab="files">文件管理</button>
   <button data-tab="pagerules">页面规则</button>
   <button data-tab="proxy">反向代理</button>
+  <button data-tab="catalog">选项目录</button>
 </nav>
 <main>
 <div id="toast" class="toast"></div>
@@ -136,6 +137,11 @@ img.preview{max-width:100%;max-height:420px}
           <select id="leAutoindexUpload"><option value="false">关闭</option><option value="true">开启</option></select>
         </div>
         <div><label>上传并行线程数</label><input id="leUploadThreads" value="4" size="3"/></div>
+        <div><label>同名文件处理</label><select id="leUploadOnExists">
+          <option value="overwrite">覆盖（默认）</option>
+          <option value="skip">跳过并回 409</option>
+          <option value="rename">自动改名（name (1).ext）</option>
+        </select></div>
         <div style="flex:1"><label>（上传走管理 API 分片断点续传，路径受 safe_join 保护）</label></div>
       </div>
       <button class="act" id="btnListenerSave">保存站点</button>
@@ -226,7 +232,8 @@ img.preview{max-width:100%;max-height:420px}
       <div id="appsOut"></div>
       <pre id="appsSaveOut"></pre>
       <h3 class="sub">引擎选项目录（/api/catalog）</h3>
-      <pre id="catalogOut" style="max-height:220px">加载中…</pre>
+      <p class="muted">引擎下拉与 <code>extensions</code> 默认值由后端 <code>options_catalog.rs</code> 驱动；
+下面的目录是它的完整枚举（含每个引擎的 <code>default_extensions</code> 与帮助文本）。见右侧「选项目录」选项卡。</p>
     </div>
   </section>
 
@@ -287,6 +294,13 @@ img.preview{max-width:100%;max-height:420px}
       <div id="pxOut"></div>
       <pre id="pxSaveOut"></pre>
     </div>
+  </section>
+
+  <section class="tab" id="tab-catalog">
+    <h2>选项目录</h2>
+    <p class="muted">由 <code>options_catalog.rs</code> 驱动：引擎清单、默认扩展名、每个选项的帮助文本。
+「应用引擎」选项卡的引擎下拉与 <code>extensions</code> 默认值取自这份目录。</p>
+    <pre id="catalogOut" style="max-height:520px">加载中…</pre>
   </section>
 
   <section class="tab" id="tab-access">
@@ -910,6 +924,7 @@ window.editListener=function(port){
   if(ai2&&typeof ai2==='object'){paths=ai2.paths||['/'];ai=ai2.enabled;}
   $('leAutoindexUpload').value=String(!!ai2.enable_upload);
   $('leUploadThreads').value=ai2.upload_threads||4;
+  $('leUploadOnExists').value=ai2.upload_on_exists||'overwrite';
   $('leAutoindex').value=String(!!ai);
   $('leAutoindexPaths').value=(paths||['/']).join(',');
 };
@@ -921,7 +936,7 @@ $('btnListenerNew').onclick=()=>{
   $('leServerName').value='';$('leStatusPath').value='';
   $('leH1').checked=true;$('leH2').checked=true;$('leH3').checked=false;
   $('leAutoindex').value='true';$('leAutoindexPaths').value='/';
-  $('leAutoindexUpload').value='false';$('leUploadThreads').value='4';
+  $('leAutoindexUpload').value='false';$('leUploadThreads').value='4';$('leUploadOnExists').value='overwrite';
 };
 $('btnListenerCancel').onclick=()=>{$('listenerEditCard').style.display='none'};
 $('btnListeners').onclick=async()=>{await loadCfg();renderListeners();};
@@ -945,7 +960,7 @@ $('btnListenerSave').onclick=async()=>{
   listener.port=port;
   listener.root=$('leRoot').value.trim();
   listener.ssl=l.ssl||null;
-  listener.autoindex={enabled:$('leAutoindex').value==='true',paths:aiPaths.length?aiPaths:['/'],enable_upload:$('leAutoindexUpload').value==='true',upload_threads:parseInt($('leUploadThreads').value,10)||4};
+  listener.autoindex={enabled:$('leAutoindex').value==='true',paths:aiPaths.length?aiPaths:['/'],enable_upload:$('leAutoindexUpload').value==='true',upload_threads:parseInt($('leUploadThreads').value,10)||4,upload_on_exists:$('leUploadOnExists').value||'overwrite'};
   listener.http_versions=versions;
   listener.server_name=$('leServerName').value.trim()||null;
   listener.status_path=$('leStatusPath').value.trim()||null;

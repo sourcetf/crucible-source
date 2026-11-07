@@ -1326,6 +1326,21 @@ fn headers_with_host(mut h: http::HeaderMap, uri: &http::Uri) -> http::HeaderMap
     h
 }
 
+/// 面板用：同步读某 key 的 PHP 运行时**最后已知**就绪状态（不连接、无副作用）。
+///
+/// `None` = 该 key 尚未冷启动（表里没有）；`Some(true/false)` = 记录里的 socket 是否仍在。
+/// 只反映「上次拉起后 socket 还在不在」，不做握手探测 —— `/api/overview` 绝不能有副作用。
+pub fn runtime_ready(port: u16, app_idx: usize) -> Option<bool> {
+    let key = runtime_key(port, app_idx);
+    let map = PHP_RUNTIME.lock();
+    let rt = map.get(&key)?;
+    Some(match &rt.addr {
+        #[cfg(unix)]
+        crate::server::apps::fastcgi::FcgiAddr::Unix(p) => p.exists(),
+        crate::server::apps::fastcgi::FcgiAddr::Tcp(_) => true,
+    })
+}
+
 fn runtime_key(port: u16, app_idx: usize) -> String {
     format!("{port}-{app_idx}")
 }

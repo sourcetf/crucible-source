@@ -336,6 +336,24 @@ pub struct AutoindexConfig {
     pub enable_upload: bool,
     /// 上传并行线程数（默认 4，可配）。
     pub upload_threads: u16,
+    /// 目标同名时怎么办（规格 §16.14）：
+    /// * `overwrite`（默认，历史行为）：直接改名覆盖；
+    /// * `skip`：目标已存在 ⇒ 拒绝（409），不动原文件；
+    /// * `rename`：目标已存在 ⇒ 自动改用 `<stem> (1)<ext>`、`<stem> (2)<ext>` …（首个空闲名）。
+    ///
+    /// `None` 视为 `overwrite`（保持旧行为，不改变既有部署语义）。
+    pub upload_on_exists: Option<String>,
+}
+
+impl AutoindexConfig {
+    /// `upload_on_exists` 的归一化取值（未知值按 `overwrite` 处理，绝不因拼错就拒上传）。
+    pub fn upload_on_exists_mode(&self) -> &'static str {
+        match self.upload_on_exists.as_deref().map(str::trim).map(str::to_ascii_lowercase).as_deref() {
+            Some("skip") => "skip",
+            Some("rename") => "rename",
+            _ => "overwrite",
+        }
+    }
 }
 
 fn default_upload_threads() -> u16 {
@@ -349,6 +367,7 @@ impl Default for AutoindexConfig {
             paths: vec!["/".into()],
             enable_upload: false,
             upload_threads: 4,
+            upload_on_exists: None,
         }
     }
 }
@@ -385,6 +404,8 @@ impl<'de> Deserialize<'de> for AutoindexConfig {
                 enable_upload: bool,
                 #[serde(default = "default_upload_threads")]
                 upload_threads: u16,
+                #[serde(default)]
+                upload_on_exists: Option<String>,
             },
         }
         match De::deserialize(deserializer)? {
@@ -393,8 +414,15 @@ impl<'de> Deserialize<'de> for AutoindexConfig {
                 paths: vec!["/".into()],
                 enable_upload: false,
                 upload_threads: 4,
+                upload_on_exists: None,
             }),
-            De::Table { enabled, paths, enable_upload, upload_threads } => Ok(Self {
+            De::Table {
+                enabled,
+                paths,
+                enable_upload,
+                upload_threads,
+                upload_on_exists,
+            } => Ok(Self {
                 enabled,
                 paths: if paths.is_empty() {
                     vec!["/".into()]
@@ -403,6 +431,9 @@ impl<'de> Deserialize<'de> for AutoindexConfig {
                 },
                 enable_upload,
                 upload_threads: upload_threads.max(1),
+                // 与 enable_upload 同理：非默认值必须随表一起序列化，否则面板
+                // 「读回→保存」会把上传冲突策略静默丢掉（Wave-25 已修过同类问题）。
+                upload_on_exists,
             }),
         }
     }
@@ -431,6 +462,7 @@ mod autoindex_roundtrip_tests {
                 paths: vec!["/".into()],
                 enable_upload: true,
                 upload_threads: 3,
+                upload_on_exists: Some("rename".into()),
             },
         };
         let text = toml::to_string(&w).expect("serialize");
@@ -448,6 +480,7 @@ mod autoindex_roundtrip_tests {
                 paths: vec!["/".into()],
                 enable_upload: false,
                 upload_threads: default_upload_threads(),
+                upload_on_exists: None,
             },
         };
         let t2 = toml::to_string(&plain).expect("serialize");
@@ -470,6 +503,8 @@ impl Serialize for AutoindexConfig {
         if self.paths == ["/".to_string()]
             && !self.enable_upload
             && self.upload_threads == default_upload_threads()
+            // `upload_on_exists` 非默认时必须保留表形态，否则面板「读回→保存」会把它丢掉。
+            && self.upload_on_exists.is_none()
         {
             serializer.serialize_bool(self.enabled)
         } else {
@@ -481,12 +516,15 @@ impl Serialize for AutoindexConfig {
                 enable_upload: bool,
                 #[serde(default)]
                 upload_threads: u16,
+                #[serde(default, skip_serializing_if = "Option::is_none")]
+                upload_on_exists: Option<String>,
             }
             T {
                 enabled: self.enabled,
                 paths: &self.paths,
                 enable_upload: self.enable_upload,
                 upload_threads: self.upload_threads,
+                upload_on_exists: self.upload_on_exists.clone(),
             }
             .serialize(serializer)
         }
