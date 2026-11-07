@@ -18,6 +18,10 @@ args=()
 for a in "$@"; do
   case "$a" in
     -Wl,-Bdynamic|-Wl,-dynamic-linker|-Wl,--dynamic-linker=*) ;;   # 丢弃
+    # **`-pie` 也要丢**：rustc 自己会传 `-pie`（OpenBSD 默认 PIE），与 `-static-pie` 冲突时
+    # clang 选 `-pie` 并把 `-static-pie` 判为 unused（实测警告原文）。丢掉它，
+    # 只留我们最前面的 `-static-pie`。注意：**不要动 `-shared`**（引擎 cdylib 还要用它）。
+    -pie) ;;
     *) args+=("$a") ;;
   esac
 done
