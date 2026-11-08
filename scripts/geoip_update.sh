@@ -240,10 +240,18 @@ ENRICH_SCRIPTS=(
       ENRICH_TOTAL=$((ENRICH_TOTAL + 1))
       # 每个 enrich 单独限时：某个源挂住（慢 RIR dump / RDAP / rdns）不应让整条
       # 更新链永远卡在 staging 上。默认 1800s/步，可用 GEOIP_ENRICH_TIMEOUT 覆盖。
+      #
+      # netorg 例外：它要通读 RIPE/APNIC/AFRINIC/LACNIC 四份 whois 全量 dump
+      # （RIPE 解压后约 2GB、近千万对象，逐条 upsert），1800s 打不住 —— 实测单 RIPE
+      # 就要 30 分钟以上。给它 7200s，可用 GEOIP_NETORG_TIMEOUT 覆盖。
+      step_timeout="$ENRICH_TIMEOUT"
+      case "$script" in
+        geoip_enrich_netorg.py) step_timeout="${GEOIP_NETORG_TIMEOUT:-7200}" ;;
+      esac
       if ! run_step "enrich/${script}" "$ENRICH_TARGET" \
-           timeout "$ENRICH_TIMEOUT" python3 "${ROOT}/scripts/${script}"; then
+           timeout "$step_timeout" python3 "${ROOT}/scripts/${script}"; then
         ENRICH_FAILS=$((ENRICH_FAILS + 1))
-        echo "warn: ${script} failed (timeout=${ENRICH_TIMEOUT}s)"
+        echo "warn: ${script} failed (timeout=${step_timeout}s)"
       fi
     done
     if [ "$ENRICH_TOTAL" -gt 0 ] && [ "$ENRICH_FAILS" -ge "$ENRICH_TOTAL" ]; then

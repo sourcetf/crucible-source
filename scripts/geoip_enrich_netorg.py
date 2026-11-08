@@ -230,6 +230,12 @@ def enrich_from_dump(db_name: str, path: Path, conn: sqlite3.Connection, cu: int
 
 
 def flush_pending(conn, orgs, pending, cu, db_name):
+    """把攒下的 inetnum 落库，**并就地提交**。
+
+    原来只在「整个 dump 跑完」时提交一次：RIPE 全量要通读约 2GB（近千万对象），
+    一旦被链路超时砍掉（或机器 OOM），这一份 dump 的所有成果全部回滚 —— 白跑半小时。
+    每 5 万条提交一次，进度即持久化，超时后重跑能接着往前推。
+    """
     for start, end, handle, descr in pending:
         net_org = orgs.get(handle or "", "")
         if not net_org and descr:
@@ -241,6 +247,7 @@ def flush_pending(conn, orgs, pending, cu, db_name):
             conn, start, end, {"net_org": net_org},
             weight=820, source=f"whois-{db_name}", commit_unix=cu,
         )
+    conn.commit()
 
 
 def arin_csv(conn: sqlite3.Connection, cu: int) -> int:
