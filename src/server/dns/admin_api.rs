@@ -122,6 +122,15 @@ async fn handle_inner(
                 if let Some(x) = v.get("ns_glue") {
                     dc.ns_glue = x.as_str().map(|s| s.trim().to_string());
                 }
+                // 递归白名单：面板「递归白名单 CIDR」输入框的值此前**没有任何人发送** ——
+                // 前端 handler 漏了这个字段、这条路径也不认它，于是填了等于没填（实测填
+                // 10.0.0.0/8,192.168.0.0/16 后 `recursion_acl` 仍是 ["127.0.0.1"]）。
+                // 叠加 `dnsStatus()` 会把输入框按服务端现值回填，用户看到自己填的内容被
+                // "弹回去"，很像「点了保存没反应」。空数组是有语义的（空 = 仅回环），
+                // 所以判据用 is_array 而不是非空。
+                if v.get("recursion_acl").map(|x| x.is_array()).unwrap_or(false) {
+                    dc.recursion_acl = json_strs(&v["recursion_acl"]);
+                }
                 persist_and_reconcile(&dc).await?;
                 Ok(json!({"ok": true, "modes": dc.modes}))
             }

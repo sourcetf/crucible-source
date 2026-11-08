@@ -815,6 +815,16 @@ function out(el,text,ok){
   p.className=ok?'ok':(text?'err':'');
   if(ok===undefined)p.className='';
 }
+/* 动作型反馈：结果 <pre> 常常在视口外（按钮正下方、或上方那张卡片里），只写 <pre>
+   用户看到的就是「点了没反应」。所以写 <pre> 的同时弹 toast 并把该 <pre> 滚进视野。
+   刷新类的展示（如 dnsStatus 全量回填）不要用这个，否则每次切页都弹提示。 */
+function acted(el,text,ok,msg){
+  out(el,text,ok);
+  const flat=String(text==null?'':text).replace(/\s+/g,' ').trim();
+  toast(ok?(msg||'已保存并应用'):('操作失败：'+(flat.slice(0,140)||'无响应')),!ok);
+  const p=$(el);
+  if(p&&p.scrollIntoView){try{p.scrollIntoView({block:'nearest'})}catch(e){}}
+}
 async function apiJson(path,opts){
   const r=await api(path,opts);
   try{return {ok:r.ok,status:r.status,json:JSON.parse(r.text),text:r.text};}
@@ -1002,7 +1012,7 @@ $('btnListenerSave').onclick=async()=>{
   listener.status_path=$('leStatusPath').value.trim()||null;
   const body={orig_port:EDIT_PORT,listener:listener};
   const r=await api('/api/listener/save',jpost(body));
-  out('listenerEditOut',r.text,r.ok);
+  acted('listenerEditOut',r.text,r.ok);
   if(r.ok){toast('站点已保存并热重载');await loadCfg();renderListeners();fillAllPortSelects();}
   else toast('保存失败',true);
 };
@@ -1106,7 +1116,7 @@ $('btnTlsSave').onclick=async()=>{
     };
   }
   const r=await api('/api/ssl/save',jpost({port:port,ssl:ssl}));
-  out('tlsOut',r.text,r.ok);
+  acted('tlsOut',r.text,r.ok);
   if(r.ok){toast('TLS 已保存并热重载');await loadCfg();}
 };
 // 常用套件一键填入：省得用户去翻 BoringSSL 的套件名字符串
@@ -1204,7 +1214,7 @@ loadTlsCipherCatalog();
 $('btnCiphersClear').onclick=()=>{$('tlsCiphers').value='';};
 $('btnTlsProbe').onclick=async()=>{
   const r=await api('/api/tls/probe',{method:'POST',body:$('tlsCert').value});
-  out('tlsOut',r.text,r.ok);
+  acted('tlsOut',r.text,r.ok);
 };
 
 /* ============ 应用引擎 ============ */
@@ -2154,13 +2164,13 @@ async function changeUserPass(name){
   if(p===null)return;
   if(!p){out('usersMsg','密码不能为空',false);return;}
   const r=await api('/api/admin/users',jpost({action:'pass',username:name,password:p}));
-  out('usersMsg',r.text,r.ok);
+  acted('usersMsg',r.text,r.ok);
   if(r.ok)loadUsers();
 }
 async function deleteUser(name){
   if(!confirm('删除用户 '+name+' ？'))return;
   const r=await api('/api/admin/users',jpost({action:'del',username:name}));
-  out('usersMsg',r.text,r.ok);
+  acted('usersMsg',r.text,r.ok);
   if(r.ok){await loadCfg();refreshAccounts();loadUsers();}
 }
 $('btnUserAdd').onclick=async()=>{
@@ -2168,7 +2178,7 @@ $('btnUserAdd').onclick=async()=>{
   const p=$('newUserPass').value;
   if(!name||!p){out('usersMsg','用户名和密码都不能为空',false);return;}
   const r=await api('/api/admin/users',jpost({action:'add',username:name,password:p}));
-  out('usersMsg',r.text,r.ok);
+  acted('usersMsg',r.text,r.ok);
   if(r.ok){$('newUserName').value='';$('newUserPass').value='';await loadCfg();refreshAccounts();loadUsers();}
 };
 
@@ -2197,9 +2207,9 @@ async function dnsStatus(){
     if(r.json.ns_name!==undefined)$('dnsNsName').value=r.json.ns_name||'';
     if(r.json.ns_glue!==undefined)$('dnsNsGlue').value=r.json.ns_glue==null?'':r.json.ns_glue;
     // AXFR 全局白名单
-    if(r.json.axfr_out_acl){$('dnsAxfrOut').value=r.json.axfr_out_acl.join(',');}
+    if(r.json.axfr_out_acl!==undefined){$('dnsAxfrOut').value=(r.json.axfr_out_acl||[]).join(',');}
     // 递归 ACL
-    if(r.json.recursion_acl){$('dnsRecAcl').value=r.json.recursion_acl.join(',');}
+    if(r.json.recursion_acl!==undefined){$('dnsRecAcl').value=(r.json.recursion_acl||[]).join(',');}
     // DoT / DoH
     if(r.json.dot){$('dotEnabled').checked=!!r.json.dot.enabled;$('dotPort').value=r.json.dot.port||853;$('dotCert').value=r.json.dot.cert||'';$('dotKey').value=r.json.dot.key||'';}
     if(r.json.doh){$('dohEnabled').checked=!!r.json.doh.enabled;$('dohPath').value=r.json.doh.path||'/dns-query';$('dohHosts').value=(r.json.doh.hostnames||[]).join(',');}
@@ -2234,19 +2244,21 @@ $('btnDnsModes').onclick=async()=>{
   const r=await apiJson('/api/dns/modes',jpost({
     enabled:$('dnsEnabled').checked,root:$('dnsModeRoot').checked,
     recursive:$('dnsModeRec').checked,authoritative:$('dnsModeAuth').checked,ecs:$('dnsEcs').checked,
-    ns_name:$('dnsNsName').value, ns_glue:$('dnsNsGlue').value}));
-  out('dnsModesOut',r.text,r.ok); if(r.ok)dnsStatus();
+    ns_name:$('dnsNsName').value, ns_glue:$('dnsNsGlue').value,
+    /* 递归白名单原本漏发：字段填了也不会生效（后端此前也不认它），必须带上。 */
+    recursion_acl:csv($('dnsRecAcl').value)}));
+  acted('dnsModesOut',r.text,r.ok,'模式与递归白名单已保存并应用'); if(r.ok)dnsStatus();
 };
 $('btnDnsZoneAdd').onclick=async()=>{
   const r=await apiJson('/api/dns/zones',jpost({action:'add',name:$('dnsZoneName').value,
     kind:$('dnsZoneKind').value,primaries:csv($('dnsZonePrimaries').value),
     axfr_acl:csv($('dnsZoneAxfr').value),also_notify:csv($('dnsZoneNotify').value),
     refresh_hours:+$('dnsZoneRefresh').value||24}));
-  out('dnsZonesOut',r.text,r.ok); if(r.ok)dnsStatus();
+  acted('dnsZonesOut',r.text,r.ok); if(r.ok)dnsStatus();
 };
 $('btnDnsZoneDel').onclick=async()=>{
   const r=await apiJson('/api/dns/zones',jpost({action:'del',name:$('dnsZoneName').value}));
-  out('dnsZonesOut',r.text,r.ok); if(r.ok)dnsStatus();
+  acted('dnsZonesOut',r.text,r.ok); if(r.ok)dnsStatus();
 };
 /* ================= DNS 分区与记录：表格编辑（替代原来的 JSON 文本框）=================
    原来是「按钮 + 把原始 JSON 打印到 pre」，输入输出都是 JSON，对不熟悉 JSON 的用户
@@ -2406,17 +2418,17 @@ $('btnZoneExport').onclick=function(){
 };
 $('btnDnsZoneList').onclick=async()=>{
   const r=await apiJson('/api/dns/zones');
-  out('dnsZonesOut',r.text,r.ok);
+  acted('dnsZonesOut',r.text,r.ok);
 };
 $('btnDnsRecAdd').onclick=async()=>{
   const r=await apiJson('/api/dns/records',jpost({action:'add',zone:$('dnsRecZone').value,
     name:$('dnsRecName').value||'@',rtype:$('dnsRecType').value,ttl:+$('dnsRecTtl').value||3600,
     rdata:$('dnsRecData').value,line:$('dnsRecLine').value}));
-  out('dnsRecOut',r.text,r.ok); if(r.ok)dnsStatus();
+  acted('dnsRecOut',r.text,r.ok); if(r.ok)dnsStatus();
 };
 $('btnDnsRecList').onclick=async()=>{
   const r=await apiJson('/api/dns/records?zone='+encodeURIComponent($('dnsRecZone').value));
-  out('dnsRecOut',r.text,r.ok);
+  acted('dnsRecOut',r.text,r.ok);
 };
 $('btnDnssecSave').onclick=async()=>{
   const r=await apiJson('/api/dns/dnssec',jpost({action:'policy',dnssec:{
@@ -2425,27 +2437,27 @@ $('btnDnssecSave').onclick=async()=>{
     ksk_lifetime_days:$('dsKskDays').value?+$('dsKskDays').value:null,
     keys:[],nsec3:$('dsNsec3').checked,nsec3_iterations:+$('dsIter').value||0,
     nsec3_optout:$('dsOptout').checked,cds:$('dsCds').checked}}));
-  out('dnssecOut',r.text,r.ok); if(r.ok)dnsStatus();
+  acted('dnssecOut',r.text,r.ok); if(r.ok)dnsStatus();
 };
 $('btnDsKeygen').onclick=async()=>{
   const r=await apiJson('/api/dns/dnssec',jpost({action:'keygen',zone:$('dsKeyZone').value,role:$('dsKeyRole').value}));
-  out('dnssecOut',r.text,r.ok);
+  acted('dnssecOut',r.text,r.ok);
 };
 $('btnDsUpload').onclick=async()=>{
   const r=await apiJson('/api/dns/dnssec',jpost({action:'upload',filename:$('dsUpName').value,b64:$('dsUpB64').value}));
-  out('dnssecOut',r.text,r.ok);
+  acted('dnssecOut',r.text,r.ok);
 };
 $('btnDnsAxfrOut').onclick=async()=>{
   const r=await apiJson('/api/dns/axfr',jpost({action:'global',axfr_out_acl:csv($('dnsAxfrOut').value)}));
-  out('dnsAxfrOut2',r.text,r.ok);
+  acted('dnsAxfrOut2',r.text,r.ok);
 };
 $('btnRpzAdd').onclick=async()=>{
   const r=await apiJson('/api/dns/override',jpost({action:'add',name:$('rpzName').value,rtype:$('rpzType').value,value:$('rpzValue').value}));
-  out('rpzOut',r.text,r.ok); if(r.ok)dnsStatus();
+  acted('rpzOut',r.text,r.ok); if(r.ok)dnsStatus();
 };
 $('btnRpzDel').onclick=async()=>{
   const r=await apiJson('/api/dns/override',jpost({action:'del',name:$('rpzName').value}));
-  out('rpzOut',r.text,r.ok); if(r.ok)dnsStatus();
+  acted('rpzOut',r.text,r.ok); if(r.ok)dnsStatus();
 };
 $('btnGeoDnsSave').onclick=async()=>{
   let lines;
@@ -2465,23 +2477,23 @@ $('btnGeoDnsSave').onclick=async()=>{
     geo.mmdb=mmdb;
   }
   const r=await apiJson('/api/dns/geo',jpost({geo}));
-  out('geoDnsOut',r.text,r.ok);
+  acted('geoDnsOut',r.text,r.ok);
   if(r.ok)dnsStatus();
 };
 $('btnDotDohSave').onclick=async()=>{
   const r=await apiJson('/api/dns/dot_doh',jpost({
     dot:{enabled:$('dotEnabled').checked,port:+$('dotPort').value||0,cert:$('dotCert').value||null,key:$('dotKey').value||null},
     doh:{enabled:$('dohEnabled').checked,path:$('dohPath').value||'/dns-query',hostnames:csv($('dohHosts').value)}}));
-  out('dotDohOut',r.text,r.ok);
+  acted('dotDohOut',r.text,r.ok);
 };
 $('btnRzSet').onclick=async()=>{
   const r=await apiJson('/api/dns/rootzone',jpost({action:'set',refresh_hours:+$('rzHours').value||24}));
-  out('rzOut',r.text,r.ok);
+  acted('rzOut',r.text,r.ok);
 };
 $('btnRzNow').onclick=async()=>{
   out('rzOut','刷新中…');
   const r=await apiJson('/api/dns/rootzone',jpost({action:'refresh'}));
-  out('rzOut',r.text,r.ok);
+  acted('rzOut',r.text,r.ok);
 };
 $('btnAcmeSave').onclick=async()=>{
   // config POST 是整体替换：先 GET 全量再合并 acme 字段，避免清掉 dnssec/rpz/geo。
@@ -2493,26 +2505,26 @@ $('btnAcmeSave').onclick=async()=>{
     domain:$('acmeDomain').value,email:$('acmeEmail').value,renew_days:+$('acmeRenew').value||60,
     challenge:$('acmeChallenge').value});
   const r=await apiJson('/api/dns/config',jpost(cur.json));
-  out('acmeOut',r.text,r.ok); if(r.ok)dnsStatus();
+  acted('acmeOut',r.text,r.ok); if(r.ok)dnsStatus();
 };
 $('btnAcmeStatus').onclick=async()=>{
   const r=await apiJson('/api/dns/acme');
-  out('acmeOut',r.text,r.ok);
+  acted('acmeOut',r.text,r.ok);
 };
 $('btnAcmeIssue').onclick=async()=>{
   out('acmeOut','签发中（外部 ACME 工具，可能耗时数十秒）…');
   const r=await apiJson('/api/dns/acme/issue',jpost({}));
-  out('acmeOut',r.text,r.ok); if(r.ok)dnsStatus();
+  acted('acmeOut',r.text,r.ok); if(r.ok)dnsStatus();
 };
 $('btnTestSplit').onclick=async()=>{
   if(!$('tsIp').value)return out('tsOut','先填客户端 IP',false);
   const r=await apiJson('/api/dns/test-split?ip='+encodeURIComponent($('tsIp').value),jpost({}));
-  out('tsOut',r.text,r.ok);
+  acted('tsOut',r.text,r.ok);
 };
 $('btnDnsReload').onclick=async()=>{
   out('dnsReloadOut','reconcile + reload 中…');
   const r=await apiJson('/api/dns/reload',jpost({}));
-  out('dnsReloadOut',r.text,r.ok); if(r.ok)dnsStatus();
+  acted('dnsReloadOut',r.text,r.ok); if(r.ok)dnsStatus();
 };
 $('btnJspCompile').onclick=async()=>{
   out('jspOut','编译中…');
