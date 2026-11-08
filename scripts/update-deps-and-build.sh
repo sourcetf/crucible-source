@@ -61,7 +61,7 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT" || exit 2
 
 OFFLINE=0; DRY=0; ALLOW_MISSING=0; DO_ENGINES=1; RUN_TESTS=0; JOBS=""
-STATIC=0; STRIP=1
+STATIC=0; STRIP=1; FORCE_STATIC_ATTEMPT="${FORCE_STATIC_ATTEMPT:-0}"
 usage() { sed -n '2,40p' "$0" | sed 's/^# \{0,1\}//'; }
 
 while [ $# -gt 0 ]; do
@@ -71,6 +71,7 @@ while [ $# -gt 0 ]; do
     --allow-missing) ALLOW_MISSING=1 ;;
     --no-engines) DO_ENGINES=0 ;;
     --static) STATIC=1 ;;
+    --force-static-attempt) STATIC=1; FORCE_STATIC_ATTEMPT=1 ;;
     --no-strip) STRIP=0 ;;
     --test) RUN_TESTS=1 ;;
     --jobs) JOBS="${2:-}"; shift ;;
@@ -251,6 +252,18 @@ if [ "$STATIC" = 1 ]; then
       echo "        交付时需把 target/$MUSL_ARCH/release/webserver 与 musl 版 target/app-engines/*.so 一起带走。"
       ;;
     OpenBSD)
+      # **先给定论再决定是否白跑 17 分钟**：实测（含 3 行 Rust 最小复现，见文件头与
+      # contact.txt Wave-25e）Rust 二进制「NEEDED=0」与「能启动」在 OpenBSD 上互斥 ——
+      # 4 种得到 NEEDED=0 的链接方式全部 Abort trap；能跑的 NEEDED≠0；-static 链接不过
+      # （_libc_mprotect）。崩在 _libc_preinit→issetugid(ENOSYS)（OpenBSD static-pie 是
+      # 静态 libc + 内嵌 ld.so 启动，也是它能 dlopen 的原因），C/C++ 无此问题。
+      if [ "${FORCE_STATIC_ATTEMPT:-0}" != "1" ]; then
+        echo "  ** OpenBSD 上无法同时满足「ldd 为空」与「能运行」**（Rust std ↔ static-pie 启动不兼容）"
+        echo "     · 证据与最小复现：scripts/openbsd-static-pie-cc.sh 文件头、contact.txt Wave-25e 节"
+        echo "     · 现状建议：保持**动态**部署（引擎/NSS 全可用）"
+        echo "     · 真要再试一次（会白跑一轮构建且第 3 项验收必然失败）：加 --force-static-attempt"
+        step_fail "--static 在 OpenBSD 上不可行（已实测定论）"
+      else
       # static-pie：ldd 为空 + dlopen 可用 + 用 OpenBSD 自有 libc（见文件头实测表）。
       FEAT_STATIC="$(echo "$FEATURES" | tr ',' '\n' | grep -vx 'tls_nss' | paste -sd, -)"
       if [ "$FEAT_STATIC" != "$FEATURES" ]; then
@@ -300,6 +313,7 @@ EOC
         else echo "    [4/4] 跳过（没有引擎 .so 或 cc -static-pie 不可用）"; fi
         rm -rf "$(dirname "$probe")"
       fi
+      fi # FORCE_STATIC_ATTEMPT
       ;;
     *) echo "  未知平台 $HOST_OS"; step_fail "--static 在 $HOST_OS 上未定义" ;;
   esac
