@@ -7294,3 +7294,36 @@ DNS 53 正常；`CONTAINMENT OK`；引擎身份 `_c_*`；孤儿自检「没有�
    共享库 ⇒ 除非连解释器一起静态化（上游未提供静态版）。
 3. 换平台/toolchain（Linux+musl 静态可达成，但**用户明确否决 musl**）；或等上游修 OpenBSD+rustc 的
    static-pie 启动路径（当前无可用版本可测）。
+
+## 2026-11-08 工号1009 · GeoIP 日更链的功能性修复（4 个脚本，均在目标机验证）
+本轮只改 `scripts/` 下的 GeoIP 相关脚本，未碰任何其它接口 ⇒ 无接口冲突风险。
+
+1. `geoip_update.sh`：`now_ms()` 用了 GNU 专有 `date +%s%N`，OpenBSD 上输出字面 `N`，
+   而 OpenBSD sh 在算术错误时**直接终止脚本** ⇒ 整条日更链在第一个 run_step 后即死。
+   改 python3 `time.time_ns()`，回退 `date +%s`×1e9。`file_size()` 用 GNU `stat -c`（OpenBSD 恒 0）
+   改 `stat -f %z` 优先 —— 磁盘前置检查此前一直静默失效。
+   另修：`sources/GeoCn.mmdb` 大小写误判（实际是 `GeoCN.mmdb`，OpenBSD 区分大小写）导致
+   每天误报「国内主力源将被跳过」（实测该源正常导入 111 万行）。
+2. `geoip_enrich_netorg.py`：原 `dst.write(src.read())` 把整份 RIR dump（RIPE 解压约 2GB）
+   读进内存 → 2GB 机器 OOM、盘满时留下 **0 字节** `ripe.db`。改流式解压 + 校验 + 原子替换，
+   并在解压前按剩余空间判断（不够就跳过解压、直接流式读 `.gz`）。已有 `.gz` 时不重复下载。
+3. `geoip_enrich_ripe_anycast_extract.py`：只判 `ripe.db` 存在 → 读到 0 字节空文件，
+   rc=0 且打印 "0 anycast ranges"，**anycast 功能静默失效**。改 `.db`/`.db.gz` 双路（流式），
+   并在都不可用时明确报出。修后实测 anycast 384 条真实 RIPE anycast 段。
+4. `geoip_enrich_qqwry.py`：三个数据源 URL **全部 404**（纯真源已迁移）⇒ weight 800 的国内源
+   长期静默跳空；且解析器有三处硬伤（记录偏移按 4 字节读 / 不读记录区头 4 字节的结束IP /
+   IP 字节序按大端解释）。按上游 protocol.md 重写解析器（小端、7 字节索引、记录区
+   [结束IP][国家][地区]、0x01/0x02 + 3 字节偏移），换 metowolf release 源 + 缓存 + 抽样自检护栏。
+   实测：1,583,511 行全部导入、自检 100%，8.8.8.8→美国–加利福尼亚州–圣克拉拉–山景城|谷歌公司，
+   114.114.114.114→中国–江苏–南京，58.14.0.1→中国–山东–济南|教育网。
+
+注意：验证时我曾手跑 `--only merge` 换出过 82MB 半成品库（merge 只重建基础表，ipv4/ipv6/anycast
+由 enrich 阶段填），已用完整链恢复（geoip 228 万 → 含 qqwry 后 386 万行），现库 966MB。
+
+追加（同日稍后）：netorg 单步原用链里默认 1800s 超时，而 RIPE 全量通读实测 24 分钟
+（还只算四份 dump 之一）⇒ 每轮必被砍，且它只在整份 dump 跑完才 commit 一次，砍掉即整份回滚。
+已改为 netorg 单独 7200s（`GEOIP_NETORG_TIMEOUT` 可覆盖）+ `flush_pending` 每 5 万条就地 commit。
+另：成品库因 RIPE net_org 涨到 1.78GB，而链的前置检查要求「库大小 + 256MiB」空闲 ⇒ 目标机需要
+约 2GB 余量才跑得动日更；已回收 `/opt/ll21`（冗余 LLVM 工具链，系统 /usr/bin/strip 本身就是
+llvm-strip）与 cargo 源码缓存，腾出 1.27GB（现余 3.0G）。`/root/ReMgr/target` 占 4.4GB 但不是本项目
+产物，未动。
