@@ -87,6 +87,31 @@ now_ms() {
   python3 -c 'import time;print(time.time_ns())' 2>/dev/null \
     || echo "$(( $(date +%s) * 1000000000 ))"
 }
+file_size() {
+  # BSD/GNU 通吃：OpenBSD 的 stat **没有** `-c`（GNU 语法，只有 `-f %z`）；反之 GNU stat 只有 `-c`。
+  # 原实现 `stat -c %s ... || echo 0` 在 OpenBSD 上**恒返回 0**（错误被 `||` 吞掉），
+  # 于是「按现有库大小预估所需空间」的磁盘预检形同虚设。
+  [ -f "$1" ] || { echo 0; return; }
+  stat -f %z "$1" 2>/dev/null || stat -c %s "$1" 2>/dev/null || echo 0
+}
+
+# 一步一计时：输出 `<step> rc=… elapsed=…ms`，主会话/报告直接引用。
+run_step() {
+  local name="$1"
+  local usedb="$2"
+  shift 2
+  local t0 rc
+  t0="$(now_ms)"
+  if [ -n "$usedb" ]; then
+    CRUCIBLE_GEOIP_DB="$usedb" "$@"
+  else
+    "$@"
+  fi
+  rc=$?
+  echo "[$(date '+%F %T')] step ${name} rc=${rc} elapsed=$(( ($(now_ms) - t0) / 1000000 ))ms"
+  return "$rc"
+}
+
 
 db_stats() {
   python3 - "$1" <<'PY'
