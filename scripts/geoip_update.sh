@@ -74,24 +74,18 @@ have_network() {
   command -v curl >/dev/null 2>&1 && curl -fsS --connect-timeout 3 -o /dev/null https://example.com 2>/dev/null
 }
 
-now_ms() { date +%s%N; }
-file_size() { [ -f "$1" ] && stat -c %s "$1" 2>/dev/null || echo 0; }
-
-# 一步一计时：输出 `<step> rc=… elapsed=…ms`，主会话/报告直接引用。
-run_step() {
-  local name="$1"
-  local usedb="$2"
-  shift 2
-  local t0 rc
-  t0="$(now_ms)"
-  if [ -n "$usedb" ]; then
-    CRUCIBLE_GEOIP_DB="$usedb" "$@"
-  else
-    "$@"
-  fi
-  rc=$?
-  echo "[$(date '+%F %T')] step ${name} rc=${rc} elapsed=$(( ($(now_ms) - t0) / 1000000 ))ms"
-  return "$rc"
+now_ms() {
+  # 返回**纳秒**（调用处用 `/(10^6)` 换算成 ms）。
+  #
+  # 原实现是 `date +%s%N` —— **GNU 专有**。OpenBSD 的 date 不支持 `%N`，会原样输出字面 `N`，
+  # 于是 `run_step` 里 `$(( $(now_ms) - t0 ))` 成了 `1794102289N` 这种非法 token；而 OpenBSD
+  # 的 sh/ksh 在算术错误时**直接终止脚本** ⇒ 整条 GeoIP 更新链在**第一个 run_step 结束后**
+  # 就死掉（fetch 跑完、merge/enrich/finish/完整性门禁/原子换库全没执行），库永远停在旧版本。
+  # 真机实证（2026-11-08）：`daily` 定时确实在触发、`update.log` 显示 `13/14 sources ok` 后
+  # 再无输出，而 `current/geoip.sqlite` 仍是 Sep 24 的库。
+  # 修法：用 python3 取纳秒（脚本本来就依赖 python3），无 python 时退回秒×1e9（精度差但可用）。
+  python3 -c 'import time;print(time.time_ns())' 2>/dev/null \
+    || echo "$(( $(date +%s) * 1000000000 ))"
 }
 
 db_stats() {
