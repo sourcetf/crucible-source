@@ -186,12 +186,17 @@ ENRICH_SCRIPTS=(
   # scripts/geoip-mmdb2jsonl 从同目录 GeoCN.mmdb 生成 —— 更新链不会自动生成它（本机也没装 Go）。
   # 缺了它 enrich 只会打一行 "run mmdb2jsonl first"，然后静默丢掉最大的源，
   # 所以在开工前就把话说重一点，并明确「不要为了腾空间删它」。
-  if [ ! -s "${DATA}/sources/GeoCn.jsonl" ]; then
-    if [ -s "${DATA}/sources/GeoCn.mmdb" ]; then
-      echo "warn: 缺少 sources/GeoCn.jsonl（GeoCN.mmdb 在，但需要 Go 工具生成）——"
-      echo "warn: 本次会跳过国内主力源（约 220 万行）。生成命令：cd ${ROOT} && go run scripts/geoip-mmdb2jsonl . > data/geoip/sources/GeoCn.jsonl"
+  #
+  # 文件名大小写：上游/文档里出现过 GeoCn 与 GeoCN 两种写法，实际落盘的是 **GeoCN**。
+  # OpenBSD 的文件系统区分大小写，只测 GeoCn.* 会让**源明明在**也天天报「将被跳过」
+  # （实测 111 万行照样导进去了，警告纯属误报）。两种拼写都认。
+  geoip_src_exists() { [ -s "${DATA}/sources/$1" ] || [ -s "${DATA}/sources/$2" ]; }
+  if ! geoip_src_exists GeoCN.jsonl GeoCn.jsonl; then
+    if geoip_src_exists GeoCN.mmdb GeoCn.mmdb; then
+      echo "warn: 缺少 sources/GeoCN.jsonl（GeoCN.mmdb 在，但需要 Go 工具生成）——"
+      echo "warn: 本次会跳过国内主力源（约 220 万行）。生成命令：cd ${ROOT} && go run scripts/geoip-mmdb2jsonl . > data/geoip/sources/GeoCN.jsonl"
     else
-      echo "warn: 缺少 sources/GeoCn.mmdb 与 GeoCN.jsonl —— 国内主力源将被跳过。"
+      echo "warn: 缺少 sources/GeoCN.mmdb 与 GeoCN.jsonl —— 国内主力源将被跳过。"
     fi
   fi
 

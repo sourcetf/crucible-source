@@ -15,6 +15,7 @@ from __future__ import annotations
 import gzip
 import os
 import re
+import shutil
 import socket
 import sqlite3
 import sys
@@ -65,28 +66,91 @@ def log(msg: str) -> None:
         f.write(f"[{time.strftime('%Y-%m-%dT%H:%M:%S')}] {msg}\n")
 
 
-def get_dump(name: str, url: str) -> Path | None:
-    out = SOURCES / f"{name}.db"
-    if out.is_file() and out.stat().st_size > 1_000_000:
-        return out
-    gz = SOURCES / f"{name}.db.gz"
-    SOURCES.mkdir(parents=True, exist_ok=True)
+def _usable(p: Path, floor: int = 1_000_000) -> bool:
     try:
-        raw = fetch(url, timeout=1800)
-        gz.write_bytes(raw)
-        with gzip.open(gz, "rb") as src, out.open("wb") as dst:
-            dst.write(src.read())
+        return p.is_file() and p.stat().st_size >= floor
+    except OSError:
+        return False
+
+
+def get_dump(name: str, url: str) -> Path | None:
+    """返回可流式解析的 dump 路径；拿不到就 None。
+
+    返回的可能是 `{name}.db`，也可能是 `{name}.db.gz`（`parse_objects` 两者都认）。
+    """
+    out = SOURCES / f"{name}.db"
+    gz = SOURCES / f"{name}.db.gz"
+    if _usable(out):
+        return out
+    SOURCES.mkdir(parents=True, exist_ok=True)
+    # 已经下过一份像样的 .gz（RIPE 376MB）就不要为了「解压失败」再重下几百 MB。
+    if not _usable(gz):
+        try:
+            raw = fetch(url, timeout=1800)
+        except Exception as exc:
+            print(f"warn: dump {name}: {exc}", file=sys.stderr)
+            return gz if _usable(gz, 1) else None
+        tmp_gz = gz.with_name(gz.name + ".tmp")
+        try:
+            tmp_gz.write_bytes(raw)
+            os.replace(tmp_gz, gz)  # 原子落位：不会留下半个 .gz
+        except OSError as exc:
+            print(f"warn: dump {name}: 写 {gz.name} 失败: {exc}", file=sys.stderr)
+            try:
+                tmp_gz.unlink()
+            except OSError:
+                pass
+            return None
+    # 流式解压到 .tmp，校验够大后原子替换。
+    # 原实现 `dst.write(src.read())` 把整份 dump 读进内存：RIPE 解压后约 2GB，
+    # 在 2GB 内存的机器上 OOM（且磁盘吃紧时 write 半途失败）→ 留下 **0 字节** 的
+    # ripe.db：上面的 reuse 检查（>1MB）看不见它，anycast 提取读到空文件**静默产 0 条**，
+    # 下一轮又要重下 376MB 的 .gz。改流式 + 校验 + 原子替换，并把失败说清楚。
+    #
+    # 还要先看盘：RIR 文本 dump 解压后是 .gz 的 5~6 倍（RIPE 376MB → 约 2GB），
+    # 空间不够时那次 write 会把盘写满（曾把根分区顶到 104%）并留下半截文件，
+    # 所以直接跳过解压、走下面的 .gz 流式退路，不碰磁盘。
+    try:
+        free = shutil.disk_usage(SOURCES).free
+        need = gz.stat().st_size * 6
+    except OSError:
+        free, need = 0, 0
+    if free < need:
+        print(
+            f"warn: dump {name}: 剩余空间 {free // 1_048_576}MB < 解压所需 "
+            f"约 {need // 1_048_576}MB —— 跳过解压，直接流式读 {gz.name}",
+            file=sys.stderr,
+        )
+        return gz if _usable(gz, 1) else None
+    tmp_out = out.with_name(out.name + ".tmp")
+    try:
+        with gzip.open(gz, "rb") as src, tmp_out.open("wb") as dst:
+            shutil.copyfileobj(src, dst, length=1 << 20)
+        if not _usable(tmp_out):
+            raise RuntimeError("解压后过小（磁盘满或源文件损坏）")
+        os.replace(tmp_out, out)
         return out
     except Exception as exc:
-        print(f"warn: dump {name}: {exc}", file=sys.stderr)
-        return None
+        print(
+            f"warn: dump {name} 解压失败（{exc}）——退回直接流式读 {gz.name}",
+            file=sys.stderr,
+        )
+        try:
+            tmp_out.unlink()
+        except OSError:
+            pass
+        return gz if _usable(gz, 1) else None
 
 
 def parse_objects(path: Path):
-    """流式解析 RIR 文本 dump：产出 (kind, obj) —— kind ∈ inetnum|organisation。"""
+    """流式解析 RIR 文本 dump：产出 (kind, obj) —— kind ∈ inetnum|organisation。
+
+    `path` 可以是 `.db` 也可以是 `.db.gz`（见 `get_dump` 的退路）。
+    """
     obj: dict[str, str] = {}
     key = None
-    with path.open(encoding="utf-8", errors="replace") as f:
+    opener = gzip.open if path.suffix == ".gz" else open
+    with opener(path, "rt", encoding="utf-8", errors="replace") as f:
         for line in f:
             line = line.rstrip("\n")
             if not line or line.startswith("%") or line.startswith("#"):
